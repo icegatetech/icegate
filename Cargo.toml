@@ -1,0 +1,59 @@
+[package]
+name = "icegate"
+version = "0.1.0"
+edition = "2024"
+authors = ["IceGate Tech"]
+description = "Observability data lake query engine using Iceberg and DataFusion"
+license = "Apache-2.0"
+repository = "https://github.com/icegatetech/icegate"
+keywords = ["iceberg", "datafusion", "query-engine", "data-lake", "observability"]
+categories = ["database", "data-structures"]
+
+# Linting configuration
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+unused_imports = "warn"
+unused_variables = "warn"
+dead_code = "deny"
+
+[lints.clippy]
+# Pedantic lints
+pedantic = { level = "warn", priority = -1 }
+
+# Nursery lints (experimental but useful)
+nursery = { level = "warn", priority = -1 }
+
+# Restriction lints (opt-in)
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Performance lints
+perf = { level = "warn", priority = -1 }
+
+# Cargo lints
+cargo = { level = "warn", priority = -1 }
+
+# Correctness (deny by default)
+correctness = { level = "deny", priority = -1 }
+
+# Style preferences
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+# Allow multiple crate versions for transitive dependencies we can't control
+multiple_crate_versions = "allow"
+
+[dependencies]
+iceberg = "0.7.0"
+iceberg-catalog-memory = "0.5.1"
+iceberg-datafusion = "0.7.0"
+
+datafusion = "50.3.0"
+
+tokio = "1.48.0"

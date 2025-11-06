@@ -1,0 +1,24 @@
+# Rust toolchain configuration for IceGate
+# This file pins the Rust toolchain version for consistent builds
+
+[toolchain]
+# Use stable channel
+channel = "stable"
+
+# Specify components to install
+components = [
+    "rustfmt",
+    "clippy",
+    "rust-src",
+    "rust-analyzer"
+]
+
+# Specify targets (add more as needed)
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin"
+]
+
+# Profile (minimal, default, or complete)
+profile = "default"

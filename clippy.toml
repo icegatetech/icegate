@@ -1,0 +1,54 @@
+# Clippy configuration for IceGate
+# https://doc.rust-lang.org/clippy/
+
+# Documentation
+# Enforce documentation on public items
+doc-valid-idents = ["DataFusion", "Iceberg", "IceGate"]
+
+# Cognitive complexity threshold
+cognitive-complexity-threshold = 30
+
+# Avoid large error types
+type-complexity-threshold = 500
+
+# Maximum function arguments
+too-many-arguments-threshold = 8
+
+# Array size threshold for array_size_threshold lint
+array-size-threshold = 512000
+
+# Vec box size threshold
+vec-box-size-threshold = 4096
+
+# Maximum struct field visibility
+max-struct-bools = 3
+
+# Maximum trait bounds
+max-trait-bounds = 5
+
+# Maximum function lines
+too-many-lines-threshold = 150
+
+# Single character binding names (allowed for short-lived variables)
+single-char-binding-names-threshold = 4
+
+# Enforce minimum Rust version
+msrv = "1.75.0"
+
+# Literal representation
+literal-representation-threshold = 65536
+
+# Stack size limit for large futures
+future-size-threshold = 16384
+
+# Configuration for allow-expect-in-tests
+allow-expect-in-tests = true
+
+# Allow unwrap in tests
+allow-unwrap-in-tests = true
+
+# Configuration for print macros
+allow-print-in-tests = true
+
+# Configuration for dbg! macro
+allow-dbg-in-tests = true
