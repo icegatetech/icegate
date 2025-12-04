@@ -10,5 +10,5 @@ pub mod common;
 pub mod ingest;
 /// Migration module for schema management.
 pub mod maintain;
-/// Select component for querying data via Loki, Prometheus, and Tempo APIs.
+/// Query component for querying data via Loki, Prometheus, and Tempo APIs.
 pub mod query;

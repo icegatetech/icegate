@@ -20,7 +20,7 @@ IceGate supports open protocols and APIs compatible with standard ingesting and 
 ## Architecture
 
 IceGate employs a compute-storage separation architecture, allowing independent scaling of processing and storage resources.
-This design enables cost-effective scaling where compute resources (Ingest, Select, Maintain, Alert) can be scaled independently based on workload demands,
+This design enables cost-effective scaling where compute resources (Ingest, Query, Maintain, Alert) can be scaled independently based on workload demands,
 while all data resides in object storage.
 
 The system consists of five core components for handling observability data (metrics, traces, logs, and events):
@@ -35,7 +35,7 @@ The system consists of five core components for handling observability data (met
 - **Purpose**: Accept observability data and persist it in Object Storage
 - **Implementation**: WAL using Parquet files organized in a special way to be compatible with the Storage data layer
 - **Delivery Guarantee**: Exactly-once delivery
-- **Note**: WAL files can be used by the Select layer to provide real-time data access
+- **Note**: WAL files can be used by the Query layer to provide real-time data access
 
 ### Query
 - **Technology**: [Apache DataFusion](https://datafusion.apache.org/) and [Apache Arrow](https://arrow.apache.org/)
