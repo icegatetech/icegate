@@ -1,0 +1,46 @@
+# Query Binary Configuration Example
+#
+# Copy this file to config.query.yaml and adjust the values for your environment.
+
+# Catalog Configuration
+catalog:
+  # Catalog backend options:
+  # - !memory (for testing)
+  # - !rest { uri: "http://localhost:8181" }
+  backend: !rest
+    uri: http://localhost:8181
+  # Warehouse location (root path for data storage)
+  warehouse: s3://warehouse
+  # Additional catalog properties (optional)
+  properties: {}
+
+# Storage Configuration
+storage:
+  # Storage backend options:
+  # - !memory (for testing)
+  # - !filesystem { root_path: "/var/lib/icegate/data" }
+  # - !s3 { bucket: "warehouse", region: "us-east-1", endpoint: "https://..." }
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: https://localhost:9100
+  # Storage properties (optional)
+  properties: {}
+
+# Loki API Server (LogQL queries)
+loki:
+  enabled: true
+  host: 0.0.0.0
+  port: 3100
+
+# Prometheus API Server (PromQL queries)
+prometheus:
+  enabled: true
+  host: 0.0.0.0
+  port: 9090
+
+# Tempo API Server (TraceQL queries)
+tempo:
+  enabled: true
+  host: 0.0.0.0
+  port: 3200

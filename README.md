@@ -30,14 +30,14 @@ The system consists of five core components for handling observability data (met
 - **Purpose**: Organizes the data lake with ACID transaction support
 - **Key Feature**: Custom catalog implementation that doesn't require a dedicated OLTP database while still supporting transactions
 
-### Insert
+### Ingest
 - **Protocol**: [OpenTelemetry](https://opentelemetry.io/)
 - **Purpose**: Accept observability data and persist it in Object Storage
 - **Implementation**: WAL using Parquet files organized in a special way to be compatible with the Storage data layer
 - **Delivery Guarantee**: Exactly-once delivery
 - **Note**: WAL files can be used by the Select layer to provide real-time data access
 
-### Select
+### Query
 - **Technology**: [Apache DataFusion](https://datafusion.apache.org/) and [Apache Arrow](https://arrow.apache.org/)
 - **Purpose**: Query engine for processing logs, metrics, traces, and events
 - **Implementation**: Rust-native query engine built on Apache Arrow, providing a foundation to build query engines using various protocols
@@ -58,7 +58,7 @@ The system consists of five core components for handling observability data (met
     - Event generation and delivery based on rule evaluation
 - **Data Type**: Events are treated as a dedicated data type alongside logs, metrics, and traces
 - **Convention**: Follows [OpenTelemetry Events Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/general/events/)
-- **Implementation**: Leverages the Select layer for querying observability data to evaluate alert rules
+- **Implementation**: Leverages the Query layer for querying observability data to evaluate alert rules
 
 ## Getting Started
 
@@ -129,8 +129,8 @@ cargo build
 cargo build --release
 
 # Build specific binaries
-cargo build --bin select
-cargo build --bin insert
+cargo build --bin query
+cargo build --bin ingest
 ```
 
 Build artifacts will be located in:
@@ -191,8 +191,8 @@ The project includes `.editorconfig` for consistent coding styles across differe
 icegate/
 ├── src/
 │   ├── bin/
-│   │   ├── select.rs    # Select component binary
-│   │   └── insert.rs    # Insert component binary
+│   │   ├── query.rs     # Query component binary
+│   │   └── ingest.rs    # Ingest component binary
 │   └── iceberg/
 │       └── mod.rs       # Iceberg catalog module
 ├── target/              # Build output (generated)
@@ -207,7 +207,7 @@ icegate/
 3. **Test**: `cargo test`
 4. **Format code**: `cargo fmt`
 5. **Run linter**: `cargo clippy`
-6. **Run binaries**: `cargo run --bin select` or `cargo run --bin insert`
+6. **Run binaries**: `cargo run --bin query` or `cargo run --bin ingest`
 
 ### Cargo Build Profiles
 
