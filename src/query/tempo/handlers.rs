@@ -1,6 +1,5 @@
 //! Tempo API request handlers
 
-use super::server::TempoState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -9,6 +8,8 @@ use axum::{
 };
 use serde_json::json;
 
+use super::server::TempoState;
+
 /// Handle get trace by ID request
 ///
 /// # TODO
@@ -16,10 +17,7 @@ use serde_json::json;
 /// - Query Iceberg spans table for all spans with matching `trace_id`
 /// - Reconstruct trace structure from spans
 /// - Format response in Tempo/Jaeger JSON format
-pub async fn get_trace(
-    State(_state): State<TempoState>,
-    Path(_trace_id): Path<String>,
-) -> Response {
+pub async fn get_trace(State(_state): State<TempoState>, Path(_trace_id): Path<String>) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({
@@ -69,10 +67,7 @@ pub async fn search_tags(State(_state): State<TempoState>) -> Response {
 /// - Query Iceberg spans table for distinct values of specified tag
 /// - Filter by time range if provided
 /// - Return list of tag values in Tempo format
-pub async fn tag_values(
-    State(_state): State<TempoState>,
-    Path(_tag_name): Path<String>,
-) -> Response {
+pub async fn tag_values(State(_state): State<TempoState>, Path(_tag_name): Path<String>) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({

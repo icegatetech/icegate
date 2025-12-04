@@ -1,7 +1,6 @@
 //! Top-level LogQL expression types.
 
-use super::log::LogExpr;
-use super::metric::MetricExpr;
+use super::{log::LogExpr, metric::MetricExpr};
 
 /// Top-level `LogQL` expression.
 ///

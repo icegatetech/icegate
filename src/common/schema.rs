@@ -1,21 +1,24 @@
 //! Iceberg schema definitions for OpenTelemetry data structures.
 //!
-//! This module provides Iceberg table schemas for OpenTelemetry logs, spans (traces),
-//! events, and metrics, based on the OpenTelemetry Protocol (OTLP) protobuf definitions.
+//! This module provides Iceberg table schemas for OpenTelemetry logs, spans
+//! (traces), events, and metrics, based on the OpenTelemetry Protocol (OTLP)
+//! protobuf definitions.
 
-use crate::common::errors::SchemaError;
-use crate::common::Result;
-use iceberg::spec::{
-    ListType, MapType, NestedField, PartitionSpec, PrimitiveType, Schema, SortDirection,
-    SortField, SortOrder, StructType, Transform, Type,
-};
 use std::sync::Arc;
+
+use iceberg::spec::{
+    ListType, MapType, NestedField, PartitionSpec, PrimitiveType, Schema, SortDirection, SortField, SortOrder,
+    StructType, Transform, Type,
+};
+
+use crate::common::{errors::SchemaError, Result};
 
 /// Creates the Iceberg schema for `OpenTelemetry` logs.
 ///
-/// Based on the `LogRecord` message from opentelemetry/proto/logs/v1/logs.proto.
-/// Body is simplified from `AnyValue` variant to String type.
-/// Attributes are merged from resource, scope, and log-level attributes into a single Map<String, String>.
+/// Based on the `LogRecord` message from
+/// opentelemetry/proto/logs/v1/logs.proto. Body is simplified from `AnyValue`
+/// variant to String type. Attributes are merged from resource, scope, and
+/// log-level attributes into a single Map<String, String>.
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
@@ -106,11 +109,7 @@ pub fn logs_schema() -> Result<Schema> {
             // Attributes (merged from resource, scope, and log attributes)
             Arc::new(NestedField::required(12, "attributes", attributes_map)),
             // Flags and monitoring
-            Arc::new(NestedField::optional(
-                13,
-                "flags",
-                Type::Primitive(PrimitiveType::Int),
-            )),
+            Arc::new(NestedField::optional(13, "flags", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::required(
                 14,
                 "dropped_attributes_count",
@@ -179,8 +178,10 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// Attributes are merged from resource, scope, and span-level attributes.
 ///
 /// # Nested Structures
-/// - events: `List<Struct>` - Span events (NO `trace_id`/`span_id`, inherits from parent)
-/// - links: `List<Struct>` - Span links (HAS `trace_id`/`span_id`, references linked span)
+/// - events: `List<Struct>` - Span events (NO `trace_id`/`span_id`, inherits
+///   from parent)
+/// - links: `List<Struct>` - Span links (HAS `trace_id`/`span_id`, references
+///   linked span)
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
@@ -194,11 +195,7 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 pub fn spans_schema() -> Result<Schema> {
     // Create Map<String, String> for main attributes (field IDs: 23, 24)
     let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(
-            23,
-            "key",
-            Type::Primitive(PrimitiveType::String),
-        )),
+        Arc::new(NestedField::required(23, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             24,
             "value",
@@ -208,11 +205,7 @@ pub fn spans_schema() -> Result<Schema> {
 
     // Create Map<String, String> for event attributes (field IDs: 25, 26)
     let event_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(
-            25,
-            "key",
-            Type::Primitive(PrimitiveType::String),
-        )),
+        Arc::new(NestedField::required(25, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             26,
             "value",
@@ -222,11 +215,7 @@ pub fn spans_schema() -> Result<Schema> {
 
     // Create Map<String, String> for link attributes (field IDs: 27, 28)
     let link_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(
-            27,
-            "key",
-            Type::Primitive(PrimitiveType::String),
-        )),
+        Arc::new(NestedField::required(27, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             28,
             "value",
@@ -277,11 +266,7 @@ pub fn spans_schema() -> Result<Schema> {
             "dropped_attributes_count",
             Type::Primitive(PrimitiveType::Int),
         )),
-        Arc::new(NestedField::optional(
-            38,
-            "flags",
-            Type::Primitive(PrimitiveType::Int),
-        )),
+        Arc::new(NestedField::optional(38, "flags", Type::Primitive(PrimitiveType::Int))),
     ]));
 
     let schema = Schema::builder()
@@ -346,11 +331,7 @@ pub fn spans_schema() -> Result<Schema> {
                 "name",
                 Type::Primitive(PrimitiveType::String),
             )),
-            Arc::new(NestedField::optional(
-                12,
-                "kind",
-                Type::Primitive(PrimitiveType::Int),
-            )),
+            Arc::new(NestedField::optional(12, "kind", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::optional(
                 13,
                 "status_code",
@@ -364,11 +345,7 @@ pub fn spans_schema() -> Result<Schema> {
             // Attributes (merged from resource, scope, and span attributes)
             Arc::new(NestedField::required(15, "attributes", attributes_map)),
             // Flags and monitoring
-            Arc::new(NestedField::optional(
-                16,
-                "flags",
-                Type::Primitive(PrimitiveType::Int),
-            )),
+            Arc::new(NestedField::optional(16, "flags", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::optional(
                 17,
                 "dropped_attributes_count",
@@ -476,11 +453,7 @@ pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
 pub fn events_schema() -> Result<Schema> {
     // Create Map<String, String> for attributes (field IDs: 12, 13)
     let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(
-            12,
-            "key",
-            Type::Primitive(PrimitiveType::String),
-        )),
+        Arc::new(NestedField::required(12, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             13,
             "value",
@@ -605,8 +578,9 @@ pub fn events_sort_order(schema: &Schema) -> Result<SortOrder> {
 
 /// Creates the Iceberg schema for `OpenTelemetry` metrics.
 ///
-/// Based on the `Metric` and `DataPoint` messages from opentelemetry/proto/metrics/v1/metrics.proto.
-/// This schema combines all metric types (gauge, sum, histogram, `exponential_histogram`, summary)
+/// Based on the `Metric` and `DataPoint` messages from
+/// opentelemetry/proto/metrics/v1/metrics.proto. This schema combines all
+/// metric types (gauge, sum, histogram, `exponential_histogram`, summary)
 /// into a single table with optional fields for type-specific data.
 ///
 /// # Partitioning
@@ -622,11 +596,7 @@ pub fn events_sort_order(schema: &Schema) -> Result<SortOrder> {
 pub fn metrics_schema() -> Result<Schema> {
     // Create Map<String, String> for main attributes (field IDs: 32, 33)
     let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(
-            32,
-            "key",
-            Type::Primitive(PrimitiveType::String),
-        )),
+        Arc::new(NestedField::required(32, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             33,
             "value",
@@ -636,11 +606,7 @@ pub fn metrics_schema() -> Result<Schema> {
 
     // Create Map<String, String> for exemplar attributes (field IDs: 34, 35)
     let exemplar_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(
-            34,
-            "key",
-            Type::Primitive(PrimitiveType::String),
-        )),
+        Arc::new(NestedField::required(34, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             35,
             "value",
@@ -773,26 +739,10 @@ pub fn metrics_schema() -> Result<Schema> {
                 Type::Primitive(PrimitiveType::Long),
             )),
             // Common histogram fields (for histogram, exponential_histogram, and summary)
-            Arc::new(NestedField::optional(
-                16,
-                "count",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                17,
-                "sum",
-                Type::Primitive(PrimitiveType::Double),
-            )),
-            Arc::new(NestedField::optional(
-                18,
-                "min",
-                Type::Primitive(PrimitiveType::Double),
-            )),
-            Arc::new(NestedField::optional(
-                19,
-                "max",
-                Type::Primitive(PrimitiveType::Double),
-            )),
+            Arc::new(NestedField::optional(16, "count", Type::Primitive(PrimitiveType::Long))),
+            Arc::new(NestedField::optional(17, "sum", Type::Primitive(PrimitiveType::Double))),
+            Arc::new(NestedField::optional(18, "min", Type::Primitive(PrimitiveType::Double))),
+            Arc::new(NestedField::optional(19, "max", Type::Primitive(PrimitiveType::Double))),
             // Standard histogram fields
             Arc::new(NestedField::optional(
                 20,
@@ -813,11 +763,7 @@ pub fn metrics_schema() -> Result<Schema> {
                 )))),
             )),
             // Exponential histogram fields
-            Arc::new(NestedField::optional(
-                22,
-                "scale",
-                Type::Primitive(PrimitiveType::Int),
-            )),
+            Arc::new(NestedField::optional(22, "scale", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::optional(
                 23,
                 "zero_count",
@@ -867,11 +813,7 @@ pub fn metrics_schema() -> Result<Schema> {
                 )))),
             )),
             // Flags and exemplars
-            Arc::new(NestedField::optional(
-                30,
-                "flags",
-                Type::Primitive(PrimitiveType::Int),
-            )),
+            Arc::new(NestedField::optional(30, "flags", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::optional(
                 31,
                 "exemplars",

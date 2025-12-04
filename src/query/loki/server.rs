@@ -1,7 +1,6 @@
 //! Loki HTTP server implementation
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use tokio_util::sync::CancellationToken;
 
@@ -27,7 +26,9 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = LokiState { engine };
+    let state = LokiState {
+        engine,
+    };
 
     let app = super::routes::routes(state);
 

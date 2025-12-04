@@ -1,6 +1,5 @@
 //! OTLP HTTP request handlers
 
-use super::server::OtlpHttpState;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -8,6 +7,8 @@ use axum::{
     Json,
 };
 use serde_json::json;
+
+use super::server::OtlpHttpState;
 
 /// Handle OTLP logs ingestion
 ///

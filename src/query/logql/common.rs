@@ -10,12 +10,16 @@ pub struct Duration {
 impl Duration {
     /// Create a new `Duration` from nanoseconds.
     pub const fn from_nanos(nanos: i64) -> Self {
-        Self { nanos }
+        Self {
+            nanos,
+        }
     }
 
     /// Create a new `Duration` from microseconds.
     pub const fn from_micros(micros: i64) -> Self {
-        Self { nanos: micros * 1_000 }
+        Self {
+            nanos: micros * 1_000,
+        }
     }
 
     /// Create a new `Duration` from milliseconds.
@@ -151,7 +155,9 @@ pub struct GroupingLabel {
 impl GroupingLabel {
     /// Create a new `GroupingLabel`.
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+        }
     }
 }
 

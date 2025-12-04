@@ -1,6 +1,5 @@
 //! Prometheus API request handlers
 
-use super::server::PrometheusState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -8,6 +7,8 @@ use axum::{
     Json,
 };
 use serde_json::json;
+
+use super::server::PrometheusState;
 
 /// Handle instant query requests
 ///
@@ -85,10 +86,7 @@ pub async fn labels(State(_state): State<PrometheusState>) -> Response {
 /// - Query Iceberg metrics table for distinct values of specified label
 /// - Filter by time range and series matchers if provided
 /// - Return list of label values in Prometheus format
-pub async fn label_values(
-    State(_state): State<PrometheusState>,
-    Path(_label_name): Path<String>,
-) -> Response {
+pub async fn label_values(State(_state): State<PrometheusState>, Path(_label_name): Path<String>) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({

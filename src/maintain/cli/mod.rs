@@ -60,7 +60,9 @@ impl Cli {
     /// Returns an error if the command execution fails
     pub async fn execute(self) -> Result<(), IceGateError> {
         match self.command {
-            Commands::Migrate { command } => commands::migrate::execute(command).await,
+            Commands::Migrate {
+                command,
+            } => commands::migrate::execute(command).await,
         }
     }
 }

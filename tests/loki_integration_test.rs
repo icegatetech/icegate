@@ -1,34 +1,51 @@
-//! Integration tests for Loki API with LogQL support
-#![allow(clippy::unwrap_used, clippy::expect_used)] // Test code can use unwrap/expect
+//! Integration tests for Loki API with `LogQL` support
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::uninlined_format_args,
+    clippy::cast_possible_truncation
+)] // Test code can use unwrap/expect and println
 
-use datafusion::arrow::array::{ArrayRef, FixedSizeBinaryBuilder, Int32Array, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray};
-use datafusion::arrow::datatypes::DataType;
-use datafusion::parquet::file::properties::WriterProperties;
-use iceberg::spec::DataFileFormat;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+use std::sync::Arc;
+
+use datafusion::{
+    arrow::{
+        array::{
+            ArrayRef, FixedSizeBinaryBuilder, Int32Array, MapBuilder, MapFieldNames, RecordBatch, StringArray,
+            StringBuilder, TimestampMicrosecondArray,
+        },
+        datatypes::DataType,
+    },
+    parquet::file::properties::WriterProperties,
 };
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::table::Table;
-use iceberg::Catalog;
-use icegate::common::catalog::CatalogBuilder;
-use icegate::common::schema;
-use icegate::common::{CatalogConfig, CatalogBackend, ICEGATE_NAMESPACE, LOGS_TABLE};
-use icegate::query::engine::{QueryEngine, QueryEngineConfig};
-use icegate::query::loki::LokiConfig;
+use iceberg::{
+    spec::DataFileFormat,
+    table::Table,
+    transaction::{ApplyTransactionAction, Transaction},
+    writer::{
+        base_writer::data_file_writer::DataFileWriterBuilder,
+        file_writer::{
+            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            ParquetWriterBuilder,
+        },
+        IcebergWriter, IcebergWriterBuilder,
+    },
+    Catalog,
+};
+use icegate::{
+    common::{catalog::CatalogBuilder, schema, CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE},
+    query::{
+        engine::{QueryEngine, QueryEngineConfig},
+        loki::LokiConfig,
+    },
+};
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::Arc;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 /// Helper function to write test log data to an Iceberg table.
-async fn write_test_logs(
-    table: &Table,
-    catalog: &Arc<dyn Catalog>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Result<(), Box<dyn std::error::Error>> {
     let now_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -37,10 +54,24 @@ async fn write_test_logs(
     // Build arrays for the logs schema
     let tenant_id: ArrayRef = Arc::new(StringArray::from(vec!["test-tenant", "test-tenant", "test-tenant"]));
     let account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
-    let service_name: ArrayRef = Arc::new(StringArray::from(vec![Some("frontend"), Some("frontend"), Some("backend")]));
-    let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![now_micros, now_micros - 1000, now_micros - 2000]));
-    let observed_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![now_micros, now_micros - 1000, now_micros - 2000]));
-    let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![now_micros, now_micros, now_micros]));
+    let service_name: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("frontend"),
+        Some("frontend"),
+        Some("backend"),
+    ]));
+    let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros,
+        now_micros - 1000,
+        now_micros - 2000,
+    ]));
+    let observed_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros,
+        now_micros - 1000,
+        now_micros - 2000,
+    ]));
+    let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros, now_micros, now_micros,
+    ]));
     let severity_number: ArrayRef = Arc::new(Int32Array::from(vec![Some(9), Some(9), Some(13)]));
     let severity_text: ArrayRef = Arc::new(StringArray::from(vec![Some("INFO"), Some("INFO"), Some("WARN")]));
     let body: ArrayRef = Arc::new(StringArray::from(vec![
@@ -52,9 +83,12 @@ async fn write_test_logs(
     let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![0, 0, 0]));
 
     // Create RecordBatch with Arrow schema from Iceberg schema
-    let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())?);
+    let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
+        table.metadata().current_schema(),
+    )?);
 
-    // Extract key and value field definitions from Iceberg schema (preserving metadata)
+    // Extract key and value field definitions from Iceberg schema (preserving
+    // metadata)
     let attributes_field = arrow_schema.field(11); // attributes is at index 11
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
@@ -98,12 +132,15 @@ async fn write_test_logs(
 
     // Build trace_id array (16 bytes for W3C trace ID)
     let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    trace_id_builder.append_value([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                   0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10])?;
-    trace_id_builder.append_value([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-                                   0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20])?;
-    trace_id_builder.append_value([0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
-                                   0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30])?;
+    trace_id_builder.append_value([
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    ])?;
+    trace_id_builder.append_value([
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    ])?;
+    trace_id_builder.append_value([
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+    ])?;
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
     // Build span_id array (8 bytes for W3C span ID)
@@ -113,25 +150,22 @@ async fn write_test_logs(
     span_id_builder.append_value([0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28])?;
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
-    let batch = RecordBatch::try_new(
-        arrow_schema.clone(),
-        vec![
-            tenant_id,
-            account_id,
-            service_name,
-            timestamp,
-            observed_timestamp,
-            ingested_timestamp,
-            trace_id,
-            span_id,
-            severity_number,
-            severity_text,
-            body,
-            attributes,
-            flags,
-            dropped_attributes_count,
-        ],
-    )?;
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        tenant_id,
+        account_id,
+        service_name,
+        timestamp,
+        observed_timestamp,
+        ingested_timestamp,
+        trace_id,
+        span_id,
+        severity_number,
+        severity_text,
+        body,
+        attributes,
+        flags,
+        dropped_attributes_count,
+    ])?;
 
     // Create writers and write data
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
@@ -173,7 +207,7 @@ async fn test_loki_query_range_endpoint() -> Result<(), Box<dyn std::error::Erro
     let catalog_config = CatalogConfig {
         backend: CatalogBackend::Memory,
         warehouse: warehouse_str.clone(),
-        properties: Default::default(),
+        properties: std::collections::HashMap::default(),
     };
 
     let loki_config = LokiConfig {
@@ -222,13 +256,9 @@ async fn test_loki_query_range_endpoint() -> Result<(), Box<dyn std::error::Erro
     let server_engine = Arc::clone(&query_engine);
 
     let server_handle = tokio::spawn(async move {
-        icegate::query::loki::run(
-            server_engine,
-            server_loki_config,
-            cancel_token_clone,
-        )
-        .await
-        .unwrap();
+        icegate::query::loki::run(server_engine, server_loki_config, cancel_token_clone)
+            .await
+            .unwrap();
     });
 
     // Wait for server to start
@@ -259,19 +289,31 @@ async fn test_loki_query_range_endpoint() -> Result<(), Box<dyn std::error::Erro
     let stream = &result[0];
     assert!(stream["stream"].is_object(), "stream should have labels");
     assert!(stream["values"].is_array(), "stream should have values");
-    assert!(!stream["values"].as_array().unwrap().is_empty(), "stream should be non-empty");
+    assert!(
+        !stream["values"].as_array().unwrap().is_empty(),
+        "stream should be non-empty"
+    );
 
     // Verify attributes are present in stream labels
     let labels = &stream["stream"];
-    assert_eq!(labels["service_name"], "frontend", "service_name label should be present");
+    assert_eq!(
+        labels["service_name"], "frontend",
+        "service_name label should be present"
+    );
     // Check that at least one of our test attributes is present
-    let has_attributes =
-        labels["user_id"].is_string() && labels["request_id"].is_string()
+    let has_attributes = labels["user_id"].is_string() && labels["request_id"].is_string()
         || labels["latency_ms"].is_string() && labels["page"].is_string();
-    assert!(has_attributes, "stream should contain attributes from test data, got: {}", labels);
+    assert!(
+        has_attributes,
+        "stream should contain attributes from test data, got: {}",
+        labels
+    );
 
     // Verify stats structure is present
-    assert!(body["data"]["stats"]["summary"]["execTime"].is_number(), "execTime should be present");
+    assert!(
+        body["data"]["stats"]["summary"]["execTime"].is_number(),
+        "execTime should be present"
+    );
     assert!(
         body["data"]["stats"]["summary"]["totalLinesProcessed"].as_u64().unwrap_or(0) > 0,
         "totalLinesProcessed should be > 0"
@@ -293,7 +335,7 @@ async fn test_loki_explain_endpoint() -> Result<(), Box<dyn std::error::Error>> 
     let catalog_config = CatalogConfig {
         backend: CatalogBackend::Memory,
         warehouse: warehouse_str.clone(),
-        properties: Default::default(),
+        properties: std::collections::HashMap::default(),
     };
 
     let loki_config = LokiConfig {
@@ -342,13 +384,9 @@ async fn test_loki_explain_endpoint() -> Result<(), Box<dyn std::error::Error>> 
     let server_engine = Arc::clone(&query_engine);
 
     let server_handle = tokio::spawn(async move {
-        icegate::query::loki::run(
-            server_engine,
-            server_loki_config,
-            cancel_token_clone,
-        )
-        .await
-        .unwrap();
+        icegate::query::loki::run(server_engine, server_loki_config, cancel_token_clone)
+            .await
+            .unwrap();
     });
 
     // Wait for server to start
@@ -374,8 +412,14 @@ async fn test_loki_explain_endpoint() -> Result<(), Box<dyn std::error::Error>> 
     // Verify plan structure
     assert!(body["plans"].is_object(), "plans should be an object");
     assert!(body["plans"]["logical"].is_string(), "logical plan should be a string");
-    assert!(body["plans"]["optimized"].is_string(), "optimized plan should be a string");
-    assert!(body["plans"]["physical"].is_string(), "physical plan should be a string");
+    assert!(
+        body["plans"]["optimized"].is_string(),
+        "optimized plan should be a string"
+    );
+    assert!(
+        body["plans"]["physical"].is_string(),
+        "physical plan should be a string"
+    );
 
     // Verify plans contain expected content
     let logical = body["plans"]["logical"].as_str().unwrap();
@@ -383,8 +427,8 @@ async fn test_loki_explain_endpoint() -> Result<(), Box<dyn std::error::Error>> 
     let physical = body["plans"]["physical"].as_str().unwrap();
 
     assert!(logical.contains("Filter"), "logical plan should contain Filter");
-    assert!(optimized.len() > 0, "optimized plan should not be empty");
-    assert!(physical.len() > 0, "physical plan should not be empty");
+    assert!(!optimized.is_empty(), "optimized plan should not be empty");
+    assert!(!physical.is_empty(), "physical plan should not be empty");
 
     // 7. Test explain endpoint with complex query (line filter)
     let resp = client
@@ -402,8 +446,11 @@ async fn test_loki_explain_endpoint() -> Result<(), Box<dyn std::error::Error>> 
 
     let logical = body["plans"]["logical"].as_str().unwrap();
     let optimized = body["plans"]["optimized"].as_str().unwrap();
-    assert!(logical.contains("contains"), "logical plan should contain 'contains' for line filter");
-    assert!(optimized.len() > 0, "optimized plan should not be empty");
+    assert!(
+        logical.contains("contains"),
+        "logical plan should contain 'contains' for line filter"
+    );
+    assert!(!optimized.is_empty(), "optimized plan should not be empty");
 
     // 8. Test explain endpoint with invalid query
     let resp = client

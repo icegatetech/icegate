@@ -1,12 +1,15 @@
 //! Catalog builder factory
 
-use super::{CatalogConfig, CatalogBackend};
-use crate::common::Result;
-use iceberg::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
-use iceberg::{Catalog, CatalogBuilder as IcebergCatalogBuilder};
+use std::{collections::HashMap, sync::Arc};
+
+use iceberg::{
+    memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE},
+    Catalog, CatalogBuilder as IcebergCatalogBuilder,
+};
 use iceberg_catalog_rest::RestCatalogBuilder;
-use std::collections::HashMap;
-use std::sync::Arc;
+
+use super::{CatalogBackend, CatalogConfig};
+use crate::common::Result;
 
 /// Factory for creating catalog instances from configuration
 pub struct CatalogBuilder;
@@ -20,7 +23,9 @@ impl CatalogBuilder {
     pub async fn from_config(config: &CatalogConfig) -> Result<Arc<dyn Catalog>> {
         match &config.backend {
             CatalogBackend::Memory => Self::create_memory_catalog(config).await,
-            CatalogBackend::Rest { uri } => Self::create_rest_catalog(config, uri).await,
+            CatalogBackend::Rest {
+                uri,
+            } => Self::create_rest_catalog(config, uri).await,
         }
     }
 
@@ -34,9 +39,7 @@ impl CatalogBuilder {
             properties.insert(key.clone(), value.clone());
         }
 
-        let catalog = MemoryCatalogBuilder::default()
-            .load("icegate", properties)
-            .await?;
+        let catalog = MemoryCatalogBuilder::default().load("icegate", properties).await?;
 
         tracing::info!(
             warehouse = %config.warehouse,

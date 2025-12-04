@@ -22,25 +22,22 @@ mod logqlparserlistener;
 mod logqlparservisitor;
 pub(crate) mod visitors;
 
+use std::sync::{Arc, Mutex};
+
+use antlr4rust::{
+    common_token_stream::CommonTokenStream, error_listener::ErrorListener, errors::ANTLRError,
+    input_stream::InputStream, recognizer::Recognizer, tree::ParseTreeVisitorCompat, Parser as AntlrParserTrait,
+};
 pub use logqllexer::LogQLLexer;
 pub use logqlparser::*;
 pub use logqlparservisitor::*;
-
-use antlr4rust::Parser as AntlrParserTrait;
-use antlr4rust::common_token_stream::CommonTokenStream;
-use antlr4rust::error_listener::ErrorListener;
-use antlr4rust::errors::ANTLRError;
-use antlr4rust::input_stream::InputStream;
-use antlr4rust::recognizer::Recognizer;
-use antlr4rust::tree::ParseTreeVisitorCompat;
-
-use super::expr::LogQLExpr;
-use super::parser::Parser;
-use crate::common::errors::{IceGateError, ParseError};
-use crate::common::Result;
 use visitors::LogQLExprVisitor;
 
-use std::sync::{Arc, Mutex};
+use super::{expr::LogQLExpr, parser::Parser};
+use crate::common::{
+    errors::{IceGateError, ParseError},
+    Result,
+};
 
 /// Error listener that collects parsing errors.
 #[derive(Debug, Clone)]
@@ -56,10 +53,7 @@ impl CollectingErrorListener {
     }
 
     fn get_errors(&self) -> Vec<ParseError> {
-        self.errors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
@@ -93,9 +87,7 @@ impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectingErrorListener {
 /// # Examples
 ///
 /// ```
-/// use icegate::query::logql::antlr::AntlrParser;
-/// use icegate::query::logql::MatchOp;
-/// use icegate::query::logql::parser::Parser;
+/// use icegate::query::logql::{antlr::AntlrParser, parser::Parser, MatchOp};
 ///
 /// let parser = AntlrParser::new();
 /// let expr = parser.parse(r#"{job="mysql"} |= "error""#).unwrap();

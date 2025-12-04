@@ -1,8 +1,11 @@
 //! Tempo API routes
 
-use super::handlers;
-use super::server::TempoState;
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
+
+use super::{handlers, server::TempoState};
 
 /// Create Tempo API router
 pub fn routes(state: TempoState) -> Router {

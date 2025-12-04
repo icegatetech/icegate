@@ -1,6 +1,7 @@
 //! OTLP gRPC server module
 //!
-//! Provides OpenTelemetry Protocol gRPC endpoint for ingesting logs, traces, and metrics.
+//! Provides OpenTelemetry Protocol gRPC endpoint for ingesting logs, traces,
+//! and metrics.
 //!
 //! # TODO
 //! - Add opentelemetry-proto dependency for OTLP protobuf definitions

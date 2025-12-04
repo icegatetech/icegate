@@ -6,4 +6,4 @@ mod builder;
 mod config;
 
 pub use builder::CatalogBuilder;
-pub use config::{CatalogConfig, CatalogBackend};
+pub use config::{CatalogBackend, CatalogConfig};

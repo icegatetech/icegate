@@ -1,8 +1,11 @@
 //! OTLP HTTP API routes
 
-use super::handlers;
-use super::server::OtlpHttpState;
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
+
+use super::{handlers, server::OtlpHttpState};
 
 /// Create OTLP HTTP API router
 pub fn routes(state: OtlpHttpState) -> Router {

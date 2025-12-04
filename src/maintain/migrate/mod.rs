@@ -1,6 +1,7 @@
 //! Migration module for Iceberg schema management
 //!
-//! Handles creation and evolution of Iceberg table schemas for observability data.
+//! Handles creation and evolution of Iceberg table schemas for observability
+//! data.
 //!
 //! # TODO
 //! - Implement table creation operations

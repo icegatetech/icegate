@@ -1,24 +1,24 @@
 //! Query execution engine with cached catalog provider
 //!
 //! The `QueryEngine` provides pre-configured `SessionContext` instances with
-//! the Iceberg catalog already registered. It caches the `IcebergCatalogProvider`
-//! to avoid the 50-500ms network round-trip on every query.
+//! the Iceberg catalog already registered. It caches the
+//! `IcebergCatalogProvider` to avoid the 50-500ms network round-trip on every
+//! query.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use datafusion::catalog::CatalogProvider;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::{
+    catalog::CatalogProvider,
+    execution::SessionStateBuilder,
+    prelude::{SessionConfig, SessionContext},
+};
+use iceberg::Catalog;
 use iceberg_datafusion::IcebergCatalogProvider;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use iceberg::Catalog;
-use crate::common::errors::IceGateError;
-use crate::common::Result;
-
 use super::QueryEngineConfig;
+use crate::common::{errors::IceGateError, Result};
 
 /// Cached `IcebergCatalogProvider` with thread-safe access
 struct CachedProvider {
@@ -28,8 +28,9 @@ struct CachedProvider {
 /// Query execution engine with cached catalog provider
 ///
 /// `QueryEngine` provides pre-configured `SessionContext` instances with
-/// the Iceberg catalog already registered. It caches the `IcebergCatalogProvider`
-/// to avoid the 50-500ms network round-trip on every query.
+/// the Iceberg catalog already registered. It caches the
+/// `IcebergCatalogProvider` to avoid the 50-500ms network round-trip on every
+/// query.
 ///
 /// # Usage
 ///
@@ -54,8 +55,8 @@ pub struct QueryEngine {
 impl QueryEngine {
     /// Create a new `QueryEngine`
     ///
-    /// Initializes the catalog provider cache. The provider is created immediately
-    /// to ensure the engine is ready to serve queries.
+    /// Initializes the catalog provider cache. The provider is created
+    /// immediately to ensure the engine is ready to serve queries.
     ///
     /// # Errors
     ///
@@ -76,8 +77,8 @@ impl QueryEngine {
     /// Create a new `SessionContext` with the Iceberg catalog registered
     ///
     /// This is the primary method handlers should use. Each call creates
-    /// a fresh `SessionContext` (required by `DataFusion` for concurrent queries)
-    /// but reuses the cached `IcebergCatalogProvider`.
+    /// a fresh `SessionContext` (required by `DataFusion` for concurrent
+    /// queries) but reuses the cached `IcebergCatalogProvider`.
     ///
     /// # Errors
     ///
@@ -121,9 +122,7 @@ impl QueryEngine {
     pub async fn refresh_provider(&self) -> Result<()> {
         let provider = IcebergCatalogProvider::try_new(Arc::clone(&self.catalog))
             .await
-            .map_err(|e| {
-                IceGateError::Config(format!("Failed to create IcebergCatalogProvider: {e}"))
-            })?;
+            .map_err(|e| IceGateError::Config(format!("Failed to create IcebergCatalogProvider: {e}")))?;
 
         {
             let mut guard = self.cached_provider.write().await;

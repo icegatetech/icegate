@@ -7,15 +7,14 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::{CatalogConfig, StorageConfig, check_port_conflicts, load_config_file};
-
-use super::otlp_grpc::OtlpGrpcConfig;
-use super::otlp_http::OtlpHttpConfig;
+use super::{otlp_grpc::OtlpGrpcConfig, otlp_http::OtlpHttpConfig};
+use crate::common::{check_port_conflicts, load_config_file, CatalogConfig, StorageConfig};
 
 /// Ingest binary configuration
 ///
-/// Root configuration struct for the ingest binary. Contains catalog and storage
-/// configuration shared across all ingest servers, plus individual server configs.
+/// Root configuration struct for the ingest binary. Contains catalog and
+/// storage configuration shared across all ingest servers, plus individual
+/// server configs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestConfig {
     /// Iceberg catalog configuration

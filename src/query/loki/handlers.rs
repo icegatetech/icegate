@@ -1,25 +1,22 @@
 //! Loki API request handlers
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use chrono::{DateTime, Duration, Utc};
-use datafusion::arrow::array::{Array, MapArray, RecordBatch, StringArray, TimestampMicrosecondArray};
-use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::{
+    array::{Array, MapArray, RecordBatch, StringArray, TimestampMicrosecondArray},
+    datatypes::Schema,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 
 use super::server::LokiState;
-use crate::query::logql::antlr::AntlrParser;
-use crate::query::logql::datafusion::DataFusionPlanner;
-use crate::query::logql::planner::QueryContext;
-use crate::query::logql::{Parser, Planner};
+use crate::query::logql::{antlr::AntlrParser, datafusion::DataFusionPlanner, planner::QueryContext, Parser, Planner};
 
 /// HTTP header for tenant identification (Grafana/Loki standard).
 const TENANT_HEADER: &str = "x-scope-orgid";
@@ -60,8 +57,9 @@ pub struct ExplainQueryParams {
 
 /// Handle explain query requests
 ///
-/// This endpoint accepts `query_range` parameters and returns the full execution plan
-/// including logical, optimized logical, and physical plans after `LogQL` transpilation.
+/// This endpoint accepts `query_range` parameters and returns the full
+/// execution plan including logical, optimized logical, and physical plans
+/// after `LogQL` transpilation.
 ///
 /// # Returns
 /// JSON response with:
@@ -176,7 +174,10 @@ pub async fn explain_query(
     // 6. Format plans as strings
     let logical_str = format!("{}", logical_plan.display_indent());
     let optimized_str = format!("{}", optimized_plan.display_indent());
-    let physical_str = format!("{}", datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true));
+    let physical_str = format!(
+        "{}",
+        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+    );
 
     (
         StatusCode::OK,
@@ -275,7 +276,8 @@ async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQ
         },
     };
 
-    // 2. Create SessionContext from QueryEngine (uses cached IcebergCatalogProvider)
+    // 2. Create SessionContext from QueryEngine (uses cached
+    //    IcebergCatalogProvider)
     let ctx = match loki_state.engine.create_session().await {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -339,9 +341,17 @@ async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQ
     let (streams, stats) = batches_to_loki_streams(&batches);
     let exec_time = exec_start.elapsed().as_secs_f64();
 
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let bytes_per_sec = if exec_time > 0.0 { (stats.total_bytes as f64 / exec_time) as u64 } else { 0 };
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let lines_per_sec = if exec_time > 0.0 { (stats.total_lines as f64 / exec_time) as u64 } else { 0 };
 
     (
@@ -403,7 +413,8 @@ struct StringInterner {
 }
 
 impl StringInterner {
-    /// Create a new interner with pre-allocated capacity for typical label sets.
+    /// Create a new interner with pre-allocated capacity for typical label
+    /// sets.
     fn new() -> Self {
         Self {
             strings: HashMap::with_capacity(256),
@@ -459,7 +470,8 @@ fn extract_timestamp(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> i6
                     if arr.is_null(row) {
                         None
                     } else {
-                        Some(arr.value(row) * 1000) // microseconds to nanoseconds
+                        Some(arr.value(row) * 1000) // microseconds to
+                                                    // nanoseconds
                     }
                 })
         })
@@ -470,18 +482,22 @@ fn extract_timestamp(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> i6
 fn extract_body(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> String {
     cols.body
         .and_then(|idx| {
-            batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .and_then(|arr| if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) })
+            batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    Some(arr.value(row).to_string())
+                }
+            })
         })
         .unwrap_or_default()
 }
 
-/// Extract labels from `service_name`, `severity_text`, and `attributes` columns.
+/// Extract labels from `service_name`, `severity_text`, and `attributes`
+/// columns.
 ///
-/// Uses string interning to deduplicate repeated label names/values across rows.
+/// Uses string interning to deduplicate repeated label names/values across
+/// rows.
 fn extract_labels(
     batch: &RecordBatch,
     cols: &BatchColumns,
@@ -555,18 +571,15 @@ fn make_stream_key_into(labels: &HashMap<Arc<str>, Arc<str>>, buffer: &mut Strin
 
 /// Convert grouped streams to Loki JSON format.
 ///
-/// Accepts `Arc<str>` labels and converts them to owned strings for JSON serialization.
-fn streams_to_json(
-    streams: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(String, String)>)>,
-) -> JsonValue {
+/// Accepts `Arc<str>` labels and converts them to owned strings for JSON
+/// serialization.
+fn streams_to_json(streams: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(String, String)>)>) -> JsonValue {
     let result: Vec<JsonValue> = streams
         .into_values()
         .map(|(labels, values)| {
             // Convert Arc<str> labels to HashMap<String, String> for JSON
-            let labels_map: HashMap<String, String> = labels
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
+            let labels_map: HashMap<String, String> =
+                labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
             json!({
                 "stream": labels_map,
                 "values": values.into_iter().map(|(ts, line)| json!([ts, line])).collect::<Vec<_>>()
@@ -589,7 +602,8 @@ fn streams_to_json(
 /// ]
 /// ```
 ///
-/// Groups log entries by their labels (`service_name`, `severity_text`, and attributes).
+/// Groups log entries by their labels (`service_name`, `severity_text`, and
+/// attributes).
 ///
 /// # Performance
 ///
@@ -599,8 +613,7 @@ fn streams_to_json(
 /// - `itoa` for fast integer-to-string conversion
 fn batches_to_loki_streams(batches: &[RecordBatch]) -> (JsonValue, QueryStats) {
     // Pre-allocate collections for typical query results
-    let mut streams: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(String, String)>)> =
-        HashMap::with_capacity(64);
+    let mut streams: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(String, String)>)> = HashMap::with_capacity(64);
     let mut interner = StringInterner::new();
     let mut key_buffer = String::with_capacity(256);
     let mut total_bytes: usize = 0;
@@ -631,7 +644,10 @@ fn batches_to_loki_streams(batches: &[RecordBatch]) -> (JsonValue, QueryStats) {
         }
     }
 
-    (streams_to_json(streams), QueryStats { total_bytes, total_lines })
+    (streams_to_json(streams), QueryStats {
+        total_bytes,
+        total_lines,
+    })
 }
 
 fn parse_time(s: &str) -> DateTime<Utc> {

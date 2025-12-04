@@ -1,13 +1,15 @@
 //! Query engine configuration
 //!
-//! Configuration for the shared `QueryEngine` that manages `DataFusion` session creation
-//! and caches the `IcebergCatalogProvider` to avoid per-query metadata fetches.
+//! Configuration for the shared `QueryEngine` that manages `DataFusion` session
+//! creation and caches the `IcebergCatalogProvider` to avoid per-query metadata
+//! fetches.
 
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the `QueryEngine`
 ///
-/// Controls `DataFusion` session parameters and catalog provider caching behavior.
+/// Controls `DataFusion` session parameters and catalog provider caching
+/// behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryEngineConfig {
     /// `DataFusion` batch size for query execution

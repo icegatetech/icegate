@@ -1,7 +1,7 @@
 //! Common configuration utilities.
 //!
-//! Provides shared traits and functions for configuration loading and validation
-//! to reduce duplication across query and ingest binaries.
+//! Provides shared traits and functions for configuration loading and
+//! validation to reduce duplication across query and ingest binaries.
 
 use std::path::Path;
 
@@ -27,7 +27,8 @@ pub trait ServerConfig {
 ///
 /// # Errors
 ///
-/// Returns an error if two or more enabled servers are configured to use the same port.
+/// Returns an error if two or more enabled servers are configured to use the
+/// same port.
 pub fn check_port_conflicts(servers: &[&dyn ServerConfig]) -> Result<(), Box<dyn std::error::Error>> {
     let enabled: Vec<_> = servers.iter().filter(|s| s.enabled()).collect();
 
@@ -69,6 +70,6 @@ pub fn load_config_file<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn s
             toml::from_str(&content)
                 .or_else(|_| serde_yaml::from_str(&content))
                 .map_err(|e| format!("Failed to parse config: {e}").into())
-        }
+        },
     }
 }

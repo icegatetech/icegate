@@ -1,7 +1,9 @@
 //! Metric query expression types for LogQL.
 
-use super::common::{Duration, Grouping};
-use super::log::{LogExpr, UnwrapExpr};
+use super::{
+    common::{Duration, Grouping},
+    log::{LogExpr, UnwrapExpr},
+};
 
 /// Metric query expression.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,7 +26,8 @@ pub enum MetricExpr {
     VectorAggregation(VectorAggregation),
     /// Literal number: `42`, `3.14`
     Literal(f64),
-    /// Label replace function: `label_replace(expr, dst, replacement, src, regex)`
+    /// Label replace function: `label_replace(expr, dst, replacement, src,
+    /// regex)`
     LabelReplace {
         /// Source expression
         expr: Box<MetricExpr>,
@@ -167,10 +170,7 @@ impl BinaryOp {
     /// Returns true if the operator is a comparison.
     #[must_use]
     pub const fn is_comparison(&self) -> bool {
-        matches!(
-            self,
-            Self::Eq | Self::Neq | Self::Gt | Self::Ge | Self::Lt | Self::Le
-        )
+        matches!(self, Self::Eq | Self::Neq | Self::Gt | Self::Ge | Self::Lt | Self::Le)
     }
 
     /// Returns true if the operator is logical.
@@ -343,11 +343,7 @@ impl RangeAggregationOp {
     pub const fn requires_unwrap(&self) -> bool {
         !matches!(
             self,
-            Self::CountOverTime
-                | Self::Rate
-                | Self::BytesOverTime
-                | Self::BytesRate
-                | Self::AbsentOverTime
+            Self::CountOverTime | Self::Rate | Self::BytesOverTime | Self::BytesRate | Self::AbsentOverTime
         )
     }
 }
@@ -502,9 +498,6 @@ impl VectorAggregationOp {
 
     /// Returns true if this operation requires a parameter (k value).
     pub const fn requires_param(&self) -> bool {
-        matches!(
-            self,
-            Self::Topk | Self::Bottomk | Self::ApproxTopk
-        )
+        matches!(self, Self::Topk | Self::Bottomk | Self::ApproxTopk)
     }
 }

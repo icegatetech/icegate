@@ -1,7 +1,8 @@
 //! Error types for IceGate operations.
 
-use antlr4rust::errors::ANTLRError;
 use core::fmt;
+
+use antlr4rust::errors::ANTLRError;
 use datafusion::error::DataFusionError;
 
 /// Kind of schema error that occurred.
@@ -70,7 +71,8 @@ pub enum IceGateError {
     Parse(Vec<ParseError>),
     /// `DataFusion` query planning or execution error.
     ///
-    /// This error happens when `DataFusion` operations fail during query planning or execution.
+    /// This error happens when `DataFusion` operations fail during query
+    /// planning or execution.
     DataFusion(DataFusionError),
     /// Schema error.
     ///

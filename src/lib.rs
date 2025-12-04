@@ -1,4 +1,5 @@
-//! `IceGate` - Observability data lake query engine using `Iceberg` and `DataFusion`.
+//! `IceGate` - Observability data lake query engine using `Iceberg` and
+//! `DataFusion`.
 //!
 //! This crate provides Iceberg schema definitions and query capabilities for
 //! `OpenTelemetry` observability data (logs, traces, metrics).

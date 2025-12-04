@@ -1,35 +1,31 @@
-//! Tests for ANTLR-based LogQL parser.
+//! Tests for ANTLR-based `LogQL` parser.
+#![allow(clippy::ignored_unit_patterns)] // Ok(()) patterns are common in test matching
+
+use antlr4rust::{
+    common_token_stream::CommonTokenStream, input_stream::InputStream, tree::ParseTree, Parser as AntlrParserTrait,
+};
 
 use super::*;
-use antlr4rust::Parser as AntlrParserTrait;
-use antlr4rust::common_token_stream::CommonTokenStream;
-use antlr4rust::input_stream::InputStream;
-use antlr4rust::tree::ParseTree;
-
-use crate::query::logql::common::*;
-use crate::query::logql::expr::*;
-use crate::query::logql::log::*;
-use crate::query::logql::metric::*;
-use crate::query::logql::parser::Parser; // Import the Parser trait
+use crate::query::logql::{common::*, expr::*, log::*, metric::*, parser::Parser}; // Import the Parser trait
 
 /// Helper that expects parsing to succeed and match the expected expression
-fn assert_parses_to(query: &str, expected: LogQLExpr) {
+fn assert_parses_to(query: &str, expected: &LogQLExpr) {
     let parser = AntlrParser::new();
     match parser.parse(query) {
         Ok(expr) => {
             assert_eq!(
-                expr, expected,
-                "Parsed expression does not match expected for query: '{}'",
-                query
+                &expr, expected,
+                "Parsed expression does not match expected for query: '{query}'"
             );
         },
         Err(e) => {
-            panic!("Query should parse successfully: '{}'\nError: {:?}", query, e);
+            panic!("Query should parse successfully: '{query}'\nError: {e:?}");
         },
     }
 }
 
-/// Helper function to parse a LogQL query with error listeners on both lexer and parser
+/// Helper function to parse a `LogQL` query with error listeners on both lexer
+/// and parser
 fn parse_query(query: &str) -> std::result::Result<(), Vec<String>> {
     let input = InputStream::new(query);
     let mut lexer = LogQLLexer::new(input);
@@ -47,21 +43,24 @@ fn parse_query(query: &str) -> std::result::Result<(), Vec<String>> {
     parser.remove_error_listeners();
     parser.add_error_listener(Box::new(parser_error_listener.clone()));
 
+    // Collect errors from both listeners
+    let collect_errors = || {
+        let mut all_errors: Vec<String> = lexer_error_listener.get_errors().iter().map(ToString::to_string).collect();
+        all_errors.extend(parser_error_listener.get_errors().iter().map(ToString::to_string));
+        all_errors
+    };
+
     // Parse the query
     match parser.root() {
         Ok(_) => {
-            // Check both lexer and parser errors
-            let mut all_errors: Vec<String> = lexer_error_listener.get_errors().iter().map(|e| e.to_string()).collect();
-            all_errors.extend(parser_error_listener.get_errors().iter().map(|e| e.to_string()));
-
-            if all_errors.is_empty() { Ok(()) } else { Err(all_errors) }
+            let all_errors = collect_errors();
+            if all_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(all_errors)
+            }
         },
-        Err(_) => {
-            // Collect all errors from both lexer and parser
-            let mut all_errors: Vec<String> = lexer_error_listener.get_errors().iter().map(|e| e.to_string()).collect();
-            all_errors.extend(parser_error_listener.get_errors().iter().map(|e| e.to_string()));
-            Err(all_errors)
-        },
+        Err(_) => Err(collect_errors()),
     }
 }
 
@@ -81,10 +80,7 @@ fn assert_parses(query: &str) {
 
 /// Helper that expects parsing to fail
 fn assert_fails(query: &str) {
-    match parse_query(query) {
-        Ok(_) => panic!("Query should fail to parse: '{}'", query),
-        Err(_) => {},
-    }
+    assert!(parse_query(query).is_err(), "Query should fail to parse: '{query}'");
 }
 
 /// Get parse tree as string for inspection using Debug format
@@ -105,15 +101,18 @@ fn get_parse_tree(query: &str) -> std::result::Result<String, Vec<String>> {
     parser.remove_error_listeners();
     parser.add_error_listener(Box::new(parser_error_listener.clone()));
 
+    // Collect errors from both listeners
+    let collect_errors = || {
+        let mut all_errors: Vec<String> = lexer_error_listener.get_errors().iter().map(ToString::to_string).collect();
+        all_errors.extend(parser_error_listener.get_errors().iter().map(ToString::to_string));
+        all_errors
+    };
+
     // Parse the query
-    let parse_result = parser.root();
-
-    match parse_result {
-        Ok(tree) => {
-            // Check both lexer and parser errors
-            let mut all_errors: Vec<String> = lexer_error_listener.get_errors().iter().map(|e| e.to_string()).collect();
-            all_errors.extend(parser_error_listener.get_errors().iter().map(|e| e.to_string()));
-
+    parser.root().map_or_else(
+        |_| Err(collect_errors()),
+        |tree| {
+            let all_errors = collect_errors();
             if all_errors.is_empty() {
                 // Use Debug format to get string representation of parse tree
                 Ok(tree.to_string_tree(&*parser))
@@ -121,13 +120,7 @@ fn get_parse_tree(query: &str) -> std::result::Result<String, Vec<String>> {
                 Err(all_errors)
             }
         },
-        Err(_) => {
-            // Collect all errors from both lexer and parser
-            let mut all_errors: Vec<String> = lexer_error_listener.get_errors().iter().map(|e| e.to_string()).collect();
-            all_errors.extend(parser_error_listener.get_errors().iter().map(|e| e.to_string()));
-            Err(all_errors)
-        },
-    }
+    )
 }
 
 /// Parse and validate that tree contains expected rule names
@@ -135,18 +128,16 @@ fn assert_tree_contains(query: &str, expected_rules: &[&str]) {
     match get_parse_tree(query) {
         Ok(tree_str) => {
             for rule in expected_rules {
-                if !tree_str.contains(rule) {
-                    panic!(
-                        "Parse tree validation failed for query: '{}'\nExpected to contain rule: '{}'\nParse tree:\n{}",
-                        query, rule, tree_str
-                    );
-                }
+                assert!(
+                    tree_str.contains(rule),
+                    "Parse tree validation failed for query: '{query}'\nExpected to contain rule: '{rule}'\nParse \
+                     tree:\n{tree_str}"
+                );
             }
         },
         Err(errors) => {
             panic!(
-                "Query should parse successfully: '{}'\nErrors:\n{}",
-                query,
+                "Query should parse successfully: '{query}'\nErrors:\n{}",
                 errors.join("\n")
             );
         },
@@ -164,11 +155,11 @@ fn test_empty_selector() {
 fn test_basic_selector() {
     assert_parses_to(
         r#"{job="mysql"}"#,
-        LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::eq("job", "mysql")]))),
+        &LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::eq("job", "mysql")]))),
     );
     assert_parses_to(
         r#"{namespace="prod", pod="app-123"}"#,
-        LogQLExpr::Log(LogExpr::new(Selector::new(vec![
+        &LogQLExpr::Log(LogExpr::new(Selector::new(vec![
             LabelMatcher::eq("namespace", "prod"),
             LabelMatcher::eq("pod", "app-123"),
         ]))),
@@ -179,19 +170,19 @@ fn test_basic_selector() {
 fn test_selector_operators() {
     assert_parses_to(
         r#"{job="mysql"}"#,
-        LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::eq("job", "mysql")]))),
+        &LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::eq("job", "mysql")]))),
     );
     assert_parses_to(
         r#"{job!="mysql"}"#,
-        LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::neq("job", "mysql")]))),
+        &LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::neq("job", "mysql")]))),
     );
     assert_parses_to(
         r#"{job=~"mysql.*"}"#,
-        LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::re("job", "mysql.*")]))),
+        &LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::re("job", "mysql.*")]))),
     );
     assert_parses_to(
         r#"{job!~"mysql.*"}"#,
-        LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::nre("job", "mysql.*")]))),
+        &LogQLExpr::Log(LogExpr::new(Selector::new(vec![LabelMatcher::nre("job", "mysql.*")]))),
     );
 }
 
@@ -208,7 +199,7 @@ fn test_selector_with_prefix() {
 fn test_line_filter_contains() {
     assert_parses_to(
         r#"{job="mysql"} |= "error""#,
-        LogQLExpr::Log(LogExpr::with_pipeline(
+        &LogQLExpr::Log(LogExpr::with_pipeline(
             Selector::new(vec![LabelMatcher::eq("job", "mysql")]),
             vec![PipelineStage::LineFilter(LineFilter::contains("error"))],
         )),
@@ -246,7 +237,7 @@ fn test_line_filter_ip_function() {
 fn test_json_parser() {
     assert_parses_to(
         r#"{job="app"} | json"#,
-        LogQLExpr::Log(LogExpr::with_pipeline(
+        &LogQLExpr::Log(LogExpr::with_pipeline(
             Selector::new(vec![LabelMatcher::eq("job", "app")]),
             vec![PipelineStage::LogParser(LogParser::json())],
         )),
@@ -371,7 +362,7 @@ fn test_multi_stage_pipeline() {
 fn test_count_over_time() {
     assert_parses_to(
         r#"count_over_time({job="mysql"}[5m])"#,
-        LogQLExpr::Metric(MetricExpr::RangeAggregation(RangeAggregation::new(
+        &LogQLExpr::Metric(MetricExpr::RangeAggregation(RangeAggregation::new(
             RangeAggregationOp::CountOverTime,
             RangeExpr::new(
                 LogExpr::new(Selector::new(vec![LabelMatcher::eq("job", "mysql")])),
@@ -427,7 +418,7 @@ fn test_absent_over_time() {
 fn test_vector_aggregations() {
     assert_parses_to(
         r#"sum(rate({job="mysql"}[5m]))"#,
-        LogQLExpr::Metric(MetricExpr::VectorAggregation(VectorAggregation::new(
+        &LogQLExpr::Metric(MetricExpr::VectorAggregation(VectorAggregation::new(
             VectorAggregationOp::Sum,
             MetricExpr::RangeAggregation(RangeAggregation::new(
                 RangeAggregationOp::Rate,
@@ -503,7 +494,7 @@ fn test_arithmetic_operators() {
     assert_parses(r#"rate({job="a"}[5m]) - rate({job="b"}[5m])"#);
     assert_parses_to(
         r#"rate({job="a"}[5m]) * 100"#,
-        LogQLExpr::Metric(MetricExpr::BinaryOp {
+        &LogQLExpr::Metric(MetricExpr::BinaryOp {
             left: Box::new(MetricExpr::RangeAggregation(RangeAggregation::new(
                 RangeAggregationOp::Rate,
                 RangeExpr::new(
@@ -521,7 +512,7 @@ fn test_arithmetic_operators() {
     );
     assert_parses(r#"rate({job="a"}[5m]) / rate({job="b"}[5m])"#);
     assert_parses(r#"rate({job="a"}[5m]) % 10"#);
-    assert_parses(r#"2 ^ 3"#);
+    assert_parses(r"2 ^ 3");
 }
 
 #[test]
@@ -562,9 +553,9 @@ fn test_group_left_right() {
 
 #[test]
 fn test_operator_precedence() {
-    assert_parses(r#"1 + 2 * 3"#);
-    assert_parses(r#"2 ^ 3 ^ 4"#);
-    assert_parses(r#"(1 + 2) * 3"#);
+    assert_parses(r"1 + 2 * 3");
+    assert_parses(r"2 ^ 3 ^ 4");
+    assert_parses(r"(1 + 2) * 3");
 }
 
 // ==================== Offset and @ Modifier Tests ====================
@@ -590,8 +581,8 @@ fn test_offset_and_at_combined() {
 
 #[test]
 fn test_vector_function() {
-    assert_parses(r#"vector(0)"#);
-    assert_parses(r#"vector(100)"#);
+    assert_parses(r"vector(0)");
+    assert_parses(r"vector(100)");
     assert_parses(r#"sum(count_over_time({job="foo"}[5m])) or vector(0)"#);
 }
 
@@ -604,28 +595,28 @@ fn test_label_replace() {
 
 #[test]
 fn test_number_literals() {
-    assert_parses(r#"42"#);
-    assert_parses(r#"3.14"#);
-    assert_parses(r#".5"#);
-    assert_parses(r#"1e10"#);
-    assert_parses(r#"1.5e-3"#);
-    assert_parses(r#"0x1234"#);
+    assert_parses(r"42");
+    assert_parses(r"3.14");
+    assert_parses(r".5");
+    assert_parses(r"1e10");
+    assert_parses(r"1.5e-3");
+    assert_parses(r"0x1234");
 }
 
 #[test]
 fn test_signed_numbers() {
-    assert_parses(r#"+42"#);
-    assert_parses(r#"-3.14"#);
-    assert_parses(r#"-1e10"#);
+    assert_parses(r"+42");
+    assert_parses(r"-3.14");
+    assert_parses(r"-1e10");
 }
 
 // ==================== Variable Expression Tests ====================
 
 #[test]
 fn test_variable_expressions() {
-    assert_parses(r#"my_metric"#);
-    assert_parses(r#"metric_name"#);
-    assert_parses(r#"my_metric + 10"#);
+    assert_parses(r"my_metric");
+    assert_parses(r"metric_name");
+    assert_parses(r"my_metric + 10");
 }
 
 // ==================== Complex Query Tests ====================
@@ -702,12 +693,12 @@ fn test_all_new_features_combined() {
 
 #[test]
 fn test_comments() {
-    assert_parses(r###"{job="mysql"} # this is a comment"###);
+    assert_parses(r#"{job="mysql"} # this is a comment"#);
     assert_parses(
-        r###"{job="mysql"}
+        r#"{job="mysql"}
         | json # parse JSON
         | request_time > 10s # filter slow queries
-        "###,
+        "#,
     );
 }
 
@@ -716,7 +707,7 @@ fn test_comments() {
 #[test]
 fn test_nested_parentheses() {
     assert_parses(r#"((rate({job="a"}[5m])))"#);
-    assert_parses(r#"(1 + (2 * (3 + 4)))"#);
+    assert_parses(r"(1 + (2 * (3 + 4)))");
 }
 
 #[test]
@@ -739,8 +730,8 @@ fn test_multiline_queries() {
 #[test]
 fn test_string_escaping() {
     assert_parses(r#"{job="my\"job"}"#);
-    assert_parses(r#"{job='my\'job'}"#);
-    assert_parses(r#"{job=`my\`job`}"#);
+    assert_parses(r"{job='my\'job'}");
+    assert_parses(r"{job=`my\`job`}");
 }
 
 // ==================== Error Case Tests ====================
@@ -760,12 +751,12 @@ fn test_invalid_queries_fail() {
     assert_fails(r#"rate({job="app"})"#); // Missing range
 
     // Invalid binary operation
-    assert_fails(r#"1 +"#); // Missing right operand
-    // Note: "+ 1" is actually valid (unary plus), so it's not an error case
+    assert_fails(r"1 +"); // Missing right operand
+                          // Note: "+ 1" is actually valid (unary plus), so it's not an error case
 
     // Invalid grouping
-    assert_fails(r#"sum by ()"#); // Missing expression
-    assert_fails(r#"sum by () "#); // Missing expression
+    assert_fails(r"sum by ()"); // Missing expression
+    assert_fails(r"sum by () "); // Missing expression
 }
 
 #[test]
@@ -827,7 +818,8 @@ fn test_parse_tree_selector_matchers() {
 #[test]
 fn test_field_names_not_keywords() {
     // Test that field names "duration", "bytes", "duration_seconds" work correctly
-    // These used to be keywords for conversion functions but are now parsed as ATTRIBUTE
+    // These used to be keywords for conversion functions but are now parsed as
+    // ATTRIBUTE
 
     // Using "duration" as a field name in filters
     assert_parses(r#"{job="app"} | json | duration > 10s"#);

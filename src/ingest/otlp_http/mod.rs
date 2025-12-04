@@ -1,6 +1,7 @@
 //! OTLP HTTP server module
 //!
-//! Provides OpenTelemetry Protocol HTTP endpoint for ingesting logs, traces, and metrics.
+//! Provides OpenTelemetry Protocol HTTP endpoint for ingesting logs, traces,
+//! and metrics.
 
 mod config;
 mod handlers;

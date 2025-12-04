@@ -1,8 +1,11 @@
 //! Prometheus API routes
 
-use super::handlers;
-use super::server::PrometheusState;
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
+
+use super::{handlers, server::PrometheusState};
 
 /// Create Prometheus API router
 pub fn routes(state: PrometheusState) -> Router {

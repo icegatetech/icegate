@@ -15,36 +15,20 @@ use super::OtlpGrpcConfig;
 ///
 /// # TODO
 /// - Import OTLP service definitions from opentelemetry-proto
-/// - Implement `LogsService` for logs ingestion
-///   ```rust,ignore
-///   impl LogsService for OtlpService {
-///       async fn export(&self, request: ExportLogsServiceRequest) -> Result<ExportLogsServiceResponse> {
-///           // Parse OTLP logs
-///           // Transform to Iceberg schema
-///           // Write to logs table
-///       }
-///   }
-///   ```
-/// - Implement `TracesService` for traces ingestion
-///   ```rust,ignore
-///   impl TracesService for OtlpService {
-///       async fn export(&self, request: ExportTracesServiceRequest) -> Result<ExportTracesServiceResponse> {
-///           // Parse OTLP spans
-///           // Transform to Iceberg schema
-///           // Write to spans table
-///       }
-///   }
-///   ```
-/// - Implement `MetricsService` for metrics ingestion
-///   ```rust,ignore
-///   impl MetricsService for OtlpService {
-///       async fn export(&self, request: ExportMetricsServiceRequest) -> Result<ExportMetricsServiceResponse> {
-///           // Parse OTLP metrics
-///           // Transform to Iceberg schema
-///           // Write to metrics table
-///       }
-///   }
-///   ```
+/// - Implement `LogsService` for logs ingestion ```rust,ignore impl LogsService
+///   for OtlpService { async fn export(&self, request:
+///   ExportLogsServiceRequest) -> Result<ExportLogsServiceResponse> { // Parse
+///   OTLP logs // Transform to Iceberg schema // Write to logs table } } ```
+/// - Implement `TracesService` for traces ingestion ```rust,ignore impl
+///   TracesService for OtlpService { async fn export(&self, request:
+///   ExportTracesServiceRequest) -> Result<ExportTracesServiceResponse> { //
+///   Parse OTLP spans // Transform to Iceberg schema // Write to spans table }
+///   } ```
+/// - Implement `MetricsService` for metrics ingestion ```rust,ignore impl
+///   MetricsService for OtlpService { async fn export(&self, request:
+///   ExportMetricsServiceRequest) -> Result<ExportMetricsServiceResponse> { //
+///   Parse OTLP metrics // Transform to Iceberg schema // Write to metrics
+///   table } } ```
 /// - Create tonic server with all three services
 /// - Configure TLS if needed
 /// - Handle graceful shutdown

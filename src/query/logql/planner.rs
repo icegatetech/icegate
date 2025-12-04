@@ -3,9 +3,10 @@
 //! This module defines the `Planner` trait that abstracts over different
 //! execution plan implementations (e.g., DataFusion LogicalPlan).
 
+use chrono::{DateTime, Utc};
+
 use super::expr::LogQLExpr;
 use crate::common::Result;
-use chrono::{DateTime, Utc};
 
 /// Default limit for log queries when no limit is specified.
 ///
@@ -26,27 +27,30 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 /// ```
 /// use chrono::Duration;
 /// use datafusion::prelude::SessionContext;
-/// use icegate::query::logql::planner::{Planner, QueryContext};
-/// use icegate::query::logql::datafusion::DataFusionPlanner;
-/// use icegate::query::logql::{LogExpr, LogQLExpr, Selector};
+/// use icegate::query::logql::{
+///     datafusion::DataFusionPlanner,
+///     planner::{Planner, QueryContext},
+///     LogExpr, LogQLExpr, Selector,
+/// };
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-///   let session_context = SessionContext::new();
-///   let query_context = QueryContext {
-///       tenant_id: "tenant-1".to_string(),
-///       start: chrono::Utc::now(),
-///       end: chrono::Utc::now() + Duration::hours(1),
-///       limit: None,
-///       step: None,
-///   };
-///   let planner = DataFusionPlanner::new(session_context, query_context);
-///   let _plan = planner.plan(LogQLExpr::Log(LogExpr::new(Selector::empty()))).await;
+/// let session_context = SessionContext::new();
+/// let query_context = QueryContext {
+///     tenant_id: "tenant-1".to_string(),
+///     start: chrono::Utc::now(),
+///     end: chrono::Utc::now() + Duration::hours(1),
+///     limit: None,
+///     step: None,
+/// };
+/// let planner = DataFusionPlanner::new(session_context, query_context);
+/// let _plan = planner.plan(LogQLExpr::Log(LogExpr::new(Selector::empty()))).await;
 /// # });
 /// ```
 /// Context for query planning, containing metadata like time range and limits.
 #[derive(Debug, Clone)]
 pub struct QueryContext {
-    /// Tenant ID for multi-tenancy isolation (extracted from X-Scope-OrgID header).
+    /// Tenant ID for multi-tenancy isolation (extracted from X-Scope-OrgID
+    /// header).
     pub tenant_id: String,
     /// Start time (inclusive)
     pub start: DateTime<Utc>,

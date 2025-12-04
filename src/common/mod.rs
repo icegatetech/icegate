@@ -37,11 +37,10 @@ pub mod storage;
 
 // Re-export commonly used types
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig};
-pub use config::{ServerConfig, check_port_conflicts, load_config_file};
+pub use config::{check_port_conflicts, load_config_file, ServerConfig};
 pub use storage::{S3Config, StorageBackend, StorageConfig};
 
 /// Result type alias for `IceGate` operations.
 ///
 /// This is a convenience type alias for `std::result::Result<T, IceGateError>`.
 pub type Result<T> = std::result::Result<T, errors::IceGateError>;
-

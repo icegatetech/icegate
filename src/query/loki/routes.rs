@@ -1,10 +1,10 @@
 //! Loki API routes
 
-use super::handlers;
-use super::server::LokiState;
 use axum::{routing::get, Router};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
+
+use super::{handlers, server::LokiState};
 
 /// Create Loki API router
 pub fn routes(state: LokiState) -> Router {

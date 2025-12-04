@@ -7,17 +7,14 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::{CatalogConfig, StorageConfig, check_port_conflicts, load_config_file};
-
-use super::engine::QueryEngineConfig;
-use super::loki::LokiConfig;
-use super::prometheus::PrometheusConfig;
-use super::tempo::TempoConfig;
+use super::{engine::QueryEngineConfig, loki::LokiConfig, prometheus::PrometheusConfig, tempo::TempoConfig};
+use crate::common::{check_port_conflicts, load_config_file, CatalogConfig, StorageConfig};
 
 /// Query binary configuration
 ///
 /// Root configuration struct for the query binary. Contains catalog and storage
-/// configuration shared across all query servers, plus individual server configs.
+/// configuration shared across all query servers, plus individual server
+/// configs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryConfig {
     /// Iceberg catalog configuration

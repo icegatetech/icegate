@@ -2,11 +2,14 @@
 
 use std::path::PathBuf;
 
-use crate::common::catalog::CatalogBuilder;
-use crate::common::errors::IceGateError;
-use crate::maintain::cli::MigrateCommands;
-use crate::maintain::config::MaintainConfig;
-use crate::maintain::migrate::operations::{self, MigrationOperation};
+use crate::{
+    common::{catalog::CatalogBuilder, errors::IceGateError},
+    maintain::{
+        cli::MigrateCommands,
+        config::MaintainConfig,
+        migrate::operations::{self, MigrationOperation},
+    },
+};
 
 /// Execute the migrate command
 ///
@@ -15,16 +18,21 @@ use crate::maintain::migrate::operations::{self, MigrationOperation};
 /// Returns an error if migration fails
 pub async fn execute(command: MigrateCommands) -> Result<(), IceGateError> {
     match command {
-        MigrateCommands::Create { config, dry_run } => create(config, dry_run).await,
-        MigrateCommands::Upgrade { config, dry_run } => upgrade(config, dry_run).await,
+        MigrateCommands::Create {
+            config,
+            dry_run,
+        } => create(config, dry_run).await,
+        MigrateCommands::Upgrade {
+            config,
+            dry_run,
+        } => upgrade(config, dry_run).await,
     }
 }
 
 /// Create all Iceberg tables
 async fn create(config_path: PathBuf, dry_run: bool) -> Result<(), IceGateError> {
     tracing::info!("Loading configuration from {:?}", config_path);
-    let config = MaintainConfig::from_file(&config_path)
-        .map_err(|e| IceGateError::Config(e.to_string()))?;
+    let config = MaintainConfig::from_file(&config_path).map_err(|e| IceGateError::Config(e.to_string()))?;
 
     tracing::info!("Initializing catalog");
     let catalog = CatalogBuilder::from_config(&config.catalog).await?;
@@ -42,8 +50,7 @@ async fn create(config_path: PathBuf, dry_run: bool) -> Result<(), IceGateError>
 /// Upgrade existing table schemas
 async fn upgrade(config_path: PathBuf, dry_run: bool) -> Result<(), IceGateError> {
     tracing::info!("Loading configuration from {:?}", config_path);
-    let config = MaintainConfig::from_file(&config_path)
-        .map_err(|e| IceGateError::Config(e.to_string()))?;
+    let config = MaintainConfig::from_file(&config_path).map_err(|e| IceGateError::Config(e.to_string()))?;
 
     tracing::info!("Initializing catalog");
     let catalog = CatalogBuilder::from_config(&config.catalog).await?;
@@ -77,11 +84,15 @@ fn report_operations(ops: &[MigrationOperation], dry_run: bool) {
 /// Log a single migration operation
 fn log_operation(op: &MigrationOperation, prefix: &str) {
     match op {
-        MigrationOperation::Create { table_name } => {
+        MigrationOperation::Create {
+            table_name,
+        } => {
             tracing::info!("{} create table: {}", prefix, table_name);
-        }
-        MigrationOperation::Upgrade { table_name } => {
+        },
+        MigrationOperation::Upgrade {
+            table_name,
+        } => {
             tracing::info!("{} upgrade table: {}", prefix, table_name);
-        }
+        },
     }
 }

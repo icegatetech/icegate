@@ -1,22 +1,19 @@
 //! Run command implementation
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::common::catalog::CatalogBuilder;
-use crate::common::errors::IceGateError;
-use crate::query::engine::QueryEngine;
-use crate::query::QueryConfig;
+use crate::{
+    common::{catalog::CatalogBuilder, errors::IceGateError},
+    query::{engine::QueryEngine, QueryConfig},
+};
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
@@ -77,9 +74,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IceGateError> {
         let engine = Arc::clone(&query_engine);
         let loki_config = config.loki.clone();
         let token = cancel_token.clone();
-        let handle = tokio::spawn(async move {
-            crate::query::loki::run(engine, loki_config, token).await
-        });
+        let handle = tokio::spawn(async move { crate::query::loki::run(engine, loki_config, token).await });
         handles.push(handle);
     }
 
@@ -87,9 +82,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IceGateError> {
         let engine = Arc::clone(&query_engine);
         let prom_config = config.prometheus.clone();
         let token = cancel_token.clone();
-        let handle = tokio::spawn(async move {
-            crate::query::prometheus::run(engine, prom_config, token).await
-        });
+        let handle = tokio::spawn(async move { crate::query::prometheus::run(engine, prom_config, token).await });
         handles.push(handle);
     }
 
@@ -97,9 +90,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IceGateError> {
         let engine = Arc::clone(&query_engine);
         let tempo_config = config.tempo.clone();
         let token = cancel_token.clone();
-        let handle = tokio::spawn(async move {
-            crate::query::tempo::run(engine, tempo_config, token).await
-        });
+        let handle = tokio::spawn(async move { crate::query::tempo::run(engine, tempo_config, token).await });
         handles.push(handle);
     }
 

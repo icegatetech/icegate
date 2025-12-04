@@ -3,8 +3,8 @@
 //! This module defines the `Parser` trait that abstracts over different
 //! parsing implementations (e.g., ANTLR-based).
 
-use crate::common::Result;
 use super::expr::LogQLExpr;
+use crate::common::Result;
 
 /// Trait for parsing `LogQL` query strings into AST representations.
 ///

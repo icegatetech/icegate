@@ -11,8 +11,8 @@ use crate::common::{CatalogConfig, StorageConfig};
 
 /// Maintain binary configuration
 ///
-/// Root configuration struct for the maintain binary. Contains catalog and storage
-/// configuration needed for maintenance operations like migrations.
+/// Root configuration struct for the maintain binary. Contains catalog and
+/// storage configuration needed for maintenance operations like migrations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MaintainConfig {
     /// Iceberg catalog configuration
@@ -39,7 +39,7 @@ impl MaintainConfig {
                 toml::from_str(&content)
                     .or_else(|_| serde_yaml::from_str(&content))
                     .map_err(|e| format!("Failed to parse config: {e}"))?
-            }
+            },
         };
 
         config.validate()?;

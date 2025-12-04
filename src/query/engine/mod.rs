@@ -8,5 +8,6 @@
 mod config;
 mod core;
 
-pub use config::QueryEngineConfig;
 pub use core::QueryEngine;
+
+pub use config::QueryEngineConfig;

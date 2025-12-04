@@ -11,22 +11,26 @@
     clippy::items_after_statements
 )]
 
-use std::future::Future;
-use std::pin::Pin;
+use std::{future::Future, pin::Pin};
 
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, col, lit};
-use datafusion::prelude::*;
+use datafusion::{
+    logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder},
+    prelude::*,
+};
 
-use crate::common::errors::IceGateError;
-use crate::common::Result;
-use crate::common::LOGS_TABLE_FQN;
-use crate::query::logql::common::MatchOp;
-use crate::query::logql::expr::LogQLExpr;
-use crate::query::logql::log::{LabelMatcher, LogExpr, Selector};
-use crate::query::logql::metric::MetricExpr;
-use crate::query::logql::planner::{Planner, QueryContext, DEFAULT_LOG_LIMIT};
+use crate::{
+    common::{errors::IceGateError, Result, LOGS_TABLE_FQN},
+    query::logql::{
+        common::MatchOp,
+        expr::LogQLExpr,
+        log::{LabelMatcher, LogExpr, Selector},
+        metric::MetricExpr,
+        planner::{Planner, QueryContext, DEFAULT_LOG_LIMIT},
+    },
+};
 
-/// A planner that converts `LogQL` expressions into `DataFusion` `LogicalPlans`.
+/// A planner that converts `LogQL` expressions into `DataFusion`
+/// `LogicalPlans`.
 pub struct DataFusionPlanner {
     ctx: SessionContext,
     context: QueryContext,
@@ -35,7 +39,10 @@ pub struct DataFusionPlanner {
 impl DataFusionPlanner {
     /// Creates a new `DataFusionPlanner`.
     pub const fn new(ctx: SessionContext, context: QueryContext) -> Self {
-        Self { ctx, context }
+        Self {
+            ctx,
+            context,
+        }
     }
 }
 
@@ -53,7 +60,7 @@ impl Planner for DataFusionPlanner {
                     .limit(0, Some(limit))?
                     .build()
                     .map_err(IceGateError::from)
-            }
+            },
             LogQLExpr::Metric(metric_expr) => self.plan_metric(metric_expr).await,
         }
     }
@@ -76,8 +83,14 @@ impl DataFusionPlanner {
         let ts_col = col("timestamp");
         let start_micros = self.context.start.timestamp_micros();
         let end_micros = self.context.end.timestamp_micros();
-        let start_literal = lit(datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(start_micros), None));
-        let end_literal = lit(datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(end_micros), None));
+        let start_literal = lit(datafusion::scalar::ScalarValue::TimestampMicrosecond(
+            Some(start_micros),
+            None,
+        ));
+        let end_literal = lit(datafusion::scalar::ScalarValue::TimestampMicrosecond(
+            Some(end_micros),
+            None,
+        ));
         let df = df.filter(ts_col.clone().gt_eq(start_literal).and(ts_col.lt_eq(end_literal)))?;
 
         // 4. Apply Selector matchers
@@ -105,7 +118,8 @@ impl DataFusionPlanner {
 
                     // TODO: Implement binary operations (vector matching)
                     // This requires joining left and right plans based on labels and timestamp,
-                    // applying the operation, and handling the modifier (on/ignoring, group_left/right).
+                    // applying the operation, and handling the modifier (on/ignoring,
+                    // group_left/right).
                     Err(IceGateError::NotImplemented(
                         "Binary operations not yet implemented".to_string(),
                     ))
@@ -122,7 +136,9 @@ impl DataFusionPlanner {
                         "Vector literal not yet implemented".to_string(),
                     ))
                 },
-                MetricExpr::LabelReplace { .. } => {
+                MetricExpr::LabelReplace {
+                    ..
+                } => {
                     // TODO: Implement label replace
                     Err(IceGateError::NotImplemented(
                         "Label replace not yet implemented".to_string(),
@@ -145,9 +161,10 @@ impl DataFusionPlanner {
         // a. Bucketize by time (if step is provided)
         // b. Apply the aggregation function over the window
 
-        // TODO: This is a complex mapping that requires window functions or specific UDAFs.
-        // For now, we will return the underlying log stream plan, but we should
-        // eventually map `agg.op` (Rate, CountOverTime, etc.) to DataFusion operations.
+        // TODO: This is a complex mapping that requires window functions or specific
+        // UDAFs. For now, we will return the underlying log stream plan, but we
+        // should eventually map `agg.op` (Rate, CountOverTime, etc.) to
+        // DataFusion operations.
 
         // Example placeholder for count_over_time:
         // df.aggregate(vec![col("service_name")], vec![count(col("timestamp"))])?
@@ -190,8 +207,9 @@ impl DataFusionPlanner {
         // We need to map agg.op to DataFusion aggregate functions.
         // For now, we'll implement a few common ones.
 
-        // Note: We assume the inner plan produces a "value" column or similar that we aggregate.
-        // Since we don't have a strict schema for the inner metric plan yet, we'll assume a column named "value".
+        // Note: We assume the inner plan produces a "value" column or similar that we
+        // aggregate. Since we don't have a strict schema for the inner metric
+        // plan yet, we'll assume a column named "value".
         let value_col = col("value");
 
         let aggr_expr = match agg.op {
@@ -221,9 +239,10 @@ impl DataFusionPlanner {
 
         // 4. Apply aggregation
         // We need to use the `aggregate` method on the LogicalPlan builder (DataFrame).
-        // Since `df` is a LogicalPlan, we might need to wrap it in a DataFrame or use LogicalPlanBuilder.
-        // However, `DataFusionPlanner` doesn't hold the full context to create a DataFrame easily without a SessionContext reference that is fully valid.
-        // But we can use `LogicalPlanBuilder::from(df)`.
+        // Since `df` is a LogicalPlan, we might need to wrap it in a DataFrame or use
+        // LogicalPlanBuilder. However, `DataFusionPlanner` doesn't hold the
+        // full context to create a DataFrame easily without a SessionContext reference
+        // that is fully valid. But we can use `LogicalPlanBuilder::from(df)`.
 
         let builder = LogicalPlanBuilder::from(df);
         let plan = builder
@@ -327,19 +346,15 @@ impl DataFusionPlanner {
                 LineFilterOp::Contains => {
                     datafusion::functions::string::contains().call(vec![body_col.clone(), lit(filter_str)])
                 },
-                LineFilterOp::NotContains => {
-                    datafusion::functions::string::contains()
-                        .call(vec![body_col.clone(), lit(filter_str)])
-                        .not()
-                },
+                LineFilterOp::NotContains => datafusion::functions::string::contains()
+                    .call(vec![body_col.clone(), lit(filter_str)])
+                    .not(),
                 LineFilterOp::Match => {
                     datafusion::functions::regex::regexp_like().call(vec![body_col.clone(), lit(filter_str)])
                 },
-                LineFilterOp::NotMatch => {
-                    datafusion::functions::regex::regexp_like()
-                        .call(vec![body_col.clone(), lit(filter_str)])
-                        .not()
-                },
+                LineFilterOp::NotMatch => datafusion::functions::regex::regexp_like()
+                    .call(vec![body_col.clone(), lit(filter_str)])
+                    .not(),
                 LineFilterOp::NotPattern => {
                     return Err(IceGateError::NotImplemented("pattern matching filter".into()));
                 },
@@ -360,11 +375,12 @@ impl DataFusionPlanner {
     fn apply_parser(&self, df: DataFrame, parser: crate::query::logql::log::LogParser) -> Result<DataFrame> {
         use crate::query::logql::log::LogParser;
 
-        // For parsers, we typically invoke a UDF that extracts attributes from the log body
-        // and merges them into the attributes map.
-        // Since DataFusion doesn't support "merge into map" easily in a single expression without complex UDFs,
-        // we'll assume the UDF returns a Map/Struct and we might need to project it.
-        // For now, we'll just invoke the UDF and project the result as "attributes" (merging is complex).
+        // For parsers, we typically invoke a UDF that extracts attributes from the log
+        // body and merges them into the attributes map.
+        // Since DataFusion doesn't support "merge into map" easily in a single
+        // expression without complex UDFs, we'll assume the UDF returns a
+        // Map/Struct and we might need to project it. For now, we'll just
+        // invoke the UDF and project the result as "attributes" (merging is complex).
         // A real implementation would likely use a specific "extract_and_merge" UDF.
 
         let _body_col = col("body");
@@ -379,7 +395,9 @@ impl DataFusionPlanner {
                 // TODO: Implement JSON parsing
                 Ok(df)
             },
-            LogParser::Logfmt { .. } => {
+            LogParser::Logfmt {
+                ..
+            } => {
                 // TODO: Implement Logfmt parsing
                 Ok(df)
             },
@@ -407,11 +425,15 @@ impl DataFusionPlanner {
 
         for op in ops {
             match op {
-                LabelFormatOp::Rename { .. } => {
+                LabelFormatOp::Rename {
+                    ..
+                } => {
                     // TODO: Implement label rename
                     // Rename is essentially projecting the src column as dst
                 },
-                LabelFormatOp::Template { .. } => {
+                LabelFormatOp::Template {
+                    ..
+                } => {
                     // TODO: Implement label template
                 },
             }
@@ -434,8 +456,8 @@ impl DataFusionPlanner {
         _labels: Vec<crate::query::logql::common::LabelExtraction>,
     ) -> Result<DataFrame> {
         // Drop columns. In DataFusion, we select all EXCEPT the dropped ones.
-        // But we can only drop top-level columns easily. Attributes map modification is harder.
-        // TODO: Implement drop
+        // But we can only drop top-level columns easily. Attributes map modification is
+        // harder. TODO: Implement drop
         Ok(df)
     }
 
@@ -474,7 +496,11 @@ impl DataFusionPlanner {
             },
             LabelFilterExpr::Parens(inner) => self.label_filter_to_expr(*inner),
             LabelFilterExpr::Matcher(matcher) => self.matcher_to_expr(matcher),
-            LabelFilterExpr::Number { label, op, value } => {
+            LabelFilterExpr::Number {
+                label,
+                op,
+                value,
+            } => {
                 let col_expr = if self.is_top_level_field(&label) {
                     col(label)
                 } else {
@@ -492,7 +518,11 @@ impl DataFusionPlanner {
                 };
                 Ok(expr)
             },
-            LabelFilterExpr::Duration { label, op, value } => {
+            LabelFilterExpr::Duration {
+                label,
+                op,
+                value,
+            } => {
                 // Convert duration to nanoseconds and compare
                 let col_expr = if self.is_top_level_field(&label) {
                     col(label)
@@ -512,7 +542,11 @@ impl DataFusionPlanner {
                 };
                 Ok(expr)
             },
-            LabelFilterExpr::Bytes { label, op, value } => {
+            LabelFilterExpr::Bytes {
+                label,
+                op,
+                value,
+            } => {
                 // Compare byte values as u64
                 let col_expr = if self.is_top_level_field(&label) {
                     col(label)
@@ -531,7 +565,9 @@ impl DataFusionPlanner {
                 };
                 Ok(expr)
             },
-            LabelFilterExpr::Ip { .. } => {
+            LabelFilterExpr::Ip {
+                ..
+            } => {
                 // TODO: Implement IP filtering using ip_match UDF
                 Err(IceGateError::NotImplemented(
                     "IP filtering not yet implemented".to_string(),
@@ -543,16 +579,22 @@ impl DataFusionPlanner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::common::catalog::CatalogBuilder;
-    use crate::common::schema::logs_schema;
-    use crate::common::{CatalogConfig, CatalogBackend, ICEGATE_NAMESPACE, LOGS_TABLE};
-    use crate::query::logql::common::MatchOp;
-    use crate::query::logql::log::{LabelMatcher, LineFilter, LogExpr, PipelineStage, Selector};
+    use std::sync::Arc;
+
     use chrono::{TimeZone, Utc};
     use datafusion::prelude::SessionContext;
     use iceberg_datafusion::IcebergCatalogProvider;
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        common::{
+            catalog::CatalogBuilder, schema::logs_schema, CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE,
+        },
+        query::logql::{
+            common::MatchOp,
+            log::{LabelMatcher, LineFilter, LogExpr, PipelineStage, Selector},
+        },
+    };
 
     async fn create_test_context() -> (SessionContext, QueryContext) {
         let ctx = SessionContext::new();
@@ -573,11 +615,7 @@ mod tests {
 
         // Create the namespace and table
         let namespace = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
-        if !iceberg_catalog
-            .namespace_exists(&namespace)
-            .await
-            .unwrap_or(false)
-        {
+        if !iceberg_catalog.namespace_exists(&namespace).await.unwrap_or(false) {
             iceberg_catalog
                 .create_namespace(&namespace, std::collections::HashMap::new())
                 .await
@@ -622,15 +660,15 @@ mod tests {
         let expr = LogExpr::new(selector);
 
         let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
         // Verify filter expressions are present
         // Display format: Filter: iceberg.icegate.logs.service_name = Utf8("frontend")
-        if !display.contains("iceberg.icegate.logs.service_name = Utf8(\"frontend\")")
-            || !display.contains("iceberg.icegate.logs.severity_text != Utf8(\"error\")")
-        {
-            panic!("Plan does not contain expected filters:\n{}", display);
-        }
+        assert!(
+            display.contains("iceberg.icegate.logs.service_name = Utf8(\"frontend\")")
+                && display.contains("iceberg.icegate.logs.severity_text != Utf8(\"error\")"),
+            "Plan does not contain expected filters:\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -642,11 +680,12 @@ mod tests {
         let expr = LogExpr::new(selector);
 
         let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
-        if !display.contains("get_field(iceberg.icegate.logs.attributes, Utf8(\"custom_attr\"))") {
-            panic!("Plan does not contain expected attribute access:\n{}", display);
-        }
+        assert!(
+            display.contains("get_field(iceberg.icegate.logs.attributes, Utf8(\"custom_attr\"))"),
+            "Plan does not contain expected attribute access:\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -659,11 +698,12 @@ mod tests {
         expr.pipeline.push(PipelineStage::LineFilter(LineFilter::contains("error")));
 
         let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
-        if !display.contains("contains(iceberg.icegate.logs.body, Utf8(\"error\"))") {
-            panic!("Plan does not contain expected contains filter:\n{}", display);
-        }
+        assert!(
+            display.contains("contains(iceberg.icegate.logs.body, Utf8(\"error\"))"),
+            "Plan does not contain expected contains filter:\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -676,11 +716,12 @@ mod tests {
         expr.pipeline.push(PipelineStage::LineFilter(LineFilter::not_contains("info")));
 
         let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
-        if !display.contains("NOT contains(iceberg.icegate.logs.body, Utf8(\"info\"))") {
-            panic!("Plan does not contain expected NOT contains filter:\n{}", display);
-        }
+        assert!(
+            display.contains("NOT contains(iceberg.icegate.logs.body, Utf8(\"info\"))"),
+            "Plan does not contain expected NOT contains filter:\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -693,11 +734,12 @@ mod tests {
         expr.pipeline.push(PipelineStage::LineFilter(LineFilter::matches("error.*")));
 
         let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
-        if !display.contains("regexp_like(iceberg.icegate.logs.body, Utf8(\"error.*\"))") {
-            panic!("Plan does not contain expected regexp_like filter:\n{}", display);
-        }
+        assert!(
+            display.contains("regexp_like(iceberg.icegate.logs.body, Utf8(\"error.*\"))"),
+            "Plan does not contain expected regexp_like filter:\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -711,11 +753,12 @@ mod tests {
             .push(PipelineStage::LineFilter(LineFilter::not_matches("debug.*")));
 
         let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
-        if !display.contains("NOT regexp_like(iceberg.icegate.logs.body, Utf8(\"debug.*\"))") {
-            panic!("Plan does not contain expected NOT regexp_like filter:\n{}", display);
-        }
+        assert!(
+            display.contains("NOT regexp_like(iceberg.icegate.logs.body, Utf8(\"debug.*\"))"),
+            "Plan does not contain expected NOT regexp_like filter:\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -725,13 +768,14 @@ mod tests {
 
         let expr = MetricExpr::Literal(42.0);
         let plan = planner.plan_metric(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
         // Verify literal projection
         // Should contain a projection with alias "value" and the literal value
-        if !display.contains("42 AS value") && !display.contains("Float64(42) AS value") {
-            panic!("Plan does not contain expected literal projection:\n{}", display);
-        }
+        assert!(
+            display.contains("42 AS value") || display.contains("Float64(42) AS value"),
+            "Plan does not contain expected literal projection:\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -746,16 +790,14 @@ mod tests {
         let expr = LogQLExpr::Log(log_expr);
 
         let plan = planner.plan(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
         // Verify limit node is present with default value (100)
-        let expected_limit = format!("Limit: skip=0, fetch={}", DEFAULT_LOG_LIMIT);
-        if !display.contains(&expected_limit) {
-            panic!(
-                "Plan does not contain expected limit node '{}':\n{}",
-                expected_limit, display
-            );
-        }
+        let expected_limit = format!("Limit: skip=0, fetch={DEFAULT_LOG_LIMIT}");
+        assert!(
+            display.contains(&expected_limit),
+            "Plan does not contain expected limit node '{expected_limit}':\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -769,15 +811,13 @@ mod tests {
         let expr = LogQLExpr::Log(log_expr);
 
         let plan = planner.plan(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
         // Verify limit node uses custom value
-        if !display.contains("Limit: skip=0, fetch=50") {
-            panic!(
-                "Plan does not contain expected limit 'Limit: skip=0, fetch=50':\n{}",
-                display
-            );
-        }
+        assert!(
+            display.contains("Limit: skip=0, fetch=50"),
+            "Plan does not contain expected limit 'Limit: skip=0, fetch=50':\n{display}"
+        );
     }
 
     #[tokio::test]
@@ -787,14 +827,12 @@ mod tests {
 
         let expr = LogQLExpr::Metric(MetricExpr::Literal(42.0));
         let plan = planner.plan(expr).await.expect("Planning failed");
-        let display = format!("{}", plan.display_indent());
+        let display = plan.display_indent().to_string();
 
         // Verify no limit node for metric queries
-        if display.contains("Limit:") {
-            panic!(
-                "Metric query should not have limit node:\n{}",
-                display
-            );
-        }
+        assert!(
+            !display.contains("Limit:"),
+            "Metric query should not have limit node:\n{display}"
+        );
     }
 }

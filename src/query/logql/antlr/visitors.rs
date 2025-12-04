@@ -1,30 +1,34 @@
 //! Visitor implementations for converting ANTLR parse tree to `LogQL` AST.
 //!
-//! This module provides visitor structs that implement `LogQLParserVisitorCompat`
-//! to transform the ANTLR parse tree into the typed `LogQL` AST representation.
+//! This module provides visitor structs that implement
+//! `LogQLParserVisitorCompat` to transform the ANTLR parse tree into the typed
+//! `LogQL` AST representation.
 
 use std::rc::Rc;
 
 use antlr4rust::tree::{ParseTree, ParseTreeVisitorCompat};
 
-use crate::common::errors::{IceGateError, ParseError};
-use crate::common::Result;
-use crate::query::logql::common::{
-    ComparisonOp, Duration, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp,
-};
-use crate::query::logql::expr::LogQLExpr;
-use crate::query::logql::log::{
-    LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr, LogParser, PipelineStage,
-    Selector, UnwrapConversion, UnwrapExpr,
-};
-use crate::query::logql::metric::{
-    AtModifier, BinaryOp, BinaryOpModifier, MatchingLabels, MetricExpr, RangeAggregation, RangeAggregationOp,
-    RangeExpr, VectorAggregation, VectorAggregationOp, VectorMatchCardinality, VectorMatching,
-};
-
 use super::LogQLParserVisitorCompat;
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::{
+    common::{
+        errors::{IceGateError, ParseError},
+        Result,
+    },
+    query::logql::{
+        common::{ComparisonOp, Duration, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp},
+        expr::LogQLExpr,
+        log::{
+            LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr, LogParser,
+            PipelineStage, Selector, UnwrapConversion, UnwrapExpr,
+        },
+        metric::{
+            AtModifier, BinaryOp, BinaryOpModifier, MatchingLabels, MetricExpr, RangeAggregation, RangeAggregationOp,
+            RangeExpr, VectorAggregation, VectorAggregationOp, VectorMatchCardinality, VectorMatching,
+        },
+    },
+};
 
 // ============================================================================
 // Wrapper type for visitor results (implements Default for ANTLR compatibility)
@@ -189,8 +193,7 @@ fn parse_number(text: &str) -> Result<f64> {
     // Handle hex numbers
     if text.starts_with("0x") || text.starts_with("0X") {
         let hex_str = &text[2..];
-        let value =
-            u64::from_str_radix(hex_str, 16).map_err(|_| parse_error(format!("Invalid hex number: {text}")))?;
+        let value = u64::from_str_radix(hex_str, 16).map_err(|_| parse_error(format!("Invalid hex number: {text}")))?;
         // Check if conversion would lose precision (f64 mantissa is 52 bits)
         if value > (1u64 << 52) {
             return Err(parse_error(format!(
@@ -485,7 +488,8 @@ fn visit_matcher(ctx: &MatcherContextAll) -> Result<LabelMatcher> {
 
 /// Collect pipeline stages from a recursive pipelineExpr.
 fn collect_pipeline_stages(ctx: &PipelineExprContextAll) -> Result<Vec<PipelineStage>> {
-    // Handle the recursive structure: pipelineExpr : pipelineStage | pipelineExpr pipelineStage
+    // Handle the recursive structure: pipelineExpr : pipelineStage | pipelineExpr
+    // pipelineStage
     fn collect_recursive(ctx: &PipelineExprContextAll, stages: &mut Vec<PipelineStage>) -> Result<()> {
         // If there's a nested pipelineExpr, process it first (left recursion)
         if let Some(nested) = ctx.pipelineExpr() {
@@ -1136,7 +1140,8 @@ fn collect_grouping_label_strings(ctx: &BinOpGroupingLabelsContextAll) -> Result
 }
 
 fn collect_labels_from_list(ctx: &GroupingLabelListContextAll, labels: &mut Vec<String>) -> Result<()> {
-    // Handle recursive structure: groupingLabelList COMMA groupingLabel | groupingLabel
+    // Handle recursive structure: groupingLabelList COMMA groupingLabel |
+    // groupingLabel
     if let Some(nested_list) = ctx.groupingLabelList() {
         collect_labels_from_list(&nested_list, labels)?;
     }
