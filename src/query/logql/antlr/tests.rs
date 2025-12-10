@@ -4,9 +4,10 @@
 use antlr4rust::{
     common_token_stream::CommonTokenStream, input_stream::InputStream, tree::ParseTree, Parser as AntlrParserTrait,
 };
+use chrono::TimeDelta;
 
 use super::*;
-use crate::query::logql::{common::*, expr::*, log::*, metric::*, parser::Parser}; // Import the Parser trait
+use crate::query::logql::{expr::*, log::*, metric::*, parser::Parser}; // Import the Parser trait
 
 /// Helper that expects parsing to succeed and match the expected expression
 fn assert_parses_to(query: &str, expected: &LogQLExpr) {
@@ -366,7 +367,7 @@ fn test_count_over_time() {
             RangeAggregationOp::CountOverTime,
             RangeExpr::new(
                 LogExpr::new(Selector::new(vec![LabelMatcher::eq("job", "mysql")])),
-                Duration::from_mins(5),
+                TimeDelta::minutes(5),
             ),
         ))),
     );
@@ -424,7 +425,7 @@ fn test_vector_aggregations() {
                 RangeAggregationOp::Rate,
                 RangeExpr::new(
                     LogExpr::new(Selector::new(vec![LabelMatcher::eq("job", "mysql")])),
-                    Duration::from_mins(5),
+                    TimeDelta::minutes(5),
                 ),
             )),
         ))),
@@ -499,7 +500,7 @@ fn test_arithmetic_operators() {
                 RangeAggregationOp::Rate,
                 RangeExpr::new(
                     LogExpr::new(Selector::new(vec![LabelMatcher::eq("job", "a")])),
-                    Duration::from_mins(5),
+                    TimeDelta::minutes(5),
                 ),
             ))),
             op: BinaryOp::Mul,
@@ -840,4 +841,53 @@ fn test_field_names_not_keywords() {
 
     // Complex: using both field name and conversion function
     assert_parses(r#"sum_over_time({job="app"} | json | duration > 10s | unwrap bytes(response_size) [5m])"#);
+}
+
+// ==================== Compound Duration Tests ====================
+
+#[test]
+fn test_compound_duration_in_range() {
+    // Simple compound durations in range brackets
+    assert_parses(r#"count_over_time({job="mysql"}[1h30m])"#);
+    assert_parses(r#"rate({job="app"}[2d5h])"#);
+    assert_parses(r#"bytes_over_time({job="api"}[5m30s])"#);
+}
+
+#[test]
+fn test_compound_duration_full() {
+    // Full compound duration with all units
+    assert_parses(r#"count_over_time({job="mysql"}[5y2w3d4h5m6s])"#);
+}
+
+#[test]
+fn test_compound_duration_with_subsecond() {
+    // Compound duration with milliseconds and smaller
+    assert_parses(r#"count_over_time({job="mysql"}[1s500ms])"#);
+    assert_parses(r#"rate({job="app"}[100ms50us])"#);
+}
+
+#[test]
+fn test_compound_duration_in_offset() {
+    // Compound duration in offset modifier
+    assert_parses(r#"rate({job="mysql"}[5m] offset 1h30m)"#);
+    assert_parses(r#"count_over_time({job="app"}[1m] offset 2d5h30m)"#);
+}
+
+#[test]
+fn test_compound_duration_combined() {
+    // Compound durations in both range and offset
+    assert_parses(r#"count_over_time({job="db"}[5m30s] offset 1h30m)"#);
+    assert_parses(r#"rate({job="app"} | json [5m30s] offset 1h30m)"#);
+}
+
+#[test]
+fn test_simple_durations_still_work() {
+    // Verify simple durations still work after compound support
+    assert_parses(r#"rate({job="mysql"}[5m])"#);
+    assert_parses(r#"rate({job="mysql"}[1h])"#);
+    assert_parses(r#"rate({job="mysql"}[30s])"#);
+    assert_parses(r#"rate({job="mysql"}[100ms])"#);
+    assert_parses(r#"rate({job="mysql"}[1d])"#);
+    assert_parses(r#"rate({job="mysql"}[1w])"#);
+    assert_parses(r#"rate({job="mysql"}[1y])"#);
 }

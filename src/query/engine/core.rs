@@ -40,8 +40,8 @@ struct CachedProvider {
 /// engine.start_refresh_task(cancel_token);
 ///
 /// // In handlers:
-/// let ctx = engine.create_session().await?;
-/// // Use ctx for query execution...
+/// let session_ctx = engine.create_session().await?;
+/// // Use session_ctx for query execution...
 /// ```
 pub struct QueryEngine {
     /// Iceberg catalog for accessing tables
@@ -96,7 +96,7 @@ impl QueryEngine {
             .build();
 
         // Create SessionContext
-        let ctx = SessionContext::new_with_state(session_state);
+        let session_ctx = SessionContext::new_with_state(session_state);
 
         // Get cached provider and register catalog
         let guard = self.cached_provider.read().await;
@@ -106,9 +106,9 @@ impl QueryEngine {
         let provider = Arc::clone(&cached.provider);
         drop(guard);
 
-        ctx.register_catalog(&self.config.catalog_name, provider);
+        session_ctx.register_catalog(&self.config.catalog_name, provider);
 
-        Ok(ctx)
+        Ok(session_ctx)
     }
 
     /// Refresh the cached `IcebergCatalogProvider`

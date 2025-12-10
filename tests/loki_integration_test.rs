@@ -27,6 +27,7 @@ use iceberg::{
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            rolling_writer::RollingFileWriterBuilder,
             ParquetWriterBuilder,
         },
         IcebergWriter, IcebergWriterBuilder,
@@ -174,16 +175,17 @@ async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Result<()
     let parquet_writer_builder = ParquetWriterBuilder::new(
         WriterProperties::builder().build(),
         table.metadata().current_schema().clone(),
-        None,
+    );
+
+    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
         table.file_io().clone(),
         location_generator,
         file_name_generator,
     );
 
-    // Use the table's default partition spec id (0 for unpartitioned tables)
-    let partition_spec_id = table.metadata().default_partition_spec().spec_id();
-    let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec_id);
-    let mut data_file_writer = data_file_writer_builder.build().await?;
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+    let mut data_file_writer = data_file_writer_builder.build(None).await?;
 
     data_file_writer.write(batch).await?;
     let data_files = data_file_writer.close().await?;
@@ -467,6 +469,636 @@ async fn test_loki_explain_endpoint() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(body["status"], "error");
     assert_eq!(body["errorType"], "bad_data");
     assert!(body["error"].as_str().unwrap().contains("Parse error"));
+
+    // Cleanup
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_loki_query_range_metric_response() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Configure catalog and Loki server
+    let warehouse_path = tempfile::tempdir()?;
+    let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
+
+    let catalog_config = CatalogConfig {
+        backend: CatalogBackend::Memory,
+        warehouse: warehouse_str.clone(),
+        properties: std::collections::HashMap::default(),
+    };
+
+    let loki_config = LokiConfig {
+        enabled: true,
+        host: "127.0.0.1".to_string(),
+        port: 3103, // Use different port to avoid conflicts
+    };
+
+    // 2. Initialize catalog
+    let catalog = CatalogBuilder::from_config(&catalog_config).await?;
+
+    // 3. Create namespace and table
+    let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+
+    if !catalog.namespace_exists(&namespace_ident).await? {
+        catalog
+            .create_namespace(&namespace_ident, std::collections::HashMap::new())
+            .await?;
+    }
+
+    let schema = schema::logs_schema()?;
+
+    let table_creation = iceberg::TableCreation::builder()
+        .name(LOGS_TABLE.to_string())
+        .schema(schema)
+        .build();
+
+    let _ = catalog.create_table(&namespace_ident, table_creation).await?;
+
+    // 4. Insert test data
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    // 5. Start Loki Server
+    let query_engine = Arc::new(
+        QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
+            .await
+            .expect("Failed to create QueryEngine"),
+    );
+    let server_loki_config = loki_config.clone();
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let server_engine = Arc::clone(&query_engine);
+
+    let server_handle = tokio::spawn(async move {
+        icegate::query::loki::run(server_engine, server_loki_config, cancel_token_clone)
+            .await
+            .unwrap();
+    });
+
+    // Wait for server to start
+    sleep(Duration::from_secs(2)).await;
+
+    // 6. Query with metric expression (count_over_time)
+    let client = Client::new();
+    let resp = client
+        .get("http://127.0.0.1:3103/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            ("query", "count_over_time({service_name=\"frontend\"}[5m])"),
+            ("step", "60s"), // Use duration format with 's' suffix
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    // Verify metric response format
+    assert_eq!(
+        body["data"]["resultType"], "matrix",
+        "Metric queries should return resultType 'matrix', got: {}",
+        body["data"]["resultType"]
+    );
+
+    // Result should have metric key (not stream)
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    if !result.is_empty() {
+        let series = &result[0];
+
+        // Metric queries use "metric" key for labels (not "stream")
+        assert!(
+            series["metric"].is_object(),
+            "metric series should have 'metric' labels, got: {}",
+            series
+        );
+        assert!(series["stream"].is_null(), "metric series should NOT have 'stream' key");
+
+        // Values should be [timestamp, value] pairs
+        let values = series["values"].as_array().expect("values should be an array");
+        if !values.is_empty() {
+            let sample = &values[0];
+            let sample_array = sample.as_array().expect("sample should be an array");
+            assert_eq!(
+                sample_array.len(),
+                2,
+                "sample should have 2 elements [timestamp, value]"
+            );
+
+            // Timestamp should be a number (decimal seconds)
+            assert!(
+                sample_array[0].is_number(),
+                "timestamp should be a number (decimal seconds), got: {}",
+                sample_array[0]
+            );
+
+            // Value should be a string (numeric value as string)
+            assert!(
+                sample_array[1].is_string(),
+                "value should be a string, got: {}",
+                sample_array[1]
+            );
+        }
+    }
+
+    // Verify stats are present
+    assert!(
+        body["data"]["stats"]["summary"]["execTime"].is_number(),
+        "execTime should be present"
+    );
+
+    // Cleanup
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_loki_query_range_bytes_over_time_metric() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Configure catalog and Loki server
+    let warehouse_path = tempfile::tempdir()?;
+    let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
+
+    let catalog_config = CatalogConfig {
+        backend: CatalogBackend::Memory,
+        warehouse: warehouse_str.clone(),
+        properties: std::collections::HashMap::default(),
+    };
+
+    let loki_config = LokiConfig {
+        enabled: true,
+        host: "127.0.0.1".to_string(),
+        port: 3104, // Use different port to avoid conflicts
+    };
+
+    // 2. Initialize catalog
+    let catalog = CatalogBuilder::from_config(&catalog_config).await?;
+
+    // 3. Create namespace and table
+    let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+
+    if !catalog.namespace_exists(&namespace_ident).await? {
+        catalog
+            .create_namespace(&namespace_ident, std::collections::HashMap::new())
+            .await?;
+    }
+
+    let schema = schema::logs_schema()?;
+
+    let table_creation = iceberg::TableCreation::builder()
+        .name(LOGS_TABLE.to_string())
+        .schema(schema)
+        .build();
+
+    let _ = catalog.create_table(&namespace_ident, table_creation).await?;
+
+    // 4. Insert test data
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    // 5. Start Loki Server
+    let query_engine = Arc::new(
+        QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
+            .await
+            .expect("Failed to create QueryEngine"),
+    );
+    let server_loki_config = loki_config.clone();
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let server_engine = Arc::clone(&query_engine);
+
+    let server_handle = tokio::spawn(async move {
+        icegate::query::loki::run(server_engine, server_loki_config, cancel_token_clone)
+            .await
+            .unwrap();
+    });
+
+    // Wait for server to start
+    sleep(Duration::from_secs(2)).await;
+
+    // 6. Query with bytes_over_time metric expression
+    let client = Client::new();
+    let resp = client
+        .get("http://127.0.0.1:3104/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[("query", "bytes_over_time({service_name=\"frontend\"}[5m])"), ("step", "60s")])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+    assert_eq!(
+        body["data"]["resultType"], "matrix",
+        "bytes_over_time() should return matrix type"
+    );
+
+    // Verify matrix structure
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    if !result.is_empty() {
+        let series = &result[0];
+        assert!(series["metric"].is_object(), "should have 'metric' key for labels");
+
+        // Values should contain numeric byte counts
+        let values = series["values"].as_array().expect("values should be an array");
+        if !values.is_empty() {
+            let sample = &values[0];
+            let sample_array = sample.as_array().expect("sample should be an array");
+            // Value should be parseable as a number (byte count)
+            let value_str = sample_array[1].as_str().expect("value should be a string");
+            assert!(
+                value_str.parse::<f64>().is_ok(),
+                "value should be a numeric string, got: {}",
+                value_str
+            );
+        }
+    }
+
+    // Cleanup
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_loki_log_vs_metric_response_types() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies the difference between log and metric query responses
+    let warehouse_path = tempfile::tempdir()?;
+    let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
+
+    let catalog_config = CatalogConfig {
+        backend: CatalogBackend::Memory,
+        warehouse: warehouse_str.clone(),
+        properties: std::collections::HashMap::default(),
+    };
+
+    let loki_config = LokiConfig {
+        enabled: true,
+        host: "127.0.0.1".to_string(),
+        port: 3105, // Use different port to avoid conflicts
+    };
+
+    let catalog = CatalogBuilder::from_config(&catalog_config).await?;
+
+    let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+
+    if !catalog.namespace_exists(&namespace_ident).await? {
+        catalog
+            .create_namespace(&namespace_ident, std::collections::HashMap::new())
+            .await?;
+    }
+
+    let schema = schema::logs_schema()?;
+
+    let table_creation = iceberg::TableCreation::builder()
+        .name(LOGS_TABLE.to_string())
+        .schema(schema)
+        .build();
+
+    let _ = catalog.create_table(&namespace_ident, table_creation).await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    let query_engine = Arc::new(
+        QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
+            .await
+            .expect("Failed to create QueryEngine"),
+    );
+    let server_loki_config = loki_config.clone();
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let server_engine = Arc::clone(&query_engine);
+
+    let server_handle = tokio::spawn(async move {
+        icegate::query::loki::run(server_engine, server_loki_config, cancel_token_clone)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_secs(2)).await;
+
+    let client = Client::new();
+
+    // Test 1: Log query should return "streams" with "stream" labels
+    let log_resp = client
+        .get("http://127.0.0.1:3105/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[("query", "{service_name=\"frontend\"}")])
+        .send()
+        .await?;
+
+    let log_body: Value = log_resp.json().await?;
+    assert_eq!(
+        log_body["data"]["resultType"], "streams",
+        "Log query should return 'streams'"
+    );
+
+    let log_result = log_body["data"]["result"].as_array().unwrap();
+    if !log_result.is_empty() {
+        assert!(
+            log_result[0]["stream"].is_object(),
+            "Log query should have 'stream' key"
+        );
+        assert!(
+            log_result[0]["metric"].is_null(),
+            "Log query should NOT have 'metric' key"
+        );
+
+        // Log timestamps are nanosecond strings
+        let log_values = log_result[0]["values"].as_array().unwrap();
+        if !log_values.is_empty() {
+            assert!(
+                log_values[0][0].is_string(),
+                "Log timestamps should be strings (nanoseconds)"
+            );
+        }
+    }
+
+    // Test 2: Metric query should return "matrix" with "metric" labels
+    let metric_resp = client
+        .get("http://127.0.0.1:3105/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[("query", "count_over_time({service_name=\"frontend\"}[5m])"), ("step", "60s")])
+        .send()
+        .await?;
+
+    let metric_body: Value = metric_resp.json().await?;
+    assert_eq!(
+        metric_body["data"]["resultType"], "matrix",
+        "Metric query should return 'matrix'"
+    );
+
+    let metric_result = metric_body["data"]["result"].as_array().unwrap();
+    if !metric_result.is_empty() {
+        assert!(
+            metric_result[0]["metric"].is_object(),
+            "Metric query should have 'metric' key"
+        );
+        assert!(
+            metric_result[0]["stream"].is_null(),
+            "Metric query should NOT have 'stream' key"
+        );
+
+        // Metric timestamps are decimal seconds (numbers)
+        let metric_values = metric_result[0]["values"].as_array().unwrap();
+        if !metric_values.is_empty() {
+            assert!(
+                metric_values[0][0].is_number(),
+                "Metric timestamps should be numbers (decimal seconds)"
+            );
+        }
+    }
+
+    // Cleanup
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_loki_query_range_rate() -> Result<(), Box<dyn std::error::Error>> {
+    // Test rate() function - counts logs per second over a time range
+    let warehouse_path = tempfile::tempdir()?;
+    let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
+
+    let catalog_config = CatalogConfig {
+        backend: CatalogBackend::Memory,
+        warehouse: warehouse_str.clone(),
+        properties: std::collections::HashMap::default(),
+    };
+
+    let loki_config = LokiConfig {
+        enabled: true,
+        host: "127.0.0.1".to_string(),
+        port: 3106,
+    };
+
+    let catalog = CatalogBuilder::from_config(&catalog_config).await?;
+
+    let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+
+    if !catalog.namespace_exists(&namespace_ident).await? {
+        catalog
+            .create_namespace(&namespace_ident, std::collections::HashMap::new())
+            .await?;
+    }
+
+    let schema = schema::logs_schema()?;
+
+    let table_creation = iceberg::TableCreation::builder()
+        .name(LOGS_TABLE.to_string())
+        .schema(schema)
+        .build();
+
+    let _ = catalog.create_table(&namespace_ident, table_creation).await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    let query_engine = Arc::new(
+        QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
+            .await
+            .expect("Failed to create QueryEngine"),
+    );
+    let server_loki_config = loki_config.clone();
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let server_engine = Arc::clone(&query_engine);
+
+    let server_handle = tokio::spawn(async move {
+        icegate::query::loki::run(server_engine, server_loki_config, cancel_token_clone)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_secs(2)).await;
+
+    let client = Client::new();
+
+    // Query with rate() - should return matrix format with per-second rate
+    let resp = client
+        .get("http://127.0.0.1:3106/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[("query", "rate({service_name=\"frontend\"}[5m])"), ("step", "60s")])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+    assert_eq!(
+        body["data"]["resultType"], "matrix",
+        "rate() should return matrix type, got: {}",
+        body["data"]["resultType"]
+    );
+
+    // Verify matrix structure
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    if !result.is_empty() {
+        let series = &result[0];
+        assert!(series["metric"].is_object(), "should have 'metric' key for labels");
+
+        // Values should be rate values (count / range_seconds)
+        let values = series["values"].as_array().expect("values should be an array");
+        if !values.is_empty() {
+            let sample = &values[0];
+            let sample_array = sample.as_array().expect("sample should be an array");
+
+            // Timestamp should be decimal seconds
+            assert!(
+                sample_array[0].is_number(),
+                "timestamp should be a number, got: {}",
+                sample_array[0]
+            );
+
+            // Value should be a numeric string (rate per second)
+            let value_str = sample_array[1].as_str().expect("value should be a string");
+            let rate_value: f64 = value_str.parse().expect("value should be parseable as f64");
+            assert!(
+                rate_value >= 0.0,
+                "rate value should be non-negative, got: {}",
+                rate_value
+            );
+        }
+    }
+
+    // Cleanup
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_loki_query_range_bytes_rate() -> Result<(), Box<dyn std::error::Error>> {
+    // Test bytes_rate() function - bytes per second over a time range
+    let warehouse_path = tempfile::tempdir()?;
+    let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
+
+    let catalog_config = CatalogConfig {
+        backend: CatalogBackend::Memory,
+        warehouse: warehouse_str.clone(),
+        properties: std::collections::HashMap::default(),
+    };
+
+    let loki_config = LokiConfig {
+        enabled: true,
+        host: "127.0.0.1".to_string(),
+        port: 3107,
+    };
+
+    let catalog = CatalogBuilder::from_config(&catalog_config).await?;
+
+    let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+
+    if !catalog.namespace_exists(&namespace_ident).await? {
+        catalog
+            .create_namespace(&namespace_ident, std::collections::HashMap::new())
+            .await?;
+    }
+
+    let schema = schema::logs_schema()?;
+
+    let table_creation = iceberg::TableCreation::builder()
+        .name(LOGS_TABLE.to_string())
+        .schema(schema)
+        .build();
+
+    let _ = catalog.create_table(&namespace_ident, table_creation).await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    let query_engine = Arc::new(
+        QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
+            .await
+            .expect("Failed to create QueryEngine"),
+    );
+    let server_loki_config = loki_config.clone();
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let server_engine = Arc::clone(&query_engine);
+
+    let server_handle = tokio::spawn(async move {
+        icegate::query::loki::run(server_engine, server_loki_config, cancel_token_clone)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_secs(2)).await;
+
+    let client = Client::new();
+
+    // Query with bytes_rate() - should return matrix format with bytes per second
+    let resp = client
+        .get("http://127.0.0.1:3107/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[("query", "bytes_rate({service_name=\"frontend\"}[5m])"), ("step", "60s")])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+    assert_eq!(
+        body["data"]["resultType"], "matrix",
+        "bytes_rate() should return matrix type, got: {}",
+        body["data"]["resultType"]
+    );
+
+    // Verify matrix structure
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    if !result.is_empty() {
+        let series = &result[0];
+        assert!(series["metric"].is_object(), "should have 'metric' key for labels");
+
+        // Values should be byte rate values (sum(bytes) / range_seconds)
+        let values = series["values"].as_array().expect("values should be an array");
+        if !values.is_empty() {
+            let sample = &values[0];
+            let sample_array = sample.as_array().expect("sample should be an array");
+
+            // Timestamp should be decimal seconds
+            assert!(
+                sample_array[0].is_number(),
+                "timestamp should be a number, got: {}",
+                sample_array[0]
+            );
+
+            // Value should be a numeric string (bytes per second)
+            let value_str = sample_array[1].as_str().expect("value should be a string");
+            let rate_value: f64 = value_str.parse().expect("value should be parseable as f64");
+            assert!(
+                rate_value >= 0.0,
+                "bytes_rate value should be non-negative, got: {}",
+                rate_value
+            );
+        }
+    }
 
     // Cleanup
     cancel_token.cancel();

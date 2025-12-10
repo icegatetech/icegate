@@ -890,6 +890,12 @@ pub fn metrics_sort_order(schema: &Schema) -> Result<SortOrder> {
     Ok(sort_order)
 }
 
+/// Indexed attribute columns for metric/log label extraction.
+///
+/// Used by both planner (for grouping) and handlers (for output).
+/// These columns are extracted as top-level fields from query results.
+pub const INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &["account_id", "service_name", "trace_id", "span_id", "severity_text"];
+
 #[cfg(test)]
 mod tests {
     use super::*;

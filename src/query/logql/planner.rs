@@ -3,7 +3,7 @@
 //! This module defines the `Planner` trait that abstracts over different
 //! execution plan implementations (e.g., DataFusion LogicalPlan).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use super::expr::LogQLExpr;
 use crate::common::Result;
@@ -25,7 +25,7 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 /// # Examples
 ///
 /// ```
-/// use chrono::Duration;
+/// use chrono::TimeDelta;
 /// use datafusion::prelude::SessionContext;
 /// use icegate::query::logql::{
 ///     datafusion::DataFusionPlanner,
@@ -38,7 +38,7 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 /// let query_context = QueryContext {
 ///     tenant_id: "tenant-1".to_string(),
 ///     start: chrono::Utc::now(),
-///     end: chrono::Utc::now() + Duration::hours(1),
+///     end: chrono::Utc::now() + TimeDelta::hours(1),
 ///     limit: None,
 ///     step: None,
 /// };
@@ -58,8 +58,8 @@ pub struct QueryContext {
     pub end: DateTime<Utc>,
     /// Max number of results to return
     pub limit: Option<usize>,
-    /// Step size for range queries in nanoseconds
-    pub step: Option<i64>,
+    /// Step size for range queries
+    pub step: Option<TimeDelta>,
 }
 
 /// A trait for planning `LogQL` expressions into execution plans.

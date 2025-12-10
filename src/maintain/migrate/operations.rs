@@ -5,7 +5,6 @@ use std::{collections::HashMap, sync::Arc};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::common::{
-    errors::IceGateError,
     schema::{
         events_partition_spec, events_schema, events_sort_order, logs_partition_spec, logs_schema, logs_sort_order,
         metrics_partition_spec, metrics_schema, metrics_sort_order, spans_partition_spec, spans_schema,
@@ -122,7 +121,7 @@ pub async fn create_tables(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Result<
         let table_ident = TableIdent::new(namespace.clone(), def.name.to_string());
 
         // Check if table already exists
-        let exists = catalog_ref.table_exists(&table_ident).await.map_err(IceGateError::Iceberg)?;
+        let exists = catalog_ref.table_exists(&table_ident).await?;
 
         if exists {
             tracing::info!("Table {} already exists, skipping", def.name);
@@ -147,7 +146,7 @@ pub async fn create_tables(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Result<
 
 /// Ensure the namespace exists, creating it if necessary
 async fn ensure_namespace_exists(catalog: &dyn Catalog, namespace: &NamespaceIdent) -> Result<()> {
-    let exists = catalog.namespace_exists(namespace).await.map_err(IceGateError::Iceberg)?;
+    let exists = catalog.namespace_exists(namespace).await?;
 
     if !exists {
         tracing::info!("Creating namespace: {}", namespace);
@@ -155,10 +154,7 @@ async fn ensure_namespace_exists(catalog: &dyn Catalog, namespace: &NamespaceIde
             ("owner".to_string(), "icegate".to_string()),
             ("description".to_string(), "IceGate observability data".to_string()),
         ]);
-        catalog
-            .create_namespace(namespace, properties)
-            .await
-            .map_err(IceGateError::Iceberg)?;
+        catalog.create_namespace(namespace, properties).await?;
     }
 
     Ok(())
@@ -177,10 +173,7 @@ async fn create_table(catalog: &dyn Catalog, namespace: &NamespaceIdent, def: &T
         ]))
         .build();
 
-    catalog
-        .create_table(namespace, table_creation)
-        .await
-        .map_err(IceGateError::Iceberg)?;
+    catalog.create_table(namespace, table_creation).await?;
 
     Ok(())
 }
@@ -219,7 +212,7 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
         let table_ident = TableIdent::new(namespace.clone(), def.name.to_string());
 
         // Check if table exists
-        let exists = catalog_ref.table_exists(&table_ident).await.map_err(IceGateError::Iceberg)?;
+        let exists = catalog_ref.table_exists(&table_ident).await?;
 
         if !exists {
             tracing::warn!(
@@ -230,7 +223,7 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
         }
 
         // Load table and check schema
-        let table = catalog_ref.load_table(&table_ident).await.map_err(IceGateError::Iceberg)?;
+        let table = catalog_ref.load_table(&table_ident).await?;
 
         let current_schema = table.metadata().current_schema();
         let target_schema = &def.schema;
@@ -278,8 +271,8 @@ fn schemas_differ(current: &iceberg::spec::Schema, target: &iceberg::spec::Schem
     for target_field in target_fields {
         match current.field_by_name(target_field.name.as_str()) {
             Some(current_field) => {
-                // Check if types match (simplified comparison)
-                if format!("{:?}", current_field.field_type) != format!("{:?}", target_field.field_type) {
+                // Check if types match structurally (ignoring field IDs)
+                if !types_equal(&current_field.field_type, &target_field.field_type) {
                     return true;
                 }
                 // Check required flag
@@ -295,6 +288,43 @@ fn schemas_differ(current: &iceberg::spec::Schema, target: &iceberg::spec::Schem
     }
 
     false
+}
+
+/// Compare two Iceberg types for structural equality (ignoring field IDs).
+///
+/// This is needed because schemas loaded from the catalog may have different
+/// field IDs than freshly constructed schemas, even when semantically
+/// identical.
+fn types_equal(a: &iceberg::spec::Type, b: &iceberg::spec::Type) -> bool {
+    use iceberg::spec::Type;
+
+    match (a, b) {
+        (Type::Primitive(pa), Type::Primitive(pb)) => pa == pb,
+        (Type::Struct(sa), Type::Struct(sb)) => {
+            let fields_a = sa.fields();
+            let fields_b = sb.fields();
+            if fields_a.len() != fields_b.len() {
+                return false;
+            }
+            // Compare fields by name and type (ignoring IDs)
+            for (fa, fb) in fields_a.iter().zip(fields_b.iter()) {
+                if fa.name != fb.name || fa.required != fb.required || !types_equal(&fa.field_type, &fb.field_type) {
+                    return false;
+                }
+            }
+            true
+        },
+        (Type::List(la), Type::List(lb)) => {
+            la.element_field.required == lb.element_field.required
+                && types_equal(&la.element_field.field_type, &lb.element_field.field_type)
+        },
+        (Type::Map(ma), Type::Map(mb)) => {
+            types_equal(&ma.key_field.field_type, &mb.key_field.field_type)
+                && ma.value_field.required == mb.value_field.required
+                && types_equal(&ma.value_field.field_type, &mb.value_field.field_type)
+        },
+        _ => false, // Different type variants
+    }
 }
 
 /// Log differences between two schemas
@@ -326,7 +356,7 @@ fn log_schema_differences(table_name: &str, current: &iceberg::spec::Schema, tar
     // Find modified fields
     for target_field in target_fields {
         if let Some(current_field) = current.field_by_name(target_field.name.as_str()) {
-            let type_changed = format!("{:?}", current_field.field_type) != format!("{:?}", target_field.field_type);
+            let type_changed = !types_equal(&current_field.field_type, &target_field.field_type);
             let required_changed = current_field.required != target_field.required;
 
             if type_changed || required_changed {

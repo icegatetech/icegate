@@ -1,6 +1,8 @@
 //! Log query expression types for LogQL.
 
-use super::common::{ComparisonOp, Duration, LabelExtraction, LabelFormatOp, MatchOp};
+use chrono::TimeDelta;
+
+use super::common::{ComparisonOp, LabelExtraction, LabelFormatOp, MatchOp};
 
 /// Log query expression: selector with optional pipeline stages.
 #[derive(Debug, Clone, PartialEq)]
@@ -303,7 +305,7 @@ pub enum LabelFilterExpr {
         /// The comparison operator.
         op: ComparisonOp,
         /// The duration value.
-        value: Duration,
+        value: TimeDelta,
     },
     /// Bytes comparison: `label > 1KB`, `label <= 1MB`
     Bytes {
@@ -356,7 +358,7 @@ impl LabelFilterExpr {
     }
 
     /// Creates a new duration comparison filter.
-    pub fn duration(label: impl Into<String>, op: ComparisonOp, value: Duration) -> Self {
+    pub fn duration(label: impl Into<String>, op: ComparisonOp, value: TimeDelta) -> Self {
         Self::Duration {
             label: label.into(),
             op,

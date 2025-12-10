@@ -6,7 +6,7 @@
 [catalog]
 # Catalog type: "memory", or struct variant with config
 # For REST catalog:
-backend = { rest = { uri = "http://localhost:8181" } }
+backend = { rest = { uri = "http://127.0.0.1:19120/iceberg" } }
 # For Memory catalog (testing):
 # backend = "memory"
 
@@ -15,6 +15,7 @@ warehouse = "s3://warehouse"
 
 # Additional catalog properties (optional)
 [catalog.properties]
+prefix = "main"
 # Add any custom catalog properties here
 
 # Storage Configuration
@@ -23,7 +24,7 @@ warehouse = "s3://warehouse"
 # For S3 storage:
 # backend = { s3 = { bucket = "warehouse", region = "us-east-1" } }
 # For S3 with custom endpoint:
-backend = { s3 = { bucket = "warehouse", region = "us-east-1", endpoint = "https://localhost:9100" } }
+backend = { s3 = { bucket = "warehouse", region = "us-east-1", endpoint = "https://127.0.0.1:9100" } }
 # For FileSystem storage:
 # backend = { filesystem = { root_path = "/var/lib/icegate/data" } }
 # For Memory storage (testing):
@@ -35,11 +36,11 @@ backend = { s3 = { bucket = "warehouse", region = "us-east-1", endpoint = "https
 # OTLP HTTP Server
 [otlp_http]
 enabled = true
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 4318
 
 # OTLP gRPC Server
 [otlp_grpc]
 enabled = true
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 4317

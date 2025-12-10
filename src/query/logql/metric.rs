@@ -1,7 +1,9 @@
 //! Metric query expression types for LogQL.
 
+use chrono::TimeDelta;
+
 use super::{
-    common::{Duration, Grouping},
+    common::Grouping,
     log::{LogExpr, UnwrapExpr},
 };
 
@@ -354,9 +356,9 @@ pub struct RangeExpr {
     /// Log expression
     pub log_expr: LogExpr,
     /// Range duration
-    pub range: Duration,
+    pub range: TimeDelta,
     /// Optional offset
-    pub offset: Option<Duration>,
+    pub offset: Option<TimeDelta>,
     /// `@ <timestamp>` modifier
     pub at: Option<AtModifier>,
     /// Optional unwrap expression
@@ -365,7 +367,7 @@ pub struct RangeExpr {
 
 impl RangeExpr {
     /// Creates a new range expression.
-    pub const fn new(log_expr: LogExpr, range: Duration) -> Self {
+    pub const fn new(log_expr: LogExpr, range: TimeDelta) -> Self {
         Self {
             log_expr,
             range,
@@ -377,7 +379,7 @@ impl RangeExpr {
 
     /// Sets the offset for the range expression.
     #[must_use]
-    pub const fn with_offset(mut self, offset: Duration) -> Self {
+    pub const fn with_offset(mut self, offset: TimeDelta) -> Self {
         self.offset = Some(offset);
         self
     }

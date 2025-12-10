@@ -1,65 +1,81 @@
 //! DataFusion-based LogQL query planner.
 
-// Allow warnings for stub implementations - these will be fixed as features are implemented
-#![allow(
-    clippy::unused_self,
-    clippy::unused_async,
-    clippy::unnecessary_wraps,
-    clippy::match_same_arms,
-    clippy::let_and_return,
-    clippy::option_if_let_else,
-    clippy::items_after_statements
-)]
+// Allow warnings for stub implementations - these will be fixed as features are
+// implemented
+use std::{future::Future, pin::Pin, sync::Arc};
 
-use std::{future::Future, pin::Pin};
-
+use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::{
-    logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder},
+    arrow::{
+        datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit},
+        record_batch::RecordBatch,
+    },
+    common::Column,
+    datasource::MemTable,
+    functions_aggregate::{count::count_udaf, expr_fn::last_value, sum::sum_udaf},
+    logical_expr::{
+        col, expr::WindowFunction, lit, AggregateUDF, Expr, JoinType, ScalarUDF, WindowFrame, WindowFrameBound,
+        WindowFrameUnits, WindowFunctionDefinition,
+    },
     prelude::*,
+    scalar::ScalarValue,
 };
 
 use crate::{
-    common::{errors::IceGateError, Result, LOGS_TABLE_FQN},
+    common::{errors::IceGateError, schema::INDEXED_ATTRIBUTE_COLUMNS, Result, LOGS_TABLE_FQN},
     query::logql::{
         common::MatchOp,
         expr::LogQLExpr,
         log::{LabelMatcher, LogExpr, Selector},
         metric::MetricExpr,
         planner::{Planner, QueryContext, DEFAULT_LOG_LIMIT},
+        RangeAggregationOp,
     },
 };
 
-/// A planner that converts `LogQL` expressions into `DataFusion`
-/// `LogicalPlans`.
+/// Strips PARQUET field metadata from `DataFrame` schema.
+/// Required because Iceberg schemas include `PARQUET:field_id` metadata,
+/// but in-memory operations (`MemTable`, `map_keys`) create fields without it.
+/// This prevents Arrow schema mismatch errors during joins/unions.
+fn strip_schema_metadata(df: DataFrame) -> datafusion::error::Result<DataFrame> {
+    let select_exprs: Vec<Expr> = df
+        .schema()
+        .inner()
+        .fields()
+        .iter()
+        .map(|field| col(field.name().as_str()))
+        .collect();
+
+    df.select(select_exprs)
+}
+
+/// A planner that converts `LogQL` expressions into `DataFusion` `DataFrame`s.
 pub struct DataFusionPlanner {
-    ctx: SessionContext,
-    context: QueryContext,
+    session_ctx: SessionContext,
+    query_ctx: QueryContext,
 }
 
 impl DataFusionPlanner {
     /// Creates a new `DataFusionPlanner`.
-    pub const fn new(ctx: SessionContext, context: QueryContext) -> Self {
+    pub const fn new(session_ctx: SessionContext, query_ctx: QueryContext) -> Self {
         Self {
-            ctx,
-            context,
+            session_ctx,
+            query_ctx,
         }
     }
 }
 
 impl Planner for DataFusionPlanner {
-    type Plan = LogicalPlan;
+    type Plan = DataFrame;
 
     async fn plan(&self, expr: LogQLExpr) -> Result<Self::Plan> {
         match expr {
             LogQLExpr::Log(log_expr) => {
-                let plan = self.plan_log(log_expr).await?;
+                let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
                 // Apply limit only for log queries (not metrics)
                 // Uses context limit or Loki default of 100 entries
-                let limit = self.context.limit.unwrap_or(DEFAULT_LOG_LIMIT);
-                LogicalPlanBuilder::from(plan)
-                    .limit(0, Some(limit))?
-                    .build()
-                    .map_err(IceGateError::from)
+                let limit = self.query_ctx.limit.unwrap_or(DEFAULT_LOG_LIMIT);
+                Ok(df.limit(0, Some(limit))?)
             },
             LogQLExpr::Metric(metric_expr) => self.plan_metric(metric_expr).await,
         }
@@ -67,42 +83,38 @@ impl Planner for DataFusionPlanner {
 }
 
 impl DataFusionPlanner {
-    async fn plan_log(&self, expr: LogExpr) -> Result<LogicalPlan> {
+    async fn plan_log(&self, expr: LogExpr, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<DataFrame> {
         // 1. Scan the logs table from iceberg.icegate namespace
-        let df = self.ctx.table(LOGS_TABLE_FQN).await?;
+        let df = self.session_ctx.table(LOGS_TABLE_FQN).await?;
+
+        // 1.5 Strip Iceberg PARQUET metadata to prevent schema mismatch with in-memory
+        // tables
+        let df = strip_schema_metadata(df)?;
 
         // 2. Apply MANDATORY tenant filter (multi-tenancy isolation)
         // This filter is applied FIRST and cannot be bypassed by user queries.
         // Since tenant_id is the leading partition key, Iceberg will prune
         // non-matching partitions for efficient query execution.
-        let df = df.filter(col("tenant_id").eq(lit(&self.context.tenant_id)))?;
+        let df = df.filter(col("tenant_id").eq(lit(&self.query_ctx.tenant_id)))?;
 
         // 3. Apply time range filter
         // The timestamp column is Timestamp(Microsecond)
         // Convert DateTime<Utc> to microseconds for comparison
         let ts_col = col("timestamp");
-        let start_micros = self.context.start.timestamp_micros();
-        let end_micros = self.context.end.timestamp_micros();
-        let start_literal = lit(datafusion::scalar::ScalarValue::TimestampMicrosecond(
-            Some(start_micros),
-            None,
-        ));
-        let end_literal = lit(datafusion::scalar::ScalarValue::TimestampMicrosecond(
-            Some(end_micros),
-            None,
-        ));
+        let start_micros = start.timestamp_micros();
+        let end_micros = end.timestamp_micros();
+        let start_literal = lit(ScalarValue::TimestampMicrosecond(Some(start_micros), None));
+        let end_literal = lit(ScalarValue::TimestampMicrosecond(Some(end_micros), None));
         let df = df.filter(ts_col.clone().gt_eq(start_literal).and(ts_col.lt_eq(end_literal)))?;
 
         // 4. Apply Selector matchers
-        let df = self.apply_selector(df, expr.selector)?;
+        let df = Self::apply_selector(df, expr.selector)?;
 
         // 5. Apply Pipeline stages
-        let df = self.apply_pipeline(df, expr.pipeline)?;
-
-        Ok(df.into_unoptimized_plan())
+        self.apply_pipeline(df, expr.pipeline)
     }
 
-    fn plan_metric<'a>(&'a self, expr: MetricExpr) -> Pin<Box<dyn Future<Output = Result<LogicalPlan>> + Send + 'a>> {
+    fn plan_metric<'a>(&'a self, expr: MetricExpr) -> Pin<Box<dyn Future<Output = Result<DataFrame>> + Send + 'a>> {
         Box::pin(async move {
             match expr {
                 MetricExpr::RangeAggregation(agg) => self.plan_range_aggregation(agg).await,
@@ -113,22 +125,21 @@ impl DataFusionPlanner {
                     right,
                     modifier: _modifier,
                 } => {
-                    let _left_plan = self.plan_metric(*left).await?;
-                    let _right_plan = self.plan_metric(*right).await?;
+                    let _left_df = self.plan_metric(*left).await?;
+                    let _right_df = self.plan_metric(*right).await?;
 
                     // TODO: Implement binary operations (vector matching)
-                    // This requires joining left and right plans based on labels and timestamp,
-                    // applying the operation, and handling the modifier (on/ignoring,
-                    // group_left/right).
+                    // This requires joining left and right DataFrames based on labels and
+                    // timestamp, applying the operation, and handling the
+                    // modifier (on/ignoring, group_left/right).
                     Err(IceGateError::NotImplemented(
                         "Binary operations not yet implemented".to_string(),
                     ))
                 },
                 MetricExpr::Literal(val) => {
-                    // Return a plan with a single row containing the literal value
-                    let df = self.ctx.read_empty()?;
-                    let df = df.select(vec![lit(val).alias("value")])?;
-                    Ok(df.into_unoptimized_plan())
+                    // Return a DataFrame with a single row containing the literal value
+                    let df = self.session_ctx.read_empty()?;
+                    Ok(df.select(vec![lit(val).alias("value")])?)
                 },
                 MetricExpr::Vector(_vals) => {
                     // TODO: Implement vector literal
@@ -152,64 +163,378 @@ impl DataFusionPlanner {
         })
     }
 
-    async fn plan_range_aggregation(&self, agg: crate::query::logql::metric::RangeAggregation) -> Result<LogicalPlan> {
-        // 1. Plan the inner LogExpr
-        let df = self.plan_log(agg.range_expr.log_expr).await?;
+    async fn plan_range_aggregation(&self, agg: crate::query::logql::metric::RangeAggregation) -> Result<DataFrame> {
+        if agg.range_expr.unwrap.is_some() {
+            Ok(self.plan_unwrap_range_aggregation(agg)?)
+        } else {
+            Ok(self.plan_log_range_aggregation(agg).await?)
+        }
+    }
 
-        // 2. Apply aggregation
-        // For range aggregations like rate({}[5m]), we typically need to:
-        // a. Bucketize by time (if step is provided)
-        // b. Apply the aggregation function over the window
+    #[allow(clippy::unused_self)]
+    fn plan_unwrap_range_aggregation(&self, _agg: crate::query::logql::metric::RangeAggregation) -> Result<DataFrame> {
+        Err(IceGateError::NotImplemented(
+            "Unwrap aggregation not yet implemented".to_string(),
+        ))
+    }
 
-        // TODO: This is a complex mapping that requires window functions or specific
-        // UDAFs. For now, we will return the underlying log stream plan, but we
-        // should eventually map `agg.op` (Rate, CountOverTime, etc.) to
-        // DataFusion operations.
+    async fn plan_log_range_aggregation(
+        &self,
+        agg: crate::query::logql::metric::RangeAggregation,
+    ) -> Result<DataFrame> {
+        // 1. Plan the inner LogExpr with extended time range for lookback window
+        // For rate({job="x"}[5m]) evaluated from start to end:
+        // - Each evaluation point T needs data from (T - range) to T
+        // - So we need data from (start - range) to end
+        // - With offset: (start - range - offset) to (end - offset)
+        let offset_duration = agg.range_expr.offset.unwrap_or(TimeDelta::zero());
 
-        // Example placeholder for count_over_time:
-        // df.aggregate(vec![col("service_name")], vec![count(col("timestamp"))])?
+        // Start: context.start - range - offset (for lookback window)
+        // End: context.end - offset
+        let adjusted_start = self.query_ctx.start - agg.range_expr.range - offset_duration;
+        let adjusted_end = self.query_ctx.end - offset_duration;
+
+        let df = self.plan_log(agg.range_expr.log_expr, adjusted_start, adjusted_end).await?;
+
+        // Create data grid, cross join with unique set of labels
+        // Note: Exclude timestamp - it comes from the time grid via cross-join
+        let mut grouping_for_grid = Self::build_default_label_exprs(&[], &["attributes"]);
+        grouping_for_grid.extend(vec![
+            array_to_string(map_keys(col("attributes")), lit(",")).alias("attributes_keys"),
+            array_to_string(map_values(col("attributes")), lit(",")).alias("attributes_values"),
+        ]);
+        let timestamps = self.generate_time_grid()?;
+        let grid_df = self.create_time_grid(timestamps)?;
+
+        // Get unique label combinations and cross-join with time grid
+        let agg_df = df.clone().aggregate(grouping_for_grid, vec![
+            last_value(col("attributes"), vec![]).alias("attributes")
+        ])?;
+        let labeled_grid_df = agg_df.join(grid_df, JoinType::Inner, &[], &[], None)?.alias("grid")?;
+
+        // 2. Build time bucket expression using step from context
+        let time_bucket = self.build_time_bucket(agg.range_expr.range);
+        let window_frame = WindowFrame::new_bounds(
+            WindowFrameUnits::Range,
+            WindowFrameBound::Preceding(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+                0,
+                0,
+                agg.range_expr.range.num_nanoseconds().unwrap_or(0) + offset_duration.num_nanoseconds().unwrap_or(0),
+            )))),
+            WindowFrameBound::Preceding(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+                0,
+                0,
+                offset_duration.num_nanoseconds().unwrap_or(0),
+            )))),
+        );
+
+        let mut grouping_for_window = Self::build_default_label_exprs(&[], &["attributes"]);
+        grouping_for_window.extend(vec![map_keys(col("attributes")), map_values(col("attributes"))]);
+
+        let range_secs = agg.range_expr.range.as_seconds_f32();
+        let window_expr = match agg.op {
+            RangeAggregationOp::CountOverTime => {
+                Self::build_log_window_expr(count_udaf(), lit(1), window_frame, grouping_for_window, None)?
+            },
+            RangeAggregationOp::Rate => Self::build_log_window_expr(
+                count_udaf(),
+                lit(1),
+                window_frame,
+                grouping_for_window,
+                Some(range_secs),
+            )?,
+            RangeAggregationOp::BytesOverTime => Self::build_log_window_expr(
+                sum_udaf(),
+                octet_length(col("body")),
+                window_frame,
+                grouping_for_window,
+                None,
+            )?,
+            RangeAggregationOp::BytesRate => Self::build_log_window_expr(
+                sum_udaf(),
+                octet_length(col("body")),
+                window_frame,
+                grouping_for_window,
+                Some(range_secs),
+            )?,
+            RangeAggregationOp::AbsentOverTime => {
+                return Err(IceGateError::NotImplemented("Absent over time".to_string()));
+            },
+            _ => {
+                return Err(IceGateError::Plan(
+                    "This range aggregation requires an unwrap expression".to_string(),
+                ))
+            },
+        };
+
+        let mut select_list = Self::build_default_label_exprs(&["timestamp"], &[]);
+        select_list.extend(vec![window_expr.alias("value"), time_bucket.alias("time_bucket")]);
+        let df = df.select(select_list)?;
+        let mut agg_list = Self::build_default_label_exprs(&[], &["attributes"]);
+        agg_list.extend(vec![
+            col("time_bucket").alias("timestamp"),
+            array_to_string(map_keys(col("attributes")), lit(",")).alias("attributes_keys"),
+            array_to_string(map_values(col("attributes")), lit(",")).alias("attributes_values"),
+        ]);
+        let df = df
+            .aggregate(agg_list, vec![
+                last_value(col("value"), vec![col("timestamp").sort(true, false)]).alias("value"),
+                last_value(col("attributes"), vec![]).alias("attributes"),
+            ])?
+            .alias("origin")?;
+
+        let names: Vec<String> =
+            Self::build_default_label_columns(&["timestamp", "attributes_keys", "attributes_values"], &["attributes"]);
+        let names_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let df = labeled_grid_df.join(df, JoinType::Left, &names_refs, &names_refs, None)?;
+
+        // After LEFT JOIN, both sides have columns like severity_text, causing
+        // ambiguity. Select specific columns using qualified names: labels from
+        // grid, value from origin.
+        let mut final_select = Vec::new();
+        // Label columns from grid side (grid has all time points, origin may have gaps)
+        for name in Self::build_default_label_columns(&["timestamp"], &["attributes"]) {
+            final_select.push(col(Column::new(Some("grid"), &name)));
+        }
+        // Value from origin (NULL if no matching data point - LEFT JOIN)
+        final_select.push(col(Column::new(Some("origin"), "value")));
+        // Attributes from grid (preserved label combinations)
+        final_select.push(col(Column::new(Some("grid"), "attributes")));
+        let df = df.select(final_select)?;
 
         Ok(df)
     }
 
-    async fn plan_vector_aggregation(
-        &self,
-        agg: crate::query::logql::metric::VectorAggregation,
-    ) -> Result<LogicalPlan> {
-        // 1. Plan the inner MetricExpr
-        let df = self.plan_metric(*agg.expr).await?;
+    // ========================================================================
+    // Range Aggregation Helper Methods
+    // ========================================================================
 
-        // 2. Identify grouping columns
+    /// Builds a window expression for log-based range aggregations.
+    ///
+    /// Creates a window function with the specified aggregation function and
+    /// argument, applies the window frame, ordering, and partitioning, then
+    /// optionally divides by the rate divisor for rate calculations.
+    fn build_log_window_expr(
+        agg_func: Arc<AggregateUDF>,
+        agg_arg: Expr,
+        window_frame: WindowFrame,
+        grouping: Vec<Expr>,
+        rate_divisor: Option<f32>,
+    ) -> Result<Expr> {
+        let window_func = WindowFunction::new(WindowFunctionDefinition::from(agg_func), vec![agg_arg]);
+        let expr = Expr::from(window_func)
+            .window_frame(window_frame)
+            .order_by(vec![col("timestamp").sort(true, false)])
+            .partition_by(grouping)
+            .build()?;
+
+        Ok(match rate_divisor {
+            Some(divisor) => expr.div(lit(divisor)),
+            None => expr,
+        })
+    }
+
+    /// Converts microseconds to DataFusion interval literal for `date_bin`.
+    /// Uses microseconds since the timestamp column has microsecond precision.
+    fn micros_to_interval_literal(micros: i64) -> Expr {
+        // DataFusion IntervalMonthDayNano uses nanoseconds internally
+        let nanos = micros * 1000;
+        lit(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano {
+            months: 0,
+            days: 0,
+            nanoseconds: nanos,
+        })))
+    }
+
+    /// Creates `date_bin` expression for time bucketing.
+    /// Uses `context.step` from Loki API for bucketing, falls back to `range`
+    /// if not provided. Interval is truncated to microseconds since
+    /// timestamp column has microsecond precision.
+    fn build_time_bucket(&self, range: chrono::TimeDelta) -> Expr {
+        // TODO: rework it to use micros only precision
+        let bucket_nanos = self.query_ctx.step.unwrap_or(range).num_nanoseconds().unwrap_or(0);
+        // Truncate to microseconds (timestamp column precision)
+        let bucket_micros = bucket_nanos / 1000;
+        datafusion::functions::datetime::date_bin().call(vec![
+            Self::micros_to_interval_literal(bucket_micros),
+            col("timestamp"),
+            lit(ScalarValue::TimestampMicrosecond(
+                Some(self.query_ctx.start.timestamp_micros()),
+                None,
+            )),
+        ])
+    }
+
+    fn build_default_label_columns(with: &[&str], without: &[&str]) -> Vec<String> {
+        INDEXED_ATTRIBUTE_COLUMNS
+            .iter()
+            .copied()
+            .chain(std::iter::once("attributes"))
+            .chain(with.iter().copied())
+            .filter(|c| !without.contains(c))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn build_default_label_exprs(with: &[&str], without: &[&str]) -> Vec<Expr> {
+        Self::build_default_label_columns(with, without).into_iter().map(col).collect()
+    }
+
+    // ========================================================================
+    // Time Grid Generation (for gap filling)
+    // ========================================================================
+
+    /// Generates time bucket timestamps from start to end with step interval.
+    /// Returns microseconds (matching timestamp column precision).
+    #[allow(clippy::cast_possible_truncation)]
+    fn generate_time_grid(&self) -> Result<Vec<i64>> {
+        let step_micros = self
+            .query_ctx
+            .step
+            .ok_or(IceGateError::Config(
+                "Step parameter is required for metric query".to_string(),
+            ))?
+            .num_microseconds()
+            .ok_or(IceGateError::Config(
+                "Step parameter is very big in microsecond ratio".to_string(),
+            ))?;
+
+        let start_micros = self.query_ctx.start.timestamp_micros();
+        let end_micros = self.query_ctx.end.timestamp_micros();
+
+        let mut timestamps = Vec::new();
+        let mut current = start_micros;
+
+        while current <= end_micros {
+            timestamps.push(current);
+            current += step_micros;
+        }
+
+        Ok(timestamps)
+    }
+
+    /// Creates a `DataFrame` representing the time grid as an in-memory table.
+    fn create_time_grid(&self, timestamps: Vec<i64>) -> Result<DataFrame> {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+
+        let time_array = TimestampMicrosecondArray::from(timestamps);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(time_array)])
+            .map_err(|e| IceGateError::Config(format!("Failed to create time grid batch: {e}")))?;
+
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]])
+            .map_err(|e| IceGateError::Config(format!("Failed to create time grid table: {e}")))?;
+
+        Ok(self.session_ctx.read_table(Arc::new(mem_table))?)
+    }
+
+    async fn plan_vector_aggregation(&self, agg: crate::query::logql::metric::VectorAggregation) -> Result<DataFrame> {
+        use crate::query::logql::{common::Grouping, metric::MetricExpr};
+
+        // 1. Push grouping down to inner RangeAggregation if present
+        // For queries like `sum by (level) (count_over_time({...}[1m]))`,
+        // we need the inner range aggregation to also group by `level`.
+        let inner_expr = match (*agg.expr, &agg.grouping) {
+            (MetricExpr::RangeAggregation(mut range_agg), Some(outer_grouping)) => {
+                // Merge outer grouping into inner range aggregation
+                // TODO: Process By and Without differently - Without should exclude labels
+                #[allow(clippy::match_same_arms)]
+                let outer_labels = match outer_grouping {
+                    Grouping::By(labels) => labels.clone(),
+                    Grouping::Without(labels) => labels.clone(),
+                };
+
+                // Add outer labels to inner grouping
+                let merged_grouping = match range_agg.grouping.take() {
+                    Some(Grouping::By(mut inner_labels)) => {
+                        // Merge labels, avoiding duplicates
+                        for label in outer_labels {
+                            if !inner_labels.iter().any(|l| l.name == label.name) {
+                                inner_labels.push(label);
+                            }
+                        }
+                        Some(Grouping::By(inner_labels))
+                    },
+                    Some(Grouping::Without(inner_labels)) => {
+                        // Keep the inner 'without' as-is
+                        Some(Grouping::Without(inner_labels))
+                    },
+                    None => {
+                        // No inner grouping, use outer labels
+                        Some(Grouping::By(outer_labels))
+                    },
+                };
+                range_agg.grouping = merged_grouping;
+                MetricExpr::RangeAggregation(range_agg)
+            },
+            (expr, _) => expr,
+        };
+
+        // 2. Plan the inner MetricExpr (now with merged grouping)
+        let df = self.plan_metric(inner_expr).await?;
+        let schema = df.schema();
+
+        // 3. Identify grouping columns for the vector aggregation
         // LogQL: sum by (label1, label2) (...)
         // DataFusion: group_expr = [col("label1"), col("label2")]
-        let group_exprs = if let Some(grouping) = agg.grouping {
+        // TODO: Process By and Without differently - Without should exclude labels from
+        // grouping
+        let mut group_exprs = if let Some(grouping) = &agg.grouping {
             let labels = match grouping {
-                crate::query::logql::common::Grouping::By(labels) => labels,
-                crate::query::logql::common::Grouping::Without(labels) => labels, // TODO: Handle 'without' correctly
+                Grouping::By(labels) | Grouping::Without(labels) => labels,
+            };
+            let udf = match grouping {
+                Grouping::By(_) => ScalarUDF::from(super::udf::MapKeepKeys::new()),
+                Grouping::Without(_) => ScalarUDF::from(super::udf::MapDropKeys::new()),
             };
 
-            labels
-                .iter()
-                .map(|l| {
-                    if self.is_top_level_field(&l.name) {
-                        col(&l.name)
-                    } else {
-                        datafusion::functions::core::get_field().call(vec![col("attributes"), lit(l.name.as_str())])
-                    }
-                })
-                .collect::<Vec<_>>()
+            let mut indexed_attributes = Vec::new();
+            let mut attributes = Vec::new();
+            for l in labels {
+                // Map Loki label names to column names (e.g., level -> severity_text)
+                let mapped_name = Self::map_label_to_internal_name(&l.name);
+                // Check if column exists directly in schema (using mapped name)
+                if Self::is_top_level_field(mapped_name) && schema.inner().column_with_name(mapped_name).is_some() {
+                    indexed_attributes.push(mapped_name);
+                } else if schema.inner().column_with_name("attributes").is_some() {
+                    attributes.push(mapped_name);
+                } else {
+                    // Column doesn't exist and no attributes map - the label isn't available
+                    return Err(IceGateError::NotImplemented(format!(
+                        "Label '{}' not available in aggregation result.",
+                        l.name
+                    )));
+                }
+            }
+
+            // Build expressions from indexed attributes
+            let mut exprs: Vec<Expr> = indexed_attributes.iter().map(|c| col((*c).to_string())).collect();
+            if !attributes.is_empty() {
+                // Create filtered attributes expression
+                let filtered_attrs = udf.call(vec![
+                    col("attributes"),
+                    make_array(attributes.iter().map(ToString::to_string).map(lit).collect()),
+                ]);
+                exprs.push(filtered_attrs.alias("attributes"));
+            }
+            exprs
         } else {
             vec![]
         };
+        group_exprs.push(col("timestamp"));
 
-        // 3. Identify aggregation function
+        // 4. Identify aggregation function
         // LogQL: sum, avg, min, max, count, stddev, stdvar, bottomk, topk
         // We need to map agg.op to DataFusion aggregate functions.
         // For now, we'll implement a few common ones.
 
-        // Note: We assume the inner plan produces a "value" column or similar that we
-        // aggregate. Since we don't have a strict schema for the inner metric
-        // plan yet, we'll assume a column named "value".
+        // Note: We assume the inner DataFrame produces a "value" column that we
+        // aggregate.
         let value_col = col("value");
 
         let aggr_expr = match agg.op {
@@ -228,78 +553,72 @@ impl DataFusionPlanner {
             crate::query::logql::metric::VectorAggregationOp::Count => {
                 datafusion::functions_aggregate::expr_fn::count(value_col)
             },
-            // TODO: Implement other operators
+            crate::query::logql::metric::VectorAggregationOp::Stddev => {
+                datafusion::functions_aggregate::expr_fn::stddev(value_col)
+            },
+            crate::query::logql::metric::VectorAggregationOp::Stdvar => {
+                datafusion::functions_aggregate::expr_fn::var_sample(value_col)
+            },
+            // TODO: Implement topk, bottomk, sort, sort_desc
             _ => {
                 return Err(IceGateError::NotImplemented(format!(
                     "Vector aggregation op {:?} not supported",
                     agg.op
                 )));
             },
-        };
+        }
+        .alias("value");
 
-        // 4. Apply aggregation
-        // We need to use the `aggregate` method on the LogicalPlan builder (DataFrame).
-        // Since `df` is a LogicalPlan, we might need to wrap it in a DataFrame or use
-        // LogicalPlanBuilder. However, `DataFusionPlanner` doesn't hold the
-        // full context to create a DataFrame easily without a SessionContext reference
-        // that is fully valid. But we can use `LogicalPlanBuilder::from(df)`.
-
-        let builder = LogicalPlanBuilder::from(df);
-        let plan = builder
-            .aggregate(group_exprs, vec![aggr_expr])
-            .map_err(IceGateError::from)?
-            .build()
-            .map_err(IceGateError::from)?;
-
-        Ok(plan)
+        // 5. Apply aggregation using DataFrame API
+        Ok(df.aggregate(group_exprs, vec![aggr_expr])?)
     }
 
-    fn apply_selector(&self, df: DataFrame, selector: Selector) -> Result<DataFrame> {
+    fn apply_selector(df: DataFrame, selector: Selector) -> Result<DataFrame> {
         let mut df = df;
         for matcher in selector.matchers {
-            let expr = self.matcher_to_expr(matcher)?;
+            let expr = Self::matcher_to_expr(matcher);
             df = df.filter(expr)?;
         }
         Ok(df)
     }
 
-    fn matcher_to_expr(&self, matcher: LabelMatcher) -> Result<Expr> {
-        let col_expr = if self.is_top_level_field(&matcher.label) {
-            col(matcher.label)
+    fn matcher_to_expr(matcher: LabelMatcher) -> Expr {
+        let mapped_label = Self::map_label_to_internal_name(&matcher.label);
+        let col_expr = if Self::is_top_level_field(&matcher.label) {
+            col(mapped_label)
         } else {
             // Access attribute from the "attributes" map
             // using get_field for map access
-            datafusion::functions::core::get_field().call(vec![col("attributes"), lit(matcher.label)])
+            datafusion::functions::core::get_field().call(vec![col("attributes"), lit(matcher.label.as_str())])
         };
 
         let val = lit(matcher.value);
 
         match matcher.op {
-            MatchOp::Eq => Ok(col_expr.eq(val)),
-            MatchOp::Neq => Ok(col_expr.not_eq(val)),
+            MatchOp::Eq => col_expr.eq(val),
+            MatchOp::Neq => col_expr.not_eq(val),
             // Use regex_match function from datafusion-functions
-            MatchOp::Re => Ok(datafusion::functions::regex::regexp_match().call(vec![col_expr, val])),
-            MatchOp::Nre => Ok(datafusion::functions::regex::regexp_match().call(vec![col_expr, val]).not()),
+            MatchOp::Re => datafusion::functions::regex::regexp_match().call(vec![col_expr, val]),
+            MatchOp::Nre => datafusion::functions::regex::regexp_match().call(vec![col_expr, val]).not(),
         }
     }
 
-    fn is_top_level_field(&self, name: &str) -> bool {
-        matches!(
-            name,
-            "tenant_id"
-                | "account_id"
-                | "service_name"
-                | "timestamp"
-                | "observed_timestamp"
-                | "ingested_timestamp"
-                | "trace_id"
-                | "span_id"
-                | "severity_number"
-                | "severity_text"
-                | "body"
-                | "flags"
-                | "dropped_attributes_count"
-        )
+    /// Maps Loki/Grafana label names to actual column names.
+    ///
+    /// Loki uses different label conventions than `OpenTelemetry`:
+    /// - `level` -> `severity_text` (log level)
+    /// - `detected_level` -> `severity_text` (Grafana's auto-detected level)
+    /// - `service` -> `service_name` (alternative name)
+    fn map_label_to_internal_name(name: &str) -> &str {
+        match name {
+            "level" | "detected_level" => "severity_text",
+            _ => name,
+        }
+    }
+
+    fn is_top_level_field(name: &str) -> bool {
+        let mapped = Self::map_label_to_internal_name(name);
+        INDEXED_ATTRIBUTE_COLUMNS.contains(&mapped) || matches!(mapped, "tenant_id" | "timestamp")
     }
 
     fn apply_pipeline(
@@ -319,15 +638,16 @@ impl DataFusionPlanner {
                     df
                 },
                 PipelineStage::Decolorize => self.apply_decolorize(df)?,
-                PipelineStage::Drop(labels) => self.apply_drop(df, labels)?,
-                PipelineStage::Keep(labels) => self.apply_keep(df, labels)?,
-                PipelineStage::LabelFilter(filter_expr) => self.apply_label_filter(df, filter_expr)?,
+                PipelineStage::Drop(labels) => Self::apply_drop(df, &labels)?,
+                PipelineStage::Keep(labels) => Self::apply_keep(df, &labels)?,
+                PipelineStage::LabelFilter(filter_expr) => Self::apply_label_filter(df, filter_expr)?,
             };
         }
 
         Ok(df)
     }
 
+    #[allow(clippy::unused_self)]
     fn apply_line_filter(&self, df: DataFrame, filter: crate::query::logql::log::LineFilter) -> Result<DataFrame> {
         use crate::query::logql::log::{LineFilterOp, LineFilterValue};
 
@@ -367,11 +687,12 @@ impl DataFusionPlanner {
         }
 
         match combined_expr {
-            Some(expr) => df.filter(expr).map_err(IceGateError::from),
+            Some(expr) => Ok(df.filter(expr)?),
             None => Ok(df),
         }
     }
 
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn apply_parser(&self, df: DataFrame, parser: crate::query::logql::log::LogParser) -> Result<DataFrame> {
         use crate::query::logql::log::LogParser;
 
@@ -388,7 +709,7 @@ impl DataFusionPlanner {
         match parser {
             LogParser::Json(_fields) => {
                 // Call json_parser UDF
-                // let udf = self.ctx.udf("json_parser")?;
+                // let udf = self.session_ctx.udf("json_parser")?;
                 // let args = vec![body_col];
                 // let expr = udf.call(args);
                 // For now, we'll just return df as we don't have the UDF registered
@@ -416,6 +737,7 @@ impl DataFusionPlanner {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn apply_label_format(
         &self,
         df: DataFrame,
@@ -427,81 +749,138 @@ impl DataFusionPlanner {
             match op {
                 LabelFormatOp::Rename {
                     ..
+                }
+                | LabelFormatOp::Template {
+                    ..
                 } => {
                     // TODO: Implement label rename
                     // Rename is essentially projecting the src column as dst
-                },
-                LabelFormatOp::Template {
-                    ..
-                } => {
-                    // TODO: Implement label template
                 },
             }
         }
         Ok(df)
     }
 
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     const fn apply_decolorize(&self, df: DataFrame) -> Result<DataFrame> {
         // Call decolorize UDF on body
-        // let udf = self.ctx.udf("decolorize")?;
+        // let udf = self.session_ctx.udf("decolorize")?;
         // let expr = udf.call(vec![col("body")]);
         // df.select(vec![expr.alias("body"), col("timestamp"), ...])
         // TODO: Implement decolorize
         Ok(df)
     }
 
-    fn apply_drop(
-        &self,
-        df: DataFrame,
-        _labels: Vec<crate::query::logql::common::LabelExtraction>,
-    ) -> Result<DataFrame> {
-        // Drop columns. In DataFusion, we select all EXCEPT the dropped ones.
-        // But we can only drop top-level columns easily. Attributes map modification is
-        // harder. TODO: Implement drop
-        Ok(df)
+    /// Apply `LogQL` `drop` operator - removes specified labels from attributes
+    /// map.
+    ///
+    /// Uses the `map_drop_keys` UDF to filter the attributes map, removing
+    /// entries whose keys match the specified labels.
+    fn apply_drop(df: DataFrame, labels: &[crate::query::logql::common::LabelExtraction]) -> Result<DataFrame> {
+        if labels.is_empty() {
+            return Ok(df);
+        }
+
+        // Build array of label names to drop
+        let label_literals: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
+
+        // Get the map_drop_keys UDF
+        let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
+
+        // Create filtered attributes expression
+        let filtered_attrs = udf.call(vec![
+            col("attributes"),
+            datafusion::functions_nested::make_array::make_array(label_literals),
+        ]);
+
+        // Select all columns, replacing attributes with filtered version
+        let select_exprs: Vec<Expr> = df
+            .schema()
+            .inner()
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "attributes" {
+                    filtered_attrs.clone().alias("attributes")
+                } else {
+                    col(field.name().as_str())
+                }
+            })
+            .collect();
+
+        Ok(df.select(select_exprs)?)
     }
 
-    fn apply_keep(
-        &self,
-        df: DataFrame,
-        _labels: Vec<crate::query::logql::common::LabelExtraction>,
-    ) -> Result<DataFrame> {
-        // Keep only specified columns.
-        // TODO: Implement keep
-        Ok(df)
+    /// Apply `LogQL` `keep` operator - keeps only specified labels in
+    /// attributes map.
+    ///
+    /// Uses the `map_keep_keys` UDF to filter the attributes map, keeping
+    /// only entries whose keys match the specified labels.
+    fn apply_keep(df: DataFrame, labels: &[crate::query::logql::common::LabelExtraction]) -> Result<DataFrame> {
+        if labels.is_empty() {
+            // keep with empty list = keep nothing (empty attributes)
+            // But this might be unexpected, so we return as-is for now
+            return Ok(df);
+        }
+
+        // Build array of label names to keep
+        let label_literals: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
+
+        // Get the map_keep_keys UDF
+        let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
+
+        // Create filtered attributes expression
+        let filtered_attrs = udf.call(vec![
+            col("attributes"),
+            datafusion::functions_nested::make_array::make_array(label_literals),
+        ]);
+
+        // Select all columns, replacing attributes with filtered version
+        let select_exprs: Vec<Expr> = df
+            .schema()
+            .inner()
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "attributes" {
+                    filtered_attrs.clone().alias("attributes")
+                } else {
+                    col(field.name().as_str())
+                }
+            })
+            .collect();
+
+        Ok(df.select(select_exprs)?)
     }
 
-    fn apply_label_filter(
-        &self,
-        df: DataFrame,
-        filter_expr: crate::query::logql::log::LabelFilterExpr,
-    ) -> Result<DataFrame> {
-        let expr = self.label_filter_to_expr(filter_expr)?;
-        df.filter(expr).map_err(IceGateError::from)
+    fn apply_label_filter(df: DataFrame, filter_expr: crate::query::logql::log::LabelFilterExpr) -> Result<DataFrame> {
+        let expr = Self::label_filter_to_expr(filter_expr)?;
+        Ok(df.filter(expr)?)
     }
 
-    fn label_filter_to_expr(&self, filter: crate::query::logql::log::LabelFilterExpr) -> Result<Expr> {
+    #[allow(clippy::items_after_statements)]
+    fn label_filter_to_expr(filter: crate::query::logql::log::LabelFilterExpr) -> Result<Expr> {
         use crate::query::logql::log::LabelFilterExpr;
 
         match filter {
             LabelFilterExpr::And(left, right) => {
-                let left_expr = self.label_filter_to_expr(*left)?;
-                let right_expr = self.label_filter_to_expr(*right)?;
+                let left_expr = Self::label_filter_to_expr(*left)?;
+                let right_expr = Self::label_filter_to_expr(*right)?;
                 Ok(left_expr.and(right_expr))
             },
             LabelFilterExpr::Or(left, right) => {
-                let left_expr = self.label_filter_to_expr(*left)?;
-                let right_expr = self.label_filter_to_expr(*right)?;
+                let left_expr = Self::label_filter_to_expr(*left)?;
+                let right_expr = Self::label_filter_to_expr(*right)?;
                 Ok(left_expr.or(right_expr))
             },
-            LabelFilterExpr::Parens(inner) => self.label_filter_to_expr(*inner),
-            LabelFilterExpr::Matcher(matcher) => self.matcher_to_expr(matcher),
+            LabelFilterExpr::Parens(inner) => Self::label_filter_to_expr(*inner),
+            LabelFilterExpr::Matcher(matcher) => Ok(Self::matcher_to_expr(matcher)),
             LabelFilterExpr::Number {
                 label,
                 op,
                 value,
             } => {
-                let col_expr = if self.is_top_level_field(&label) {
+                let col_expr = if Self::is_top_level_field(&label) {
                     col(label)
                 } else {
                     datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
@@ -524,14 +903,14 @@ impl DataFusionPlanner {
                 value,
             } => {
                 // Convert duration to nanoseconds and compare
-                let col_expr = if self.is_top_level_field(&label) {
+                let col_expr = if Self::is_top_level_field(&label) {
                     col(label)
                 } else {
                     datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
                 };
 
                 use crate::query::logql::common::ComparisonOp;
-                let nanos = value.as_nanos();
+                let nanos = value.num_nanoseconds().unwrap_or(0);
                 let expr = match op {
                     ComparisonOp::Gt => col_expr.gt(lit(nanos)),
                     ComparisonOp::Ge => col_expr.gt_eq(lit(nanos)),
@@ -548,7 +927,7 @@ impl DataFusionPlanner {
                 value,
             } => {
                 // Compare byte values as u64
-                let col_expr = if self.is_top_level_field(&label) {
+                let col_expr = if Self::is_top_level_field(&label) {
                     col(label)
                 } else {
                     datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
@@ -574,265 +953,5 @@ impl DataFusionPlanner {
                 ))
             },
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use chrono::{TimeZone, Utc};
-    use datafusion::prelude::SessionContext;
-    use iceberg_datafusion::IcebergCatalogProvider;
-
-    use super::*;
-    use crate::{
-        common::{
-            catalog::CatalogBuilder, schema::logs_schema, CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE,
-        },
-        query::logql::{
-            common::MatchOp,
-            log::{LabelMatcher, LineFilter, LogExpr, PipelineStage, Selector},
-        },
-    };
-
-    async fn create_test_context() -> (SessionContext, QueryContext) {
-        let ctx = SessionContext::new();
-
-        // Create a memory Iceberg catalog for testing with a temporary warehouse path
-        let warehouse_path = tempfile::tempdir().expect("Failed to create temp dir");
-        let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
-
-        let config = CatalogConfig {
-            backend: CatalogBackend::Memory,
-            warehouse: warehouse_str,
-            properties: std::collections::HashMap::new(),
-        };
-
-        let iceberg_catalog = CatalogBuilder::from_config(&config)
-            .await
-            .expect("Failed to create test catalog");
-
-        // Create the namespace and table
-        let namespace = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
-        if !iceberg_catalog.namespace_exists(&namespace).await.unwrap_or(false) {
-            iceberg_catalog
-                .create_namespace(&namespace, std::collections::HashMap::new())
-                .await
-                .expect("Failed to create namespace");
-        }
-
-        // Create logs table using the common schema
-        let schema = logs_schema().expect("Failed to get logs schema");
-        let table_creation = iceberg::TableCreation::builder()
-            .name(LOGS_TABLE.to_string())
-            .schema(schema)
-            .build();
-
-        let _ = iceberg_catalog.create_table(&namespace, table_creation).await;
-
-        // Register Iceberg catalog with DataFusion
-        let iceberg_provider = IcebergCatalogProvider::try_new(iceberg_catalog)
-            .await
-            .expect("Failed to create IcebergCatalogProvider");
-        ctx.register_catalog("iceberg", Arc::new(iceberg_provider));
-
-        let context = QueryContext {
-            tenant_id: "test-tenant".to_string(),
-            start: Utc.timestamp_opt(0, 0).unwrap(),
-            end: Utc.timestamp_opt(100, 0).unwrap(), // 100 seconds from epoch
-            limit: None,
-            step: None,
-        };
-
-        (ctx, context)
-    }
-
-    #[tokio::test]
-    async fn test_selector_planning() {
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let selector = Selector::new(vec![
-            LabelMatcher::new("service_name", MatchOp::Eq, "frontend"),
-            LabelMatcher::new("severity_text", MatchOp::Neq, "error"),
-        ]);
-        let expr = LogExpr::new(selector);
-
-        let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        // Verify filter expressions are present
-        // Display format: Filter: iceberg.icegate.logs.service_name = Utf8("frontend")
-        assert!(
-            display.contains("iceberg.icegate.logs.service_name = Utf8(\"frontend\")")
-                && display.contains("iceberg.icegate.logs.severity_text != Utf8(\"error\")"),
-            "Plan does not contain expected filters:\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_selector_attribute_access() {
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let selector = Selector::new(vec![LabelMatcher::new("custom_attr", MatchOp::Eq, "value")]);
-        let expr = LogExpr::new(selector);
-
-        let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        assert!(
-            display.contains("get_field(iceberg.icegate.logs.attributes, Utf8(\"custom_attr\"))"),
-            "Plan does not contain expected attribute access:\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_line_filter_contains() {
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let selector = Selector::new(vec![]);
-        let mut expr = LogExpr::new(selector);
-        expr.pipeline.push(PipelineStage::LineFilter(LineFilter::contains("error")));
-
-        let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        assert!(
-            display.contains("contains(iceberg.icegate.logs.body, Utf8(\"error\"))"),
-            "Plan does not contain expected contains filter:\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_line_filter_not_contains() {
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let selector = Selector::new(vec![]);
-        let mut expr = LogExpr::new(selector);
-        expr.pipeline.push(PipelineStage::LineFilter(LineFilter::not_contains("info")));
-
-        let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        assert!(
-            display.contains("NOT contains(iceberg.icegate.logs.body, Utf8(\"info\"))"),
-            "Plan does not contain expected NOT contains filter:\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_line_filter_regex() {
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let selector = Selector::new(vec![]);
-        let mut expr = LogExpr::new(selector);
-        expr.pipeline.push(PipelineStage::LineFilter(LineFilter::matches("error.*")));
-
-        let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        assert!(
-            display.contains("regexp_like(iceberg.icegate.logs.body, Utf8(\"error.*\"))"),
-            "Plan does not contain expected regexp_like filter:\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_line_filter_not_regex() {
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let selector = Selector::new(vec![]);
-        let mut expr = LogExpr::new(selector);
-        expr.pipeline
-            .push(PipelineStage::LineFilter(LineFilter::not_matches("debug.*")));
-
-        let plan = planner.plan_log(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        assert!(
-            display.contains("NOT regexp_like(iceberg.icegate.logs.body, Utf8(\"debug.*\"))"),
-            "Plan does not contain expected NOT regexp_like filter:\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_metric_literal_planning() {
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let expr = MetricExpr::Literal(42.0);
-        let plan = planner.plan_metric(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        // Verify literal projection
-        // Should contain a projection with alias "value" and the literal value
-        assert!(
-            display.contains("42 AS value") || display.contains("Float64(42) AS value"),
-            "Plan does not contain expected literal projection:\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_log_query_default_limit() {
-        use crate::query::logql::planner::DEFAULT_LOG_LIMIT;
-
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let selector = Selector::new(vec![]);
-        let log_expr = LogExpr::new(selector);
-        let expr = LogQLExpr::Log(log_expr);
-
-        let plan = planner.plan(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        // Verify limit node is present with default value (100)
-        let expected_limit = format!("Limit: skip=0, fetch={DEFAULT_LOG_LIMIT}");
-        assert!(
-            display.contains(&expected_limit),
-            "Plan does not contain expected limit node '{expected_limit}':\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_log_query_custom_limit() {
-        let (ctx, mut context) = create_test_context().await;
-        context.limit = Some(50);
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let selector = Selector::new(vec![]);
-        let log_expr = LogExpr::new(selector);
-        let expr = LogQLExpr::Log(log_expr);
-
-        let plan = planner.plan(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        // Verify limit node uses custom value
-        assert!(
-            display.contains("Limit: skip=0, fetch=50"),
-            "Plan does not contain expected limit 'Limit: skip=0, fetch=50':\n{display}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_metric_query_no_limit() {
-        let (ctx, context) = create_test_context().await;
-        let planner = DataFusionPlanner::new(ctx, context);
-
-        let expr = LogQLExpr::Metric(MetricExpr::Literal(42.0));
-        let plan = planner.plan(expr).await.expect("Planning failed");
-        let display = plan.display_indent().to_string();
-
-        // Verify no limit node for metric queries
-        assert!(
-            !display.contains("Limit:"),
-            "Metric query should not have limit node:\n{display}"
-        );
     }
 }

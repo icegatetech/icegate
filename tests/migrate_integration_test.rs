@@ -270,7 +270,6 @@ async fn test_migrate_create_tables_idempotent() {
 
 /// Test that `upgrade_schemas` returns 0 operations when schemas are up to date
 #[tokio::test]
-#[ignore = "comparison of schema doesn't work yet"]
 async fn test_migrate_upgrade_schemas() {
     let (_minio, _iceberg, config) = setup_containers().await;
 

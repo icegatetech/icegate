@@ -19,4 +19,4 @@ ARG PROFILE=release
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/${PROFILE}/query /app/target/${PROFILE}/maintain /usr/local/bin/
 USER nobody
-CMD ["query"]
+CMD ["icegate"]

@@ -56,12 +56,12 @@ multiple_crate_versions = "allow"
 antlr4rust = "0.5"
 
 # Iceberg
-iceberg = "0.7.0"
-iceberg-catalog-rest = "0.7.0"
-iceberg-datafusion = "0.7.0"
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
 
 # DataFusion
-datafusion = "48"
+datafusion = "50"
 
 # Async runtime
 tokio = { version = "1.48.0", features = ["full"] }

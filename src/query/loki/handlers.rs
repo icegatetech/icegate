@@ -9,14 +9,23 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use datafusion::arrow::{
-    array::{Array, MapArray, RecordBatch, StringArray, TimestampMicrosecondArray},
+    array::{
+        Array, Float64Array, Int64Array, MapArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray,
+    },
     datatypes::Schema,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 
 use super::server::LokiState;
-use crate::query::logql::{antlr::AntlrParser, datafusion::DataFusionPlanner, planner::QueryContext, Parser, Planner};
+use crate::{
+    common::schema::INDEXED_ATTRIBUTE_COLUMNS,
+    query::logql::{
+        antlr::AntlrParser, datafusion::DataFusionPlanner, duration::parse_duration_opt, planner::QueryContext, Parser,
+        Planner,
+    },
+};
 
 /// HTTP header for tenant identification (Grafana/Loki standard).
 const TENANT_HEADER: &str = "x-scope-orgid";
@@ -75,8 +84,8 @@ pub async fn explain_query(
     let tenant_id = extract_tenant_id(&headers);
 
     // Create SessionContext from QueryEngine (uses cached IcebergCatalogProvider)
-    let ctx = match loki_state.engine.create_session().await {
-        Ok(ctx) => ctx,
+    let session_ctx = match loki_state.engine.create_session().await {
+        Ok(session_ctx) => session_ctx,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -111,18 +120,18 @@ pub async fn explain_query(
 
     // 2. Create query context with default time range for explain
     let now = Utc::now();
-    let context = QueryContext {
+    let query_ctx = QueryContext {
         tenant_id,
         start: params.start.as_ref().map_or(now - Duration::hours(1), |s| parse_time(s)),
         end: params.end.as_ref().map_or(now, |s| parse_time(s)),
         limit: params.limit.map(|l| l as usize),
-        step: params.step.as_ref().and_then(|s| parse_duration(s)),
+        step: params.step.as_ref().and_then(|s| parse_duration_opt(s)),
     };
 
     // 3. Plan the query
-    let planner = DataFusionPlanner::new(ctx.clone(), context);
-    let logical_plan = match planner.plan(expr).await {
-        Ok(plan) => plan,
+    let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
+    let df = match planner.plan(expr).await {
+        Ok(df) => df,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -137,8 +146,9 @@ pub async fn explain_query(
         },
     };
 
-    // 4. Get optimized logical plan
-    let optimized_plan = match ctx.state().optimize(&logical_plan) {
+    // 4. Get logical plan from DataFrame and optimize
+    let logical_plan = df.logical_plan().clone();
+    let optimized_plan = match session_ctx.state().optimize(&logical_plan) {
         Ok(plan) => plan,
         Err(e) => {
             return (
@@ -155,7 +165,7 @@ pub async fn explain_query(
     };
 
     // 5. Get physical plan
-    let physical_plan = match ctx.state().create_physical_plan(&optimized_plan).await {
+    let physical_plan = match session_ctx.state().create_physical_plan(&optimized_plan).await {
         Ok(plan) => plan,
         Err(e) => {
             return (
@@ -248,15 +258,17 @@ async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQ
     let tenant_id = extract_tenant_id(&headers);
 
     let now = Utc::now();
-    let start = params.start.as_ref().map_or(DateTime::UNIX_EPOCH, |s| parse_time(s));
+    // Default to 1 hour ago if start not provided (Loki convention)
+    // Using UNIX_EPOCH would create billions of time buckets with step parameter
+    let start = params.start.as_ref().map_or(now - Duration::hours(1), |s| parse_time(s));
     let end = params.end.as_ref().map_or(now, |s| parse_time(s));
 
-    let context = QueryContext {
+    let query_ctx = QueryContext {
         tenant_id,
         start,
         end,
         limit: params.limit.map(|l| l as usize),
-        step: params.step.as_ref().and_then(|s| parse_duration(s)),
+        step: params.step.as_ref().and_then(|s| parse_duration_opt(s)),
     };
 
     // 1. Parse LogQL
@@ -276,10 +288,13 @@ async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQ
         },
     };
 
+    // Track query type BEFORE planning consumes the expression
+    let is_metric_query = expr.is_metric();
+
     // 2. Create SessionContext from QueryEngine (uses cached
     //    IcebergCatalogProvider)
-    let ctx = match loki_state.engine.create_session().await {
-        Ok(ctx) => ctx,
+    let session_ctx = match loki_state.engine.create_session().await {
+        Ok(session_ctx) => session_ctx,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -293,9 +308,9 @@ async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQ
     };
 
     // 3. Plan Query
-    let planner = DataFusionPlanner::new(ctx.clone(), context);
-    let plan = match planner.plan(expr).await {
-        Ok(plan) => plan,
+    let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
+    let df = match planner.plan(expr).await {
+        Ok(df) => df,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -308,21 +323,7 @@ async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQ
         },
     };
 
-    // 4. Execute Query
-    let df = match ctx.execute_logical_plan(plan).await {
-        Ok(df) => df,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "status": "error",
-                    "error": format!("Execution error: {}", e)
-                })),
-            )
-                .into_response();
-        },
-    };
-
+    // 4. Execute Query - DataFrame is lazy, collect() triggers execution
     let batches = match df.collect().await {
         Ok(batches) => batches,
         Err(e) => {
@@ -337,9 +338,16 @@ async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQ
         },
     };
 
-    // 5. Format Response
-    let (streams, stats) = batches_to_loki_streams(&batches);
+    // 5. Format Response based on query type
     let exec_time = exec_start.elapsed().as_secs_f64();
+
+    let (result, result_type, stats) = if is_metric_query {
+        let (matrix, stats) = batches_to_loki_matrix(&batches);
+        (matrix, "matrix", stats)
+    } else {
+        let (streams, stats) = batches_to_loki_streams(&batches);
+        (streams, "streams", stats)
+    };
 
     #[allow(
         clippy::cast_precision_loss,
@@ -359,8 +367,8 @@ async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQ
         Json(json!({
             "status": "success",
             "data": {
-                "resultType": "streams",
-                "result": streams,
+                "resultType": result_type,
+                "result": result,
                 "stats": {
                     "ingester": {
                         "compressedBytes": 0,
@@ -458,24 +466,47 @@ impl BatchColumns {
     }
 }
 
+/// Column indices for metric query batches (matrix format).
+///
+/// Metric queries return `time_bucket`, `value`, and optional grouping label
+/// columns.
+struct MetricBatchColumns {
+    timestamp: Option<usize>,
+    value: Option<usize>,
+    attributes: Option<usize>,
+}
+
+impl MetricBatchColumns {
+    /// Extract column indices from schema
+    fn from_schema(schema: &Schema) -> Self {
+        Self {
+            timestamp: schema.index_of("timestamp").ok(),
+            value: schema.index_of("value").ok(),
+            attributes: schema.index_of("attributes").ok(),
+        }
+    }
+
+    /// Returns indices of predefined indexed label columns that exist in the
+    /// schema.
+    fn label_indices(schema: &Schema) -> Vec<(String, usize)> {
+        INDEXED_ATTRIBUTE_COLUMNS
+            .iter()
+            .filter_map(|&name| schema.index_of(name).ok().map(|idx| (name.to_string(), idx)))
+            .collect()
+    }
+}
+
 /// Extract timestamp from row (microseconds -> nanoseconds)
 fn extract_timestamp(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> i64 {
-    cols.timestamp
-        .and_then(|idx| {
-            batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .and_then(|arr| {
-                    if arr.is_null(row) {
-                        None
-                    } else {
-                        Some(arr.value(row) * 1000) // microseconds to
-                                                    // nanoseconds
-                    }
-                })
-        })
-        .unwrap_or(0)
+    let Some(idx) = cols.timestamp else { return 0 };
+    let arr = batch.column(idx).as_any();
+    if let Some(arr) = arr.downcast_ref::<TimestampMicrosecondArray>() {
+        return if arr.is_null(row) { 0 } else { arr.value(row) * 1000 };
+    }
+    if let Some(arr) = arr.downcast_ref::<TimestampNanosecondArray>() {
+        return if arr.is_null(row) { 0 } else { arr.value(row) };
+    }
+    0
 }
 
 /// Extract body string from row
@@ -650,6 +681,189 @@ fn batches_to_loki_streams(batches: &[RecordBatch]) -> (JsonValue, QueryStats) {
     })
 }
 
+// ============================================================================
+// Matrix Format (Metric Queries)
+// ============================================================================
+
+/// Extract `time_bucket` from row (microseconds → decimal seconds).
+#[allow(clippy::cast_precision_loss)]
+fn extract_time_bucket_secs(batch: &RecordBatch, cols: &MetricBatchColumns, row: usize) -> i64 {
+    let Some(idx) = cols.timestamp else { return 0i64 };
+    let arr = batch.column(idx).as_any();
+    if let Some(arr) = arr.downcast_ref::<TimestampMicrosecondArray>() {
+        return if arr.is_null(row) { 0i64 } else { arr.value(row) / 1_000_000i64 };
+    }
+    if let Some(arr) = arr.downcast_ref::<TimestampNanosecondArray>() {
+        return if arr.is_null(row) { 0i64 } else { arr.value(row) / 1_000_000_000i64 };
+    }
+    0i64
+}
+
+/// Extract metric value as string (handles Float64, Int64).
+fn extract_metric_value(batch: &RecordBatch, cols: &MetricBatchColumns, row: usize) -> String {
+    cols.value.map_or_else(
+        || "0".to_string(),
+        |idx| {
+            let col = batch.column(idx);
+            if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                if !arr.is_null(row) {
+                    return arr.value(row).to_string();
+                }
+            }
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                if !arr.is_null(row) {
+                    return arr.value(row).to_string();
+                }
+            }
+            "0".to_string()
+        },
+    )
+}
+
+/// Maps `OTel` column names to Loki label names for output.
+///
+/// Reverse of `map_label_to_column()` in planner.
+fn map_column_to_label(name: &str) -> &str {
+    match name {
+        "severity_text" => "level",
+        "service_name" => "service",
+        _ => name,
+    }
+}
+
+/// Extract labels from indexed columns and attributes map for metric queries.
+///
+/// Uses reverse label mapping (e.g., `severity_text` → `level`) for output.
+fn extract_metric_labels(
+    batch: &RecordBatch,
+    label_cols: &[(String, usize)],
+    attributes_idx: Option<usize>,
+    row: usize,
+    interner: &mut StringInterner,
+) -> HashMap<Arc<str>, Arc<str>> {
+    let mut labels = HashMap::with_capacity(label_cols.len() + 8);
+
+    // Extract predefined indexed columns with reverse label mapping
+    for (col_name, idx) in label_cols {
+        if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<StringArray>() {
+            if !arr.is_null(row) {
+                let label_name = map_column_to_label(col_name);
+                labels.insert(interner.intern(label_name), interner.intern(arr.value(row)));
+            }
+        }
+    }
+
+    // Extract all attributes from map column
+    if let Some(attr_idx) = attributes_idx {
+        extract_attributes_map(batch, attr_idx, row, &mut labels, interner);
+    }
+
+    labels
+}
+
+/// Extract key-value pairs from attributes `MapArray` column.
+fn extract_attributes_map(
+    batch: &RecordBatch,
+    attr_idx: usize,
+    row: usize,
+    labels: &mut HashMap<Arc<str>, Arc<str>>,
+    interner: &mut StringInterner,
+) {
+    if let Some(map_arr) = batch.column(attr_idx).as_any().downcast_ref::<MapArray>() {
+        if !map_arr.is_null(row) {
+            let offsets = map_arr.offsets();
+            #[allow(clippy::cast_sign_loss)]
+            let start = offsets[row] as usize;
+            #[allow(clippy::cast_sign_loss)]
+            let end = offsets[row + 1] as usize;
+
+            let keys = map_arr.keys().as_any().downcast_ref::<StringArray>();
+            let values = map_arr.values().as_any().downcast_ref::<StringArray>();
+
+            if let (Some(keys), Some(values)) = (keys, values) {
+                for i in start..end {
+                    if !keys.is_null(i) && !values.is_null(i) {
+                        labels.insert(interner.intern(keys.value(i)), interner.intern(values.value(i)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Convert series map to Loki matrix JSON format.
+///
+/// Matrix format uses "metric" instead of "stream" for labels,
+/// and timestamps are decimal seconds (f64) instead of nanosecond strings.
+fn matrix_to_json(series: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(i64, String)>)>) -> JsonValue {
+    let result: Vec<JsonValue> = series
+        .into_values()
+        .map(|(labels, values)| {
+            let labels_map: HashMap<String, String> =
+                labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            json!({
+                "metric": labels_map,
+                "values": values.into_iter().map(|(ts, val)| json!([ts, val])).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    json!(result)
+}
+
+/// Converts `DataFusion` `RecordBatches` to Loki matrix format.
+///
+/// Loki matrix format (for metric queries):
+/// ```json
+/// [
+///   {
+///     "metric": {"label1": "value1", "label2": "value2"},
+///     "values": [[<timestamp_seconds>, "<value>"], ...]
+///   }
+/// ]
+/// ```
+///
+/// Groups metric samples by their labels (grouping columns from the query).
+/// Timestamps are decimal seconds (f64), values are numeric strings.
+fn batches_to_loki_matrix(batches: &[RecordBatch]) -> (JsonValue, QueryStats) {
+    let mut series: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(i64, String)>)> = HashMap::with_capacity(64);
+    let mut interner = StringInterner::new();
+    let mut key_buffer = String::with_capacity(256);
+    let mut total_samples: usize = 0;
+
+    for batch in batches {
+        let cols = MetricBatchColumns::from_schema(batch.schema().as_ref());
+        let label_cols = MetricBatchColumns::label_indices(batch.schema().as_ref());
+
+        for row in 0..batch.num_rows() {
+            // Extract timestamp (microseconds -> decimal seconds)
+            let timestamp_secs = extract_time_bucket_secs(batch, &cols, row);
+
+            // Extract value as string
+            let value = extract_metric_value(batch, &cols, row);
+
+            // Extract labels from indexed columns and attributes map
+            let labels = extract_metric_labels(batch, &label_cols, cols.attributes, row, &mut interner);
+
+            // Group by labels
+            make_stream_key_into(&labels, &mut key_buffer);
+
+            total_samples += 1;
+
+            series
+                .entry(key_buffer.clone())
+                .or_insert_with(|| (labels, Vec::new()))
+                .1
+                .push((timestamp_secs, value));
+        }
+    }
+
+    (matrix_to_json(series), QueryStats {
+        total_bytes: total_samples * 16, // approximate
+        total_lines: total_samples,
+    })
+}
+
 fn parse_time(s: &str) -> DateTime<Utc> {
     // Simple parsing, assumes nanoseconds if digits, otherwise try RFC3339
     s.parse::<i64>().map_or_else(
@@ -660,15 +874,6 @@ fn parse_time(s: &str) -> DateTime<Utc> {
                 .unwrap_or(DateTime::UNIX_EPOCH)
         },
         DateTime::from_timestamp_nanos,
-    )
-}
-
-fn parse_duration(s: &str) -> Option<i64> {
-    // TODO: Implement proper duration parsing (e.g. "15s", "1m")
-    // For now, assume it's seconds if it ends with 's', or raw nanoseconds
-    s.strip_suffix('s').map_or_else(
-        || s.parse::<i64>().ok(),
-        |stripped| stripped.parse::<i64>().ok().map(|v| v * 1_000_000_000),
     )
 }
 

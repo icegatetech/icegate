@@ -1,83 +1,15 @@
 //! Common types shared across LogQL expression modules.
 
-/// Duration with nanosecond precision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Duration {
-    /// The duration in nanoseconds.
-    pub nanos: i64,
-}
+use crate::common::errors::{IceGateError, ParseError};
 
-impl Duration {
-    /// Create a new `Duration` from nanoseconds.
-    pub const fn from_nanos(nanos: i64) -> Self {
-        Self {
-            nanos,
-        }
-    }
-
-    /// Create a new `Duration` from microseconds.
-    pub const fn from_micros(micros: i64) -> Self {
-        Self {
-            nanos: micros * 1_000,
-        }
-    }
-
-    /// Create a new `Duration` from milliseconds.
-    pub const fn from_millis(millis: i64) -> Self {
-        Self {
-            nanos: millis * 1_000_000,
-        }
-    }
-
-    /// Create a new `Duration` from seconds.
-    pub const fn from_secs(secs: i64) -> Self {
-        Self {
-            nanos: secs * 1_000_000_000,
-        }
-    }
-
-    /// Create a new `Duration` from minutes.
-    pub const fn from_mins(mins: i64) -> Self {
-        Self {
-            nanos: mins * 60 * 1_000_000_000,
-        }
-    }
-
-    /// Create a new `Duration` from hours.
-    pub const fn from_hours(hours: i64) -> Self {
-        Self {
-            nanos: hours * 3600 * 1_000_000_000,
-        }
-    }
-
-    /// Create a new `Duration` from days.
-    pub const fn from_days(days: i64) -> Self {
-        Self {
-            nanos: days * 86400 * 1_000_000_000,
-        }
-    }
-
-    /// Create a new `Duration` from weeks.
-    pub const fn from_weeks(weeks: i64) -> Self {
-        Self {
-            nanos: weeks * 7 * 86400 * 1_000_000_000,
-        }
-    }
-
-    /// Get the duration in nanoseconds.
-    pub const fn as_nanos(&self) -> i64 {
-        self.nanos
-    }
-
-    /// Get the duration in milliseconds.
-    pub const fn as_millis(&self) -> i64 {
-        self.nanos / 1_000_000
-    }
-
-    /// Get the duration in seconds.
-    pub const fn as_secs(&self) -> i64 {
-        self.nanos / 1_000_000_000
-    }
+/// Create a parse error with the given message.
+pub fn parse_error(message: impl Into<String>) -> IceGateError {
+    IceGateError::Parse(vec![ParseError {
+        line: 0,
+        column: 0,
+        message: message.into(),
+        antlr_error: None,
+    }])
 }
 
 /// Match operator for label matchers.

@@ -4,7 +4,7 @@
 //!
 //! # Module Structure
 //!
-//! - [`common`] - Shared types: Duration, operators, grouping
+//! - [`common`] - Shared types: operators, grouping
 //! - [`expr`] - Top-level [`LogQLExpr`] enum
 //! - [`log`] - Log query types: selectors, pipeline stages
 //! - [`metric`] - Metric query types: aggregations, binary operations
@@ -14,10 +14,12 @@
 
 /// ANTLR-based parser implementation
 pub mod antlr;
-/// Shared types: Duration, operators, grouping, label extraction
+/// Shared types: operators, grouping, label extraction
 pub mod common;
 /// DataFusion implementation of the LogQL planner
 pub mod datafusion;
+/// Duration parsing utilities
+pub mod duration;
 /// Top-level LogQL expression enum
 pub mod expr;
 /// Log query types: selectors, pipeline stages, filters
@@ -30,7 +32,7 @@ pub mod parser;
 pub mod planner;
 
 // Re-export key types for convenient access
-pub use common::{ComparisonOp, Duration, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp};
+pub use common::{parse_error, ComparisonOp, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp};
 pub use expr::LogQLExpr;
 pub use log::{
     LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr, LogParser, PipelineStage,

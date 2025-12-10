@@ -6,13 +6,14 @@
 catalog:
   # Catalog backend options:
   # - !memory (for testing)
-  # - !rest { uri: "http://localhost:8181" }
+  # - !rest { uri: "http://127.0.0.1:19120/iceberg" }
   backend: !rest
-    uri: http://localhost:8181
+    uri: http://127.0.0.1:19120/iceberg
   # Warehouse location (root path for data storage)
   warehouse: s3://warehouse
   # Additional catalog properties (optional)
-  properties: {}
+  properties:
+    prefix: main
 
 # Storage Configuration
 storage:
@@ -23,18 +24,18 @@ storage:
   backend: !s3
     bucket: warehouse
     region: us-east-1
-    endpoint: https://localhost:9100
+    endpoint: https://127.0.0.1:9100
   # Storage properties (optional)
   properties: {}
 
 # OTLP HTTP Server
 otlp_http:
   enabled: true
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 4318
 
 # OTLP gRPC Server
 otlp_grpc:
   enabled: true
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 4317

@@ -12,7 +12,8 @@ cargo test                     # Run all tests
 cargo test test_name           # Run specific test
 cargo test -- --nocapture      # Run tests with output shown
 cargo fmt                      # Format code
-cargo clippy                   # Run linter (strict config in Cargo.toml)
+cargo +nightly fmt -- --check  # Check code format
+cargo clippy --all-targets     # Run linter (strict config in Cargo.toml)
 ```
 
 ## Project Overview
@@ -85,3 +86,4 @@ Strict clippy/rustc lints configured in `Cargo.toml`:
 - clippy pedantic/nursery enabled
 
 Thresholds in `clippy.toml`: cognitive-complexity=30, too-many-arguments=8, too-many-lines=150.
+Use rules in `rustfmt.toml` to generate well-formated code.

@@ -69,6 +69,11 @@ pub enum IceGateError {
     ///
     /// This error happens when the parser encounters syntax errors.
     Parse(Vec<ParseError>),
+    /// Planner error
+    ///
+    /// This error happens when syntax of expression is valid, but usage of
+    /// expression's part are not valid
+    Plan(String),
     /// `DataFusion` query planning or execution error.
     ///
     /// This error happens when `DataFusion` operations fail during query
@@ -150,6 +155,9 @@ impl fmt::Display for IceGateError {
             },
             Self::Io(err) => {
                 write!(f, "I/O error: {err}")
+            },
+            Self::Plan(msg) => {
+                write!(f, "Plan error: {msg}")
             },
         }
     }

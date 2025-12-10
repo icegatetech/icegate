@@ -877,6 +877,196 @@ let rate = in_range.project(vec![
 ])?;
 ```
 
+### 4.4. Time Grid Gap Filling for Matrix Responses
+
+When executing `query_range` requests, Loki returns a **matrix** response with samples at regular intervals from `start` to `end` with `step` spacing. If no data exists for a time bucket, the value should be `0` (not omitted).
+
+**Problem:** Using `date_bin()` alone only returns buckets where data exists. For proper matrix responses, we need:
+1. Complete time grid from `start` to `end` with `step` interval
+2. JOIN aggregated data to the grid
+3. Fill gaps with `0` for missing time buckets
+
+**Example:** 1-hour query with 5-minute step = 12 buckets. If data exists in only 3 buckets, `date_bin()` returns 3 rows. Matrix response needs 12 rows (9 with zeros).
+
+#### Architecture
+
+```mermaid
+flowchart TB
+    subgraph Input["Query Context"]
+        START["start: DateTime"]
+        END["end: DateTime"]
+        STEP["step: Duration"]
+    end
+
+    subgraph TimeGrid["1. Time Grid Generation"]
+        GEN["generate_time_grid()"]
+        ARROW["Arrow MemTable<br/>grid_time: Timestamp[]"]
+    end
+
+    subgraph Aggregation["2. Data Aggregation"]
+        AGG["GROUP BY time_bucket + labels<br/>date_bin(step, timestamp)"]
+        SPARSE["Sparse Result<br/>(only buckets with data)"]
+    end
+
+    subgraph Labels["3. Distinct Labels (if grouped)"]
+        DISTINCT["SELECT DISTINCT labels<br/>FROM aggregation"]
+        CROSS["CROSS JOIN<br/>time_grid × distinct_labels"]
+    end
+
+    subgraph Join["4. Gap Filling Join"]
+        LEFT["LEFT JOIN<br/>full_grid ⟕ agg_result<br/>ON (time_bucket, labels)"]
+    end
+
+    subgraph Output["5. Final Projection"]
+        COALESCE["COALESCE(value, 0)"]
+        RESULT["Complete Matrix<br/>all time buckets filled"]
+    end
+
+    START --> GEN
+    END --> GEN
+    STEP --> GEN
+    GEN --> ARROW
+
+    AGG --> SPARSE
+    SPARSE --> DISTINCT
+    ARROW --> CROSS
+    DISTINCT --> CROSS
+
+    CROSS --> LEFT
+    SPARSE --> LEFT
+    LEFT --> COALESCE
+    COALESCE --> RESULT
+
+    style TimeGrid fill:#e1f5fe
+    style Aggregation fill:#fff3e0
+    style Labels fill:#f3e5f5
+    style Join fill:#e8f5e9
+    style Output fill:#fce4ec
+```
+
+#### Implementation Flow
+
+```mermaid
+sequenceDiagram
+    participant P as Planner
+    participant A as Aggregation Plan
+    participant G as Time Grid
+    participant L as Labels
+    participant J as Join
+
+    P->>A: Build aggregation<br/>(GROUP BY time_bucket + labels)
+    P->>G: generate_time_grid(start, end, step)
+    G-->>P: Vec<i64> microseconds
+    P->>G: create_time_grid_plan()
+    G-->>P: MemTable LogicalPlan
+
+    alt Has Grouping Labels
+        P->>L: Extract DISTINCT labels<br/>from aggregation result
+        P->>J: CROSS JOIN<br/>(time_grid × distinct_labels)
+        P->>J: LEFT JOIN<br/>(full_grid ⟕ aggregation)
+    else No Grouping
+        P->>J: RIGHT JOIN<br/>(aggregation ⟖ time_grid)
+    end
+
+    P->>P: Project with COALESCE(value, 0)
+```
+
+#### Key Functions
+
+| Function | Purpose |
+|----------|---------|
+| `generate_time_grid()` | Creates `Vec<i64>` timestamps from start→end by step |
+| `create_time_grid_plan()` | Builds Arrow MemTable as LogicalPlan |
+| `fill_time_gaps()` | Main logic: CROSS JOIN + LEFT JOIN for grouped queries |
+| `join_with_time_grid_only()` | RIGHT JOIN for ungrouped queries |
+| `project_with_coalesce()` | Final projection with `COALESCE(value, 0)` |
+
+#### Translation to DataFusion
+
+**Ungrouped Query (simple case):**
+```rust
+// LogQL: count_over_time({service="api"}[5m])
+// Result: Single time series with all buckets filled
+
+// 1. Build aggregation (GROUP BY time_bucket only)
+let agg_plan = df.aggregate(
+    vec![date_bin(step, col("timestamp")).alias("time_bucket")],
+    vec![count(lit(1)).alias("value")]
+)?;
+
+// 2. Generate time grid
+let timestamps = generate_time_grid(start, end, step);
+let grid_plan = create_time_grid_plan(timestamps)?;
+
+// 3. RIGHT JOIN: ensures all grid times appear
+let joined = LogicalPlanBuilder::from(agg_plan)
+    .join(grid_plan, JoinType::Right,
+          (vec!["time_bucket"], vec!["grid_time"]), None)?;
+
+// 4. Project with COALESCE
+let result = joined.project(vec![
+    col("grid_time").alias("time_bucket"),
+    coalesce(vec![col("value"), lit(0.0)]).alias("value")
+])?;
+```
+
+**Grouped Query (with labels):**
+```rust
+// LogQL: sum by (service) (count_over_time({job="mysql"}[5m]))
+// Result: Multiple time series, each with all buckets filled
+
+// 1. Build aggregation (GROUP BY time_bucket + labels)
+let agg_plan = df.aggregate(
+    vec![
+        date_bin(step, col("timestamp")).alias("time_bucket"),
+        col("service")
+    ],
+    vec![count(lit(1)).alias("value")]
+)?;
+
+// 2. Extract distinct label combinations FROM aggregation result
+let distinct_labels = LogicalPlanBuilder::from(agg_plan.clone())
+    .aggregate(vec![col("service")], vec![])?  // GROUP BY = DISTINCT
+    .build()?;
+
+// 3. Generate time grid
+let grid_plan = create_time_grid_plan(generate_time_grid(start, end, step))?;
+
+// 4. CROSS JOIN: time_grid × distinct_labels (Cartesian product)
+let full_grid = LogicalPlanBuilder::from(grid_plan)
+    .cross_join(distinct_labels)?
+    .build()?;
+
+// 5. LEFT JOIN: full_grid ⟕ aggregation
+let joined = LogicalPlanBuilder::from(full_grid)
+    .join_on(agg_plan, JoinType::Left, vec![
+        col("grid_time").eq(col("time_bucket"))
+            .and(col("full_grid.service").eq(col("agg.service")))
+    ])?;
+
+// 6. Project with COALESCE
+let result = joined.project(vec![
+    col("grid_time").alias("time_bucket"),
+    col("full_grid.service").alias("service"),
+    coalesce(vec![col("value"), lit(0.0)]).alias("value")
+])?;
+```
+
+#### Edge Cases
+
+| Case | Behavior |
+|------|----------|
+| No data at all | Empty aggregation → empty distinct_labels → empty result |
+| Label combo has partial data | Filled to all buckets (missing = 0) |
+| Multiple label columns | All existing combinations filled |
+| Step > range | Single bucket per label combo |
+
+#### Performance Notes
+
+- **agg_plan referenced twice**: Once for DISTINCT labels, once for LEFT JOIN. DataFusion's Common Subexpression Elimination (CSE) computes it once.
+- **MemTable overhead**: Minimal - time grid is small (typically <1000 rows).
+- **Cartesian product**: Only includes label combos that exist in the data, not all possible combinations.
+
 ## 5. Vector Aggregations
 
 Vector aggregations group and aggregate time series results, similar to GROUP BY in SQL.
@@ -2074,9 +2264,84 @@ Key DataFusion types and functions used in transpilation.
 **`DataType::List(field)`**: List/array type.
 **`DataType::Map(key_type, value_type)`**: Map type.
 
-## 13. Performance Considerations
+## 13. Known Limitations
 
-### 13.1. Memory Management
+### 13.1. MAP Type Limitations in Grouping and Aggregation
+
+**Status:** Unimplemented - blocked by upstream dependencies
+
+The `attributes` column uses `Map<String, String>` type to store OpenTelemetry attributes. However, MAP types cannot be used in GROUP BY, DISTINCT, ORDER BY, or other row-comparison operations due to limitations in the Arrow/DataFusion/Iceberg stack.
+
+**Root Cause Chain:**
+
+1. **arrow-rs (`arrow-row` crate)**: The row format used for comparisons doesn't support MAP types.
+   - Code: [`arrow-row/src/lib.rs`](https://github.com/apache/arrow-rs/blob/main/arrow-row/src/lib.rs)
+   - Returns: `ArrowError::NotYetImplemented("not yet implemented: Map(...)")`
+
+2. **DataFusion**: Any operation requiring row comparison on MAP columns fails.
+   - Issue: [apache/datafusion#15428](https://github.com/apache/datafusion/issues/15428)
+   - Affects: `SELECT DISTINCT`, `GROUP BY`, `ORDER BY` on MAP columns
+
+3. **iceberg-rust**: Complex types (MAP, nested STRUCT) have limited support when reading into Arrow RecordBatch.
+   - Issue: [apache/iceberg-rust#405](https://github.com/apache/iceberg-rust/issues/405)
+   - Status: Work in progress, complex type support is lower priority
+
+**Error Message:**
+```
+not yet implemented: Map(Field { name: "key_value", data_type: Struct([
+  Field { name: "key", data_type: Utf8, ... },
+  Field { name: "value", data_type: Utf8, ... }
+]), ... }, false)
+```
+
+**Current Workaround:**
+
+The `attributes` column is excluded from default label columns in metric queries:
+
+```rust
+fn build_default_label_columns(with: Vec<&str>, without: Vec<&str>) -> Vec<String> {
+    // "attributes" excluded - MAP type doesn't support grouping operations
+    vec!["account_id", "service_name", "trace_id", "span_id"]
+        .into_iter()
+        .chain(with.into_iter())
+        .filter(|c| !without.contains(c))
+        .map(|c| c.to_string())
+        .collect()
+}
+```
+
+**Impact:**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Filter by attribute (`{foo="bar"}`) | ✅ Works | Uses `get_field()` for individual key access |
+| Select attributes in log queries | ❌ Fails | MAP column in result triggers error on `collect()` |
+| Group by attribute in metrics | ❌ Fails | Cannot use MAP in GROUP BY |
+| Label extraction from attributes | ⚠️ Partial | Individual keys work, full map doesn't |
+
+**Potential Solutions (Future):**
+
+1. **Flatten to JSON string**: Convert MAP to JSON string before collection
+   ```rust
+   // Hypothetical - to_json() for maps
+   col("attributes").to_json().alias("attributes_json")
+   ```
+
+2. **Extract specific keys**: Use `get_field()` to extract needed attributes as separate columns
+   ```rust
+   get_field(col("attributes"), lit("key1")).alias("attr_key1")
+   ```
+
+3. **Wait for upstream fixes**: Monitor arrow-rs and iceberg-rust for MAP support improvements
+
+**Tracking:**
+- arrow-rs: No specific issue (generic limitation in `arrow-row`)
+- DataFusion: [#15428](https://github.com/apache/datafusion/issues/15428)
+- iceberg-rust: [#405](https://github.com/apache/iceberg-rust/issues/405)
+
+## 14. Performance Considerations
+
+### 14.1. Memory Management
 
 **Challenge:** Large result sets can consume significant memory.
 
@@ -2095,19 +2360,19 @@ if let Some(limit) = query.limit {
 }
 ```
 
-### 13.2. Index Utilization
+### 14.2. Index Utilization
 
 **Strategy:**
 - Ensure filters on indexed columns (service_name, severity_text, trace_id, span_id) are pushed to scan.
 - Iceberg will use min/max statistics and bloom filters to skip files.
 
-### 13.3. Partition-Aware Processing
+### 14.3. Partition-Aware Processing
 
 **Strategy:**
 - Timestamp-based partitioning allows efficient pruning.
 - Always extract and push down timestamp range filters.
 
-### 13.4. Query Complexity Limits
+### 14.4. Query Complexity Limits
 
 **Strategy:**
 - Set limits on query complexity to prevent resource exhaustion:
@@ -2130,37 +2395,37 @@ fn validate_query_complexity(query: &ParsedQuery) -> Result<()> {
 }
 ```
 
-### 13.5. Caching
+### 14.5. Caching
 
 **Strategy:**
 - Cache compiled regex patterns.
 - Cache parsed query plans for repeated queries.
 - Leverage DataFusion's result caching when appropriate.
 
-## 14. Future Enhancements
+## 15. Future Enhancements
 
-### 14.1. Template Variables
+### 15.1. Template Variables
 
 Support for Grafana-style template variables in queries.
 
 **Example:** `{service_name="$service"}` where `$service` is replaced at runtime.
 
-### 14.2. Subqueries
+### 15.2. Subqueries
 
 Support for nested LogQL queries.
 
 **Example:** `{job="mysql"} | json | latency > (avg_over_time({job="mysql"} | json | unwrap latency [1h]))`
 
-### 14.3. Additional Metric Types
+### 15.3. Additional Metric Types
 
 - **Counters with resets:** Automatically detect and handle counter resets in `rate()`.
 - **Histograms:** Support for histogram metrics and quantile calculations.
 
-### 14.4. Query Result Caching
+### 15.4. Query Result Caching
 
 Cache query results for frequently executed queries to improve performance.
 
-### 14.5. Distributed Execution
+### 15.5. Distributed Execution
 
 Leverage DataFusion's distributed execution capabilities for very large datasets.
 
@@ -2169,7 +2434,7 @@ Leverage DataFusion's distributed execution capabilities for very large datasets
 - Execute partial aggregations on each node.
 - Combine results in a final aggregation step.
 
-### 14.6. Query Optimization Rules
+### 15.6. Query Optimization Rules
 
 Implement custom optimization rules specific to LogQL patterns.
 
@@ -2178,7 +2443,7 @@ Implement custom optimization rules specific to LogQL patterns.
 - Eliminate redundant projections.
 - Reorder pipeline stages for better performance.
 
-### 14.7. Advanced Parser Support
+### 15.7. Advanced Parser Support
 
 - **Unpack:** `| unpack` - Treat each JSON field as a label.
 - **Line filters with IP ranges:** `| ip("192.168.0.0/16")`.
@@ -2262,4 +2527,3 @@ let final_plan = with_rate.aggregate(
 
 final_plan.build()
 ```
-

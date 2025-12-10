@@ -104,6 +104,8 @@ services:
       args:
         PROFILE: ${PROFILE:-release}
     command: ["query", "run", "--config", "/etc/icegate/query.yaml"]
+    deploy:
+      replicas: ${QUERY_REPLICAS:-1}
     ports:
       - "3100:3100"
       - "9090:9090"
@@ -123,7 +125,7 @@ services:
           path: ../../src
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:12.3
     ports:
       - "3000:3000"
     volumes:
