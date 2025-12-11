@@ -11,7 +11,6 @@ use super::{
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetricExpr {
     /// Binary operation: `left op right`
-    /// Binary operation: `left op right`
     BinaryOp {
         /// Left operand
         left: Box<MetricExpr>,

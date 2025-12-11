@@ -222,26 +222,27 @@ pub struct RangeQueryParams {
 }
 
 /// Handle instant query requests
+///
+/// Per Loki API spec, instant queries (`/query`) use `time` parameter (not
+/// start/end) and only support metric queries (returns 400 for log queries).
+///
+/// # TODO
+/// - Implement proper instant query with `time` parameter
+/// - Validate that only metric queries are accepted
+/// - Return 400 Bad Request for log queries
 pub async fn query(
-    State(loki_state): State<LokiState>,
-    headers: HeaderMap,
-    Query(params): Query<ExplainQueryParams>,
+    State(_loki_state): State<LokiState>,
+    _headers: HeaderMap,
+    Query(_params): Query<ExplainQueryParams>,
 ) -> Response {
-    // Instant query is treated as a range query with start=end=now if not provided
-    let now = Utc::now();
-
-    let time = params.start.as_ref().map_or(now, |s| parse_time(s));
-
-    let range_params = RangeQueryParams {
-        query: params.query,
-        start: Some(time.timestamp_nanos_opt().unwrap_or(0).to_string()),
-        end: Some(time.timestamp_nanos_opt().unwrap_or(0).to_string()),
-        step: None,
-        limit: params.limit,
-        direction: None,
-    };
-
-    execute_query(loki_state, headers, range_params).await
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "status": "error",
+            "error": "Instant query endpoint not yet implemented. Use /loki/api/v1/query_range instead."
+        })),
+    )
+        .into_response()
 }
 
 /// Handle range query requests

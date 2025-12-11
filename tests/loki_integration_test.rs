@@ -45,6 +45,168 @@ use reqwest::Client;
 use serde_json::Value;
 use tokio::time::{sleep, Duration};
 
+/// Helper function to write test log data to an Iceberg table for a specific
+/// tenant.
+async fn write_test_logs_for_tenant(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    service_name: &str,
+    body_prefix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Generate unique suffix based on tenant and timestamp to avoid file conflicts
+    let unique_suffix = format!(
+        "{}-{}",
+        tenant_id,
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    );
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    // Build arrays for the logs schema
+    let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(vec![tenant_id, tenant_id, tenant_id]));
+    let account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
+    let service_name_arr: ArrayRef = Arc::new(StringArray::from(vec![
+        Some(service_name),
+        Some(service_name),
+        Some(service_name),
+    ]));
+    let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros,
+        now_micros - 1000,
+        now_micros - 2000,
+    ]));
+    let observed_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros,
+        now_micros - 1000,
+        now_micros - 2000,
+    ]));
+    let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros, now_micros, now_micros,
+    ]));
+    let severity_number: ArrayRef = Arc::new(Int32Array::from(vec![Some(9), Some(9), Some(13)]));
+    let severity_text: ArrayRef = Arc::new(StringArray::from(vec![Some("INFO"), Some("INFO"), Some("WARN")]));
+    let body: ArrayRef = Arc::new(StringArray::from(vec![
+        Some(format!("{} message 1", body_prefix)),
+        Some(format!("{} message 2", body_prefix)),
+        Some(format!("{} message 3", body_prefix)),
+    ]));
+    let flags: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>, None, None]));
+    let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![0, 0, 0]));
+
+    // Create RecordBatch with Arrow schema from Iceberg schema
+    let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
+        table.metadata().current_schema(),
+    )?);
+
+    // Extract key and value field definitions from Iceberg schema
+    let attributes_field = arrow_schema.field(11);
+    let (key_field, value_field) = match attributes_field.data_type() {
+        DataType::Map(entries_field, _) => match entries_field.data_type() {
+            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
+            _ => panic!("Expected Struct type for map entries"),
+        },
+        _ => panic!("Expected Map type for attributes field"),
+    };
+
+    let field_names = MapFieldNames {
+        entry: "key_value".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let key_builder = StringBuilder::new();
+    let value_builder = StringBuilder::new();
+    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
+        .with_keys_field(key_field)
+        .with_values_field(value_field);
+    // Row 0
+    attributes_builder.keys().append_value("tenant_marker");
+    attributes_builder.values().append_value(tenant_id);
+    attributes_builder.append(true)?;
+    // Row 1
+    attributes_builder.keys().append_value("tenant_marker");
+    attributes_builder.values().append_value(tenant_id);
+    attributes_builder.append(true)?;
+    // Row 2
+    attributes_builder.keys().append_value("tenant_marker");
+    attributes_builder.values().append_value(tenant_id);
+    attributes_builder.append(true)?;
+
+    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+
+    // Build trace_id array (16 bytes)
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
+    trace_id_builder.append_value([
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    ])?;
+    trace_id_builder.append_value([
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    ])?;
+    trace_id_builder.append_value([
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+    ])?;
+    let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
+
+    // Build span_id array (8 bytes)
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
+    span_id_builder.append_value([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])?;
+    span_id_builder.append_value([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18])?;
+    span_id_builder.append_value([0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28])?;
+    let span_id: ArrayRef = Arc::new(span_id_builder.finish());
+
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        tenant_id_arr,
+        account_id,
+        service_name_arr,
+        timestamp,
+        observed_timestamp,
+        ingested_timestamp,
+        trace_id,
+        span_id,
+        severity_number,
+        severity_text,
+        body,
+        attributes,
+        flags,
+        dropped_attributes_count,
+    ])?;
+
+    // Create writers and write data with unique file name
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
+
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::builder().build(),
+        table.metadata().current_schema().clone(),
+    );
+
+    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+    let mut data_file_writer = data_file_writer_builder.build(None).await?;
+
+    data_file_writer.write(batch).await?;
+    let data_files = data_file_writer.close().await?;
+
+    // Commit the data files using transaction
+    let tx = Transaction::new(table);
+    let action = tx.fast_append();
+    let action = action.add_data_files(data_files);
+    let tx = action.apply(Transaction::new(table))?;
+    tx.commit(&**catalog).await?;
+
+    Ok(())
+}
+
 /// Helper function to write test log data to an Iceberg table.
 async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Result<(), Box<dyn std::error::Error>> {
     let now_micros = std::time::SystemTime::now()
@@ -1099,6 +1261,192 @@ async fn test_loki_query_range_bytes_rate() -> Result<(), Box<dyn std::error::Er
             );
         }
     }
+
+    // Cleanup
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    Ok(())
+}
+
+/// Test that tenant isolation is enforced - tenant A cannot see tenant B's
+/// data.
+#[tokio::test]
+async fn test_tenant_isolation() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Configure catalog and Loki server
+    let warehouse_path = tempfile::tempdir()?;
+    let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
+
+    let catalog_config = CatalogConfig {
+        backend: CatalogBackend::Memory,
+        warehouse: warehouse_str.clone(),
+        properties: std::collections::HashMap::default(),
+    };
+
+    let loki_config = LokiConfig {
+        enabled: true,
+        host: "127.0.0.1".to_string(),
+        port: 3108, // Use different port to avoid conflicts
+    };
+
+    // 2. Initialize catalog
+    let catalog = CatalogBuilder::from_config(&catalog_config).await?;
+
+    // 3. Create namespace and table
+    let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+
+    if !catalog.namespace_exists(&namespace_ident).await? {
+        catalog
+            .create_namespace(&namespace_ident, std::collections::HashMap::new())
+            .await?;
+    }
+
+    let schema = schema::logs_schema()?;
+
+    let table_creation = iceberg::TableCreation::builder()
+        .name(LOGS_TABLE.to_string())
+        .schema(schema)
+        .build();
+
+    let _ = catalog.create_table(&namespace_ident, table_creation).await?;
+
+    // 4. Insert test data for TWO different tenants
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+
+    // Write logs for tenant-alpha
+    write_test_logs_for_tenant(&table, &catalog, "tenant-alpha", "alpha-service", "Alpha").await?;
+
+    // Reload table to get updated metadata after first write
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+
+    // Write logs for tenant-beta
+    write_test_logs_for_tenant(&table, &catalog, "tenant-beta", "beta-service", "Beta").await?;
+
+    // 5. Start IceGate Server
+    let query_engine = Arc::new(
+        QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
+            .await
+            .expect("Failed to create QueryEngine"),
+    );
+    let server_loki_config = loki_config.clone();
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let server_engine = Arc::clone(&query_engine);
+
+    let server_handle = tokio::spawn(async move {
+        icegate::query::loki::run(server_engine, server_loki_config, cancel_token_clone)
+            .await
+            .unwrap();
+    });
+
+    // Wait for server to start
+    sleep(Duration::from_secs(2)).await;
+
+    let client = Client::new();
+
+    // 6. Query as tenant-alpha - should only see alpha's logs
+    let resp_alpha = client
+        .get("http://127.0.0.1:3108/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "tenant-alpha")
+        .query(&[("query", "{service_name=\"alpha-service\"}")])
+        .send()
+        .await?;
+
+    let status_alpha = resp_alpha.status();
+    let body_alpha: Value = resp_alpha.json().await?;
+
+    assert_eq!(status_alpha, 200, "Alpha query failed: {}", body_alpha);
+    assert_eq!(body_alpha["status"], "success");
+
+    let result_alpha = body_alpha["data"]["result"].as_array().expect("result should be an array");
+    assert!(!result_alpha.is_empty(), "tenant-alpha should see their own logs");
+
+    // Verify alpha only sees alpha-service logs
+    for stream in result_alpha {
+        let service = stream["stream"]["service_name"].as_str().unwrap_or("");
+        assert_eq!(
+            service, "alpha-service",
+            "tenant-alpha should only see alpha-service, but saw: {}",
+            service
+        );
+
+        // Also verify log bodies contain "Alpha" prefix
+        let values = stream["values"].as_array().expect("values should be array");
+        for value in values {
+            let log_line = value[1].as_str().unwrap_or("");
+            assert!(
+                log_line.starts_with("Alpha"),
+                "tenant-alpha should only see Alpha logs, but saw: {}",
+                log_line
+            );
+        }
+    }
+
+    // 7. Query as tenant-beta - should only see beta's logs
+    let resp_beta = client
+        .get("http://127.0.0.1:3108/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "tenant-beta")
+        .query(&[("query", "{service_name=\"beta-service\"}")])
+        .send()
+        .await?;
+
+    let status_beta = resp_beta.status();
+    let body_beta: Value = resp_beta.json().await?;
+
+    assert_eq!(status_beta, 200, "Beta query failed: {}", body_beta);
+    assert_eq!(body_beta["status"], "success");
+
+    let result_beta = body_beta["data"]["result"].as_array().expect("result should be an array");
+    assert!(!result_beta.is_empty(), "tenant-beta should see their own logs");
+
+    // Verify beta only sees beta-service logs
+    for stream in result_beta {
+        let service = stream["stream"]["service_name"].as_str().unwrap_or("");
+        assert_eq!(
+            service, "beta-service",
+            "tenant-beta should only see beta-service, but saw: {}",
+            service
+        );
+
+        // Also verify log bodies contain "Beta" prefix
+        let values = stream["values"].as_array().expect("values should be array");
+        for value in values {
+            let log_line = value[1].as_str().unwrap_or("");
+            assert!(
+                log_line.starts_with("Beta"),
+                "tenant-beta should only see Beta logs, but saw: {}",
+                log_line
+            );
+        }
+    }
+
+    // 8. Query as tenant-alpha but try to access beta's service - should see
+    //    nothing
+    // This tests cross-tenant isolation: even if you know another tenant's service
+    // name, you shouldn't be able to see their data
+    let resp_cross = client
+        .get("http://127.0.0.1:3108/loki/api/v1/query_range")
+        .header("X-Scope-OrgID", "tenant-alpha")
+        .query(&[("query", "{service_name=\"beta-service\"}")])
+        .send()
+        .await?;
+
+    let status_cross = resp_cross.status();
+    let body_cross: Value = resp_cross.json().await?;
+
+    assert_eq!(status_cross, 200, "Cross-tenant query failed: {}", body_cross);
+    assert_eq!(body_cross["status"], "success");
+
+    let result_cross = body_cross["data"]["result"].as_array().expect("result should be an array");
+    assert!(
+        result_cross.is_empty(),
+        "tenant-alpha should NOT see beta-service logs (cross-tenant isolation), but saw: {}",
+        body_cross
+    );
 
     // Cleanup
     cancel_token.cancel();

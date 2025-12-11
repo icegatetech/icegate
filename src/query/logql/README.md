@@ -41,10 +41,10 @@ Core log queries and metric aggregations (`rate`, `count_over_time`, `bytes_over
 | Endpoint | Status | Details |
 | :--- | :--- | :--- |
 | `GET/POST /loki/api/v1/query_range` | ✅ Implemented | Returns `streams` format for log queries, `matrix` format for metric queries. Supports `step` parameter for time bucketing. |
-| `GET/POST /loki/api/v1/query` | ✅ Implemented | Instant query endpoint. |
+| `GET/POST /loki/api/v1/query` | ⚠️ Stub | Returns `501 Not Implemented`. Requires `time` parameter and metric-only queries per Loki spec. |
 | `GET /loki/api/v1/explain` | ✅ Implemented | Returns logical, optimized, and physical query plans. |
-| `GET /loki/api/v1/labels` | ⚠️ Stub | Returns empty array (not yet implemented). |
-| `GET /loki/api/v1/label/:name/values` | ⚠️ Stub | Returns empty array (not yet implemented). |
+| `GET /loki/api/v1/labels` | ⚠️ Stub | Returns `501 Not Implemented`. |
+| `GET /loki/api/v1/label/:name/values` | ⚠️ Stub | Returns `501 Not Implemented`. |
 | `GET /ready` | ✅ Implemented | Health check endpoint. |
 
 **Response Formats:**
