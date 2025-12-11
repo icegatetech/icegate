@@ -89,6 +89,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Fast integer formatting
 itoa = "1"
+axum-extra = { version = "0.9", features = ["query"] }
 
 [[bin]]
 name = "query"

@@ -45,14 +45,6 @@ fn unwrap_filter(plan: &LogicalPlan) -> &Filter {
     }
 }
 
-/// Extract Limit, panic with context on mismatch.
-fn unwrap_limit(plan: &LogicalPlan) -> &Limit {
-    match plan {
-        LogicalPlan::Limit(l) => l,
-        other => panic!("Expected Limit, got: {}", other.display_indent()),
-    }
-}
-
 /// Extract Projection, panic with context on mismatch.
 #[allow(dead_code)]
 fn unwrap_projection(plan: &LogicalPlan) -> &Projection {
@@ -184,7 +176,6 @@ fn is_alias_named<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
         _ => None,
     }
 }
-
 
 // ============================================================================
 // Test Setup
@@ -445,7 +436,7 @@ async fn test_log_query_default_limit() {
 
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
-    let limit = unwrap_limit(plan);
+    let limit = find_limit(plan).expect("Expected Limit in plan tree");
 
     // Check skip = 0 (can be None or Some(0))
     match &limit.skip {
@@ -478,7 +469,7 @@ async fn test_log_query_custom_limit() {
 
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
-    let limit = unwrap_limit(plan);
+    let limit = find_limit(plan).expect("Expected Limit in plan tree");
 
     // Check fetch = 50
     match &limit.fetch {

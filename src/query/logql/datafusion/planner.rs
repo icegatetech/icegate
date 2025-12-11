@@ -14,8 +14,8 @@ use datafusion::{
     datasource::MemTable,
     functions_aggregate::{count::count_udaf, expr_fn::last_value, sum::sum_udaf},
     logical_expr::{
-        col, expr::WindowFunction, lit, AggregateUDF, Expr, JoinType, ScalarUDF, WindowFrame, WindowFrameBound,
-        WindowFrameUnits, WindowFunctionDefinition,
+        col, expr::WindowFunction, lit, AggregateUDF, Expr, ExprSchemable, JoinType, ScalarUDF, WindowFrame,
+        WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
     },
     prelude::*,
     scalar::ScalarValue,
@@ -75,7 +75,9 @@ impl Planner for DataFusionPlanner {
                 // Apply limit only for log queries (not metrics)
                 // Uses context limit or Loki default of 100 entries
                 let limit = self.query_ctx.limit.unwrap_or(DEFAULT_LOG_LIMIT);
-                Ok(df.limit(0, Some(limit))?)
+                let df = df.limit(0, Some(limit))?;
+                // Transform output: hex-encode binary columns, add `level` alias
+                Self::transform_output_columns(df)
             },
             LogQLExpr::Metric(metric_expr) => self.plan_metric(metric_expr).await,
         }
@@ -83,6 +85,9 @@ impl Planner for DataFusionPlanner {
 }
 
 impl DataFusionPlanner {
+    /// Binary columns that need hex encoding for output.
+    const BINARY_COLUMNS: [&'static str; 2] = ["trace_id", "span_id"];
+
     async fn plan_log(&self, expr: LogExpr, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<DataFrame> {
         // 1. Scan the logs table from iceberg.icegate namespace
         let df = self.session_ctx.table(LOGS_TABLE_FQN).await?;
@@ -112,6 +117,224 @@ impl DataFusionPlanner {
 
         // 5. Apply Pipeline stages
         self.apply_pipeline(df, expr.pipeline)
+    }
+
+    /// Plan a query for distinct label names.
+    ///
+    /// Returns a `DataFrame` with a single column `label` containing all
+    /// distinct label names from logs matching the selector and time range.
+    /// This includes:
+    /// - Attribute keys from the `attributes` MAP column
+    /// - Indexed column names that have at least one non-null value
+    /// - `level` alias (if `severity_text` has non-null values)
+    ///
+    /// Labels with only NULL values are excluded from the result.
+    pub async fn plan_labels(&self, selector: Selector) -> Result<DataFrame> {
+        // Build base query with tenant + time + selector filters
+        let log_expr = LogExpr::new(selector);
+        let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
+
+        // Query 1: Get distinct attribute keys from MAP column
+        let attr_keys_df = df
+            .clone()
+            .select(vec![map_keys(col("attributes")).alias("attr_keys")])?
+            .unnest_columns(&["attr_keys"])?
+            .aggregate(vec![col("attr_keys").alias("label")], vec![])?;
+
+        // Query 2: For each indexed column, emit its name only if it has non-null
+        // values Build: SELECT 'col_name' as label WHERE col IS NOT NULL LIMIT
+        // 1
+        let mut union_df = attr_keys_df;
+
+        for &col_name in INDEXED_ATTRIBUTE_COLUMNS {
+            let col_df = df
+                .clone()
+                .filter(col(col_name).is_not_null())?
+                .limit(0, Some(1))?
+                .select(vec![lit(col_name).alias("label")])?;
+            union_df = union_df.union(col_df)?;
+        }
+
+        // Add 'level' if severity_text has non-null values (Grafana compatibility)
+        let level_df = df
+            .filter(col("severity_text").is_not_null())?
+            .limit(0, Some(1))?
+            .select(vec![lit("level").alias("label")])?;
+        union_df = union_df.union(level_df)?;
+
+        // Deduplicate and return
+        Ok(union_df.aggregate(vec![col("label")], vec![])?)
+    }
+
+    /// Plan a query for distinct values of a specific label.
+    ///
+    /// Returns a `DataFrame` with a single column `value` containing all
+    /// distinct values for the specified label from logs matching the
+    /// selector and time range.
+    pub async fn plan_label_values(&self, selector: Selector, label_name: &str) -> Result<DataFrame> {
+        // Build base query with tenant + time + selector filters
+        let log_expr = LogExpr::new(selector);
+        let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
+
+        // Select value column (handle indexed vs attribute columns)
+        let internal_name = Self::map_label_to_internal_name(label_name);
+        let value_expr = if Self::is_top_level_field(internal_name) {
+            // Binary columns (trace_id, span_id) need to be converted to hex strings
+            // Cast FixedSizeBinary to Binary first since encode() requires Binary type
+            if Self::is_binary_column(internal_name) {
+                datafusion::functions::encoding::encode()
+                    .call(vec![
+                        col(internal_name).cast_to(&DataType::Binary, df.schema())?,
+                        lit("hex"),
+                    ])
+                    .alias("value")
+            } else {
+                col(internal_name).alias("value")
+            }
+        } else {
+            datafusion::functions::core::get_field()
+                .call(vec![col("attributes"), lit(label_name)])
+                .alias("value")
+        };
+
+        // Filter nulls, get distinct, sort
+        let df = df
+            .select(vec![value_expr])?
+            .filter(col("value").is_not_null())?
+            .aggregate(vec![col("value")], vec![])?
+            .sort(vec![col("value").sort(true, true)])?;
+
+        Ok(df)
+    }
+
+    /// Check if a column stores binary data (`trace_id`, `span_id`).
+    fn is_binary_column(name: &str) -> bool {
+        matches!(name, "trace_id" | "span_id")
+    }
+
+    /// Transform output columns for Loki/Grafana compatibility:
+    /// - Encode binary columns (`trace_id`, `span_id`) to hex strings
+    /// - Add `level` column as alias of `severity_text` (Grafana expects
+    ///   `level` label)
+    ///
+    /// This ensures that all output from log queries has:
+    /// - String-typed trace/span IDs (simplifies handler code)
+    /// - Grafana-compatible `level` label for log level filtering
+    fn transform_output_columns(df: DataFrame) -> Result<DataFrame> {
+        let schema = df.schema().clone();
+
+        // Build select expressions with transformations
+        let mut select_exprs: Vec<Expr> = schema
+            .inner()
+            .fields()
+            .iter()
+            .map(|field| {
+                let name = field.name().as_str();
+                if Self::BINARY_COLUMNS.contains(&name) {
+                    // encode(cast(col, Binary), 'hex') converts FixedSizeBinary to hex string
+                    datafusion::functions::encoding::encode()
+                        .call(vec![
+                            col(name).cast_to(&DataType::Binary, &schema).unwrap_or_else(|_| col(name)),
+                            lit("hex"),
+                        ])
+                        .alias(name)
+                } else {
+                    col(name)
+                }
+            })
+            .collect();
+
+        // Add `level` as alias of `severity_text` for Grafana compatibility
+        if schema.has_column_with_unqualified_name("severity_text") {
+            select_exprs.push(col("severity_text").alias("level"));
+        }
+
+        Ok(df.select(select_exprs)?)
+    }
+
+    /// Plan a query for distinct series (unique label combinations).
+    ///
+    /// Returns a `DataFrame` with indexed columns and attributes MAP for all
+    /// distinct series matching any of the provided selectors.
+    ///
+    /// The approach:
+    /// 1. Serialize MAP keys/values to strings (MAP doesn't support GROUP BY)
+    /// 2. Convert binary columns (`trace_id`, `span_id`) to hex strings
+    /// 3. Group by indexed columns + serialized attributes
+    /// 4. Keep one representative attributes MAP using `first_value()`
+    #[allow(clippy::items_after_statements)]
+    pub async fn plan_series(&self, selectors: &[Selector]) -> Result<DataFrame> {
+        use datafusion::{
+            functions_aggregate::first_last::first_value,
+            functions_nested::{map_keys::map_keys, map_values::map_values, string::array_to_string},
+        };
+
+        if selectors.is_empty() {
+            return Err(IceGateError::Plan("At least one selector is required".to_string()));
+        }
+
+        // Plan first selector as base
+        let log_expr = LogExpr::new(selectors[0].clone());
+        let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
+
+        // If multiple selectors, OR their filters together
+        let df = if selectors.len() > 1 {
+            let mut or_filters: Vec<Expr> = Vec::new();
+            for selector in &selectors[1..] {
+                if let Some(filter) = selector.matchers.iter().map(Self::matcher_to_expr).reduce(Expr::and) {
+                    or_filters.push(filter);
+                }
+            }
+            if or_filters.is_empty() {
+                df
+            } else if let Some(or_filter) = or_filters.into_iter().reduce(Expr::or) {
+                df.filter(or_filter)?
+            } else {
+                df
+            }
+        } else {
+            df
+        };
+
+        // Build select with serialized attributes for grouping
+        // Convert binary columns to hex strings for proper grouping and output
+        // Cast FixedSizeBinary to Binary first since encode() requires Binary type
+        let schema = df.schema().clone();
+        let mut select_cols: Vec<Expr> = INDEXED_ATTRIBUTE_COLUMNS
+            .iter()
+            .map(|&c| {
+                if Self::is_binary_column(c) {
+                    datafusion::functions::encoding::encode()
+                        .call(vec![
+                            col(c).cast_to(&DataType::Binary, &schema).unwrap_or_else(|_| col(c)),
+                            lit("hex"),
+                        ])
+                        .alias(c)
+                } else {
+                    col(c)
+                }
+            })
+            .collect();
+        // Add `level` as alias of `severity_text` for Grafana compatibility
+        select_cols.push(col("severity_text").alias("level"));
+        select_cols.push(col("attributes"));
+        // Serialize map keys and values for grouping
+        select_cols.push(array_to_string(map_keys(col("attributes")), lit(",")).alias("_attr_keys"));
+        select_cols.push(array_to_string(map_values(col("attributes")), lit(",")).alias("_attr_vals"));
+
+        let df = df.select(select_cols)?;
+
+        // Group by indexed columns + level + serialized attributes
+        let mut group_cols: Vec<Expr> = INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)).collect();
+        group_cols.push(col("level"));
+        group_cols.push(col("_attr_keys"));
+        group_cols.push(col("_attr_vals"));
+
+        let df = df.aggregate(group_cols, vec![
+            first_value(col("attributes"), vec![]).alias("attributes")
+        ])?;
+
+        Ok(df)
     }
 
     fn plan_metric<'a>(&'a self, expr: MetricExpr) -> Pin<Box<dyn Future<Output = Result<DataFrame>> + Send + 'a>> {
@@ -573,16 +796,28 @@ impl DataFusionPlanner {
         Ok(df.aggregate(group_exprs, vec![aggr_expr])?)
     }
 
-    fn apply_selector(df: DataFrame, selector: Selector) -> Result<DataFrame> {
+    /// Apply selector matchers to filter a `DataFrame`.
+    ///
+    /// Each matcher is converted to a filter expression and applied
+    /// sequentially.
+    pub fn apply_selector(df: DataFrame, selector: Selector) -> Result<DataFrame> {
         let mut df = df;
         for matcher in selector.matchers {
-            let expr = Self::matcher_to_expr(matcher);
+            let expr = Self::matcher_to_expr(&matcher);
             df = df.filter(expr)?;
         }
         Ok(df)
     }
 
-    fn matcher_to_expr(matcher: LabelMatcher) -> Expr {
+    /// Convert a `LabelMatcher` to a `DataFusion` filter expression.
+    ///
+    /// Handles both indexed columns (e.g., `service_name`, `severity_text`) and
+    /// attributes from the MAP column.
+    ///
+    /// For binary columns (`trace_id`, `span_id`), the user-provided hex string
+    /// is decoded to binary for comparison with the stored `FixedSizeBinary`
+    /// value.
+    pub fn matcher_to_expr(matcher: &LabelMatcher) -> Expr {
         let mapped_label = Self::map_label_to_internal_name(&matcher.label);
         let col_expr = if Self::is_top_level_field(&matcher.label) {
             col(mapped_label)
@@ -592,14 +827,26 @@ impl DataFusionPlanner {
             datafusion::functions::core::get_field().call(vec![col("attributes"), lit(matcher.label.as_str())])
         };
 
-        let val = lit(matcher.value);
+        // For binary columns (trace_id, span_id), decode the hex string to binary
+        // to compare with the stored FixedSizeBinary value
+        let val = if Self::is_binary_column(mapped_label) {
+            // decode(value, 'hex') converts hex string to Binary
+            datafusion::functions::encoding::decode().call(vec![lit(matcher.value.as_str()), lit("hex")])
+        } else {
+            lit(matcher.value.as_str())
+        };
 
         match matcher.op {
             MatchOp::Eq => col_expr.eq(val),
             MatchOp::Neq => col_expr.not_eq(val),
-            // Use regex_match function from datafusion-functions
-            MatchOp::Re => datafusion::functions::regex::regexp_match().call(vec![col_expr, val]),
-            MatchOp::Nre => datafusion::functions::regex::regexp_match().call(vec![col_expr, val]).not(),
+            // Use regexp_like which returns boolean (true if pattern matches)
+            // Note: regex matching on binary columns is not supported, will treat as string
+            MatchOp::Re => {
+                datafusion::functions::regex::regexp_like().call(vec![col_expr, lit(matcher.value.as_str())])
+            },
+            MatchOp::Nre => datafusion::functions::regex::regexp_like()
+                .call(vec![col_expr, lit(matcher.value.as_str())])
+                .not(),
         }
     }
 
@@ -609,14 +856,18 @@ impl DataFusionPlanner {
     /// - `level` -> `severity_text` (log level)
     /// - `detected_level` -> `severity_text` (Grafana's auto-detected level)
     /// - `service` -> `service_name` (alternative name)
-    fn map_label_to_internal_name(name: &str) -> &str {
+    pub fn map_label_to_internal_name(name: &str) -> &str {
         match name {
             "level" | "detected_level" => "severity_text",
             _ => name,
         }
     }
 
-    fn is_top_level_field(name: &str) -> bool {
+    /// Check if a label name corresponds to a top-level indexed column.
+    ///
+    /// Top-level fields are stored as separate columns in the Iceberg table,
+    /// while other labels are stored in the `attributes` MAP column.
+    pub fn is_top_level_field(name: &str) -> bool {
         let mapped = Self::map_label_to_internal_name(name);
         INDEXED_ATTRIBUTE_COLUMNS.contains(&mapped) || matches!(mapped, "tenant_id" | "timestamp")
     }
@@ -874,7 +1125,7 @@ impl DataFusionPlanner {
                 Ok(left_expr.or(right_expr))
             },
             LabelFilterExpr::Parens(inner) => Self::label_filter_to_expr(*inner),
-            LabelFilterExpr::Matcher(matcher) => Ok(Self::matcher_to_expr(matcher)),
+            LabelFilterExpr::Matcher(matcher) => Ok(Self::matcher_to_expr(&matcher)),
             LabelFilterExpr::Number {
                 label,
                 op,

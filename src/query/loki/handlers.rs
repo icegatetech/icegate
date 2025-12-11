@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use axum_extra::extract::Query as QueryExtra;
 use chrono::{DateTime, Duration, Utc};
 use datafusion::arrow::{
     array::{
@@ -22,8 +23,8 @@ use super::server::LokiState;
 use crate::{
     common::schema::INDEXED_ATTRIBUTE_COLUMNS,
     query::logql::{
-        antlr::AntlrParser, datafusion::DataFusionPlanner, duration::parse_duration_opt, planner::QueryContext, Parser,
-        Planner,
+        antlr::AntlrParser, datafusion::DataFusionPlanner, duration::parse_duration_opt, expr::LogQLExpr,
+        log::Selector, planner::QueryContext, Parser, Planner,
     },
 };
 
@@ -219,6 +220,44 @@ pub struct RangeQueryParams {
     pub limit: Option<u32>,
     /// Direction (forward/backward)
     pub direction: Option<String>,
+}
+
+/// Query parameters for `/loki/api/v1/labels`
+#[derive(Debug, Deserialize)]
+pub struct LabelsQueryParams {
+    /// Start time (nanoseconds or RFC3339)
+    pub start: Option<String>,
+    /// End time (nanoseconds or RFC3339)
+    pub end: Option<String>,
+    /// Duration string (e.g. "1h") - alternative to start/end
+    pub since: Option<String>,
+    /// `LogQL` selector to filter streams (e.g. `{service_name="foo"}`)
+    pub query: Option<String>,
+}
+
+/// Query parameters for `/loki/api/v1/label/:name/values`
+#[derive(Debug, Deserialize)]
+pub struct LabelValuesQueryParams {
+    /// Start time (nanoseconds or RFC3339)
+    pub start: Option<String>,
+    /// End time (nanoseconds or RFC3339)
+    pub end: Option<String>,
+    /// Duration string (e.g. "1h") - alternative to start/end
+    pub since: Option<String>,
+    /// `LogQL` selector to filter streams (e.g. `{service_name="foo"}`)
+    pub query: Option<String>,
+}
+
+/// Query parameters for `/loki/api/v1/series`
+#[derive(Debug, Deserialize)]
+pub struct SeriesQueryParams {
+    /// Required `LogQL` selectors (at least one required)
+    #[serde(rename = "match[]", default)]
+    pub matchers: Vec<String>,
+    /// Start time (nanoseconds or RFC3339)
+    pub start: Option<String>,
+    /// End time (nanoseconds or RFC3339)
+    pub end: Option<String>,
 }
 
 /// Handle instant query requests
@@ -449,8 +488,12 @@ impl StringInterner {
 struct BatchColumns {
     timestamp: Option<usize>,
     body: Option<usize>,
+    account_id: Option<usize>,
     service_name: Option<usize>,
     severity_text: Option<usize>,
+    level: Option<usize>,
+    trace_id: Option<usize>,
+    span_id: Option<usize>,
     attributes: Option<usize>,
 }
 
@@ -460,8 +503,12 @@ impl BatchColumns {
         Self {
             timestamp: schema.index_of("timestamp").ok(),
             body: schema.index_of("body").ok(),
+            account_id: schema.index_of("account_id").ok(),
             service_name: schema.index_of("service_name").ok(),
             severity_text: schema.index_of("severity_text").ok(),
+            level: schema.index_of("level").ok(),
+            trace_id: schema.index_of("trace_id").ok(),
+            span_id: schema.index_of("span_id").ok(),
             attributes: schema.index_of("attributes").ok(),
         }
     }
@@ -525,35 +572,76 @@ fn extract_body(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> String 
         .unwrap_or_default()
 }
 
-/// Extract labels from `service_name`, `severity_text`, and `attributes`
-/// columns.
+/// Extract labels from indexed columns (`account_id`, `service_name`,
+/// `severity_text`, `trace_id`, `span_id`) and `attributes` columns.
 ///
 /// Uses string interning to deduplicate repeated label names/values across
 /// rows.
+///
+/// Note: Binary columns (`trace_id`, `span_id`) are hex-encoded to strings
+/// by the planner before reaching the handler, so all columns are
+/// `StringArray`.
 fn extract_labels(
     batch: &RecordBatch,
     cols: &BatchColumns,
     row: usize,
     interner: &mut StringInterner,
 ) -> HashMap<Arc<str>, Arc<str>> {
-    // Pre-allocate for typical label count (service_name + level + ~6 attributes)
-    let mut labels: HashMap<Arc<str>, Arc<str>> = HashMap::with_capacity(8);
+    // Pre-allocate for typical label count (account_id + service_name + level +
+    // trace/span + ~6 attributes)
+    let mut labels: HashMap<Arc<str>, Arc<str>> = HashMap::with_capacity(12);
 
-    // Add service_name as label
-    if let Some(idx) = cols.service_name {
-        if let Some(arr) = batch.column(idx).as_any().downcast_ref::<StringArray>() {
-            if !arr.is_null(row) {
-                labels.insert(interner.intern("service_name"), interner.intern(arr.value(row)));
+    // Helper to extract string column value
+    let extract_string = |idx: usize| -> Option<&str> {
+        batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row))
             }
+        })
+    };
+
+    // Add account_id as label
+    if let Some(idx) = cols.account_id {
+        if let Some(val) = extract_string(idx) {
+            labels.insert(interner.intern("account_id"), interner.intern(val));
         }
     }
 
-    // Add severity_text as "level" label
+    // Add service_name as label
+    if let Some(idx) = cols.service_name {
+        if let Some(val) = extract_string(idx) {
+            labels.insert(interner.intern("service_name"), interner.intern(val));
+        }
+    }
+
+    // Add severity_text as label (original OTel name)
     if let Some(idx) = cols.severity_text {
-        if let Some(arr) = batch.column(idx).as_any().downcast_ref::<StringArray>() {
-            if !arr.is_null(row) {
-                labels.insert(interner.intern("level"), interner.intern(arr.value(row)));
-            }
+        if let Some(val) = extract_string(idx) {
+            labels.insert(interner.intern("severity_text"), interner.intern(val));
+        }
+    }
+
+    // Add level as label (alias of severity_text, added by planner for Grafana
+    // compatibility)
+    if let Some(idx) = cols.level {
+        if let Some(val) = extract_string(idx) {
+            labels.insert(interner.intern("level"), interner.intern(val));
+        }
+    }
+
+    // Add trace_id (hex-encoded string from planner)
+    if let Some(idx) = cols.trace_id {
+        if let Some(val) = extract_string(idx) {
+            labels.insert(interner.intern("trace_id"), interner.intern(val));
+        }
+    }
+
+    // Add span_id (hex-encoded string from planner)
+    if let Some(idx) = cols.span_id {
+        if let Some(val) = extract_string(idx) {
+            labels.insert(interner.intern("span_id"), interner.intern(val));
         }
     }
 
@@ -701,6 +789,8 @@ fn extract_time_bucket_secs(batch: &RecordBatch, cols: &MetricBatchColumns, row:
 }
 
 /// Extract metric value as string (handles Float64, Int64).
+///
+/// Returns `"0"` for NULL values (e.g., empty aggregation windows from LEFT JOIN).
 fn extract_metric_value(batch: &RecordBatch, cols: &MetricBatchColumns, row: usize) -> String {
     cols.value.map_or_else(
         || "0".to_string(),
@@ -878,38 +968,268 @@ fn parse_time(s: &str) -> DateTime<Utc> {
     )
 }
 
-/// Handle label names request
+// ============================================================================
+// Label Metadata Endpoints - Helper Functions
+// ============================================================================
+
+/// Build `QueryContext` from request parameters.
 ///
-/// # TODO
-/// - Query Iceberg logs table for distinct label/attribute names
-/// - Filter by time range if provided
-/// - Return list of label names in Loki format
-pub async fn labels(State(_state): State<LokiState>) -> Response {
+/// Handles time range parsing with support for `start`, `end`, and `since`
+/// parameters. Defaults to 6 hours if no time range is specified.
+fn build_query_context(
+    tenant_id: String,
+    start: Option<&String>,
+    end: Option<&String>,
+    since: Option<&String>,
+) -> QueryContext {
+    let now = Utc::now();
+    let end_time = end.map_or(now, |s| parse_time(s));
+    let start_time = since
+        .and_then(|s| parse_duration_opt(s))
+        .map(|d| end_time - d)
+        .or_else(|| start.map(|s| parse_time(s)))
+        .unwrap_or(now - Duration::hours(6));
+
+    QueryContext {
+        tenant_id,
+        start: start_time,
+        end: end_time,
+        limit: None, // No limit for metadata queries
+        step: None,
+    }
+}
+
+/// Parse a `LogQL` selector string into a `Selector`.
+///
+/// Uses the `AntlrParser` to parse the query string and extracts the selector.
+/// Returns an error if the query is not a valid log selector.
+fn parse_selector(query: &str) -> Result<Selector, String> {
+    let parser = AntlrParser::new();
+    match parser.parse(query) {
+        Ok(LogQLExpr::Log(log_expr)) => Ok(log_expr.selector),
+        Ok(_) => Err("Expected log selector, got metric query".to_string()),
+        Err(e) => Err(format!("Parse error: {e}")),
+    }
+}
+
+/// Format error response in Loki format.
+fn error_response(status: StatusCode, message: &str) -> Response {
     (
-        StatusCode::NOT_IMPLEMENTED,
+        status,
         Json(json!({
             "status": "error",
-            "error": "Labels endpoint not yet implemented. TODO: Query distinct labels from Iceberg"
+            "error": message
         })),
     )
         .into_response()
 }
 
-/// Handle label values request
+/// Extract string values from a column in record batches.
+fn extract_string_column(batches: &[RecordBatch], col_idx: usize) -> Vec<String> {
+    let mut values = Vec::new();
+    for batch in batches {
+        if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>() {
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    values.push(arr.value(i).to_string());
+                }
+            }
+        }
+    }
+    values
+}
+
+// ============================================================================
+// Label Metadata Endpoints - Handlers
+// ============================================================================
+
+/// Handle label names request.
 ///
-/// # TODO
-/// - Query Iceberg logs table for distinct values of specified label
-/// - Filter by time range if provided
-/// - Return list of label values in Loki format
-pub async fn label_values(State(_state): State<LokiState>, Path(_label_name): Path<String>) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "status": "error",
-            "error": "Label values endpoint not yet implemented. TODO: Query label values from Iceberg"
-        })),
-    )
-        .into_response()
+/// Returns all distinct label names (indexed columns + attribute keys) from
+/// logs matching the optional selector and time range.
+///
+/// Loki API: `GET /loki/api/v1/labels`
+pub async fn labels(
+    State(loki_state): State<LokiState>,
+    headers: HeaderMap,
+    Query(params): Query<LabelsQueryParams>,
+) -> Response {
+    let query_ctx = build_query_context(
+        extract_tenant_id(&headers),
+        params.start.as_ref(),
+        params.end.as_ref(),
+        params.since.as_ref(),
+    );
+
+    // Parse optional selector (or use empty)
+    let selector = match params.query.as_ref() {
+        Some(query) => match parse_selector(query) {
+            Ok(s) => s,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+        },
+        None => Selector::empty(),
+    };
+
+    // Create session and planner
+    let session_ctx = match loki_state.engine.create_session().await {
+        Ok(ctx) => ctx,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    // Plan and execute labels query
+    let df = match planner.plan_labels(selector).await {
+        Ok(df) => df,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let batches = match df.collect().await {
+        Ok(b) => b,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Build result from planner output (includes indexed columns with non-null
+    // values, attribute keys, and 'level' alias)
+    let mut labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for value in extract_string_column(&batches, 0) {
+        labels.insert(value);
+    }
+
+    let mut result: Vec<String> = labels.into_iter().collect();
+    result.sort();
+
+    (StatusCode::OK, Json(json!({"status": "success", "data": result}))).into_response()
+}
+
+/// Handle label values request.
+///
+/// Returns all distinct values for a specific label from logs matching
+/// the optional selector and time range.
+///
+/// Loki API: `GET /loki/api/v1/label/:name/values`
+pub async fn label_values(
+    State(loki_state): State<LokiState>,
+    headers: HeaderMap,
+    Path(label_name): Path<String>,
+    Query(params): Query<LabelValuesQueryParams>,
+) -> Response {
+    let query_ctx = build_query_context(
+        extract_tenant_id(&headers),
+        params.start.as_ref(),
+        params.end.as_ref(),
+        params.since.as_ref(),
+    );
+
+    // Parse optional selector (or use empty)
+    let selector = match params.query.as_ref() {
+        Some(query) => match parse_selector(query) {
+            Ok(s) => s,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+        },
+        None => Selector::empty(),
+    };
+
+    // Create session and planner
+    let session_ctx = match loki_state.engine.create_session().await {
+        Ok(ctx) => ctx,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    // Plan and execute label values query
+    let df = match planner.plan_label_values(selector, &label_name).await {
+        Ok(df) => df,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let batches = match df.collect().await {
+        Ok(b) => b,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Extract string values
+    let values = extract_string_column(&batches, 0);
+
+    (StatusCode::OK, Json(json!({"status": "success", "data": values}))).into_response()
+}
+
+/// Handle series request.
+///
+/// Returns all unique label combinations (series) matching the provided
+/// selectors and time range. At least one `match[]` parameter is required.
+///
+/// Loki API: `GET /loki/api/v1/series`
+pub async fn series(
+    State(loki_state): State<LokiState>,
+    headers: HeaderMap,
+    QueryExtra(params): QueryExtra<SeriesQueryParams>,
+) -> Response {
+    // Require at least one matcher (per Loki API spec)
+    if params.matchers.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "match[] parameter required");
+    }
+
+    let query_ctx = build_query_context(
+        extract_tenant_id(&headers),
+        params.start.as_ref(),
+        params.end.as_ref(),
+        None, // series doesn't support 'since'
+    );
+
+    // Parse all selectors
+    let mut selectors = Vec::new();
+    for matcher_str in &params.matchers {
+        match parse_selector(matcher_str) {
+            Ok(selector) => selectors.push(selector),
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+        }
+    }
+
+    // Create session and planner
+    let session_ctx = match loki_state.engine.create_session().await {
+        Ok(ctx) => ctx,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    // Plan and execute series query
+    let df = match planner.plan_series(&selectors).await {
+        Ok(df) => df,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let batches = match df.collect().await {
+        Ok(b) => b,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Convert to series list (array of label maps)
+    let series_list = batches_to_series_list(&batches);
+
+    (StatusCode::OK, Json(json!({"status": "success", "data": series_list}))).into_response()
+}
+
+/// Convert record batches to series list (array of label maps).
+///
+/// Each series is a map of label name -> value for all indexed columns
+/// and attributes.
+fn batches_to_series_list(batches: &[RecordBatch]) -> Vec<HashMap<String, String>> {
+    let mut series_list = Vec::new();
+    let mut interner = StringInterner::new();
+
+    for batch in batches {
+        let cols = BatchColumns::from_schema(batch.schema().as_ref());
+
+        for row in 0..batch.num_rows() {
+            let labels = extract_labels(batch, &cols, row, &mut interner);
+            // Convert Arc<str> to String for JSON
+            let label_map: HashMap<String, String> =
+                labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            series_list.push(label_map);
+        }
+    }
+
+    series_list
 }
 
 /// Health/ready check endpoint

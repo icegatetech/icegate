@@ -12,7 +12,7 @@ cargo test                     # Run all tests
 cargo test test_name           # Run specific test
 cargo test -- --nocapture      # Run tests with output shown
 cargo fmt                      # Format code
-cargo +nightly fmt -- --check  # Check code format
+cargo +nightly fmt -- --check  # Check code format DO NOT RUN via rustup because it doesn't respect rustfmt.toml
 cargo clippy --all-targets     # Run linter (strict config in Cargo.toml)
 ```
 
