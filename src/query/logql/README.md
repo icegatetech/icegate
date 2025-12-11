@@ -24,13 +24,14 @@ Core log queries and metric aggregations (`rate`, `count_over_time`, `bytes_over
 | :--- | :--- | :--- |
 | **Log Selection** | ✅ Implemented | Scans `logs` table, applies time range filters. |
 | **Label Matchers** | ✅ Implemented | Supports `=`, `!=`, `=~` (regex), `!~` (not regex). |
-| **Line Filters** | ⚠️ Partial | **Implemented:** `|=` (contains), `!=` (not contains), `|~` (regex), `!~` (not regex).<br>**Missing:** `!>` (not pattern) is a no-op. IP filtering is a no-op. |
+| **Line Filters** | ⚠️ Partial | **Implemented:** `|=` (contains), `!=` (not contains), `|~` (regex), `!~` (not regex).<br>**Missing:** `!>` (not pattern) returns `NotImplemented` error. IP filtering returns `NotImplemented` error. |
 | **Pipeline Parsers** | ❌ Missing | `json`, `logfmt`, `regexp`, `pattern`, `unpack` are all placeholders (no-ops). |
 | **Pipeline Formatting** | ❌ Missing | `label_format`, `line_format`, `decolorize` are placeholders (no-ops). |
-| **Label Management** | ❌ Missing | `drop` and `keep` stages are placeholders (no-ops). |
+| **Label Management** | ⚠️ Partial | **Implemented:** `drop` and `keep` with simple names and `=` matcher via UDFs.<br>**Missing:** `!=`, `=~`, `!~` matchers for drop/keep expressions. |
 | **Label Filters** | ⚠️ Partial | **Implemented:** Numeric, Duration, and Bytes comparisons (`>`, `>=`, `<`, `<=`, `=`, `!=`).<br>**Missing:** IP filtering returns `NotImplemented` error. |
-| **Range Aggregation** | ⚠️ Partial | **Implemented:** `count_over_time`, `rate`, `bytes_over_time`, `bytes_rate` with time bucketing via `date_bin()` and `offset` modifier support.<br>**Missing:** `absent_over_time`, unwrap-based aggregations (`sum_over_time`, `avg_over_time`, `min_over_time`, `max_over_time`, `stddev_over_time`, `stdvar_over_time`, `quantile_over_time`, `first_over_time`, `last_over_time`, `rate_counter`). |
-| **Vector Aggregation** | ⚠️ Partial | **Implemented:** `sum`, `avg`, `min`, `max`, `count`.<br>**Missing:** `stddev`, `stdvar`, `bottomk`, `topk` return `NotImplemented` error. |
+| **Log-Range Aggregation** | ⚠️ Partial | **Implemented:** `count_over_time`, `rate`, `bytes_over_time`, `bytes_rate` with time bucketing via `date_bin()` and `offset` modifier support.<br>**Missing:** `absent_over_time` returns `NotImplemented` error. |
+| **Unwrap Aggregation** | ❌ Missing | `sum_over_time`, `avg_over_time`, `min_over_time`, `max_over_time`, `stddev_over_time`, `stdvar_over_time`, `quantile_over_time`, `first_over_time`, `last_over_time`, `rate_counter` all return `NotImplemented` error. |
+| **Vector Aggregation** | ⚠️ Partial | **Implemented:** `sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`.<br>**Missing:** `bottomk`, `topk`, `sort`, `sort_desc` return `NotImplemented` error. |
 | **Binary Operations** | ❌ Missing | Arithmetic (`+`, `-`, `*`, `/`, etc.) and logical/set operations between vectors are not implemented. Returns `NotImplemented` error. |
 | **Literals** | ✅ Implemented | Scalar literals work. Vector literals and label replace are missing. |
 
@@ -51,9 +52,9 @@ Core log queries and metric aggregations (`rate`, `count_over_time`, `bytes_over
 - **Metric queries** (e.g., `rate({service="x"}[5m])`): Returns `resultType: "matrix"` with `metric` labels and decimal second numeric timestamps.
 
 ### 4. User Defined Functions (UDFs) (`src/query/logql/datafusion/udf.rs`)
-**Status: ❌ Missing**
-- `UdfRegistry` exists but is empty.
-- Critical UDFs for pipeline stages (e.g., `json_parser`, `ip_match`) are not registered or implemented.
+**Status: ⚠️ Partial**
+- **Implemented:** `map_keep_keys`, `map_drop_keys` (for `keep`/`drop`/`by`/`without` operations).
+- **Missing:** `json_parser`, `logfmt_parser`, `ip_match` for pipeline stages.
 
 ## Recommendations
 

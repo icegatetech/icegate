@@ -160,6 +160,9 @@ decolorizeExpr
  *------------------------------------------------------------------
 */
 // https://clickhouse.com/docs/sql-reference/statements/select#dynamic-column-selection
+// TODO: Loki supports all matchers (=, !=, =~, !~) for drop/keep expressions
+// Example: drop level, method="GET", app=~"api.*", err!=""
+// Current grammar only supports simple names and = matcher via labelExtractionExpr
 dropExpr
     : DROP labelExtractions
     ;
