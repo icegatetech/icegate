@@ -1,4 +1,4 @@
-//! User-defined functions for LogQL operations in DataFusion.
+//! User-defined scalar functions for LogQL operations in DataFusion.
 //!
 //! This module provides UDFs for LogQL-specific operations, particularly
 //! map filtering functions needed for `keep`, `drop`, `by`, and `without`
@@ -13,35 +13,8 @@ use datafusion::{
         datatypes::DataType,
     },
     common::{plan_err, Result},
-    logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
-    prelude::SessionContext,
+    logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
-
-/// Registry for all `LogQL` UDFs.
-///
-/// Provides UDF registration for LogQL-specific operations including:
-/// - `map_keep_keys`: Filters a map to keep only specified keys
-/// - `map_drop_keys`: Filters a map to remove specified keys
-#[derive(Debug, Clone, Default)]
-pub struct UdfRegistry;
-
-impl UdfRegistry {
-    /// Creates a new UDF registry.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-
-    /// Registers all UDFs with a DataFusion session context.
-    ///
-    /// Registers the following UDFs:
-    /// - `map_keep_keys(map, keys_array)`: Keeps only keys present in array
-    /// - `map_drop_keys(map, keys_array)`: Removes keys present in array
-    pub fn register_all(&self, session_ctx: &SessionContext) {
-        session_ctx.register_udf(ScalarUDF::from(MapKeepKeys::new()));
-        session_ctx.register_udf(ScalarUDF::from(MapDropKeys::new()));
-    }
-}
 
 /// UDF: `map_keep_keys(map, keys_array)` - keeps only keys present in array.
 ///

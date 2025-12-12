@@ -2,21 +2,20 @@
 
 // Allow warnings for stub implementations - these will be fixed as features are
 // implemented
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin};
+
+/// Internal column name for serialized attribute keys.
+const COL_ATTR_KEYS: &str = "_attr_keys";
+/// Internal column name for serialized attribute values.
+const COL_ATTR_VALS: &str = "_attr_vals";
+/// Internal column name for UDAF result.
+const COL_RESULT: &str = "_result";
 
 use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::{
-    arrow::{
-        datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit},
-        record_batch::RecordBatch,
-    },
-    common::Column,
-    datasource::MemTable,
-    functions_aggregate::{count::count_udaf, expr_fn::last_value, sum::sum_udaf},
-    logical_expr::{
-        col, expr::WindowFunction, lit, AggregateUDF, Expr, ExprSchemable, JoinType, ScalarUDF, WindowFrame,
-        WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
-    },
+    arrow::datatypes::{DataType, IntervalMonthDayNano},
+    functions_aggregate::expr_fn::last_value,
+    logical_expr::{col, lit, AggregateUDF, Expr, ExprSchemable, ScalarUDF},
     prelude::*,
     scalar::ScalarValue,
 };
@@ -319,16 +318,16 @@ impl DataFusionPlanner {
         select_cols.push(col("severity_text").alias("level"));
         select_cols.push(col("attributes"));
         // Serialize map keys and values for grouping
-        select_cols.push(array_to_string(map_keys(col("attributes")), lit(",")).alias("_attr_keys"));
-        select_cols.push(array_to_string(map_values(col("attributes")), lit(",")).alias("_attr_vals"));
+        select_cols.push(array_to_string(map_keys(col("attributes")), lit(",")).alias(COL_ATTR_KEYS));
+        select_cols.push(array_to_string(map_values(col("attributes")), lit(",")).alias(COL_ATTR_VALS));
 
         let df = df.select(select_cols)?;
 
         // Group by indexed columns + level + serialized attributes
         let mut group_cols: Vec<Expr> = INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)).collect();
         group_cols.push(col("level"));
-        group_cols.push(col("_attr_keys"));
-        group_cols.push(col("_attr_vals"));
+        group_cols.push(col(COL_ATTR_KEYS));
+        group_cols.push(col(COL_ATTR_VALS));
 
         let df = df.aggregate(group_cols, vec![
             first_value(col("attributes"), vec![]).alias("attributes")
@@ -401,87 +400,125 @@ impl DataFusionPlanner {
         ))
     }
 
+    /// Plans a log range aggregation using UDAF-based implementation.
+    ///
+    /// This implementation uses custom aggregate functions that compute
+    /// values for each time grid point in a single pass, then unnest the
+    /// result to produce the output rows.
+    ///
+    /// Supports: `count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`,
+    /// `absent_over_time`.
     async fn plan_log_range_aggregation(
         &self,
         agg: crate::query::logql::metric::RangeAggregation,
     ) -> Result<DataFrame> {
         // 1. Plan the inner LogExpr with extended time range for lookback window
-        // For rate({job="x"}[5m]) evaluated from start to end:
-        // - Each evaluation point T needs data from (T - range) to T
-        // - So we need data from (start - range) to end
-        // - With offset: (start - range - offset) to (end - offset)
         let offset_duration = agg.range_expr.offset.unwrap_or(TimeDelta::zero());
-
-        // Start: context.start - range - offset (for lookback window)
-        // End: context.end - offset
         let adjusted_start = self.query_ctx.start - agg.range_expr.range - offset_duration;
         let adjusted_end = self.query_ctx.end - offset_duration;
 
         let df = self.plan_log(agg.range_expr.log_expr, adjusted_start, adjusted_end).await?;
 
-        // Create data grid, cross join with unique set of labels
-        // Note: Exclude timestamp - it comes from the time grid via cross-join
-        let mut grouping_for_grid = Self::build_default_label_exprs(&[], &["attributes"]);
-        grouping_for_grid.extend(vec![
-            array_to_string(map_keys(col("attributes")), lit(",")).alias("attributes_keys"),
-            array_to_string(map_values(col("attributes")), lit(",")).alias("attributes_values"),
-        ]);
-        let timestamps = self.generate_time_grid()?;
-        let grid_df = self.create_time_grid(timestamps)?;
+        // 2. Build grouping expressions for labels
+        let mut grouping_exprs = Self::build_default_label_exprs(&[], &["attributes"]);
+        grouping_exprs.push(array_to_string(map_keys(col("attributes")), lit(",")).alias(COL_ATTR_KEYS));
+        grouping_exprs.push(array_to_string(map_values(col("attributes")), lit(",")).alias(COL_ATTR_VALS));
 
-        // Get unique label combinations and cross-join with time grid
-        let agg_df = df.clone().aggregate(grouping_for_grid, vec![
-            last_value(col("attributes"), vec![]).alias("attributes")
-        ])?;
-        let labeled_grid_df = agg_df.join(grid_df, JoinType::Inner, &[], &[], None)?.alias("grid")?;
+        // 3. Build UDAF arguments
+        let start_micros = self.query_ctx.start.timestamp_micros();
+        let end_micros = self.query_ctx.end.timestamp_micros();
+        let step_micros = self
+            .query_ctx
+            .step
+            .ok_or(IceGateError::Config("Step parameter is required".to_string()))?
+            .num_microseconds()
+            .ok_or(IceGateError::Config("Step too large".to_string()))?;
+        let range_nanos = agg
+            .range_expr
+            .range
+            .num_nanoseconds()
+            .ok_or(IceGateError::Config("Range too large".to_string()))?;
+        let offset_nanos = offset_duration
+            .num_nanoseconds()
+            .ok_or(IceGateError::Config("Offset too large".to_string()))?;
 
-        // 2. Build time bucket expression using step from context
-        let time_bucket = self.build_time_bucket(agg.range_expr.range);
-        let window_frame = WindowFrame::new_bounds(
-            WindowFrameUnits::Range,
-            WindowFrameBound::Preceding(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
-                0,
-                0,
-                agg.range_expr.range.num_nanoseconds().unwrap_or(0) + offset_duration.num_nanoseconds().unwrap_or(0),
-            )))),
-            WindowFrameBound::Preceding(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
-                0,
-                0,
-                offset_duration.num_nanoseconds().unwrap_or(0),
-            )))),
-        );
+        // Common UDAF arguments
+        let start_arg = lit(ScalarValue::TimestampMicrosecond(Some(start_micros), None));
+        let end_arg = lit(ScalarValue::TimestampMicrosecond(Some(end_micros), None));
+        let step_arg = lit(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+            0,
+            0,
+            step_micros * 1000,
+        ))));
+        let range_arg = lit(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+            0,
+            0,
+            range_nanos,
+        ))));
+        let offset_arg = lit(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+            0,
+            0,
+            offset_nanos,
+        ))));
 
-        let mut grouping_for_window = Self::build_default_label_exprs(&[], &["attributes"]);
-        grouping_for_window.extend(vec![map_keys(col("attributes")), map_values(col("attributes"))]);
-
-        let range_secs = agg.range_expr.range.as_seconds_f32();
-        let window_expr = match agg.op {
+        // 4. Build UDAF expression based on operation type
+        let udaf_expr = match agg.op {
             RangeAggregationOp::CountOverTime => {
-                Self::build_log_window_expr(count_udaf(), lit(1), window_frame, grouping_for_window, None)?
+                let udaf = AggregateUDF::from(super::udaf::CountOverTime::new());
+                udaf.call(vec![
+                    col("timestamp"),
+                    start_arg,
+                    end_arg,
+                    step_arg,
+                    range_arg,
+                    offset_arg,
+                ])
             },
-            RangeAggregationOp::Rate => Self::build_log_window_expr(
-                count_udaf(),
-                lit(1),
-                window_frame,
-                grouping_for_window,
-                Some(range_secs),
-            )?,
-            RangeAggregationOp::BytesOverTime => Self::build_log_window_expr(
-                sum_udaf(),
-                octet_length(col("body")),
-                window_frame,
-                grouping_for_window,
-                None,
-            )?,
-            RangeAggregationOp::BytesRate => Self::build_log_window_expr(
-                sum_udaf(),
-                octet_length(col("body")),
-                window_frame,
-                grouping_for_window,
-                Some(range_secs),
-            )?,
+            RangeAggregationOp::Rate => {
+                let udaf = AggregateUDF::from(super::udaf::RateOverTime::new());
+                udaf.call(vec![
+                    col("timestamp"),
+                    start_arg,
+                    end_arg,
+                    step_arg,
+                    range_arg,
+                    offset_arg,
+                ])
+            },
+            RangeAggregationOp::BytesOverTime => {
+                let udaf = AggregateUDF::from(super::udaf::BytesOverTime::new());
+                udaf.call(vec![
+                    col("timestamp"),
+                    col("body"), // Body column - UDAF calculates byte length internally
+                    start_arg,
+                    end_arg,
+                    step_arg,
+                    range_arg,
+                    offset_arg,
+                ])
+            },
+            RangeAggregationOp::BytesRate => {
+                let udaf = AggregateUDF::from(super::udaf::BytesRate::new());
+                udaf.call(vec![
+                    col("timestamp"),
+                    col("body"), // Body column - UDAF calculates byte length internally
+                    start_arg,
+                    end_arg,
+                    step_arg,
+                    range_arg,
+                    offset_arg,
+                ])
+            },
             RangeAggregationOp::AbsentOverTime => {
-                return Err(IceGateError::NotImplemented("Absent over time".to_string()));
+                let udaf = AggregateUDF::from(super::udaf::AbsentOverTime::new());
+                udaf.call(vec![
+                    col("timestamp"),
+                    start_arg,
+                    end_arg,
+                    step_arg,
+                    range_arg,
+                    offset_arg,
+                ])
             },
             _ => {
                 return Err(IceGateError::Plan(
@@ -490,102 +527,31 @@ impl DataFusionPlanner {
             },
         };
 
-        let mut select_list = Self::build_default_label_exprs(&["timestamp"], &[]);
-        select_list.extend(vec![window_expr.alias("value"), time_bucket.alias("time_bucket")]);
-        let df = df.select(select_list)?;
-        let mut agg_list = Self::build_default_label_exprs(&[], &["attributes"]);
-        agg_list.extend(vec![
-            col("time_bucket").alias("timestamp"),
-            array_to_string(map_keys(col("attributes")), lit(",")).alias("attributes_keys"),
-            array_to_string(map_values(col("attributes")), lit(",")).alias("attributes_values"),
-        ]);
-        let df = df
-            .aggregate(agg_list, vec![
-                last_value(col("value"), vec![col("timestamp").sort(true, false)]).alias("value"),
-                last_value(col("attributes"), vec![]).alias("attributes"),
-            ])?
-            .alias("origin")?;
+        // 5. Aggregate with grouping
+        let df = df.aggregate(grouping_exprs, vec![
+            udaf_expr.alias(COL_RESULT),
+            last_value(col("attributes"), vec![]).alias("attributes"),
+        ])?;
 
-        let names: Vec<String> =
-            Self::build_default_label_columns(&["timestamp", "attributes_keys", "attributes_values"], &["attributes"]);
-        let names_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let df = labeled_grid_df.join(df, JoinType::Left, &names_refs, &names_refs, None)?;
+        // 6. Unnest the list to get individual struct rows
+        // UDAF returns List<Struct { timestamp, value }>
+        let df = df.unnest_columns(&[COL_RESULT])?;
 
-        // After LEFT JOIN, both sides have columns like severity_text, causing
-        // ambiguity. Select specific columns using qualified names: labels from
-        // grid, value from origin.
-        let mut final_select = Vec::new();
-        // Label columns from grid side (grid has all time points, origin may have gaps)
-        for name in Self::build_default_label_columns(&["timestamp"], &["attributes"]) {
-            final_select.push(col(Column::new(Some("grid"), &name)));
-        }
-        // Value from origin (NULL if no matching data point - LEFT JOIN)
-        final_select.push(col(Column::new(Some("origin"), "value")));
-        // Attributes from grid (preserved label combinations)
-        final_select.push(col(Column::new(Some("grid"), "attributes")));
-        let df = df.select(final_select)?;
+        // 7. Unnest the struct to expand timestamp and value columns
+        let df = df.unnest_columns(&[COL_RESULT])?;
+
+        // 8. Rename and cast to final schema
+        let schema = df.schema().clone();
+        let mut select_exprs = Self::build_default_label_exprs(&[], &[]);
+        #[allow(clippy::uninlined_format_args)] // Can't inline in raw strings
+        let col_result_ts = format!(r#""{}.timestamp""#, COL_RESULT);
+        #[allow(clippy::uninlined_format_args)]
+        let col_result_val = format!(r#""{}.value""#, COL_RESULT);
+        select_exprs.push(col(&col_result_ts).alias("timestamp"));
+        select_exprs.push(col(&col_result_val).cast_to(&DataType::Float64, &schema)?.alias("value"));
+        let df = df.select(select_exprs)?;
 
         Ok(df)
-    }
-
-    // ========================================================================
-    // Range Aggregation Helper Methods
-    // ========================================================================
-
-    /// Builds a window expression for log-based range aggregations.
-    ///
-    /// Creates a window function with the specified aggregation function and
-    /// argument, applies the window frame, ordering, and partitioning, then
-    /// optionally divides by the rate divisor for rate calculations.
-    fn build_log_window_expr(
-        agg_func: Arc<AggregateUDF>,
-        agg_arg: Expr,
-        window_frame: WindowFrame,
-        grouping: Vec<Expr>,
-        rate_divisor: Option<f32>,
-    ) -> Result<Expr> {
-        let window_func = WindowFunction::new(WindowFunctionDefinition::from(agg_func), vec![agg_arg]);
-        let expr = Expr::from(window_func)
-            .window_frame(window_frame)
-            .order_by(vec![col("timestamp").sort(true, false)])
-            .partition_by(grouping)
-            .build()?;
-
-        Ok(match rate_divisor {
-            Some(divisor) => expr.div(lit(divisor)),
-            None => expr,
-        })
-    }
-
-    /// Converts microseconds to DataFusion interval literal for `date_bin`.
-    /// Uses microseconds since the timestamp column has microsecond precision.
-    fn micros_to_interval_literal(micros: i64) -> Expr {
-        // DataFusion IntervalMonthDayNano uses nanoseconds internally
-        let nanos = micros * 1000;
-        lit(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano {
-            months: 0,
-            days: 0,
-            nanoseconds: nanos,
-        })))
-    }
-
-    /// Creates `date_bin` expression for time bucketing.
-    /// Uses `context.step` from Loki API for bucketing, falls back to `range`
-    /// if not provided. Interval is truncated to microseconds since
-    /// timestamp column has microsecond precision.
-    fn build_time_bucket(&self, range: chrono::TimeDelta) -> Expr {
-        // TODO: rework it to use micros only precision
-        let bucket_nanos = self.query_ctx.step.unwrap_or(range).num_nanoseconds().unwrap_or(0);
-        // Truncate to microseconds (timestamp column precision)
-        let bucket_micros = bucket_nanos / 1000;
-        datafusion::functions::datetime::date_bin().call(vec![
-            Self::micros_to_interval_literal(bucket_micros),
-            col("timestamp"),
-            lit(ScalarValue::TimestampMicrosecond(
-                Some(self.query_ctx.start.timestamp_micros()),
-                None,
-            )),
-        ])
     }
 
     fn build_default_label_columns(with: &[&str], without: &[&str]) -> Vec<String> {
@@ -601,59 +567,6 @@ impl DataFusionPlanner {
 
     fn build_default_label_exprs(with: &[&str], without: &[&str]) -> Vec<Expr> {
         Self::build_default_label_columns(with, without).into_iter().map(col).collect()
-    }
-
-    // ========================================================================
-    // Time Grid Generation (for gap filling)
-    // ========================================================================
-
-    /// Generates time bucket timestamps from start to end with step interval.
-    /// Returns microseconds (matching timestamp column precision).
-    #[allow(clippy::cast_possible_truncation)]
-    fn generate_time_grid(&self) -> Result<Vec<i64>> {
-        let step_micros = self
-            .query_ctx
-            .step
-            .ok_or(IceGateError::Config(
-                "Step parameter is required for metric query".to_string(),
-            ))?
-            .num_microseconds()
-            .ok_or(IceGateError::Config(
-                "Step parameter is very big in microsecond ratio".to_string(),
-            ))?;
-
-        let start_micros = self.query_ctx.start.timestamp_micros();
-        let end_micros = self.query_ctx.end.timestamp_micros();
-
-        let mut timestamps = Vec::new();
-        let mut current = start_micros;
-
-        while current <= end_micros {
-            timestamps.push(current);
-            current += step_micros;
-        }
-
-        Ok(timestamps)
-    }
-
-    /// Creates a `DataFrame` representing the time grid as an in-memory table.
-    fn create_time_grid(&self, timestamps: Vec<i64>) -> Result<DataFrame> {
-        use datafusion::arrow::array::TimestampMicrosecondArray;
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        )]));
-
-        let time_array = TimestampMicrosecondArray::from(timestamps);
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(time_array)])
-            .map_err(|e| IceGateError::Config(format!("Failed to create time grid batch: {e}")))?;
-
-        let mem_table = MemTable::try_new(schema, vec![vec![batch]])
-            .map_err(|e| IceGateError::Config(format!("Failed to create time grid table: {e}")))?;
-
-        Ok(self.session_ctx.read_table(Arc::new(mem_table))?)
     }
 
     async fn plan_vector_aggregation(&self, agg: crate::query::logql::metric::VectorAggregation) -> Result<DataFrame> {
@@ -1161,7 +1074,9 @@ impl DataFusionPlanner {
                 };
 
                 use crate::query::logql::common::ComparisonOp;
-                let nanos = value.num_nanoseconds().unwrap_or(0);
+                let nanos = value
+                    .num_nanoseconds()
+                    .ok_or(IceGateError::Config("Duration too large".to_string()))?;
                 let expr = match op {
                     ComparisonOp::Gt => col_expr.gt(lit(nanos)),
                     ComparisonOp::Ge => col_expr.gt_eq(lit(nanos)),

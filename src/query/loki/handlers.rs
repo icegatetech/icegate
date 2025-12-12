@@ -790,7 +790,8 @@ fn extract_time_bucket_secs(batch: &RecordBatch, cols: &MetricBatchColumns, row:
 
 /// Extract metric value as string (handles Float64, Int64).
 ///
-/// Returns `"0"` for NULL values (e.g., empty aggregation windows from LEFT JOIN).
+/// Returns `"0"` for NULL values (e.g., empty aggregation windows from LEFT
+/// JOIN).
 fn extract_metric_value(batch: &RecordBatch, cols: &MetricBatchColumns, row: usize) -> String {
     cols.value.map_or_else(
         || "0".to_string(),

@@ -6,7 +6,7 @@ use chrono::{TimeDelta, TimeZone, Utc};
 use datafusion::{
     logical_expr::{
         logical_plan::{Filter, Limit, Projection},
-        BinaryExpr, Expr, JoinType, LogicalPlan, Operator,
+        BinaryExpr, Expr, LogicalPlan, Operator,
     },
     prelude::{DataFrame, SessionContext},
     scalar::ScalarValue,
@@ -496,22 +496,13 @@ async fn test_metric_query_no_limit() {
 }
 
 // ============================================================================
-// Range Aggregation Tests (Window Function Based)
+// Range Aggregation Tests (UDAF Based)
 // ============================================================================
 
-/// Check if plan contains window expressions.
-fn plan_contains_window(plan: &LogicalPlan) -> bool {
+/// Check if plan contains aggregate expressions.
+fn plan_contains_aggregate(plan: &LogicalPlan) -> bool {
     let debug_str = format!("{plan:?}").to_lowercase();
-    debug_str.contains("windowfunction") || debug_str.contains("window")
-}
-
-/// Check if plan contains time bucketing (`date_bin` or `time_bucket` alias).
-fn plan_contains_time_bucketing(plan: &LogicalPlan) -> bool {
-    let debug_str = format!("{plan:?}").to_lowercase();
-    debug_str.contains("date_bin")
-        || debug_str.contains("datebin")
-        || debug_str.contains("time_bucket")
-        || debug_str.contains("timebucket")
+    debug_str.contains("aggregate")
 }
 
 #[tokio::test]
@@ -530,12 +521,11 @@ async fn test_count_over_time_planning() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // Window-based implementation: check for window function and time bucketing
+    // UDAF-based implementation: count_over_time uses aggregate function
     assert!(
-        plan_contains_window(plan),
-        "Plan should contain window function for count_over_time"
+        plan_contains_aggregate(plan),
+        "Plan should contain aggregate for count_over_time"
     );
-    assert!(plan_contains_time_bucketing(plan), "Plan should contain time bucketing");
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
@@ -561,19 +551,16 @@ async fn test_rate_planning() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // Window-based implementation: rate = window_count / range_seconds
-    // Check for window function and division by range (300 seconds = 5 minutes)
-    assert!(
-        plan_contains_window(plan),
-        "Plan should contain window function for rate"
-    );
+    // UDAF-based implementation: rate_over_time divides count by range_seconds
+    // internally
+    assert!(plan_contains_aggregate(plan), "Plan should contain aggregate for rate");
 
-    // Check for division operation (rate divides by range seconds)
-    let plan_str = format!("{plan:?}");
-    assert!(
-        plan_str.contains("Divide") || plan_str.contains("300"),
-        "Rate plan should contain division by range seconds (300)"
-    );
+    // Check for "value" alias in projections
+    let projections = collect_projections(plan);
+    let has_value = projections
+        .iter()
+        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    assert!(has_value, "Plan should have 'value' alias");
 }
 
 #[tokio::test]
@@ -592,19 +579,19 @@ async fn test_bytes_over_time_planning() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // Window-based implementation: bytes_over_time uses window function with
-    // octet_length
+    // UDAF-based implementation: bytes_over_time accepts body column and calculates
+    // byte length internally
     assert!(
-        plan_contains_window(plan),
-        "Plan should contain window function for bytes_over_time"
+        plan_contains_aggregate(plan),
+        "Plan should contain aggregate for bytes_over_time"
     );
 
-    // Check for octet_length function (measures byte length)
-    let plan_str = format!("{plan:?}");
-    assert!(
-        plan_str.contains("octet_length") || plan_str.contains("OctetLength"),
-        "Plan should contain octet_length for byte measurement"
-    );
+    // Check for "value" alias in projections
+    let projections = collect_projections(plan);
+    let has_value = projections
+        .iter()
+        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    assert!(has_value, "Plan should have 'value' alias");
 }
 
 #[tokio::test]
@@ -623,23 +610,19 @@ async fn test_bytes_rate_planning() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // Window-based implementation: bytes_rate = window_sum(octet_length) /
-    // range_seconds
+    // UDAF-based implementation: bytes_rate accepts body column, calculates bytes
+    // internally, and divides by range_seconds
     assert!(
-        plan_contains_window(plan),
-        "Plan should contain window function for bytes_rate"
+        plan_contains_aggregate(plan),
+        "Plan should contain aggregate for bytes_rate"
     );
 
-    let plan_str = format!("{plan:?}");
-    // Check for octet_length and division
-    assert!(
-        plan_str.contains("octet_length") || plan_str.contains("OctetLength"),
-        "Plan should contain octet_length for byte measurement"
-    );
-    assert!(
-        plan_str.contains("Divide") || plan_str.contains("300"),
-        "Bytes rate plan should contain division by range seconds (300)"
-    );
+    // Check for "value" alias in projections
+    let projections = collect_projections(plan);
+    let has_value = projections
+        .iter()
+        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    assert!(has_value, "Plan should have 'value' alias");
 }
 
 #[tokio::test]
@@ -662,12 +645,11 @@ async fn test_range_aggregation_with_grouping() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // Window-based implementation: grouping is handled via partition_by in window
-    // function Check plan contains window function
-    assert!(plan_contains_window(plan), "Plan should contain window function");
+    // UDAF-based implementation: count_over_time uses aggregate function with
+    // grouping Check plan contains aggregate
+    assert!(plan_contains_aggregate(plan), "Plan should contain aggregate");
 
-    // Check that severity_text appears in the plan (used in window partition or
-    // aggregation)
+    // Check that severity_text appears in the plan (used in grouping)
     let plan_str = format!("{plan:?}");
     assert!(
         plan_str.contains("severity_text"),
@@ -695,9 +677,19 @@ async fn test_step_based_bucketing() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // Window-based implementation: date_bin is used for time bucketing in
-    // projection
-    assert!(plan_contains_time_bucketing(plan), "Plan should contain time bucketing");
+    // UDAF-based implementation: step is passed to count_over_time UDAF
+    // Check plan contains aggregate with step parameter
+    assert!(
+        plan_contains_aggregate(plan),
+        "Plan should contain aggregate for count_over_time"
+    );
+
+    // Check the step (60 seconds = 60_000_000 microseconds) appears in plan
+    let plan_str = format!("{plan:?}");
+    assert!(
+        plan_str.contains("60000000000") || plan_str.contains("IntervalMonthDayNano"),
+        "Plan should reference step interval parameter"
+    );
 }
 
 #[tokio::test]
@@ -757,22 +749,7 @@ async fn test_unwrap_required_error() {
 
 #[tokio::test]
 async fn test_time_grid_gap_filling() {
-    use chrono::TimeDelta;
-    use datafusion::logical_expr::logical_plan::Join;
-
     use crate::query::logql::metric::{MetricExpr, RangeAggregation, RangeAggregationOp, RangeExpr};
-
-    // Helper to find Join nodes (for RIGHT JOIN with time grid)
-    fn find_join(plan: &LogicalPlan) -> Option<&Join> {
-        let mut stack = vec![plan];
-        while let Some(node) = stack.pop() {
-            if let LogicalPlan::Join(j) = node {
-                return Some(j);
-            }
-            stack.extend(node.inputs());
-        }
-        None
-    }
 
     let (session_ctx, query_ctx) = create_test_context().await;
     let planner = DataFusionPlanner::new(session_ctx, query_ctx);
@@ -786,15 +763,18 @@ async fn test_time_grid_gap_filling() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // For non-grouped queries, we should have a RIGHT JOIN with time grid
-    let join = find_join(plan);
-    assert!(join.is_some(), "Plan should contain a Join node for time grid filling");
-
-    // Verify the Join is LEFT/RIGHT/FULL (outer join for gap filling)
-    let join_node = join.unwrap();
+    // UDAF-based implementation: count_over_time UDAF handles gap filling
+    // internally by always returning all grid points (with zero counts for
+    // gaps) No Join needed - the UDAF generates a complete time grid
     assert!(
-        matches!(join_node.join_type, JoinType::Left | JoinType::Right | JoinType::Full),
-        "Join should be an outer join (LEFT/RIGHT/FULL) for gap filling, got {:?}",
-        join_node.join_type
+        plan_contains_aggregate(plan),
+        "Plan should contain aggregate for count_over_time"
+    );
+
+    // Check plan contains count_over_time UDAF (name may appear in various forms)
+    let plan_str = format!("{plan:?}").to_lowercase();
+    assert!(
+        plan_str.contains("count_over_time") || plan_str.contains("countovertime"),
+        "Plan should reference count_over_time UDAF: {plan_str}"
     );
 }
