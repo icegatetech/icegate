@@ -29,113 +29,35 @@ The stream selector is translated into a `Filter` logical plan node. The label m
     -   **Direct Columns**: If the attribute is a direct column in the schema (e.g., `service_name`), the predicate is applied directly to that column.
     -   **Map Attributes**: If the attribute is not a direct column, it is assumed to be in the `attributes` map. The predicate is applied by first extracting the value from the map. This is currently not fully implemented and will require using `map_extract` or a similar function.
 
-### 2.1.1. Schema Normalization After Filtering
+### 2.1.1. Schema Handling
 
-After applying the stream selector filters, the schema is normalized by merging the indexed columns (service_name, severity_text, trace_id, span_id) into the `attributes` map. This ensures a consistent schema for downstream pipeline operations.
+> **Implementation Note:** The schema normalization described in the original design (merging indexed columns into the attributes MAP) was **not implemented**. Indexed columns remain as separate top-level columns throughout query execution.
 
-**Normalization Rules:**
-1. **Indexed columns** (service_name, severity_text, trace_id, span_id) are added to the `attributes` map.
-2. **Top-level columns** are reduced to only `timestamp` and `body`.
-3. The `attributes` map contains both the original attributes and the indexed columns.
+**Current Implementation:**
+- Indexed columns (`service_name`, `severity_text`, `trace_id`, `span_id`) remain as separate columns
+- The `attributes` MAP column contains only non-indexed attributes
+- Label operations work with both indexed columns and the attributes MAP separately
+- For Grafana compatibility, `level` is added as an alias of `severity_text` in output
 
-**Translation to DataFusion:**
+**Rationale for Current Approach:**
+- Avoids MAP type limitations in GROUP BY operations (see Section 13.1)
+- Better query performance by keeping indexed columns as direct columns
+- Simpler predicate pushdown to Iceberg for indexed columns
+
+**Example:**
 ```rust
-// After applying filters, normalize the schema
-// Example: {service_name="api", severity_text="ERROR"}
+// LogQL: {service_name="api", severity_text="ERROR"}
+// Indexed columns filtered directly, attributes MAP preserved separately
 
-// Build the normalized attributes map by combining existing attributes with indexed columns
-let existing_keys = map_keys(col("attributes"));
-let existing_values = map_values(col("attributes"));
+let filtered = df
+    .filter(col("service_name").eq(lit("api")))?
+    .filter(col("severity_text").eq(lit("ERROR")))?;
 
-// Create arrays of indexed column names and their values
-let indexed_keys = make_array(vec![
-    lit("service_name"),
-    lit("severity_text"),
-    lit("trace_id"),
-    lit("span_id")
-]);
-
-let indexed_values = make_array(vec![
-    col("service_name"),
-    col("severity_text"),
-    col("trace_id"),
-    col("span_id")
-]);
-
-// Merge existing attributes with indexed columns
-let combined_keys = array_concat(vec![existing_keys, indexed_keys]);
-let combined_values = array_concat(vec![existing_values, indexed_values]);
-
-// Project to normalized schema
-LogicalPlanBuilder::from(filtered_plan)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        make_map(combined_keys, combined_values).alias("attributes")
-    ])?
-    .build()
+// Output schema includes both:
+// - timestamp, body, service_name, severity_text, trace_id, span_id (columns)
+// - attributes (MAP)
+// - level (alias of severity_text for Grafana)
 ```
-
-**Complete Example:**
-```rust
-// LogQL: {service_name="api", severity_text="ERROR"} | json
-
-// Step 1: Apply stream selector filters
-let filtered = LogicalPlanBuilder::scan("logs", table_source, None)?
-    .filter(
-        col("service_name").eq(lit("api"))
-            .and(col("severity_text").eq(lit("ERROR")))
-    )?
-    .build()?;
-
-// Step 2: Normalize schema - merge indexed columns into attributes map
-let normalized = LogicalPlanBuilder::from(filtered)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        make_map(
-            array_concat(vec![
-                map_keys(col("attributes")),
-                make_array(vec![
-                    lit("service_name"),
-                    lit("severity_text"),
-                    lit("trace_id"),
-                    lit("span_id")
-                ])
-            ]),
-            array_concat(vec![
-                map_values(col("attributes")),
-                make_array(vec![
-                    col("service_name"),
-                    col("severity_text"),
-                    col("trace_id"),
-                    col("span_id")
-                ])
-            ])
-        ).alias("attributes")
-    ])?
-    .build()?;
-
-// Step 3: Apply pipeline stages (e.g., JSON parser)
-let with_json = LogicalPlanBuilder::from(normalized)
-    .project(vec![
-        col("*"),
-        get_json_object(col("body"), lit("$.level")).alias("level"),
-        // ... other extracted fields
-    ])?
-    .build()?;
-```
-
-**Benefits of Schema Normalization:**
-- **Consistency**: All subsequent pipeline stages work with a uniform schema.
-- **Simplicity**: Label operations (label_format, drop, keep) only need to manipulate the attributes map.
-- **Compatibility**: Matches Loki's behavior where indexed labels are treated like any other label in pipelines.
-
-**Important Notes:**
-- Normalization happens **after** filtering but **before** any pipeline stages.
-- The indexed columns are **removed** from the top level and only exist in the attributes map.
-- If an indexed column has a NULL value, it is still added to the map with a NULL value.
-- The `timestamp` and `body` columns are **always** preserved as top-level columns.
 
 ### 2.2. Pipeline Stages (`|`)
 
@@ -154,104 +76,46 @@ Multiple line filter conditions can be chained with `OR`.
 
 #### 2.2.2. Parser Expressions
 
-Parser expressions (`| json`, `| logfmt`, `| regexp`) extract data from the `body` column and add the extracted values as new columns in a `Projection` node.
+> **Implementation Status: ❌ Not Implemented**
+>
+> Parser expressions are currently **placeholders (no-ops)** in the implementation. The AST is parsed correctly, but the actual parsing logic is not executed. Logs pass through unchanged.
+
+Parser expressions (`| json`, `| logfmt`, `| regexp`) are designed to extract data from the `body` column and add the extracted values as new columns.
+
+-   **`| json`**: ❌ Placeholder - returns DataFrame unchanged
+-   **`| logfmt`**: ❌ Placeholder - returns DataFrame unchanged
+-   **`| regexp "<re>"`**: ❌ Placeholder - returns DataFrame unchanged
+-   **`| pattern "<pattern>"`**: ❌ Placeholder - returns DataFrame unchanged
+-   **`| unpack`**: ❌ Placeholder - returns DataFrame unchanged
+
+**Future Implementation Notes:**
+
+The design below describes the intended implementation:
 
 -   **`| json`**:
-    -   Uses a series of `get_json_object(body, '$.field')` expressions to extract fields from a JSON log line.
-    -   Each extracted field is added as a new column in the plan.
-    -   The original columns are preserved.
-
-    **Parameters:**
-    - `| json field1, field2="json_path"`: Extract specific fields only.
-    - Without parameters: Extract all top-level fields from the JSON object.
-
-    **Nested JSON Extraction:**
-    - Supports nested paths using JSONPath syntax: `$.user.address.city`
-    - Array indexing: `$.items[0].name`
-    - Multiple levels of nesting are supported
-
-    **Example:**
-    ```rust
-    // LogQL: | json level, user_id="$.user.id", city="$.user.address.city"
-    // DataFusion: Extract specific fields with nested paths
-    LogicalPlanBuilder::from(input_plan)
-        .project(vec![
-            col("*"),
-            get_json_object(col("body"), lit("$.level")).alias("level"),
-            get_json_object(col("body"), lit("$.user.id")).alias("user_id"),
-            get_json_object(col("body"), lit("$.user.address.city")).alias("city"),
-        ])?
-        .build()
-    ```
-
-    **Error Handling:**
-    - Invalid JSON results in NULL values for extracted fields.
-    - An `__error__` label is added with value "JSONParseError" when parsing fails.
+    -   Would use `get_json_object(body, '$.field')` expressions to extract fields from JSON log lines.
+    -   Each extracted field would be added as a new column in the plan.
 
 -   **`| logfmt`**:
-    -   Requires a User-Defined Function (UDF) to parse the logfmt format.
-    -   The UDF will take the `body` column as input and output a `Struct` or multiple columns representing the parsed key-value pairs.
-    -   These new columns are added via a `Projection` node.
-
-    **Parameters:**
-    - `| logfmt field1, field2`: Extract specific fields only.
-    - `| logfmt --strict`: Enable strict mode (fail on malformed input).
-    - `| logfmt --keep-empty`: Keep fields with empty values (default: skip them).
-
-    **Strict Mode:**
-    - When enabled, malformed logfmt input causes the entire parse to fail.
-    - An `__error__` label is set to "LogfmtParseError".
-    - Without strict mode, invalid key-value pairs are skipped.
-
-    **Example:**
-    ```rust
-    // LogQL: | logfmt --strict level, user_id
-    // DataFusion: Call logfmt UDF with strict=true
-    let parsed = logfmt_parser_udf(col("body"), lit(true)); // strict=true
-
-    LogicalPlanBuilder::from(input_plan)
-        .project(vec![
-            col("*"),
-            get_field(parsed.clone(), "level").alias("level"),
-            get_field(parsed, "user_id").alias("user_id"),
-            // Add error label if parsing fails
-            when(is_null(get_field(parsed.clone(), "level")))
-                .then(lit("LogfmtParseError"))
-                .otherwise(lit(null))
-                .alias("__error__")
-        ])?
-        .build()
-    ```
+    -   Requires a custom UDF (`logfmt_parser`) to parse the logfmt format.
+    -   The UDF would take the `body` column and output a `Struct` of parsed key-value pairs.
 
 -   **`| regexp "<re>"`**:
-    -   Uses a regex with named capture groups to extract data.
-    -   This will be implemented using a UDF that takes the `body` and the regex pattern, and returns a `Struct` of the captured values.
+    -   Requires a custom UDF (`regexp_extractor`) with named capture groups.
+    -   Use `(?P<name>...)` syntax for named groups.
 
-    **Named Capture Groups:**
-    - Use `(?P<name>...)` syntax for named groups.
-    - Each named group becomes a column in the result.
-
-    **Example:**
-    ```rust
-    // LogQL: | regexp "(?P<ip>\\d+\\.\\d+\\.\\d+\\.\\d+) - - \\[(?P<timestamp>[^\\]]+)\\]"
-    // DataFusion: Call regexp extractor UDF
-    let extracted = regexp_extractor_udf(
-        col("body"),
-        lit(r"(?P<ip>\d+\.\d+\.\d+\.\d+) - - \[(?P<timestamp>[^\]]+)\]")
-    );
-
-    LogicalPlanBuilder::from(input_plan)
-        .project(vec![
-            col("*"),
-            get_field(extracted.clone(), "ip").alias("ip"),
-            get_field(extracted, "timestamp").alias("timestamp"),
-        ])?
-        .build()
-    ```
-
-    **Error Handling:**
-    - If the regex doesn't match, all extracted fields are NULL.
-    - An `__error__` label can be added to indicate regex match failure.
+**Current Code (Placeholder):**
+```rust
+fn apply_parser(&self, df: DataFrame, parser: LogParser) -> Result<DataFrame> {
+    match parser {
+        LogParser::Json(_fields) => Ok(df),      // No-op
+        LogParser::Logfmt { .. } => Ok(df),      // No-op
+        LogParser::Regexp(_pattern) => Ok(df),   // No-op
+        LogParser::Pattern(_pattern) => Ok(df),  // No-op
+        LogParser::Unpack => Ok(df),             // No-op
+    }
+}
+```
 
 #### 2.2.3. Label Filter Expressions
 
@@ -264,356 +128,128 @@ These expressions filter the stream based on values of extracted labels (columns
 
 ### 2.2.4. Label Format Expressions
 
-Label format expressions allow renaming and transforming labels using Go template syntax.
+> **Implementation Status: ❌ Not Implemented**
+>
+> Label format expressions are currently **placeholders (no-ops)**. The AST is parsed correctly, but template expansion is not executed.
 
--   `| label_format new_label="{{.old_label}}"`: Creates or renames labels using template expansion.
--   `| label_format combined="{{.label1}}-{{.label2}}"`: Combines multiple labels.
+Label format expressions are designed to rename and transform labels using Go template syntax.
 
-**Translation to DataFusion:**
-- New labels are added to the `attributes` map column using map manipulation.
-- Use `map_keys()` and `map_values()` to extract existing entries.
-- Append new key-value pairs using `array_concat()`.
-- Reconstruct the map using `make_map()`.
-- Template expansion is handled by the `gtmpl` crate (Go template library).
-- A `label_format_udf` processes the template string and extracts referenced fields.
-- Template variables reference direct columns or use `map_extract()` for attributes.
-- Each pipeline stage creates a separate `Projection` node.
+-   `| label_format new_label="{{.old_label}}"`: ❌ Placeholder - no effect
+-   `| label_format combined="{{.label1}}-{{.label2}}"`: ❌ Placeholder - no effect
 
-**Implementation Approach:**
-Use the [`gtmpl`](https://crates.io/crates/gtmpl) crate to parse and render Go templates:
-1. Parse template string to extract referenced variables (`{{.field}}`)
-2. Build DataFusion expressions to gather column values
-3. Create UDF that renders template with row data
-4. Add result to attributes map
-
-**Single Label Example:**
+**Current Code (Placeholder):**
 ```rust
-// LogQL: | label_format env="prod-{{.region}}"
-// DataFusion: Use gtmpl UDF to expand template
-
-let existing_keys = map_keys(col("attributes"));
-let existing_values = map_values(col("attributes"));
-
-// Template expansion via UDF
-let new_value = label_format_template_udf(
-    lit("prod-{{.region}}"),
-    col("region")  // Referenced fields passed as arguments
-);
-
-// Combine with existing map
-let combined_keys = array_concat(vec![existing_keys, make_array(vec![lit("env")])]);
-let combined_values = array_concat(vec![existing_values, make_array(vec![new_value])]);
-
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        col("service_name"),
-        col("severity_text"),
-        col("trace_id"),
-        col("span_id"),
-        make_map(combined_keys, combined_values).alias("attributes")
-    ])?
-    .build()
+fn apply_label_format(&self, df: DataFrame, ops: Vec<LabelFormatOp>) -> Result<DataFrame> {
+    for op in ops {
+        match op {
+            LabelFormatOp::Rename { .. } | LabelFormatOp::Template { .. } => {
+                // TODO: Implement label rename/template
+            },
+        }
+    }
+    Ok(df) // Returns unchanged
+}
 ```
 
-**Multiple Labels in Same Stage:**
-```rust
-// LogQL: | label_format env="prod-{{.region}}", full_name="{{.first}}-{{.last}}"
-// Single projection for multiple labels in the same stage
-
-let existing_keys = map_keys(col("attributes"));
-let existing_values = map_values(col("attributes"));
-
-// Add both entries in one operation using template UDF
-let new_keys = make_array(vec![lit("env"), lit("full_name")]);
-let new_values = make_array(vec![
-    label_format_template_udf(lit("prod-{{.region}}"), col("region")),
-    label_format_template_udf(lit("{{.first}}-{{.last}}"), col("first"), col("last"))
-]);
-
-let combined_keys = array_concat(vec![existing_keys, new_keys]);
-let combined_values = array_concat(vec![existing_values, new_values]);
-
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        col("service_name"),
-        col("severity_text"),
-        col("trace_id"),
-        col("span_id"),
-        make_map(combined_keys, combined_values).alias("attributes")
-    ])?
-    .build()
-```
-
-**Separate Pipeline Stages:**
-```rust
-// LogQL: | label_format env="prod-{{.region}}" | label_format full_name="{{.first}}-{{.last}}"
-// Two separate projections (different pipeline stages)
-
-// First stage
-let plan1 = LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        col("service_name"),
-        col("severity_text"),
-        col("trace_id"),
-        col("span_id"),
-        make_map(
-            array_concat(vec![map_keys(col("attributes")), make_array(vec![lit("env")])]),
-            array_concat(vec![map_values(col("attributes")), make_array(vec![
-                label_format_template_udf(lit("prod-{{.region}}"), col("region"))
-            ])])
-        ).alias("attributes")
-    ])?
-    .build()?;
-
-// Second stage (separate projection)
-let plan2 = LogicalPlanBuilder::from(plan1)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        col("service_name"),
-        col("severity_text"),
-        col("trace_id"),
-        col("span_id"),
-        make_map(
-            array_concat(vec![map_keys(col("attributes")), make_array(vec![lit("full_name")])]),
-            array_concat(vec![map_values(col("attributes")), make_array(vec![
-                label_format_template_udf(lit("{{.first}}-{{.last}}"), col("first"), col("last"))
-            ])])
-        ).alias("attributes")
-    ])?
-    .build()?;
-```
+**Future Implementation Notes:**
+- Would require a template UDF using `gtmpl` crate for Go template syntax
+- Would manipulate the `attributes` MAP using `map_keys()`, `map_values()`, and `make_map()`
 
 ### 2.2.5. Line Format Expressions
 
-Line format expressions reformat the log line (`body` column) using Go template syntax.
+> **Implementation Status: ❌ Not Implemented**
+>
+> Line format expressions are currently **placeholders (no-ops)**. The body column is not modified.
 
--   `| line_format "{{.label}}: {{.body}}"`: Reformats the body using label values.
--   Template expansion uses the `gtmpl` crate, similar to label format.
+Line format expressions are designed to reformat the log line (`body` column) using Go template syntax.
 
-**Translation to DataFusion:**
-- Implemented as a `Projection` that replaces the `body` column.
-- Uses the `line_format_udf` to expand Go templates.
-- Template processing handled by the `gtmpl` crate.
+-   `| line_format "{{.label}}: {{.body}}"`: ❌ Placeholder - no effect
 
-**Implementation Approach:**
-Use the [`gtmpl`](https://crates.io/crates/gtmpl) crate to parse and render Go templates:
-1. Parse template string to extract referenced variables (`{{.field}}`)
-2. Build DataFusion expressions to gather column values
-3. Create UDF that renders template with row data
-4. Replace `body` column with formatted result
-
-**Example:**
+**Current Code (Placeholder):**
 ```rust
-// LogQL: | line_format "[{{.severity_text}}] {{.body}}"
-// DataFusion: Replace body with template-formatted string
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        line_format_template_udf(
-            lit("[{{.severity_text}}] {{.body}}"),
-            col("severity_text"),
-            col("body")
-        ).alias("body"),
-        // ... other columns
-    ])?
-    .build()
-```
-
-**Complex Example:**
-```rust
-// LogQL: | line_format "{{.timestamp}} [{{.service_name}}] {{.severity_text}}: {{.body}}"
-// DataFusion: Multi-field template expansion
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        col("timestamp"),
-        col("service_name"),
-        col("severity_text"),
-        col("trace_id"),
-        col("span_id"),
-        col("attributes"),
-        line_format_template_udf(
-            lit("{{.timestamp}} [{{.service_name}}] {{.severity_text}}: {{.body}}"),
-            col("timestamp"),
-            col("service_name"),
-            col("severity_text"),
-            col("body")
-        ).alias("body")
-    ])?
-    .build()
+PipelineStage::LineFormat(_template) => {
+    // TODO: Implement line_format using template engine
+    df  // Returns unchanged
+}
 ```
 
 ### 2.2.6. Drop and Keep Labels
 
-These expressions control which labels (columns) are included in the result.
+> **Implementation Status: ✅ Implemented**
+>
+> Drop and keep operations work on the `attributes` MAP column using custom UDFs.
 
--   `| drop label1, label2`: Removes specified labels from the result.
--   `| keep label1, label2`: Keeps only the specified labels (plus timestamp and body).
+These expressions control which labels are included in the `attributes` map.
 
-**Translation to DataFusion:**
-- Implemented as a `Projection` that manipulates the `attributes` map.
-- Direct columns (service_name, severity_text, etc.) are handled via projection.
-- Labels in the `attributes` map are filtered using map operations.
-- For `drop`: Remove specified keys from the attributes map.
-- For `keep`: Filter attributes map to only include specified keys.
+-   `| drop label1, label2`: ✅ Removes specified keys from attributes map
+-   `| keep label1, label2`: ✅ Keeps only specified keys in attributes map
 
-**Drop Labels Example:**
+**Implementation:**
+Uses two custom UDFs defined in `src/query/logql/datafusion/udf.rs`:
+- `map_drop_keys(map, keys_array)`: Removes keys present in array
+- `map_keep_keys(map, keys_array)`: Keeps only keys present in array
+
+**Drop Example:**
 ```rust
 // LogQL: | drop region, instance
-// DataFusion: Filter out specified keys from attributes map
+fn apply_drop(df: DataFrame, labels: &[LabelExtraction]) -> Result<DataFrame> {
+    let label_literals: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
+    let udf = ScalarUDF::from(MapDropKeys::new());
 
-// Get all map entries
-let all_entries = map_entries(col("attributes"));
+    let filtered_attrs = udf.call(vec![
+        col("attributes"),
+        make_array(label_literals),
+    ]);
 
-// Filter out the dropped keys using array filtering
-// unnest entries, filter where key NOT IN ('region', 'instance'), rebuild map
-let filtered_entries = array_filter(
-    all_entries,
-    |entry| not(array_contains(
-        make_array(vec![lit("region"), lit("instance")]),
-        get_field(entry, "key")
-    ))
-);
-
-// Extract keys and values from filtered entries
-let filtered_keys = array_map(filtered_entries.clone(), |e| get_field(e, "key"));
-let filtered_values = array_map(filtered_entries, |e| get_field(e, "value"));
-
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        col("service_name"),
-        col("severity_text"),
-        col("trace_id"),
-        col("span_id"),
-        make_map(filtered_keys, filtered_values).alias("attributes")
-    ])?
-    .build()
+    // Replace attributes column with filtered version
+    df.select(/* all columns with attributes replaced */)
+}
 ```
 
-**Keep Labels Example:**
+**Keep Example:**
 ```rust
-// LogQL: | keep service_name, severity_text, level
-// DataFusion: Keep only specified direct columns and filter attributes map
+// LogQL: | keep level, service
+fn apply_keep(df: DataFrame, labels: &[LabelExtraction]) -> Result<DataFrame> {
+    let label_literals: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
+    let udf = ScalarUDF::from(MapKeepKeys::new());
 
-// For direct columns: keep them in projection
-// For attributes: filter to only include 'level'
+    let filtered_attrs = udf.call(vec![
+        col("attributes"),
+        make_array(label_literals),
+    ]);
 
-let all_entries = map_entries(col("attributes"));
-
-// Keep only specified keys in attributes
-let filtered_entries = array_filter(
-    all_entries,
-    |entry| array_contains(
-        make_array(vec![lit("level")]), // keys to keep from attributes
-        get_field(entry, "key")
-    )
-);
-
-let filtered_keys = array_map(filtered_entries.clone(), |e| get_field(e, "key"));
-let filtered_values = array_map(filtered_entries, |e| get_field(e, "value"));
-
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        col("service_name"),  // Direct columns we're keeping
-        col("severity_text"), // Direct columns we're keeping
-        // trace_id and span_id are dropped (not in keep list)
-        make_map(filtered_keys, filtered_values).alias("attributes")
-    ])?
-    .build()
+    df.select(/* all columns with attributes replaced */)
+}
 ```
 
-**Multiple Operations in Same Stage:**
-```rust
-// LogQL: | drop region, instance, host
-// All three keys removed in single projection
-
-let all_entries = map_entries(col("attributes"));
-
-let drop_keys = make_array(vec![lit("region"), lit("instance"), lit("host")]);
-
-let filtered_entries = array_filter(
-    all_entries,
-    |entry| not(array_contains(drop_keys, get_field(entry, "key")))
-);
-
-let filtered_keys = array_map(filtered_entries.clone(), |e| get_field(e, "key"));
-let filtered_values = array_map(filtered_entries, |e| get_field(e, "value"));
-
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        col("timestamp"),
-        col("body"),
-        col("service_name"),
-        col("severity_text"),
-        col("trace_id"),
-        col("span_id"),
-        make_map(filtered_keys, filtered_values).alias("attributes")
-    ])?
-    .build()
-```
+**Limitations:**
+- Only simple label names with `=` matcher are supported
+- `!=`, `=~`, `!~` matchers for drop/keep are not implemented
+- Only operates on `attributes` MAP, not indexed columns
 
 ### 2.2.7. Decolorize
 
-The decolorize expression removes ANSI color codes from log lines.
+> **Implementation Status: ❌ Not Implemented**
+>
+> Decolorize is currently a **placeholder (no-op)**.
 
--   `| decolorize`: Strips ANSI escape sequences from the `body` column.
+-   `| decolorize`: ❌ Placeholder - body unchanged
 
-**Translation to DataFusion:**
-- Implemented using a custom UDF that applies regex replacement.
-- Regex pattern: `\x1b\[[0-9;]*m`
-
-**Example:**
+**Current Code (Placeholder):**
 ```rust
-// LogQL: | decolorize
-// DataFusion: Apply decolorize UDF
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        decolorize_udf(col("body")).alias("body"),
-        // ... other columns
-    ])?
-    .build()
+const fn apply_decolorize(&self, df: DataFrame) -> Result<DataFrame> {
+    // TODO: Implement decolorize
+    Ok(df)
+}
 ```
 
 ### 2.2.8. Pattern Expression
 
-Pattern expressions extract structured data from log lines using a simpler pattern syntax (alternative to regex).
+> **Implementation Status: ❌ Not Implemented**
+>
+> Pattern expressions are handled as part of parser expressions (see Section 2.2.2).
 
--   `| pattern "<pattern>"`: Extracts fields using named placeholders like `<field_name>`.
-
-**Translation to DataFusion:**
-- Implemented using a custom UDF that converts the pattern to a regex and extracts values.
-- Returns a `Struct` with extracted fields.
-- Extracted fields are added as new columns via `Projection`.
-
-**Example:**
-```rust
-// LogQL: | pattern "<ip> - - [<timestamp>] \"<method> <path> <protocol>\""
-// DataFusion: Apply pattern parser UDF
-let pattern_result = pattern_parser_udf(
-    col("body"),
-    lit("<ip> - - [<timestamp>] \"<method> <path> <protocol>\"")
-);
-
-LogicalPlanBuilder::from(input_plan)
-    .project(vec![
-        col("*"),
-        get_field(pattern_result.clone(), "ip").alias("ip"),
-        get_field(pattern_result.clone(), "timestamp").alias("timestamp"),
-        get_field(pattern_result.clone(), "method").alias("method"),
-        get_field(pattern_result.clone(), "path").alias("path"),
-        get_field(pattern_result, "protocol").alias("protocol")
-    ])?
-    .build()
-```
+-   `| pattern "<pattern>"`: ❌ Placeholder - returns DataFrame unchanged
 
 ## 3. Range Queries and Time Windows
 
@@ -687,130 +323,145 @@ LogicalPlanBuilder::from(base_plan)
     .build()
 ```
 
-### 3.3. Time Window Implementation with Window Functions
+### 3.3. Time Window Implementation
 
-For aggregations over time windows (used in metric queries), DataFusion window functions are employed.
+> **Implementation Note:** The original design proposed using DataFusion Window Functions. The actual implementation uses **custom UDAFs (User-Defined Aggregate Functions)** with a `GridAccumulator` pattern for better efficiency with LogQL's time-series semantics.
 
-**Window Frame Specification:**
-- Use `WindowFrame` with `WindowFrameUnits::Range` for time-based windows.
-- Define window bounds using time intervals.
-
-**Example:**
-```rust
-use datafusion::logical_expr::{WindowFrame, WindowFrameBound, WindowFrameUnits};
-
-// Create a 5-minute time window
-let window_frame = WindowFrame::new_bounds(
-    WindowFrameUnits::Range,
-    WindowFrameBound::Preceding(ScalarValue::new_interval_dt(
-        0,
-        5 * 60 * 1_000_000_000 // 5 minutes in nanoseconds
-    )),
-    WindowFrameBound::CurrentRow
-);
-
-// Apply window function
-let window_expr = Expr::WindowFunction(expr::WindowFunction {
-    fun: WindowFunctionDefinition::AggregateFunction(AggregateFunction::Count),
-    args: vec![col("timestamp")],
-    partition_by: vec![],
-    order_by: vec![col("timestamp").sort(true, false)],
-    window_frame: Some(window_frame),
-    null_treatment: None,
-});
-```
+See Section 4 for the actual UDAF-based implementation.
 
 ## 4. Metric Queries and Range Aggregations
 
+> **Implementation Status: ⚠️ Partial**
+>
+> Log-range aggregations (`count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`, `absent_over_time`) are fully implemented using custom UDAFs. Unwrap-based aggregations are not implemented.
+
 Metric queries compute aggregated metrics over time ranges, converting log streams into time series data.
 
-### 4.1. Range Aggregation Functions
+### 4.1. Architecture: UDAF-Based Range Aggregations
 
-These functions operate on range vectors to produce time series metrics.
+The implementation uses custom **User-Defined Aggregate Functions (UDAFs)** instead of Window Functions. All UDAFs share a common `GridAccumulator` base that provides:
 
-#### 4.1.1. Count-based Functions
+- **Time grid generation** from start/end/step parameters
+- **Vectorized grid-major updates** (processes all timestamps per grid point)
+- **State serialization** for distributed execution
+- **Merge logic** for combining partial results
 
-- **`count_over_time(range-vector)`**: Counts log entries in the time window.
-- **`rate(range-vector)`**: Per-second rate of log entries.
-- **`bytes_rate(range-vector)`**: Per-second rate of bytes (requires unwrap).
-- **`bytes_over_time(range-vector)`**: Sum of bytes in the time window.
+**Source:** `src/query/logql/datafusion/udaf.rs`
 
-**Translation Strategy:**
+#### 4.1.1. Implemented UDAFs
+
+| UDAF | Status | Description |
+|:-----|:-------|:------------|
+| `count_over_time` | ✅ Implemented | Counts log entries per time bucket |
+| `rate` | ✅ Implemented | Log entry rate (count / range_seconds) |
+| `bytes_over_time` | ✅ Implemented | Sums byte lengths of log bodies per bucket |
+| `bytes_rate` | ✅ Implemented | Byte throughput rate (bytes / range_seconds) |
+| `absent_over_time` | ✅ Implemented | Returns 1 for time ranges with no samples |
+
+#### 4.1.2. GridAccumulator Algorithm
+
+The `GridAccumulator` uses **grid-major iteration** for efficiency:
+
+```rust
+// Instead of: for each timestamp → check all grid points (O(timestamps × grid))
+// We do: for each grid point → vectorized check all timestamps
+
+pub fn update_counts(&mut self, timestamps: &TimestampMicrosecondArray) -> Result<()> {
+    // Pre-compute duration scalars for vectorized comparison
+    let offset_scalar = Scalar::new(DurationMicrosecondArray::from(vec![self.offset_micros]));
+    let upper_scalar = Scalar::new(DurationMicrosecondArray::from(vec![self.upper_bound_micros]));
+
+    // Grid-major iteration: for each grid point, find matching timestamps
+    for (grid_idx, &grid_val) in self.grid.iter().enumerate() {
+        // Broadcast: compute (grid_val - all_timestamps) in one vectorized pass
+        let grid_scalar = Scalar::new(TimestampMicrosecondArray::from(vec![grid_val]));
+        let diff = numeric::sub(&grid_scalar, timestamps)?;
+
+        // Vectorized bounds check: offset <= diff <= upper_bound
+        let lower_ok = cmp::gt_eq(&diff, &offset_scalar)?;
+        let upper_ok = cmp::lt_eq(&diff, &upper_scalar)?;
+        let mask = boolean::and(&lower_ok, &upper_ok)?;
+
+        // Count matching timestamps
+        let count = mask.true_count() as u64;
+        self.values[grid_idx] += count;
+    }
+    Ok(())
+}
+```
+
+#### 4.1.3. UDAF Arguments
+
+All log-range UDAFs accept these arguments:
+
+| Argument | Type | Description |
+|:---------|:-----|:------------|
+| `timestamp` | `Timestamp(Microsecond)` | Input timestamps |
+| `start` | `Timestamp(Microsecond)` | Grid start time |
+| `end` | `Timestamp(Microsecond)` | Grid end time |
+| `step` | `Interval` | Step between grid points |
+| `range` | `Interval` | Range window size |
+| `offset` | `Interval` | Offset for range window |
+
+`bytes_over_time` and `bytes_rate` additionally take `body` column as second argument.
+
+#### 4.1.4. Translation Example
+
 ```rust
 // LogQL: count_over_time({job="mysql"}[5m])
-// DataFusion: Count with window function
-let count_window = Expr::WindowFunction(WindowFunction {
-    fun: WindowFunctionDefinition::AggregateFunction(AggregateFunction::Count),
-    args: vec![lit(1)],
-    partition_by: vec![/* group by labels */],
-    order_by: vec![col("timestamp").sort(true, false)],
-    window_frame: Some(window_frame_5m),
-    null_treatment: None,
-});
+async fn plan_log_range_aggregation(&self, agg: RangeAggregation) -> Result<DataFrame> {
+    // 1. Plan inner LogExpr with extended time range for lookback
+    let adjusted_start = self.query_ctx.start - agg.range_expr.range - offset_duration;
+    let adjusted_end = self.query_ctx.end - offset_duration;
+    let df = self.plan_log(agg.range_expr.log_expr, adjusted_start, adjusted_end).await?;
 
-// For rate(), divide count by time window in seconds
-let rate_expr = count_window / lit(300.0); // 5 minutes = 300 seconds
-```
+    // 2. Build UDAF expression
+    let udaf = AggregateUDF::from(CountOverTime::new());
+    let udaf_expr = udaf.call(vec![
+        col("timestamp"),
+        start_arg, end_arg, step_arg, range_arg, offset_arg,
+    ]);
 
-#### 4.1.2. Statistical Functions
+    // 3. Aggregate with grouping
+    let df = df.aggregate(grouping_exprs, vec![udaf_expr.alias("_result")])?;
 
-- **`sum_over_time(range-vector)`**: Sum of sample values (requires unwrap).
-- **`avg_over_time(range-vector)`**: Average of sample values.
-- **`min_over_time(range-vector)`**: Minimum sample value.
-- **`max_over_time(range-vector)`**: Maximum sample value.
-- **`stddev_over_time(range-vector)`**: Standard deviation of sample values.
-- **`stdvar_over_time(range-vector)`**: Standard variance of sample values.
-- **`quantile_over_time(φ, range-vector)`**: φ-quantile (0 ≤ φ ≤ 1).
+    // 4. Unnest the result (UDAF returns List<Struct {timestamp, value}>)
+    let df = df.unnest_columns(&["_result"])?;
+    let df = df.unnest_columns(&["_result"])?;
 
-**Translation:**
-```rust
-// LogQL: avg_over_time(rate({job="mysql"} | unwrap bytes [5m]))
-// DataFusion: AVG window function on unwrapped column
-let avg_window = Expr::WindowFunction(WindowFunction {
-    fun: WindowFunctionDefinition::AggregateFunction(AggregateFunction::Avg),
-    args: vec![col("bytes")], // unwrapped numeric column
-    partition_by: vec![],
-    order_by: vec![col("timestamp").sort(true, false)],
-    window_frame: Some(window_frame_5m),
-    null_treatment: None,
-});
-```
-
-#### 4.1.3. First and Last Functions
-
-- **`first_over_time(range-vector)`**: First sample value in the window.
-- **`last_over_time(range-vector)`**: Last sample value in the window.
-
-**Translation:**
-```rust
-// LogQL: first_over_time({job="mysql"} | unwrap latency [5m])
-// DataFusion: Use FIRST_VALUE window function
-let first_window = Expr::WindowFunction(WindowFunction {
-    fun: WindowFunctionDefinition::WindowFunction(
-        datafusion::logical_expr::BuiltInWindowFunction::FirstValue
-    ),
-    args: vec![col("latency")],
-    partition_by: vec![],
-    order_by: vec![col("timestamp").sort(true, false)],
-    window_frame: Some(window_frame_5m),
-    null_treatment: None,
-});
+    // 5. Project to final schema
+    df.select(/* timestamp, value columns */)
+}
 ```
 
 ### 4.2. Unwrap Expressions
 
-Unwrap expressions extract numeric values from labels to use in range aggregations.
+> **Implementation Status: ❌ Not Implemented**
+>
+> Unwrap-based aggregations return `NotImplemented` error.
 
-**Syntax:**
+Unwrap expressions are designed to extract numeric values from labels for use in range aggregations.
+
+**Not Implemented Functions:**
+- `sum_over_time`, `avg_over_time`, `min_over_time`, `max_over_time`
+- `stddev_over_time`, `stdvar_over_time`, `quantile_over_time`
+- `first_over_time`, `last_over_time`, `rate_counter`
+
+**Current Code:**
+```rust
+fn plan_unwrap_range_aggregation(&self, _agg: RangeAggregation) -> Result<DataFrame> {
+    Err(IceGateError::NotImplemented(
+        "Unwrap aggregation not yet implemented".to_string(),
+    ))
+}
+```
+
+**Syntax (for future implementation):**
 - `| unwrap label_name`: Extracts numeric value from the label.
-- `| unwrap label_name | __error__=""`: Converts errors to empty strings.
+- `duration()`: Converts duration strings to seconds.
+- `bytes()`: Converts byte strings to numeric values.
 
-**Conversion Functions:**
-- `duration()`: Converts duration strings to seconds (e.g., "5m" → 300).
-- `duration_seconds()`: Alias for `duration()`.
-- `bytes()`: Converts byte strings to numeric values (e.g., "5MB" → 5242880).
-
-**Translation to DataFusion:**
+**Future Translation to DataFusion:**
 ```rust
 // LogQL: rate({job="mysql"} | unwrap bytes(size) [5m])
 // DataFusion: Convert size label to bytes, then calculate rate
@@ -879,193 +530,16 @@ let rate = in_range.project(vec![
 
 ### 4.4. Time Grid Gap Filling for Matrix Responses
 
-When executing `query_range` requests, Loki returns a **matrix** response with samples at regular intervals from `start` to `end` with `step` spacing. If no data exists for a time bucket, the value should be `0` (not omitted).
+> **⚠️ NOT IMPLEMENTED**: Gap filling is not implemented. UDAFs return sparse results with only buckets that contain data. Time buckets with no matching logs are omitted from the response.
 
-**Problem:** Using `date_bin()` alone only returns buckets where data exists. For proper matrix responses, we need:
-1. Complete time grid from `start` to `end` with `step` interval
-2. JOIN aggregated data to the grid
-3. Fill gaps with `0` for missing time buckets
+**Design Intent:** Loki matrix responses should return samples at regular intervals from `start` to `end` with `step` spacing, filling gaps with `0`. The current implementation returns sparse results.
 
-**Example:** 1-hour query with 5-minute step = 12 buckets. If data exists in only 3 buckets, `date_bin()` returns 3 rows. Matrix response needs 12 rows (9 with zeros).
+**Current Behavior:**
+- UDAFs generate time grids internally via `GridAccumulator`
+- Only buckets with actual data are returned
+- Missing time buckets are omitted (not filled with zeros)
 
-#### Architecture
-
-```mermaid
-flowchart TB
-    subgraph Input["Query Context"]
-        START["start: DateTime"]
-        END["end: DateTime"]
-        STEP["step: Duration"]
-    end
-
-    subgraph TimeGrid["1. Time Grid Generation"]
-        GEN["generate_time_grid()"]
-        ARROW["Arrow MemTable<br/>grid_time: Timestamp[]"]
-    end
-
-    subgraph Aggregation["2. Data Aggregation"]
-        AGG["GROUP BY time_bucket + labels<br/>date_bin(step, timestamp)"]
-        SPARSE["Sparse Result<br/>(only buckets with data)"]
-    end
-
-    subgraph Labels["3. Distinct Labels (if grouped)"]
-        DISTINCT["SELECT DISTINCT labels<br/>FROM aggregation"]
-        CROSS["CROSS JOIN<br/>time_grid × distinct_labels"]
-    end
-
-    subgraph Join["4. Gap Filling Join"]
-        LEFT["LEFT JOIN<br/>full_grid ⟕ agg_result<br/>ON (time_bucket, labels)"]
-    end
-
-    subgraph Output["5. Final Projection"]
-        COALESCE["COALESCE(value, 0)"]
-        RESULT["Complete Matrix<br/>all time buckets filled"]
-    end
-
-    START --> GEN
-    END --> GEN
-    STEP --> GEN
-    GEN --> ARROW
-
-    AGG --> SPARSE
-    SPARSE --> DISTINCT
-    ARROW --> CROSS
-    DISTINCT --> CROSS
-
-    CROSS --> LEFT
-    SPARSE --> LEFT
-    LEFT --> COALESCE
-    COALESCE --> RESULT
-
-    style TimeGrid fill:#e1f5fe
-    style Aggregation fill:#fff3e0
-    style Labels fill:#f3e5f5
-    style Join fill:#e8f5e9
-    style Output fill:#fce4ec
-```
-
-#### Implementation Flow
-
-```mermaid
-sequenceDiagram
-    participant P as Planner
-    participant A as Aggregation Plan
-    participant G as Time Grid
-    participant L as Labels
-    participant J as Join
-
-    P->>A: Build aggregation<br/>(GROUP BY time_bucket + labels)
-    P->>G: generate_time_grid(start, end, step)
-    G-->>P: Vec<i64> microseconds
-    P->>G: create_time_grid_plan()
-    G-->>P: MemTable LogicalPlan
-
-    alt Has Grouping Labels
-        P->>L: Extract DISTINCT labels<br/>from aggregation result
-        P->>J: CROSS JOIN<br/>(time_grid × distinct_labels)
-        P->>J: LEFT JOIN<br/>(full_grid ⟕ aggregation)
-    else No Grouping
-        P->>J: RIGHT JOIN<br/>(aggregation ⟖ time_grid)
-    end
-
-    P->>P: Project with COALESCE(value, 0)
-```
-
-#### Key Functions
-
-| Function | Purpose |
-|----------|---------|
-| `generate_time_grid()` | Creates `Vec<i64>` timestamps from start→end by step |
-| `create_time_grid_plan()` | Builds Arrow MemTable as LogicalPlan |
-| `fill_time_gaps()` | Main logic: CROSS JOIN + LEFT JOIN for grouped queries |
-| `join_with_time_grid_only()` | RIGHT JOIN for ungrouped queries |
-| `project_with_coalesce()` | Final projection with `COALESCE(value, 0)` |
-
-#### Translation to DataFusion
-
-**Ungrouped Query (simple case):**
-```rust
-// LogQL: count_over_time({service="api"}[5m])
-// Result: Single time series with all buckets filled
-
-// 1. Build aggregation (GROUP BY time_bucket only)
-let agg_plan = df.aggregate(
-    vec![date_bin(step, col("timestamp")).alias("time_bucket")],
-    vec![count(lit(1)).alias("value")]
-)?;
-
-// 2. Generate time grid
-let timestamps = generate_time_grid(start, end, step);
-let grid_plan = create_time_grid_plan(timestamps)?;
-
-// 3. RIGHT JOIN: ensures all grid times appear
-let joined = LogicalPlanBuilder::from(agg_plan)
-    .join(grid_plan, JoinType::Right,
-          (vec!["time_bucket"], vec!["grid_time"]), None)?;
-
-// 4. Project with COALESCE
-let result = joined.project(vec![
-    col("grid_time").alias("time_bucket"),
-    coalesce(vec![col("value"), lit(0.0)]).alias("value")
-])?;
-```
-
-**Grouped Query (with labels):**
-```rust
-// LogQL: sum by (service) (count_over_time({job="mysql"}[5m]))
-// Result: Multiple time series, each with all buckets filled
-
-// 1. Build aggregation (GROUP BY time_bucket + labels)
-let agg_plan = df.aggregate(
-    vec![
-        date_bin(step, col("timestamp")).alias("time_bucket"),
-        col("service")
-    ],
-    vec![count(lit(1)).alias("value")]
-)?;
-
-// 2. Extract distinct label combinations FROM aggregation result
-let distinct_labels = LogicalPlanBuilder::from(agg_plan.clone())
-    .aggregate(vec![col("service")], vec![])?  // GROUP BY = DISTINCT
-    .build()?;
-
-// 3. Generate time grid
-let grid_plan = create_time_grid_plan(generate_time_grid(start, end, step))?;
-
-// 4. CROSS JOIN: time_grid × distinct_labels (Cartesian product)
-let full_grid = LogicalPlanBuilder::from(grid_plan)
-    .cross_join(distinct_labels)?
-    .build()?;
-
-// 5. LEFT JOIN: full_grid ⟕ aggregation
-let joined = LogicalPlanBuilder::from(full_grid)
-    .join_on(agg_plan, JoinType::Left, vec![
-        col("grid_time").eq(col("time_bucket"))
-            .and(col("full_grid.service").eq(col("agg.service")))
-    ])?;
-
-// 6. Project with COALESCE
-let result = joined.project(vec![
-    col("grid_time").alias("time_bucket"),
-    col("full_grid.service").alias("service"),
-    coalesce(vec![col("value"), lit(0.0)]).alias("value")
-])?;
-```
-
-#### Edge Cases
-
-| Case | Behavior |
-|------|----------|
-| No data at all | Empty aggregation → empty distinct_labels → empty result |
-| Label combo has partial data | Filled to all buckets (missing = 0) |
-| Multiple label columns | All existing combinations filled |
-| Step > range | Single bucket per label combo |
-
-#### Performance Notes
-
-- **agg_plan referenced twice**: Once for DISTINCT labels, once for LEFT JOIN. DataFusion's Common Subexpression Elimination (CSE) computes it once.
-- **MemTable overhead**: Minimal - time grid is small (typically <1000 rows).
-- **Cartesian product**: Only includes label combos that exist in the data, not all possible combinations.
+**Future Implementation:** Would require post-aggregation JOIN with a complete time grid table and COALESCE for gap filling.
 
 ## 5. Vector Aggregations
 
@@ -1073,15 +547,19 @@ Vector aggregations group and aggregate time series results, similar to GROUP BY
 
 ### 5.1. Aggregation Operators
 
-- **`sum(vector-expression)`**: Sum of all samples.
-- **`avg(vector-expression)`**: Average of all samples.
-- **`min(vector-expression)`**: Minimum sample.
-- **`max(vector-expression)`**: Maximum sample.
-- **`count(vector-expression)`**: Count of samples.
-- **`stddev(vector-expression)`**: Standard deviation.
-- **`stdvar(vector-expression)`**: Standard variance.
-- **`topk(k, vector-expression)`**: Top k samples.
-- **`bottomk(k, vector-expression)`**: Bottom k samples.
+| Operator | Description | Status |
+|----------|-------------|--------|
+| `sum(vector-expression)` | Sum of all samples | ✅ Implemented |
+| `avg(vector-expression)` | Average of all samples | ✅ Implemented |
+| `min(vector-expression)` | Minimum sample | ✅ Implemented |
+| `max(vector-expression)` | Maximum sample | ✅ Implemented |
+| `count(vector-expression)` | Count of samples | ✅ Implemented |
+| `stddev(vector-expression)` | Standard deviation | ✅ Implemented |
+| `stdvar(vector-expression)` | Standard variance | ✅ Implemented |
+| `topk(k, vector-expression)` | Top k samples | ❌ Not implemented |
+| `bottomk(k, vector-expression)` | Bottom k samples | ❌ Not implemented |
+| `sort(vector-expression)` | Sort samples ascending | ❌ Not implemented |
+| `sort_desc(vector-expression)` | Sort samples descending | ❌ Not implemented |
 
 ### 5.2. Grouping Modifiers
 
@@ -1137,6 +615,8 @@ let aggregated = LogicalPlanBuilder::from(count_plan)
 ```
 
 ## 6. Binary Operations and Vector Matching
+
+> **⚠️ NOT IMPLEMENTED**: Binary operations between vectors are not implemented. The planner returns `NotImplemented` error for all binary operations. Only scalar literals work in simple arithmetic contexts.
 
 Binary operations combine two vector expressions using arithmetic, comparison, or logical operators.
 
@@ -1290,11 +770,38 @@ let joined = LogicalPlanBuilder::from(vector1_plan)
 
 ## 7. User-Defined Functions (UDFs)
 
-The following UDFs are necessary to support full LogQL functionality.
+> **Implementation Status:** Only map filtering UDFs are implemented. Parser UDFs (`logfmt_parser`, `json_parser`, `regexp_extractor`, `pattern_parser`) and template UDFs (`label_format_template`, `line_format_template`) are designed but not yet implemented.
 
-### 7.1. Scalar UDFs
+### 7.0. Implemented UDFs
+
+The following UDFs are currently implemented in `src/query/logql/datafusion/udf.rs`:
+
+| UDF | Purpose | Status |
+|-----|---------|--------|
+| `map_keep_keys(map, keys_array)` | Keep only specified keys from a `Map<String, String>` | ✅ Implemented |
+| `map_drop_keys(map, keys_array)` | Remove specified keys from a `Map<String, String>` | ✅ Implemented |
+
+**Usage:** These UDFs support the `keep`, `drop`, `by`, and `without` operations on the `attributes` MAP column.
+
+```rust
+// Example: keep only "level" and "service" keys
+// SELECT map_keep_keys(attributes, ARRAY['level', 'service']) FROM logs
+// {level: "info", service: "api", method: "GET"} → {level: "info", service: "api"}
+
+// Example: drop "method" key
+// SELECT map_drop_keys(attributes, ARRAY['method']) FROM logs
+// {level: "info", service: "api", method: "GET"} → {level: "info", service: "api"}
+```
+
+---
+
+The following UDFs are necessary to support full LogQL functionality but are **not yet implemented**.
+
+### 7.1. Scalar UDFs (Not Implemented)
 
 #### 7.1.1. `logfmt_parser`
+
+> **❌ NOT IMPLEMENTED**: Pipeline parser stage `| logfmt` is a no-op placeholder.
 
 Parses a logfmt-formatted string and returns a struct of key-value pairs.
 
@@ -1331,6 +838,8 @@ ctx.register_udf(logfmt_udf);
 
 #### 7.1.2. `regexp_extractor`
 
+> **❌ NOT IMPLEMENTED**: Pipeline parser stage `| regexp` is a no-op placeholder.
+
 Extracts named capture groups from a string using a regex pattern.
 
 **Signature:** `regexp_extractor(body: String, pattern: String) -> Struct`
@@ -1357,6 +866,8 @@ let regexp_udf = create_udf(
 
 #### 7.1.3. `pattern_parser`
 
+> **❌ NOT IMPLEMENTED**: Pipeline parser stage `| pattern` is a no-op placeholder.
+
 Extracts fields from log lines using LogQL pattern syntax.
 
 **Signature:** `pattern_parser(body: String, pattern: String) -> Struct`
@@ -1379,6 +890,8 @@ fn pattern_parse_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 
 #### 7.1.4. `decolorize`
 
+> **❌ NOT IMPLEMENTED**: Pipeline stage `| decolorize` is a no-op placeholder.
+
 Removes ANSI color codes from strings.
 
 **Signature:** `decolorize(text: String) -> String`
@@ -1395,6 +908,8 @@ fn decolorize_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 ```
 
 #### 7.1.5. `duration_parser`
+
+> **❌ NOT IMPLEMENTED**: Duration parsing for label filters uses inline Rust code, not a UDF.
 
 Converts duration strings to seconds (float).
 
@@ -1417,6 +932,8 @@ fn duration_parse_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 
 #### 7.1.6. `bytes_parser`
 
+> **❌ NOT IMPLEMENTED**: Bytes parsing for label filters uses inline Rust code, not a UDF.
+
 Converts byte strings to numeric values.
 
 **Signature:** `bytes_parser(value: String) -> Int64`
@@ -1438,6 +955,8 @@ fn bytes_parse_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 
 #### 7.1.7. `ip_filter`
 
+> **❌ NOT IMPLEMENTED**: IP filtering returns `NotImplemented` error.
+
 Checks if an IP address is within a CIDR range.
 
 **Signature:** `ip_filter(ip: String, cidr: String) -> Boolean`
@@ -1458,6 +977,8 @@ fn ip_filter_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 
 #### 7.1.8. `json_extractor` (Enhanced)
 
+> **❌ NOT IMPLEMENTED**: Pipeline parser stage `| json` is a no-op placeholder.
+
 Enhanced JSON extraction with support for nested paths and arrays.
 
 **Signature:** `json_extractor(body: String, paths: List<String>) -> Struct`
@@ -1468,6 +989,8 @@ Enhanced JSON extraction with support for nested paths and arrays.
 - Multiple field extraction in single call.
 
 #### 7.1.9. `label_format_template_udf`
+
+> **❌ NOT IMPLEMENTED**: Pipeline stage `| label_format` is a no-op placeholder.
 
 Expands Go template strings for label formatting using the `gtmpl` crate.
 
@@ -1512,6 +1035,8 @@ let label_format_udf = create_udf(
 
 #### 7.1.10. `line_format_template_udf`
 
+> **❌ NOT IMPLEMENTED**: Pipeline stage `| line_format` is a no-op placeholder.
+
 Expands Go template strings for line formatting using the `gtmpl` crate.
 
 **Signature:** `line_format_template_udf(template: String, ...fields: String) -> String`
@@ -1547,7 +1072,11 @@ let line_format_udf = create_udf(
 
 ### 7.2. Aggregate UDFs (UDAFs)
 
+> **Note:** Log-range aggregation UDAFs (`count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`, `absent_over_time`) are implemented in `src/query/logql/datafusion/udaf.rs` using a shared `GridAccumulator` pattern. See Section 4.1 for details. Unwrap-based aggregations are not implemented.
+
 #### 7.2.1. `quantile_over_time`
+
+> **❌ NOT IMPLEMENTED**: Requires unwrap expression support which is not implemented.
 
 Calculates quantiles over time windows.
 
