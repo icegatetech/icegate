@@ -4,17 +4,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::ServerConfig;
 
+/// Default host for OTLP HTTP server.
+const DEFAULT_HOST: &str = "0.0.0.0";
+
+/// Default port for OTLP HTTP server (OTLP/HTTP standard).
+const DEFAULT_PORT: u16 = 4318;
+
 /// OTLP HTTP server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OtlpHttpConfig {
     /// Whether this server is enabled
-    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Host to bind to
-    #[serde(default = "default_host")]
     pub host: String,
     /// Port to listen on
-    #[serde(default = "default_port")]
     pub port: u16,
 }
 
@@ -36,22 +40,10 @@ impl Default for OtlpHttpConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            host: default_host(),
-            port: default_port(),
+            host: DEFAULT_HOST.to_string(),
+            port: DEFAULT_PORT,
         }
     }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-fn default_host() -> String {
-    "0.0.0.0".to_string()
-}
-
-const fn default_port() -> u16 {
-    4318
 }
 
 impl ServerConfig for OtlpHttpConfig {

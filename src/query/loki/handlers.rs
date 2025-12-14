@@ -1,5 +1,7 @@
-//! Loki API request handlers
-use std::{collections::HashMap, sync::Arc, time::Instant};
+//! Loki API request handlers.
+//!
+//! Thin route handlers that delegate to executor for query execution
+//! and use typed models for responses.
 
 use axum::{
     extract::{Path, Query, State},
@@ -8,25 +10,17 @@ use axum::{
     Json,
 };
 use axum_extra::extract::Query as QueryExtra;
-use chrono::{DateTime, Duration, Utc};
-use datafusion::arrow::{
-    array::{
-        Array, Float64Array, Int64Array, MapArray, RecordBatch, StringArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray,
-    },
-    datatypes::Schema,
-};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue};
 
-use super::server::LokiState;
-use crate::{
-    common::schema::INDEXED_ATTRIBUTE_COLUMNS,
-    query::logql::{
-        antlr::AntlrParser, datafusion::DataFusionPlanner, duration::parse_duration_opt, expr::LogQLExpr,
-        log::Selector, planner::QueryContext, Parser, Planner,
-    },
+use super::{
+    executor::QueryExecutor,
+    models::{LabelValuesQueryParams, LabelsQueryParams, LokiResponse, RangeQueryParams, SeriesQueryParams},
+    server::LokiState,
 };
+use crate::common::errors::IceGateError;
+
+// ============================================================================
+// Constants
+// ============================================================================
 
 /// HTTP header for tenant identification (Grafana/Loki standard).
 const TENANT_HEADER: &str = "x-scope-orgid";
@@ -34,10 +28,11 @@ const TENANT_HEADER: &str = "x-scope-orgid";
 /// Default tenant ID when header is not provided.
 const DEFAULT_TENANT: &str = "anonymous";
 
+// ============================================================================
+// Helpers
+// ============================================================================
+
 /// Extract tenant ID from HTTP headers.
-///
-/// Uses the `X-Scope-OrgID` header (Grafana/Loki standard for multi-tenancy).
-/// Returns "anonymous" if the header is not present or invalid.
 fn extract_tenant_id(headers: &HeaderMap) -> String {
     headers
         .get(TENANT_HEADER)
@@ -46,1008 +41,45 @@ fn extract_tenant_id(headers: &HeaderMap) -> String {
         .map_or_else(|| DEFAULT_TENANT.to_string(), String::from)
 }
 
-/// Query parameters for explain endpoint
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ExplainQueryParams {
-    /// `LogQL` query string
-    pub query: String,
-    /// Optional start time (for context, not used in explain)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start: Option<String>,
-    /// Optional end time (for context, not used in explain)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end: Option<String>,
-    /// Optional limit (for context, not used in explain)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-    /// Optional step (for context, not used in explain)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub step: Option<String>,
-}
+// ============================================================================
+// Query Handlers
+// ============================================================================
 
-/// Handle explain query requests
-///
-/// This endpoint accepts `query_range` parameters and returns the full
-/// execution plan including logical, optimized logical, and physical plans
-/// after `LogQL` transpilation.
-///
-/// # Returns
-/// JSON response with:
-/// - `query`: Original `LogQL` query
-/// - `plans.logical`: Unoptimized logical plan
-/// - `plans.optimized`: Optimized logical plan
-/// - `plans.physical`: Physical execution plan
-pub async fn explain_query(
-    State(loki_state): State<LokiState>,
-    headers: HeaderMap,
-    Query(params): Query<ExplainQueryParams>,
-) -> Response {
-    let tenant_id = extract_tenant_id(&headers);
-
-    // Create SessionContext from QueryEngine (uses cached IcebergCatalogProvider)
-    let session_ctx = match loki_state.engine.create_session().await {
-        Ok(session_ctx) => session_ctx,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "status": "error",
-                    "errorType": "session_error",
-                    "error": format!("Failed to create session: {}", e),
-                    "query": params.query
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // 1. Parse the LogQL query
-    let parser = AntlrParser::new();
-    let expr = match parser.parse(&params.query) {
-        Ok(expr) => expr,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "status": "error",
-                    "errorType": "bad_data",
-                    "error": format!("Parse error: {}", e),
-                    "query": params.query
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // 2. Create query context with default time range for explain
-    let now = Utc::now();
-    let query_ctx = QueryContext {
-        tenant_id,
-        start: params.start.as_ref().map_or(now - Duration::hours(1), |s| parse_time(s)),
-        end: params.end.as_ref().map_or(now, |s| parse_time(s)),
-        limit: params.limit.map(|l| l as usize),
-        step: params.step.as_ref().and_then(|s| parse_duration_opt(s)),
-    };
-
-    // 3. Plan the query
-    let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
-    let df = match planner.plan(expr).await {
-        Ok(df) => df,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "status": "error",
-                    "errorType": "planning_error",
-                    "error": format!("Planning error: {}", e),
-                    "query": params.query
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // 4. Get logical plan from DataFrame and optimize
-    let logical_plan = df.logical_plan().clone();
-    let optimized_plan = match session_ctx.state().optimize(&logical_plan) {
-        Ok(plan) => plan,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "status": "error",
-                    "errorType": "optimization_error",
-                    "error": format!("Optimization error: {}", e),
-                    "query": params.query
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // 5. Get physical plan
-    let physical_plan = match session_ctx.state().create_physical_plan(&optimized_plan).await {
-        Ok(plan) => plan,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "status": "error",
-                    "errorType": "physical_planning_error",
-                    "error": format!("Physical planning error: {}", e),
-                    "query": params.query
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // 6. Format plans as strings
-    let logical_str = format!("{}", logical_plan.display_indent());
-    let optimized_str = format!("{}", optimized_plan.display_indent());
-    let physical_str = format!(
-        "{}",
-        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
-    );
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "success",
-            "query": params.query,
-            "plans": {
-                "logical": logical_str,
-                "optimized": optimized_str,
-                "physical": physical_str
-            }
-        })),
-    )
-        .into_response()
-}
-
-/// Query parameters for range query
-#[derive(Debug, Deserialize, Serialize)]
-pub struct RangeQueryParams {
-    /// `LogQL` query string
-    pub query: String,
-    /// Start time (nanoseconds or RFC3339)
-    pub start: Option<String>,
-    /// End time (nanoseconds or RFC3339)
-    pub end: Option<String>,
-    /// Step (duration string, e.g. "15s")
-    pub step: Option<String>,
-    /// Limit
-    pub limit: Option<u32>,
-    /// Direction (forward/backward)
-    pub direction: Option<String>,
-}
-
-/// Query parameters for `/loki/api/v1/labels`
-#[derive(Debug, Deserialize)]
-pub struct LabelsQueryParams {
-    /// Start time (nanoseconds or RFC3339)
-    pub start: Option<String>,
-    /// End time (nanoseconds or RFC3339)
-    pub end: Option<String>,
-    /// Duration string (e.g. "1h") - alternative to start/end
-    pub since: Option<String>,
-    /// `LogQL` selector to filter streams (e.g. `{service_name="foo"}`)
-    pub query: Option<String>,
-}
-
-/// Query parameters for `/loki/api/v1/label/:name/values`
-#[derive(Debug, Deserialize)]
-pub struct LabelValuesQueryParams {
-    /// Start time (nanoseconds or RFC3339)
-    pub start: Option<String>,
-    /// End time (nanoseconds or RFC3339)
-    pub end: Option<String>,
-    /// Duration string (e.g. "1h") - alternative to start/end
-    pub since: Option<String>,
-    /// `LogQL` selector to filter streams (e.g. `{service_name="foo"}`)
-    pub query: Option<String>,
-}
-
-/// Query parameters for `/loki/api/v1/series`
-#[derive(Debug, Deserialize)]
-pub struct SeriesQueryParams {
-    /// Required `LogQL` selectors (at least one required)
-    #[serde(rename = "match[]", default)]
-    pub matchers: Vec<String>,
-    /// Start time (nanoseconds or RFC3339)
-    pub start: Option<String>,
-    /// End time (nanoseconds or RFC3339)
-    pub end: Option<String>,
-}
-
-/// Handle instant query requests
+/// Handle instant query requests.
 ///
 /// Per Loki API spec, instant queries (`/query`) use `time` parameter (not
 /// start/end) and only support metric queries (returns 400 for log queries).
-///
-/// # TODO
-/// - Implement proper instant query with `time` parameter
-/// - Validate that only metric queries are accepted
-/// - Return 400 Bad Request for log queries
 pub async fn query(
     State(_loki_state): State<LokiState>,
     _headers: HeaderMap,
-    Query(_params): Query<ExplainQueryParams>,
+    Query(_params): Query<RangeQueryParams>,
 ) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "status": "error",
-            "error": "Instant query endpoint not yet implemented. Use /loki/api/v1/query_range instead."
-        })),
+    IceGateError::NotImplemented(
+        "Instant query endpoint not yet implemented. Use /loki/api/v1/query_range instead.".to_string(),
     )
-        .into_response()
+    .into_response()
 }
 
-/// Handle range query requests
+/// Handle range query requests.
 pub async fn query_range(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
     Query(params): Query<RangeQueryParams>,
 ) -> Response {
-    execute_query(loki_state, headers, params).await
-}
-
-async fn execute_query(loki_state: LokiState, headers: HeaderMap, params: RangeQueryParams) -> Response {
-    let exec_start = Instant::now();
     let tenant_id = extract_tenant_id(&headers);
+    let executor = QueryExecutor::new(loki_state.engine);
 
-    let now = Utc::now();
-    // Default to 1 hour ago if start not provided (Loki convention)
-    // Using UNIX_EPOCH would create billions of time buckets with step parameter
-    let start = params.start.as_ref().map_or(now - Duration::hours(1), |s| parse_time(s));
-    let end = params.end.as_ref().map_or(now, |s| parse_time(s));
-
-    let query_ctx = QueryContext {
-        tenant_id,
-        start,
-        end,
-        limit: params.limit.map(|l| l as usize),
-        step: params.step.as_ref().and_then(|s| parse_duration_opt(s)),
-    };
-
-    // 1. Parse LogQL
-    let parser = AntlrParser::new();
-    let expr = match parser.parse(&params.query) {
-        Ok(expr) => expr,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "status": "error",
-                    "errorType": "bad_data",
-                    "error": format!("Parse error: {}", e)
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // Track query type BEFORE planning consumes the expression
-    let is_metric_query = expr.is_metric();
-
-    // 2. Create SessionContext from QueryEngine (uses cached
-    //    IcebergCatalogProvider)
-    let session_ctx = match loki_state.engine.create_session().await {
-        Ok(session_ctx) => session_ctx,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "status": "error",
-                    "error": format!("Failed to create session: {}", e)
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // 3. Plan Query
-    let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
-    let df = match planner.plan(expr).await {
-        Ok(df) => df,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "status": "error",
-                    "error": format!("Planning error: {}", e)
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // 4. Execute Query - DataFrame is lazy, collect() triggers execution
-    let batches = match df.collect().await {
-        Ok(batches) => batches,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "status": "error",
-                    "error": format!("Collection error: {}", e)
-                })),
-            )
-                .into_response();
-        },
-    };
-
-    // 5. Format Response based on query type
-    let exec_time = exec_start.elapsed().as_secs_f64();
-
-    let (result, result_type, stats) = if is_metric_query {
-        let (matrix, stats) = batches_to_loki_matrix(&batches);
-        (matrix, "matrix", stats)
-    } else {
-        let (streams, stats) = batches_to_loki_streams(&batches);
-        (streams, "streams", stats)
-    };
-
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    let bytes_per_sec = if exec_time > 0.0 { (stats.total_bytes as f64 / exec_time) as u64 } else { 0 };
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    let lines_per_sec = if exec_time > 0.0 { (stats.total_lines as f64 / exec_time) as u64 } else { 0 };
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "success",
-            "data": {
-                "resultType": result_type,
-                "result": result,
-                "stats": {
-                    "ingester": {
-                        "compressedBytes": 0,
-                        "decompressedBytes": stats.total_bytes,
-                        "decompressedLines": stats.total_lines,
-                        "headChunkBytes": 0,
-                        "headChunkLines": 0,
-                        "totalBatches": batches.len(),
-                        "totalChunksMatched": 0,
-                        "totalDuplicates": 0,
-                        "totalLinesSent": stats.total_lines,
-                        "totalReached": 1
-                    },
-                    "store": {
-                        "compressedBytes": 0,
-                        "decompressedBytes": stats.total_bytes,
-                        "decompressedLines": stats.total_lines,
-                        "chunksDownloadTime": 0,
-                        "totalChunksRef": 0,
-                        "totalChunksDownloaded": 0,
-                        "totalDuplicates": 0
-                    },
-                    "summary": {
-                        "bytesProcessedPerSecond": bytes_per_sec,
-                        "linesProcessedPerSecond": lines_per_sec,
-                        "totalBytesProcessed": stats.total_bytes,
-                        "totalLinesProcessed": stats.total_lines,
-                        "execTime": exec_time,
-                        "queueTime": 0
-                    }
-                }
-            }
-        })),
-    )
-        .into_response()
-}
-
-/// Statistics collected during result formatting
-struct QueryStats {
-    total_bytes: usize,
-    total_lines: usize,
-}
-
-/// Simple string interner for deduplicating label strings.
-///
-/// Reduces allocations by reusing `Arc<str>` for repeated label names/values
-/// (e.g., `service_name`, `level` appear on every row).
-struct StringInterner {
-    strings: HashMap<String, Arc<str>>,
-}
-
-impl StringInterner {
-    /// Create a new interner with pre-allocated capacity for typical label
-    /// sets.
-    fn new() -> Self {
-        Self {
-            strings: HashMap::with_capacity(256),
-        }
+    match executor.execute_range_query(tenant_id, &params).await {
+        Ok(data) => (StatusCode::OK, Json(LokiResponse::success(data))).into_response(),
+        Err(e) => e.into_response(),
     }
-
-    /// Intern a string, returning an `Arc<str>` that can be cheaply cloned.
-    ///
-    /// If the string was seen before, returns the existing `Arc`.
-    /// Otherwise, creates a new `Arc` and stores it for future lookups.
-    fn intern(&mut self, s: &str) -> Arc<str> {
-        if let Some(interned) = self.strings.get(s) {
-            Arc::clone(interned)
-        } else {
-            let arc: Arc<str> = Arc::from(s);
-            self.strings.insert(s.to_string(), Arc::clone(&arc));
-            arc
-        }
-    }
-}
-
-/// Column indices cached once per batch for efficient row processing
-struct BatchColumns {
-    timestamp: Option<usize>,
-    body: Option<usize>,
-    account_id: Option<usize>,
-    service_name: Option<usize>,
-    severity_text: Option<usize>,
-    level: Option<usize>,
-    trace_id: Option<usize>,
-    span_id: Option<usize>,
-    attributes: Option<usize>,
-}
-
-impl BatchColumns {
-    /// Extract column indices from schema
-    fn from_schema(schema: &Schema) -> Self {
-        Self {
-            timestamp: schema.index_of("timestamp").ok(),
-            body: schema.index_of("body").ok(),
-            account_id: schema.index_of("account_id").ok(),
-            service_name: schema.index_of("service_name").ok(),
-            severity_text: schema.index_of("severity_text").ok(),
-            level: schema.index_of("level").ok(),
-            trace_id: schema.index_of("trace_id").ok(),
-            span_id: schema.index_of("span_id").ok(),
-            attributes: schema.index_of("attributes").ok(),
-        }
-    }
-}
-
-/// Column indices for metric query batches (matrix format).
-///
-/// Metric queries return `time_bucket`, `value`, and optional grouping label
-/// columns.
-struct MetricBatchColumns {
-    timestamp: Option<usize>,
-    value: Option<usize>,
-    attributes: Option<usize>,
-}
-
-impl MetricBatchColumns {
-    /// Extract column indices from schema
-    fn from_schema(schema: &Schema) -> Self {
-        Self {
-            timestamp: schema.index_of("timestamp").ok(),
-            value: schema.index_of("value").ok(),
-            attributes: schema.index_of("attributes").ok(),
-        }
-    }
-
-    /// Returns indices of predefined indexed label columns that exist in the
-    /// schema.
-    fn label_indices(schema: &Schema) -> Vec<(String, usize)> {
-        INDEXED_ATTRIBUTE_COLUMNS
-            .iter()
-            .filter_map(|&name| schema.index_of(name).ok().map(|idx| (name.to_string(), idx)))
-            .collect()
-    }
-}
-
-/// Extract timestamp from row (microseconds -> nanoseconds)
-fn extract_timestamp(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> i64 {
-    let Some(idx) = cols.timestamp else { return 0 };
-    let arr = batch.column(idx).as_any();
-    if let Some(arr) = arr.downcast_ref::<TimestampMicrosecondArray>() {
-        return if arr.is_null(row) { 0 } else { arr.value(row) * 1000 };
-    }
-    if let Some(arr) = arr.downcast_ref::<TimestampNanosecondArray>() {
-        return if arr.is_null(row) { 0 } else { arr.value(row) };
-    }
-    0
-}
-
-/// Extract body string from row
-fn extract_body(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> String {
-    cols.body
-        .and_then(|idx| {
-            batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row).to_string())
-                }
-            })
-        })
-        .unwrap_or_default()
-}
-
-/// Extract labels from indexed columns (`account_id`, `service_name`,
-/// `severity_text`, `trace_id`, `span_id`) and `attributes` columns.
-///
-/// Uses string interning to deduplicate repeated label names/values across
-/// rows.
-///
-/// Note: Binary columns (`trace_id`, `span_id`) are hex-encoded to strings
-/// by the planner before reaching the handler, so all columns are
-/// `StringArray`.
-fn extract_labels(
-    batch: &RecordBatch,
-    cols: &BatchColumns,
-    row: usize,
-    interner: &mut StringInterner,
-) -> HashMap<Arc<str>, Arc<str>> {
-    // Pre-allocate for typical label count (account_id + service_name + level +
-    // trace/span + ~6 attributes)
-    let mut labels: HashMap<Arc<str>, Arc<str>> = HashMap::with_capacity(12);
-
-    // Helper to extract string column value
-    let extract_string = |idx: usize| -> Option<&str> {
-        batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
-            if arr.is_null(row) {
-                None
-            } else {
-                Some(arr.value(row))
-            }
-        })
-    };
-
-    // Add account_id as label
-    if let Some(idx) = cols.account_id {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("account_id"), interner.intern(val));
-        }
-    }
-
-    // Add service_name as label
-    if let Some(idx) = cols.service_name {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("service_name"), interner.intern(val));
-        }
-    }
-
-    // Add severity_text as label (original OTel name)
-    if let Some(idx) = cols.severity_text {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("severity_text"), interner.intern(val));
-        }
-    }
-
-    // Add level as label (alias of severity_text, added by planner for Grafana
-    // compatibility)
-    if let Some(idx) = cols.level {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("level"), interner.intern(val));
-        }
-    }
-
-    // Add trace_id (hex-encoded string from planner)
-    if let Some(idx) = cols.trace_id {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("trace_id"), interner.intern(val));
-        }
-    }
-
-    // Add span_id (hex-encoded string from planner)
-    if let Some(idx) = cols.span_id {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("span_id"), interner.intern(val));
-        }
-    }
-
-    // Extract attributes from Map column
-    if let Some(idx) = cols.attributes {
-        if let Some(map_arr) = batch.column(idx).as_any().downcast_ref::<MapArray>() {
-            if !map_arr.is_null(row) {
-                let offsets = map_arr.offsets();
-                #[allow(clippy::cast_sign_loss)]
-                let start = offsets[row] as usize;
-                #[allow(clippy::cast_sign_loss)]
-                let end = offsets[row + 1] as usize;
-
-                let keys = map_arr.keys().as_any().downcast_ref::<StringArray>();
-                let values = map_arr.values().as_any().downcast_ref::<StringArray>();
-
-                if let (Some(keys), Some(values)) = (keys, values) {
-                    for i in start..end {
-                        if !keys.is_null(i) && !values.is_null(i) {
-                            labels.insert(interner.intern(keys.value(i)), interner.intern(values.value(i)));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    labels
-}
-
-/// Create a deterministic sorted key for stream grouping.
-///
-/// Writes the key into a pre-allocated buffer to avoid per-call allocations.
-fn make_stream_key_into(labels: &HashMap<Arc<str>, Arc<str>>, buffer: &mut String) {
-    buffer.clear();
-    let mut label_pairs: Vec<_> = labels.iter().collect();
-    label_pairs.sort_by(|(k1, _), (k2, _)| k1.as_ref().cmp(k2.as_ref()));
-    for (i, (k, v)) in label_pairs.iter().enumerate() {
-        if i > 0 {
-            buffer.push(',');
-        }
-        buffer.push_str(k);
-        buffer.push('=');
-        buffer.push_str(v);
-    }
-}
-
-/// Convert grouped streams to Loki JSON format.
-///
-/// Accepts `Arc<str>` labels and converts them to owned strings for JSON
-/// serialization.
-fn streams_to_json(streams: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(String, String)>)>) -> JsonValue {
-    let result: Vec<JsonValue> = streams
-        .into_values()
-        .map(|(labels, values)| {
-            // Convert Arc<str> labels to HashMap<String, String> for JSON
-            let labels_map: HashMap<String, String> =
-                labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            json!({
-                "stream": labels_map,
-                "values": values.into_iter().map(|(ts, line)| json!([ts, line])).collect::<Vec<_>>()
-            })
-        })
-        .collect();
-
-    json!(result)
-}
-
-/// Converts `DataFusion` `RecordBatches` to Loki streams format.
-///
-/// Loki streams format:
-/// ```json
-/// [
-///   {
-///     "stream": {"label1": "value1", "label2": "value2"},
-///     "values": [["<timestamp_nanos>", "<log_line>"], ...]
-///   }
-/// ]
-/// ```
-///
-/// Groups log entries by their labels (`service_name`, `severity_text`, and
-/// attributes).
-///
-/// # Performance
-///
-/// Uses string interning and buffer reuse to minimize allocations:
-/// - `StringInterner` deduplicates repeated label names/values across rows
-/// - Pre-allocated key buffer avoids per-row string allocations
-/// - `itoa` for fast integer-to-string conversion
-fn batches_to_loki_streams(batches: &[RecordBatch]) -> (JsonValue, QueryStats) {
-    // Pre-allocate collections for typical query results
-    let mut streams: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(String, String)>)> = HashMap::with_capacity(64);
-    let mut interner = StringInterner::new();
-    let mut key_buffer = String::with_capacity(256);
-    let mut total_bytes: usize = 0;
-    let mut total_lines: usize = 0;
-
-    for batch in batches {
-        let cols = BatchColumns::from_schema(batch.schema().as_ref());
-
-        for row in 0..batch.num_rows() {
-            let timestamp_nanos = extract_timestamp(batch, &cols, row);
-            let body = extract_body(batch, &cols, row);
-            let labels = extract_labels(batch, &cols, row, &mut interner);
-
-            // Reuse buffer for stream key construction
-            make_stream_key_into(&labels, &mut key_buffer);
-
-            total_bytes += body.len();
-            total_lines += 1;
-
-            // Use itoa for fast integer formatting
-            let ts_str = itoa::Buffer::new().format(timestamp_nanos).to_string();
-
-            streams
-                .entry(key_buffer.clone())
-                .or_insert_with(|| (labels, Vec::new()))
-                .1
-                .push((ts_str, body));
-        }
-    }
-
-    (streams_to_json(streams), QueryStats {
-        total_bytes,
-        total_lines,
-    })
 }
 
 // ============================================================================
-// Matrix Format (Metric Queries)
-// ============================================================================
-
-/// Extract `time_bucket` from row (microseconds → decimal seconds).
-#[allow(clippy::cast_precision_loss)]
-fn extract_time_bucket_secs(batch: &RecordBatch, cols: &MetricBatchColumns, row: usize) -> i64 {
-    let Some(idx) = cols.timestamp else { return 0i64 };
-    let arr = batch.column(idx).as_any();
-    if let Some(arr) = arr.downcast_ref::<TimestampMicrosecondArray>() {
-        return if arr.is_null(row) { 0i64 } else { arr.value(row) / 1_000_000i64 };
-    }
-    if let Some(arr) = arr.downcast_ref::<TimestampNanosecondArray>() {
-        return if arr.is_null(row) { 0i64 } else { arr.value(row) / 1_000_000_000i64 };
-    }
-    0i64
-}
-
-/// Extract metric value as string (handles Float64, Int64).
-///
-/// Returns `"0"` for NULL values (e.g., empty aggregation windows from LEFT
-/// JOIN).
-fn extract_metric_value(batch: &RecordBatch, cols: &MetricBatchColumns, row: usize) -> String {
-    cols.value.map_or_else(
-        || "0".to_string(),
-        |idx| {
-            let col = batch.column(idx);
-            if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-                if !arr.is_null(row) {
-                    return arr.value(row).to_string();
-                }
-            }
-            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                if !arr.is_null(row) {
-                    return arr.value(row).to_string();
-                }
-            }
-            "0".to_string()
-        },
-    )
-}
-
-/// Maps `OTel` column names to Loki label names for output.
-///
-/// Reverse of `map_label_to_column()` in planner.
-fn map_column_to_label(name: &str) -> &str {
-    match name {
-        "severity_text" => "level",
-        "service_name" => "service",
-        _ => name,
-    }
-}
-
-/// Extract labels from indexed columns and attributes map for metric queries.
-///
-/// Uses reverse label mapping (e.g., `severity_text` → `level`) for output.
-fn extract_metric_labels(
-    batch: &RecordBatch,
-    label_cols: &[(String, usize)],
-    attributes_idx: Option<usize>,
-    row: usize,
-    interner: &mut StringInterner,
-) -> HashMap<Arc<str>, Arc<str>> {
-    let mut labels = HashMap::with_capacity(label_cols.len() + 8);
-
-    // Extract predefined indexed columns with reverse label mapping
-    for (col_name, idx) in label_cols {
-        if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<StringArray>() {
-            if !arr.is_null(row) {
-                let label_name = map_column_to_label(col_name);
-                labels.insert(interner.intern(label_name), interner.intern(arr.value(row)));
-            }
-        }
-    }
-
-    // Extract all attributes from map column
-    if let Some(attr_idx) = attributes_idx {
-        extract_attributes_map(batch, attr_idx, row, &mut labels, interner);
-    }
-
-    labels
-}
-
-/// Extract key-value pairs from attributes `MapArray` column.
-fn extract_attributes_map(
-    batch: &RecordBatch,
-    attr_idx: usize,
-    row: usize,
-    labels: &mut HashMap<Arc<str>, Arc<str>>,
-    interner: &mut StringInterner,
-) {
-    if let Some(map_arr) = batch.column(attr_idx).as_any().downcast_ref::<MapArray>() {
-        if !map_arr.is_null(row) {
-            let offsets = map_arr.offsets();
-            #[allow(clippy::cast_sign_loss)]
-            let start = offsets[row] as usize;
-            #[allow(clippy::cast_sign_loss)]
-            let end = offsets[row + 1] as usize;
-
-            let keys = map_arr.keys().as_any().downcast_ref::<StringArray>();
-            let values = map_arr.values().as_any().downcast_ref::<StringArray>();
-
-            if let (Some(keys), Some(values)) = (keys, values) {
-                for i in start..end {
-                    if !keys.is_null(i) && !values.is_null(i) {
-                        labels.insert(interner.intern(keys.value(i)), interner.intern(values.value(i)));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Convert series map to Loki matrix JSON format.
-///
-/// Matrix format uses "metric" instead of "stream" for labels,
-/// and timestamps are decimal seconds (f64) instead of nanosecond strings.
-fn matrix_to_json(series: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(i64, String)>)>) -> JsonValue {
-    let result: Vec<JsonValue> = series
-        .into_values()
-        .map(|(labels, values)| {
-            let labels_map: HashMap<String, String> =
-                labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            json!({
-                "metric": labels_map,
-                "values": values.into_iter().map(|(ts, val)| json!([ts, val])).collect::<Vec<_>>()
-            })
-        })
-        .collect();
-
-    json!(result)
-}
-
-/// Converts `DataFusion` `RecordBatches` to Loki matrix format.
-///
-/// Loki matrix format (for metric queries):
-/// ```json
-/// [
-///   {
-///     "metric": {"label1": "value1", "label2": "value2"},
-///     "values": [[<timestamp_seconds>, "<value>"], ...]
-///   }
-/// ]
-/// ```
-///
-/// Groups metric samples by their labels (grouping columns from the query).
-/// Timestamps are decimal seconds (f64), values are numeric strings.
-fn batches_to_loki_matrix(batches: &[RecordBatch]) -> (JsonValue, QueryStats) {
-    let mut series: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(i64, String)>)> = HashMap::with_capacity(64);
-    let mut interner = StringInterner::new();
-    let mut key_buffer = String::with_capacity(256);
-    let mut total_samples: usize = 0;
-
-    for batch in batches {
-        let cols = MetricBatchColumns::from_schema(batch.schema().as_ref());
-        let label_cols = MetricBatchColumns::label_indices(batch.schema().as_ref());
-
-        for row in 0..batch.num_rows() {
-            // Extract timestamp (microseconds -> decimal seconds)
-            let timestamp_secs = extract_time_bucket_secs(batch, &cols, row);
-
-            // Extract value as string
-            let value = extract_metric_value(batch, &cols, row);
-
-            // Extract labels from indexed columns and attributes map
-            let labels = extract_metric_labels(batch, &label_cols, cols.attributes, row, &mut interner);
-
-            // Group by labels
-            make_stream_key_into(&labels, &mut key_buffer);
-
-            total_samples += 1;
-
-            series
-                .entry(key_buffer.clone())
-                .or_insert_with(|| (labels, Vec::new()))
-                .1
-                .push((timestamp_secs, value));
-        }
-    }
-
-    (matrix_to_json(series), QueryStats {
-        total_bytes: total_samples * 16, // approximate
-        total_lines: total_samples,
-    })
-}
-
-fn parse_time(s: &str) -> DateTime<Utc> {
-    // Simple parsing, assumes nanoseconds if digits, otherwise try RFC3339
-    s.parse::<i64>().map_or_else(
-        |_| {
-            // Try RFC3339 parsing
-            DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or(DateTime::UNIX_EPOCH)
-        },
-        DateTime::from_timestamp_nanos,
-    )
-}
-
-// ============================================================================
-// Label Metadata Endpoints - Helper Functions
-// ============================================================================
-
-/// Build `QueryContext` from request parameters.
-///
-/// Handles time range parsing with support for `start`, `end`, and `since`
-/// parameters. Defaults to 6 hours if no time range is specified.
-fn build_query_context(
-    tenant_id: String,
-    start: Option<&String>,
-    end: Option<&String>,
-    since: Option<&String>,
-) -> QueryContext {
-    let now = Utc::now();
-    let end_time = end.map_or(now, |s| parse_time(s));
-    let start_time = since
-        .and_then(|s| parse_duration_opt(s))
-        .map(|d| end_time - d)
-        .or_else(|| start.map(|s| parse_time(s)))
-        .unwrap_or(now - Duration::hours(6));
-
-    QueryContext {
-        tenant_id,
-        start: start_time,
-        end: end_time,
-        limit: None, // No limit for metadata queries
-        step: None,
-    }
-}
-
-/// Parse a `LogQL` selector string into a `Selector`.
-///
-/// Uses the `AntlrParser` to parse the query string and extracts the selector.
-/// Returns an error if the query is not a valid log selector.
-fn parse_selector(query: &str) -> Result<Selector, String> {
-    let parser = AntlrParser::new();
-    match parser.parse(query) {
-        Ok(LogQLExpr::Log(log_expr)) => Ok(log_expr.selector),
-        Ok(_) => Err("Expected log selector, got metric query".to_string()),
-        Err(e) => Err(format!("Parse error: {e}")),
-    }
-}
-
-/// Format error response in Loki format.
-fn error_response(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "status": "error",
-            "error": message
-        })),
-    )
-        .into_response()
-}
-
-/// Extract string values from a column in record batches.
-fn extract_string_column(batches: &[RecordBatch], col_idx: usize) -> Vec<String> {
-    let mut values = Vec::new();
-    for batch in batches {
-        if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>() {
-            for i in 0..arr.len() {
-                if !arr.is_null(i) {
-                    values.push(arr.value(i).to_string());
-                }
-            }
-        }
-    }
-    values
-}
-
-// ============================================================================
-// Label Metadata Endpoints - Handlers
+// Metadata Handlers
 // ============================================================================
 
 /// Handle label names request.
-///
-/// Returns all distinct label names (indexed columns + attribute keys) from
-/// logs matching the optional selector and time range.
 ///
 /// Loki API: `GET /loki/api/v1/labels`
 pub async fn labels(
@@ -1055,57 +87,15 @@ pub async fn labels(
     headers: HeaderMap,
     Query(params): Query<LabelsQueryParams>,
 ) -> Response {
-    let query_ctx = build_query_context(
-        extract_tenant_id(&headers),
-        params.start.as_ref(),
-        params.end.as_ref(),
-        params.since.as_ref(),
-    );
+    let executor = QueryExecutor::new(loki_state.engine);
 
-    // Parse optional selector (or use empty)
-    let selector = match params.query.as_ref() {
-        Some(query) => match parse_selector(query) {
-            Ok(s) => s,
-            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
-        },
-        None => Selector::empty(),
-    };
-
-    // Create session and planner
-    let session_ctx = match loki_state.engine.create_session().await {
-        Ok(ctx) => ctx,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-
-    // Plan and execute labels query
-    let df = match planner.plan_labels(selector).await {
-        Ok(df) => df,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-
-    let batches = match df.collect().await {
-        Ok(b) => b,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-
-    // Build result from planner output (includes indexed columns with non-null
-    // values, attribute keys, and 'level' alias)
-    let mut labels: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for value in extract_string_column(&batches, 0) {
-        labels.insert(value);
+    match executor.execute_labels(extract_tenant_id(&headers), &params).await {
+        Ok(data) => (StatusCode::OK, Json(LokiResponse::success(data))).into_response(),
+        Err(e) => e.into_response(),
     }
-
-    let mut result: Vec<String> = labels.into_iter().collect();
-    result.sort();
-
-    (StatusCode::OK, Json(json!({"status": "success", "data": result}))).into_response()
 }
 
 /// Handle label values request.
-///
-/// Returns all distinct values for a specific label from logs matching
-/// the optional selector and time range.
 ///
 /// Loki API: `GET /loki/api/v1/label/:name/values`
 pub async fn label_values(
@@ -1114,50 +104,18 @@ pub async fn label_values(
     Path(label_name): Path<String>,
     Query(params): Query<LabelValuesQueryParams>,
 ) -> Response {
-    let query_ctx = build_query_context(
-        extract_tenant_id(&headers),
-        params.start.as_ref(),
-        params.end.as_ref(),
-        params.since.as_ref(),
-    );
+    let executor = QueryExecutor::new(loki_state.engine);
 
-    // Parse optional selector (or use empty)
-    let selector = match params.query.as_ref() {
-        Some(query) => match parse_selector(query) {
-            Ok(s) => s,
-            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
-        },
-        None => Selector::empty(),
-    };
-
-    // Create session and planner
-    let session_ctx = match loki_state.engine.create_session().await {
-        Ok(ctx) => ctx,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-
-    // Plan and execute label values query
-    let df = match planner.plan_label_values(selector, &label_name).await {
-        Ok(df) => df,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-
-    let batches = match df.collect().await {
-        Ok(b) => b,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-
-    // Extract string values
-    let values = extract_string_column(&batches, 0);
-
-    (StatusCode::OK, Json(json!({"status": "success", "data": values}))).into_response()
+    match executor
+        .execute_label_values(extract_tenant_id(&headers), &label_name, &params)
+        .await
+    {
+        Ok(data) => (StatusCode::OK, Json(LokiResponse::success(data))).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Handle series request.
-///
-/// Returns all unique label combinations (series) matching the provided
-/// selectors and time range. At least one `match[]` parameter is required.
 ///
 /// Loki API: `GET /loki/api/v1/series`
 pub async fn series(
@@ -1165,75 +123,19 @@ pub async fn series(
     headers: HeaderMap,
     QueryExtra(params): QueryExtra<SeriesQueryParams>,
 ) -> Response {
-    // Require at least one matcher (per Loki API spec)
-    if params.matchers.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "match[] parameter required");
+    let executor = QueryExecutor::new(loki_state.engine);
+
+    match executor.execute_series(extract_tenant_id(&headers), &params).await {
+        Ok(data) => (StatusCode::OK, Json(LokiResponse::success(data))).into_response(),
+        Err(e) => e.into_response(),
     }
-
-    let query_ctx = build_query_context(
-        extract_tenant_id(&headers),
-        params.start.as_ref(),
-        params.end.as_ref(),
-        None, // series doesn't support 'since'
-    );
-
-    // Parse all selectors
-    let mut selectors = Vec::new();
-    for matcher_str in &params.matchers {
-        match parse_selector(matcher_str) {
-            Ok(selector) => selectors.push(selector),
-            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
-        }
-    }
-
-    // Create session and planner
-    let session_ctx = match loki_state.engine.create_session().await {
-        Ok(ctx) => ctx,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-
-    // Plan and execute series query
-    let df = match planner.plan_series(&selectors).await {
-        Ok(df) => df,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-
-    let batches = match df.collect().await {
-        Ok(b) => b,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-
-    // Convert to series list (array of label maps)
-    let series_list = batches_to_series_list(&batches);
-
-    (StatusCode::OK, Json(json!({"status": "success", "data": series_list}))).into_response()
 }
 
-/// Convert record batches to series list (array of label maps).
-///
-/// Each series is a map of label name -> value for all indexed columns
-/// and attributes.
-fn batches_to_series_list(batches: &[RecordBatch]) -> Vec<HashMap<String, String>> {
-    let mut series_list = Vec::new();
-    let mut interner = StringInterner::new();
+// ============================================================================
+// Health Handlers
+// ============================================================================
 
-    for batch in batches {
-        let cols = BatchColumns::from_schema(batch.schema().as_ref());
-
-        for row in 0..batch.num_rows() {
-            let labels = extract_labels(batch, &cols, row, &mut interner);
-            // Convert Arc<str> to String for JSON
-            let label_map: HashMap<String, String> =
-                labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            series_list.push(label_map);
-        }
-    }
-
-    series_list
-}
-
-/// Health/ready check endpoint
+/// Health/ready check endpoint.
 pub async fn ready() -> Response {
     (StatusCode::OK, "ready").into_response()
 }

@@ -63,7 +63,7 @@ use datafusion::{
 ///     count = sum(matches)        // single scalar result
 /// ```
 #[derive(Debug)]
-struct GridAccumulator {
+pub struct GridAccumulator {
     /// Grid timestamps (microseconds).
     grid: Vec<i64>,
     /// Accumulated values (counts or byte sums) per grid point.
@@ -85,7 +85,7 @@ impl GridAccumulator {
     /// - `step_micros`: Step between grid points (microseconds)
     /// - `range_micros`: Range window size (microseconds)
     /// - `offset_micros`: Offset for range window (microseconds)
-    fn new(
+    pub fn new(
         start_micros: i64,
         end_micros: i64,
         step_micros: i64,
@@ -121,7 +121,7 @@ impl GridAccumulator {
 
     /// Serializes state for distributed execution.
     #[allow(clippy::unnecessary_wraps)] // Required by Accumulator trait interface
-    fn state(&self) -> Result<Vec<ScalarValue>> {
+    pub fn state(&self) -> Result<Vec<ScalarValue>> {
         let grid_array = TimestampMicrosecondArray::from(self.grid.clone());
         let values_array = UInt64Array::from(self.values.clone());
 
@@ -137,7 +137,7 @@ impl GridAccumulator {
     }
 
     /// Merges another accumulator's state into this one.
-    fn merge(&mut self, states: &[ArrayRef]) -> Result<()> {
+    pub fn merge(&mut self, states: &[ArrayRef]) -> Result<()> {
         if states.is_empty() {
             return Ok(());
         }
@@ -181,7 +181,7 @@ impl GridAccumulator {
     /// For each grid point, computes which input timestamps fall within its
     /// range window, then counts them. This is more efficient than the inverse
     /// (iterating timestamps) when `num_timestamps` >> `num_grid_points`.
-    fn update_counts(&mut self, timestamps: &TimestampMicrosecondArray) -> Result<()> {
+    pub fn update_counts(&mut self, timestamps: &TimestampMicrosecondArray) -> Result<()> {
         if timestamps.is_empty() {
             return Ok(());
         }
@@ -261,7 +261,7 @@ impl GridAccumulator {
     /// Builds sparse output as `List<Struct { timestamp, value: UInt64 }>`.
     ///
     /// Only includes grid points where value > 0 (or value == 0 if inverted).
-    fn build_sparse_u64(&self, invert: bool) -> Result<ScalarValue> {
+    pub fn build_sparse_u64(&self, invert: bool) -> Result<ScalarValue> {
         let mut timestamps = Vec::new();
         let mut output_values = Vec::new();
 
@@ -280,7 +280,7 @@ impl GridAccumulator {
     /// Builds sparse output as `List<Struct { timestamp, value: Float64 }>`.
     ///
     /// Divides values by the given divisor (`range_seconds` for rate).
-    fn build_sparse_f64(&self, divisor: f64) -> Result<ScalarValue> {
+    pub fn build_sparse_f64(&self, divisor: f64) -> Result<ScalarValue> {
         let mut timestamps = Vec::new();
         let mut output_values = Vec::new();
 

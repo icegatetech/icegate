@@ -90,7 +90,7 @@ pub enum IceGateError {
     /// A collection of one or more [`IceGateError`]. Useful in cases where
     /// `IceGate` can recover from an erroneous state, and produce more errors
     /// before terminating. e.g. when transpiling a query.
-    Collection(Vec<IceGateError>),
+    Collection(Vec<Self>),
     /// Not implemented error.
     NotImplemented(String),
     /// Configuration error.
@@ -101,6 +101,10 @@ pub enum IceGateError {
     ///
     /// This error happens when I/O operations fail.
     Io(std::io::Error),
+    /// Validation error for invalid request parameters.
+    ///
+    /// This error happens when request parameters fail validation.
+    Validation(String),
 }
 
 impl fmt::Display for IceGateError {
@@ -158,6 +162,9 @@ impl fmt::Display for IceGateError {
             },
             Self::Plan(msg) => {
                 write!(f, "Plan error: {msg}")
+            },
+            Self::Validation(msg) => {
+                write!(f, "{msg}")
             },
         }
     }

@@ -110,3 +110,10 @@ testcontainers = { version = "0.26", features = ["http_wait"] }
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 aws-config = "1"
 aws-sdk-s3 = "1"
+
+# Benchmarking
+criterion = "0.5"
+
+[[bench]]
+name = "count_over_time"
+harness = false

@@ -282,11 +282,11 @@ impl LogParser {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LabelFilterExpr {
     /// Logical AND: `filter1, filter2` or `filter1 and filter2`
-    And(Box<LabelFilterExpr>, Box<LabelFilterExpr>),
+    And(Box<Self>, Box<Self>),
     /// Logical OR: `filter1 or filter2`
-    Or(Box<LabelFilterExpr>, Box<LabelFilterExpr>),
+    Or(Box<Self>, Box<Self>),
     /// Parenthesized expression: `(filter)`
-    Parens(Box<LabelFilterExpr>),
+    Parens(Box<Self>),
     /// Label matcher: `label = "value"`, `label =~ "regex"`
     Matcher(LabelMatcher),
     /// Numeric comparison: `label > 10`, `label <= 100`

@@ -13,13 +13,13 @@ pub enum MetricExpr {
     /// Binary operation: `left op right`
     BinaryOp {
         /// Left operand
-        left: Box<MetricExpr>,
+        left: Box<Self>,
         /// Operator
         op: BinaryOp,
         /// Optional modifier (bool or vector matching)
         modifier: Option<BinaryOpModifier>,
         /// Right operand
-        right: Box<MetricExpr>,
+        right: Box<Self>,
     },
     /// Range aggregation: `rate({...}[5m])`, `count_over_time({...}[1h])`
     RangeAggregation(RangeAggregation),
@@ -31,7 +31,7 @@ pub enum MetricExpr {
     /// regex)`
     LabelReplace {
         /// Source expression
-        expr: Box<MetricExpr>,
+        expr: Box<Self>,
         /// Destination label name
         dst_label: String,
         /// Replacement string
@@ -46,7 +46,7 @@ pub enum MetricExpr {
     /// Variable reference: `$variable`
     Variable(String),
     /// Parenthesized expression: `(expr)`
-    Parens(Box<MetricExpr>),
+    Parens(Box<Self>),
 }
 
 impl MetricExpr {
