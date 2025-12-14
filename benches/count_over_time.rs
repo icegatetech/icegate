@@ -18,7 +18,7 @@ fn generate_timestamps(count: usize, start: i64, end: i64) -> TimestampMicroseco
 /// Benchmark `update_counts` with varying dataset sizes
 fn bench_update_counts(c: &mut Criterion) {
     let mut group = c.benchmark_group("update_counts");
-    group.measurement_time(Duration::from_secs(10));
+    group.measurement_time(Duration::from_secs(30));
 
     // Test different dataset sizes
     let configs = vec![
@@ -58,7 +58,7 @@ fn bench_update_counts(c: &mut Criterion) {
 /// Benchmark `update_counts` with varying grid sizes (fixed timestamp count)
 fn bench_grid_size_impact(c: &mut Criterion) {
     let mut group = c.benchmark_group("grid_size_impact");
-    group.measurement_time(Duration::from_secs(10));
+    group.measurement_time(Duration::from_secs(30));
 
     let num_timestamps = 10_000; // Fixed timestamp count
 
