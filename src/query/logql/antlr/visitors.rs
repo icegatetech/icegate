@@ -95,38 +95,70 @@ fn clean_string(text: &str) -> String {
     }
 }
 
-/// Parse a bytes string like "1KB", "10MB" into bytes.
+/// Parse a bytes string like `1KB`, `10MiB`, `1e3GB`, `0x10KiB` into bytes.
+///
+/// Supports decimal, scientific notation (`1e3`), and hexadecimal (`0x10`) number formats.
+///
+/// Suffixes (case-insensitive):
+/// - Binary (IEC, base 1024): `KiB`, `MiB`, `GiB`, `TiB`, `PiB`, `EiB`
+/// - Decimal (SI, base 1000): `KB`, `MB`, `GB`, `TB`, `PB`, `EB`
+/// - Bytes: `B`
 fn parse_bytes(text: &str) -> Result<u64> {
-    let text = text.trim();
+    // Known suffixes ordered by length (longest first to avoid partial matches)
+    // Binary units (IEC): base 1024
+    // Decimal units (SI): base 1000
+    const SUFFIXES: &[(&str, f64)] = &[
+        // Binary units (IEC) - base 1024
+        ("EIB", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("PIB", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("TIB", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("GIB", 1024.0 * 1024.0 * 1024.0),
+        ("MIB", 1024.0 * 1024.0),
+        ("KIB", 1024.0),
+        // Decimal units (SI) - base 1000
+        ("EB", 1000.0 * 1000.0 * 1000.0 * 1000.0 * 1000.0 * 1000.0),
+        ("PB", 1000.0 * 1000.0 * 1000.0 * 1000.0 * 1000.0),
+        ("TB", 1000.0 * 1000.0 * 1000.0 * 1000.0),
+        ("GB", 1000.0 * 1000.0 * 1000.0),
+        ("MB", 1000.0 * 1000.0),
+        ("KB", 1000.0),
+        // Bytes
+        ("B", 1.0),
+    ];
 
-    // Find where the number ends and unit begins
-    let mut num_end = 0;
-    for (i, c) in text.char_indices() {
-        if c.is_ascii_digit() || c == '.' {
-            num_end = i + c.len_utf8();
-        } else {
-            break;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(parse_error("Empty bytes value"));
+    }
+
+    let text_upper = text.to_uppercase();
+
+    // Strip known suffix from the end and parse the numeric prefix
+    for &(suffix, multiplier) in SUFFIXES {
+        if text_upper.ends_with(suffix) {
+            let prefix_len = text.len() - suffix.len();
+            let num_str = text[..prefix_len].trim();
+            if num_str.is_empty() {
+                return Err(parse_error(format!("Missing number in bytes: {text}")));
+            }
+            let num = parse_number(num_str)?;
+            return f64_to_u64_checked(num * multiplier);
         }
     }
 
-    let num_str = &text[..num_end];
-    let unit = text[num_end..].trim().to_uppercase();
+    // No recognized suffix - try parsing as raw bytes
+    if let Ok(num) = parse_number(text) {
+        return f64_to_u64_checked(num);
+    }
 
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| parse_error(format!("Invalid number in bytes: {num_str}")))?;
-
-    let multiplier: f64 = match unit.as_str() {
-        "" | "B" => 1.0,
-        "KB" | "KIB" => 1024.0,
-        "MB" | "MIB" => 1024.0 * 1024.0,
-        "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
-        "TB" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "PB" | "PIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => return Err(parse_error(format!("Unknown bytes unit: {unit}"))),
-    };
-
-    f64_to_u64_checked(num * multiplier)
+    // Could not parse - extract trailing alphabetic characters as unknown suffix
+    let suffix_start = text.rfind(|c: char| !c.is_ascii_alphabetic()).map_or(0, |i| i + 1);
+    if suffix_start < text.len() {
+        let unknown_suffix = &text[suffix_start..];
+        Err(parse_error(format!("Unknown bytes unit: {unknown_suffix}")))
+    } else {
+        Err(parse_error(format!("Invalid number in bytes: {text}")))
+    }
 }
 
 /// Parse a number string into f64.
@@ -1474,5 +1506,247 @@ impl<'input> LogQLParserVisitorCompat<'input> for LogQLExprVisitor {
             Ok(expr) => VisitorResult::ok(LogQLExpr::Metric(expr)),
             Err(e) => VisitorResult::err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_bytes_tests {
+    use super::*;
+
+    // ==================== Binary Units (IEC, base 1024) ====================
+
+    #[test]
+    fn test_binary_kib() {
+        assert_eq!(parse_bytes("1KiB").unwrap(), 1024);
+        assert_eq!(parse_bytes("2KiB").unwrap(), 2048);
+    }
+
+    #[test]
+    fn test_binary_mib() {
+        assert_eq!(parse_bytes("1MiB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_bytes("2MiB").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_binary_gib() {
+        assert_eq!(parse_bytes("1GiB").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_binary_tib() {
+        assert_eq!(parse_bytes("1TiB").unwrap(), 1024_u64.pow(4));
+    }
+
+    #[test]
+    fn test_binary_pib() {
+        assert_eq!(parse_bytes("1PiB").unwrap(), 1024_u64.pow(5));
+    }
+
+    #[test]
+    fn test_binary_eib() {
+        assert_eq!(parse_bytes("1EiB").unwrap(), 1024_u64.pow(6));
+    }
+
+    // ==================== Decimal Units (SI, base 1000) ====================
+
+    #[test]
+    fn test_decimal_kb() {
+        assert_eq!(parse_bytes("1KB").unwrap(), 1000);
+        assert_eq!(parse_bytes("2KB").unwrap(), 2000);
+    }
+
+    #[test]
+    fn test_decimal_mb() {
+        assert_eq!(parse_bytes("1MB").unwrap(), 1_000_000);
+        assert_eq!(parse_bytes("2MB").unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn test_decimal_gb() {
+        assert_eq!(parse_bytes("1GB").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_decimal_tb() {
+        assert_eq!(parse_bytes("1TB").unwrap(), 1_000_000_000_000);
+    }
+
+    #[test]
+    fn test_decimal_pb() {
+        assert_eq!(parse_bytes("1PB").unwrap(), 1_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_decimal_eb() {
+        assert_eq!(parse_bytes("1EB").unwrap(), 1_000_000_000_000_000_000);
+    }
+
+    // ==================== Binary vs Decimal Differentiation ====================
+
+    #[test]
+    fn test_kib_vs_kb() {
+        // 1 KiB = 1024 bytes, 1 KB = 1000 bytes
+        assert_eq!(parse_bytes("1KiB").unwrap(), 1024);
+        assert_eq!(parse_bytes("1KB").unwrap(), 1000);
+        assert_ne!(parse_bytes("1KiB").unwrap(), parse_bytes("1KB").unwrap());
+    }
+
+    #[test]
+    fn test_mib_vs_mb() {
+        // 1 MiB = 1048576, 1 MB = 1000000
+        assert_eq!(parse_bytes("1MiB").unwrap(), 1_048_576);
+        assert_eq!(parse_bytes("1MB").unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn test_gib_vs_gb() {
+        // 1 GiB = 1073741824, 1 GB = 1000000000
+        assert_eq!(parse_bytes("1GiB").unwrap(), 1_073_741_824);
+        assert_eq!(parse_bytes("1GB").unwrap(), 1_000_000_000);
+    }
+
+    // ==================== Scientific Notation ====================
+
+    #[test]
+    fn test_scientific_notation_decimal_units() {
+        // 1e3 KB = 1000 * 1000 = 1,000,000
+        assert_eq!(parse_bytes("1e3KB").unwrap(), 1_000_000);
+        // 1E3 MB = 1000 * 1,000,000 = 1,000,000,000
+        assert_eq!(parse_bytes("1E3MB").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_scientific_notation_binary_units() {
+        // 1e3 KiB = 1000 * 1024 = 1,024,000
+        assert_eq!(parse_bytes("1e3KiB").unwrap(), 1_024_000);
+        // 2e2 MiB = 200 * 1048576 = 209,715,200
+        assert_eq!(parse_bytes("2e2MiB").unwrap(), 209_715_200);
+    }
+
+    #[test]
+    fn test_scientific_notation_raw_bytes() {
+        assert_eq!(parse_bytes("1e3").unwrap(), 1000);
+        assert_eq!(parse_bytes("1e6").unwrap(), 1_000_000);
+    }
+
+    // ==================== Hexadecimal Numbers ====================
+
+    #[test]
+    fn test_hex_decimal_units() {
+        // 0x10 = 16, 16 KB = 16,000
+        assert_eq!(parse_bytes("0x10KB").unwrap(), 16_000);
+        // 0xFF = 255, 255 MB = 255,000,000
+        assert_eq!(parse_bytes("0xFFMB").unwrap(), 255_000_000);
+    }
+
+    #[test]
+    fn test_hex_binary_units() {
+        // 0x10 = 16, 16 KiB = 16,384
+        assert_eq!(parse_bytes("0x10KiB").unwrap(), 16_384);
+        // 0xFF = 255, 255 MiB = 267,386,880
+        assert_eq!(parse_bytes("0xFFMiB").unwrap(), 267_386_880);
+    }
+
+    #[test]
+    fn test_hex_raw_bytes() {
+        assert_eq!(parse_bytes("0x10").unwrap(), 16);
+        assert_eq!(parse_bytes("0xFF").unwrap(), 255);
+        assert_eq!(parse_bytes("0x100").unwrap(), 256);
+    }
+
+    #[test]
+    fn test_hex_uppercase_prefix() {
+        assert_eq!(parse_bytes("0X10KB").unwrap(), 16_000);
+        assert_eq!(parse_bytes("0X10KiB").unwrap(), 16_384);
+    }
+
+    // ==================== Case Insensitivity ====================
+
+    #[test]
+    fn test_suffix_case_insensitivity() {
+        // All variations should work
+        assert_eq!(parse_bytes("1kb").unwrap(), 1000);
+        assert_eq!(parse_bytes("1Kb").unwrap(), 1000);
+        assert_eq!(parse_bytes("1KB").unwrap(), 1000);
+        assert_eq!(parse_bytes("1kB").unwrap(), 1000);
+    }
+
+    #[test]
+    fn test_binary_suffix_case_insensitivity() {
+        assert_eq!(parse_bytes("1kib").unwrap(), 1024);
+        assert_eq!(parse_bytes("1Kib").unwrap(), 1024);
+        assert_eq!(parse_bytes("1KIB").unwrap(), 1024);
+        assert_eq!(parse_bytes("1KiB").unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_bytes_suffix_case_insensitivity() {
+        assert_eq!(parse_bytes("100b").unwrap(), 100);
+        assert_eq!(parse_bytes("100B").unwrap(), 100);
+    }
+
+    // ==================== Raw Bytes (No Suffix) ====================
+
+    #[test]
+    fn test_raw_bytes_integer() {
+        assert_eq!(parse_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_bytes("100").unwrap(), 100);
+    }
+
+    #[test]
+    fn test_raw_bytes_decimal() {
+        assert_eq!(parse_bytes("1.5").unwrap(), 1); // truncated
+        assert_eq!(parse_bytes("2.9").unwrap(), 2); // truncated
+    }
+
+    // ==================== Decimal Numbers with Units ====================
+
+    #[test]
+    fn test_decimal_number_with_unit() {
+        // 1.5 KB = 1500
+        assert_eq!(parse_bytes("1.5KB").unwrap(), 1500);
+        // 1.5 KiB = 1536
+        assert_eq!(parse_bytes("1.5KiB").unwrap(), 1536);
+        // 2.5 MB = 2,500,000
+        assert_eq!(parse_bytes("2.5MB").unwrap(), 2_500_000);
+    }
+
+    // ==================== Whitespace Handling ====================
+
+    #[test]
+    fn test_whitespace_trimming() {
+        assert_eq!(parse_bytes("  1KB  ").unwrap(), 1000);
+        assert_eq!(parse_bytes("\t1MiB\n").unwrap(), 1_048_576);
+    }
+
+    // ==================== Error Cases ====================
+
+    #[test]
+    fn test_empty_input() {
+        assert!(parse_bytes("").is_err());
+        assert!(parse_bytes("   ").is_err());
+    }
+
+    #[test]
+    fn test_missing_number() {
+        assert!(parse_bytes("KB").is_err());
+        assert!(parse_bytes("MiB").is_err());
+    }
+
+    #[test]
+    fn test_unknown_suffix() {
+        // Use "ZZ" which doesn't match any valid suffix (not ending with B)
+        let err = parse_bytes("100ZZ").unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("Unknown bytes unit"),
+            "Expected 'Unknown bytes unit' but got: {err_str}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_number() {
+        let err = parse_bytes("abcKB").unwrap_err();
+        assert!(err.to_string().contains("Invalid"));
     }
 }

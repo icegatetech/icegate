@@ -272,28 +272,20 @@ impl DataFusionPlanner {
             return Err(IceGateError::Plan("At least one selector is required".to_string()));
         }
 
-        // Plan first selector as base
-        let log_expr = LogExpr::new(selectors[0].clone());
-        let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
+        // Plan each selector independently and UNION the results
+        // This ensures correct semantics: rows matching ANY selector are returned
+        let mut dataframes: Vec<DataFrame> = Vec::with_capacity(selectors.len());
+        for selector in selectors {
+            let log_expr = LogExpr::new(selector.clone());
+            let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
+            dataframes.push(df);
+        }
 
-        // If multiple selectors, OR their filters together
-        let df = if selectors.len() > 1 {
-            let mut or_filters: Vec<Expr> = Vec::new();
-            for selector in &selectors[1..] {
-                if let Some(filter) = selector.matchers.iter().map(Self::matcher_to_expr).reduce(Expr::and) {
-                    or_filters.push(filter);
-                }
-            }
-            if or_filters.is_empty() {
-                df
-            } else if let Some(or_filter) = or_filters.into_iter().reduce(Expr::or) {
-                df.filter(or_filter)?
-            } else {
-                df
-            }
-        } else {
-            df
-        };
+        // UNION all DataFrames (the aggregation step below will deduplicate)
+        let mut df = dataframes.remove(0);
+        for other_df in dataframes {
+            df = df.union(other_df)?;
+        }
 
         // Build select with serialized attributes for grouping
         // Convert binary columns to hex strings for proper grouping and output
@@ -598,9 +590,9 @@ impl DataFusionPlanner {
                         }
                         Some(Grouping::By(inner_labels))
                     },
-                    Some(Grouping::Without(inner_labels)) => {
-                        // Keep the inner 'without' as-is
-                        Some(Grouping::Without(inner_labels))
+                    Some(Grouping::Without(_)) => {
+                        // When outer is By and inner is Without, apply outer By restriction
+                        Some(Grouping::By(outer_labels))
                     },
                     None => {
                         // No inner grouping, use outer labels
