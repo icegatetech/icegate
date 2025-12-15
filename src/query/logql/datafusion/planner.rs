@@ -352,10 +352,11 @@ impl DataFusionPlanner {
                         "Binary operations not yet implemented".to_string(),
                     ))
                 },
-                MetricExpr::Literal(val) => {
-                    // Return a DataFrame with a single row containing the literal value
-                    let df = self.session_ctx.read_empty()?;
-                    Ok(df.select(vec![lit(val).alias("value")])?)
+                MetricExpr::Literal(_val) => {
+                    // TODO: Implement literal value
+                    Err(IceGateError::NotImplemented(
+                        "Literal value not yet implemented".to_string(),
+                    ))
                 },
                 MetricExpr::Vector(_vals) => {
                     // TODO: Implement vector literal
@@ -770,6 +771,7 @@ impl DataFusionPlanner {
     pub fn map_label_to_internal_name(name: &str) -> &str {
         match name {
             "level" | "detected_level" => "severity_text",
+            "service" => "service_name",
             _ => name,
         }
     }
@@ -1042,8 +1044,9 @@ impl DataFusionPlanner {
                 op,
                 value,
             } => {
-                let col_expr = if Self::is_top_level_field(&label) {
-                    col(label)
+                let internal_name = Self::map_label_to_internal_name(&label);
+                let col_expr = if Self::is_top_level_field(internal_name) {
+                    col(internal_name)
                 } else {
                     datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
                 };
@@ -1065,8 +1068,9 @@ impl DataFusionPlanner {
                 value,
             } => {
                 // Convert duration to nanoseconds and compare
-                let col_expr = if Self::is_top_level_field(&label) {
-                    col(label)
+                let internal_name = Self::map_label_to_internal_name(&label);
+                let col_expr = if Self::is_top_level_field(internal_name) {
+                    col(internal_name)
                 } else {
                     datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
                 };
@@ -1091,8 +1095,9 @@ impl DataFusionPlanner {
                 value,
             } => {
                 // Compare byte values as u64
-                let col_expr = if Self::is_top_level_field(&label) {
-                    col(label)
+                let internal_name = Self::map_label_to_internal_name(&label);
+                let col_expr = if Self::is_top_level_field(internal_name) {
+                    col(internal_name)
                 } else {
                     datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
                 };

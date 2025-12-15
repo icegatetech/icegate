@@ -79,18 +79,6 @@ fn find_limit(plan: &LogicalPlan) -> Option<&Limit> {
     None
 }
 
-/// Find first Projection in plan tree.
-fn find_projection(plan: &LogicalPlan) -> Option<&Projection> {
-    let mut stack = vec![plan];
-    while let Some(node) = stack.pop() {
-        if let LogicalPlan::Projection(p) = node {
-            return Some(p);
-        }
-        stack.extend(node.inputs());
-    }
-    None
-}
-
 /// Collect all Projection nodes from plan tree.
 fn collect_projections(plan: &LogicalPlan) -> Vec<&Projection> {
     let mut projections = Vec::new();
@@ -120,14 +108,6 @@ fn is_column_named(expr: &Expr, name: &str) -> bool {
 fn is_literal_str(expr: &Expr, value: &str) -> bool {
     match expr {
         Expr::Literal(ScalarValue::Utf8(Some(s)), _) => s == value,
-        _ => false,
-    }
-}
-
-/// Check f64 literal value.
-fn is_literal_f64(expr: &Expr, value: f64) -> bool {
-    match expr {
-        Expr::Literal(ScalarValue::Float64(Some(v)), _) => (*v - value).abs() < f64::EPSILON,
         _ => false,
     }
 }
@@ -408,17 +388,15 @@ async fn test_metric_literal_planning() {
     let planner = DataFusionPlanner::new(session_ctx, query_ctx);
 
     let metric_expr = MetricExpr::Literal(42.0);
-    let df = planner.plan(LogQLExpr::Metric(metric_expr)).await.expect("Planning failed");
-    let plan = get_logical_plan(&df);
+    let result = planner.plan(LogQLExpr::Metric(metric_expr)).await;
 
-    // Find projection with "value" alias containing literal 42.0
-    let proj = find_projection(plan).expect("Missing Projection node");
-
-    let has_value_alias = proj
-        .expr
-        .iter()
-        .any(|e| is_alias_named(e, "value").is_some_and(|inner| is_literal_f64(inner, 42.0)));
-    assert!(has_value_alias, "Missing 'value' alias with literal 42.0");
+    // Literal values are not yet implemented
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("not yet implemented"),
+        "Expected NotImplemented error, got: {err}"
+    );
 }
 
 // ============================================================================
@@ -483,10 +461,18 @@ async fn test_log_query_custom_limit() {
 
 #[tokio::test]
 async fn test_metric_query_no_limit() {
+    use crate::query::logql::metric::{RangeAggregation, RangeAggregationOp, RangeExpr};
+
     let (session_ctx, query_ctx) = create_test_context().await;
     let planner = DataFusionPlanner::new(session_ctx, query_ctx);
 
-    let expr = LogQLExpr::Metric(MetricExpr::Literal(42.0));
+    // Use a RangeAggregation instead of Literal (which is not implemented)
+    let selector = Selector::new(vec![LabelMatcher::new("service_name", MatchOp::Eq, "mysql")]);
+    let log_expr = LogExpr::new(selector);
+    let range_expr = RangeExpr::new(log_expr, TimeDelta::minutes(5));
+    let agg = RangeAggregation::new(RangeAggregationOp::CountOverTime, range_expr);
+
+    let expr = LogQLExpr::Metric(MetricExpr::RangeAggregation(agg));
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
