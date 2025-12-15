@@ -309,9 +309,11 @@ impl DataFusionPlanner {
         // Add `level` as alias of `severity_text` for Grafana compatibility
         select_cols.push(col("severity_text").alias("level"));
         select_cols.push(col("attributes"));
-        // Serialize map keys and values for grouping
-        select_cols.push(array_to_string(map_keys(col("attributes")), lit(",")).alias(COL_ATTR_KEYS));
-        select_cols.push(array_to_string(map_values(col("attributes")), lit(",")).alias(COL_ATTR_VALS));
+        // Serialize map keys and values for grouping.
+        // Use "|||" delimiter instead of "," to avoid ambiguity when keys/values
+        // contain commas.
+        select_cols.push(array_to_string(map_keys(col("attributes")), lit("|||")).alias(COL_ATTR_KEYS));
+        select_cols.push(array_to_string(map_values(col("attributes")), lit("|||")).alias(COL_ATTR_VALS));
 
         let df = df.select(select_cols)?;
 
@@ -412,9 +414,11 @@ impl DataFusionPlanner {
         let df = self.plan_log(agg.range_expr.log_expr, adjusted_start, adjusted_end).await?;
 
         // 2. Build grouping expressions for labels
+        // Use "|||" delimiter instead of "," to avoid ambiguity when keys/values
+        // contain commas.
         let mut grouping_exprs = Self::build_default_label_exprs(&[], &["attributes"]);
-        grouping_exprs.push(array_to_string(map_keys(col("attributes")), lit(",")).alias(COL_ATTR_KEYS));
-        grouping_exprs.push(array_to_string(map_values(col("attributes")), lit(",")).alias(COL_ATTR_VALS));
+        grouping_exprs.push(array_to_string(map_keys(col("attributes")), lit("|||")).alias(COL_ATTR_KEYS));
+        grouping_exprs.push(array_to_string(map_values(col("attributes")), lit("|||")).alias(COL_ATTR_VALS));
 
         // 3. Build UDAF arguments
         let start_micros = self.query_ctx.start.timestamp_micros();
@@ -631,7 +635,8 @@ impl DataFusionPlanner {
                 if Self::is_top_level_field(mapped_name) && schema.inner().column_with_name(mapped_name).is_some() {
                     indexed_attributes.push(mapped_name);
                 } else if schema.inner().column_with_name("attributes").is_some() {
-                    attributes.push(mapped_name);
+                    // Use original label name for attributes map lookup, not mapped name
+                    attributes.push(l.name.as_str());
                 } else {
                     // Column doesn't exist and no attributes map - the label isn't available
                     return Err(IceGateError::NotImplemented(format!(

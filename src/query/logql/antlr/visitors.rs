@@ -97,7 +97,8 @@ fn clean_string(text: &str) -> String {
 
 /// Parse a bytes string like `1KB`, `10MiB`, `1e3GB`, `0x10KiB` into bytes.
 ///
-/// Supports decimal, scientific notation (`1e3`), and hexadecimal (`0x10`) number formats.
+/// Supports decimal, scientific notation (`1e3`), and hexadecimal (`0x10`)
+/// number formats.
 ///
 /// Suffixes (case-insensitive):
 /// - Binary (IEC, base 1024): `KiB`, `MiB`, `GiB`, `TiB`, `PiB`, `EiB`
