@@ -188,6 +188,4 @@ INSERT INTO icegate.logs (
     0
 );
 
-DELETE FROM icegate.logs;
-
 SELECT * FROM icegate.logs;

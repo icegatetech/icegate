@@ -205,6 +205,18 @@ pub trait LogQLParserBaseListener<'input>:
      * Enter a parse tree produced by \{@link LogQLParserBaseParser#s}.
      * @param ctx the parse tree
      */
+    fn enter_linefilterspattern(&mut self, _ctx: &LineFiltersPatternContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_linefilterspattern(&mut self, _ctx: &LineFiltersPatternContext<'input>) {}
+
+
+    /**
+     * Enter a parse tree produced by \{@link LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
     fn enter_linefiltersnotpattern(&mut self, _ctx: &LineFiltersNotPatternContext<'input>) {}
     /**
      * Exit a parse tree produced by \{@link  LogQLParserBaseParser#s}.

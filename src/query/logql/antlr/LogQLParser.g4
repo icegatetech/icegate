@@ -89,6 +89,7 @@ lineFilters
     | NE lineFilter (OR lineFilter)*             #lineFiltersNotContains
     | PIPE_MATCH lineFilter (OR lineFilter)*     #lineFiltersMatch
     | NRE lineFilter (OR lineFilter)*            #lineFiltersNotMatch
+    | PIPE_PATTERN lineFilter (OR lineFilter)*   #lineFiltersPattern
     | PIPE_NPATTERN lineFilter (OR lineFilter)*  #lineFiltersNotPattern
     ;
 

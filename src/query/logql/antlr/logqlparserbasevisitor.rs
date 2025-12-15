@@ -89,6 +89,11 @@ pub trait LogQLParserBaseVisitor<'input>:
             self.visit_children(ctx)
         }
 
+	// Visit a parse tree produced by LogQLParser#lineFiltersPattern.
+	fn visit_linefilterspattern(&mut self, ctx: &LineFiltersPatternContext<'input>) {
+            self.visit_children(ctx)
+        }
+
 	// Visit a parse tree produced by LogQLParser#lineFiltersNotPattern.
 	fn visit_linefiltersnotpattern(&mut self, ctx: &LineFiltersNotPatternContext<'input>) {
             self.visit_children(ctx)

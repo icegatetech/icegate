@@ -14,7 +14,7 @@ use datafusion::arrow::{
 };
 
 use super::models::{MetricSeries, QueryResult, QueryStats, ResultType, Stream};
-use crate::common::schema::INDEXED_ATTRIBUTE_COLUMNS;
+use crate::common::schema::LOG_INDEXED_ATTRIBUTE_COLUMNS;
 
 // ============================================================================
 // Formatting Result
@@ -140,7 +140,7 @@ impl MetricBatchColumns {
     /// Returns indices of predefined indexed label columns that exist in the
     /// schema.
     pub fn label_indices(schema: &Schema) -> Vec<(String, usize)> {
-        INDEXED_ATTRIBUTE_COLUMNS
+        LOG_INDEXED_ATTRIBUTE_COLUMNS
             .iter()
             .filter_map(|&name| schema.index_of(name).ok().map(|idx| (name.to_string(), idx)))
             .collect()

@@ -21,7 +21,7 @@ use datafusion::{
 };
 
 use crate::{
-    common::{errors::IceGateError, schema::INDEXED_ATTRIBUTE_COLUMNS, Result, LOGS_TABLE_FQN},
+    common::{errors::IceGateError, schema::LOG_INDEXED_ATTRIBUTE_COLUMNS, Result, LOGS_TABLE_FQN},
     query::logql::{
         common::MatchOp,
         expr::LogQLExpr,
@@ -145,7 +145,7 @@ impl DataFusionPlanner {
         // 1
         let mut union_df = attr_keys_df;
 
-        for &col_name in INDEXED_ATTRIBUTE_COLUMNS {
+        for &col_name in LOG_INDEXED_ATTRIBUTE_COLUMNS {
             let col_df = df
                 .clone()
                 .filter(col(col_name).is_not_null())?
@@ -299,7 +299,7 @@ impl DataFusionPlanner {
         // Convert binary columns to hex strings for proper grouping and output
         // Cast FixedSizeBinary to Binary first since encode() requires Binary type
         let schema = df.schema().clone();
-        let mut select_cols: Vec<Expr> = INDEXED_ATTRIBUTE_COLUMNS
+        let mut select_cols: Vec<Expr> = LOG_INDEXED_ATTRIBUTE_COLUMNS
             .iter()
             .map(|&c| {
                 if Self::is_binary_column(c) {
@@ -324,7 +324,7 @@ impl DataFusionPlanner {
         let df = df.select(select_cols)?;
 
         // Group by indexed columns + level + serialized attributes
-        let mut group_cols: Vec<Expr> = INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)).collect();
+        let mut group_cols: Vec<Expr> = LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)).collect();
         group_cols.push(col("level"));
         group_cols.push(col(COL_ATTR_KEYS));
         group_cols.push(col(COL_ATTR_VALS));
@@ -555,7 +555,7 @@ impl DataFusionPlanner {
     }
 
     fn build_default_label_columns(with: &[&str], without: &[&str]) -> Vec<String> {
-        INDEXED_ATTRIBUTE_COLUMNS
+        LOG_INDEXED_ATTRIBUTE_COLUMNS
             .iter()
             .copied()
             .chain(std::iter::once("attributes"))
@@ -578,11 +578,13 @@ impl DataFusionPlanner {
         let inner_expr = match (*agg.expr, &agg.grouping) {
             (MetricExpr::RangeAggregation(mut range_agg), Some(outer_grouping)) => {
                 // Merge outer grouping into inner range aggregation
-                // TODO: Process By and Without differently - Without should exclude labels
-                #[allow(clippy::match_same_arms)]
                 let outer_labels = match outer_grouping {
                     Grouping::By(labels) => labels.clone(),
-                    Grouping::Without(labels) => labels.clone(),
+                    Grouping::Without(_) => {
+                        return Err(IceGateError::NotImplemented(
+                            "Grouping::Without is not yet implemented".to_string(),
+                        ));
+                    },
                 };
 
                 // Add outer labels to inner grouping
@@ -618,15 +620,14 @@ impl DataFusionPlanner {
         // 3. Identify grouping columns for the vector aggregation
         // LogQL: sum by (label1, label2) (...)
         // DataFusion: group_expr = [col("label1"), col("label2")]
-        // TODO: Process By and Without differently - Without should exclude labels from
-        // grouping
         let mut group_exprs = if let Some(grouping) = &agg.grouping {
-            let labels = match grouping {
-                Grouping::By(labels) | Grouping::Without(labels) => labels,
-            };
-            let udf = match grouping {
-                Grouping::By(_) => ScalarUDF::from(super::udf::MapKeepKeys::new()),
-                Grouping::Without(_) => ScalarUDF::from(super::udf::MapDropKeys::new()),
+            let (labels, udf) = match grouping {
+                Grouping::By(labels) => (labels, ScalarUDF::from(super::udf::MapKeepKeys::new())),
+                Grouping::Without(_) => {
+                    return Err(IceGateError::NotImplemented(
+                        "Grouping::Without is not yet implemented".to_string(),
+                    ));
+                },
             };
 
             let mut indexed_attributes = Vec::new();
@@ -782,7 +783,7 @@ impl DataFusionPlanner {
     /// while other labels are stored in the `attributes` MAP column.
     pub fn is_top_level_field(name: &str) -> bool {
         let mapped = Self::map_label_to_internal_name(name);
-        INDEXED_ATTRIBUTE_COLUMNS.contains(&mapped) || matches!(mapped, "tenant_id" | "timestamp")
+        LOG_INDEXED_ATTRIBUTE_COLUMNS.contains(&mapped) || matches!(mapped, "tenant_id" | "timestamp")
     }
 
     fn apply_pipeline(

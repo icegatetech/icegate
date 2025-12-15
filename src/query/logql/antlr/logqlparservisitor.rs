@@ -116,6 +116,13 @@ pub trait LogQLParserVisitor<'input>: ParseTreeVisitor<'input,LogQLParserContext
 	fn visit_lineFiltersNotMatch(&mut self, ctx: &LineFiltersNotMatchContext<'input>) { self.visit_children(ctx) }
 
 	/**
+	 * Visit a parse tree produced by the {@code lineFiltersPattern}
+	 * labeled alternative in {@link LogQLParser#lineFilters}.
+	 * @param ctx the parse tree
+	 */
+	fn visit_lineFiltersPattern(&mut self, ctx: &LineFiltersPatternContext<'input>) { self.visit_children(ctx) }
+
+	/**
 	 * Visit a parse tree produced by the {@code lineFiltersNotPattern}
 	 * labeled alternative in {@link LogQLParser#lineFilters}.
 	 * @param ctx the parse tree
@@ -910,6 +917,15 @@ pub trait LogQLParserVisitorCompat<'input>:ParseTreeVisitorCompat<'input, Node= 
 	 * @param ctx the parse tree
 	 */
 		fn visit_lineFiltersNotMatch(&mut self, ctx: &LineFiltersNotMatchContext<'input>) -> Self::Return {
+			self.visit_children(ctx)
+		}
+
+	/**
+	 * Visit a parse tree produced by the {@code lineFiltersPattern}
+	 * labeled alternative in {@link LogQLParser#lineFilters}.
+	 * @param ctx the parse tree
+	 */
+		fn visit_lineFiltersPattern(&mut self, ctx: &LineFiltersPatternContext<'input>) -> Self::Return {
 			self.visit_children(ctx)
 		}
 
@@ -1851,6 +1867,11 @@ where
 
 	fn visit_lineFiltersNotMatch(&mut self, ctx: &LineFiltersNotMatchContext<'input>){
 		let result = <Self as LogQLParserVisitorCompat>::visit_lineFiltersNotMatch(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+	}
+
+	fn visit_lineFiltersPattern(&mut self, ctx: &LineFiltersPatternContext<'input>){
+		let result = <Self as LogQLParserVisitorCompat>::visit_lineFiltersPattern(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
 	}
 

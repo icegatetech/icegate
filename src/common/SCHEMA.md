@@ -477,7 +477,7 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 
 **Version:** 1.1
 **Last Updated:** 2025-11-12
-**Schema Source:** `src/schema.rs`
+**Schema Source:** `src/common/schema.rs`
 
 **Notable Changes in v1.1:**
 - Updated field optionality: `account_id`, `service_name`, and `body` are now optional where applicable

@@ -6,8 +6,8 @@ install:
 
 gen: antlr/LogQLLexer.g4 antlr/LogQLParser.g4
 	java -jar $(ANTLR4_JAR) -Dlanguage=Rust -visitor antlr/LogQLLexer.g4 antlr/LogQLParser.g4
-	sed -i '' 's/LogQLParserParserContext/LogQLParserContext/g' antlr/logqlparser.rs # https://github.com/rrevenantt/antlr4rust/pull/53
-	for f in antlr/logql*.rs; do sed -i '' '1s/^/#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::unwrap_used)]\n/' $$f; done
+	sed -i.bak 's/LogQLParserParserContext/LogQLParserContext/g' antlr/logqlparser.rs && rm antlr/logqlparser.rs.bak # https://github.com/rrevenantt/antlr4rust/pull/53
+	for f in antlr/logql*.rs; do sed -i.bak '1s/^/#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::unwrap_used)]\n/' $$f && rm $$f.bak; done
 
 clean:
 	rm antlr/logql*.rs || true

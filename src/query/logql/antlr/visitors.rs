@@ -80,6 +80,9 @@ fn f64_to_u64_checked(value: f64) -> Result<u64> {
 }
 
 /// Remove surrounding quotes from a string literal.
+///
+/// Note: Escape sequences (e.g., `\n`, `\\`) are NOT processed here.
+/// ANTLR's lexer handles escape sequences during tokenization.
 fn clean_string(text: &str) -> String {
     let text = text.trim();
     if (text.starts_with('"') && text.ends_with('"'))
@@ -480,6 +483,13 @@ pub struct LogQLExprVisitor {
 }
 
 impl LogQLExprVisitor {
+    // ========================================================================
+    // Internal Pipeline/Log Methods
+    // ========================================================================
+
+    /// Maximum pipeline nesting depth to prevent stack overflow.
+    const MAX_PIPELINE_DEPTH: usize = 100;
+
     /// Create a new visitor.
     pub fn new() -> Self {
         Self {
@@ -873,14 +883,10 @@ impl LogQLExprVisitor {
         }
     }
 
-    // ========================================================================
-    // Internal Pipeline/Log Methods
-    // ========================================================================
-
     /// Collect pipeline stages from a recursive pipelineExpr.
     fn collect_pipeline_stages(&self, ctx: &PipelineExprContextAll) -> Result<Vec<PipelineStage>> {
         let mut stages = Vec::new();
-        self.collect_pipeline_stages_recursive(ctx, &mut stages)?;
+        self.collect_pipeline_stages_recursive(ctx, &mut stages, 0)?;
         Ok(stages)
     }
 
@@ -889,10 +895,15 @@ impl LogQLExprVisitor {
         &self,
         ctx: &PipelineExprContextAll,
         stages: &mut Vec<PipelineStage>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > Self::MAX_PIPELINE_DEPTH {
+            return Err(parse_error("Pipeline exceeds maximum nesting depth"));
+        }
+
         // If there's a nested pipelineExpr, process it first (left recursion)
         if let Some(nested) = ctx.pipelineExpr() {
-            self.collect_pipeline_stages_recursive(&nested, stages)?;
+            self.collect_pipeline_stages_recursive(&nested, stages, depth + 1)?;
         }
 
         // Then process this stage
@@ -1007,9 +1018,11 @@ impl LogQLExprVisitor {
                 let filters = collect_line_filter_values(&c.lineFilter_all())?;
                 (LineFilterOp::NotMatch, filters)
             },
-            LineFiltersContextAll::LineFiltersNotPatternContext(c) => {
-                let filters = collect_line_filter_values(&c.lineFilter_all())?;
-                (LineFilterOp::NotPattern, filters)
+            LineFiltersContextAll::LineFiltersPatternContext(_)
+            | LineFiltersContextAll::LineFiltersNotPatternContext(_) => {
+                return Err(IceGateError::NotImplemented(
+                    "Pattern matching doesn't supported yet.".to_string(),
+                ))
             },
             LineFiltersContextAll::Error(_) => {
                 return Err(parse_error("Error in line filter"));

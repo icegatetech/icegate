@@ -98,6 +98,11 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
 /// Each table is created with appropriate partition specs and sort orders
 /// for optimal query performance.
 ///
+/// # Return Value
+///
+/// Returns a list of operations. In dry-run mode, operations represent what
+/// *would* happen, not what actually occurred.
+///
 /// # Errors
 ///
 /// Returns an error if:
@@ -194,6 +199,11 @@ async fn create_table(catalog: &dyn Catalog, namespace: &NamespaceIdent, def: &T
 /// - Removing columns
 /// - Changing column types to incompatible types
 /// - Changing required columns to optional or vice versa
+///
+/// # Return Value
+///
+/// Returns a list of operations. In dry-run mode, operations represent what
+/// *would* happen, not what actually occurred.
 ///
 /// # Errors
 ///

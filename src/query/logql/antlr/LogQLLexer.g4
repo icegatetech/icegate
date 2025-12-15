@@ -157,9 +157,9 @@ DURATION :
     )
     ;
 
-// Bytes token for size units (must be uppercase: KB, MB, GB, TB, PB, EB)
+// Bytes token for size units (uppercase SI and IEC units)
 BYTES :
-    NUMBER ( 'KB' | 'MB' | 'GB' | 'TB' | 'PB' | 'EB' )
+    NUMBER ( 'KB' | 'KiB' | 'MB' | 'MiB' | 'GB' | 'GiB' | 'TB' | 'TiB' | 'PB' | 'PiB' | 'EB' )
     ;
 
 // Textual tokens

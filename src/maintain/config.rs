@@ -28,20 +28,7 @@ impl MaintainConfig {
     ///
     /// Returns an error if the file cannot be read or parsed
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let path = path.as_ref();
-        let content = std::fs::read_to_string(path)?;
-
-        let config: Self = match path.extension().and_then(|e| e.to_str()) {
-            Some("toml") => toml::from_str(&content)?,
-            Some("yaml" | "yml") => serde_yaml::from_str(&content)?,
-            _ => {
-                // Try TOML first, then YAML
-                toml::from_str(&content)
-                    .or_else(|_| serde_yaml::from_str(&content))
-                    .map_err(|e| format!("Failed to parse config: {e}"))?
-            },
-        };
-
+        let config: Self = crate::common::load_config_file(path.as_ref())?;
         config.validate()?;
         Ok(config)
     }

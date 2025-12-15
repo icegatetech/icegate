@@ -29,7 +29,7 @@ fn bench_update_counts(c: &mut Criterion) {
 
     for (name, num_timestamps, num_grid_points) in configs {
         let start = 0i64;
-        let end = i64::from(num_grid_points * 1_000_000); // 1 second per grid point
+        let end = i64::from(num_grid_points) * 1_000_000i64; // 1 second per grid point
         let step = 1_000_000i64; // 1 second step
         let range = 500_000i64; // 500ms range
         let offset = 0i64;
@@ -67,7 +67,7 @@ fn bench_grid_size_impact(c: &mut Criterion) {
 
     for (name, num_grid_points) in grid_configs {
         let start = 0i64;
-        let end = i64::from(num_grid_points * 1_000_000); // 1 second per grid point
+        let end = i64::from(num_grid_points) * 1_000_000i64; // 1 second per grid point
         let step = 1_000_000i64; // 1 second step
         let range = 500_000i64; // 500ms range
         let offset = 0i64;
@@ -104,7 +104,7 @@ fn bench_range_configurations(c: &mut Criterion) {
     let num_timestamps = 10_000;
     let num_grid_points = 100;
     let start = 0i64;
-    let end = i64::from(num_grid_points * 1_000_000);
+    let end = i64::from(num_grid_points) * 1_000_000i64;
     let step = 1_000_000i64;
 
     let timestamps = generate_timestamps(num_timestamps, start, end);
@@ -148,7 +148,7 @@ fn bench_offset_configurations(c: &mut Criterion) {
     let num_timestamps = 10_000;
     let num_grid_points = 100;
     let start = 0i64;
-    let end = i64::from(num_grid_points * 1_000_000);
+    let end = i64::from(num_grid_points) * 1_000_000i64;
     let step = 1_000_000i64;
     let range = 500_000i64;
 
@@ -192,7 +192,7 @@ fn bench_merge_operations(c: &mut Criterion) {
 
     let num_grid_points = 100;
     let start = 0i64;
-    let end = i64::from(num_grid_points * 1_000_000);
+    let end = i64::from(num_grid_points) * 1_000_000i64;
     let step = 1_000_000i64;
     let range = 500_000i64;
     let offset = 0i64;
@@ -251,7 +251,7 @@ fn bench_grid_creation(c: &mut Criterion) {
 
     for (name, num_points) in grid_sizes {
         let start = 0i64;
-        let end = i64::from(num_points * 1_000_000);
+        let end = i64::from(num_points) * 1_000_000i64;
         let step = 1_000_000i64;
         let range = 500_000i64;
         let offset = 0i64;
@@ -280,7 +280,7 @@ fn bench_sparse_output(c: &mut Criterion) {
     let num_timestamps = 10_000;
     let num_grid_points = 100;
     let start = 0i64;
-    let end = i64::from(num_grid_points * 1_000_000);
+    let end = i64::from(num_grid_points) * 1_000_000i64;
     let step = 1_000_000i64;
     let range = 500_000i64;
     let offset = 0i64;

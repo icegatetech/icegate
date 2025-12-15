@@ -186,6 +186,18 @@ fn enter_lineFiltersNotMatch(&mut self, _ctx: &LineFiltersNotMatchContext<'input
  */
 fn exit_lineFiltersNotMatch(&mut self, _ctx: &LineFiltersNotMatchContext<'input>) { }
 /**
+ * Enter a parse tree produced by the {@code lineFiltersPattern}
+ * labeled alternative in {@link LogQLParser#lineFilters}.
+ * @param ctx the parse tree
+ */
+fn enter_lineFiltersPattern(&mut self, _ctx: &LineFiltersPatternContext<'input>) { }
+/**
+ * Exit a parse tree produced by the {@code lineFiltersPattern}
+ * labeled alternative in {@link LogQLParser#lineFilters}.
+ * @param ctx the parse tree
+ */
+fn exit_lineFiltersPattern(&mut self, _ctx: &LineFiltersPatternContext<'input>) { }
+/**
  * Enter a parse tree produced by the {@code lineFiltersNotPattern}
  * labeled alternative in {@link LogQLParser#lineFilters}.
  * @param ctx the parse tree

@@ -73,9 +73,10 @@ impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectingErrorListener {
             message: msg.to_string(),
             antlr_error: e.cloned(),
         };
-        if let Ok(mut errors) = self.errors.lock() {
-            errors.push(error);
-        }
+        self.errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(error);
     }
 }
 
