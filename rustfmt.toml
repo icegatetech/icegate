@@ -2,7 +2,15 @@
 # https://rust-lang.github.io/rustfmt/
 
 # Edition
-edition = "2024"
+edition = "2021"
+
+# Ignore
+ignore = [
+    "src/query/logql/antlr/",
+    "!src/query/logql/antlr/mod.rs",
+    "!src/query/logql/antlr/tests.rs",
+    "!src/query/logql/antlr/visitors.rs"
+]
 
 # Basic formatting
 max_width = 120

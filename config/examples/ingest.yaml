@@ -1,0 +1,41 @@
+# Ingest Binary Configuration Example
+#
+# Copy this file to config.ingest.yaml and adjust the values for your environment.
+
+# Catalog Configuration
+catalog:
+  # Catalog backend options:
+  # - !memory (for testing)
+  # - !rest { uri: "http://127.0.0.1:19120/iceberg" }
+  backend: !rest
+    uri: http://127.0.0.1:19120/iceberg
+  # Warehouse location (root path for data storage)
+  warehouse: s3://warehouse
+  # Additional catalog properties (optional)
+  properties:
+    prefix: main
+
+# Storage Configuration
+storage:
+  # Storage backend options:
+  # - !memory (for testing)
+  # - !filesystem { root_path: "/var/lib/icegate/data" }
+  # - !s3 { bucket: "warehouse", region: "us-east-1", endpoint: "https://..." }
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: https://127.0.0.1:9100
+  # Storage properties (optional)
+  properties: {}
+
+# OTLP HTTP Server
+otlp_http:
+  enabled: true
+  host: 127.0.0.1
+  port: 4318
+
+# OTLP gRPC Server
+otlp_grpc:
+  enabled: true
+  host: 127.0.0.1
+  port: 4317

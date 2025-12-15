@@ -1,0 +1,59 @@
+# Query Binary Configuration Example
+#
+# Copy this file to config.query.toml and adjust the values for your environment.
+
+# Catalog Configuration
+[catalog]
+# Catalog backend: "memory", or struct variant with config
+# For REST catalog:
+backend = { rest = { uri = "http://127.0.0.1:19120/iceberg" } }
+# For Memory catalog (testing):
+# backend = "memory"
+
+# Warehouse location (root path for data storage)
+warehouse = "s3://warehouse"
+
+# Additional catalog properties (optional)
+[catalog.properties]
+prefix = "main"
+# Add any custom catalog properties here
+
+# Storage Configuration
+[storage]
+# Storage backend: struct variant with config
+# For S3 storage:
+# backend = { s3 = { bucket = "warehouse", region = "us-east-1" } }
+# For S3 with custom endpoint:
+backend = { s3 = { bucket = "warehouse", region = "us-east-1", endpoint = "https://127.0.0.1:9100" } }
+# For FileSystem storage:
+# backend = { filesystem = { root_path = "/var/lib/icegate/data" } }
+# For Memory storage (testing):
+# backend = "memory"
+
+# Storage properties (optional)
+[storage.properties]
+
+# Loki API Server (LogQL queries)
+[loki]
+enabled = true
+host = "127.0.0.1"
+port = 3100
+
+# Prometheus API Server (PromQL queries)
+[prometheus]
+enabled = true
+host = "127.0.0.1"
+port = 9090
+
+# Tempo API Server (TraceQL queries)
+[tempo]
+enabled = true
+host = "127.0.0.1"
+port = 3200
+
+# Query Engine Configuration (optional, uses defaults if not specified)
+# [engine]
+# batch_size = 8192                   # DataFusion batch size
+# target_partitions = 4              # Parallelism degree
+# catalog_name = "iceberg"           # Catalog name in SQL queries
+# provider_refresh_seconds = 60      # Cache refresh interval (0 to disable)

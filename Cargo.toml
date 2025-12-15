@@ -1,12 +1,12 @@
 [package]
 name = "icegate"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 authors = ["IceGate Tech"]
-description = "Observability data lake query engine using Iceberg and DataFusion"
+description = "Observability data lake engine"
 license = "Apache-2.0"
 repository = "https://github.com/icegatetech/icegate"
-keywords = ["iceberg", "datafusion", "query-engine", "data-lake", "observability"]
+keywords = ["iceberg", "datafusion", "engine", "data-lake", "observability"]
 categories = ["database", "data-structures"]
 
 # Linting configuration
@@ -30,6 +30,8 @@ todo = "warn"
 unimplemented = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
 
 # Performance lints
 perf = { level = "warn", priority = -1 }
@@ -50,10 +52,68 @@ module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
 
 [dependencies]
-iceberg = "0.7.0"
-iceberg-catalog-memory = "0.5.1"
-iceberg-datafusion = "0.7.0"
+# ANTLR parser
+antlr4rust = "0.5"
 
-datafusion = "50.3.0"
+# Iceberg
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
 
-tokio = "1.48.0"
+# DataFusion
+datafusion = "50"
+
+# Async runtime
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-util = "0.7"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Configuration
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.9"
+
+# HTTP server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["trace"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Date and time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Fast integer formatting
+itoa = "1"
+axum-extra = { version = "0.9", features = ["query"] }
+
+[[bin]]
+name = "query"
+path = "src/bin/query.rs"
+
+[[bin]]
+name = "maintain"
+path = "src/bin/maintain.rs"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
+tokio-util = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Integration testing with containers
+testcontainers = { version = "0.26", features = ["http_wait"] }
+testcontainers-modules = { version = "0.14", features = ["minio"] }
+aws-config = "1"
+aws-sdk-s3 = "1"
+
+# Benchmarking
+criterion = "0.5"
+
+[[bench]]
+name = "count_over_time"
+harness = false

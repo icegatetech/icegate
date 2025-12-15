@@ -1,0 +1,54 @@
+# Query Binary Configuration Example
+#
+# Copy this file to config.query.yaml and adjust the values for your environment.
+
+# Catalog Configuration
+catalog:
+  # Catalog backend options:
+  # - !memory (for testing)
+  # - !rest { uri: "http://127.0.0.1:19120/iceberg" }
+  backend: !rest
+    uri: http://127.0.0.1:19120/iceberg
+  # Warehouse location (root path for data storage)
+  warehouse: s3://warehouse
+  # Additional catalog properties (optional)
+  properties:
+    prefix: main
+
+# Storage Configuration
+storage:
+  # Storage backend options:
+  # - !memory (for testing)
+  # - !filesystem { root_path: "/var/lib/icegate/data" }
+  # - !s3 { bucket: "warehouse", region: "us-east-1", endpoint: "https://..." }
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: https://127.0.0.1:9100
+  # Storage properties (optional)
+  properties: {}
+
+# Loki API Server (LogQL queries)
+loki:
+  enabled: true
+  host: 127.0.0.1
+  port: 3100
+
+# Prometheus API Server (PromQL queries)
+prometheus:
+  enabled: true
+  host: 127.0.0.1
+  port: 9090
+
+# Tempo API Server (TraceQL queries)
+tempo:
+  enabled: true
+  host: 127.0.0.1
+  port: 3200
+
+# Query Engine Configuration (optional, uses defaults if not specified)
+# engine:
+#   batch_size: 8192                   # DataFusion batch size
+#   target_partitions: 4               # Parallelism degree
+#   catalog_name: iceberg              # Catalog name in SQL queries
+#   provider_refresh_seconds: 60       # Cache refresh interval (0 to disable)

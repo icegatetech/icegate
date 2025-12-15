@@ -1,0 +1,46 @@
+# Ingest Binary Configuration Example
+#
+# Copy this file to config.ingest.toml and adjust the values for your environment.
+
+# Catalog Configuration
+[catalog]
+# Catalog type: "memory", or struct variant with config
+# For REST catalog:
+backend = { rest = { uri = "http://127.0.0.1:19120/iceberg" } }
+# For Memory catalog (testing):
+# backend = "memory"
+
+# Warehouse location (root path for data storage)
+warehouse = "s3://warehouse"
+
+# Additional catalog properties (optional)
+[catalog.properties]
+prefix = "main"
+# Add any custom catalog properties here
+
+# Storage Configuration
+[storage]
+# Storage backend: struct variant with config
+# For S3 storage:
+# backend = { s3 = { bucket = "warehouse", region = "us-east-1" } }
+# For S3 with custom endpoint:
+backend = { s3 = { bucket = "warehouse", region = "us-east-1", endpoint = "https://127.0.0.1:9100" } }
+# For FileSystem storage:
+# backend = { filesystem = { root_path = "/var/lib/icegate/data" } }
+# For Memory storage (testing):
+# backend = "memory"
+
+# Storage properties (optional)
+[storage.properties]
+
+# OTLP HTTP Server
+[otlp_http]
+enabled = true
+host = "127.0.0.1"
+port = 4318
+
+# OTLP gRPC Server
+[otlp_grpc]
+enabled = true
+host = "127.0.0.1"
+port = 4317
