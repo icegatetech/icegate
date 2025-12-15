@@ -1,0 +1,33 @@
+[package]
+name = "icegate-common"
+description = "Shared infrastructure for IceGate"
+readme = "../../README.md"
+keywords = ["iceberg", "datafusion", "data-lake", "observability"]
+categories = ["database"]
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+# ANTLR parser (for error types)
+antlr4rust = { workspace = true }
+
+# Iceberg
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+
+# DataFusion (for error types)
+datafusion = { workspace = true }
+
+# Configuration
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+
+# Logging
+tracing = { workspace = true }

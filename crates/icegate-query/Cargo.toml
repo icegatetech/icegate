@@ -1,0 +1,69 @@
+[package]
+name = "icegate-query"
+description = "Query APIs for IceGate (Loki, Prometheus, Tempo)"
+readme = "../../README.md"
+keywords = ["iceberg", "datafusion", "logql", "observability"]
+categories = ["database"]
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "query"
+path = "src/main.rs"
+
+[dependencies]
+icegate-common = { workspace = true }
+
+# ANTLR parser
+antlr4rust = { workspace = true }
+
+# Iceberg
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+iceberg-datafusion = { workspace = true }
+
+# DataFusion
+datafusion = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Configuration
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+
+# HTTP server
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower-http = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Date and time
+chrono = { workspace = true }
+
+# Utilities
+itoa = { workspace = true }
+
+[[bench]]
+name = "count_over_time"
+harness = false
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true }

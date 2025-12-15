@@ -3,17 +3,17 @@ RUN cargo install cargo-chef
 WORKDIR /app
 
 FROM chef AS planner
-COPY Cargo.* .
-COPY ./benches ./benches
+COPY Cargo.toml Cargo.lock ./
+COPY ./crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG PROFILE=release
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook $([ "$PROFILE" = "release" ] && echo "--release") --recipe-path recipe.json
-COPY ./src ./src
-COPY Cargo.* .
-RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") --lib --bins
+COPY ./crates ./crates
+COPY Cargo.toml Cargo.lock ./
+RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") --workspace --bins
 
 FROM debian:bookworm-slim
 ARG PROFILE=release

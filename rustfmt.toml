@@ -6,10 +6,10 @@ edition = "2021"
 
 # Ignore
 ignore = [
-    "src/query/logql/antlr/",
-    "!src/query/logql/antlr/mod.rs",
-    "!src/query/logql/antlr/tests.rs",
-    "!src/query/logql/antlr/visitors.rs"
+    "crates/icegate-query/src/logql/antlr/",
+    "!crates/icegate-query/src/logql/antlr/mod.rs",
+    "!crates/icegate-query/src/logql/antlr/tests.rs",
+    "!crates/icegate-query/src/logql/antlr/visitors.rs"
 ]
 
 # Basic formatting

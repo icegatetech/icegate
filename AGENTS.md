@@ -39,30 +39,57 @@ The architecture is based on open standards:
 
 ## Architecture
 
+This project is organized as a Cargo workspace with 4 crates:
+
 ```
-src/
-├── lib.rs              # Crate root, exports modules
-├── bin/query.rs        # Query binary entry point
-├── common/             # Shared infrastructure
-│   ├── catalog/        # Iceberg catalog management (CatalogBuilder, CatalogManager)
-│   ├── storage/        # Storage backends (S3Config, StorageConfig)
-│   ├── schema.rs       # Iceberg table schemas
-│   └── errors.rs       # Error types
-├── ingest/             # OTLP data ingestion
-│   ├── otlp_grpc/      # gRPC receiver
-│   └── otlp_http/      # HTTP receiver (handlers, routes, server)
-├── query/              # Query APIs
-│   ├── logql/          # LogQL implementation (parser, planner, AST)
-│   ├── loki/           # Loki API (handlers, routes, server)
-│   ├── prometheus/     # Prometheus API
-│   ├── tempo/          # Tempo API
-│   └── cli/            # Query CLI commands
-└── maintain/           # Data maintenance (migrate, optimize)
+crates/
+├── icegate-common/           # Shared infrastructure (lib)
+│   └── src/
+│       ├── lib.rs
+│       ├── catalog/          # Iceberg catalog management (CatalogBuilder)
+│       ├── storage/          # Storage backends (S3Config, StorageConfig)
+│       ├── schema.rs         # Iceberg table schemas
+│       └── errors.rs         # Error types
+│
+├── icegate-query/            # Query APIs + CLI (lib + bin)
+│   └── src/
+│       ├── lib.rs
+│       ├── main.rs           # Query binary entry point
+│       ├── cli/              # Query CLI commands
+│       ├── engine/           # Query engine
+│       ├── loki/             # Loki API (handlers, routes, server)
+│       ├── logql/            # LogQL implementation (parser, planner, AST)
+│       ├── prometheus/       # Prometheus API
+│       └── tempo/            # Tempo API
+│
+├── icegate-ingest/           # OTLP receivers (lib)
+│   └── src/
+│       ├── lib.rs
+│       ├── config.rs
+│       ├── otlp_grpc/        # gRPC receiver
+│       └── otlp_http/        # HTTP receiver (handlers, routes, server)
+│
+└── icegate-maintain/         # Maintenance ops + CLI (lib + bin)
+    └── src/
+        ├── lib.rs
+        ├── main.rs           # Maintain binary entry point
+        ├── cli/              # Maintain CLI commands
+        ├── config.rs
+        └── migrate/          # Schema migration operations
+```
+
+**Dependency graph:**
+```
+icegate-common (no deps on other workspace crates)
+    ↑
+    ├── icegate-query     (depends: icegate-common)
+    ├── icegate-ingest    (depends: icegate-common)
+    └── icegate-maintain  (depends: icegate-common)
 ```
 
 ## Key Data Types
 
-Four Iceberg tables defined in `src/common/schema.rs` (DDL in `src/common/SCHEMA.md`):
+Four Iceberg tables defined in `crates/icegate-common/src/schema.rs` (DDL in `crates/icegate-common/src/SCHEMA.md`):
 - **logs** - OpenTelemetry LogRecords
 - **spans** - Distributed trace spans with nested events/links
 - **events** - Semantic events (extracted from logs)
@@ -72,22 +99,22 @@ All tables use: tenant_id partitioning, ZSTD compression, MAP(VARCHAR,VARCHAR) f
 
 ## LogQL Implementation
 
-The LogQL parser uses ANTLR4. Grammar files are in `src/query/logql/antlr/`.
+The LogQL parser uses ANTLR4. Grammar files are in `crates/icegate-query/src/logql/antlr/`.
 
 Regenerate parser (requires Java):
 ```bash
-cd src/query/logql && make install  # Download ANTLR jar (first time)
-cd src/query/logql && make gen      # Regenerate parser from .g4 files
+cd crates/icegate-query/src/logql && make install  # Download ANTLR jar (first time)
+cd crates/icegate-query/src/logql && make gen      # Regenerate parser from .g4 files
 ```
 
-Parser status: Complete. Planner status: Partial (see `src/query/logql/README.md` for feature matrix).
+Parser status: Complete. Planner status: Partial (see `crates/icegate-query/src/logql/README.md` for feature matrix).
 
 ## Development Environment
 
 ### Quick Start
 
 ```bash
-make dev     # Run full stack with hot-reload (watches src/ for changes)
+make dev     # Run full stack with hot-reload (watches crates/ for changes)
 make debug   # Run without query service for debugging
 ```
 
