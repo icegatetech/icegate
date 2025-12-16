@@ -27,6 +27,16 @@ make install        # Install cargo-audit
 make ci             # Run all CI checks (check, fmt, clippy, test, audit)
 ```
 
+### Documentation Commands
+
+```bash
+cd docs
+make lite           # Run Structurizr Lite UI at http://localhost:8080 (recommended)
+make validate       # Validate Structurizr DSL workspace
+make html           # Export static HTML site
+make help           # Show all documentation commands
+```
+
 ## Project Overview
 
 IceGate is an observability data lake engine that stores logs, traces, metrics, and events in Apache Iceberg tables with DataFusion as the query engine. Data is ingested via OpenTelemetry protocol and queried via Loki/Prometheus/Tempo-compatible APIs.

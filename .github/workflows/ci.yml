@@ -211,6 +211,8 @@ jobs:
   docs-validate:
     name: Validate Structurizr DSL
     runs-on: ubuntu-latest
+    env:
+      STRUCTURIZR_CLI_VERSION: "2025.11.09"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -223,10 +225,13 @@ jobs:
 
       - name: Install structurizr-cli
         run: |
-          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/structurizr/cli/releases/latest | grep "browser_download_url.*structurizr-cli.*\.zip" | cut -d '"' -f 4)
-          curl -L -o structurizr-cli.zip "$DOWNLOAD_URL"
-          unzip structurizr-cli.zip -d structurizr-cli
+          set -e
+          DOWNLOAD_URL="https://github.com/structurizr/cli/releases/download/v${STRUCTURIZR_CLI_VERSION}/structurizr-cli.zip"
+          echo "Downloading structurizr-cli v${STRUCTURIZR_CLI_VERSION}..."
+          curl -fsSL -o structurizr-cli.zip "$DOWNLOAD_URL"
+          unzip -q structurizr-cli.zip -d structurizr-cli
           chmod +x structurizr-cli/structurizr.sh
+          echo "Installed structurizr-cli v${STRUCTURIZR_CLI_VERSION}"
 
       - name: Validate workspace
         run: ./structurizr-cli/structurizr.sh validate -workspace docs/workspace.dsl
