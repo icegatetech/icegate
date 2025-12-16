@@ -1,0 +1,7 @@
+# Generated output
+_site/
+
+# Structurizr Lite workspace files
+.structurizr/
+
+workspace.json

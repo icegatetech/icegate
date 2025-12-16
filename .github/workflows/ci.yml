@@ -208,6 +208,29 @@ jobs:
           path: target/criterion/
           retention-days: 30
 
+  docs-validate:
+    name: Validate Structurizr DSL
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install structurizr-cli
+        run: |
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/structurizr/cli/releases/latest | grep "browser_download_url.*structurizr-cli.*\.zip" | cut -d '"' -f 4)
+          curl -L -o structurizr-cli.zip "$DOWNLOAD_URL"
+          unzip structurizr-cli.zip -d structurizr-cli
+          chmod +x structurizr-cli/structurizr.sh
+
+      - name: Validate workspace
+        run: ./structurizr-cli/structurizr.sh validate -workspace docs/workspace.dsl
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
