@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Deciders: IceGate Core Team
-- Date: 2024-12-16
+- Date: 2025-10-03
 
 ## Context and Problem Statement
 

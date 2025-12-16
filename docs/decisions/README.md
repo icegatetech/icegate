@@ -10,10 +10,10 @@ An ADR is a document that captures an important architectural decision made alon
 
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
-| [0001](0001-use-iceberg-for-storage.md) | Use Apache Iceberg for Storage | Accepted | 2024-12-16 |
-| [0002](0002-use-datafusion-query-engine.md) | Use Apache DataFusion as Query Engine | Accepted | 2024-12-16 |
-| [0003](0003-queue-based-ingestion.md) | Use Queue-Based Ingestion with Parquet WAL | Accepted | 2024-12-16 |
-| [0004](0004-parquet-queue-format.md) | Use Parquet for Queue Segment Format | Accepted | 2024-12-16 |
+| [0001](0001-use-iceberg-for-storage.md) | Use Apache Iceberg for Storage | Accepted | 2025-06-10 |
+| [0002](0002-use-datafusion-query-engine.md) | Use Apache DataFusion as Query Engine | Accepted | 2025-10-03 |
+| [0003](0003-queue-based-ingestion.md) | Use Queue-Based Ingestion with Parquet WAL | Accepted | 2025-12-16 |
+| [0004](0004-parquet-queue-format.md) | Use Parquet for Queue Segment Format | Accepted | 2025-12-16 |
 
 ## Creating a New ADR
 

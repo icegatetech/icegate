@@ -71,7 +71,7 @@ json: check $(OUTPUT_DIR)
 
 validate: check
 	@echo "Validating workspace..."
-	@structurizr-cli validate -workspace $(WORKSPACE) && echo "✓ Workspace is valid" || true
+	@structurizr-cli validate -workspace $(WORKSPACE) && echo "✓ Workspace is valid"
 
 lite:
 	@command -v docker >/dev/null 2>&1 || { \

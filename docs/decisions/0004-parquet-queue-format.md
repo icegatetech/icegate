@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Deciders: IceGate Core Team
-- Date: 2024-12-16
+- Date: 2025-12-16
 
 ## Context and Problem Statement
 
@@ -108,7 +108,7 @@ object_store.put_opts(&path, payload, opts).await?;
 Each segment contains multiple row groups, one per tenant:
 
 ```
-segment_00000000000000000001.parquet
+/00000000000000000001.parquet
 ├── RowGroup 0: tenant_id = "acme"
 ├── RowGroup 1: tenant_id = "globex"
 └── RowGroup 2: tenant_id = "initech"
