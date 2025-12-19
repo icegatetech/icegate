@@ -19,15 +19,23 @@ path = "src/main.rs"
 
 [dependencies]
 icegate-common = { workspace = true }
+icegate-queue = { workspace = true }
 
 # Iceberg
 iceberg = { workspace = true }
+arrow = { workspace = true }
+uuid = { workspace = true }
+parquet = { workspace = true }
+
+# Object storage
+object_store = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 # CLI
 clap = { workspace = true }

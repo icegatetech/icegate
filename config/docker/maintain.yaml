@@ -10,3 +10,11 @@ storage:
     bucket: warehouse
     region: us-east-1
     endpoint: http://minio:9000
+
+shift:
+  queue:
+    base_path: s3://queue/
+  row_group_size: 10000
+  max_file_size_mb: 100
+  flush_timeout_secs: 60
+  poll_interval_ms: 1000

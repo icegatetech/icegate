@@ -8,6 +8,8 @@ use std::path::Path;
 use icegate_common::{CatalogConfig, StorageConfig};
 use serde::{Deserialize, Serialize};
 
+use crate::shift::ShiftConfig;
+
 /// Maintain binary configuration
 ///
 /// Root configuration struct for the maintain binary. Contains catalog and
@@ -18,6 +20,9 @@ pub struct MaintainConfig {
     pub catalog: CatalogConfig,
     /// Storage backend configuration
     pub storage: StorageConfig,
+    /// Shift configuration (optional, required for shift command)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shift: Option<ShiftConfig>,
 }
 
 impl MaintainConfig {

@@ -3591,20 +3591,26 @@ dependencies = [
 name = "icegate-maintain"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "aws-config",
  "aws-sdk-s3",
  "clap",
  "iceberg",
  "icegate-common",
+ "icegate-queue",
+ "object_store",
+ "parquet",
  "serde",
  "serde_yaml",
  "testcontainers",
  "testcontainers-modules",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -2,6 +2,9 @@
 
 use core::fmt;
 
+use arrow::error::ArrowError;
+use icegate_queue::QueueError;
+
 /// Result type alias for maintain operations.
 pub type Result<T> = std::result::Result<T, MaintainError>;
 
@@ -19,6 +22,18 @@ pub enum MaintainError {
     /// Schema construction error.
     #[error("{0}")]
     Schema(#[from] SchemaError),
+
+    /// Shift operation error.
+    #[error("{0}")]
+    Shift(String),
+
+    /// Arrow error.
+    #[error("{0}")]
+    Arrow(#[from] ArrowError),
+
+    /// Queue error
+    #[error("{0}")]
+    Queue(#[from] QueueError),
 }
 
 impl From<icegate_common::error::CommonError> for MaintainError {

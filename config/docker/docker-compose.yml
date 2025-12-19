@@ -26,6 +26,12 @@ services:
                   mc mb --ignore-existing minio/warehouse &&
                   mc mb --ignore-existing minio/queue"
 
+  nessie-init:
+    image: busybox
+    volumes:
+      - nessie-data:/data
+    command: ["sh", "-c", "chown -R 10000:0 /data"]
+
   nessie:
     image: quay.io/projectnessie/nessie:0.105.7
     ports:
@@ -47,9 +53,16 @@ services:
       # MinIO compatibility
       AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
       AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+      # RocksDB version store
+      nessie.version.store.type: ROCKSDB
+      nessie.version.store.persist.rocks.database-path: /data/rocksdb
+    volumes:
+      - nessie-data:/data
     depends_on:
       minio:
         condition: service_healthy
+      nessie-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
       interval: 5s
@@ -154,9 +167,33 @@ services:
         - action: rebuild
           path: ../../crates
 
+  shift:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile
+      args:
+        PROFILE: ${PROFILE:-release}
+        SERVICE: maintain
+    command: ["shift", "--config", "/etc/icegate/maintain.yaml"]
+    volumes:
+      - ./maintain.yaml:/etc/icegate/maintain.yaml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      RUST_LOG: info
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: rebuild
+          path: ../../crates
+
   otelgen:
     image: ghcr.io/krzko/otelgen:latest
-    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]
+    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", logs", "multi", "--workers", "5", "--duration", "0"]
     depends_on:
       ingest:
         condition: service_started
@@ -180,3 +217,4 @@ services:
 volumes:
   minio-data:
   grafana-data:
+  nessie-data:

@@ -27,6 +27,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: MigrateCommands,
     },
+    /// Continuously shift data from queue to Iceberg tables
+    Shift {
+        /// Path to configuration file
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+    },
 }
 
 /// Migration subcommands
@@ -63,6 +69,9 @@ impl Cli {
             Commands::Migrate {
                 command,
             } => commands::migrate::execute(command).await,
+            Commands::Shift {
+                config,
+            } => commands::shift::execute(config).await,
         }
     }
 }
