@@ -9,7 +9,7 @@ use iceberg::{
 use iceberg_catalog_rest::RestCatalogBuilder;
 
 use super::{CatalogBackend, CatalogConfig};
-use crate::Result;
+use crate::error::Result;
 
 /// Factory for creating catalog instances from configuration
 pub struct CatalogBuilder;

@@ -10,7 +10,7 @@ use axum::{
     Json,
 };
 use axum_extra::extract::Query as QueryExtra;
-use icegate_common::errors::IceGateError;
+use icegate_common::DEFAULT_TENANT_ID;
 
 use super::{
     error::{LokiError, LokiResult},
@@ -18,6 +18,7 @@ use super::{
     models::{LabelValuesQueryParams, LabelsQueryParams, LokiResponse, RangeQueryParams, SeriesQueryParams},
     server::LokiState,
 };
+use crate::error::QueryError;
 
 // ============================================================================
 // Constants
@@ -25,9 +26,6 @@ use super::{
 
 /// HTTP header for tenant identification (Grafana/Loki standard).
 const TENANT_HEADER: &str = "x-scope-orgid";
-
-/// Default tenant ID when header is not provided.
-const DEFAULT_TENANT: &str = "anonymous";
 
 // ============================================================================
 // Helpers
@@ -39,7 +37,7 @@ fn extract_tenant_id(headers: &HeaderMap) -> String {
         .get(TENANT_HEADER)
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map_or_else(|| DEFAULT_TENANT.to_string(), String::from)
+        .map_or_else(|| DEFAULT_TENANT_ID.to_string(), String::from)
 }
 
 // ============================================================================
@@ -55,7 +53,7 @@ pub async fn query(
     _headers: HeaderMap,
     Query(_params): Query<RangeQueryParams>,
 ) -> Result<StatusCode, LokiError> {
-    Err(LokiError(IceGateError::NotImplemented(
+    Err(LokiError(QueryError::NotImplemented(
         "Instant query endpoint not yet implemented. Use /loki/api/v1/query_range instead.".to_string(),
     )))
 }
@@ -101,9 +99,7 @@ pub async fn label_values(
     Query(params): Query<LabelValuesQueryParams>,
 ) -> LokiResult<impl IntoResponse> {
     let executor = QueryExecutor::new(loki_state.engine);
-    let data = executor
-        .execute_label_values(extract_tenant_id(&headers), &label_name, &params)
-        .await?;
+    let data = executor.execute_label_values(extract_tenant_id(&headers), &label_name, &params).await?;
 
     Ok((StatusCode::OK, Json(LokiResponse::success(data))))
 }

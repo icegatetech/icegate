@@ -6,64 +6,60 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{QueryError, Result};
+
+/// Default batch size for `DataFusion` query execution.
+const DEFAULT_BATCH_SIZE: usize = 8192;
+
+/// Default number of target partitions for parallel execution.
+const DEFAULT_TARGET_PARTITIONS: usize = 4;
+
+/// Default catalog name to register with `DataFusion`.
+const DEFAULT_CATALOG_NAME: &str = "iceberg";
+
+/// Default interval in seconds for refreshing the `IcebergCatalogProvider`
+/// cache.
+const DEFAULT_PROVIDER_REFRESH_SECONDS: u64 = 60;
+
 /// Configuration for the `QueryEngine`
 ///
 /// Controls `DataFusion` session parameters and catalog provider caching
 /// behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QueryEngineConfig {
     /// `DataFusion` batch size for query execution
     ///
     /// Controls how many rows are processed at once during query execution.
     /// Higher values may improve throughput but increase memory usage.
-    #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 
     /// Number of target partitions for parallel execution
     ///
     /// Controls the degree of parallelism in query execution.
     /// Typically set to the number of CPU cores.
-    #[serde(default = "default_target_partitions")]
     pub target_partitions: usize,
 
     /// Catalog name to register with `DataFusion`
     ///
     /// The name used to reference the Iceberg catalog in SQL queries
     /// (e.g., `SELECT * FROM iceberg.icegate.logs`).
-    #[serde(default = "default_catalog_name")]
     pub catalog_name: String,
 
     /// Interval in seconds for refreshing the `IcebergCatalogProvider` cache
     ///
     /// Set to 0 to disable periodic refresh (provider only created at startup).
     /// The cache is refreshed in a background task to avoid blocking queries.
-    #[serde(default = "default_provider_refresh_seconds")]
     pub provider_refresh_seconds: u64,
-}
-
-const fn default_batch_size() -> usize {
-    8192
-}
-
-const fn default_target_partitions() -> usize {
-    4
-}
-
-fn default_catalog_name() -> String {
-    "iceberg".to_string()
-}
-
-const fn default_provider_refresh_seconds() -> u64 {
-    60
 }
 
 impl Default for QueryEngineConfig {
     fn default() -> Self {
         Self {
-            batch_size: default_batch_size(),
-            target_partitions: default_target_partitions(),
-            catalog_name: default_catalog_name(),
-            provider_refresh_seconds: default_provider_refresh_seconds(),
+            batch_size: DEFAULT_BATCH_SIZE,
+            target_partitions: DEFAULT_TARGET_PARTITIONS,
+            catalog_name: DEFAULT_CATALOG_NAME.to_string(),
+            provider_refresh_seconds: DEFAULT_PROVIDER_REFRESH_SECONDS,
         }
     }
 }
@@ -74,15 +70,15 @@ impl QueryEngineConfig {
     /// # Errors
     ///
     /// Returns an error if any configuration value is invalid
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<()> {
         if self.batch_size == 0 {
-            return Err("batch_size must be greater than 0".into());
+            return Err(QueryError::Config("batch_size must be greater than 0".into()));
         }
         if self.target_partitions == 0 {
-            return Err("target_partitions must be greater than 0".into());
+            return Err(QueryError::Config("target_partitions must be greater than 0".into()));
         }
         if self.catalog_name.trim().is_empty() {
-            return Err("catalog_name cannot be empty".into());
+            return Err(QueryError::Config("catalog_name cannot be empty".into()));
         }
         Ok(())
     }

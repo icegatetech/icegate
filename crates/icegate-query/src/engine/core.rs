@@ -14,11 +14,11 @@ use datafusion::{
 };
 use iceberg::Catalog;
 use iceberg_datafusion::IcebergCatalogProvider;
-use icegate_common::{errors::IceGateError, Result};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::QueryEngineConfig;
+use crate::error::{QueryError, Result};
 
 /// Cached `IcebergCatalogProvider` with thread-safe access
 struct CachedProvider {
@@ -90,10 +90,7 @@ impl QueryEngine {
             .with_target_partitions(self.config.target_partitions);
 
         // Build session state
-        let session_state = SessionStateBuilder::new()
-            .with_config(session_config)
-            .with_default_features()
-            .build();
+        let session_state = SessionStateBuilder::new().with_config(session_config).with_default_features().build();
 
         // Create SessionContext
         let session_ctx = SessionContext::new_with_state(session_state);
@@ -101,7 +98,7 @@ impl QueryEngine {
         // Get cached provider and register catalog
         let guard = self.cached_provider.read().await;
         let Some(cached) = guard.as_ref() else {
-            return Err(IceGateError::Config("Catalog provider not initialized".to_string()));
+            return Err(QueryError::Config("Catalog provider not initialized".to_string()));
         };
         let provider = Arc::clone(&cached.provider);
         drop(guard);
@@ -122,7 +119,7 @@ impl QueryEngine {
     pub async fn refresh_provider(&self) -> Result<()> {
         let provider = IcebergCatalogProvider::try_new(Arc::clone(&self.catalog))
             .await
-            .map_err(|e| IceGateError::Config(format!("Failed to create IcebergCatalogProvider: {e}")))?;
+            .map_err(|e| QueryError::Config(format!("Failed to create IcebergCatalogProvider: {e}")))?;
 
         {
             let mut guard = self.cached_provider.write().await;

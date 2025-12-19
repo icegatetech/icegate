@@ -9,8 +9,10 @@ use icegate_common::{
         metrics_partition_spec, metrics_schema, metrics_sort_order, spans_partition_spec, spans_schema,
         spans_sort_order,
     },
-    Result, EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE,
+    EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE,
 };
+
+use crate::error::Result;
 
 /// Migration operation types
 #[derive(Debug, Clone)]

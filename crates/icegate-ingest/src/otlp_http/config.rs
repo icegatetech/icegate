@@ -3,6 +3,8 @@
 use icegate_common::ServerConfig;
 use serde::{Deserialize, Serialize};
 
+use crate::error::{IngestError, Result};
+
 /// Default host for OTLP HTTP server.
 const DEFAULT_HOST: &str = "0.0.0.0";
 
@@ -27,9 +29,9 @@ impl OtlpHttpConfig {
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<()> {
         if self.enabled && self.host.trim().is_empty() {
-            return Err("OTLP HTTP host cannot be empty".into());
+            return Err(IngestError::Config("OTLP HTTP host cannot be empty".into()));
         }
         Ok(())
     }

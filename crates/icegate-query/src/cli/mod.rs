@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use icegate_common::errors::IceGateError;
+
+use crate::error::QueryError;
 
 mod commands;
 
@@ -37,7 +38,7 @@ impl Cli {
     /// # Errors
     ///
     /// Returns an error if the command execution fails
-    pub async fn execute(self) -> Result<(), IceGateError> {
+    pub async fn execute(self) -> Result<(), QueryError> {
         match self.command {
             Commands::Version => commands::version::execute(),
             Commands::Run {

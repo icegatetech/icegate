@@ -91,7 +91,7 @@ impl Default for StringInterner {
 pub struct BatchColumns {
     pub timestamp: Option<usize>,
     pub body: Option<usize>,
-    pub account_id: Option<usize>,
+    pub cloud_account_id: Option<usize>,
     pub service_name: Option<usize>,
     pub severity_text: Option<usize>,
     pub level: Option<usize>,
@@ -106,7 +106,7 @@ impl BatchColumns {
         Self {
             timestamp: schema.index_of("timestamp").ok(),
             body: schema.index_of("body").ok(),
-            account_id: schema.index_of("account_id").ok(),
+            cloud_account_id: schema.index_of("cloud_account_id").ok(),
             service_name: schema.index_of("service_name").ok(),
             severity_text: schema.index_of("severity_text").ok(),
             level: schema.index_of("level").ok(),
@@ -201,9 +201,9 @@ fn extract_labels(
         })
     };
 
-    if let Some(idx) = cols.account_id {
+    if let Some(idx) = cols.cloud_account_id {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("account_id"), interner.intern(val));
+            labels.insert(interner.intern("cloud_account_id"), interner.intern(val));
         }
     }
 
@@ -318,11 +318,7 @@ pub fn batches_to_loki_streams(batches: &[RecordBatch]) -> FormattedResult {
 
             let ts_str = itoa::Buffer::new().format(timestamp_nanos).to_string();
 
-            streams
-                .entry(key_buffer.clone())
-                .or_insert_with(|| (labels, Vec::new()))
-                .1
-                .push((ts_str, body));
+            streams.entry(key_buffer.clone()).or_insert_with(|| (labels, Vec::new())).1.push((ts_str, body));
         }
     }
 

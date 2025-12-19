@@ -3,25 +3,35 @@
 use icegate_common::ServerConfig;
 use serde::{Deserialize, Serialize};
 
+use crate::error::{QueryError, Result};
+
+/// Default host for Prometheus server.
+const DEFAULT_HOST: &str = "0.0.0.0";
+
+/// Default port for Prometheus server.
+const DEFAULT_PORT: u16 = 9090;
+
 /// Prometheus server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PrometheusConfig {
     /// Whether this server is enabled
-    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Host to bind to
-    #[serde(default = "default_host")]
     pub host: String,
     /// Port to listen on
-    #[serde(default = "default_port")]
     pub port: u16,
 }
 
 impl PrometheusConfig {
     /// Validate Prometheus configuration
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid
+    pub fn validate(&self) -> Result<()> {
         if self.enabled && self.host.trim().is_empty() {
-            return Err("Prometheus host cannot be empty".into());
+            return Err(QueryError::Config("Prometheus host cannot be empty".into()));
         }
         Ok(())
     }
@@ -31,22 +41,10 @@ impl Default for PrometheusConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            host: default_host(),
-            port: default_port(),
+            host: DEFAULT_HOST.to_string(),
+            port: DEFAULT_PORT,
         }
     }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-fn default_host() -> String {
-    "0.0.0.0".to_string()
-}
-
-const fn default_port() -> u16 {
-    9090
 }
 
 impl ServerConfig for PrometheusConfig {

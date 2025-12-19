@@ -1,0 +1,25 @@
+catalog:
+  backend: !rest
+    uri: http://nessie:19120/iceberg
+  warehouse: s3://warehouse/
+  properties:
+    prefix: main
+
+storage:
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: http://minio:9000
+
+queue:
+  base_path: s3://queue/
+
+otlp_http:
+  enabled: true
+  host: 0.0.0.0
+  port: 4318
+
+otlp_grpc:
+  enabled: true
+  host: 0.0.0.0
+  port: 4317

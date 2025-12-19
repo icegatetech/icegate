@@ -7,7 +7,6 @@ use std::{sync::Arc, time::Instant};
 
 use chrono::{DateTime, Duration, Utc};
 use datafusion::prelude::SessionContext;
-use icegate_common::errors::IceGateError;
 
 use super::{
     error::LokiResult,
@@ -16,9 +15,15 @@ use super::{
 };
 use crate::{
     engine::QueryEngine,
+    error::QueryError,
     logql::{
-        antlr::AntlrParser, datafusion::DataFusionPlanner, duration::parse_duration_opt, expr::LogQLExpr,
-        log::Selector, planner::QueryContext, Parser, Planner,
+        antlr::AntlrParser,
+        datafusion::DataFusionPlanner,
+        duration::parse_duration_opt,
+        expr::LogQLExpr,
+        log::Selector,
+        planner::{QueryContext, SortDirection},
+        Parser, Planner,
     },
 };
 
@@ -29,11 +34,7 @@ use crate::{
 /// Parse time string (nanoseconds or RFC3339).
 pub fn parse_time(s: &str) -> DateTime<Utc> {
     s.parse::<i64>().map_or_else(
-        |_| {
-            DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or(DateTime::UNIX_EPOCH)
-        },
+        |_| DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)).unwrap_or(DateTime::UNIX_EPOCH),
         DateTime::from_timestamp_nanos,
     )
 }
@@ -62,6 +63,7 @@ pub fn build_query_context(
         end: end_time,
         limit: None,
         step: None,
+        direction: SortDirection::default(),
     }
 }
 
@@ -74,7 +76,7 @@ pub fn parse_selector(query: &str) -> LokiResult<Selector> {
     let parser = AntlrParser::new();
     match parser.parse(query) {
         Ok(LogQLExpr::Log(log_expr)) => Ok(log_expr.selector),
-        Ok(_) => Err(IceGateError::Validation("Expected log selector, got metric query".to_string()).into()),
+        Ok(_) => Err(QueryError::Validation("Expected log selector, got metric query".to_string()).into()),
         Err(e) => Err(e.into()),
     }
 }
@@ -122,6 +124,10 @@ impl QueryExecutor {
             end,
             limit: params.limit.map(|l| l as usize),
             step: params.step.as_ref().and_then(|s| parse_duration_opt(s)),
+            direction: match params.direction.as_deref() {
+                Some("forward") => SortDirection::Forward,
+                _ => SortDirection::Backward, // Default per Loki spec
+            },
         };
 
         // Parse LogQL
@@ -137,7 +143,7 @@ impl QueryExecutor {
         let df = planner.plan(expr).await?;
 
         // Execute
-        let batches = df.collect().await.map_err(IceGateError::from)?;
+        let batches = df.collect().await.map_err(QueryError::from)?;
 
         let exec_time = exec_start.elapsed().as_secs_f64();
 
@@ -181,7 +187,7 @@ impl QueryExecutor {
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
 
         let df = planner.plan_labels(selector).await?;
-        let batches = df.collect().await.map_err(IceGateError::from)?;
+        let batches = df.collect().await.map_err(QueryError::from)?;
 
         let mut labels: std::collections::HashSet<String> = std::collections::HashSet::new();
         for value in extract_string_column(&batches, 0) {
@@ -218,7 +224,7 @@ impl QueryExecutor {
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
 
         let df = planner.plan_label_values(selector, label_name).await?;
-        let batches = df.collect().await.map_err(IceGateError::from)?;
+        let batches = df.collect().await.map_err(QueryError::from)?;
 
         Ok(extract_string_column(&batches, 0))
     }
@@ -230,23 +236,20 @@ impl QueryExecutor {
         params: &super::models::SeriesQueryParams,
     ) -> LokiResult<Vec<std::collections::HashMap<String, String>>> {
         if params.matchers.is_empty() {
-            return Err(IceGateError::Validation("match[] parameter required".to_string()).into());
+            return Err(QueryError::Validation("match[] parameter required".to_string()).into());
         }
 
         let query_ctx = build_query_context(tenant_id, params.start.as_ref(), params.end.as_ref(), None);
 
         // Parse all matchers
-        let selectors: Vec<Selector> = params
-            .matchers
-            .iter()
-            .map(|m| parse_selector(m))
-            .collect::<LokiResult<Vec<_>>>()?;
+        let selectors: Vec<Selector> =
+            params.matchers.iter().map(|m| parse_selector(m)).collect::<LokiResult<Vec<_>>>()?;
 
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
 
         let df = planner.plan_series(&selectors).await?;
-        let batches = df.collect().await.map_err(IceGateError::from)?;
+        let batches = df.collect().await.map_err(QueryError::from)?;
 
         Ok(batches_to_series_list(&batches))
     }

@@ -140,8 +140,7 @@ impl ScalarUDFImpl for MapDropKeys {
 ///
 /// # Arguments
 /// - `args`: Two `ColumnarValue`s: the map and the keys array
-/// - `keep_mode`: If true, keep only keys in array; if false, drop keys in
-///   array
+/// - `keep_mode`: If true, keep only keys in array; if false, drop keys in array
 ///
 /// # Returns
 /// A new `MapArray` with filtered entries.
@@ -400,9 +399,7 @@ mod tests {
     #[test]
     fn test_map_filter_multiple_rows() {
         let map = create_test_map(
-            &[vec![("a", "1"), ("b", "2"), ("c", "3")], vec![("a", "4"), ("d", "5")], vec![(
-                "b", "6",
-            )]],
+            &[vec![("a", "1"), ("b", "2"), ("c", "3")], vec![("a", "4"), ("d", "5")], vec![("b", "6")]],
         );
 
         let filter_set: HashSet<&str> = ["a", "b"].into_iter().collect();

@@ -17,7 +17,9 @@ RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") --workspace --
 
 FROM debian:bookworm-slim
 ARG PROFILE=release
+ARG SERVICE=query
+ENV SERVICE=${SERVICE}
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/${PROFILE}/query /app/target/${PROFILE}/maintain /usr/local/bin/
+COPY --from=builder /app/target/${PROFILE}/${SERVICE} /usr/local/bin/${SERVICE}
 USER nobody
-CMD ["echo", "Use: query or maintain"]
+ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/${SERVICE} \"$@\"", "--"]

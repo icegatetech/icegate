@@ -28,7 +28,7 @@ use crate::logql::{
     expr::LogQLExpr,
     log::{LabelMatcher, LineFilter, LogExpr, PipelineStage, Selector},
     metric::MetricExpr,
-    planner::{Planner, QueryContext, DEFAULT_LOG_LIMIT},
+    planner::{Planner, QueryContext, SortDirection, DEFAULT_LOG_LIMIT},
 };
 
 // ============================================================================
@@ -173,9 +173,7 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
         properties: std::collections::HashMap::new(),
     };
 
-    let iceberg_catalog = CatalogBuilder::from_config(&config)
-        .await
-        .expect("Failed to create test catalog");
+    let iceberg_catalog = CatalogBuilder::from_config(&config).await.expect("Failed to create test catalog");
 
     // Create the namespace and table
     let namespace = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
@@ -188,10 +186,7 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
 
     // Create logs table using the common schema
     let schema = logs_schema().expect("Failed to get logs schema");
-    let table_creation = iceberg::TableCreation::builder()
-        .name(LOGS_TABLE.to_string())
-        .schema(schema)
-        .build();
+    let table_creation = iceberg::TableCreation::builder().name(LOGS_TABLE.to_string()).schema(schema).build();
 
     let _ = iceberg_catalog.create_table(&namespace, table_creation).await;
 
@@ -207,6 +202,7 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
         end: Utc.timestamp_opt(100, 0).unwrap(), // 100 seconds from epoch
         limit: None,
         step: Some(TimeDelta::seconds(15)), // 15-second step for metric queries
+        direction: SortDirection::default(),
     };
 
     (session_ctx, query_ctx)
@@ -308,9 +304,7 @@ async fn test_line_filter_not_contains() {
 
     let selector = Selector::new(vec![]);
     let mut log_expr = LogExpr::new(selector);
-    log_expr
-        .pipeline
-        .push(PipelineStage::LineFilter(LineFilter::not_contains("info")));
+    log_expr.pipeline.push(PipelineStage::LineFilter(LineFilter::not_contains("info")));
 
     let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
@@ -334,9 +328,7 @@ async fn test_line_filter_regex() {
 
     let selector = Selector::new(vec![]);
     let mut log_expr = LogExpr::new(selector);
-    log_expr
-        .pipeline
-        .push(PipelineStage::LineFilter(LineFilter::matches("error.*")));
+    log_expr.pipeline.push(PipelineStage::LineFilter(LineFilter::matches("error.*")));
 
     let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
@@ -358,9 +350,7 @@ async fn test_line_filter_not_regex() {
 
     let selector = Selector::new(vec![]);
     let mut log_expr = LogExpr::new(selector);
-    log_expr
-        .pipeline
-        .push(PipelineStage::LineFilter(LineFilter::not_matches("debug.*")));
+    log_expr.pipeline.push(PipelineStage::LineFilter(LineFilter::not_matches("debug.*")));
 
     let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
@@ -514,9 +504,7 @@ async fn test_count_over_time_planning() {
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
-    let has_value = projections
-        .iter()
-        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    let has_value = projections.iter().any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
     assert!(has_value, "Plan should have 'value' alias");
 }
 
@@ -542,9 +530,7 @@ async fn test_rate_planning() {
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
-    let has_value = projections
-        .iter()
-        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    let has_value = projections.iter().any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
     assert!(has_value, "Plan should have 'value' alias");
 }
 
@@ -573,9 +559,7 @@ async fn test_bytes_over_time_planning() {
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
-    let has_value = projections
-        .iter()
-        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    let has_value = projections.iter().any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
     assert!(has_value, "Plan should have 'value' alias");
 }
 
@@ -604,9 +588,7 @@ async fn test_bytes_rate_planning() {
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
-    let has_value = projections
-        .iter()
-        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    let has_value = projections.iter().any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
     assert!(has_value, "Plan should have 'value' alias");
 }
 

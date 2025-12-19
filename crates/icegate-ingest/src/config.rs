@@ -6,9 +6,11 @@
 use std::path::Path;
 
 use icegate_common::{check_port_conflicts, load_config_file, CatalogConfig, StorageConfig};
+use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 
 use super::{otlp_grpc::OtlpGrpcConfig, otlp_http::OtlpHttpConfig};
+use crate::error::Result;
 
 /// Ingest binary configuration
 ///
@@ -21,6 +23,9 @@ pub struct IngestConfig {
     pub catalog: CatalogConfig,
     /// Storage backend configuration
     pub storage: StorageConfig,
+    /// Queue configuration for WAL-based ingestion
+    #[serde(default)]
+    pub queue: Option<QueueConfig>,
     /// OTLP HTTP server
     pub otlp_http: OtlpHttpConfig,
     /// OTLP gRPC server
@@ -33,7 +38,7 @@ impl IngestConfig {
     /// # Errors
     ///
     /// Returns an error if the file cannot be read or parsed
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let config: Self = load_config_file(path.as_ref())?;
         config.validate()?;
         Ok(config)
@@ -44,7 +49,7 @@ impl IngestConfig {
     /// # Errors
     ///
     /// Returns an error if any configuration is invalid
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<()> {
         self.catalog.validate()?;
         self.storage.validate()?;
         self.otlp_http.validate()?;

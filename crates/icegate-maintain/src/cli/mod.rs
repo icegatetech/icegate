@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use icegate_common::errors::IceGateError;
+
+use crate::error::MaintainError;
 
 mod commands;
 
@@ -57,7 +58,7 @@ impl Cli {
     /// # Errors
     ///
     /// Returns an error if the command execution fails
-    pub async fn execute(self) -> Result<(), IceGateError> {
+    pub async fn execute(self) -> Result<(), MaintainError> {
         match self.command {
             Commands::Migrate {
                 command,

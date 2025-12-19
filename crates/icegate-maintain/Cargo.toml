@@ -23,6 +23,9 @@ icegate-common = { workspace = true }
 # Iceberg
 iceberg = { workspace = true }
 
+# Error handling
+thiserror = { workspace = true }
+
 # Async runtime
 tokio = { workspace = true }
 

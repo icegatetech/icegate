@@ -19,15 +19,18 @@ use datafusion::{
     prelude::*,
     scalar::ScalarValue,
 };
-use icegate_common::{errors::IceGateError, schema::LOG_INDEXED_ATTRIBUTE_COLUMNS, Result, LOGS_TABLE_FQN};
+use icegate_common::{schema::LOG_INDEXED_ATTRIBUTE_COLUMNS, LOGS_TABLE_FQN};
 
-use crate::logql::{
-    common::MatchOp,
-    expr::LogQLExpr,
-    log::{LabelMatcher, LogExpr, Selector},
-    metric::MetricExpr,
-    planner::{Planner, QueryContext, DEFAULT_LOG_LIMIT},
-    RangeAggregationOp,
+use crate::{
+    error::{QueryError, Result},
+    logql::{
+        common::MatchOp,
+        expr::LogQLExpr,
+        log::{LabelMatcher, LogExpr, Selector},
+        metric::MetricExpr,
+        planner::{Planner, QueryContext, SortDirection, DEFAULT_LOG_LIMIT},
+        RangeAggregationOp,
+    },
 };
 
 /// Strips PARQUET field metadata from `DataFrame` schema.
@@ -35,13 +38,7 @@ use crate::logql::{
 /// but in-memory operations (`MemTable`, `map_keys`) create fields without it.
 /// This prevents Arrow schema mismatch errors during joins/unions.
 fn strip_schema_metadata(df: DataFrame) -> datafusion::error::Result<DataFrame> {
-    let select_exprs: Vec<Expr> = df
-        .schema()
-        .inner()
-        .fields()
-        .iter()
-        .map(|field| col(field.name().as_str()))
-        .collect();
+    let select_exprs: Vec<Expr> = df.schema().inner().fields().iter().map(|field| col(field.name().as_str())).collect();
 
     df.select(select_exprs)
 }
@@ -69,10 +66,17 @@ impl Planner for DataFusionPlanner {
         match expr {
             LogQLExpr::Log(log_expr) => {
                 let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
+
+                // Sort by timestamp (ascending for forward, descending for backward)
+                // Must apply sort BEFORE limit to get correct N oldest/newest entries
+                let ascending = self.query_ctx.direction == SortDirection::Forward;
+                let df = df.sort(vec![col("timestamp").sort(ascending, true)])?;
+
                 // Apply limit only for log queries (not metrics)
                 // Uses context limit or Loki default of 100 entries
                 let limit = self.query_ctx.limit.unwrap_or(DEFAULT_LOG_LIMIT);
                 let df = df.limit(0, Some(limit))?;
+
                 // Transform output: hex-encode binary columns, add `level` alias
                 Self::transform_output_columns(df)
             },
@@ -211,8 +215,7 @@ impl DataFusionPlanner {
 
     /// Transform output columns for Loki/Grafana compatibility:
     /// - Encode binary columns (`trace_id`, `span_id`) to hex strings
-    /// - Add `level` column as alias of `severity_text` (Grafana expects
-    ///   `level` label)
+    /// - Add `level` column as alias of `severity_text` (Grafana expects `level` label)
     ///
     /// This ensures that all output from log queries has:
     /// - String-typed trace/span IDs (simplifies handler code)
@@ -267,7 +270,7 @@ impl DataFusionPlanner {
         };
 
         if selectors.is_empty() {
-            return Err(IceGateError::Plan("At least one selector is required".to_string()));
+            return Err(QueryError::Plan("At least one selector is required".to_string()));
         }
 
         // Plan each selector independently and UNION the results
@@ -346,19 +349,19 @@ impl DataFusionPlanner {
                     // This requires joining left and right DataFrames based on labels and
                     // timestamp, applying the operation, and handling the
                     // modifier (on/ignoring, group_left/right).
-                    Err(IceGateError::NotImplemented(
+                    Err(QueryError::NotImplemented(
                         "Binary operations not yet implemented".to_string(),
                     ))
                 },
                 MetricExpr::Literal(_val) => {
                     // TODO: Implement literal value
-                    Err(IceGateError::NotImplemented(
+                    Err(QueryError::NotImplemented(
                         "Literal value not yet implemented".to_string(),
                     ))
                 },
                 MetricExpr::Vector(_vals) => {
                     // TODO: Implement vector literal
-                    Err(IceGateError::NotImplemented(
+                    Err(QueryError::NotImplemented(
                         "Vector literal not yet implemented".to_string(),
                     ))
                 },
@@ -366,13 +369,11 @@ impl DataFusionPlanner {
                     ..
                 } => {
                     // TODO: Implement label replace
-                    Err(IceGateError::NotImplemented(
+                    Err(QueryError::NotImplemented(
                         "Label replace not yet implemented".to_string(),
                     ))
                 },
-                MetricExpr::Variable(_) => {
-                    Err(IceGateError::NotImplemented("Variable not yet implemented".to_string()))
-                },
+                MetricExpr::Variable(_) => Err(QueryError::NotImplemented("Variable not yet implemented".to_string())),
                 MetricExpr::Parens(inner) => self.plan_metric(*inner).await,
             }
         })
@@ -388,7 +389,7 @@ impl DataFusionPlanner {
 
     #[allow(clippy::unused_self)]
     fn plan_unwrap_range_aggregation(&self, _agg: crate::logql::metric::RangeAggregation) -> Result<DataFrame> {
-        Err(IceGateError::NotImplemented(
+        Err(QueryError::NotImplemented(
             "Unwrap aggregation not yet implemented".to_string(),
         ))
     }
@@ -422,17 +423,13 @@ impl DataFusionPlanner {
         let step_micros = self
             .query_ctx
             .step
-            .ok_or(IceGateError::Config("Step parameter is required".to_string()))?
+            .ok_or(QueryError::Config("Step parameter is required".to_string()))?
             .num_microseconds()
-            .ok_or(IceGateError::Config("Step too large".to_string()))?;
-        let range_nanos = agg
-            .range_expr
-            .range
-            .num_nanoseconds()
-            .ok_or(IceGateError::Config("Range too large".to_string()))?;
-        let offset_nanos = offset_duration
-            .num_nanoseconds()
-            .ok_or(IceGateError::Config("Offset too large".to_string()))?;
+            .ok_or(QueryError::Config("Step too large".to_string()))?;
+        let range_nanos =
+            agg.range_expr.range.num_nanoseconds().ok_or(QueryError::Config("Range too large".to_string()))?;
+        let offset_nanos =
+            offset_duration.num_nanoseconds().ok_or(QueryError::Config("Offset too large".to_string()))?;
 
         // Common UDAF arguments
         let start_arg = lit(ScalarValue::TimestampMicrosecond(Some(start_micros), None));
@@ -513,7 +510,7 @@ impl DataFusionPlanner {
                 ])
             },
             _ => {
-                return Err(IceGateError::Plan(
+                return Err(QueryError::Plan(
                     "This range aggregation requires an unwrap expression".to_string(),
                 ))
             },
@@ -573,7 +570,7 @@ impl DataFusionPlanner {
                 let outer_labels = match outer_grouping {
                     Grouping::By(labels) => labels.clone(),
                     Grouping::Without(_) => {
-                        return Err(IceGateError::NotImplemented(
+                        return Err(QueryError::NotImplemented(
                             "Grouping::Without is not yet implemented".to_string(),
                         ));
                     },
@@ -616,7 +613,7 @@ impl DataFusionPlanner {
             let (labels, udf) = match grouping {
                 Grouping::By(labels) => (labels, ScalarUDF::from(super::udf::MapKeepKeys::new())),
                 Grouping::Without(_) => {
-                    return Err(IceGateError::NotImplemented(
+                    return Err(QueryError::NotImplemented(
                         "Grouping::Without is not yet implemented".to_string(),
                     ));
                 },
@@ -635,7 +632,7 @@ impl DataFusionPlanner {
                     attributes.push(l.name.as_str());
                 } else {
                     // Column doesn't exist and no attributes map - the label isn't available
-                    return Err(IceGateError::NotImplemented(format!(
+                    return Err(QueryError::NotImplemented(format!(
                         "Label '{}' not available in aggregation result.",
                         l.name
                     )));
@@ -683,7 +680,7 @@ impl DataFusionPlanner {
             },
             // TODO: Implement topk, bottomk, sort, sort_desc
             _ => {
-                return Err(IceGateError::NotImplemented(format!(
+                return Err(QueryError::NotImplemented(format!(
                     "Vector aggregation op {:?} not supported",
                     agg.op
                 )));
@@ -743,9 +740,9 @@ impl DataFusionPlanner {
             MatchOp::Re => {
                 datafusion::functions::regex::regexp_like().call(vec![col_expr, lit(matcher.value.as_str())])
             },
-            MatchOp::Nre => datafusion::functions::regex::regexp_like()
-                .call(vec![col_expr, lit(matcher.value.as_str())])
-                .not(),
+            MatchOp::Nre => {
+                datafusion::functions::regex::regexp_like().call(vec![col_expr, lit(matcher.value.as_str())]).not()
+            },
         }
     }
 
@@ -805,7 +802,7 @@ impl DataFusionPlanner {
             let filter_str = match filter_value {
                 LineFilterValue::String(s) => s,
                 LineFilterValue::Ip(_cidr) => {
-                    return Err(IceGateError::NotImplemented("IP CIDR filtering".into()));
+                    return Err(QueryError::NotImplemented("IP CIDR filtering".into()));
                 },
             };
 
@@ -813,17 +810,17 @@ impl DataFusionPlanner {
                 LineFilterOp::Contains => {
                     datafusion::functions::string::contains().call(vec![body_col.clone(), lit(filter_str)])
                 },
-                LineFilterOp::NotContains => datafusion::functions::string::contains()
-                    .call(vec![body_col.clone(), lit(filter_str)])
-                    .not(),
+                LineFilterOp::NotContains => {
+                    datafusion::functions::string::contains().call(vec![body_col.clone(), lit(filter_str)]).not()
+                },
                 LineFilterOp::Match => {
                     datafusion::functions::regex::regexp_like().call(vec![body_col.clone(), lit(filter_str)])
                 },
-                LineFilterOp::NotMatch => datafusion::functions::regex::regexp_like()
-                    .call(vec![body_col.clone(), lit(filter_str)])
-                    .not(),
+                LineFilterOp::NotMatch => {
+                    datafusion::functions::regex::regexp_like().call(vec![body_col.clone(), lit(filter_str)]).not()
+                },
                 LineFilterOp::NotPattern => {
-                    return Err(IceGateError::NotImplemented("pattern matching filter".into()));
+                    return Err(QueryError::NotImplemented("pattern matching filter".into()));
                 },
             };
 
@@ -1055,9 +1052,7 @@ impl DataFusionPlanner {
                 };
 
                 use crate::logql::common::ComparisonOp;
-                let nanos = value
-                    .num_nanoseconds()
-                    .ok_or(IceGateError::Config("Duration too large".to_string()))?;
+                let nanos = value.num_nanoseconds().ok_or(QueryError::Config("Duration too large".to_string()))?;
                 let expr = match op {
                     ComparisonOp::Gt => col_expr.gt(lit(nanos)),
                     ComparisonOp::Ge => col_expr.gt_eq(lit(nanos)),
@@ -1096,7 +1091,7 @@ impl DataFusionPlanner {
                 ..
             } => {
                 // TODO: Implement IP filtering using ip_match UDF
-                Err(IceGateError::NotImplemented(
+                Err(QueryError::NotImplemented(
                     "IP filtering not yet implemented".to_string(),
                 ))
             },

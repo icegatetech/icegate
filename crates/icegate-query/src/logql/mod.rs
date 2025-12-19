@@ -43,4 +43,4 @@ pub use metric::{
     RangeExpr, VectorAggregation, VectorAggregationOp, VectorMatchCardinality, VectorMatching,
 };
 pub use parser::Parser;
-pub use planner::Planner;
+pub use planner::{Planner, SortDirection};

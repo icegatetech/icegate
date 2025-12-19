@@ -8,21 +8,23 @@ use std::rc::Rc;
 
 use antlr4rust::tree::{ParseTree, ParseTreeVisitorCompat};
 use chrono::TimeDelta;
-use icegate_common::{errors::IceGateError, Result};
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use super::{super::duration::parse_duration, LogQLParserVisitorCompat};
-use crate::logql::{
-    common::{parse_error, ComparisonOp, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp},
-    expr::LogQLExpr,
-    log::{
-        LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr, LogParser, PipelineStage,
-        Selector, UnwrapConversion, UnwrapExpr,
-    },
-    metric::{
-        AtModifier, BinaryOp, BinaryOpModifier, MatchingLabels, MetricExpr, RangeAggregation, RangeAggregationOp,
-        RangeExpr, VectorAggregation, VectorAggregationOp, VectorMatchCardinality, VectorMatching,
+use crate::{
+    error::{QueryError, Result},
+    logql::{
+        common::{parse_error, ComparisonOp, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp},
+        expr::LogQLExpr,
+        log::{
+            LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr, LogParser,
+            PipelineStage, Selector, UnwrapConversion, UnwrapExpr,
+        },
+        metric::{
+            AtModifier, BinaryOp, BinaryOpModifier, MatchingLabels, MetricExpr, RangeAggregation, RangeAggregationOp,
+            RangeExpr, VectorAggregation, VectorAggregationOp, VectorMatchCardinality, VectorMatching,
+        },
     },
 };
 
@@ -47,7 +49,7 @@ impl<T> VisitorResult<T> {
         Self(Ok(value))
     }
 
-    pub const fn err(error: IceGateError) -> Self {
+    pub const fn err(error: QueryError) -> Self {
         Self(Err(error))
     }
 
@@ -265,15 +267,11 @@ fn visit_label_extractions(ctx: &LabelExtractionsContextAll) -> Result<Vec<Label
 fn visit_grouping(ctx: &GroupingContextAll) -> Result<Grouping> {
     match ctx {
         GroupingContextAll::GroupingByContext(c) => {
-            let labels = c
-                .groupingLabels()
-                .map_or_else(Vec::new, |labels_ctx| collect_grouping_labels(&labels_ctx));
+            let labels = c.groupingLabels().map_or_else(Vec::new, |labels_ctx| collect_grouping_labels(&labels_ctx));
             Ok(Grouping::By(labels))
         },
         GroupingContextAll::GroupingWithoutContext(c) => {
-            let labels = c
-                .groupingLabels()
-                .map_or_else(Vec::new, |labels_ctx| collect_grouping_labels(&labels_ctx));
+            let labels = c.groupingLabels().map_or_else(Vec::new, |labels_ctx| collect_grouping_labels(&labels_ctx));
             Ok(Grouping::Without(labels))
         },
         GroupingContextAll::GroupingByEmptyContext(_) => Ok(Grouping::By(Vec::new())),
@@ -552,10 +550,7 @@ impl LogQLExprVisitor {
             },
             MetricExprContextAll::MetricExprVariableContext(c) => {
                 let var_ctx = c.variableExpr().ok_or_else(|| parse_error("Missing variable expression"))?;
-                let name = var_ctx
-                    .ATTRIBUTE()
-                    .ok_or_else(|| parse_error("Missing variable name"))?
-                    .get_text();
+                let name = var_ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing variable name"))?.get_text();
                 Ok(MetricExpr::Variable(name))
             },
             // Binary operations
@@ -580,18 +575,14 @@ impl LogQLExprVisitor {
 
     /// Visit metric expression with range aggregation.
     fn visit_metric_expr_range_agg(&self, ctx: &MetricExprRangeAggContext) -> Result<MetricExpr> {
-        let agg_ctx = ctx
-            .rangeAggregationExpr()
-            .ok_or_else(|| parse_error("Missing range aggregation"))?;
+        let agg_ctx = ctx.rangeAggregationExpr().ok_or_else(|| parse_error("Missing range aggregation"))?;
         let agg = self.visit_range_aggregation(&agg_ctx)?;
         Ok(MetricExpr::RangeAggregation(agg))
     }
 
     /// Visit metric expression with vector aggregation.
     fn visit_metric_expr_vector_agg(&self, ctx: &MetricExprVectorAggContext) -> Result<MetricExpr> {
-        let agg_ctx = ctx
-            .vectorAggregationExpr()
-            .ok_or_else(|| parse_error("Missing vector aggregation"))?;
+        let agg_ctx = ctx.vectorAggregationExpr().ok_or_else(|| parse_error("Missing vector aggregation"))?;
         let agg = self.visit_vector_aggregation(&agg_ctx)?;
         Ok(MetricExpr::VectorAggregation(agg))
     }
@@ -759,9 +750,8 @@ impl LogQLExprVisitor {
         let op_ctx = ctx.vectorOp().ok_or_else(|| parse_error("Missing vector operation"))?;
         let op = visit_vector_op(&op_ctx)?;
 
-        let metric_ctx = ctx
-            .metricExpr()
-            .ok_or_else(|| parse_error("Missing metric expression in vector aggregation"))?;
+        let metric_ctx =
+            ctx.metricExpr().ok_or_else(|| parse_error("Missing metric expression in vector aggregation"))?;
         let expr = self.visit_metric_expr(&metric_ctx)?;
 
         let grouping = if let Some(grouping_ctx) = ctx.grouping() {
@@ -792,9 +782,7 @@ impl LogQLExprVisitor {
 
     /// Visit log range expression.
     fn visit_log_range_expr(&self, ctx: &LogRangeExprContextAll) -> Result<RangeExpr> {
-        let selector_ctx = ctx
-            .selector()
-            .ok_or_else(|| parse_error("Missing selector in range expression"))?;
+        let selector_ctx = ctx.selector().ok_or_else(|| parse_error("Missing selector in range expression"))?;
         let selector = visit_selector(&selector_ctx)?;
 
         let range_ctx = ctx.range().ok_or_else(|| parse_error("Missing range"))?;
@@ -832,9 +820,7 @@ impl LogQLExprVisitor {
 
     /// Visit unwrapped range expression.
     fn visit_unwrapped_range_expr(&self, ctx: &UnwrappedRangeExprContextAll) -> Result<RangeExpr> {
-        let selector_ctx = ctx
-            .selector()
-            .ok_or_else(|| parse_error("Missing selector in unwrapped range"))?;
+        let selector_ctx = ctx.selector().ok_or_else(|| parse_error("Missing selector in unwrapped range"))?;
         let selector = visit_selector(&selector_ctx)?;
 
         let range_ctx = ctx.range().ok_or_else(|| parse_error("Missing range"))?;
@@ -991,9 +977,7 @@ impl LogQLExprVisitor {
 
         // Line format
         if let Some(line_format) = ctx.lineFormatExpr() {
-            let template = line_format
-                .STRING()
-                .ok_or_else(|| parse_error("Missing line format template"))?;
+            let template = line_format.STRING().ok_or_else(|| parse_error("Missing line format template"))?;
             return Ok(PipelineStage::LineFormat(clean_string(&template.get_text())));
         }
 
@@ -1051,7 +1035,7 @@ impl LogQLExprVisitor {
             },
             LineFiltersContextAll::LineFiltersPatternContext(_)
             | LineFiltersContextAll::LineFiltersNotPatternContext(_) => {
-                return Err(IceGateError::NotImplemented(
+                return Err(QueryError::NotImplemented(
                     "Pattern matching doesn't supported yet.".to_string(),
                 ))
             },
@@ -1098,9 +1082,7 @@ impl LogQLExprVisitor {
     /// Visit label format expression.
     #[allow(clippy::unused_self)]
     fn visit_label_format_expr(&self, ctx: &LabelFormatExprContext) -> Result<PipelineStage> {
-        let ops_ctx = ctx
-            .labelFormatOps()
-            .ok_or_else(|| parse_error("Missing label format operations"))?;
+        let ops_ctx = ctx.labelFormatOps().ok_or_else(|| parse_error("Missing label format operations"))?;
 
         let mut ops = Vec::new();
         for op_ctx in ops_ctx.labelFormatOp_all() {
@@ -1115,10 +1097,7 @@ impl LogQLExprVisitor {
                     }
                 },
                 LabelFormatOpContextAll::LabelFormatTemplateContext(c) => {
-                    let dst = c
-                        .ATTRIBUTE()
-                        .ok_or_else(|| parse_error("Missing destination label"))?
-                        .get_text();
+                    let dst = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing destination label"))?.get_text();
                     let template = c.STRING().ok_or_else(|| parse_error("Missing template"))?.get_text();
                     ops.push(LabelFormatOp::Template {
                         dst,
@@ -1188,10 +1167,7 @@ impl LogQLExprVisitor {
     /// Visit number filter.
     #[allow(clippy::unused_self)]
     fn visit_number_filter(&self, ctx: &NumberFilterContextAll) -> Result<LabelFilterExpr> {
-        let label = ctx
-            .ATTRIBUTE()
-            .ok_or_else(|| parse_error("Missing label in number filter"))?
-            .get_text();
+        let label = ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in number filter"))?.get_text();
 
         let op = ctx.comparisonOp().ok_or_else(|| parse_error("Missing comparison operator"))?;
         let comparison_op = visit_comparison_op(&op)?;
@@ -1209,10 +1185,7 @@ impl LogQLExprVisitor {
     /// Visit duration filter.
     #[allow(clippy::unused_self)]
     fn visit_duration_filter(&self, ctx: &DurationFilterContextAll) -> Result<LabelFilterExpr> {
-        let label = ctx
-            .ATTRIBUTE()
-            .ok_or_else(|| parse_error("Missing label in duration filter"))?
-            .get_text();
+        let label = ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in duration filter"))?.get_text();
 
         let op = ctx.comparisonOp().ok_or_else(|| parse_error("Missing comparison operator"))?;
         let comparison_op = visit_comparison_op(&op)?;
@@ -1230,10 +1203,7 @@ impl LogQLExprVisitor {
     /// Visit bytes filter.
     #[allow(clippy::unused_self)]
     fn visit_bytes_filter(&self, ctx: &BytesFilterContextAll) -> Result<LabelFilterExpr> {
-        let label = ctx
-            .ATTRIBUTE()
-            .ok_or_else(|| parse_error("Missing label in bytes filter"))?
-            .get_text();
+        let label = ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in bytes filter"))?.get_text();
 
         let op = ctx.comparisonOp().ok_or_else(|| parse_error("Missing comparison operator"))?;
         let comparison_op = visit_comparison_op(&op)?;
@@ -1251,10 +1221,7 @@ impl LogQLExprVisitor {
     /// Visit IP label filter.
     #[allow(clippy::unused_self)]
     fn visit_ip_label_filter(&self, ctx: &IpLabelFilterContextAll) -> Result<LabelFilterExpr> {
-        let label = ctx
-            .ATTRIBUTE()
-            .ok_or_else(|| parse_error("Missing label in IP filter"))?
-            .get_text();
+        let label = ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in IP filter"))?.get_text();
 
         let negated = ctx.NE().is_some();
 

@@ -164,12 +164,7 @@ async fn create_s3_bucket(minio_port: u16) {
 
     let s3_client = aws_sdk_s3::Client::new(&config);
 
-    s3_client
-        .create_bucket()
-        .bucket(BUCKET_NAME)
-        .send()
-        .await
-        .expect("Failed to create S3 bucket");
+    s3_client.create_bucket().bucket(BUCKET_NAME).send().await.expect("Failed to create S3 bucket");
 }
 
 /// Test that `create_tables` creates all 4 observability tables
@@ -231,9 +226,7 @@ async fn test_migrate_create_tables_dry_run() {
 
     // Verify NO tables were actually created by calling create_tables again
     // This time with dry_run=false, it should still create 4 tables
-    let ops_actual = create_tables(&catalog, false)
-        .await
-        .expect("Failed to create tables after dry-run");
+    let ops_actual = create_tables(&catalog, false).await.expect("Failed to create tables after dry-run");
 
     assert_eq!(
         ops_actual.len(),
@@ -250,15 +243,11 @@ async fn test_migrate_create_tables_idempotent() {
     let catalog = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
 
     // First call - creates tables
-    let ops_first = create_tables(&catalog, false)
-        .await
-        .expect("Failed to create tables first time");
+    let ops_first = create_tables(&catalog, false).await.expect("Failed to create tables first time");
     assert_eq!(ops_first.len(), 4, "First call should create 4 tables");
 
     // Second call - should be idempotent
-    let ops_second = create_tables(&catalog, false)
-        .await
-        .expect("Failed to create tables second time");
+    let ops_second = create_tables(&catalog, false).await.expect("Failed to create tables second time");
     assert_eq!(
         ops_second.len(),
         0,
