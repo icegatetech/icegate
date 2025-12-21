@@ -165,9 +165,6 @@ impl<S: ObjectStore> QueueReader<S> {
         let record_count = parquet_meta.file_metadata().num_rows();
         let row_group_count = parquet_meta.num_row_groups();
 
-        #[allow(clippy::cast_sign_loss)]
-        let created_at = object_meta.last_modified.timestamp_millis() as u128;
-
         Ok(SegmentMetadata {
             topic: topic.clone(),
             offset,
@@ -176,7 +173,6 @@ impl<S: ObjectStore> QueueReader<S> {
             row_group_count,
             status: SegmentStatus::Complete,
             schema_fingerprint: None,
-            created_at,
         })
     }
 
@@ -261,7 +257,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn write_test_segment(writer: &QueueWriter<InMemory>, topic: &str, values: &[i32]) -> u64 {
+    async fn write_test_segment(writer: &QueueWriter, topic: &str, values: &[i32]) -> u64 {
         let batch = test_batch(values);
         let (offset, _count) = writer.write_batch(&topic.to_string(), batch, None).await.unwrap();
         offset

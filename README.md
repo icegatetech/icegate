@@ -65,7 +65,7 @@ The system consists of five core components for handling observability data (met
 ### Prerequisites
 
 #### Required Tools
-- **Rust** >= 1.91.0 (for Rust 2024 edition support)
+- **Rust** >= 1.92.0 (for Rust 2021 edition support)
 - **Cargo** (Rust's package manager and build tool, included with Rust)
 - **Git**
 
@@ -92,7 +92,7 @@ rustfmt --version
 cargo clippy --version
 ```
 
-You should have Rust 1.80.0 or later installed.
+You should have Rust 1.92.0 or later installed.
 
 ### Installing Rust
 

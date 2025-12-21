@@ -30,7 +30,7 @@ services:
     image: busybox
     volumes:
       - nessie-data:/data
-    command: ["sh", "-c", "chown -R 10000:0 /data"]
+    command: ["sh", "-c", "chown -R 10000:10001 /data"]
 
   nessie:
     image: quay.io/projectnessie/nessie:0.105.7

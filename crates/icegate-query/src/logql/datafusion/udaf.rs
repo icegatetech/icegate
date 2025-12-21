@@ -16,7 +16,7 @@
 //! - Input handling (timestamp-only vs timestamp+body)
 //! - Output evaluation (raw counts, rates, inverted for absent)
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use datafusion::{
     arrow::{
@@ -69,9 +69,6 @@ pub struct GridAccumulator {
     upper_bound_micros: i64,
     /// Range in microseconds (for state serialization and rate calculation).
     range_micros: i64,
-
-    /// Debug performance
-    timestamps: HashMap<usize, usize>,
 }
 
 impl GridAccumulator {
@@ -114,7 +111,6 @@ impl GridAccumulator {
             offset_micros,
             upper_bound_micros,
             range_micros,
-            timestamps: HashMap::new(),
         })
     }
 
@@ -185,7 +181,6 @@ impl GridAccumulator {
     /// A timestamp `t` matches grid point `g` when: `offset <= (g - t) <= upper_bound`
     /// Rearranging: `t + offset <= g <= t + upper_bound`
     pub fn update_counts(&mut self, timestamps: &TimestampMicrosecondArray) {
-        *self.timestamps.entry(timestamps.len()).or_insert(0) += 1;
         if timestamps.is_empty() {
             return;
         }
@@ -219,7 +214,6 @@ impl GridAccumulator {
     /// Similar to `update_counts`, but sums byte lengths of body values
     /// for matching timestamps instead of just counting.
     fn update_bytes(&mut self, timestamps: &TimestampMicrosecondArray, bodies: &StringArray) {
-        *self.timestamps.entry(timestamps.len()).or_insert(0) += 1;
         if timestamps.is_empty() {
             return;
         }

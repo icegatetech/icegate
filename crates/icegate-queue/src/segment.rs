@@ -112,8 +112,6 @@ pub struct SegmentMetadata {
     /// Schema fingerprint (hash of Arrow schema).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_fingerprint: Option<String>,
-    /// Creation timestamp (Unix epoch millis).
-    pub created_at: u128,
 }
 
 impl SegmentMetadata {
@@ -134,12 +132,6 @@ impl SegmentMetadata {
             row_group_count,
             status: SegmentStatus::Complete,
             schema_fingerprint: None,
-            // Safe cast: millis since epoch won't overflow u64 until year 584,554,049 AD
-            #[allow(clippy::cast_possible_truncation)]
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0),
         }
     }
 

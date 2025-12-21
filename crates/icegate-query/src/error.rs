@@ -49,6 +49,7 @@ impl From<icegate_common::error::CommonError> for QueryError {
             CommonError::Yaml(e) => Self::Config(e.to_string()),
             CommonError::Iceberg(e) => Self::Iceberg(e),
             CommonError::Io(e) => Self::Config(e.to_string()),
+            CommonError::ObjectStore(e) => Self::Config(format!("object store error: {e}")),
         }
     }
 }

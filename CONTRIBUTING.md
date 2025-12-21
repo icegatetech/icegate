@@ -131,12 +131,28 @@ make audit   # Run security audit
 ```
 crates/
 ├── icegate-common/     # Shared infrastructure
+├── icegate-queue/      # Queue service
 ├── icegate-query/      # Query APIs + CLI
 ├── icegate-ingest/     # OTLP receivers
 └── icegate-maintain/   # Maintenance operations + CLI
 ```
 
 See `AGENTS.md` for detailed architecture documentation.
+
+## Third-party fork: icegatetech/iceberg-rust
+
+IceGate uses a fork of `apache/iceberg-rust` for Iceberg table operations. See [#25](../../issues/25) for tracking.
+
+**Required patches:**
+- DataFusion 51 + Arrow 57 compatibility (upstream [PR #1830](https://github.com/apache/iceberg-rust/pull/1830) closed)
+- Memory catalog builder enhancements for testing
+
+**Upstream plan:** Switch to upstream once DataFusion 51 is officially supported.
+
+**Maintenance:**
+- Fork branch: `develop` (continuously rebased on upstream `main`)
+- Responsible: IceGate maintainers
+- Regression testing: Run `make ci` after each sync
 
 ## Code of Conduct
 

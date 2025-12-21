@@ -30,12 +30,12 @@ use crate::{
 /// threshold is reached. Each flush writes accumulated batches as a single
 /// Parquet segment. Writes are atomic using `If-None-Match` to prevent
 /// duplicate segments.
-pub struct QueueWriter<S: ObjectStore> {
+pub struct QueueWriter {
     /// Configuration for the queue.
     config: QueueConfig,
 
     /// Object store backend.
-    store: Arc<S>,
+    store: Arc<dyn ObjectStore>,
 
     /// Current offset per topic.
     offsets: Arc<RwLock<HashMap<Topic, u64>>>,
@@ -44,9 +44,9 @@ pub struct QueueWriter<S: ObjectStore> {
     accumulators: Arc<RwLock<HashMap<Topic, TopicAccumulator>>>,
 }
 
-impl<S: ObjectStore> QueueWriter<S> {
+impl QueueWriter {
     /// Creates a new queue writer.
-    pub fn new(config: QueueConfig, store: Arc<S>) -> Self {
+    pub fn new(config: QueueConfig, store: Arc<dyn ObjectStore>) -> Self {
         Self {
             config,
             store,
@@ -65,15 +65,22 @@ impl<S: ObjectStore> QueueWriter<S> {
     pub fn start(self, mut receiver: WriteReceiver) -> tokio::task::JoinHandle<()> {
         let writer = Arc::new(self);
         let flush_writer = Arc::clone(&writer);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Spawn flush ticker task
         let flush_interval = Duration::from_millis(writer.config.flush_interval_ms / 2);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(flush_interval);
             loop {
-                interval.tick().await;
-                if let Err(e) = flush_writer.flush_due_topics().await {
-                    warn!("Flush ticker error: {}", e);
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = flush_writer.flush_due_topics().await {
+                            warn!("Flush ticker error: {}", e);
+                        }
+                    }
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
                 }
             }
         });
@@ -101,6 +108,9 @@ impl<S: ObjectStore> QueueWriter<S> {
             if let Err(e) = writer.flush_all().await {
                 error!("Failed to flush on shutdown: {}", e);
             }
+
+            // Signal the flush ticker task to stop
+            let _ = shutdown_tx.send(());
 
             info!("Queue writer stopped (channel closed)");
         })
@@ -501,7 +511,7 @@ impl<S: ObjectStore> QueueWriter<S> {
     }
 
     /// Gets a reference to the object store.
-    pub const fn store(&self) -> &Arc<S> {
+    pub fn store(&self) -> &Arc<dyn ObjectStore> {
         &self.store
     }
 

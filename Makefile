@@ -1,4 +1,4 @@
-.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci docs docs-serve docs-lint docs-clean
+.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci
 
 dev:
 	PROFILE=debug docker compose -f config/docker/docker-compose.yml up --watch --build

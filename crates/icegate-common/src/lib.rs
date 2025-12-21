@@ -49,4 +49,7 @@ pub mod storage;
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig};
 pub use config::{check_port_conflicts, load_config_file, ServerConfig};
 pub use error::Result;
-pub use storage::{S3Config, StorageBackend, StorageConfig};
+pub use storage::{
+    create_local_store, create_memory_store, create_object_store, create_s3_store, ObjectStoreWithPath, S3Config,
+    StorageBackend, StorageConfig,
+};

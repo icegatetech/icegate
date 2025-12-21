@@ -11,6 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.92.0"
 authors = ["IceGate Tech"]
 license = "Apache-2.0"
 repository = "https://github.com/icegatetech/icegate"
@@ -65,6 +66,10 @@ antlr4rust = "0.5"
 #iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
 #iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
 
+# Fork: icegatetech/iceberg-rust (tracking #25)
+# Patches: DataFusion 51 + Arrow 57 compat (upstream PR #1830 closed), memory catalog enhancements
+# Upstream plan: Switch back when DataFusion 51 officially supported upstream
+# Maintenance: develop branch rebased on upstream main; run `make ci` after each sync
 iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
 iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
 iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
