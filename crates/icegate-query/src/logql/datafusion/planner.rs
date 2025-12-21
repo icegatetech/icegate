@@ -15,21 +15,21 @@ use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::{
     arrow::datatypes::{DataType, IntervalMonthDayNano},
     functions_aggregate::expr_fn::last_value,
-    logical_expr::{col, lit, AggregateUDF, Expr, ExprSchemable, ScalarUDF},
+    logical_expr::{AggregateUDF, Expr, ExprSchemable, ScalarUDF, col, lit},
     prelude::*,
     scalar::ScalarValue,
 };
-use icegate_common::{schema::LOG_INDEXED_ATTRIBUTE_COLUMNS, LOGS_TABLE_FQN};
+use icegate_common::{LOGS_TABLE_FQN, schema::LOG_INDEXED_ATTRIBUTE_COLUMNS};
 
 use crate::{
     error::{QueryError, Result},
     logql::{
+        RangeAggregationOp,
         common::MatchOp,
         expr::LogQLExpr,
         log::{LabelMatcher, LogExpr, Selector},
         metric::MetricExpr,
-        planner::{Planner, QueryContext, SortDirection, DEFAULT_LOG_LIMIT},
-        RangeAggregationOp,
+        planner::{DEFAULT_LOG_LIMIT, Planner, QueryContext, SortDirection},
     },
 };
 
@@ -325,7 +325,7 @@ impl DataFusionPlanner {
         group_cols.push(col(COL_ATTR_VALS));
 
         let df = df.aggregate(group_cols, vec![
-            first_value(col("attributes"), vec![]).alias("attributes")
+            first_value(col("attributes"), vec![]).alias("attributes"),
         ])?;
 
         Ok(df)
@@ -512,7 +512,7 @@ impl DataFusionPlanner {
             _ => {
                 return Err(QueryError::Plan(
                     "This range aggregation requires an unwrap expression".to_string(),
-                ))
+                ));
             },
         };
 

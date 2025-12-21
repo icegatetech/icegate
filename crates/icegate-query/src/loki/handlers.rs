@@ -4,10 +4,10 @@
 //! and use typed models for responses.
 
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use axum_extra::extract::Query as QueryExtra;
 use icegate_common::DEFAULT_TENANT_ID;

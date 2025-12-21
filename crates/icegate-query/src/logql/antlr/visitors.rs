@@ -15,7 +15,7 @@ use super::{super::duration::parse_duration, LogQLParserVisitorCompat};
 use crate::{
     error::{QueryError, Result},
     logql::{
-        common::{parse_error, ComparisonOp, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp},
+        common::{ComparisonOp, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp, parse_error},
         expr::LogQLExpr,
         log::{
             LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr, LogParser,
@@ -1037,7 +1037,7 @@ impl LogQLExprVisitor {
             | LineFiltersContextAll::LineFiltersNotPatternContext(_) => {
                 return Err(QueryError::NotImplemented(
                     "Pattern matching doesn't supported yet.".to_string(),
-                ))
+                ));
             },
             LineFiltersContextAll::Error(_) => {
                 return Err(parse_error("Error in line filter"));

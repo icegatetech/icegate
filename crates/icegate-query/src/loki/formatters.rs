@@ -169,11 +169,7 @@ fn extract_body(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> String 
     cols.body
         .and_then(|idx| {
             batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row).to_string())
-                }
+                if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) }
             })
         })
         .unwrap_or_default()
@@ -192,13 +188,11 @@ fn extract_labels(
     let mut labels: HashMap<Arc<str>, Arc<str>> = HashMap::with_capacity(12);
 
     let extract_string = |idx: usize| -> Option<&str> {
-        batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
-            if arr.is_null(row) {
-                None
-            } else {
-                Some(arr.value(row))
-            }
-        })
+        batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .and_then(|arr| if arr.is_null(row) { None } else { Some(arr.value(row)) })
     };
 
     if let Some(idx) = cols.cloud_account_id {

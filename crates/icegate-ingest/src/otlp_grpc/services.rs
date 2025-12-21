@@ -6,9 +6,9 @@
 use icegate_common::LOGS_TOPIC;
 use icegate_queue::WriteChannel;
 use opentelemetry_proto::tonic::collector::{
-    logs::v1::{logs_service_server::LogsService, ExportLogsServiceRequest, ExportLogsServiceResponse},
-    metrics::v1::{metrics_service_server::MetricsService, ExportMetricsServiceRequest, ExportMetricsServiceResponse},
-    trace::v1::{trace_service_server::TraceService, ExportTraceServiceRequest, ExportTraceServiceResponse},
+    logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService},
+    metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse, metrics_service_server::MetricsService},
+    trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse, trace_service_server::TraceService},
 };
 use tonic::{Request, Response, Status};
 use tracing::debug;

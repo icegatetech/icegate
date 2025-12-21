@@ -16,7 +16,7 @@ use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::{DEFAULT_ACCOUNT_ID, DEFAULT_TENANT_ID};
 use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
-    common::v1::{any_value::Value, AnyValue},
+    common::v1::{AnyValue, any_value::Value},
 };
 
 /// Returns the Arrow schema for logs, derived from the Iceberg schema.

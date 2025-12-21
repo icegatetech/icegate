@@ -18,11 +18,11 @@ use std::{
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use icegate_common::catalog::{CatalogBackend, CatalogBuilder, CatalogConfig};
-use icegate_maintain::migrate::operations::{create_tables, upgrade_schemas, MigrationOperation};
+use icegate_maintain::migrate::operations::{MigrationOperation, create_tables, upgrade_schemas};
 use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage, ImageExt,
 };
 use testcontainers_modules::minio::MinIO;
 

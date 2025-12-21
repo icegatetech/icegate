@@ -47,9 +47,9 @@ pub mod storage;
 
 // Re-export commonly used types
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig};
-pub use config::{check_port_conflicts, load_config_file, ServerConfig};
+pub use config::{ServerConfig, check_port_conflicts, load_config_file};
 pub use error::Result;
 pub use storage::{
-    create_local_store, create_memory_store, create_object_store, create_s3_store, ObjectStoreWithPath, S3Config,
-    StorageBackend, StorageConfig,
+    ObjectStoreWithPath, S3Config, StorageBackend, StorageConfig, create_local_store, create_memory_store,
+    create_object_store, create_s3_store,
 };

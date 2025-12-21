@@ -17,13 +17,13 @@ use crate::{
     engine::QueryEngine,
     error::QueryError,
     logql::{
+        Parser, Planner,
         antlr::AntlrParser,
         datafusion::DataFusionPlanner,
         duration::parse_duration_opt,
         expr::LogQLExpr,
         log::Selector,
         planner::{QueryContext, SortDirection},
-        Parser, Planner,
     },
 };
 

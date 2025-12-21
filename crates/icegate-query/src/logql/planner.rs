@@ -28,9 +28,9 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 /// use chrono::TimeDelta;
 /// use datafusion::prelude::SessionContext;
 /// use icegate_query::logql::{
+///     LogExpr, LogQLExpr, Selector,
 ///     datafusion::DataFusionPlanner,
 ///     planner::{Planner, QueryContext, SortDirection},
-///     LogExpr, LogQLExpr, Selector,
 /// };
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {

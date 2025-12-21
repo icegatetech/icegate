@@ -11,7 +11,7 @@
 use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
 use serde_json::Value;
 
-use super::harness::{write_test_logs, TestServer};
+use super::harness::{TestServer, write_test_logs};
 
 #[tokio::test]
 async fn test_query_by_trace_id() -> Result<(), Box<dyn std::error::Error>> {

@@ -25,8 +25,8 @@ pub(crate) mod visitors;
 use std::sync::{Arc, Mutex};
 
 use antlr4rust::{
-    common_token_stream::CommonTokenStream, error_listener::ErrorListener, errors::ANTLRError,
-    input_stream::InputStream, recognizer::Recognizer, tree::ParseTreeVisitorCompat, Parser as AntlrParserTrait,
+    Parser as AntlrParserTrait, common_token_stream::CommonTokenStream, error_listener::ErrorListener,
+    errors::ANTLRError, input_stream::InputStream, recognizer::Recognizer, tree::ParseTreeVisitorCompat,
 };
 pub use logqllexer::LogQLLexer;
 pub use logqlparser::*;
@@ -82,7 +82,7 @@ impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectingErrorListener {
 /// # Examples
 ///
 /// ```
-/// use icegate_query::logql::{antlr::AntlrParser, parser::Parser, MatchOp};
+/// use icegate_query::logql::{MatchOp, antlr::AntlrParser, parser::Parser};
 ///
 /// let parser = AntlrParser::new();
 /// let expr = parser.parse(r#"{job="mysql"} |= "error""#).unwrap();

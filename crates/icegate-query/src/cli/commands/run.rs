@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 use icegate_common::CatalogBuilder;
 use tokio_util::sync::CancellationToken;
 
-use crate::{engine::QueryEngine, error::QueryError, QueryConfig};
+use crate::{QueryConfig, engine::QueryEngine, error::QueryError};
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors

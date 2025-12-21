@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use iceberg::{
+    Error, ErrorKind,
     spec::{
         ListType, MapType, NestedField, PartitionSpec, PrimitiveType, Schema, SortDirection, SortField, SortOrder,
         StructType, Transform, Type,
     },
-    Error, ErrorKind,
 };
 
 use crate::error::Result;

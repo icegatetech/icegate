@@ -8,7 +8,7 @@ use opentelemetry_proto::tonic::collector::{
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
-use super::{services::OtlpGrpcService, OtlpGrpcConfig};
+use super::{OtlpGrpcConfig, services::OtlpGrpcService};
 
 /// Run the OTLP gRPC server.
 ///

@@ -3,7 +3,7 @@
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::QueueError, Topic};
+use crate::{Topic, error::QueueError};
 
 /// Number of digits for zero-padded offset (max u64 = 18446744073709551615 = 20 digits).
 const OFFSET_DIGITS: usize = 20;

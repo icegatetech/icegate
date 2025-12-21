@@ -12,7 +12,7 @@ use datafusion::{
         buffer::{OffsetBuffer, ScalarBuffer},
         datatypes::DataType,
     },
-    common::{plan_err, Result},
+    common::{Result, plan_err},
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
 
@@ -282,7 +282,7 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
         _ => {
             return Err(datafusion::error::DataFusionError::Plan(
                 "Expected Map data type".to_string(),
-            ))
+            ));
         },
     };
 
@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         let offsets = result.offsets();
         assert_eq!(offsets[1] - offsets[0], 2); // 2 entries remain (level,
-                                                // service)
+        // service)
     }
 
     #[test]

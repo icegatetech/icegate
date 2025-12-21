@@ -4,12 +4,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use icegate_common::{
+    EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE,
     schema::{
         events_partition_spec, events_schema, events_sort_order, logs_partition_spec, logs_schema, logs_sort_order,
         metrics_partition_spec, metrics_schema, metrics_sort_order, spans_partition_spec, spans_schema,
         spans_sort_order,
     },
-    EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE,
 };
 
 use crate::error::Result;

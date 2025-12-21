@@ -1,6 +1,6 @@
 //! Common types shared across LogQL expression modules.
 
-pub use crate::error::{parse_error, ParseError, QueryError};
+pub use crate::error::{ParseError, QueryError, parse_error};
 
 /// Match operator for label matchers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

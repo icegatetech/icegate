@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use icegate_common::{check_port_conflicts, load_config_file, CatalogConfig, StorageConfig};
+use icegate_common::{CatalogConfig, StorageConfig, check_port_conflicts, load_config_file};
 use serde::{Deserialize, Serialize};
 
 use super::{engine::QueryEngineConfig, loki::LokiConfig, prometheus::PrometheusConfig, tempo::TempoConfig};

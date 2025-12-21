@@ -3,8 +3,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use iceberg::{
-    memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE},
     Catalog, CatalogBuilder as IcebergCatalogBuilder,
+    memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
 };
 use iceberg_catalog_rest::RestCatalogBuilder;
 

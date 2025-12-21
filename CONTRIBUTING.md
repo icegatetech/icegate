@@ -13,7 +13,7 @@ Thank you for your interest in contributing to IceGate! This document provides g
 
 ### Prerequisites
 
-- **Rust** >= 1.92.0 (for Rust 2021 edition support)
+- **Rust** >= 1.92.0 (for Rust 2024 edition support)
 - **Cargo** (included with Rust)
 - **Git**
 - **Docker** and **Docker Compose** (for development environment)

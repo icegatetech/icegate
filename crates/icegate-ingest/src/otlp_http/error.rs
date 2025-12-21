@@ -4,9 +4,9 @@
 //! [`OtlpError`] newtype wrapper implementing axum's `IntoResponse`.
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 
 use super::models::{ErrorResponse, ErrorType};

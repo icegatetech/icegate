@@ -47,7 +47,7 @@ mod reader;
 mod segment;
 mod writer;
 
-pub use channel::{channel, Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult};
+pub use channel::{Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult, channel};
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
 pub use reader::QueueReader;

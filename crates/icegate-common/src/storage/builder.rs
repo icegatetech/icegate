@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use object_store::{aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory, ObjectStore};
+use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 
 use super::StorageBackend;
 use crate::error::{CommonError, Result};

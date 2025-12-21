@@ -2,7 +2,7 @@
 #![allow(clippy::ignored_unit_patterns)] // Ok(()) patterns are common in test matching
 
 use antlr4rust::{
-    common_token_stream::CommonTokenStream, input_stream::InputStream, tree::ParseTree, Parser as AntlrParserTrait,
+    Parser as AntlrParserTrait, common_token_stream::CommonTokenStream, input_stream::InputStream, tree::ParseTree,
 };
 use chrono::TimeDelta;
 
@@ -55,11 +55,7 @@ fn parse_query(query: &str) -> std::result::Result<(), Vec<String>> {
     match parser.root() {
         Ok(_) => {
             let all_errors = collect_errors();
-            if all_errors.is_empty() {
-                Ok(())
-            } else {
-                Err(all_errors)
-            }
+            if all_errors.is_empty() { Ok(()) } else { Err(all_errors) }
         },
         Err(_) => Err(collect_errors()),
     }
@@ -753,7 +749,7 @@ fn test_invalid_queries_fail() {
 
     // Invalid binary operation
     assert_fails(r"1 +"); // Missing right operand
-                          // Note: "+ 1" is actually valid (unary plus), so it's not an error case
+    // Note: "+ 1" is actually valid (unary plus), so it's not an error case
 
     // Invalid grouping
     assert_fails(r"sum by ()"); // Missing expression

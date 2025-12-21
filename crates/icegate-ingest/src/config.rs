@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use icegate_common::{check_port_conflicts, load_config_file, CatalogConfig, StorageConfig};
+use icegate_common::{CatalogConfig, StorageConfig, check_port_conflicts, load_config_file};
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 

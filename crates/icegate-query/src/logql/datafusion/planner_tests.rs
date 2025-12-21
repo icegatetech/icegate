@@ -5,8 +5,8 @@ use std::sync::Arc;
 use chrono::{TimeDelta, TimeZone, Utc};
 use datafusion::{
     logical_expr::{
-        logical_plan::{Filter, Limit, Projection},
         BinaryExpr, Expr, LogicalPlan, Operator,
+        logical_plan::{Filter, Limit, Projection},
     },
     prelude::{DataFrame, SessionContext},
     scalar::ScalarValue,
@@ -20,7 +20,7 @@ fn get_logical_plan(df: &DataFrame) -> &LogicalPlan {
     df.logical_plan()
 }
 use icegate_common::{
-    schema::logs_schema, CatalogBackend, CatalogBuilder, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE,
+    CatalogBackend, CatalogBuilder, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE, schema::logs_schema,
 };
 
 use crate::logql::{
@@ -28,7 +28,7 @@ use crate::logql::{
     expr::LogQLExpr,
     log::{LabelMatcher, LineFilter, LogExpr, PipelineStage, Selector},
     metric::MetricExpr,
-    planner::{Planner, QueryContext, SortDirection, DEFAULT_LOG_LIMIT},
+    planner::{DEFAULT_LOG_LIMIT, Planner, QueryContext, SortDirection},
 };
 
 // ============================================================================

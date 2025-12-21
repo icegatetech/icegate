@@ -4,23 +4,23 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::{
     array::ArrayRef,
-    compute::{lexsort_to_indices, take, SortColumn, SortOptions},
+    compute::{SortColumn, SortOptions, lexsort_to_indices, take},
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    Topic,
     accumulator::TopicAccumulator,
     channel::{WriteReceiver, WriteRequest},
     config::QueueConfig,
     error::{QueueError, Result},
     segment::SegmentId,
-    Topic,
 };
 
 /// Queue writer that persists Arrow `RecordBatches` to Parquet on object

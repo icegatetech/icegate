@@ -1,11 +1,11 @@
 //! OTLP HTTP request handlers
 
 use axum::{
+    Json,
     body::Bytes,
     extract::State,
-    http::{header::CONTENT_TYPE, HeaderMap},
+    http::{HeaderMap, header::CONTENT_TYPE},
     response::IntoResponse,
-    Json,
 };
 use icegate_common::LOGS_TOPIC;
 use icegate_queue::{WriteRequest, WriteResult};
@@ -165,7 +165,7 @@ pub async fn health() -> impl IntoResponse {
 mod tests {
     use axum::body::Bytes;
     use opentelemetry_proto::tonic::{
-        common::v1::{any_value::Value, AnyValue, KeyValue},
+        common::v1::{AnyValue, KeyValue, any_value::Value},
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
         resource::v1::Resource,
     };

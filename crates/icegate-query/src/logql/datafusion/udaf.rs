@@ -29,8 +29,8 @@ use datafusion::{
     common::{Result, ScalarValue},
     error::DataFusionError,
     logical_expr::{
-        function::{AccumulatorArgs, StateFieldsArgs},
         Accumulator, AggregateUDFImpl, Signature, Volatility,
+        function::{AccumulatorArgs, StateFieldsArgs},
     },
     physical_plan::PhysicalExpr,
 };
@@ -356,7 +356,7 @@ fn extract_timestamp_micros_from_expr(expr: &Arc<dyn PhysicalExpr>) -> Result<i6
             other => {
                 return Err(DataFusionError::Plan(format!(
                     "Expected TimestampMicrosecond, got: {other:?}"
-                )))
+                )));
             },
         }
     }
@@ -390,7 +390,7 @@ fn extract_interval_micros_from_expr(expr: &Arc<dyn PhysicalExpr>) -> Result<i64
             other => {
                 return Err(DataFusionError::Plan(format!(
                     "Expected IntervalMonthDayNano, got: {other:?}"
-                )))
+                )));
             },
         }
     }
@@ -1186,9 +1186,9 @@ mod tests {
                 let values = struct_arr.column(1);
                 let float_arr = values.as_any().downcast_ref::<Float64Array>().unwrap();
                 assert!((float_arr.value(0) - 3.0).abs() < f64::EPSILON); // 300
-                                                                          // / 100
-                                                                          // = 3.
-                                                                          // 0
+                // / 100
+                // = 3.
+                // 0
             },
             _ => panic!("Expected List"),
         }

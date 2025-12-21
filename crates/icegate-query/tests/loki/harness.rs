@@ -20,27 +20,27 @@ use datafusion::{
     parquet::file::properties::WriterProperties,
 };
 use iceberg::{
+    Catalog,
     spec::DataFileFormat,
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
     writer::{
+        IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
+            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
             rolling_writer::RollingFileWriterBuilder,
-            ParquetWriterBuilder,
         },
-        IcebergWriter, IcebergWriterBuilder,
     },
-    Catalog,
 };
-use icegate_common::{catalog::CatalogBuilder, schema, CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE};
+use icegate_common::{CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE, catalog::CatalogBuilder, schema};
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
     loki::LokiConfig,
 };
 use reqwest::Client;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 /// Test server configuration and handles

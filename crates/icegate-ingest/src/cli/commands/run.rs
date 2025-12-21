@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 
 use icegate_common::create_object_store;
-use icegate_queue::{channel, QueueConfig, QueueWriter};
+use icegate_queue::{QueueConfig, QueueWriter, channel};
 use tokio_util::sync::CancellationToken;
 
-use crate::{error::IngestError, IngestConfig};
+use crate::{IngestConfig, error::IngestError};
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors
@@ -59,7 +59,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IngestError> {
     queue_config.base_path = normalized_path;
 
     let writer = QueueWriter::new(queue_config, store);
-    let _writer_handle = writer.start(write_rx);
+    let writer_handle = writer.start(write_rx);
 
     tracing::info!("WAL queue initialized successfully");
 
@@ -89,6 +89,11 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IngestError> {
 
     if handles.is_empty() {
         tracing::warn!("No OTLP servers are enabled in configuration");
+        // Orderly shutdown: close channel so writer loop can exit, then await it
+        drop(write_tx);
+        if let Err(e) = writer_handle.await {
+            tracing::error!("Writer task failed: {}", e);
+        }
         return Ok(());
     }
 
@@ -111,6 +116,16 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IngestError> {
     }
 
     tracing::info!("All OTLP servers stopped gracefully");
+
+    // Close the write channel so the writer loop can exit
+    drop(write_tx);
+
+    // Wait for the writer task to finish
+    if let Err(e) = writer_handle.await {
+        tracing::error!("Writer task failed: {}", e);
+    }
+
+    tracing::info!("WAL writer stopped gracefully");
 
     Ok(())
 }

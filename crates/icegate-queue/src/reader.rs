@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore};
+use object_store::{ObjectStore, path::Path};
 use parquet::{
     arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
     file::reader::{FileReader, SerializedFileReader},
@@ -13,9 +13,9 @@ use parquet::{
 use tracing::debug;
 
 use crate::{
+    Topic,
     error::Result,
     segment::{SegmentId, SegmentMetadata, SegmentStatus},
-    Topic,
 };
 
 /// Queue reader for reading Parquet segments from object storage.
