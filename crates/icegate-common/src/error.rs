@@ -27,4 +27,8 @@ pub enum CommonError {
     /// I/O error (file reading).
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+
+    /// Object store error.
+    #[error("object store error: {0}")]
+    ObjectStore(#[from] object_store::Error),
 }

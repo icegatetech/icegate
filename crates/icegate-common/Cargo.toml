@@ -18,6 +18,9 @@ workspace = true
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 
+# Storage
+object_store = { workspace = true }
+
 # Configuration
 serde = { workspace = true }
 serde_yaml = { workspace = true }
