@@ -6,7 +6,7 @@ use icegate_common::create_object_store;
 use icegate_queue::{QueueConfig, QueueWriter, channel};
 use tokio_util::sync::CancellationToken;
 
-use crate::{IngestConfig, error::IngestError};
+use crate::{IngestConfig, error::Result};
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors
@@ -39,7 +39,7 @@ async fn shutdown_signal() {
 /// Execute the run command
 ///
 /// Starts all enabled OTLP servers and runs until Ctrl+C
-pub async fn execute(config_path: PathBuf) -> Result<(), IngestError> {
+pub async fn execute(config_path: PathBuf) -> Result<()> {
     // Load configuration
     tracing::info!("Loading configuration from {:?}", config_path);
     let config = IngestConfig::from_file(config_path)?;
@@ -91,10 +91,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IngestError> {
         tracing::warn!("No OTLP servers are enabled in configuration");
         // Orderly shutdown: close channel so writer loop can exit, then await it
         drop(write_tx);
-        if let Err(e) = writer_handle.await {
-            tracing::error!("Writer task failed: {}", e);
-        }
-        return Ok(());
+        return Ok(writer_handle.await??);
     }
 
     tracing::info!("All enabled OTLP servers started");
@@ -110,9 +107,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IngestError> {
 
     // Wait for all servers to stop
     for handle in handles {
-        if let Err(e) = handle.await {
-            tracing::error!("Server task failed: {}", e);
-        }
+        handle.await??;
     }
 
     tracing::info!("All OTLP servers stopped gracefully");
@@ -121,11 +116,5 @@ pub async fn execute(config_path: PathBuf) -> Result<(), IngestError> {
     drop(write_tx);
 
     // Wait for the writer task to finish
-    if let Err(e) = writer_handle.await {
-        tracing::error!("Writer task failed: {}", e);
-    }
-
-    tracing::info!("WAL writer stopped gracefully");
-
-    Ok(())
+    Ok(writer_handle.await??)
 }

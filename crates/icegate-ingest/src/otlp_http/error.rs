@@ -37,9 +37,13 @@ impl IntoResponse for OtlpError {
             IngestError::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, ErrorType::NotImplemented),
 
             // 500 Internal Server Error
-            IngestError::Io(_) | IngestError::Queue(_) | IngestError::Config(_) | IngestError::Iceberg(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::Internal)
-            },
+            IngestError::Io(_)
+            | IngestError::Queue(_)
+            | IngestError::Config(_)
+            | IngestError::Iceberg(_)
+            | IngestError::Join(_)
+            | IngestError::Other(_)
+            | IngestError::Multiple(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::Internal),
         };
 
         (status, Json(ErrorResponse::new(error_type, self.0.to_string()))).into_response()

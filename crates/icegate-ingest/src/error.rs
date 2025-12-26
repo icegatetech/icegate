@@ -1,6 +1,6 @@
 //! Error types for ingest operations.
 
-use std::io;
+use std::{error::Error, io};
 
 /// Result type alias for ingest operations.
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -35,6 +35,18 @@ pub enum IngestError {
     /// Underlying Iceberg error (from catalog operations).
     #[error("iceberg error: {0}")]
     Iceberg(#[from] iceberg::Error),
+
+    /// Runtime error
+    #[error("join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    /// Other errors
+    #[error("other error: {0}")]
+    Other(#[from] Box<dyn Error + Send + Sync>),
+
+    /// Multiple errors
+    #[error("multiple errors: {0:?}")]
+    Multiple(Vec<IngestError>),
 }
 
 impl From<icegate_common::error::CommonError> for IngestError {

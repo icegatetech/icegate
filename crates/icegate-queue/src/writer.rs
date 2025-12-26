@@ -8,7 +8,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{TryStreamExt, future::join_all};
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
@@ -62,15 +62,16 @@ impl QueueWriter {
     /// 2. Flush ticker that periodically checks for time-based flushes
     ///
     /// Returns a handle to the main task.
-    pub fn start(self, mut receiver: WriteReceiver) -> tokio::task::JoinHandle<()> {
+    pub fn start(self, mut receiver: WriteReceiver) -> tokio::task::JoinHandle<Result<()>> {
         let writer = Arc::new(self);
         let flush_writer = Arc::clone(&writer);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Spawn flush ticker task
-        let flush_interval = Duration::from_millis(writer.config.flush_interval_ms / 2);
+        // To make a flush interval is more precise make the check interval is smaller than the one
+        let check_flush_interval = Duration::from_millis(writer.config.flush_interval_ms / 2);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(flush_interval);
+            let mut interval = tokio::time::interval(check_flush_interval);
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -88,16 +89,13 @@ impl QueueWriter {
         // Main request processing task
         tokio::spawn(async move {
             // Recover offsets from existing segments before processing
-            if let Err(e) = writer.recover().await {
-                error!("Failed to recover queue state: {}", e);
-            }
+            writer.recover().await?;
 
             info!("Queue writer started");
 
             while let Some(request) = receiver.recv().await {
                 let writer = Arc::clone(&writer);
                 let result = writer.handle_request(request).await;
-
                 if let Err(e) = result {
                     error!("Failed to handle write request: {}", e);
                 }
@@ -105,14 +103,13 @@ impl QueueWriter {
 
             // Flush all pending batches on shutdown
             info!("Queue writer shutting down, flushing pending batches...");
-            if let Err(e) = writer.flush_all().await {
-                error!("Failed to flush on shutdown: {}", e);
-            }
+            writer.flush_all().await?;
 
             // Signal the flush ticker task to stop
             let _ = shutdown_tx.send(());
 
             info!("Queue writer stopped (channel closed)");
+            Ok(())
         })
     }
 
@@ -148,12 +145,15 @@ impl QueueWriter {
                 .collect()
         };
 
-        for topic in topics_to_flush {
-            if let Err(e) = self.flush_topic(&topic).await {
-                warn!("Failed to flush topic {}: {}", topic, e);
-            }
+        let errors: Vec<_> =
+            join_all(topics_to_flush.into_iter().map(|topic| async move { self.flush_topic(&topic).await }))
+                .await
+                .into_iter()
+                .filter_map(Result::err)
+                .collect();
+        if !errors.is_empty() {
+            return Err(QueueError::Multiple(errors));
         }
-
         Ok(())
     }
 
@@ -216,7 +216,7 @@ impl QueueWriter {
     ///
     /// This is the core write method used internally. For normal usage, prefer
     /// using the channel-based approach via `start()`.
-    pub async fn write_batch(
+    async fn write_batch(
         &self,
         topic: &Topic,
         batch: RecordBatch,
@@ -386,6 +386,9 @@ impl QueueWriter {
                         topic, offset, attempts
                     );
                     // Increment offset and retry (loop continues)
+                    let interval = self.config.flush_interval_ms / 4; // 25% delta
+                    let delay = self.config.flush_interval_ms + rand::random_range(interval..=interval);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
                 },
                 Err(e) => return Err(e),
             }

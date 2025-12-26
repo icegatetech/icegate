@@ -3570,6 +3570,7 @@ dependencies = [
  "arrow",
  "axum 0.7.9",
  "clap",
+ "futures",
  "hex",
  "iceberg",
  "icegate-common",
@@ -3643,14 +3644,13 @@ name = "icegate-queue"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "async-stream",
  "bytes",
  "futures",
  "object_store",
  "parquet",
+ "rand 0.9.2",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",

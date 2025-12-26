@@ -24,9 +24,6 @@ icegate-queue = { path = "../icegate-queue" }
 # Apache Arrow
 arrow = { workspace = true }
 
-# Object storage
-object_store = { workspace = true }
-
 # Iceberg
 iceberg = { workspace = true }
 
@@ -46,7 +43,6 @@ hex = { workspace = true }
 
 # HTTP server
 axum = { workspace = true }
-tower-http = { workspace = true }
 
 # gRPC server
 tonic = { workspace = true }

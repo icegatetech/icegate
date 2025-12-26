@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::error::IngestError;
+use crate::error::Result;
 
 mod commands;
 
@@ -38,7 +38,7 @@ impl Cli {
     /// # Errors
     ///
     /// Returns an error if the command execution fails
-    pub async fn execute(self) -> Result<(), IngestError> {
+    pub async fn execute(self) -> Result<()> {
         match self.command {
             Commands::Version => commands::version::execute(),
             Commands::Run {

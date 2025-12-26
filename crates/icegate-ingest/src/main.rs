@@ -5,10 +5,10 @@
 #![allow(clippy::print_stderr)]
 
 use clap::Parser;
-use icegate_ingest::cli::Cli;
+use icegate_ingest::{cli::Cli, error::Result};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     // Initialize tracing subscriber for logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -19,12 +19,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse CLI arguments
     let cli = Cli::parse();
-
-    // Execute command
-    if let Err(e) = cli.execute().await {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
-    }
-
-    Ok(())
+    cli.execute().await
 }

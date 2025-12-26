@@ -84,4 +84,8 @@ pub enum QueueError {
     /// Configuration error.
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// Multiple errors occurred.
+    #[error("multiple errors occurred: {0:?}")]
+    Multiple(Vec<QueueError>),
 }
