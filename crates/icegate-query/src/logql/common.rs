@@ -1,16 +1,6 @@
 //! Common types shared across LogQL expression modules.
 
-use icegate_common::errors::{IceGateError, ParseError};
-
-/// Create a parse error with the given message.
-pub fn parse_error(message: impl Into<String>) -> IceGateError {
-    IceGateError::Parse(vec![ParseError {
-        line: 0,
-        column: 0,
-        message: message.into(),
-        antlr_error: None,
-    }])
-}
+pub use crate::error::{ParseError, QueryError, parse_error};
 
 /// Match operator for label matchers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

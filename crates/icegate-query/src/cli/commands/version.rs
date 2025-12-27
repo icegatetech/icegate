@@ -1,12 +1,12 @@
 //! Version command implementation
 
-use icegate_common::errors::IceGateError;
+use crate::error::QueryError;
 
 /// Execute the version command
 ///
 /// Shows version information about `IceGate` and its dependencies
 #[allow(clippy::unnecessary_wraps, clippy::print_stdout)]
-pub fn execute() -> Result<(), IceGateError> {
+pub fn execute() -> Result<(), QueryError> {
     println!("IceGate v{}", env!("CARGO_PKG_VERSION"));
     println!("Observability data lake query engine");
     println!();

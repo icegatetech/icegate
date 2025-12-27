@@ -10,21 +10,17 @@
 use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
 use serde_json::Value;
 
-use super::harness::{write_test_logs_for_tenant, TestServer};
+use super::harness::{TestServer, write_test_logs_for_tenant};
 
 #[tokio::test]
 async fn test_tenant_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3211).await?;
 
     // Insert test data for two different tenants
-    let table = catalog
-        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
-        .await?;
+    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
     write_test_logs_for_tenant(&table, &catalog, "tenant-alpha", "alpha-service", "Alpha").await?;
 
-    let table = catalog
-        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
-        .await?;
+    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
     write_test_logs_for_tenant(&table, &catalog, "tenant-beta", "beta-service", "Beta").await?;
 
     // Query as tenant-alpha - should only see alpha's logs
@@ -134,14 +130,10 @@ async fn test_labels_tenant_isolation() -> Result<(), Box<dyn std::error::Error>
     let (server, catalog) = TestServer::start(3212).await?;
 
     // Insert test data for two different tenants
-    let table = catalog
-        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
-        .await?;
+    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
     write_test_logs_for_tenant(&table, &catalog, "tenant-gamma", "gamma-service", "Gamma").await?;
 
-    let table = catalog
-        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
-        .await?;
+    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
     write_test_logs_for_tenant(&table, &catalog, "tenant-delta", "delta-service", "Delta").await?;
 
     // Query label values for service_name as tenant-gamma

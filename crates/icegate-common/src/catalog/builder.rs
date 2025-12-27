@@ -3,13 +3,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use iceberg::{
-    memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE},
     Catalog, CatalogBuilder as IcebergCatalogBuilder,
+    memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
 };
 use iceberg_catalog_rest::RestCatalogBuilder;
 
 use super::{CatalogBackend, CatalogConfig};
-use crate::Result;
+use crate::error::Result;
 
 /// Factory for creating catalog instances from configuration
 pub struct CatalogBuilder;

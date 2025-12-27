@@ -1,8 +1,8 @@
 //! Prometheus API routes
 
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 
 use super::{handlers, server::PrometheusState};

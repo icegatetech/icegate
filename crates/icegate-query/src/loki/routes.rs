@@ -1,6 +1,6 @@
 //! Loki API routes
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 

@@ -8,7 +8,7 @@
 //! All range aggregation UDAFs share a common `GridAccumulator` base that
 //! handles:
 //! - Time grid generation
-//! - Vectorized grid-major update (processes all timestamps per grid point)
+//! - Timestamp-major iteration with binary search (O(T * log G) where T=timestamps, G=grid)
 //! - State serialization for distributed execution
 //! - Merge logic for combining partial results
 //!
@@ -21,18 +21,16 @@ use std::{any::Any, sync::Arc};
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, DurationMicrosecondArray, Float64Array, ListArray, Scalar, StringArray, StructArray,
-            TimestampMicrosecondArray, UInt64Array,
+            Array, ArrayRef, Float64Array, ListArray, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
         },
         buffer::OffsetBuffer,
-        compute::kernels::{boolean, cmp, numeric},
         datatypes::{DataType, Field, Fields, IntervalMonthDayNano, TimeUnit},
     },
     common::{Result, ScalarValue},
     error::DataFusionError,
     logical_expr::{
-        function::{AccumulatorArgs, StateFieldsArgs},
         Accumulator, AggregateUDFImpl, Signature, Volatility,
+        function::{AccumulatorArgs, StateFieldsArgs},
     },
     physical_plan::PhysicalExpr,
 };
@@ -43,25 +41,22 @@ use datafusion::{
 
 /// Base accumulator for time-bucketed range aggregations.
 ///
-/// Handles grid generation, state serialization, merging, and vectorized
-/// updates. Uses **grid-major iteration** for better performance: iterates over
-/// grid points (typically ~100) instead of input timestamps (typically
-/// ~10,000), reducing intermediate array allocations by ~100x.
+/// Handles grid generation, state serialization, merging, and efficient
+/// timestamp-major iteration. Uses **binary search** to find matching grid
+/// ranges for each timestamp, which is O(T * (log G + M)) where T=timestamps,
+/// G=grid points, M=matching grid points per timestamp.
 ///
-/// # Vectorization Strategy
+/// # Iteration Strategy
 ///
-/// Instead of:
+/// For sparse data (few timestamps per batch, many grid points):
 /// ```text
-/// for each timestamp t:           // 10,000 iterations
-///     diff = grid - t             // creates grid-size array each time
+/// for each timestamp t:           // 1-10 iterations
+///     binary_search(grid, t + offset)  // O(log G)
+///     increment matching range    // O(M) where M << G typically
 /// ```
 ///
-/// We do:
-/// ```text
-/// for each grid_point g:          // 100 iterations
-///     diff = g - timestamps       // creates timestamp-size array each time
-///     count = sum(matches)        // single scalar result
-/// ```
+/// This is optimal when `num_timestamps` << `num_grid_points`, which is the
+/// typical case for per-file batches (1-10 timestamps) vs query grids (100+).
 #[derive(Debug)]
 pub struct GridAccumulator {
     /// Grid timestamps (microseconds).
@@ -176,86 +171,78 @@ impl GridAccumulator {
             + self.values.capacity() * std::mem::size_of::<u64>()
     }
 
-    /// Updates counts using grid-major vectorized iteration.
+    /// Updates counts using timestamp-major iteration with binary search.
     ///
-    /// For each grid point, computes which input timestamps fall within its
-    /// range window, then counts them. This is more efficient than the inverse
-    /// (iterating timestamps) when `num_timestamps` >> `num_grid_points`.
-    pub fn update_counts(&mut self, timestamps: &TimestampMicrosecondArray) -> Result<()> {
+    /// For each timestamp, finds the range of grid points it affects using
+    /// binary search, then increments those grid points. This is efficient
+    /// when `num_timestamps` << `num_grid_points` (typical case: 1-10 timestamps
+    /// per batch vs 100+ grid points).
+    ///
+    /// A timestamp `t` matches grid point `g` when: `offset <= (g - t) <= upper_bound`
+    /// Rearranging: `t + offset <= g <= t + upper_bound`
+    pub fn update_counts(&mut self, timestamps: &TimestampMicrosecondArray) {
         if timestamps.is_empty() {
-            return Ok(());
+            return;
         }
 
-        // Pre-compute duration scalars for vectorized comparison
-        let offset_scalar = Scalar::new(DurationMicrosecondArray::from(vec![self.offset_micros]));
-        let upper_scalar = Scalar::new(DurationMicrosecondArray::from(vec![self.upper_bound_micros]));
+        // Timestamp-major iteration: for each timestamp, find matching grid range
+        for i in 0..timestamps.len() {
+            if timestamps.is_null(i) {
+                continue;
+            }
+            let t = timestamps.value(i);
 
-        // Grid-major iteration: for each grid point, find matching timestamps
-        for (grid_idx, &grid_val) in self.grid.iter().enumerate() {
-            // Broadcast: compute (grid_val - all_timestamps) in one vectorized pass
-            let grid_scalar = Scalar::new(TimestampMicrosecondArray::from(vec![grid_val]));
-            let diff = numeric::sub(&grid_scalar, timestamps)?;
+            // Grid point g matches if: t + offset <= g <= t + upper_bound
+            let lower_grid = t + self.offset_micros;
+            let upper_grid = t + self.upper_bound_micros;
 
-            // Vectorized bounds check: offset <= diff <= upper_bound
-            let lower_ok = cmp::gt_eq(&diff, &offset_scalar)?;
-            let upper_ok = cmp::lt_eq(&diff, &upper_scalar)?;
-            let mask = boolean::and(&lower_ok, &upper_ok)?;
+            // Binary search for first grid point >= lower_grid
+            let start_idx = self.grid.partition_point(|&g| g < lower_grid);
 
-            // Count matching timestamps (sum of true values)
-            #[allow(clippy::cast_possible_truncation)]
-            let count = mask.true_count() as u64;
-            self.values[grid_idx] += count;
+            // Increment counts for all matching grid points
+            for idx in start_idx..self.grid.len() {
+                if self.grid[idx] > upper_grid {
+                    break;
+                }
+                self.values[idx] += 1;
+            }
         }
-
-        Ok(())
     }
 
-    /// Updates byte sums using grid-major vectorized iteration.
+    /// Updates byte sums using timestamp-major iteration with binary search.
     ///
     /// Similar to `update_counts`, but sums byte lengths of body values
     /// for matching timestamps instead of just counting.
-    fn update_bytes(&mut self, timestamps: &TimestampMicrosecondArray, bodies: &StringArray) -> Result<()> {
+    fn update_bytes(&mut self, timestamps: &TimestampMicrosecondArray, bodies: &StringArray) {
         if timestamps.is_empty() {
-            return Ok(());
+            return;
         }
 
-        // Pre-compute byte lengths for all bodies
-        let byte_lengths: Vec<u64> = (0..bodies.len())
-            .map(|i| {
-                if bodies.is_null(i) {
-                    0
-                } else {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let len = bodies.value(i).len() as u64;
-                    len
+        // Timestamp-major iteration: for each timestamp, find matching grid range
+        for i in 0..timestamps.len() {
+            if timestamps.is_null(i) || bodies.is_null(i) {
+                continue;
+            }
+            let t = timestamps.value(i);
+
+            #[allow(clippy::cast_possible_truncation)]
+            let byte_len = bodies.value(i).len() as u64;
+
+            // Grid point g matches if: t + offset <= g <= t + upper_bound
+            let lower_grid = t + self.offset_micros;
+            let upper_grid = t + self.upper_bound_micros;
+
+            // Binary search for first grid point >= lower_grid
+            let start_idx = self.grid.partition_point(|&g| g < lower_grid);
+
+            // Add byte length for all matching grid points
+            for idx in start_idx..self.grid.len() {
+                if self.grid[idx] > upper_grid {
+                    break;
                 }
-            })
-            .collect();
-
-        // Pre-compute duration scalars
-        let offset_scalar = Scalar::new(DurationMicrosecondArray::from(vec![self.offset_micros]));
-        let upper_scalar = Scalar::new(DurationMicrosecondArray::from(vec![self.upper_bound_micros]));
-
-        // Grid-major iteration
-        for (grid_idx, &grid_val) in self.grid.iter().enumerate() {
-            let grid_scalar = Scalar::new(TimestampMicrosecondArray::from(vec![grid_val]));
-            let diff = numeric::sub(&grid_scalar, timestamps)?;
-
-            let lower_ok = cmp::gt_eq(&diff, &offset_scalar)?;
-            let upper_ok = cmp::lt_eq(&diff, &upper_scalar)?;
-            let mask = boolean::and(&lower_ok, &upper_ok)?;
-
-            // Sum byte lengths where mask is true
-            let sum: u64 = mask
-                .iter()
-                .zip(byte_lengths.iter())
-                .filter_map(|(m, &bytes)| m.and_then(|matched| if matched { Some(bytes) } else { None }))
-                .sum();
-
-            self.values[grid_idx] += sum;
+                self.values[idx] += byte_len;
+            }
         }
-
-        Ok(())
     }
 
     /// Builds sparse output as `List<Struct { timestamp, value: UInt64 }>`.
@@ -369,7 +356,7 @@ fn extract_timestamp_micros_from_expr(expr: &Arc<dyn PhysicalExpr>) -> Result<i6
             other => {
                 return Err(DataFusionError::Plan(format!(
                     "Expected TimestampMicrosecond, got: {other:?}"
-                )))
+                )));
             },
         }
     }
@@ -403,7 +390,7 @@ fn extract_interval_micros_from_expr(expr: &Arc<dyn PhysicalExpr>) -> Result<i64
             other => {
                 return Err(DataFusionError::Plan(format!(
                     "Expected IntervalMonthDayNano, got: {other:?}"
-                )))
+                )));
             },
         }
     }
@@ -539,7 +526,8 @@ impl Accumulator for CountOverTimeAccumulator {
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .ok_or_else(|| DataFusionError::Plan("Expected TimestampMicrosecondArray".to_string()))?;
-        self.0.update_counts(timestamps)
+        self.0.update_counts(timestamps);
+        Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
@@ -633,7 +621,8 @@ impl Accumulator for RateOverTimeAccumulator {
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .ok_or_else(|| DataFusionError::Plan("Expected TimestampMicrosecondArray".to_string()))?;
-        self.0.update_counts(timestamps)
+        self.0.update_counts(timestamps);
+        Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
@@ -735,7 +724,8 @@ impl Accumulator for BytesOverTimeAccumulator {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| DataFusionError::Plan("Expected StringArray for body".to_string()))?;
-        self.0.update_bytes(timestamps, bodies)
+        self.0.update_bytes(timestamps, bodies);
+        Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
@@ -833,7 +823,8 @@ impl Accumulator for BytesRateAccumulator {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| DataFusionError::Plan("Expected StringArray for body".to_string()))?;
-        self.0.update_bytes(timestamps, bodies)
+        self.0.update_bytes(timestamps, bodies);
+        Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
@@ -928,7 +919,8 @@ impl Accumulator for AbsentOverTimeAccumulator {
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .ok_or_else(|| DataFusionError::Plan("Expected TimestampMicrosecondArray".to_string()))?;
-        self.0.update_counts(timestamps)
+        self.0.update_counts(timestamps);
+        Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
@@ -1002,7 +994,7 @@ mod tests {
         let mut acc = GridAccumulator::new(0, 200, 100, 150, 0).unwrap();
 
         let timestamps = TimestampMicrosecondArray::from(vec![50i64]);
-        acc.update_counts(&timestamps).unwrap();
+        acc.update_counts(&timestamps);
 
         assert_eq!(acc.values[0], 0); // grid=0, diff=-50, outside [0,150]
         assert_eq!(acc.values[1], 1); // grid=100, diff=50, inside [0,150]
@@ -1018,7 +1010,7 @@ mod tests {
         // t=50: matches grid 50..150 → grid 100 (diff=50)
         // t=150: matches grid 150..250 → grid 200 (diff=50)
         let timestamps = TimestampMicrosecondArray::from(vec![0i64, 50, 150]);
-        acc.update_counts(&timestamps).unwrap();
+        acc.update_counts(&timestamps);
 
         assert_eq!(acc.values[0], 1); // only t=0 matches
         assert_eq!(acc.values[1], 2); // t=0 (diff=100) and t=50 (diff=50)
@@ -1034,7 +1026,7 @@ mod tests {
         // t=50: grid 0 → diff=-50 (no), grid 100 → diff=50 (yes), grid 200 → diff=150
         // (no)
         let timestamps = TimestampMicrosecondArray::from(vec![50i64]);
-        acc.update_counts(&timestamps).unwrap();
+        acc.update_counts(&timestamps);
 
         assert_eq!(acc.values[0], 0);
         assert_eq!(acc.values[1], 1);
@@ -1046,7 +1038,7 @@ mod tests {
         let mut acc = GridAccumulator::new(0, 200, 100, 100, 0).unwrap();
 
         let timestamps = TimestampMicrosecondArray::from(Vec::<i64>::new());
-        acc.update_counts(&timestamps).unwrap();
+        acc.update_counts(&timestamps);
 
         assert_eq!(acc.values[0], 0);
         assert_eq!(acc.values[1], 0);
@@ -1060,7 +1052,7 @@ mod tests {
 
         // t=0: all grid points have diff > 100, so no matches
         let timestamps = TimestampMicrosecondArray::from(vec![0i64]);
-        acc.update_counts(&timestamps).unwrap();
+        acc.update_counts(&timestamps);
 
         assert_eq!(acc.values[0], 0);
         assert_eq!(acc.values[1], 0);
@@ -1080,7 +1072,7 @@ mod tests {
         // t=100: diff=0, exactly at lower bound (inclusive)
         // t=101: diff=-1, outside range
         let timestamps = TimestampMicrosecondArray::from(vec![49i64, 50, 100, 101]);
-        acc.update_counts(&timestamps).unwrap();
+        acc.update_counts(&timestamps);
 
         assert_eq!(acc.values[0], 2); // t=50 and t=100 match
     }
@@ -1091,10 +1083,10 @@ mod tests {
         let mut acc2 = GridAccumulator::new(0, 200, 100, 100, 0).unwrap();
 
         let ts1 = TimestampMicrosecondArray::from(vec![0i64]);
-        acc1.update_counts(&ts1).unwrap();
+        acc1.update_counts(&ts1);
 
         let ts2 = TimestampMicrosecondArray::from(vec![100i64]);
-        acc2.update_counts(&ts2).unwrap();
+        acc2.update_counts(&ts2);
 
         let state = acc2.state().unwrap();
         let grid_list = match &state[0] {
@@ -1170,7 +1162,7 @@ mod tests {
         let timestamps = TimestampMicrosecondArray::from(vec![50i64, 50]);
         let bodies = StringArray::from(vec!["hello", "world"]); // 5 + 5 = 10 bytes each match
 
-        acc.update_bytes(&timestamps, &bodies).unwrap();
+        acc.update_bytes(&timestamps, &bodies);
 
         // Both timestamps match grid points 100 and 200
         assert_eq!(acc.values[0], 0);
@@ -1194,9 +1186,9 @@ mod tests {
                 let values = struct_arr.column(1);
                 let float_arr = values.as_any().downcast_ref::<Float64Array>().unwrap();
                 assert!((float_arr.value(0) - 3.0).abs() < f64::EPSILON); // 300
-                                                                          // / 100
-                                                                          // = 3.
-                                                                          // 0
+                // / 100
+                // = 3.
+                // 0
             },
             _ => panic!("Expected List"),
         }

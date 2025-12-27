@@ -32,7 +32,7 @@ pub mod parser;
 pub mod planner;
 
 // Re-export key types for convenient access
-pub use common::{parse_error, ComparisonOp, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp};
+pub use common::{ComparisonOp, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp, parse_error};
 pub use expr::LogQLExpr;
 pub use log::{
     LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr, LogParser, PipelineStage,
@@ -43,4 +43,4 @@ pub use metric::{
     RangeExpr, VectorAggregation, VectorAggregationOp, VectorMatchCardinality, VectorMatching,
 };
 pub use parser::Parser;
-pub use planner::Planner;
+pub use planner::{Planner, SortDirection};

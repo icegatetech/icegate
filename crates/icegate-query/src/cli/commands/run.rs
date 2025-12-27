@@ -2,10 +2,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icegate_common::{errors::IceGateError, CatalogBuilder};
+use icegate_common::CatalogBuilder;
 use tokio_util::sync::CancellationToken;
 
-use crate::{engine::QueryEngine, QueryConfig};
+use crate::{QueryConfig, engine::QueryEngine, error::QueryError};
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors
@@ -39,7 +39,7 @@ async fn shutdown_signal() {
 ///
 /// Starts all enabled query servers and runs until Ctrl+C
 #[allow(clippy::cognitive_complexity)]
-pub async fn execute(config_path: PathBuf) -> Result<(), IceGateError> {
+pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Load configuration
     tracing::info!("Loading configuration from {:?}", config_path);
     let config = QueryConfig::from_file(config_path)?;

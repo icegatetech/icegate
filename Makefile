@@ -31,4 +31,3 @@ install:
 	cargo install cargo-audit
 
 ci: check fmt clippy test audit
-

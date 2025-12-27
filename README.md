@@ -1,7 +1,7 @@
 # IceGate
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-alpha-orange.svg)]()
+[![Status](https://img.shields.io/badge/status-prototype-red.svg)]()
 
 An Observability Data Lake engine designed to be fast, easy-to-use, cost-effective, scalable, and fault-tolerant.
 
@@ -65,7 +65,7 @@ The system consists of five core components for handling observability data (met
 ### Prerequisites
 
 #### Required Tools
-- **Rust** >= 1.80.0 (for Rust 2024 edition support)
+- **Rust** >= 1.92.0 (for Rust 2024 edition support)
 - **Cargo** (Rust's package manager and build tool, included with Rust)
 - **Git**
 
@@ -92,7 +92,7 @@ rustfmt --version
 cargo clippy --version
 ```
 
-You should have Rust 1.80.0 or later installed.
+You should have Rust 1.92.0 or later installed.
 
 ### Installing Rust
 
@@ -117,120 +117,17 @@ Dependencies are managed via Cargo and specified in `Cargo.toml`. They will be a
 
 ## Development
 
-### Building from Source
-
-The project uses Cargo for building:
-
 ```bash
-# Build in debug mode (default)
-cargo build
-
-# Build in release mode (optimized)
-cargo build --release
-
-# Build specific binaries
-cargo build --bin query
-cargo build --bin ingest
+cargo build            # Build the project
+cargo test             # Run tests
+make dev               # Start full development stack with Docker
 ```
 
-Build artifacts will be located in:
-- Debug: `target/debug/`
-- Release: `target/release/`
-
-### Running Tests
-
-```bash
-# Run all tests
-cargo test
-
-# Run tests with output shown
-cargo test -- --nocapture
-
-# Run tests in release mode
-cargo test --release
-
-# Run specific test
-cargo test test_name
-```
-
-### Code Quality
-
-The project includes configuration for code quality tools:
-
-#### Code Formatting
-```bash
-# Format all source files
-cargo fmt
-
-# Check formatting without making changes
-cargo fmt -- --check
-```
-
-Configuration: `rustfmt.toml` (if present) or default Rust formatting
-
-#### Linting and Static Analysis
-```bash
-# Run clippy linter
-cargo clippy
-
-# Run clippy with all warnings
-cargo clippy -- -W clippy::all
-
-# Run clippy and treat warnings as errors
-cargo clippy -- -D warnings
-```
-
-Configuration: `clippy.toml` (if present) or default clippy rules
-
-#### Editor Configuration
-The project includes `.editorconfig` for consistent coding styles across different editors.
-
-### Project Structure
-
-```
-icegate/
-├── src/
-│   ├── bin/
-│   │   ├── query.rs     # Query component binary
-│   │   └── ingest.rs    # Ingest component binary
-│   └── iceberg/
-│       └── mod.rs       # Iceberg catalog module
-├── target/              # Build output (generated)
-├── Cargo.toml           # Project manifest and dependencies
-└── Cargo.lock           # Dependency lock file
-```
-
-### Development Workflow
-
-1. **Validate prerequisites**: `rustc --version && cargo --version`
-2. **Build**: `cargo build`
-3. **Test**: `cargo test`
-4. **Format code**: `cargo fmt`
-5. **Run linter**: `cargo clippy`
-6. **Run binaries**: `cargo run --bin query` or `cargo run --bin ingest`
-
-### Cargo Build Profiles
-
-Cargo supports different build profiles (see `Cargo.toml` for customization):
-- **dev** (default) - Debug build with symbols and no optimization (`cargo build`)
-- **release** - Optimized release build with maximum performance (`cargo build --release`)
-- **test** - Used when running tests (`cargo test`)
-- **bench** - Used for benchmarks (`cargo bench`)
-
-## Usage
-
-Detailed usage documentation will be provided as features are implemented.
+For detailed development setup, build commands, and code quality guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Contributing
 
-Contributions are welcome! Here's how you can help:
-
-- **Report bugs** and request features via [GitHub Issues](../../issues)
-- **Submit pull requests** for bug fixes or new features
-- **Improve documentation** to help others understand IceGate
-- **Share your use cases** and feedback
-
-Please check `CONTRIBUTING.md` for detailed guidelines (coming soon).
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
@@ -246,4 +143,4 @@ Built with:
 
 ## Status
 
-IceGate is currently in alpha development. APIs and features are subject to change.
+IceGate is currently in prototype development. APIs and features are subject to change.

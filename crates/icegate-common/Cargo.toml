@@ -14,20 +14,20 @@ repository = { workspace = true }
 workspace = true
 
 [dependencies]
-# ANTLR parser (for error types)
-antlr4rust = { workspace = true }
-
 # Iceberg
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 
-# DataFusion (for error types)
-datafusion = { workspace = true }
+# Storage
+object_store = { workspace = true }
 
 # Configuration
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use datafusion::arrow::array::{ArrayRef, TimestampMicrosecondArray};
 use icegate_query::logql::datafusion::udaf::GridAccumulator;
 
@@ -46,7 +46,7 @@ fn bench_update_counts(c: &mut Criterion) {
                     black_box(offset),
                 )
                 .expect("Failed to create accumulator");
-                acc.update_counts(black_box(ts)).expect("Update failed");
+                acc.update_counts(black_box(ts));
                 acc
             });
         });
@@ -87,7 +87,7 @@ fn bench_grid_size_impact(c: &mut Criterion) {
                         black_box(*off),
                     )
                     .expect("Failed to create accumulator");
-                    acc.update_counts(black_box(ts)).expect("Update failed");
+                    acc.update_counts(black_box(ts));
                     acc
                 });
             },
@@ -131,7 +131,7 @@ fn bench_range_configurations(c: &mut Criterion) {
                         black_box(0),
                     )
                     .expect("Failed to create accumulator");
-                    acc.update_counts(black_box(ts)).expect("Update failed");
+                    acc.update_counts(black_box(ts));
                     acc
                 });
             },
@@ -176,7 +176,7 @@ fn bench_offset_configurations(c: &mut Criterion) {
                         black_box(*off),
                     )
                     .expect("Failed to create accumulator");
-                    acc.update_counts(black_box(ts)).expect("Update failed");
+                    acc.update_counts(black_box(ts));
                     acc
                 });
             },
@@ -202,10 +202,10 @@ fn bench_merge_operations(c: &mut Criterion) {
     let timestamps2 = generate_timestamps(5_000, end / 2, end);
 
     let mut acc1 = GridAccumulator::new(start, end, step, range, offset).expect("Failed to create accumulator");
-    acc1.update_counts(&timestamps1).expect("Update failed");
+    acc1.update_counts(&timestamps1);
 
     let mut acc2 = GridAccumulator::new(start, end, step, range, offset).expect("Failed to create accumulator");
-    acc2.update_counts(&timestamps2).expect("Update failed");
+    acc2.update_counts(&timestamps2);
 
     group.bench_function("merge_two_accumulators", |b| {
         b.iter(|| {
@@ -242,12 +242,7 @@ fn bench_merge_operations(c: &mut Criterion) {
 fn bench_grid_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("grid_creation");
 
-    let grid_sizes = vec![
-        ("tiny_10", 10),
-        ("small_100", 100),
-        ("medium_1000", 1_000),
-        ("large_10000", 10_000),
-    ];
+    let grid_sizes = vec![("tiny_10", 10), ("small_100", 100), ("medium_1000", 1_000), ("large_10000", 10_000)];
 
     for (name, num_points) in grid_sizes {
         let start = 0i64;
@@ -288,7 +283,7 @@ fn bench_sparse_output(c: &mut Criterion) {
     let timestamps = generate_timestamps(num_timestamps, start, end);
 
     let mut acc = GridAccumulator::new(start, end, step, range, offset).expect("Failed to create accumulator");
-    acc.update_counts(&timestamps).expect("Update failed");
+    acc.update_counts(&timestamps);
 
     group.bench_function("build_sparse_u64", |b| {
         b.iter(|| black_box(acc.build_sparse_u64(false)).expect("Build sparse failed"));

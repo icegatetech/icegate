@@ -2,11 +2,12 @@
 
 use std::path::PathBuf;
 
-use icegate_common::{errors::IceGateError, CatalogBuilder};
+use icegate_common::CatalogBuilder;
 
 use crate::{
     cli::MigrateCommands,
     config::MaintainConfig,
+    error::MaintainError,
     migrate::operations::{self, MigrationOperation},
 };
 
@@ -15,7 +16,7 @@ use crate::{
 /// # Errors
 ///
 /// Returns an error if migration fails
-pub async fn execute(command: MigrateCommands) -> Result<(), IceGateError> {
+pub async fn execute(command: MigrateCommands) -> Result<(), MaintainError> {
     match command {
         MigrateCommands::Create {
             config,
@@ -29,9 +30,9 @@ pub async fn execute(command: MigrateCommands) -> Result<(), IceGateError> {
 }
 
 /// Create all Iceberg tables
-async fn create(config_path: PathBuf, dry_run: bool) -> Result<(), IceGateError> {
+async fn create(config_path: PathBuf, dry_run: bool) -> Result<(), MaintainError> {
     tracing::info!("Loading configuration from {:?}", config_path);
-    let config = MaintainConfig::from_file(&config_path).map_err(|e| IceGateError::Config(e.to_string()))?;
+    let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
     tracing::info!("Initializing catalog");
     let catalog = CatalogBuilder::from_config(&config.catalog).await?;
@@ -47,9 +48,9 @@ async fn create(config_path: PathBuf, dry_run: bool) -> Result<(), IceGateError>
 }
 
 /// Upgrade existing table schemas
-async fn upgrade(config_path: PathBuf, dry_run: bool) -> Result<(), IceGateError> {
+async fn upgrade(config_path: PathBuf, dry_run: bool) -> Result<(), MaintainError> {
     tracing::info!("Loading configuration from {:?}", config_path);
-    let config = MaintainConfig::from_file(&config_path).map_err(|e| IceGateError::Config(e.to_string()))?;
+    let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
     tracing::info!("Initializing catalog");
     let catalog = CatalogBuilder::from_config(&config.catalog).await?;

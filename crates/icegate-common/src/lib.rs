@@ -24,12 +24,22 @@ pub const EVENTS_TABLE_FQN: &str = "iceberg.icegate.events";
 /// Fully qualified table name for metrics (`iceberg.icegate.metrics`).
 pub const METRICS_TABLE_FQN: &str = "iceberg.icegate.metrics";
 
+/// Default tenant ID when not provided in request metadata.
+pub const DEFAULT_TENANT_ID: &str = "default";
+
+/// Default account ID when not provided in resource attributes.
+/// Required because `cloud_account_id` is a partition column.
+pub const DEFAULT_ACCOUNT_ID: &str = "default";
+
+/// Topic name for logs in the WAL queue.
+pub const LOGS_TOPIC: &str = "logs";
+
 /// Catalog management for Iceberg catalogs.
 pub mod catalog;
 /// Common configuration utilities.
 pub mod config;
-/// Error types for IceGate operations.
-pub mod errors;
+/// Error types for common operations.
+pub mod error;
 /// Schema definitions for Iceberg tables.
 pub mod schema;
 /// Storage configuration.
@@ -37,10 +47,9 @@ pub mod storage;
 
 // Re-export commonly used types
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig};
-pub use config::{check_port_conflicts, load_config_file, ServerConfig};
-pub use storage::{S3Config, StorageBackend, StorageConfig};
-
-/// Result type alias for `IceGate` operations.
-///
-/// This is a convenience type alias for `std::result::Result<T, IceGateError>`.
-pub type Result<T> = std::result::Result<T, errors::IceGateError>;
+pub use config::{ServerConfig, check_port_conflicts, load_config_file};
+pub use error::Result;
+pub use storage::{
+    ObjectStoreWithPath, S3Config, StorageBackend, StorageConfig, create_local_store, create_memory_store,
+    create_object_store, create_s3_store,
+};

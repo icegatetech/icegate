@@ -2,6 +2,9 @@
 
 mod config;
 
+/// Error types for query operations.
+pub mod error;
+
 /// CLI for query binary
 pub mod cli;
 

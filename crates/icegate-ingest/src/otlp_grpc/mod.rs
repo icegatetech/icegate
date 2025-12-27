@@ -1,18 +1,14 @@
-//! OTLP gRPC server module
+//! OTLP gRPC server module.
 //!
 //! Provides OpenTelemetry Protocol gRPC endpoint for ingesting logs, traces,
 //! and metrics.
-//!
-//! # TODO
-//! - Add opentelemetry-proto dependency for OTLP protobuf definitions
-//! - Generate tonic service stubs from .proto files
-//! - Implement LogsService, TracesService, MetricsService traits
-//! - Parse OTLP protobuf messages
-//! - Transform OTLP data to Iceberg schema format
-//! - Write to Iceberg tables via catalog
 
 mod config;
+mod error;
 mod server;
+mod services;
 
 pub use config::OtlpGrpcConfig;
+pub use error::GrpcError;
 pub use server::run;
+pub use services::OtlpGrpcService;

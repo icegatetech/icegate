@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{CommonError, Result};
+
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -49,21 +51,21 @@ impl StorageConfig {
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<()> {
         match &self.backend {
             StorageBackend::FileSystem {
                 root_path,
             } => {
                 if root_path.trim().is_empty() {
-                    return Err("FileSystem root path cannot be empty".into());
+                    return Err(CommonError::Config("FileSystem root path cannot be empty".into()));
                 }
             },
             StorageBackend::S3(s3_config) => {
                 if s3_config.bucket.trim().is_empty() {
-                    return Err("S3 bucket cannot be empty".into());
+                    return Err(CommonError::Config("S3 bucket cannot be empty".into()));
                 }
                 if s3_config.region.trim().is_empty() {
-                    return Err("S3 region cannot be empty".into());
+                    return Err(CommonError::Config("S3 region cannot be empty".into()));
                 }
             },
             StorageBackend::Memory => {

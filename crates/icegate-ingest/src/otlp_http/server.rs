@@ -1,8 +1,8 @@
 //! OTLP HTTP server implementation
 
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
-use iceberg::Catalog;
+use icegate_queue::WriteChannel;
 use tokio_util::sync::CancellationToken;
 
 use super::OtlpHttpConfig;
@@ -10,9 +10,8 @@ use super::OtlpHttpConfig;
 /// Shared application state for OTLP HTTP server
 #[derive(Clone)]
 pub struct OtlpHttpState {
-    /// Iceberg catalog for accessing tables
-    #[allow(dead_code)]
-    pub catalog: Arc<dyn Catalog>,
+    /// Write channel for sending batches to the WAL queue.
+    pub write_channel: WriteChannel,
 }
 
 /// Run the OTLP HTTP server
@@ -21,14 +20,14 @@ pub struct OtlpHttpState {
 ///
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
-    catalog: Arc<dyn Catalog>,
+    write_channel: WriteChannel,
     config: OtlpHttpConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
     let state = OtlpHttpState {
-        catalog,
+        write_channel,
     };
 
     let app = super::routes::routes(state);

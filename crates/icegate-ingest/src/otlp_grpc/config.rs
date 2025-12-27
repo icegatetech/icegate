@@ -3,17 +3,23 @@
 use icegate_common::ServerConfig;
 use serde::{Deserialize, Serialize};
 
+use crate::error::{IngestError, Result};
+
+/// Default host for OTLP gRPC server.
+const DEFAULT_HOST: &str = "0.0.0.0";
+
+/// Default port for OTLP gRPC server (OTLP/gRPC standard).
+const DEFAULT_PORT: u16 = 4317;
+
 /// OTLP gRPC server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OtlpGrpcConfig {
     /// Whether this server is enabled
-    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Host to bind to
-    #[serde(default = "default_host")]
     pub host: String,
     /// Port to listen on
-    #[serde(default = "default_port")]
     pub port: u16,
 }
 
@@ -23,9 +29,9 @@ impl OtlpGrpcConfig {
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<()> {
         if self.enabled && self.host.trim().is_empty() {
-            return Err("OTLP gRPC host cannot be empty".into());
+            return Err(IngestError::Config("OTLP gRPC host cannot be empty".into()));
         }
         Ok(())
     }
@@ -35,22 +41,10 @@ impl Default for OtlpGrpcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            host: default_host(),
-            port: default_port(),
+            host: DEFAULT_HOST.to_string(),
+            port: DEFAULT_PORT,
         }
     }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-fn default_host() -> String {
-    "0.0.0.0".to_string()
-}
-
-const fn default_port() -> u16 {
-    4317
 }
 
 impl ServerConfig for OtlpGrpcConfig {

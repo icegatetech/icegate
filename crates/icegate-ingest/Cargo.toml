@@ -13,11 +13,22 @@ repository = { workspace = true }
 [lints]
 workspace = true
 
+[[bin]]
+name = "ingest"
+path = "src/main.rs"
+
 [dependencies]
 icegate-common = { workspace = true }
+icegate-queue = { path = "../icegate-queue" }
+
+# Apache Arrow
+arrow = { workspace = true }
 
 # Iceberg
 iceberg = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -27,9 +38,20 @@ tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Utilities
+hex = { workspace = true }
+
 # HTTP server
 axum = { workspace = true }
-tower-http = { workspace = true }
+
+# gRPC server
+tonic = { workspace = true }
+prost = { workspace = true }
+opentelemetry-proto = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI
+clap = { workspace = true }

@@ -3,9 +3,8 @@
 //! This module defines the `Parser` trait that abstracts over different
 //! parsing implementations (e.g., ANTLR-based).
 
-use icegate_common::Result;
-
 use super::expr::LogQLExpr;
+use crate::error::Result;
 
 /// Trait for parsing `LogQL` query strings into AST representations.
 ///

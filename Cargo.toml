@@ -1,7 +1,8 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/icegate-common",
+    "crates/icegate-queue",
     "crates/icegate-query",
     "crates/icegate-ingest",
     "crates/icegate-maintain",
@@ -9,7 +10,8 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.92.0"
 authors = ["IceGate Tech"]
 license = "Apache-2.0"
 repository = "https://github.com/icegatetech/icegate"
@@ -43,21 +45,42 @@ multiple_crate_versions = "allow"
 [workspace.dependencies]
 # Internal crates
 icegate-common = { path = "crates/icegate-common" }
+icegate-queue = { path = "crates/icegate-queue" }
+
+# Arrow ecosystem (must match iceberg's version)
+arrow = { version = "57", default-features = false, features = ["prettyprint"] }
+parquet = { version = "57", default-features = false, features = ["arrow", "zstd"] }
+object_store = { version = "0.12", features = ["aws"] }
+
+# Error handling
+thiserror = "2"
+
+# Utilities
+uuid = { version = "1", features = ["v7"] }
 
 # ANTLR parser
 antlr4rust = "0.5"
 
 # Iceberg
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
-iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
-iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
+#iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
+#iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
+#iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
+
+# Fork: icegatetech/iceberg-rust (tracking #25)
+# Patches: DataFusion 51 + Arrow 57 compat (upstream PR #1830 closed), memory catalog enhancements
+# Upstream plan: Switch back when DataFusion 51 officially supported upstream
+# Maintenance: develop branch rebased on upstream main; run `make ci` after each sync
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
 
 # DataFusion
-datafusion = "50"
+datafusion = "51"
 
 # Async runtime
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = "0.7"
+futures = "0.3.31"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -73,6 +96,13 @@ axum = "0.7"
 axum-extra = { version = "0.9", features = ["query"] }
 tower-http = { version = "0.5", features = ["trace"] }
 
+# gRPC server
+tonic = "0.12"
+prost = "0.13"
+
+# OpenTelemetry proto (with tonic service generation)
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic", "logs", "trace", "metrics"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -82,6 +112,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Utilities
 itoa = "1"
+bytes = "1"
+hex = "0.4"
+rand = "0.9.2"
 
 # Dev dependencies
 reqwest = { version = "0.12", features = ["json"] }

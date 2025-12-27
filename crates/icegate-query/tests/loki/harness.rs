@@ -20,27 +20,27 @@ use datafusion::{
     parquet::file::properties::WriterProperties,
 };
 use iceberg::{
+    Catalog,
     spec::DataFileFormat,
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
     writer::{
+        IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
+            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
             rolling_writer::RollingFileWriterBuilder,
-            ParquetWriterBuilder,
         },
-        IcebergWriter, IcebergWriterBuilder,
     },
-    Catalog,
 };
-use icegate_common::{catalog::CatalogBuilder, schema, CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE};
+use icegate_common::{CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE, catalog::CatalogBuilder, schema};
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
     loki::LokiConfig,
 };
 use reqwest::Client;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 /// Test server configuration and handles
@@ -75,17 +75,12 @@ impl TestServer {
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
 
         if !catalog.namespace_exists(&namespace_ident).await? {
-            catalog
-                .create_namespace(&namespace_ident, std::collections::HashMap::new())
-                .await?;
+            catalog.create_namespace(&namespace_ident, std::collections::HashMap::new()).await?;
         }
 
         let schema = schema::logs_schema()?;
 
-        let table_creation = iceberg::TableCreation::builder()
-            .name(LOGS_TABLE.to_string())
-            .schema(schema)
-            .build();
+        let table_creation = iceberg::TableCreation::builder().name(LOGS_TABLE.to_string()).schema(schema).build();
 
         let _ = catalog.create_table(&namespace_ident, table_creation).await?;
 
@@ -101,9 +96,7 @@ impl TestServer {
         let server_engine = Arc::clone(&query_engine);
 
         let server_handle = tokio::spawn(async move {
-            icegate_query::loki::run(server_engine, loki_config, cancel_token_clone)
-                .await
-                .unwrap();
+            icegate_query::loki::run(server_engine, loki_config, cancel_token_clone).await.unwrap();
         });
 
         // Wait for server to start
@@ -277,10 +270,7 @@ pub async fn write_test_logs_for_tenant(
 
 /// Write standard test log data to an Iceberg table
 pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Result<(), Box<dyn std::error::Error>> {
-    let now_micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64;
+    let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
 
     let tenant_id: ArrayRef = Arc::new(StringArray::from(vec!["test-tenant", "test-tenant", "test-tenant"]));
     let account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));

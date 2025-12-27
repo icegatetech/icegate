@@ -25,12 +25,8 @@ pub(crate) mod visitors;
 use std::sync::{Arc, Mutex};
 
 use antlr4rust::{
-    common_token_stream::CommonTokenStream, error_listener::ErrorListener, errors::ANTLRError,
-    input_stream::InputStream, recognizer::Recognizer, tree::ParseTreeVisitorCompat, Parser as AntlrParserTrait,
-};
-use icegate_common::{
-    errors::{IceGateError, ParseError},
-    Result,
+    Parser as AntlrParserTrait, common_token_stream::CommonTokenStream, error_listener::ErrorListener,
+    errors::ANTLRError, input_stream::InputStream, recognizer::Recognizer, tree::ParseTreeVisitorCompat,
 };
 pub use logqllexer::LogQLLexer;
 pub use logqlparser::*;
@@ -38,6 +34,7 @@ pub use logqlparservisitor::*;
 use visitors::LogQLExprVisitor;
 
 use super::{expr::LogQLExpr, parser::Parser};
+use crate::error::{ParseError, QueryError, Result};
 
 /// Error listener that collects parsing errors.
 #[derive(Debug, Clone)]
@@ -73,10 +70,7 @@ impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectingErrorListener {
             message: msg.to_string(),
             antlr_error: e.cloned(),
         };
-        self.errors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(error);
+        self.errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(error);
     }
 }
 
@@ -88,7 +82,7 @@ impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectingErrorListener {
 /// # Examples
 ///
 /// ```
-/// use icegate_query::logql::{antlr::AntlrParser, parser::Parser, MatchOp};
+/// use icegate_query::logql::{MatchOp, antlr::AntlrParser, parser::Parser};
 ///
 /// let parser = AntlrParser::new();
 /// let expr = parser.parse(r#"{job="mysql"} |= "error""#).unwrap();
@@ -125,7 +119,7 @@ impl Parser for AntlrParser {
         let tree = parser.root().map_err(|_| {
             let mut all_errors = lexer_error_listener.get_errors();
             all_errors.extend(parser_error_listener.get_errors());
-            IceGateError::Parse(all_errors)
+            QueryError::Parse(all_errors)
         })?;
 
         // Collect any errors from listeners
@@ -133,7 +127,7 @@ impl Parser for AntlrParser {
         all_errors.extend(parser_error_listener.get_errors());
 
         if !all_errors.is_empty() {
-            return Err(IceGateError::Parse(all_errors));
+            return Err(QueryError::Parse(all_errors));
         }
 
         // Convert parse tree to LogQLExpr AST using visitor

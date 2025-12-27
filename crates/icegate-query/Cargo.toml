@@ -31,6 +31,9 @@ iceberg-datafusion = { workspace = true }
 # DataFusion
 datafusion = { workspace = true }
 
+# Error handling
+thiserror = { workspace = true }
+
 # Async runtime
 tokio = { workspace = true }
 tokio-util = { workspace = true }

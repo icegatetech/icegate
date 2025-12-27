@@ -4,25 +4,25 @@
 //! [`LokiError`] newtype wrapper implementing axum's `IntoResponse`.
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
-use icegate_common::errors::IceGateError;
 
 use super::models::{ErrorType, LokiResponse};
+use crate::error::QueryError;
 
 /// Result type for Loki API operations.
 pub type LokiResult<T> = Result<T, LokiError>;
 
-/// Newtype wrapper for `IceGateError` that implements `IntoResponse`.
+/// Newtype wrapper for `QueryError` that implements `IntoResponse`.
 ///
 /// Enables idiomatic error handling in axum handlers via the `?` operator.
 #[derive(Debug)]
-pub struct LokiError(pub IceGateError);
+pub struct LokiError(pub QueryError);
 
-impl From<IceGateError> for LokiError {
-    fn from(err: IceGateError) -> Self {
+impl From<QueryError> for LokiError {
+    fn from(err: QueryError) -> Self {
         Self(err)
     }
 }
@@ -31,21 +31,17 @@ impl IntoResponse for LokiError {
     fn into_response(self) -> Response {
         let (status, error_type) = match &self.0 {
             // 400 Bad Request
-            IceGateError::Parse(_) | IceGateError::Validation(_) | IceGateError::Schema(_) => {
-                (StatusCode::BAD_REQUEST, ErrorType::BadData)
-            },
-            IceGateError::Plan(_) => (StatusCode::BAD_REQUEST, ErrorType::PlanningError),
+            QueryError::Parse(_) | QueryError::Validation(_) => (StatusCode::BAD_REQUEST, ErrorType::BadData),
+            QueryError::Plan(_) => (StatusCode::BAD_REQUEST, ErrorType::PlanningError),
 
             // 501 Not Implemented
-            IceGateError::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, ErrorType::NotImplemented),
+            QueryError::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, ErrorType::NotImplemented),
 
-            // 500 Internal Server Error
-            IceGateError::DataFusion(_) | IceGateError::Iceberg(_) | IceGateError::Io(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::ExecutionError)
-            },
-            IceGateError::Config(_) | IceGateError::Collection(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::Internal)
-            },
+            // 500 Internal Server Error - execution failures
+            QueryError::DataFusion(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::ExecutionError),
+
+            // 500 Internal Server Error - infrastructure failures
+            QueryError::Iceberg(_) | QueryError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::Internal),
         };
 
         (status, Json(LokiResponse::<()>::error(error_type, self.0.to_string()))).into_response()

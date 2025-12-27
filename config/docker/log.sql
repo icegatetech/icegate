@@ -3,7 +3,7 @@
 
 INSERT INTO icegate.logs (
     tenant_id,
-    account_id,
+    cloud_account_id,
     service_name,
     timestamp,
     observed_timestamp,

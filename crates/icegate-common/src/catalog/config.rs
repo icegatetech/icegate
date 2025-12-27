@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{CommonError, Result};
+
 /// Catalog configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogConfig {
@@ -37,10 +39,10 @@ impl CatalogConfig {
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<()> {
         // Validate warehouse path is not empty
         if self.warehouse.trim().is_empty() {
-            return Err("Warehouse location cannot be empty".into());
+            return Err(CommonError::Config("Warehouse location cannot be empty".into()));
         }
 
         // Validate catalog type specific requirements
@@ -49,11 +51,13 @@ impl CatalogConfig {
                 uri,
             } => {
                 if uri.trim().is_empty() {
-                    return Err("REST catalog URI cannot be empty".into());
+                    return Err(CommonError::Config("REST catalog URI cannot be empty".into()));
                 }
                 // Basic URI validation
                 if !uri.starts_with("http://") && !uri.starts_with("https://") {
-                    return Err("REST catalog URI must start with http:// or https://".into());
+                    return Err(CommonError::Config(
+                        "REST catalog URI must start with http:// or https://".into(),
+                    ));
                 }
             },
             CatalogBackend::Memory => {

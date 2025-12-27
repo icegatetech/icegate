@@ -1,0 +1,43 @@
+[package]
+name = "icegate-queue"
+description = "Generic WAL-based data queue with Parquet on object storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["parquet", "wal", "queue", "s3", "arrow"]
+categories = ["database", "data-structures"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Arrow ecosystem
+arrow = { workspace = true }
+parquet = { workspace = true }
+
+# Storage abstraction (S3, GCS, Azure, local filesystem)
+object_store = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync", "rt", "fs"] }
+futures = { workspace = true }
+
+# Serialization for metadata
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

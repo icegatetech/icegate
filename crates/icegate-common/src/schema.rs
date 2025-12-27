@@ -6,12 +6,15 @@
 
 use std::sync::Arc;
 
-use iceberg::spec::{
-    ListType, MapType, NestedField, PartitionSpec, PrimitiveType, Schema, SortDirection, SortField, SortOrder,
-    StructType, Transform, Type,
+use iceberg::{
+    Error, ErrorKind,
+    spec::{
+        ListType, MapType, NestedField, PartitionSpec, PrimitiveType, Schema, SortDirection, SortField, SortOrder,
+        StructType, Transform, Type,
+    },
 };
 
-use crate::{errors::SchemaError, Result};
+use crate::error::Result;
 
 /// Creates the Iceberg schema for `OpenTelemetry` logs.
 ///
@@ -22,22 +25,28 @@ use crate::{errors::SchemaError, Result};
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
-/// - `account_id` (identity)
+/// - `cloud_account_id` (identity)
 /// - day(`timestamp`)
 ///
 /// # Sorting
 /// - `service_name` (ascending)
 /// - `timestamp` (descending) - recent-first ordering
+///
+/// # Field IDs
+/// Field IDs are assigned sequentially to match Iceberg catalog behavior.
+/// Map nested fields (key=13, value=14) come after attributes (12),
+/// then flags (15) and `dropped_attributes_count` (16).
 pub fn logs_schema() -> Result<Schema> {
     // Create Map<String, String> for attributes
+    // Nested field IDs must be sequential after parent (12 -> 13, 14)
     let attributes_map = Type::Map(MapType::new(
         Arc::new(NestedField::required(
-            100,
+            13, // Sequential after attributes field (12)
             "key",
             Type::Primitive(PrimitiveType::String),
         )),
         Arc::new(NestedField::required(
-            101,
+            14, // Sequential after key (13)
             "value",
             Type::Primitive(PrimitiveType::String),
         )),
@@ -52,9 +61,9 @@ pub fn logs_schema() -> Result<Schema> {
                 "tenant_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            Arc::new(NestedField::optional(
+            Arc::new(NestedField::required(
                 2,
-                "account_id",
+                "cloud_account_id",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
@@ -107,11 +116,12 @@ pub fn logs_schema() -> Result<Schema> {
                 Type::Primitive(PrimitiveType::String),
             )),
             // Attributes (merged from resource, scope, and log attributes)
+            // Map nested fields use IDs 13, 14
             Arc::new(NestedField::required(12, "attributes", attributes_map)),
-            // Flags and monitoring
-            Arc::new(NestedField::optional(13, "flags", Type::Primitive(PrimitiveType::Int))),
+            // Flags and monitoring (IDs continue after map nested fields)
+            Arc::new(NestedField::optional(15, "flags", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::required(
-                14,
+                16,
                 "dropped_attributes_count",
                 Type::Primitive(PrimitiveType::Int),
             )),
@@ -125,13 +135,13 @@ pub fn logs_schema() -> Result<Schema> {
 ///
 /// Partitions by:
 /// - `tenant_id` (identity transform)
-/// - `account_id` (identity transform)
+/// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn logs_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(1)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
-        .add_partition_field("account_id", "account_id", Transform::Identity)?
+        .add_partition_field("cloud_account_id", "cloud_account_id", Transform::Identity)?
         .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
         .build()?;
 
@@ -146,11 +156,11 @@ pub fn logs_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
 pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
     let service_name_field = schema
         .field_by_name("service_name")
-        .ok_or_else(|| SchemaError::field_not_found("logs", "service_name"))?;
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'service_name' not found in logs schema"))?;
 
     let timestamp_field = schema
         .field_by_name("timestamp")
-        .ok_or_else(|| SchemaError::field_not_found("logs", "timestamp"))?;
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'timestamp' not found in logs schema"))?;
 
     let sort_order = SortOrder::builder()
         .with_order_id(1)
@@ -178,14 +188,12 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// Attributes are merged from resource, scope, and span-level attributes.
 ///
 /// # Nested Structures
-/// - events: `List<Struct>` - Span events (NO `trace_id`/`span_id`, inherits
-///   from parent)
-/// - links: `List<Struct>` - Span links (HAS `trace_id`/`span_id`, references
-///   linked span)
+/// - events: `List<Struct>` - Span events (NO `trace_id`/`span_id`, inherits from parent)
+/// - links: `List<Struct>` - Span links (HAS `trace_id`/`span_id`, references linked span)
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
-/// - `account_id` (identity)
+/// - `cloud_account_id` (identity)
 /// - day(`timestamp`)
 ///
 /// # Sorting
@@ -278,9 +286,9 @@ pub fn spans_schema() -> Result<Schema> {
                 "tenant_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            Arc::new(NestedField::optional(
+            Arc::new(NestedField::required(
                 2,
-                "account_id",
+                "cloud_account_id",
                 Type::Primitive(PrimitiveType::String),
             )),
             // Trace identifiers
@@ -391,13 +399,13 @@ pub fn spans_schema() -> Result<Schema> {
 ///
 /// Partitions by:
 /// - `tenant_id` (identity transform)
-/// - `account_id` (identity transform)
+/// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn spans_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(2)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
-        .add_partition_field("account_id", "account_id", Transform::Identity)?
+        .add_partition_field("cloud_account_id", "cloud_account_id", Transform::Identity)?
         .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
         .build()?;
 
@@ -412,11 +420,11 @@ pub fn spans_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
 pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
     let trace_id_field = schema
         .field_by_name("trace_id")
-        .ok_or_else(|| SchemaError::field_not_found("spans", "trace_id"))?;
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'trace_id' not found in spans schema"))?;
 
     let timestamp_field = schema
         .field_by_name("timestamp")
-        .ok_or_else(|| SchemaError::field_not_found("spans", "timestamp"))?;
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'timestamp' not found in spans schema"))?;
 
     let sort_order = SortOrder::builder()
         .with_order_id(2)
@@ -444,7 +452,7 @@ pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
-/// - `account_id` (identity)
+/// - `cloud_account_id` (identity)
 /// - day(`timestamp`)
 ///
 /// # Sorting
@@ -470,9 +478,9 @@ pub fn events_schema() -> Result<Schema> {
                 "tenant_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            Arc::new(NestedField::optional(
+            Arc::new(NestedField::required(
                 2,
-                "account_id",
+                "cloud_account_id",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
@@ -530,13 +538,13 @@ pub fn events_schema() -> Result<Schema> {
 ///
 /// Partitions by:
 /// - `tenant_id` (identity transform)
-/// - `account_id` (identity transform)
+/// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn events_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(3)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
-        .add_partition_field("account_id", "account_id", Transform::Identity)?
+        .add_partition_field("cloud_account_id", "cloud_account_id", Transform::Identity)?
         .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
         .build()?;
 
@@ -549,13 +557,16 @@ pub fn events_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
 /// - `service_name` (ascending)
 /// - `timestamp` (descending) - recent-first ordering
 pub fn events_sort_order(schema: &Schema) -> Result<SortOrder> {
-    let service_name_field = schema
-        .field_by_name("service_name")
-        .ok_or_else(|| SchemaError::field_not_found("events", "service_name"))?;
+    let service_name_field = schema.field_by_name("service_name").ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "field 'service_name' not found in events schema",
+        )
+    })?;
 
     let timestamp_field = schema
         .field_by_name("timestamp")
-        .ok_or_else(|| SchemaError::field_not_found("events", "timestamp"))?;
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'timestamp' not found in events schema"))?;
 
     let sort_order = SortOrder::builder()
         .with_order_id(3)
@@ -585,7 +596,7 @@ pub fn events_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
-/// - `account_id` (identity)
+/// - `cloud_account_id` (identity)
 /// - day(`timestamp`)
 ///
 /// # Sorting
@@ -667,9 +678,9 @@ pub fn metrics_schema() -> Result<Schema> {
                 "tenant_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            Arc::new(NestedField::optional(
+            Arc::new(NestedField::required(
                 2,
-                "account_id",
+                "cloud_account_id",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::required(
@@ -833,13 +844,13 @@ pub fn metrics_schema() -> Result<Schema> {
 ///
 /// Partitions by:
 /// - `tenant_id` (identity transform)
-/// - `account_id` (identity transform)
+/// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn metrics_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(4)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
-        .add_partition_field("account_id", "account_id", Transform::Identity)?
+        .add_partition_field("cloud_account_id", "cloud_account_id", Transform::Identity)?
         .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
         .build()?;
 
@@ -853,17 +864,23 @@ pub fn metrics_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
 /// - `service_name` (ascending)
 /// - `timestamp` (descending) - recent-first ordering
 pub fn metrics_sort_order(schema: &Schema) -> Result<SortOrder> {
-    let metric_name_field = schema
-        .field_by_name("metric_name")
-        .ok_or_else(|| SchemaError::field_not_found("metrics", "metric_name"))?;
+    let metric_name_field = schema.field_by_name("metric_name").ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "field 'metric_name' not found in metrics schema",
+        )
+    })?;
 
-    let service_name_field = schema
-        .field_by_name("service_name")
-        .ok_or_else(|| SchemaError::field_not_found("metrics", "service_name"))?;
+    let service_name_field = schema.field_by_name("service_name").ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "field 'service_name' not found in metrics schema",
+        )
+    })?;
 
     let timestamp_field = schema
         .field_by_name("timestamp")
-        .ok_or_else(|| SchemaError::field_not_found("metrics", "timestamp"))?;
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'timestamp' not found in metrics schema"))?;
 
     let sort_order = SortOrder::builder()
         .with_order_id(4)
@@ -895,7 +912,7 @@ pub fn metrics_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// These columns are extracted as top-level fields from log query results.
 /// Used by planner (for grouping) and handlers (for output).
 pub const LOG_INDEXED_ATTRIBUTE_COLUMNS: &[&str] =
-    &["account_id", "service_name", "trace_id", "span_id", "severity_text"];
+    &["cloud_account_id", "service_name", "trace_id", "span_id", "severity_text"];
 
 #[cfg(test)]
 mod tests {

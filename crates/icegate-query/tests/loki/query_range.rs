@@ -10,16 +10,14 @@
 use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
 use serde_json::Value;
 
-use super::harness::{write_test_logs, TestServer};
+use super::harness::{TestServer, write_test_logs};
 
 #[tokio::test]
 async fn test_query_range_endpoint() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3201).await?;
 
     // Insert test data
-    let table = catalog
-        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
-        .await?;
+    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
     write_test_logs(&table, &catalog).await?;
 
     // Query Loki API with tenant header
@@ -75,9 +73,7 @@ async fn test_query_range_endpoint() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_log_vs_metric_response_types() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3203).await?;
 
-    let table = catalog
-        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
-        .await?;
+    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
     write_test_logs(&table, &catalog).await?;
 
     // Log query should return "streams" with "stream" labels

@@ -91,7 +91,7 @@ impl Default for StringInterner {
 pub struct BatchColumns {
     pub timestamp: Option<usize>,
     pub body: Option<usize>,
-    pub account_id: Option<usize>,
+    pub cloud_account_id: Option<usize>,
     pub service_name: Option<usize>,
     pub severity_text: Option<usize>,
     pub level: Option<usize>,
@@ -106,7 +106,7 @@ impl BatchColumns {
         Self {
             timestamp: schema.index_of("timestamp").ok(),
             body: schema.index_of("body").ok(),
-            account_id: schema.index_of("account_id").ok(),
+            cloud_account_id: schema.index_of("cloud_account_id").ok(),
             service_name: schema.index_of("service_name").ok(),
             severity_text: schema.index_of("severity_text").ok(),
             level: schema.index_of("level").ok(),
@@ -169,11 +169,7 @@ fn extract_body(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> String 
     cols.body
         .and_then(|idx| {
             batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row).to_string())
-                }
+                if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) }
             })
         })
         .unwrap_or_default()
@@ -192,18 +188,16 @@ fn extract_labels(
     let mut labels: HashMap<Arc<str>, Arc<str>> = HashMap::with_capacity(12);
 
     let extract_string = |idx: usize| -> Option<&str> {
-        batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
-            if arr.is_null(row) {
-                None
-            } else {
-                Some(arr.value(row))
-            }
-        })
+        batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .and_then(|arr| if arr.is_null(row) { None } else { Some(arr.value(row)) })
     };
 
-    if let Some(idx) = cols.account_id {
+    if let Some(idx) = cols.cloud_account_id {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("account_id"), interner.intern(val));
+            labels.insert(interner.intern("cloud_account_id"), interner.intern(val));
         }
     }
 
@@ -318,11 +312,7 @@ pub fn batches_to_loki_streams(batches: &[RecordBatch]) -> FormattedResult {
 
             let ts_str = itoa::Buffer::new().format(timestamp_nanos).to_string();
 
-            streams
-                .entry(key_buffer.clone())
-                .or_insert_with(|| (labels, Vec::new()))
-                .1
-                .push((ts_str, body));
+            streams.entry(key_buffer.clone()).or_insert_with(|| (labels, Vec::new())).1.push((ts_str, body));
         }
     }
 

@@ -4,9 +4,9 @@
 //! execution plan implementations (e.g., DataFusion LogicalPlan).
 
 use chrono::{DateTime, TimeDelta, Utc};
-use icegate_common::Result;
 
 use super::expr::LogQLExpr;
+use crate::error::Result;
 
 /// Default limit for log queries when no limit is specified.
 ///
@@ -28,9 +28,9 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 /// use chrono::TimeDelta;
 /// use datafusion::prelude::SessionContext;
 /// use icegate_query::logql::{
-///     datafusion::DataFusionPlanner,
-///     planner::{Planner, QueryContext},
 ///     LogExpr, LogQLExpr, Selector,
+///     datafusion::DataFusionPlanner,
+///     planner::{Planner, QueryContext, SortDirection},
 /// };
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -41,11 +41,23 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 ///     end: chrono::Utc::now() + TimeDelta::hours(1),
 ///     limit: None,
 ///     step: None,
+///     direction: SortDirection::default(),
 /// };
 /// let planner = DataFusionPlanner::new(session_context, query_context);
 /// let _plan = planner.plan(LogQLExpr::Log(LogExpr::new(Selector::empty()))).await;
 /// # });
 /// ```
+/// Sort direction for log queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SortDirection {
+    /// Forward (oldest first, ascending timestamp) - chronological order.
+    Forward,
+    /// Backward (newest first, descending timestamp) - reverse chronological.
+    /// This is the Loki default.
+    #[default]
+    Backward,
+}
+
 /// Context for query planning, containing metadata like time range and limits.
 #[derive(Debug, Clone)]
 pub struct QueryContext {
@@ -60,6 +72,8 @@ pub struct QueryContext {
     pub limit: Option<usize>,
     /// Step size for range queries
     pub step: Option<TimeDelta>,
+    /// Sort direction for log queries (default: backward/newest first).
+    pub direction: SortDirection,
 }
 
 /// A trait for planning `LogQL` expressions into execution plans.
