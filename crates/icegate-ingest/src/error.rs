@@ -46,7 +46,7 @@ pub enum IngestError {
 
     /// Multiple errors
     #[error("multiple errors: {0:?}")]
-    Multiple(Vec<IngestError>),
+    Multiple(Vec<Self>),
 }
 
 impl From<icegate_common::error::CommonError> for IngestError {

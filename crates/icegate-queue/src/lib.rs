@@ -24,7 +24,7 @@
 //!
 //! // Create queue writer
 //! let config = QueueConfig::new("s3://bucket/queue");
-//! let (tx, writer) = QueueWriter::new(config, object_store).await?;
+//! let (tx, writer) = QueueWriter::new(config, object_store)?;
 //!
 //! // Send write request
 //! let (response_tx, response_rx) = oneshot::channel();
@@ -49,5 +49,5 @@ mod writer;
 pub use channel::{Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult, channel};
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
-pub use segment::{SegmentId, SegmentMetadata, SegmentStatus};
+pub use segment::SegmentId;
 pub use writer::QueueWriter;

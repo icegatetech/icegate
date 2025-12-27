@@ -87,5 +87,5 @@ pub enum QueueError {
 
     /// Multiple errors occurred.
     #[error("multiple errors occurred: {0:?}")]
-    Multiple(Vec<QueueError>),
+    Multiple(Vec<Self>),
 }

@@ -63,7 +63,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     tracing::info!("WAL queue initialized successfully");
 
-    // Create cancellation token for coordinated shutdown
+    // Create a cancellation token for coordinated shutdown
     let cancel_token = CancellationToken::new();
 
     // Spawn server tasks

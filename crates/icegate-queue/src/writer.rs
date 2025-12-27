@@ -386,8 +386,15 @@ impl QueueWriter {
                         topic, offset, attempts
                     );
                     // Increment offset and retry (loop continues)
-                    let interval = self.config.flush_interval_ms / 4; // 25% delta
-                    let delay = self.config.flush_interval_ms + rand::random_range(interval..=interval);
+                    // SAFETY: check the interval is within the range of u64
+                    if self.config.flush_interval_ms >= i64::MAX as u64 {
+                        return Err(QueueError::Config("flush_interval_ms too large".to_string()));
+                    }
+                    #[allow(clippy::cast_possible_wrap)]
+                    let interval = self.config.flush_interval_ms as i64 / 4; // 25% delta
+                    #[allow(clippy::cast_sign_loss)]
+                    // SAFETY: the `interval` can't be negative
+                    let delay = self.config.flush_interval_ms + rand::random_range(-interval..=interval) as u64;
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 },
                 Err(e) => return Err(e),
@@ -399,12 +406,7 @@ impl QueueWriter {
     ///
     /// Uses `If-None-Match: *` for atomic write (fails if file exists).
     async fn try_write(&self, segment_id: &SegmentId, data: Bytes) -> Result<()> {
-        let full_path = Path::from(format!(
-            "{}/{}/{}.parquet",
-            self.config.base_path,
-            segment_id.topic,
-            segment_id.offset_string()
-        ));
+        let full_path = Path::from(format!("{}/{}", self.config.base_path, segment_id.to_path()));
 
         let opts = PutOptions {
             mode: PutMode::Create, // If-None-Match: *
