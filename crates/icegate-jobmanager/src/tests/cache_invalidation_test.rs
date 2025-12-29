@@ -1,0 +1,65 @@
+use std::{collections::HashMap, sync::Arc};
+
+use chrono::Duration as ChronoDuration;
+use tokio_util::sync::CancellationToken;
+
+use super::common::in_memory_storage::InMemoryStorage;
+use crate::{CachedStorage, Job, JobCode, Metrics, Storage, Task, TaskCode, TaskDefinition};
+
+// TestCacheInvalidation verifies that CachedStorage avoids redundant S3 calls on cache hit.
+#[tokio::test]
+async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
+    let _log_guard = super::common::logging::init_test_logging();
+
+    let storage = Arc::new(InMemoryStorage::new());
+    let cached_storage = Arc::new(CachedStorage::new(
+        storage.clone() as Arc<dyn Storage>,
+        Metrics::new_disabled(),
+    ));
+    let cancel_token = CancellationToken::new();
+
+    let task = Task::new(
+        "worker-1".to_string(),
+        TaskDefinition::new(TaskCode::from("cache_task"), Vec::new(), ChronoDuration::seconds(5))?,
+    );
+
+    let job_code = JobCode::new("test_cache_job");
+
+    let mut job = Job::new(job_code.clone(), vec![task], HashMap::new(), "worker-1".to_string(), 1);
+    job.work("worker-1")?;
+
+    storage.save_job(&mut job, &cancel_token).await?;
+    assert_eq!(storage.version(), 1);
+
+    let job_from_cache = cached_storage.get_job(&job_code, &cancel_token).await?;
+    assert_eq!(storage.find_meta_calls(), 1);
+    assert_eq!(storage.get_by_meta_calls(), 1);
+    assert_eq!(storage.version(), 1);
+    assert_eq!(job_from_cache.version(), storage.version().to_string());
+
+    cached_storage.save_job(&mut job, &cancel_token).await?;
+    assert_eq!(storage.find_meta_calls(), 1);
+    assert_eq!(storage.get_by_meta_calls(), 1);
+    assert_eq!(storage.version(), 2);
+    assert_eq!(job.version(), storage.version().to_string());
+
+    let job_from_cache = cached_storage.get_job(&job_code, &cancel_token).await?;
+    assert_eq!(storage.find_meta_calls(), 2);
+    assert_eq!(storage.get_by_meta_calls(), 1);
+    assert_eq!(storage.version(), 2);
+    assert_eq!(job_from_cache.version(), storage.version().to_string());
+
+    storage.save_job(&mut job, &cancel_token).await?;
+    assert_eq!(storage.find_meta_calls(), 2);
+    assert_eq!(storage.get_by_meta_calls(), 1);
+    assert_eq!(storage.version(), 3);
+    assert_eq!(job.version(), storage.version().to_string());
+
+    let job_from_cache = cached_storage.get_job(&job_code, &cancel_token).await?;
+    assert_eq!(storage.find_meta_calls(), 3);
+    assert_eq!(storage.get_by_meta_calls(), 2);
+    assert_eq!(storage.version(), 3);
+    assert_eq!(job_from_cache.version(), storage.version().to_string());
+
+    Ok(())
+}

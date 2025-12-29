@@ -6,6 +6,7 @@ members = [
     "crates/icegate-query",
     "crates/icegate-ingest",
     "crates/icegate-maintain",
+    "crates/icegate-jobmanager",
 ]
 
 [workspace.package]
@@ -56,7 +57,7 @@ object_store = { version = "0.12", features = ["aws"] }
 thiserror = "2"
 
 # Utilities
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1.19", features = ["v7", "v4", "serde"] }
 
 # ANTLR parser
 antlr4rust = "0.5"
@@ -121,6 +122,6 @@ reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
 testcontainers = { version = "0.26", features = ["http_wait"] }
 testcontainers-modules = { version = "0.14", features = ["minio"] }
-aws-config = "1"
-aws-sdk-s3 = "1"
+aws-config = "1.1"
+aws-sdk-s3 = "1.11"
 criterion = "0.5"

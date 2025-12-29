@@ -32,7 +32,7 @@ overflow_delimited_expr = true
 use_try_shorthand = true
 
 # Comments and documentation
-comment_width = 100
+comment_width = 120
 wrap_comments = true
 format_code_in_doc_comments = true
 normalize_comments = true
