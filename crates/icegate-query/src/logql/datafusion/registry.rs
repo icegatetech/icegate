@@ -12,6 +12,7 @@ use super::{
     udaf::{AbsentOverTime, BytesOverTime, BytesRate, CountOverTime, RateOverTime},
     udf::{MapDropKeys, MapKeepKeys},
 };
+use crate::logql::datafusion::udf::DateGrid;
 
 /// Registry for all `LogQL` UDFs and UDAFs.
 ///
@@ -49,6 +50,7 @@ impl UdfRegistry {
         // Scalar UDFs
         session_ctx.register_udf(ScalarUDF::from(MapKeepKeys::new()));
         session_ctx.register_udf(ScalarUDF::from(MapDropKeys::new()));
+        session_ctx.register_udf(ScalarUDF::from(DateGrid::new()));
 
         // Aggregate UDAFs
         session_ctx.register_udaf(AggregateUDF::from(CountOverTime::new()));

@@ -12,7 +12,7 @@ use datafusion::{
         buffer::{OffsetBuffer, ScalarBuffer},
         datatypes::DataType,
     },
-    common::{Result, plan_err},
+    common::{Result, datatype::DataTypeExt, exec_err, plan_err},
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
 
@@ -157,7 +157,7 @@ fn filter_map_keys(args: &[ColumnarValue], keep_mode: bool) -> Result<ColumnarVa
     let map_array = arrays[0]
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| datafusion::error::DataFusionError::Plan("First argument must be a map".to_string()))?;
+        .ok_or_else(|| datafusion::error::DataFusionError::Execution("First argument must be a map".to_string()))?;
 
     // Extract filter keys from the second argument (could be ListArray or
     // StringArray)
@@ -207,12 +207,12 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
         .keys()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| datafusion::error::DataFusionError::Plan("Map keys must be strings".to_string()))?;
+        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Map keys must be strings".to_string()))?;
     let values = map_array
         .values()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| datafusion::error::DataFusionError::Plan("Map values must be strings".to_string()))?;
+        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Map values must be strings".to_string()))?;
 
     // Extract the original entries field from the map's data type to preserve
     // metadata
@@ -280,9 +280,7 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
     let original_map_field = match map_array.data_type() {
         DataType::Map(field, _) => field.clone(),
         _ => {
-            return Err(datafusion::error::DataFusionError::Plan(
-                "Expected Map data type".to_string(),
-            ));
+            return exec_err!("Expected Map data type");
         },
     };
 
@@ -295,9 +293,225 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
     ))
 }
 
+/// UDF: `date_grid(timestamp, start, end, step, range, offset)` - calculate step timestamps of
+/// aligning grid
+///
+/// # Arguments
+/// - `timestamp`: A `Timestamp` column
+/// - `start`: Grid start timestamp
+/// - `end`: Grid end timestamp
+/// - `step`: Step between grid points
+/// - `range`: Range window size as interval
+/// - `offset`: Offset for the range window as interval
+///
+/// # References
+/// - [Loki Metric Query](https://grafana.com/blog/how-to-run-faster-loki-metric-queries-with-more-accurate-results/)
+///
+/// # Returns
+/// A new array with the date bins containing the timestamp point
+///
+/// # Example
+/// ```sql
+/// SELECT timestamp FROM t;
+/// -- TIMESTAMP '2025-01-02 00:10:30'
+/// -- TIMESTAMP '2025-01-02 00:13:59'
+/// SELECT date_grid(
+///     timestamp,
+///     TIMESTAMP '2025-01-02 00:00:00',
+///     TIMESTAMP '2025-01-03 00:00:00',
+///     INTERVAL '1 minute',
+///     INTERVAL '2 minute',
+///     INTERVAL '10 seconds'
+/// ) FROM logs;
+/// -- [TIMESTAMP '2025-01-02 00:11:00', '2025-01-02 00:11:01', ..., '2025-01-03 00:00:00']
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct DateGrid {
+    signature: Signature,
+}
+
+impl Default for DateGrid {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DateGrid {
+    /// Creates a new `Grid` UDF.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::any(6, Volatility::Immutable),
+        }
+    }
+
+    /// Extracts interval as microseconds from a `ColumnarValue`.
+    fn extract_interval_micros(arg: &ColumnarValue, param_name: &str) -> Result<i64> {
+        use datafusion::{arrow::datatypes::IntervalMonthDayNano, common::ScalarValue};
+
+        if let ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(interval))) = arg {
+            let IntervalMonthDayNano {
+                months,
+                days,
+                nanoseconds,
+            } = *interval;
+
+            if months != 0 {
+                return plan_err!("Month intervals are not supported, use days or smaller units");
+            }
+
+            let day_micros = i64::from(days) * 86_400_000_000;
+            let nano_micros = nanoseconds / 1000;
+
+            Ok(day_micros + nano_micros)
+        } else {
+            plan_err!("{param_name} must be an IntervalMonthDayNano scalar")
+        }
+    }
+}
+
+impl ScalarUDFImpl for DateGrid {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
+        "date_grid"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if arg_types.len() != 6 {
+            return plan_err!("date_grid requires 6 arguments");
+        }
+        Ok(DataType::List(arg_types[0].clone().into_nullable_field_ref()))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        use datafusion::{
+            arrow::{
+                array::{Array, ListArray, TimestampMicrosecondArray},
+                buffer::{OffsetBuffer, ScalarBuffer},
+                datatypes::TimeUnit,
+            },
+            common::ScalarValue,
+        };
+
+        // Validate argument count
+        if args.args.len() != 6 {
+            return plan_err!("date_grid requires 6 arguments");
+        }
+
+        // Extract arguments
+        let timestamp_array = match &args.args[0] {
+            ColumnarValue::Array(arr) => arr.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(
+                    "First argument must be TimestampMicrosecond array".to_string(),
+                )
+            })?,
+            ColumnarValue::Scalar(_) => {
+                return plan_err!("First argument must be an array, not a scalar");
+            },
+        };
+
+        // Extract scalar parameters
+        let start_micros = match &args.args[1] {
+            ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(v), _)) => *v,
+            _ => return plan_err!("Second argument (start) must be a TimestampMicrosecond scalar"),
+        };
+
+        let end_micros = match &args.args[2] {
+            ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(v), _)) => *v,
+            _ => return plan_err!("Third argument (end) must be a TimestampMicrosecond scalar"),
+        };
+
+        // Extract interval parameters and convert to microseconds
+        let step_micros = Self::extract_interval_micros(&args.args[3], "step")?;
+        let range_micros = Self::extract_interval_micros(&args.args[4], "range")?;
+        let offset_micros = Self::extract_interval_micros(&args.args[5], "offset")?;
+
+        // Validate step is positive
+        if step_micros <= 0 {
+            return plan_err!("step must be positive");
+        }
+
+        // Generate grid timestamps
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let num_points = ((end_micros - start_micros) / step_micros + 1) as usize;
+        let grid: Vec<i64> = (0..num_points)
+            .map(|i| {
+                #[allow(clippy::cast_possible_wrap)]
+                let idx = i as i64;
+                start_micros + idx * step_micros
+            })
+            .collect();
+
+        let upper_bound_micros = range_micros + offset_micros;
+
+        // Process each timestamp and collect matching grid points
+        let mut list_builder: Vec<Vec<i64>> = Vec::with_capacity(timestamp_array.len());
+
+        for i in 0..timestamp_array.len() {
+            if timestamp_array.is_null(i) {
+                list_builder.push(Vec::new());
+            } else {
+                let t = timestamp_array.value(i);
+
+                // Grid point g matches if: t + offset <= g <= t + upper_bound
+                let lower_grid = t + offset_micros;
+                let upper_grid = t + upper_bound_micros;
+
+                // Binary search for first grid point >= lower_grid
+                let start_idx = grid.partition_point(|&g| g < lower_grid);
+
+                // Collect all matching grid points
+                let matches: Vec<i64> = grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect();
+
+                list_builder.push(matches);
+            }
+        }
+
+        // Build the ListArray result
+        let mut offset = 0i32;
+        let mut offsets_vec = vec![0i32];
+        let mut values_vec = Vec::new();
+
+        for matches in list_builder {
+            let len = i32::try_from(matches.len())
+                .map_err(|_| datafusion::error::DataFusionError::Execution("ListArray overflow".to_string()))?;
+            for timestamp in matches {
+                values_vec.push(timestamp);
+            }
+            offset += len;
+            offsets_vec.push(offset);
+        }
+
+        let values_array = Arc::new(TimestampMicrosecondArray::from(values_vec));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets_vec));
+
+        let field = Arc::new(datafusion::arrow::datatypes::Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ));
+
+        let list_array = ListArray::new(field, offsets, values_array, None);
+
+        Ok(ColumnarValue::Array(Arc::new(list_array)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::datatypes::{Field, Fields};
+    use datafusion::{
+        arrow::{
+            array::TimestampMicrosecondArray,
+            datatypes::{Field, Fields, IntervalMonthDayNano, TimeUnit},
+        },
+        common::{DataFusionError, Result, ScalarValue, config::ConfigOptions},
+    };
 
     use super::*;
 
@@ -349,6 +563,159 @@ mod tests {
             values,
             None,
         )
+    }
+
+    // DateGrid test helpers
+
+    /// Helper to create `IntervalMonthDayNano` from microseconds.
+    ///
+    /// # Arguments
+    /// - `micros`: Microseconds for the interval (negative values supported)
+    ///
+    /// # Notes
+    /// - Only supports day and nanosecond components (months not supported per udaf.rs:379-382)
+    fn create_interval_micros(micros: i64) -> ScalarValue {
+        ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+            0,             // months (not supported)
+            0,             // days
+            micros * 1000, // convert micros to nanos
+        )))
+    }
+
+    /// Helper to create a timestamp in microseconds from a datetime string.
+    ///
+    /// # Arguments
+    /// - `datetime`: String in format "YYYY-MM-DD HH:MM:SS"
+    ///
+    /// # Example
+    /// ```
+    /// let ts = timestamp_micros("2025-01-02 00:10:30");
+    /// // Returns: 1735776630000000 (microseconds since epoch)
+    /// ```
+    fn timestamp_micros(datetime: &str) -> i64 {
+        use chrono::NaiveDateTime;
+
+        let dt = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("Invalid datetime format");
+
+        dt.and_utc().timestamp() * 1_000_000 + i64::from(dt.and_utc().timestamp_subsec_micros())
+    }
+
+    /// Helper to create `TimestampMicrosecondArray` from datetime strings.
+    fn create_timestamps(datetimes: &[&str]) -> TimestampMicrosecondArray {
+        let micros: Vec<i64> = datetimes.iter().map(|dt| timestamp_micros(dt)).collect();
+        TimestampMicrosecondArray::from(micros)
+    }
+
+    /// Helper to execute `date_grid` UDF and return the result as a vector of timestamp arrays.
+    ///
+    /// # Arguments
+    /// - `timestamps`: Input timestamps to process
+    /// - `start`: Grid start timestamp
+    /// - `end`: Grid end timestamp
+    /// - `step`: Step interval between grid points
+    /// - `range`: Range window size
+    /// - `offset`: Range window offset
+    ///
+    /// # Returns
+    /// `Vec` of `Vec<i64>` where each inner vec is the grid timestamps for one input timestamp
+    fn execute_date_grid(
+        timestamps: &TimestampMicrosecondArray,
+        start: i64,
+        end: i64,
+        step: ScalarValue,
+        range: ScalarValue,
+        offset: ScalarValue,
+    ) -> Result<Vec<Vec<i64>>> {
+        let udf = DateGrid::new();
+
+        let timestamp_arg = ColumnarValue::Array(Arc::new(timestamps.clone()) as ArrayRef);
+        let start_arg = ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(start), None));
+        let end_arg = ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(end), None));
+        let step_arg = ColumnarValue::Scalar(step);
+        let range_arg = ColumnarValue::Scalar(range);
+        let offset_arg = ColumnarValue::Scalar(offset);
+
+        let return_field = Arc::new(Field::new(
+            "item",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ))),
+            false,
+        ));
+
+        let arg_fields = vec![
+            Arc::new(Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )),
+            Arc::new(Field::new(
+                "start",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )),
+            Arc::new(Field::new(
+                "end",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )),
+            Arc::new(Field::new(
+                "step",
+                DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::MonthDayNano),
+                false,
+            )),
+            Arc::new(Field::new(
+                "range",
+                DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::MonthDayNano),
+                false,
+            )),
+            Arc::new(Field::new(
+                "offset",
+                DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::MonthDayNano),
+                false,
+            )),
+        ];
+
+        let args = ScalarFunctionArgs {
+            args: vec![timestamp_arg, start_arg, end_arg, step_arg, range_arg, offset_arg],
+            number_rows: timestamps.len(),
+            return_field,
+            arg_fields,
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+
+        let result = udf.invoke_with_args(args)?;
+
+        // Extract ListArray from result
+        match result {
+            ColumnarValue::Array(arr) => {
+                let list_array = arr
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .ok_or_else(|| DataFusionError::Plan("Expected ListArray".to_string()))?;
+
+                let mut output = Vec::new();
+                for i in 0..list_array.len() {
+                    if list_array.is_null(i) {
+                        output.push(Vec::new());
+                    } else {
+                        let ts_array = list_array.value(i);
+                        let ts_micros = ts_array
+                            .as_any()
+                            .downcast_ref::<TimestampMicrosecondArray>()
+                            .ok_or_else(|| DataFusionError::Plan("Expected TimestampMicrosecondArray".to_string()))?;
+
+                        let timestamps_vec: Vec<i64> = (0..ts_micros.len()).map(|j| ts_micros.value(j)).collect();
+                        output.push(timestamps_vec);
+                    }
+                }
+
+                Ok(output)
+            },
+            ColumnarValue::Scalar(_) => Err(DataFusionError::Plan("Expected Array result".to_string())),
+        }
     }
 
     #[test]
@@ -411,5 +778,526 @@ mod tests {
         assert_eq!(offsets[1] - offsets[0], 2); // row 0: a, b
         assert_eq!(offsets[2] - offsets[1], 1); // row 1: a
         assert_eq!(offsets[3] - offsets[2], 1); // row 2: b
+    }
+
+    // DateGrid UDF tests
+
+    #[test]
+    fn test_date_grid_basic_single_match() {
+        // Test basic functionality: single timestamp matching one grid point
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03, 00:04, 00:05 (1-minute steps)
+        // Timestamp: 00:00:30
+        // Range: 1 minute, Offset: 0
+        //
+        // For t = 00:00:30:
+        //   - Lower bound: 00:00:30 + 0 = 00:00:30
+        //   - Upper bound: 00:00:30 + 1min = 00:01:30
+        //   - Matches: 00:01:00 (only grid point in [00:00:30, 00:01:30])
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:30"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:05:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:01:00"));
+    }
+
+    #[test]
+    fn test_date_grid_multiple_matches() {
+        // Test timestamp matching multiple grid points
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03, 00:04, 00:05 (1-minute steps)
+        // Timestamp: 00:00:00
+        // Range: 3 minutes, Offset: 0
+        //
+        // For t = 00:00:00:
+        //   - Lower bound: 00:00:00 + 0 = 00:00:00
+        //   - Upper bound: 00:00:00 + 3min = 00:03:00
+        //   - Matches: 00:00:00, 00:01:00, 00:02:00, 00:03:00
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:05:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(180_000_000); // 3 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 4);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:01:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:02:00"));
+        assert_eq!(result[0][3], timestamp_micros("2025-01-02 00:03:00"));
+    }
+
+    #[test]
+    fn test_date_grid_with_offset() {
+        // Test offset parameter shifts the range window
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps)
+        // Timestamp: 00:00:00
+        // Range: 1 minute, Offset: 30 seconds
+        //
+        // For t = 00:00:00:
+        //   - Lower bound: 00:00:00 + 30s = 00:00:30
+        //   - Upper bound: 00:00:00 + 30s + 1min = 00:01:30
+        //   - Matches: 00:01:00 (only grid point in [00:00:30, 00:01:30])
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(30_000_000); // 30 seconds
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:01:00"));
+    }
+
+    #[test]
+    fn test_date_grid_negative_offset() {
+        // Test negative offset shifts range window backward
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps)
+        // Timestamp: 00:02:00
+        // Range: 1 minute, Offset: -30 seconds
+        //
+        // For t = 00:02:00:
+        //   - Lower bound: 00:02:00 - 30s = 00:01:30
+        //   - Upper bound: 00:02:00 - 30s + 1min = 00:02:30
+        //   - Matches: 00:02:00 (only grid point in [00:01:30, 00:02:30])
+
+        let timestamps = create_timestamps(&["2025-01-02 00:02:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(-30_000_000); // -30 seconds
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:02:00"));
+    }
+
+    #[test]
+    fn test_date_grid_no_matches() {
+        // Test timestamp with no matching grid points (outside range window)
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps)
+        // Timestamp: 00:10:00 (far after grid end)
+        // Range: 1 minute, Offset: 0
+        //
+        // For t = 00:10:00:
+        //   - Lower bound: 00:10:00 + 0 = 00:10:00
+        //   - Upper bound: 00:10:00 + 1min = 00:11:00
+        //   - Matches: none (grid ends at 00:03:00)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:10:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 0); // Empty array
+    }
+
+    #[test]
+    fn test_date_grid_timestamp_before_grid() {
+        // Test timestamp before grid start
+        //
+        // Grid: 01:00, 01:01, 01:02, 01:03 (1-minute steps, starts at 01:00)
+        // Timestamp: 00:59:30 (before grid start)
+        // Range: 2 minutes, Offset: 0
+        //
+        // For t = 00:59:30:
+        //   - Lower bound: 00:59:30 + 0 = 00:59:30
+        //   - Upper bound: 00:59:30 + 2min = 01:01:30
+        //   - Matches: 01:00:00, 01:01:00 (first two grid points)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:59:30"]);
+        let start = timestamp_micros("2025-01-02 01:00:00");
+        let end = timestamp_micros("2025-01-02 01:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(120_000_000); // 2 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 01:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 01:01:00"));
+    }
+
+    #[test]
+    fn test_date_grid_exactly_on_grid_point() {
+        // Test timestamp exactly matching a grid point
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps)
+        // Timestamp: 00:02:00 (exactly on grid point)
+        // Range: 1 minute, Offset: 0
+        //
+        // For t = 00:02:00:
+        //   - Lower bound: 00:02:00 + 0 = 00:02:00
+        //   - Upper bound: 00:02:00 + 1min = 00:03:00
+        //   - Matches: 00:02:00, 00:03:00 (inclusive boundaries)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:02:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:02:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:03:00"));
+    }
+
+    #[test]
+    fn test_date_grid_batch_processing() {
+        // Test multiple timestamps in a batch (common use case)
+        //
+        // Grid: 00:00, 00:05, 00:10, 00:15 (5-minute steps)
+        // Timestamps: [00:01:00, 00:07:00, 00:14:00]
+        // Range: 5 minutes, Offset: 0
+        //
+        // For t1 = 00:01:00: matches 00:05:00
+        // For t2 = 00:07:00: matches 00:10:00
+        // For t3 = 00:14:00: matches 00:15:00
+
+        let timestamps = create_timestamps(&["2025-01-02 00:01:00", "2025-01-02 00:07:00", "2025-01-02 00:14:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:15:00");
+        let step = create_interval_micros(300_000_000); // 5 minutes
+        let range = create_interval_micros(300_000_000); // 5 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 3);
+
+        // First timestamp matches 00:05:00
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:05:00"));
+
+        // Second timestamp matches 00:10:00
+        assert_eq!(result[1].len(), 1);
+        assert_eq!(result[1][0], timestamp_micros("2025-01-02 00:10:00"));
+
+        // Third timestamp matches 00:15:00
+        assert_eq!(result[2].len(), 1);
+        assert_eq!(result[2][0], timestamp_micros("2025-01-02 00:15:00"));
+    }
+
+    #[test]
+    fn test_date_grid_subsecond_precision() {
+        // Test subsecond (microsecond) precision in grid
+        //
+        // Grid: 00:00:00.000000, 00:00:00.100000, 00:00:00.200000 (100ms steps)
+        // Timestamp: 00:00:00.050000
+        // Range: 100ms, Offset: 0
+        //
+        // For t = 00:00:00.050000:
+        //   - Lower bound: 00:00:00.050000
+        //   - Upper bound: 00:00:00.150000
+        //   - Matches: 00:00:00.100000
+
+        let base = timestamp_micros("2025-01-02 00:00:00");
+        let timestamps = TimestampMicrosecondArray::from(vec![base + 50_000]); // +50ms
+        let start = base;
+        let end = base + 300_000; // +300ms
+        let step = create_interval_micros(100_000); // 100ms
+        let range = create_interval_micros(100_000); // 100ms
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], base + 100_000); // 00:00:00.100000
+    }
+
+    #[test]
+    fn test_date_grid_large_grid() {
+        // Test performance with large grid (1000+ points)
+        //
+        // Grid: 00:00 to 16:40 with 1-second steps (1000 points)
+        // Timestamp: 08:20:00 (middle of grid)
+        // Range: 10 seconds, Offset: 0
+        //
+        // Should efficiently find ~10 matching grid points
+
+        let timestamps = create_timestamps(&["2025-01-02 08:20:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 16:40:00"); // 1000 minutes = 60000 seconds
+        let step = create_interval_micros(1_000_000); // 1 second
+        let range = create_interval_micros(10_000_000); // 10 seconds
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 11); // 08:20:00 through 08:20:10 (inclusive)
+
+        // Verify first and last match
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 08:20:00"));
+        assert_eq!(result[0][10], timestamp_micros("2025-01-02 08:20:10"));
+    }
+
+    #[test]
+    fn test_date_grid_edge_case_range_equals_step() {
+        // Test edge case: range equals step size
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps)
+        // Timestamp: 00:00:30 (halfway between grid points)
+        // Range: 1 minute (same as step), Offset: 0
+        //
+        // For t = 00:00:30:
+        //   - Lower bound: 00:00:30
+        //   - Upper bound: 00:01:30
+        //   - Matches: 00:01:00 (only one grid point)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:30"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute (same as step)
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:01:00"));
+    }
+
+    #[test]
+    fn test_date_grid_edge_case_zero_range() {
+        // Test edge case: zero range (degenerate window)
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps)
+        // Timestamp: 00:01:00 (exactly on grid)
+        // Range: 0, Offset: 0
+        //
+        // For t = 00:01:00:
+        //   - Lower bound: 00:01:00
+        //   - Upper bound: 00:01:00
+        //   - Matches: 00:01:00 (only exact point due to <= boundaries)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:01:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(0); // zero range
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:01:00"));
+    }
+
+    #[test]
+    fn test_date_grid_range_less_than_step_no_match() {
+        // Test edge case: range smaller than step, timestamp falls between grid points
+        //
+        // Grid: 00:00, 00:05, 00:10, 00:15 (5-minute steps)
+        // Timestamp: 00:02:00 (between grid points)
+        // Range: 1 minute (much less than 5-minute step), Offset: 0
+        //
+        // For t = 00:02:00:
+        //   - Lower bound: 00:02:00 + 0 = 00:02:00
+        //   - Upper bound: 00:02:00 + 1min = 00:03:00
+        //   - Grid points in range [00:02:00, 00:03:00]: NONE
+        //   - 00:00 < 00:02:00 (not in range)
+        //   - 00:05 > 00:03:00 (not in range)
+        //   - Matches: [] (empty)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:02:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:15:00");
+        let step = create_interval_micros(300_000_000); // 5 minutes
+        let range = create_interval_micros(60_000_000); // 1 minute (less than step)
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 0); // No matches
+    }
+
+    #[test]
+    fn test_date_grid_range_less_than_step_single_match() {
+        // Test edge case: range smaller than step, timestamp just before grid point
+        //
+        // Grid: 00:00, 00:05, 00:10, 00:15 (5-minute steps)
+        // Timestamp: 00:04:30 (30 seconds before grid point)
+        // Range: 1 minute (much less than 5-minute step), Offset: 0
+        //
+        // For t = 00:04:30:
+        //   - Lower bound: 00:04:30 + 0 = 00:04:30
+        //   - Upper bound: 00:04:30 + 1min = 00:05:30
+        //   - Grid points in range [00:04:30, 00:05:30]: 00:05:00
+        //   - Matches: [00:05:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:04:30"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:15:00");
+        let step = create_interval_micros(300_000_000); // 5 minutes
+        let range = create_interval_micros(60_000_000); // 1 minute (less than step)
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:05:00"));
+    }
+
+    #[test]
+    fn test_date_grid_range_less_than_step_with_negative_offset() {
+        // Test edge case: range smaller than step with negative offset
+        //
+        // Grid: 00:00, 00:05, 00:10, 00:15 (5-minute steps)
+        // Timestamp: 00:05:30 (30 seconds after grid point)
+        // Range: 1 minute, Offset: -1 minute
+        //
+        // For t = 00:05:30:
+        //   - Lower bound: 00:05:30 - 1min = 00:04:30
+        //   - Upper bound: 00:05:30 - 1min + 1min = 00:05:30
+        //   - Grid points in range [00:04:30, 00:05:30]: 00:05:00
+        //   - Matches: [00:05:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:05:30"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:15:00");
+        let step = create_interval_micros(300_000_000); // 5 minutes
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(-60_000_000); // -1 minute
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:05:00"));
+    }
+
+    // Error cases
+
+    #[test]
+    #[should_panic(expected = "requires 6 arguments")]
+    fn test_date_grid_wrong_argument_count() {
+        // Test error handling: wrong number of arguments
+        // Should panic with message "date_grid requires 6 arguments"
+        // (This tests the bug fix from current "requires 5 arguments")
+
+        let udf = DateGrid::new();
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+
+        // Only provide 3 arguments (should require 6)
+        let return_field = Arc::new(Field::new(
+            "item",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ))),
+            false,
+        ));
+
+        let arg_fields = vec![
+            Arc::new(Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )),
+            Arc::new(Field::new(
+                "start",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )),
+            Arc::new(Field::new(
+                "end",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )),
+        ];
+
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(Arc::new(timestamps) as ArrayRef),
+                ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(0), None)),
+                ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(1000), None)),
+            ],
+            number_rows: 1,
+            return_field,
+            arg_fields,
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+
+        // Should panic
+        let _result = udf.invoke_with_args(args).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "step must be positive")]
+    fn test_date_grid_negative_step() {
+        // Test error handling: negative step interval
+        // Should panic with "step must be positive" (from GridAccumulator::new)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(-60_000_000); // negative step
+        let range = create_interval_micros(60_000_000);
+        let offset = create_interval_micros(0);
+
+        // Should panic
+        let _result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "Month intervals are not supported")]
+    fn test_date_grid_month_interval() {
+        // Test error handling: intervals with months not supported
+        // Should panic with "Month intervals are not supported" (from udaf.rs:379-382)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+
+        // Create interval with months (not supported)
+        let step = ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+            1, // 1 month (not supported!)
+            0, 0,
+        )));
+        let range = create_interval_micros(60_000_000);
+        let offset = create_interval_micros(0);
+
+        // Should panic
+        let _result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
     }
 }
