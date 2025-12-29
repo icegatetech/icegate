@@ -6,8 +6,8 @@ use crate::{Error, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry,
 
 /// Task executor function signature.
 ///
-/// JobManager is borrowed so executors can't move it into background tasks.
-/// CancellationToken allows executor to stop early on shutdown.
+/// `JobManager` is borrowed so executors can't move it into background tasks.
+/// `CancellationToken` allows executor to stop early on shutdown.
 pub type TaskExecutorFn = Arc<
     dyn for<'a> Fn(
             Arc<dyn ImmutableTask>,
@@ -40,7 +40,7 @@ impl JobRegistry {
                 return Err(Error::Other("job code cannot be empty".into()));
             }
             if jobs_by_code.contains_key(&job_code) {
-                return Err(Error::Other(format!("job {} has duplicate", job_code)));
+                return Err(Error::Other(format!("job {job_code} has duplicate")));
             }
 
             for (task_code, executor) in job_def.task_executors() {
@@ -61,17 +61,15 @@ impl JobRegistry {
         self.jobs_by_code
             .get(code)
             .cloned()
-            .ok_or_else(|| Error::Other(format!("job definition {} not found", code)))
+            .ok_or_else(|| Error::Other(format!("job definition {code} not found")))
     }
 
     pub(crate) fn get_task_executor(&self, job_code: &JobCode, task_code: &TaskCode) -> Result<TaskExecutorFn, Error> {
         let key = Self::task_executor_key(job_code, task_code);
-        self.task_executors_by_key.get(&key).cloned().ok_or_else(|| {
-            Error::Other(format!(
-                "executor for task {} and job {} not exist",
-                task_code, job_code
-            ))
-        })
+        self.task_executors_by_key
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| Error::Other(format!("executor for task {task_code} and job {job_code} not exist")))
     }
 
     // TODO(low): add iterator
@@ -80,7 +78,7 @@ impl JobRegistry {
     }
 
     fn task_executor_key(job_code: &JobCode, task_code: &TaskCode) -> String {
-        format!("{}:{}", job_code, task_code)
+        format!("{job_code}:{task_code}")
     }
 }
 

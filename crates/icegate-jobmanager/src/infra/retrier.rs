@@ -5,8 +5,6 @@ use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::error::InternalError;
-
 #[derive(Clone)]
 pub struct RetrierConfig {
     /// Maximum number of retry attempts.

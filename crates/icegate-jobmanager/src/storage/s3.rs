@@ -7,7 +7,6 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::{Client, primitives::ByteStream};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
@@ -145,7 +144,7 @@ impl S3Storage {
                     .bucket(&config.bucket_name)
                     .send()
                     .await
-                    .map_err(|e| Error::Other(format!("Failed to create bucket: {}", e)))?;
+                    .map_err(|e| Error::Other(format!("Failed to create bucket: {e}")))?;
                 info!("Created bucket {}", config.bucket_name);
             },
         }
@@ -187,15 +186,15 @@ impl S3Storage {
                     412 => StorageError::ConcurrentModification,
                     429 => StorageError::RateLimited,
                     500 | 502 | 503 | 504 => StorageError::ServiceUnavailable,
-                    _ => StorageError::S3(format!("S3 SDK error: {:?}", err)),
+                    _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
                 }
             },
             aws_sdk_s3::error::SdkError::TimeoutError(_) => StorageError::Timeout,
             aws_sdk_s3::error::SdkError::DispatchFailure(e) => {
                 // Network/connection errors - should be retryable
-                StorageError::S3(format!("Network error: {:?}", e))
+                StorageError::S3(format!("Network error: {e:?}"))
             },
-            _ => StorageError::S3(format!("S3 SDK error: {:?}", err)),
+            _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
         }
     }
 
@@ -222,19 +221,19 @@ impl S3Storage {
         // Expected format: {prefix}/{jobCode}/state-00001.json
         let parts: Vec<&str> = file_path.split('/').collect();
         if parts.len() < 2 {
-            return Err(StorageError::Other(format!("Cannot split file path {}", file_path)));
+            return Err(StorageError::Other(format!("Cannot split file path {file_path}")));
         }
 
         let filename = parts[parts.len() - 1];
         if !filename.starts_with(JOB_STATE_FILE_PREFIX) || !filename.ends_with(JOB_STATE_FILE_EXTENSION) {
-            return Err(StorageError::Other(format!("Invalid filename format {}", filename)));
+            return Err(StorageError::Other(format!("Invalid filename format {filename}")));
         }
 
         let iter_num_str =
             filename.trim_start_matches(JOB_STATE_FILE_PREFIX).trim_end_matches(JOB_STATE_FILE_EXTENSION);
 
         let inv_iter_num: u64 =
-            iter_num_str.parse().map_err(|e| StorageError::Other(format!("Failed to parse iter_num: {}", e)))?;
+            iter_num_str.parse().map_err(|e| StorageError::Other(format!("Failed to parse iter_num: {e}")))?;
 
         // Restore original iterNum
         Ok(u64::MAX - inv_iter_num)
@@ -346,7 +345,7 @@ impl S3Storage {
         match result {
             Ok(output) => {
                 self.record_s3_ok("PUT", start);
-                Ok(output.e_tag().map(|tag| tag.to_string()))
+                Ok(output.e_tag().map(std::string::ToString::to_string))
             },
             Err(e) => {
                 self.record_s3_err("PUT", &e, start);
@@ -378,7 +377,7 @@ impl S3Storage {
         match result {
             Ok(output) => {
                 self.record_s3_ok("PUT", start);
-                Ok(output.e_tag().map(|tag| tag.to_string()))
+                Ok(output.e_tag().map(std::string::ToString::to_string))
             },
             Err(e) => {
                 self.record_s3_err("PUT", &e, start);
@@ -449,12 +448,12 @@ impl Storage for S3Storage {
             .await
             .map_err(|e| {
                 self.metrics.record_s3_operation("GET", "ERR", start.elapsed());
-                StorageError::S3(format!("Failed to read job body: {}", e))
+                StorageError::S3(format!("Failed to read job body: {e}"))
             })?
             .into_bytes();
         self.record_s3_ok("GET", start);
 
-        let mut job = self.deserialize_job(&data, job_meta.version.as_str())?;
+        let job = self.deserialize_job(&data, job_meta.version.as_str())?;
 
         Ok(job)
     }
@@ -509,7 +508,7 @@ impl Storage for S3Storage {
         let is_new_iter = job.is_started();
         let version = job.version().to_string();
         let data = Arc::new(self.serialize_job(job)?);
-        let key = self.build_state_path(job.code(), job.iter_num()).clone();
+        let key = self.build_state_path(job.code(), job.iter_num());
 
         if job.is_started() {
             debug!(

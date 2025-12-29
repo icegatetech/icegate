@@ -56,15 +56,15 @@ pub(crate) enum JobError {
 
 impl From<JobError> for InternalError {
     fn from(err: JobError) -> Self {
-        InternalError::Job(err)
+        Self::Job(err)
     }
 }
 
 impl From<StorageError> for InternalError {
     fn from(err: StorageError) -> Self {
         match err {
-            StorageError::Cancelled => InternalError::Cancelled,
-            _ => InternalError::Storage(err),
+            StorageError::Cancelled => Self::Cancelled,
+            _ => Self::Storage(err),
         }
     }
 }
@@ -72,19 +72,19 @@ impl From<StorageError> for InternalError {
 impl From<Error> for InternalError {
     fn from(err: Error) -> Self {
         match err {
-            Error::Cancelled => InternalError::Cancelled,
-            Error::Serialization(e) => InternalError::Other(e.to_string()),
-            Error::Other(msg) => InternalError::Other(msg),
+            Error::Cancelled => Self::Cancelled,
+            Error::Serialization(e) => Self::Other(e.to_string()),
+            Error::Other(msg) => Self::Other(msg),
         }
     }
 }
 
 impl RetryError for InternalError {
     fn cancelled() -> Self {
-        InternalError::Cancelled
+        Self::Cancelled
     }
 
     fn max_attempts() -> Self {
-        InternalError::MaxAttemptsReached
+        Self::MaxAttemptsReached
     }
 }

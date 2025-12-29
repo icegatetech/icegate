@@ -1,5 +1,8 @@
 [package]
 name = "jobmanager"
+description = "Job manager"
+readme = "../../README.md"
+keywords = ["iceberg", "S3", "job", "task"]
 categories = ["database"]
 version = { workspace = true }
 edition = { workspace = true }

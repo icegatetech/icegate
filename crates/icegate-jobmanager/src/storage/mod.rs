@@ -45,29 +45,26 @@ pub(crate) enum StorageError {
 }
 
 impl StorageError {
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            StorageError::Timeout | StorageError::RateLimited | StorageError::ServiceUnavailable
-        )
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Timeout | Self::RateLimited | Self::ServiceUnavailable)
     }
 
-    pub fn is_conflict(&self) -> bool {
-        matches!(self, StorageError::ConcurrentModification)
+    pub const fn is_conflict(&self) -> bool {
+        matches!(self, Self::ConcurrentModification)
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, StorageError::Cancelled)
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 }
 
 impl RetryError for StorageError {
     fn cancelled() -> Self {
-        StorageError::Cancelled
+        Self::Cancelled
     }
 
     fn max_attempts() -> Self {
-        StorageError::Other("max retry attempts reached".into())
+        Self::Other("max retry attempts reached".into())
     }
 }
 
@@ -94,7 +91,7 @@ pub trait Storage: Send + Sync {
     async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta>;
 
     /// Save job with optimistic locking. Updates job.version on success. Returns
-    /// ConcurrentModification error if version mismatch.
+    /// If version mismatch.
     async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()>;
 }
 

@@ -29,20 +29,20 @@ impl std::fmt::Display for JobCode {
 
 impl From<String> for JobCode {
     fn from(s: String) -> Self {
-        JobCode(s)
+        Self(s)
     }
 }
 
 impl From<&str> for JobCode {
     fn from(s: &str) -> Self {
-        JobCode(s.to_string())
+        Self(s.to_string())
     }
 }
 
 // TODO(low): add a status for jobs that should not be repeated. For example, a job should only run
 // N times (or only once).
 /// Job lifecycle state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     Started,   // New job created or new iteration started - tasks can be picked up for work.
@@ -54,22 +54,22 @@ pub enum JobStatus {
 impl std::fmt::Display for JobStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            JobStatus::Started => write!(f, "started"),
-            JobStatus::Running => write!(f, "running"),
-            JobStatus::Completed => write!(f, "completed"),
-            JobStatus::Failed => write!(f, "failed"),
+            Self::Started => write!(f, "started"),
+            Self::Running => write!(f, "running"),
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
         }
     }
 }
 
 impl JobStatus {
     // Checks if transition to new status is allowed and returns error if not
-    fn can_transition_to(&self, new: &JobStatus) -> Result<(), JobError> {
+    fn can_transition_to(&self, new: &Self) -> Result<(), JobError> {
         let allowed = match self {
-            JobStatus::Started => matches!(new, JobStatus::Running | JobStatus::Failed),
-            JobStatus::Running => matches!(new, JobStatus::Running | JobStatus::Completed | JobStatus::Failed),
-            JobStatus::Completed => matches!(new, JobStatus::Started),
-            JobStatus::Failed => matches!(new, JobStatus::Started),
+            Self::Started => matches!(new, Self::Running | Self::Failed),
+            Self::Running => matches!(new, Self::Running | Self::Completed | Self::Failed),
+            Self::Completed => matches!(new, Self::Started),
+            Self::Failed => matches!(new, Self::Started),
         };
 
         if allowed {
@@ -82,7 +82,7 @@ impl JobStatus {
         }
     }
 
-    fn transition_to(&mut self, new: JobStatus) -> Result<(), JobError> {
+    fn transition_to(&mut self, new: Self) -> Result<(), JobError> {
         self.can_transition_to(&new)?;
         *self = new;
         Ok(())
@@ -131,7 +131,7 @@ impl JobDefinition {
         })
     }
 
-    pub fn code(&self) -> &JobCode {
+    pub const fn code(&self) -> &JobCode {
         &self.code
     }
 
@@ -143,7 +143,7 @@ impl JobDefinition {
         &self.task_executors
     }
 
-    pub fn max_iterations(&self) -> u64 {
+    pub const fn max_iterations(&self) -> u64 {
         self.max_iterations
     }
 }
@@ -249,7 +249,7 @@ impl Job {
         let old_iter_num = self.iter_num;
         let old_metadata = self.metadata.clone();
 
-        *self = Job::new(self.code.clone(), tasks, old_metadata, worker_id, max_iterations);
+        *self = Self::new(self.code.clone(), tasks, old_metadata, worker_id, max_iterations);
         self.id = old_id;
         // TODO(low): in the future, a mechanism for restarting the sequence is needed (currently the
         // maximum sequence is 10^20). Sequential uuid will not work, as there may be a race when creating a
@@ -327,15 +327,15 @@ impl Job {
         &self.id
     }
 
-    pub(crate) fn code(&self) -> &JobCode {
+    pub(crate) const fn code(&self) -> &JobCode {
         &self.code
     }
 
-    pub(crate) fn iter_num(&self) -> u64 {
+    pub(crate) const fn iter_num(&self) -> u64 {
         self.iter_num
     }
 
-    pub(crate) fn status(&self) -> &JobStatus {
+    pub(crate) const fn status(&self) -> &JobStatus {
         &self.status
     }
 
@@ -343,23 +343,23 @@ impl Job {
         &self.version
     }
 
-    pub(crate) fn started_at(&self) -> DateTime<Utc> {
+    pub(crate) const fn started_at(&self) -> DateTime<Utc> {
         self.started_at
     }
 
-    pub(crate) fn completed_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) const fn completed_at(&self) -> Option<DateTime<Utc>> {
         self.completed_at
     }
 
-    pub(crate) fn running_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) const fn running_at(&self) -> Option<DateTime<Utc>> {
         self.running_at
     }
 
-    pub(crate) fn next_start_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) const fn next_start_at(&self) -> Option<DateTime<Utc>> {
         self.next_start_at
     }
 
-    pub(crate) fn metadata(&self) -> &HashMap<String, serde_json::Value> {
+    pub(crate) const fn metadata(&self) -> &HashMap<String, serde_json::Value> {
         &self.metadata
     }
 
@@ -368,15 +368,15 @@ impl Job {
     }
 
     // State checks
-    pub(crate) fn is_started(&self) -> bool {
+    pub(crate) const fn is_started(&self) -> bool {
         matches!(self.status, JobStatus::Started)
     }
 
-    pub(crate) fn is_processed(&self) -> bool {
+    pub(crate) const fn is_processed(&self) -> bool {
         matches!(self.status, JobStatus::Completed | JobStatus::Failed)
     }
 
-    pub(crate) fn is_ready_for_processing(&self) -> bool {
+    pub(crate) const fn is_ready_for_processing(&self) -> bool {
         matches!(self.status, JobStatus::Started | JobStatus::Running)
     }
 
@@ -431,7 +431,7 @@ impl Job {
     // Merging. Call this method after worker handled a task.
     pub(crate) fn merge_with_processed_task(
         &mut self,
-        worker_job: &Job,
+        worker_job: &Self,
         worker_id: &str,
         task_id: &str,
     ) -> Result<(), JobError> {
@@ -478,7 +478,7 @@ impl Job {
         Ok(())
     }
 
-    pub(crate) fn is_iteration_limit_reached(&self) -> bool {
+    pub(crate) const fn is_iteration_limit_reached(&self) -> bool {
         // TODO(low): add a special status that we no longer run the job and remove this check at the
         // complete stage
         self.max_iterations > 0 && self.iter_num >= self.max_iterations
@@ -494,7 +494,7 @@ impl Job {
     }
 
     pub(crate) fn tasks_as_iter(&self) -> impl Iterator<Item = &Task> {
-        self.tasks_by_id.values().map(|arc| arc.as_ref())
+        self.tasks_by_id.values().map(std::convert::AsRef::as_ref)
     }
 
     pub(crate) fn get_task(&self, task_id: &str) -> Result<Arc<dyn ImmutableTask>, JobError> {

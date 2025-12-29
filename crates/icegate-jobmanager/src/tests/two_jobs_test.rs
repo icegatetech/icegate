@@ -17,7 +17,7 @@ use crate::{
     s3_storage::{S3Storage, S3StorageConfig},
 };
 
-/// TestTwoJobsConcurrent runs two jobs in parallel with two workers.
+/// Runs two jobs in parallel with two workers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = super::common::logging::init_test_logging();
@@ -160,7 +160,7 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
         tasks_per_iter,
         "job B tasks count mismatch"
     );
-    let job_b_timeouts: u64 = job_b_state.tasks_as_iter().map(|t| (t.attempt() - 1).max(0) as u64).sum();
+    let job_b_timeouts: u64 = job_b_state.tasks_as_iter().map(|t| u64::from(t.attempt() - 1)).sum();
     assert_eq!(job_b_timeouts, 0, "job B should not have timeouts");
 
     Ok(())

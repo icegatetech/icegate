@@ -28,7 +28,7 @@ pub struct JobsManager {
     metrics: Metrics,
 }
 
-/// Handle for controlling a running JobsManager.
+/// Handle for controlling a running `JobsManager`.
 pub struct JobsManagerHandle {
     cancel_token: CancellationToken,
     join_set: JoinSet<Result<(), InternalError>>,

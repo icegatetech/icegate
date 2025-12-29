@@ -8,12 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{
-    Job, JobCode, JobDefinition, JobRegistry, Metrics, Retrier, RetrierConfig, Storage, StorageError, Task, TaskCode,
-    error::{InternalError, JobError},
-    job_manager::JobManagerImpl,
-};
-
+use crate::{Job, JobCode, JobDefinition, JobRegistry, Metrics, Retrier, RetrierConfig, Storage, StorageError, Task, error::{InternalError, JobError}, job_manager::JobManagerImpl, TaskCode};
 // TODO(low): implement subscription mechanism for job updates between workers - if worker
 // received/saved job, other workers should update their state to reduce races. Can be done via
 // storage wrapper.
@@ -223,7 +218,7 @@ impl Worker {
         let job_def = self.job_registry.get_job(code)?;
         let tasks = self.create_tasks_from_job_def(&job_def);
 
-        let mut job = Job::new(
+        let job = Job::new(
             code.clone(),
             tasks,
             HashMap::new(),

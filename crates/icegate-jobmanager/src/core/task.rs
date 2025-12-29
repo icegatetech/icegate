@@ -27,18 +27,18 @@ impl std::fmt::Display for TaskCode {
 
 impl From<String> for TaskCode {
     fn from(s: String) -> Self {
-        TaskCode(s)
+        Self(s)
     }
 }
 
 impl From<&str> for TaskCode {
     fn from(s: &str) -> Self {
-        TaskCode(s.to_string())
+        Self(s.to_string())
     }
 }
 
 /// Task lifecycle state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
     Todo,      // task is waiting to be picked up by a worker
@@ -50,10 +50,10 @@ pub enum TaskStatus {
 impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TaskStatus::Todo => write!(f, "todo"),
-            TaskStatus::Started => write!(f, "started"),
-            TaskStatus::Completed => write!(f, "completed"),
-            TaskStatus::Failed => write!(f, "failed"),
+            Self::Todo => write!(f, "todo"),
+            Self::Started => write!(f, "started"),
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
         }
     }
 }
@@ -79,7 +79,7 @@ impl TaskDefinition {
         })
     }
 
-    pub fn code(&self) -> &TaskCode {
+    pub const fn code(&self) -> &TaskCode {
         &self.code
     }
 
@@ -89,7 +89,7 @@ impl TaskDefinition {
     }
 
     pub fn timeout(&self) -> Duration {
-        self.timeout.clone()
+        self.timeout
     }
 }
 
@@ -180,11 +180,11 @@ impl Task {
         &self.id
     }
 
-    pub(crate) fn code(&self) -> &TaskCode {
+    pub(crate) const fn code(&self) -> &TaskCode {
         &self.code
     }
 
-    pub(crate) fn status(&self) -> &TaskStatus {
+    pub(crate) const fn status(&self) -> &TaskStatus {
         &self.status
     }
 
@@ -197,22 +197,22 @@ impl Task {
     }
 
     pub(crate) fn timeout(&self) -> Duration {
-        self.timeout.clone()
+        self.timeout
     }
 
-    pub(crate) fn attempt(&self) -> u32 {
+    pub(crate) const fn attempt(&self) -> u32 {
         self.attempt
     }
 
-    pub(crate) fn started_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) const fn started_at(&self) -> Option<DateTime<Utc>> {
         self.started_at
     }
 
-    pub(crate) fn completed_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) const fn completed_at(&self) -> Option<DateTime<Utc>> {
         self.completed_at
     }
 
-    pub(crate) fn deadline_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) const fn deadline_at(&self) -> Option<DateTime<Utc>> {
         self.deadline_at
     }
 
@@ -237,15 +237,15 @@ impl Task {
         }
     }
 
-    pub(crate) fn is_completed(&self) -> bool {
+    pub(crate) const fn is_completed(&self) -> bool {
         matches!(self.status, TaskStatus::Completed)
     }
 
-    pub(crate) fn is_failed(&self) -> bool {
+    pub(crate) const fn is_failed(&self) -> bool {
         matches!(self.status, TaskStatus::Failed)
     }
 
-    pub(crate) fn is_started(&self) -> bool {
+    pub(crate) const fn is_started(&self) -> bool {
         matches!(self.status, TaskStatus::Started)
     }
 
@@ -321,19 +321,19 @@ impl ImmutableTask for Task {
     }
 
     fn code(&self) -> &TaskCode {
-        &self.code()
+        self.code()
     }
 
     fn get_input(&self) -> &[u8] {
-        &self.input()
+        self.input()
     }
 
     fn get_output(&self) -> &[u8] {
-        &self.output()
+        self.output()
     }
 
     fn get_error(&self) -> &str {
-        &self.error_msg()
+        self.error_msg()
     }
 
     fn is_expired(&self) -> bool {

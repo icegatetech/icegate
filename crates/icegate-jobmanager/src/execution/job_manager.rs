@@ -31,7 +31,7 @@ impl<'a> JobManagerImpl<'a> {
     }
 }
 
-impl<'a> JobManager for JobManagerImpl<'a> {
+impl JobManager for JobManagerImpl<'_> {
     fn add_task(&self, task_def: TaskDefinition) -> Result<(), Error> {
         let mut job = self.job.write();
         job.add_task(task_def, &self.worker_id).map_err(|e| Error::Other(e.to_string()))?;
