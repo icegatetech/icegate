@@ -48,7 +48,7 @@ pub(crate) trait RetryError: Sized {
 }
 
 impl Retrier {
-    pub fn new(config: RetrierConfig) -> Self {
+    pub const fn new(config: RetrierConfig) -> Self {
         Self {
             config,
         }
