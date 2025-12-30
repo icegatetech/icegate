@@ -347,8 +347,12 @@ impl Default for DateGrid {
 impl DateGrid {
     /// Creates a new `Grid` UDF.
     pub fn new() -> Self {
+        use datafusion::logical_expr::TypeSignature;
         Self {
-            signature: Signature::any(6, Volatility::Immutable),
+            signature: Signature::one_of(
+                vec![TypeSignature::Any(6), TypeSignature::Any(7)],
+                Volatility::Immutable,
+            ),
         }
     }
 
@@ -391,8 +395,8 @@ impl ScalarUDFImpl for DateGrid {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.len() != 6 {
-            return plan_err!("date_grid requires 6 arguments");
+        if arg_types.len() != 6 && arg_types.len() != 7 {
+            return plan_err!("date_grid requires 6 or 7 arguments");
         }
         Ok(DataType::List(arg_types[0].clone().into_nullable_field_ref()))
     }
@@ -408,8 +412,8 @@ impl ScalarUDFImpl for DateGrid {
         };
 
         // Validate argument count
-        if args.args.len() != 6 {
-            return plan_err!("date_grid requires 6 arguments");
+        if args.args.len() != 6 && args.args.len() != 7 {
+            return plan_err!("date_grid requires 6 or 7 arguments");
         }
 
         // Extract arguments
@@ -439,6 +443,16 @@ impl ScalarUDFImpl for DateGrid {
         let step_micros = Self::extract_interval_micros(&args.args[3], "step")?;
         let range_micros = Self::extract_interval_micros(&args.args[4], "range")?;
         let offset_micros = Self::extract_interval_micros(&args.args[5], "offset")?;
+
+        // Extract optional inverse parameter (7th argument)
+        let inverse = if args.args.len() == 7 {
+            match &args.args[6] {
+                ColumnarValue::Scalar(ScalarValue::Boolean(Some(v))) => *v,
+                _ => return plan_err!("Seventh argument (inverse) must be a Boolean scalar"),
+            }
+        } else {
+            false
+        };
 
         // Validate step is positive
         if step_micros <= 0 {
@@ -471,11 +485,31 @@ impl ScalarUDFImpl for DateGrid {
                 let lower_grid = t + offset_micros;
                 let upper_grid = t + upper_bound_micros;
 
-                // Binary search for first grid point >= lower_grid
-                let start_idx = grid.partition_point(|&g| g < lower_grid);
+                let matches: Vec<i64> = if inverse {
+                    // Inverse mode: collect grid points OUTSIDE the range [lower_grid, upper_grid]
+                    // Binary search for boundaries
+                    let lower_idx = grid.partition_point(|&g| g < lower_grid);
+                    let upper_idx = grid.partition_point(|&g| g <= upper_grid);
 
-                // Collect all matching grid points
-                let matches: Vec<i64> = grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect();
+                    let mut result = Vec::new();
+
+                    // Add all grid points before the range
+                    result.extend_from_slice(&grid[..lower_idx]);
+
+                    // Add all grid points after the range
+                    if upper_idx < grid.len() {
+                        result.extend_from_slice(&grid[upper_idx..]);
+                    }
+
+                    result
+                } else {
+                    // Normal mode: collect grid points WITHIN the range [lower_grid, upper_grid]
+                    // Binary search for first grid point >= lower_grid
+                    let start_idx = grid.partition_point(|&g| g < lower_grid);
+
+                    // Collect all matching grid points
+                    grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect()
+                };
 
                 list_builder.push(matches);
             }
@@ -500,9 +534,9 @@ impl ScalarUDFImpl for DateGrid {
         let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets_vec));
 
         let field = Arc::new(datafusion::arrow::datatypes::Field::new(
-            "item",
+            "",  // Empty name to match return_type promise
             DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
+            true,  // Nullable to match return_type promise
         ));
 
         let list_array = ListArray::new(field, offsets, values_array, None);
@@ -1218,11 +1252,11 @@ mod tests {
     // Error cases
 
     #[test]
-    #[should_panic(expected = "requires 6 arguments")]
+    #[should_panic(expected = "requires 6 or 7 arguments")]
     fn test_date_grid_wrong_argument_count() {
         // Test error handling: wrong number of arguments
-        // Should panic with message "date_grid requires 6 arguments"
-        // (This tests the bug fix from current "requires 5 arguments")
+        // Should panic with message "date_grid requires 6 or 7 arguments"
+        // (This tests that we support both 6-arg and 7-arg versions)
 
         let udf = DateGrid::new();
         let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
