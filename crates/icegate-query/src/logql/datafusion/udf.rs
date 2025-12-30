@@ -475,11 +475,7 @@ impl ScalarUDFImpl for DateGrid {
                 let start_idx = grid.partition_point(|&g| g < lower_grid);
 
                 // Collect all matching grid points within the range
-                let matches: Vec<i64> = grid[start_idx..]
-                    .iter()
-                    .take_while(|&&g| g <= upper_grid)
-                    .copied()
-                    .collect();
+                let matches: Vec<i64> = grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect();
 
                 list_builder.push(matches);
             }
