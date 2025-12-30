@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Error, ImmutableTask, Task, TaskCode, TaskDefinition, error::JobError, registry::TaskExecutorFn};
+use crate::{Error, ImmutableTask, JobError, Task, TaskCode, TaskDefinition, registry::TaskExecutorFn};
 
 /// Job identifier used to select a job definition and persisted state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

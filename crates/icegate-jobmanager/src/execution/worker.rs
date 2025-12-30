@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{Job, JobCode, JobDefinition, JobRegistry, Metrics, Retrier, RetrierConfig, Storage, StorageError, Task, error::{InternalError, JobError}, job_manager::JobManagerImpl, TaskCode};
+use crate::{InternalError, Job, JobCode, JobDefinition, JobError, JobRegistry, Metrics, Retrier, RetrierConfig, Storage, StorageError, Task, TaskCode, job_manager::JobManagerImpl};
 // TODO(low): implement subscription mechanism for job updates between workers - if worker
 // received/saved job, other workers should update their state to reduce races. Can be done via
 // storage wrapper.
@@ -399,6 +399,7 @@ impl Worker {
         Ok(true)
     }
 
+    #[allow(clippy::map_unwrap_or)]
     #[tracing::instrument(
         skip(self, job, cancel_token),
         fields(
@@ -458,7 +459,7 @@ impl Worker {
 
                 let worker_id = self.id.clone();
                 let task_id_clone = task_id.clone();
-                job = self
+                _ = self
                     .save_processed_task(job, &task_id, &cancel_token, move |ctx| {
                         let JobMergeContext {
                             current_job,

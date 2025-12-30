@@ -4,7 +4,7 @@ use std::{
 };
 
 use aws_config::timeout::TimeoutConfig;
-use aws_sdk_s3::{Client, primitives::ByteStream};
+use aws_sdk_s3::{primitives::ByteStream, Client};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -239,7 +239,7 @@ impl S3Storage {
         Ok(u64::MAX - inv_iter_num)
     }
 
-    fn serialize_job(&self, job: &Job) -> StorageResult<Vec<u8>> {
+    fn serialize_job(job: &Job) -> StorageResult<Vec<u8>> {
         let job_json = Self::job_to_json(job);
         serde_json::to_vec_pretty(&job_json).map_err(|e| StorageError::Serialization(e.to_string()))
     }
@@ -388,6 +388,7 @@ impl S3Storage {
 }
 
 #[async_trait::async_trait]
+#[allow(private_interfaces)]
 impl Storage for S3Storage {
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
         if cancel_token.is_cancelled() {
@@ -507,7 +508,7 @@ impl Storage for S3Storage {
         }
         let is_new_iter = job.is_started();
         let version = job.version().to_string();
-        let data = Arc::new(self.serialize_job(job)?);
+        let data = Arc::new(Self::serialize_job(job)?);
         let key = self.build_state_path(job.code(), job.iter_num());
 
         if job.is_started() {

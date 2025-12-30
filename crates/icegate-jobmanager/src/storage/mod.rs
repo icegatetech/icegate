@@ -80,6 +80,7 @@ pub(crate) struct JobMeta {
 
 /// Storage backend trait for persisting job state.
 #[async_trait]
+#[allow(private_interfaces)] // TODO(low): think about how to open Job to public
 pub trait Storage: Send + Sync {
     /// Get latest job by code
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job>;

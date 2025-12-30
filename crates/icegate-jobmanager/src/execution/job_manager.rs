@@ -31,32 +31,27 @@ impl<'a> JobManagerImpl<'a> {
     }
 }
 
-impl JobManager for JobManagerImpl<'_> {
+impl<'a> JobManager for JobManagerImpl<'a> {
     fn add_task(&self, task_def: TaskDefinition) -> Result<(), Error> {
-        let mut job = self.job.write();
-        job.add_task(task_def, &self.worker_id).map_err(|e| Error::Other(e.to_string()))?;
+        self.job.write().add_task(task_def, &self.worker_id).map_err(|e| Error::Other(e.to_string()))?;
         Ok(())
     }
 
     fn complete_task(&self, task_id: &str, output: Vec<u8>) -> Result<(), Error> {
-        let mut job = self.job.write();
-        job.complete_task(task_id, output).map_err(|e| Error::Other(e.to_string()))?;
+        self.job.write().complete_task(task_id, output).map_err(|e| Error::Other(e.to_string()))?;
         Ok(())
     }
 
     fn fail_task(&self, task_id: &str, error_msg: &str) -> Result<(), Error> {
-        let mut job = self.job.write();
-        job.fail_task(task_id, error_msg).map_err(|e| Error::Other(e.to_string()))?;
+        self.job.write().fail_task(task_id, error_msg).map_err(|e| Error::Other(e.to_string()))?;
         Ok(())
     }
 
     fn get_task(&self, task_id: &str) -> Result<Arc<dyn ImmutableTask>, Error> {
-        let job = self.job.read();
-        job.get_task(task_id).map_err(|e| Error::Other(e.to_string()))
+        self.job.read().get_task(task_id).map_err(|e| Error::Other(e.to_string()))
     }
 
     fn get_tasks_by_code(&self, code: &TaskCode) -> Result<Vec<Arc<dyn ImmutableTask>>, Error> {
-        let job = self.job.read();
-        Ok(job.get_tasks_by_code(code))
+        Ok(self.job.read().get_tasks_by_code(code))
     }
 }

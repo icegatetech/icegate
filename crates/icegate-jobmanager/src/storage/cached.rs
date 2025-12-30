@@ -53,6 +53,8 @@ impl CachedStorage {
 }
 
 #[async_trait]
+#[allow(private_interfaces)]
+#[allow(clippy::significant_drop_tightening)]
 impl Storage for CachedStorage {
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
         if cancel_token.is_cancelled() {
@@ -106,6 +108,7 @@ impl Storage for CachedStorage {
         Ok(job)
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn get_job_by_meta(&self, meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
         if cancel_token.is_cancelled() {
             return Err(StorageError::Cancelled);
@@ -159,6 +162,7 @@ impl Storage for CachedStorage {
         self.inner.find_job_meta(job_code, cancel_token).await
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
         if cancel_token.is_cancelled() {
             return Err(StorageError::Cancelled);

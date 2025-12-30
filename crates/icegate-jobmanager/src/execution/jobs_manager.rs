@@ -4,7 +4,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::{Error, JobRegistry, Metrics, Storage, Worker, WorkerConfig, error::InternalError};
+use crate::{Error, InternalError, JobRegistry, Metrics, Storage, Worker, WorkerConfig};
 
 #[derive(Clone)]
 pub struct JobsManagerConfig {

@@ -8,7 +8,7 @@ pub mod storage;
 
 // Public compatibility modules
 pub mod error {
-    pub use crate::core::error::*;
+    pub use crate::core::error::{Error, Result};
 }
 pub mod job {
     pub use crate::core::job::*;
@@ -44,6 +44,7 @@ pub mod s3_storage {
 // Re-exports
 pub use cached_storage::CachedStorage;
 pub use error::Error;
+pub(crate) use crate::core::error::{InternalError, JobError};
 pub(crate) use job::Job;
 pub use job::{JobCode, JobDefinition, JobStatus};
 pub use job_manager::JobManager;
@@ -60,6 +61,6 @@ pub use task::{ImmutableTask, TaskCode, TaskDefinition, TaskStatus};
 pub(crate) use worker::Worker;
 pub use worker::WorkerConfig;
 
-// Integration tests (moved from tests/ to have access to pub(crate) types)
+// Integration tests
 #[cfg(test)]
 mod tests;

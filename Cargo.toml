@@ -42,6 +42,7 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+single_match_else = "allow"
 
 [workspace.dependencies]
 # Internal crates
