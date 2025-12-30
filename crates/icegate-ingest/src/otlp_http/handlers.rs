@@ -44,7 +44,10 @@ pub async fn ingest_logs(
     body: Bytes,
 ) -> OtlpResult<Json<ExportLogsResponse>> {
     // Determine content type (default to protobuf per OTLP spec)
-    let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or(CONTENT_TYPE_PROTOBUF);
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(CONTENT_TYPE_PROTOBUF);
 
     // Parse the request based on content type
     let export_request = parse_logs_request(content_type, &body)?;
@@ -85,16 +88,11 @@ pub async fn ingest_logs(
     })?;
 
     match result {
-        WriteResult::Success {
-            offset,
-            records,
-        } => {
+        WriteResult::Success { offset, records } => {
             debug!(offset, records, "Logs written to WAL");
             Ok(Json(ExportLogsResponse::default()))
-        },
-        WriteResult::Failed {
-            reason,
-        } => {
+        }
+        WriteResult::Failed { reason } => {
             // Return partial success with all records rejected
             Ok(Json(ExportLogsResponse {
                 partial_success: Some(LogsPartialSuccess {
@@ -102,7 +100,7 @@ pub async fn ingest_logs(
                     error_message: Some(reason),
                 }),
             }))
-        },
+        }
     }
 }
 

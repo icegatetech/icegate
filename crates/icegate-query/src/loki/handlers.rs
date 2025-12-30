@@ -99,7 +99,9 @@ pub async fn label_values(
     Query(params): Query<LabelValuesQueryParams>,
 ) -> LokiResult<impl IntoResponse> {
     let executor = QueryExecutor::new(loki_state.engine);
-    let data = executor.execute_label_values(extract_tenant_id(&headers), &label_name, &params).await?;
+    let data = executor
+        .execute_label_values(extract_tenant_id(&headers), &label_name, &params)
+        .await?;
 
     Ok((StatusCode::OK, Json(LokiResponse::success(data))))
 }

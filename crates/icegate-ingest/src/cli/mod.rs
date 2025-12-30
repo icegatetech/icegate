@@ -41,9 +41,7 @@ impl Cli {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             Commands::Version => commands::version::execute(),
-            Commands::Run {
-                config,
-            } => commands::run::execute(config).await,
+            Commands::Run { config } => commands::run::execute(config).await,
         }
     }
 }

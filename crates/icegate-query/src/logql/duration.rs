@@ -177,7 +177,9 @@ pub fn parse_duration(text: &str) -> Result<TimeDelta> {
         last_priority = Some(priority);
 
         // Parse number and calculate nanos
-        let num: f64 = num_str.parse().map_err(|_| parse_error(format!("Invalid number in duration: {num_str}")))?;
+        let num: f64 = num_str
+            .parse()
+            .map_err(|_| parse_error(format!("Invalid number in duration: {num_str}")))?;
 
         let nanos_per_unit =
             unit_to_nanos(unit).ok_or_else(|| parse_error(format!("Unknown duration unit: {unit}")))?;
@@ -185,7 +187,9 @@ pub fn parse_duration(text: &str) -> Result<TimeDelta> {
         #[allow(clippy::cast_precision_loss)]
         let component_nanos = f64_to_i64_checked(num * nanos_per_unit as f64)?;
 
-        total_nanos = total_nanos.checked_add(component_nanos).ok_or_else(|| parse_error("Duration overflow"))?;
+        total_nanos = total_nanos
+            .checked_add(component_nanos)
+            .ok_or_else(|| parse_error("Duration overflow"))?;
 
         component_count += 1;
         remaining = after_unit;

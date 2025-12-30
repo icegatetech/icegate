@@ -18,10 +18,10 @@ fn assert_parses_to(query: &str, expected: &LogQLExpr) {
                 &expr, expected,
                 "Parsed expression does not match expected for query: '{query}'"
             );
-        },
+        }
         Err(e) => {
             panic!("Query should parse successfully: '{query}'\nError: {e:?}");
-        },
+        }
     }
 }
 
@@ -56,7 +56,7 @@ fn parse_query(query: &str) -> std::result::Result<(), Vec<String>> {
         Ok(_) => {
             let all_errors = collect_errors();
             if all_errors.is_empty() { Ok(()) } else { Err(all_errors) }
-        },
+        }
         Err(_) => Err(collect_errors()),
     }
 }
@@ -64,14 +64,14 @@ fn parse_query(query: &str) -> std::result::Result<(), Vec<String>> {
 /// Helper that expects parsing to succeed
 fn assert_parses(query: &str) {
     match parse_query(query) {
-        Ok(_) => {},
+        Ok(_) => {}
         Err(errors) => {
             panic!(
                 "Query should parse successfully: '{}'\nErrors:\n{}",
                 query,
                 errors.join("\n")
             );
-        },
+        }
     }
 }
 
@@ -131,13 +131,13 @@ fn assert_tree_contains(query: &str, expected_rules: &[&str]) {
                      tree:\n{tree_str}"
                 );
             }
-        },
+        }
         Err(errors) => {
             panic!(
                 "Query should parse successfully: '{query}'\nErrors:\n{}",
                 errors.join("\n")
             );
-        },
+        }
     }
 }
 

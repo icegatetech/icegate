@@ -27,9 +27,7 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = PrometheusState {
-        engine,
-    };
+    let state = PrometheusState { engine };
 
     let app = super::routes::routes(state);
 

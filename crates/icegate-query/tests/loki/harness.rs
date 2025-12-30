@@ -75,12 +75,17 @@ impl TestServer {
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
 
         if !catalog.namespace_exists(&namespace_ident).await? {
-            catalog.create_namespace(&namespace_ident, std::collections::HashMap::new()).await?;
+            catalog
+                .create_namespace(&namespace_ident, std::collections::HashMap::new())
+                .await?;
         }
 
         let schema = schema::logs_schema()?;
 
-        let table_creation = iceberg::TableCreation::builder().name(LOGS_TABLE.to_string()).schema(schema).build();
+        let table_creation = iceberg::TableCreation::builder()
+            .name(LOGS_TABLE.to_string())
+            .schema(schema)
+            .build();
 
         let _ = catalog.create_table(&namespace_ident, table_creation).await?;
 
@@ -96,7 +101,9 @@ impl TestServer {
         let server_engine = Arc::clone(&query_engine);
 
         let server_handle = tokio::spawn(async move {
-            icegate_query::loki::run(server_engine, loki_config, cancel_token_clone).await.unwrap();
+            icegate_query::loki::run(server_engine, loki_config, cancel_token_clone)
+                .await
+                .unwrap();
         });
 
         // Wait for server to start
@@ -221,22 +228,25 @@ pub async fn write_test_logs_for_tenant(
     span_id_builder.append_value([0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28])?;
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        tenant_id_arr,
-        account_id,
-        service_name_arr,
-        timestamp,
-        observed_timestamp,
-        ingested_timestamp,
-        trace_id,
-        span_id,
-        severity_number,
-        severity_text,
-        body,
-        attributes,
-        flags,
-        dropped_attributes_count,
-    ])?;
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            tenant_id_arr,
+            account_id,
+            service_name_arr,
+            timestamp,
+            observed_timestamp,
+            ingested_timestamp,
+            trace_id,
+            span_id,
+            severity_number,
+            severity_text,
+            body,
+            attributes,
+            flags,
+            dropped_attributes_count,
+        ],
+    )?;
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
     let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
@@ -270,7 +280,10 @@ pub async fn write_test_logs_for_tenant(
 
 /// Write standard test log data to an Iceberg table
 pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Result<(), Box<dyn std::error::Error>> {
-    let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
 
     let tenant_id: ArrayRef = Arc::new(StringArray::from(vec!["test-tenant", "test-tenant", "test-tenant"]));
     let account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
@@ -365,22 +378,25 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
     span_id_builder.append_value([0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28])?;
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        tenant_id,
-        account_id,
-        service_name,
-        timestamp,
-        observed_timestamp,
-        ingested_timestamp,
-        trace_id,
-        span_id,
-        severity_number,
-        severity_text,
-        body,
-        attributes,
-        flags,
-        dropped_attributes_count,
-    ])?;
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            tenant_id,
+            account_id,
+            service_name,
+            timestamp,
+            observed_timestamp,
+            ingested_timestamp,
+            trace_id,
+            span_id,
+            severity_number,
+            severity_text,
+            body,
+            attributes,
+            flags,
+            dropped_attributes_count,
+        ],
+    )?;
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
     let file_name_generator = DefaultFileNameGenerator::new("data".to_string(), None, DataFileFormat::Parquet);

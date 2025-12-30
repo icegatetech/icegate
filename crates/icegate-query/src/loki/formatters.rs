@@ -169,7 +169,11 @@ fn extract_body(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> String 
     cols.body
         .and_then(|idx| {
             batch.column(idx).as_any().downcast_ref::<StringArray>().and_then(|arr| {
-                if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) }
+                if arr.is_null(row) {
+                    None
+                } else {
+                    Some(arr.value(row).to_string())
+                }
             })
         })
         .unwrap_or_default()
@@ -312,7 +316,11 @@ pub fn batches_to_loki_streams(batches: &[RecordBatch]) -> FormattedResult {
 
             let ts_str = itoa::Buffer::new().format(timestamp_nanos).to_string();
 
-            streams.entry(key_buffer.clone()).or_insert_with(|| (labels, Vec::new())).1.push((ts_str, body));
+            streams
+                .entry(key_buffer.clone())
+                .or_insert_with(|| (labels, Vec::new()))
+                .1
+                .push((ts_str, body));
         }
     }
 
@@ -321,10 +329,7 @@ pub fn batches_to_loki_streams(batches: &[RecordBatch]) -> FormattedResult {
         .map(|(labels, values)| {
             let stream: HashMap<String, String> =
                 labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            Stream {
-                stream,
-                values,
-            }
+            Stream { stream, values }
         })
         .collect();
 
@@ -347,10 +352,18 @@ fn extract_time_bucket_secs(batch: &RecordBatch, cols: &MetricBatchColumns, row:
     let Some(idx) = cols.timestamp else { return 0i64 };
     let arr = batch.column(idx).as_any();
     if let Some(arr) = arr.downcast_ref::<TimestampMicrosecondArray>() {
-        return if arr.is_null(row) { 0i64 } else { arr.value(row) / 1_000_000i64 };
+        return if arr.is_null(row) {
+            0i64
+        } else {
+            arr.value(row) / 1_000_000i64
+        };
     }
     if let Some(arr) = arr.downcast_ref::<TimestampNanosecondArray>() {
-        return if arr.is_null(row) { 0i64 } else { arr.value(row) / 1_000_000_000i64 };
+        return if arr.is_null(row) {
+            0i64
+        } else {
+            arr.value(row) / 1_000_000_000i64
+        };
     }
     0i64
 }
@@ -445,10 +458,7 @@ pub fn batches_to_loki_matrix(batches: &[RecordBatch]) -> FormattedResult {
         .map(|(labels, values)| {
             let metric: HashMap<String, String> =
                 labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            MetricSeries {
-                metric,
-                values,
-            }
+            MetricSeries { metric, values }
         })
         .collect();
 

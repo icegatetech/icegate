@@ -145,12 +145,15 @@ impl QueueWriter {
                 .collect()
         };
 
-        let errors: Vec<_> =
-            join_all(topics_to_flush.into_iter().map(|topic| async move { self.flush_topic(&topic).await }))
-                .await
+        let errors: Vec<_> = join_all(
+            topics_to_flush
                 .into_iter()
-                .filter_map(Result::err)
-                .collect();
+                .map(|topic| async move { self.flush_topic(&topic).await }),
+        )
+        .await
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
         if !errors.is_empty() {
             return Err(QueueError::Multiple(errors));
         }
@@ -180,7 +183,7 @@ impl QueueWriter {
             Err(e) => {
                 TopicAccumulator::send_failure(responses, &e.to_string());
                 return Err(e);
-            },
+            }
         };
 
         // Write the concatenated batch
@@ -188,11 +191,11 @@ impl QueueWriter {
             Ok((offset, _)) => {
                 TopicAccumulator::send_success(responses, offset, total_records);
                 Ok(())
-            },
+            }
             Err(e) => {
                 TopicAccumulator::send_failure(responses, &e.to_string());
                 Err(e)
-            },
+            }
         }
     }
 
@@ -239,7 +242,9 @@ impl QueueWriter {
         let size_bytes = parquet_bytes.len() as u64;
 
         // Write with retry on conflict
-        let offset = self.write_with_retry(topic, parquet_bytes, record_count, size_bytes, row_group_count).await?;
+        let offset = self
+            .write_with_retry(topic, parquet_bytes, record_count, size_bytes, row_group_count)
+            .await?;
 
         Ok((offset, record_count))
     }
@@ -293,7 +298,7 @@ impl QueueWriter {
                     let prev_slice = sorted_group_col.slice(i - 1, 1);
                     let curr_slice = sorted_group_col.slice(i, 1);
                     prev_slice.as_ref() != curr_slice.as_ref()
-                },
+                }
             };
 
             if is_boundary {
@@ -369,10 +374,8 @@ impl QueueWriter {
                     );
 
                     return Ok(offset);
-                },
-                Err(QueueError::AlreadyExists {
-                    ..
-                }) => {
+                }
+                Err(QueueError::AlreadyExists { .. }) => {
                     attempts += 1;
                     if attempts >= max_attempts {
                         return Err(QueueError::Write {
@@ -396,7 +399,7 @@ impl QueueWriter {
                     // SAFETY: the `interval` can't be negative
                     let delay = self.config.flush_interval_ms + rand::random_range(-interval..=interval) as u64;
                     tokio::time::sleep(Duration::from_millis(delay)).await;
-                },
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -547,10 +550,13 @@ mod tests {
 
     fn test_batch() -> RecordBatch {
         let schema = test_schema();
-        RecordBatch::try_new(schema, vec![
-            Arc::new(StringArray::from(vec!["acme", "globex", "acme", "globex"])),
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
-        ])
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["acme", "globex", "acme", "globex"])),
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
         .unwrap()
     }
 
@@ -579,8 +585,10 @@ mod tests {
         let writer = QueueWriter::new(config, store.clone());
 
         let batch = test_batch();
-        let (offset, count) =
-            writer.write_batch(&"logs".to_string(), batch, Some("tenant_id".to_string())).await.unwrap();
+        let (offset, count) = writer
+            .write_batch(&"logs".to_string(), batch, Some("tenant_id".to_string()))
+            .await
+            .unwrap();
 
         assert_eq!(offset, 0);
         assert_eq!(count, 4);

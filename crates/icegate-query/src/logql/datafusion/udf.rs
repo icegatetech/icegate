@@ -244,7 +244,11 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
             }
 
             let key = keys.value(entry_idx);
-            let should_include = if keep_mode { filter_set.contains(key) } else { !filter_set.contains(key) };
+            let should_include = if keep_mode {
+                filter_set.contains(key)
+            } else {
+                !filter_set.contains(key)
+            };
 
             if should_include {
                 new_keys.append_value(key);
@@ -274,14 +278,18 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
     let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(new_offsets));
 
     // Handle nulls from original map
-    let null_buffer = if map_array.null_count() > 0 { map_array.nulls().cloned() } else { None };
+    let null_buffer = if map_array.null_count() > 0 {
+        map_array.nulls().cloned()
+    } else {
+        None
+    };
 
     // Get the original map field which contains the field name and metadata
     let original_map_field = match map_array.data_type() {
         DataType::Map(field, _) => field.clone(),
         _ => {
             return exec_err!("Expected Map data type");
-        },
+        }
     };
 
     Ok(MapArray::new(
@@ -413,7 +421,7 @@ impl ScalarUDFImpl for DateGrid {
             })?,
             ColumnarValue::Scalar(_) => {
                 return plan_err!("First argument must be an array, not a scalar");
-            },
+            }
         };
 
         // Extract scalar parameters
@@ -713,7 +721,7 @@ mod tests {
                 }
 
                 Ok(output)
-            },
+            }
             ColumnarValue::Scalar(_) => Err(DataFusionError::Plan("Expected Array result".to_string())),
         }
     }
@@ -765,9 +773,11 @@ mod tests {
 
     #[test]
     fn test_map_filter_multiple_rows() {
-        let map = create_test_map(
-            &[vec![("a", "1"), ("b", "2"), ("c", "3")], vec![("a", "4"), ("d", "5")], vec![("b", "6")]],
-        );
+        let map = create_test_map(&[
+            vec![("a", "1"), ("b", "2"), ("c", "3")],
+            vec![("a", "4"), ("d", "5")],
+            vec![("b", "6")],
+        ]);
 
         let filter_set: HashSet<&str> = ["a", "b"].into_iter().collect();
 

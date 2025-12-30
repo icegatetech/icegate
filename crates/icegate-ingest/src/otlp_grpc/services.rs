@@ -28,9 +28,7 @@ pub struct OtlpGrpcService {
 impl OtlpGrpcService {
     /// Create a new OTLP gRPC service.
     pub const fn new(write_channel: WriteChannel) -> Self {
-        Self {
-            write_channel,
-        }
+        Self { write_channel }
     }
 }
 
@@ -54,9 +52,7 @@ impl LogsService for OtlpGrpcService {
         // Transform OTLP logs to Arrow RecordBatch
         let Some(batch) = transform::logs_to_record_batch(&export_request, tenant_id) else {
             // No records to process - return success with 0 rejected
-            return Ok(Response::new(ExportLogsServiceResponse {
-                partial_success: None,
-            }));
+            return Ok(Response::new(ExportLogsServiceResponse { partial_success: None }));
         };
 
         let record_count = batch.num_rows();
@@ -78,21 +74,16 @@ impl LogsService for OtlpGrpcService {
             .map_err(|e| Status::unavailable(format!("WAL queue unavailable: {e}")))?;
 
         // Wait for write result
-        let result = response_rx.await.map_err(|e| Status::internal(format!("Failed to receive write result: {e}")))?;
+        let result = response_rx
+            .await
+            .map_err(|e| Status::internal(format!("Failed to receive write result: {e}")))?;
 
         match result {
-            icegate_queue::WriteResult::Success {
-                offset,
-                records,
-            } => {
+            icegate_queue::WriteResult::Success { offset, records } => {
                 debug!(offset, records, "Logs written to WAL");
-                Ok(Response::new(ExportLogsServiceResponse {
-                    partial_success: None,
-                }))
-            },
-            icegate_queue::WriteResult::Failed {
-                reason,
-            } => {
+                Ok(Response::new(ExportLogsServiceResponse { partial_success: None }))
+            }
+            icegate_queue::WriteResult::Failed { reason } => {
                 // Return partial success with all records rejected
                 Ok(Response::new(ExportLogsServiceResponse {
                     partial_success: Some(
@@ -102,7 +93,7 @@ impl LogsService for OtlpGrpcService {
                         },
                     ),
                 }))
-            },
+            }
         }
     }
 }

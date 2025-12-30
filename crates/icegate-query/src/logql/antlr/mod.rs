@@ -70,7 +70,10 @@ impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectingErrorListener {
             message: msg.to_string(),
             antlr_error: e.cloned(),
         };
-        self.errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(error);
+        self.errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(error);
     }
 }
 

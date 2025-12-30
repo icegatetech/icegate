@@ -60,8 +60,12 @@ pub fn logs_to_record_batch(request: &ExportLogsServiceRequest, tenant_id: Optio
         .as_micros() as i64;
 
     // Count total log records for capacity hints
-    let total_records: usize =
-        request.resource_logs.iter().flat_map(|rl| &rl.scope_logs).map(|sl| sl.log_records.len()).sum();
+    let total_records: usize = request
+        .resource_logs
+        .iter()
+        .flat_map(|rl| &rl.scope_logs)
+        .map(|sl| sl.log_records.len())
+        .sum();
 
     if total_records == 0 {
         return None;
@@ -164,7 +168,9 @@ pub fn logs_to_record_batch(request: &ExportLogsServiceRequest, tenant_id: Optio
 
                 // trace_id (16 bytes)
                 if log_record.trace_id.len() == 16 && !is_zero_bytes(&log_record.trace_id) {
-                    trace_id_builder.append_value(&log_record.trace_id).expect("trace_id is 16 bytes");
+                    trace_id_builder
+                        .append_value(&log_record.trace_id)
+                        .expect("trace_id is 16 bytes");
                 } else {
                     trace_id_builder.append_null();
                 }
@@ -263,7 +269,7 @@ pub fn logs_to_record_batch(request: &ExportLogsServiceRequest, tenant_id: Optio
         Err(e) => {
             tracing::error!("Failed to create RecordBatch: {e}");
             None
-        },
+        }
     }
 }
 
@@ -281,7 +287,7 @@ fn extract_any_value_string(value: Option<&AnyValue>) -> Option<String> {
             Value::ArrayValue(arr) => {
                 let items: Vec<String> = arr.values.iter().filter_map(|v| extract_any_value_string(Some(v))).collect();
                 format!("[{}]", items.join(", "))
-            },
+            }
             Value::KvlistValue(kvs) => {
                 let pairs: Vec<String> = kvs
                     .values
@@ -289,7 +295,7 @@ fn extract_any_value_string(value: Option<&AnyValue>) -> Option<String> {
                     .filter_map(|kv| extract_any_value_string(kv.value.as_ref()).map(|v| format!("{}={}", kv.key, v)))
                     .collect();
                 format!("{{{}}}", pairs.join(", "))
-            },
+            }
         })
     })
 }
@@ -324,9 +330,7 @@ mod tests {
 
     #[test]
     fn test_logs_to_record_batch_empty() {
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![],
-        };
+        let request = ExportLogsServiceRequest { resource_logs: vec![] };
 
         let batch = logs_to_record_batch(&request, None);
         assert!(batch.is_none());

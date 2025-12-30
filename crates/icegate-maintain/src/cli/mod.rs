@@ -60,9 +60,7 @@ impl Cli {
     /// Returns an error if the command execution fails
     pub async fn execute(self) -> Result<(), MaintainError> {
         match self.command {
-            Commands::Migrate {
-                command,
-            } => commands::migrate::execute(command).await,
+            Commands::Migrate { command } => commands::migrate::execute(command).await,
         }
     }
 }

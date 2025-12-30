@@ -180,10 +180,13 @@ mod tests {
         let schema = test_schema();
         let tenant_ids: Vec<&str> = (0..rows).map(|_| "acme").collect();
         let values: Vec<i32> = (0..rows).map(|i| i as i32).collect();
-        RecordBatch::try_new(schema, vec![
-            Arc::new(StringArray::from(tenant_ids)),
-            Arc::new(Int32Array::from(values)),
-        ])
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(tenant_ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
         .expect("batch creation")
     }
 

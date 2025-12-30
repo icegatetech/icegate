@@ -17,7 +17,9 @@ async fn test_query_range_endpoint() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3201).await?;
 
     // Insert test data
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     // Query Loki API with tenant header
@@ -73,7 +75,9 @@ async fn test_query_range_endpoint() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_log_vs_metric_response_types() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3203).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     // Log query should return "streams" with "stream" labels
@@ -116,7 +120,10 @@ async fn test_log_vs_metric_response_types() -> Result<(), Box<dyn std::error::E
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
         .header("X-Scope-OrgID", "test-tenant")
-        .query(&[("query", "count_over_time({service_name=\"frontend\"}[5m])"), ("step", "60s")])
+        .query(&[
+            ("query", "count_over_time({service_name=\"frontend\"}[5m])"),
+            ("step", "60s"),
+        ])
         .send()
         .await?;
 

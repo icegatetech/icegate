@@ -53,13 +53,11 @@ impl StorageConfig {
     /// Returns an error if the configuration is invalid
     pub fn validate(&self) -> Result<()> {
         match &self.backend {
-            StorageBackend::FileSystem {
-                root_path,
-            } => {
+            StorageBackend::FileSystem { root_path } => {
                 if root_path.trim().is_empty() {
                     return Err(CommonError::Config("FileSystem root path cannot be empty".into()));
                 }
-            },
+            }
             StorageBackend::S3(s3_config) => {
                 if s3_config.bucket.trim().is_empty() {
                     return Err(CommonError::Config("S3 bucket cannot be empty".into()));
@@ -67,10 +65,10 @@ impl StorageConfig {
                 if s3_config.region.trim().is_empty() {
                     return Err(CommonError::Config("S3 region cannot be empty".into()));
                 }
-            },
+            }
             StorageBackend::Memory => {
                 // No validation needed for memory storage
-            },
+            }
         }
 
         Ok(())

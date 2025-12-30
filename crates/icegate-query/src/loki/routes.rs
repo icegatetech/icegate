@@ -11,7 +11,10 @@ pub fn routes(state: LokiState) -> Router {
     Router::new()
         // Query endpoints (Loki API supports both GET and POST)
         .route("/loki/api/v1/query", get(handlers::query).post(handlers::query))
-        .route("/loki/api/v1/query_range", get(handlers::query_range).post(handlers::query_range))
+        .route(
+            "/loki/api/v1/query_range",
+            get(handlers::query_range).post(handlers::query_range),
+        )
         // Label endpoints
         .route("/loki/api/v1/labels", get(handlers::labels))
         .route("/loki/api/v1/label/:name/values", get(handlers::label_values))

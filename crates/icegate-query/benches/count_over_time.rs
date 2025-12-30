@@ -63,7 +63,12 @@ fn bench_grid_size_impact(c: &mut Criterion) {
     let num_timestamps = 10_000; // Fixed timestamp count
 
     // Test different grid sizes
-    let grid_configs = vec![("10_grid", 10), ("100_grid", 100), ("1000_grid", 1_000), ("10000_grid", 10_000)];
+    let grid_configs = vec![
+        ("10_grid", 10),
+        ("100_grid", 100),
+        ("1000_grid", 1_000),
+        ("10000_grid", 10_000),
+    ];
 
     for (name, num_grid_points) in grid_configs {
         let start = 0i64;
@@ -242,7 +247,12 @@ fn bench_merge_operations(c: &mut Criterion) {
 fn bench_grid_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("grid_creation");
 
-    let grid_sizes = vec![("tiny_10", 10), ("small_100", 100), ("medium_1000", 1_000), ("large_10000", 10_000)];
+    let grid_sizes = vec![
+        ("tiny_10", 10),
+        ("small_100", 100),
+        ("medium_1000", 1_000),
+        ("large_10000", 10_000),
+    ];
 
     for (name, num_points) in grid_sizes {
         let start = 0i64;
