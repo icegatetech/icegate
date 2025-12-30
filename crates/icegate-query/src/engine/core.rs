@@ -90,7 +90,10 @@ impl QueryEngine {
             .with_target_partitions(self.config.target_partitions);
 
         // Build session state
-        let session_state = SessionStateBuilder::new().with_config(session_config).with_default_features().build();
+        let session_state = SessionStateBuilder::new()
+            .with_config(session_config)
+            .with_default_features()
+            .build();
 
         // Create SessionContext
         let session_ctx = SessionContext::new_with_state(session_state);

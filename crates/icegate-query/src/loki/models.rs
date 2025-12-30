@@ -333,8 +333,16 @@ impl SummaryStats {
         clippy::cast_sign_loss
     )]
     pub fn from_metrics(bytes: usize, lines: usize, exec_time: f64) -> Self {
-        let bytes_per_sec = if exec_time > 0.0 { (bytes as f64 / exec_time) as u64 } else { 0 };
-        let lines_per_sec = if exec_time > 0.0 { (lines as f64 / exec_time) as u64 } else { 0 };
+        let bytes_per_sec = if exec_time > 0.0 {
+            (bytes as f64 / exec_time) as u64
+        } else {
+            0
+        };
+        let lines_per_sec = if exec_time > 0.0 {
+            (lines as f64 / exec_time) as u64
+        } else {
+            0
+        };
 
         Self {
             bytes_per_second: bytes_per_sec,

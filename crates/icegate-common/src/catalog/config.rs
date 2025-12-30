@@ -47,9 +47,7 @@ impl CatalogConfig {
 
         // Validate catalog type specific requirements
         match &self.backend {
-            CatalogBackend::Rest {
-                uri,
-            } => {
+            CatalogBackend::Rest { uri } => {
                 if uri.trim().is_empty() {
                     return Err(CommonError::Config("REST catalog URI cannot be empty".into()));
                 }
@@ -59,10 +57,10 @@ impl CatalogConfig {
                         "REST catalog URI must start with http:// or https://".into(),
                     ));
                 }
-            },
+            }
             CatalogBackend::Memory => {
                 // No specific validation needed for memory catalog
-            },
+            }
         }
 
         Ok(())

@@ -290,11 +290,11 @@ fn schemas_differ(current: &iceberg::spec::Schema, target: &iceberg::spec::Schem
                 if current_field.required != target_field.required {
                     return true;
                 }
-            },
+            }
             None => {
                 // Field doesn't exist in current schema
                 return true;
-            },
+            }
         }
     }
 
@@ -324,16 +324,16 @@ fn types_equal(a: &iceberg::spec::Type, b: &iceberg::spec::Type) -> bool {
                 }
             }
             true
-        },
+        }
         (Type::List(la), Type::List(lb)) => {
             la.element_field.required == lb.element_field.required
                 && types_equal(&la.element_field.field_type, &lb.element_field.field_type)
-        },
+        }
         (Type::Map(ma), Type::Map(mb)) => {
             types_equal(&ma.key_field.field_type, &mb.key_field.field_type)
                 && ma.value_field.required == mb.value_field.required
                 && types_equal(&ma.value_field.field_type, &mb.value_field.field_type)
-        },
+        }
         _ => false, // Different type variants
     }
 }

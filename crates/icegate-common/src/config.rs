@@ -69,6 +69,6 @@ pub fn load_config_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
         _ => {
             // Try TOML first, then YAML
             toml::from_str(&content).or_else(|_| Ok(serde_yaml::from_str(&content)?))
-        },
+        }
     }
 }

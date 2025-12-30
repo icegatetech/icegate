@@ -17,14 +17,19 @@ use super::harness::{TestServer, write_test_logs};
 async fn test_count_over_time_metric() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3204).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
         .header("X-Scope-OrgID", "test-tenant")
-        .query(&[("query", "count_over_time({service_name=\"frontend\"}[5m])"), ("step", "60s")])
+        .query(&[
+            ("query", "count_over_time({service_name=\"frontend\"}[5m])"),
+            ("step", "60s"),
+        ])
         .send()
         .await?;
 
@@ -81,14 +86,19 @@ async fn test_count_over_time_metric() -> Result<(), Box<dyn std::error::Error>>
 async fn test_bytes_over_time_metric() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3205).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
         .header("X-Scope-OrgID", "test-tenant")
-        .query(&[("query", "bytes_over_time({service_name=\"frontend\"}[5m])"), ("step", "60s")])
+        .query(&[
+            ("query", "bytes_over_time({service_name=\"frontend\"}[5m])"),
+            ("step", "60s"),
+        ])
         .send()
         .await?;
 
@@ -132,7 +142,9 @@ async fn test_bytes_over_time_metric() -> Result<(), Box<dyn std::error::Error>>
 async fn test_rate() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3206).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     let resp = server
@@ -182,14 +194,19 @@ async fn test_rate() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_bytes_rate() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3207).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
         .header("X-Scope-OrgID", "test-tenant")
-        .query(&[("query", "bytes_rate({service_name=\"frontend\"}[5m])"), ("step", "60s")])
+        .query(&[
+            ("query", "bytes_rate({service_name=\"frontend\"}[5m])"),
+            ("step", "60s"),
+        ])
         .send()
         .await?;
 

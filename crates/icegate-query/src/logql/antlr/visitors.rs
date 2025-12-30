@@ -219,22 +219,22 @@ fn visit_matcher(ctx: &MatcherContextAll) -> Result<LabelMatcher> {
             let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
             let value = c.STRING().ok_or_else(|| parse_error("Missing value"))?.get_text();
             Ok(LabelMatcher::new(label, MatchOp::Eq, clean_string(&value)))
-        },
+        }
         MatcherContextAll::MatcherNeqContext(c) => {
             let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
             let value = c.STRING().ok_or_else(|| parse_error("Missing value"))?.get_text();
             Ok(LabelMatcher::new(label, MatchOp::Neq, clean_string(&value)))
-        },
+        }
         MatcherContextAll::MatcherReContext(c) => {
             let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
             let value = c.STRING().ok_or_else(|| parse_error("Missing value"))?.get_text();
             Ok(LabelMatcher::new(label, MatchOp::Re, clean_string(&value)))
-        },
+        }
         MatcherContextAll::MatcherNreContext(c) => {
             let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
             let value = c.STRING().ok_or_else(|| parse_error("Missing value"))?.get_text();
             Ok(LabelMatcher::new(label, MatchOp::Nre, clean_string(&value)))
-        },
+        }
         MatcherContextAll::Error(_) => Err(parse_error("Error in matcher")),
     }
 }
@@ -248,15 +248,15 @@ fn visit_label_extractions(ctx: &LabelExtractionsContextAll) -> Result<Vec<Label
             LabelExtractionExprContextAll::LabelExtractionSimpleContext(c) => {
                 let name = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
                 extractions.push(LabelExtraction::new(name));
-            },
+            }
             LabelExtractionExprContextAll::LabelExtractionWithPathContext(c) => {
                 let name = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
                 let path = c.STRING().ok_or_else(|| parse_error("Missing path"))?.get_text();
                 extractions.push(LabelExtraction::with_path(name, clean_string(&path)));
-            },
+            }
             LabelExtractionExprContextAll::Error(_) => {
                 return Err(parse_error("Error in label extraction"));
-            },
+            }
         }
     }
 
@@ -267,13 +267,17 @@ fn visit_label_extractions(ctx: &LabelExtractionsContextAll) -> Result<Vec<Label
 fn visit_grouping(ctx: &GroupingContextAll) -> Result<Grouping> {
     match ctx {
         GroupingContextAll::GroupingByContext(c) => {
-            let labels = c.groupingLabels().map_or_else(Vec::new, |labels_ctx| collect_grouping_labels(&labels_ctx));
+            let labels = c
+                .groupingLabels()
+                .map_or_else(Vec::new, |labels_ctx| collect_grouping_labels(&labels_ctx));
             Ok(Grouping::By(labels))
-        },
+        }
         GroupingContextAll::GroupingWithoutContext(c) => {
-            let labels = c.groupingLabels().map_or_else(Vec::new, |labels_ctx| collect_grouping_labels(&labels_ctx));
+            let labels = c
+                .groupingLabels()
+                .map_or_else(Vec::new, |labels_ctx| collect_grouping_labels(&labels_ctx));
             Ok(Grouping::Without(labels))
-        },
+        }
         GroupingContextAll::GroupingByEmptyContext(_) => Ok(Grouping::By(Vec::new())),
         GroupingContextAll::GroupingWithoutEmptyContext(_) => Ok(Grouping::Without(Vec::new())),
         GroupingContextAll::Error(_) => Err(parse_error("Error in grouping")),
@@ -309,16 +313,16 @@ fn collect_line_filter_values(filters: &[Rc<LineFilterContextAll>]) -> Result<Ve
             LineFilterContextAll::LineFilterStringContext(c) => {
                 let s = c.STRING().ok_or_else(|| parse_error("Missing string in line filter"))?;
                 values.push(LineFilterValue::String(clean_string(&s.get_text())));
-            },
+            }
             LineFilterContextAll::LineFilterIpContext(c) => {
                 if let Some(ip_fn) = c.ipFn() {
                     let s = ip_fn.STRING().ok_or_else(|| parse_error("Missing IP address in ip()"))?;
                     values.push(LineFilterValue::Ip(clean_string(&s.get_text())));
                 }
-            },
+            }
             LineFilterContextAll::Error(_) => {
                 return Err(parse_error("Error in line filter value"));
-            },
+            }
         }
     }
     Ok(values)
@@ -391,16 +395,16 @@ fn visit_literal_value(ctx: &LiteralExprContextAll) -> Result<f64> {
         LiteralExprContextAll::LiteralNumberContext(c) => {
             let num = c.NUMBER().ok_or_else(|| parse_error("Missing number"))?;
             parse_number(&num.get_text())
-        },
+        }
         LiteralExprContextAll::LiteralPositiveNumberContext(c) => {
             let num = c.NUMBER().ok_or_else(|| parse_error("Missing number"))?;
             parse_number(&num.get_text())
-        },
+        }
         LiteralExprContextAll::LiteralNegativeNumberContext(c) => {
             let num = c.NUMBER().ok_or_else(|| parse_error("Missing number"))?;
             let value = parse_number(&num.get_text())?;
             Ok(-value)
-        },
+        }
         LiteralExprContextAll::Error(_) => Err(parse_error("Error in literal expression")),
     }
 }
@@ -424,7 +428,7 @@ fn visit_range_unwrap_op_no_group(ctx: &RangeUnwrapOpNoGroupingContextAll) -> Re
         RangeUnwrapOpNoGroupingContextAll::RangeUnwrapOpNoGroupRateContext(_) => Ok(RangeAggregationOp::Rate),
         RangeUnwrapOpNoGroupingContextAll::RangeUnwrapOpNoGroupRateCounterContext(_) => {
             Ok(RangeAggregationOp::RateCounter)
-        },
+        }
         RangeUnwrapOpNoGroupingContextAll::Error(_) => Err(parse_error("Error in range unwrap operation")),
     }
 }
@@ -439,20 +443,20 @@ fn visit_range_unwrap_op_with_group(
         RangeUnwrapOpWithGroupingContextAll::RangeUnwrapOpMaxContext(_) => Ok((RangeAggregationOp::MaxOverTime, None)),
         RangeUnwrapOpWithGroupingContextAll::RangeUnwrapOpStddevContext(_) => {
             Ok((RangeAggregationOp::StddevOverTime, None))
-        },
+        }
         RangeUnwrapOpWithGroupingContextAll::RangeUnwrapOpStdvarContext(_) => {
             Ok((RangeAggregationOp::StdvarOverTime, None))
-        },
+        }
         RangeUnwrapOpWithGroupingContextAll::RangeUnwrapOpQuantileContext(_) => {
             // Note: quantile parameter would need to come from parent context
             Ok((RangeAggregationOp::QuantileOverTime, None))
-        },
+        }
         RangeUnwrapOpWithGroupingContextAll::RangeUnwrapOpFirstContext(_) => {
             Ok((RangeAggregationOp::FirstOverTime, None))
-        },
+        }
         RangeUnwrapOpWithGroupingContextAll::RangeUnwrapOpLastContext(_) => {
             Ok((RangeAggregationOp::LastOverTime, None))
-        },
+        }
         RangeUnwrapOpWithGroupingContextAll::Error(_) => Err(parse_error("Error in range unwrap operation")),
     }
 }
@@ -540,19 +544,22 @@ impl LogQLExprVisitor {
                 let inner = c.metricExpr().ok_or_else(|| parse_error("Missing inner expression"))?;
                 let inner_expr = self.visit_metric_expr(&inner)?;
                 Ok(MetricExpr::Parens(Box::new(inner_expr)))
-            },
+            }
             MetricExprContextAll::MetricExprLabelReplaceContext(c) => self.visit_metric_expr_label_replace(c),
             MetricExprContextAll::MetricExprVectorContext(c) => {
                 let vector_ctx = c.vectorExpr().ok_or_else(|| parse_error("Missing vector expression"))?;
                 let num = vector_ctx.NUMBER().ok_or_else(|| parse_error("Missing number in vector()"))?;
                 let value = parse_number(&num.get_text())?;
                 Ok(MetricExpr::Vector(value))
-            },
+            }
             MetricExprContextAll::MetricExprVariableContext(c) => {
                 let var_ctx = c.variableExpr().ok_or_else(|| parse_error("Missing variable expression"))?;
-                let name = var_ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing variable name"))?.get_text();
+                let name = var_ctx
+                    .ATTRIBUTE()
+                    .ok_or_else(|| parse_error("Missing variable name"))?
+                    .get_text();
                 Ok(MetricExpr::Variable(name))
-            },
+            }
             // Binary operations
             MetricExprContextAll::BinaryOpPowContext(c) => self.visit_binary_op(c, BinaryOp::Pow),
             MetricExprContextAll::BinaryOpMulContext(c) => self.visit_binary_op(c, BinaryOp::Mul),
@@ -575,14 +582,18 @@ impl LogQLExprVisitor {
 
     /// Visit metric expression with range aggregation.
     fn visit_metric_expr_range_agg(&self, ctx: &MetricExprRangeAggContext) -> Result<MetricExpr> {
-        let agg_ctx = ctx.rangeAggregationExpr().ok_or_else(|| parse_error("Missing range aggregation"))?;
+        let agg_ctx = ctx
+            .rangeAggregationExpr()
+            .ok_or_else(|| parse_error("Missing range aggregation"))?;
         let agg = self.visit_range_aggregation(&agg_ctx)?;
         Ok(MetricExpr::RangeAggregation(agg))
     }
 
     /// Visit metric expression with vector aggregation.
     fn visit_metric_expr_vector_agg(&self, ctx: &MetricExprVectorAggContext) -> Result<MetricExpr> {
-        let agg_ctx = ctx.vectorAggregationExpr().ok_or_else(|| parse_error("Missing vector aggregation"))?;
+        let agg_ctx = ctx
+            .vectorAggregationExpr()
+            .ok_or_else(|| parse_error("Missing vector aggregation"))?;
         let agg = self.visit_vector_aggregation(&agg_ctx)?;
         Ok(MetricExpr::VectorAggregation(agg))
     }
@@ -750,8 +761,9 @@ impl LogQLExprVisitor {
         let op_ctx = ctx.vectorOp().ok_or_else(|| parse_error("Missing vector operation"))?;
         let op = visit_vector_op(&op_ctx)?;
 
-        let metric_ctx =
-            ctx.metricExpr().ok_or_else(|| parse_error("Missing metric expression in vector aggregation"))?;
+        let metric_ctx = ctx
+            .metricExpr()
+            .ok_or_else(|| parse_error("Missing metric expression in vector aggregation"))?;
         let expr = self.visit_metric_expr(&metric_ctx)?;
 
         let grouping = if let Some(grouping_ctx) = ctx.grouping() {
@@ -782,7 +794,9 @@ impl LogQLExprVisitor {
 
     /// Visit log range expression.
     fn visit_log_range_expr(&self, ctx: &LogRangeExprContextAll) -> Result<RangeExpr> {
-        let selector_ctx = ctx.selector().ok_or_else(|| parse_error("Missing selector in range expression"))?;
+        let selector_ctx = ctx
+            .selector()
+            .ok_or_else(|| parse_error("Missing selector in range expression"))?;
         let selector = visit_selector(&selector_ctx)?;
 
         let range_ctx = ctx.range().ok_or_else(|| parse_error("Missing range"))?;
@@ -820,7 +834,9 @@ impl LogQLExprVisitor {
 
     /// Visit unwrapped range expression.
     fn visit_unwrapped_range_expr(&self, ctx: &UnwrappedRangeExprContextAll) -> Result<RangeExpr> {
-        let selector_ctx = ctx.selector().ok_or_else(|| parse_error("Missing selector in unwrapped range"))?;
+        let selector_ctx = ctx
+            .selector()
+            .ok_or_else(|| parse_error("Missing selector in unwrapped range"))?;
         let selector = visit_selector(&selector_ctx)?;
 
         let range_ctx = ctx.range().ok_or_else(|| parse_error("Missing range"))?;
@@ -865,7 +881,7 @@ impl LogQLExprVisitor {
             UnwrapExprContextAll::UnwrapBasicContext(c) => {
                 let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in unwrap"))?.get_text();
                 Ok(UnwrapExpr::new(label))
-            },
+            }
             UnwrapExprContextAll::UnwrapWithConversionContext(c) => {
                 let attrs: Vec<_> = c.ATTRIBUTE_all();
                 if attrs.len() < 2 {
@@ -882,7 +898,7 @@ impl LogQLExprVisitor {
                 };
 
                 Ok(UnwrapExpr::with_conversion(label, conversion))
-            },
+            }
             UnwrapExprContextAll::UnwrapWithFilterContext(c) => {
                 // Get base unwrap from inner unwrapExpr
                 let inner = c.unwrapExpr().ok_or_else(|| parse_error("Missing unwrap expression"))?;
@@ -895,7 +911,7 @@ impl LogQLExprVisitor {
                 }
 
                 Ok(unwrap)
-            },
+            }
             UnwrapExprContextAll::Error(_) => Err(parse_error("Error in unwrap expression")),
         }
     }
@@ -977,7 +993,9 @@ impl LogQLExprVisitor {
 
         // Line format
         if let Some(line_format) = ctx.lineFormatExpr() {
-            let template = line_format.STRING().ok_or_else(|| parse_error("Missing line format template"))?;
+            let template = line_format
+                .STRING()
+                .ok_or_else(|| parse_error("Missing line format template"))?;
             return Ok(PipelineStage::LineFormat(clean_string(&template.get_text())));
         }
 
@@ -1020,28 +1038,28 @@ impl LogQLExprVisitor {
             LineFiltersContextAll::LineFiltersContainsContext(c) => {
                 let filters = collect_line_filter_values(&c.lineFilter_all())?;
                 (LineFilterOp::Contains, filters)
-            },
+            }
             LineFiltersContextAll::LineFiltersNotContainsContext(c) => {
                 let filters = collect_line_filter_values(&c.lineFilter_all())?;
                 (LineFilterOp::NotContains, filters)
-            },
+            }
             LineFiltersContextAll::LineFiltersMatchContext(c) => {
                 let filters = collect_line_filter_values(&c.lineFilter_all())?;
                 (LineFilterOp::Match, filters)
-            },
+            }
             LineFiltersContextAll::LineFiltersNotMatchContext(c) => {
                 let filters = collect_line_filter_values(&c.lineFilter_all())?;
                 (LineFilterOp::NotMatch, filters)
-            },
+            }
             LineFiltersContextAll::LineFiltersPatternContext(_)
             | LineFiltersContextAll::LineFiltersNotPatternContext(_) => {
                 return Err(QueryError::NotImplemented(
                     "Pattern matching doesn't supported yet.".to_string(),
                 ));
-            },
+            }
             LineFiltersContextAll::Error(_) => {
                 return Err(parse_error("Error in line filter"));
-            },
+            }
         };
 
         Ok(PipelineStage::LineFilter(LineFilter::new(op, filters)))
@@ -1082,7 +1100,9 @@ impl LogQLExprVisitor {
     /// Visit label format expression.
     #[allow(clippy::unused_self)]
     fn visit_label_format_expr(&self, ctx: &LabelFormatExprContext) -> Result<PipelineStage> {
-        let ops_ctx = ctx.labelFormatOps().ok_or_else(|| parse_error("Missing label format operations"))?;
+        let ops_ctx = ctx
+            .labelFormatOps()
+            .ok_or_else(|| parse_error("Missing label format operations"))?;
 
         let mut ops = Vec::new();
         for op_ctx in ops_ctx.labelFormatOp_all() {
@@ -1095,18 +1115,21 @@ impl LogQLExprVisitor {
                             src: attrs[1].clone(),
                         });
                     }
-                },
+                }
                 LabelFormatOpContextAll::LabelFormatTemplateContext(c) => {
-                    let dst = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing destination label"))?.get_text();
+                    let dst = c
+                        .ATTRIBUTE()
+                        .ok_or_else(|| parse_error("Missing destination label"))?
+                        .get_text();
                     let template = c.STRING().ok_or_else(|| parse_error("Missing template"))?.get_text();
                     ops.push(LabelFormatOp::Template {
                         dst,
                         template: clean_string(&template),
                     });
-                },
+                }
                 LabelFormatOpContextAll::Error(_) => {
                     return Err(parse_error("Error in label format operation"));
-                },
+                }
             }
         }
 
@@ -1124,7 +1147,7 @@ impl LogQLExprVisitor {
                 let left = self.visit_label_filter(&filters[0])?;
                 let right = self.visit_label_filter(&filters[1])?;
                 Ok(LabelFilterExpr::And(Box::new(left), Box::new(right)))
-            },
+            }
             LabelFilterContextAll::LabelFilterOrContext(c) => {
                 let filters = c.labelFilter_all();
                 if filters.len() < 2 {
@@ -1133,33 +1156,33 @@ impl LogQLExprVisitor {
                 let left = self.visit_label_filter(&filters[0])?;
                 let right = self.visit_label_filter(&filters[1])?;
                 Ok(LabelFilterExpr::Or(Box::new(left), Box::new(right)))
-            },
+            }
             LabelFilterContextAll::LabelFilterParensContext(c) => {
                 let inner = c.labelFilter().ok_or_else(|| parse_error("Missing inner filter"))?;
                 let inner_expr = self.visit_label_filter(&inner)?;
                 Ok(LabelFilterExpr::Parens(Box::new(inner_expr)))
-            },
+            }
             LabelFilterContextAll::LabelFilterMatcherContext(c) => {
                 let matcher_ctx = c.matcher().ok_or_else(|| parse_error("Missing matcher in label filter"))?;
                 let matcher = visit_matcher(&matcher_ctx)?;
                 Ok(LabelFilterExpr::Matcher(matcher))
-            },
+            }
             LabelFilterContextAll::LabelFilterNumberContext(c) => {
                 let filter = c.numberFilter().ok_or_else(|| parse_error("Missing number filter"))?;
                 self.visit_number_filter(&filter)
-            },
+            }
             LabelFilterContextAll::LabelFilterDurationContext(c) => {
                 let filter = c.durationFilter().ok_or_else(|| parse_error("Missing duration filter"))?;
                 self.visit_duration_filter(&filter)
-            },
+            }
             LabelFilterContextAll::LabelFilterBytesContext(c) => {
                 let filter = c.bytesFilter().ok_or_else(|| parse_error("Missing bytes filter"))?;
                 self.visit_bytes_filter(&filter)
-            },
+            }
             LabelFilterContextAll::LabelFilterIpContext(c) => {
                 let filter = c.ipLabelFilter().ok_or_else(|| parse_error("Missing IP filter"))?;
                 self.visit_ip_label_filter(&filter)
-            },
+            }
             LabelFilterContextAll::Error(_) => Err(parse_error("Error in label filter")),
         }
     }
@@ -1167,7 +1190,10 @@ impl LogQLExprVisitor {
     /// Visit number filter.
     #[allow(clippy::unused_self)]
     fn visit_number_filter(&self, ctx: &NumberFilterContextAll) -> Result<LabelFilterExpr> {
-        let label = ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in number filter"))?.get_text();
+        let label = ctx
+            .ATTRIBUTE()
+            .ok_or_else(|| parse_error("Missing label in number filter"))?
+            .get_text();
 
         let op = ctx.comparisonOp().ok_or_else(|| parse_error("Missing comparison operator"))?;
         let comparison_op = visit_comparison_op(&op)?;
@@ -1185,7 +1211,10 @@ impl LogQLExprVisitor {
     /// Visit duration filter.
     #[allow(clippy::unused_self)]
     fn visit_duration_filter(&self, ctx: &DurationFilterContextAll) -> Result<LabelFilterExpr> {
-        let label = ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in duration filter"))?.get_text();
+        let label = ctx
+            .ATTRIBUTE()
+            .ok_or_else(|| parse_error("Missing label in duration filter"))?
+            .get_text();
 
         let op = ctx.comparisonOp().ok_or_else(|| parse_error("Missing comparison operator"))?;
         let comparison_op = visit_comparison_op(&op)?;
@@ -1203,7 +1232,10 @@ impl LogQLExprVisitor {
     /// Visit bytes filter.
     #[allow(clippy::unused_self)]
     fn visit_bytes_filter(&self, ctx: &BytesFilterContextAll) -> Result<LabelFilterExpr> {
-        let label = ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in bytes filter"))?.get_text();
+        let label = ctx
+            .ATTRIBUTE()
+            .ok_or_else(|| parse_error("Missing label in bytes filter"))?
+            .get_text();
 
         let op = ctx.comparisonOp().ok_or_else(|| parse_error("Missing comparison operator"))?;
         let comparison_op = visit_comparison_op(&op)?;
@@ -1221,7 +1253,10 @@ impl LogQLExprVisitor {
     /// Visit IP label filter.
     #[allow(clippy::unused_self)]
     fn visit_ip_label_filter(&self, ctx: &IpLabelFilterContextAll) -> Result<LabelFilterExpr> {
-        let label = ctx.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in IP filter"))?.get_text();
+        let label = ctx
+            .ATTRIBUTE()
+            .ok_or_else(|| parse_error("Missing label in IP filter"))?
+            .get_text();
 
         let negated = ctx.NE().is_some();
 

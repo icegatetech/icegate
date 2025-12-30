@@ -104,14 +104,8 @@ async fn setup_containers() -> (ContainerAsync<MinIO>, ContainerAsync<GenericIma
             "nessie.catalog.service.s3.default-options.external-endpoint",
             &s3_external_endpoint,
         )
-        .with_env_var(
-            "nessie.catalog.service.s3.default-options.path-style-access",
-            "true",
-        )
-        .with_env_var(
-            "nessie.catalog.service.s3.default-options.region",
-            "us-east-1",
-        )
+        .with_env_var("nessie.catalog.service.s3.default-options.path-style-access", "true")
+        .with_env_var("nessie.catalog.service.s3.default-options.region", "us-east-1")
         // Configure S3 credentials via secret reference
         .with_env_var(
             "nessie.catalog.service.s3.default-options.access-key",
@@ -141,9 +135,7 @@ async fn setup_containers() -> (ContainerAsync<MinIO>, ContainerAsync<GenericIma
     properties.insert("prefix".to_string(), "main".to_string());
 
     let config = CatalogConfig {
-        backend: CatalogBackend::Rest {
-            uri: iceberg_base,
-        },
+        backend: CatalogBackend::Rest { uri: iceberg_base },
         warehouse: format!("s3://{BUCKET_NAME}/"),
         properties,
     };
@@ -164,7 +156,12 @@ async fn create_s3_bucket(minio_port: u16) {
 
     let s3_client = aws_sdk_s3::Client::new(&config);
 
-    s3_client.create_bucket().bucket(BUCKET_NAME).send().await.expect("Failed to create S3 bucket");
+    s3_client
+        .create_bucket()
+        .bucket(BUCKET_NAME)
+        .send()
+        .await
+        .expect("Failed to create S3 bucket");
 }
 
 /// Test that `create_tables` creates all 4 observability tables
@@ -183,7 +180,7 @@ async fn test_migrate_create_tables() {
         Err(e) => {
             println!("Error creating tables: {:?}", e);
             panic!("Failed to create tables: {e}");
-        },
+        }
     };
 
     // Should have created 4 tables: logs, spans, events, metrics
@@ -193,14 +190,10 @@ async fn test_migrate_create_tables() {
     let table_names: Vec<&str> = ops
         .iter()
         .map(|op| match op {
-            MigrationOperation::Create {
-                table_name,
-            } => table_name.as_str(),
-            MigrationOperation::Upgrade {
-                ..
-            } => {
+            MigrationOperation::Create { table_name } => table_name.as_str(),
+            MigrationOperation::Upgrade { .. } => {
                 panic!("Expected Create operation")
-            },
+            }
         })
         .collect();
 
@@ -226,7 +219,9 @@ async fn test_migrate_create_tables_dry_run() {
 
     // Verify NO tables were actually created by calling create_tables again
     // This time with dry_run=false, it should still create 4 tables
-    let ops_actual = create_tables(&catalog, false).await.expect("Failed to create tables after dry-run");
+    let ops_actual = create_tables(&catalog, false)
+        .await
+        .expect("Failed to create tables after dry-run");
 
     assert_eq!(
         ops_actual.len(),
@@ -243,11 +238,15 @@ async fn test_migrate_create_tables_idempotent() {
     let catalog = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
 
     // First call - creates tables
-    let ops_first = create_tables(&catalog, false).await.expect("Failed to create tables first time");
+    let ops_first = create_tables(&catalog, false)
+        .await
+        .expect("Failed to create tables first time");
     assert_eq!(ops_first.len(), 4, "First call should create 4 tables");
 
     // Second call - should be idempotent
-    let ops_second = create_tables(&catalog, false).await.expect("Failed to create tables second time");
+    let ops_second = create_tables(&catalog, false)
+        .await
+        .expect("Failed to create tables second time");
     assert_eq!(
         ops_second.len(),
         0,

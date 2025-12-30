@@ -26,10 +26,7 @@ impl LogExpr {
     /// Creates a new `LogExpr` with the given selector and pipeline.
     #[must_use]
     pub const fn with_pipeline(selector: Selector, pipeline: Vec<PipelineStage>) -> Self {
-        Self {
-            selector,
-            pipeline,
-        }
+        Self { selector, pipeline }
     }
 }
 
@@ -44,17 +41,13 @@ impl Selector {
     /// Creates a new `Selector` with the given matchers.
     #[must_use]
     pub const fn new(matchers: Vec<LabelMatcher>) -> Self {
-        Self {
-            matchers,
-        }
+        Self { matchers }
     }
 
     /// Creates a new empty `Selector`.
     #[must_use]
     pub const fn empty() -> Self {
-        Self {
-            matchers: Vec::new(),
-        }
+        Self { matchers: Vec::new() }
     }
 }
 
@@ -134,10 +127,7 @@ impl LineFilter {
     /// Creates a new `LineFilter`.
     #[must_use]
     pub const fn new(op: LineFilterOp, filters: Vec<LineFilterValue>) -> Self {
-        Self {
-            op,
-            filters,
-        }
+        Self { op, filters }
     }
 
     /// Creates a new contains filter (`|=`).

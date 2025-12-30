@@ -123,11 +123,7 @@ fn get_literal_usize(expr: &Expr) -> Option<usize> {
 /// Check if `BinaryExpr` with given operator.
 fn is_binary_op(expr: &Expr, expected_op: Operator) -> Option<(&Expr, &Expr)> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op,
-            right,
-        }) if *op == expected_op => Some((left.as_ref(), right.as_ref())),
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == expected_op => Some((left.as_ref(), right.as_ref())),
         _ => None,
     }
 }
@@ -173,7 +169,9 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
         properties: std::collections::HashMap::new(),
     };
 
-    let iceberg_catalog = CatalogBuilder::from_config(&config).await.expect("Failed to create test catalog");
+    let iceberg_catalog = CatalogBuilder::from_config(&config)
+        .await
+        .expect("Failed to create test catalog");
 
     // Create the namespace and table
     let namespace = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
@@ -186,7 +184,10 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
 
     // Create logs table using the common schema
     let schema = logs_schema().expect("Failed to get logs schema");
-    let table_creation = iceberg::TableCreation::builder().name(LOGS_TABLE.to_string()).schema(schema).build();
+    let table_creation = iceberg::TableCreation::builder()
+        .name(LOGS_TABLE.to_string())
+        .schema(schema)
+        .build();
 
     let _ = iceberg_catalog.create_table(&namespace, table_creation).await;
 
@@ -304,7 +305,9 @@ async fn test_line_filter_not_contains() {
 
     let selector = Selector::new(vec![]);
     let mut log_expr = LogExpr::new(selector);
-    log_expr.pipeline.push(PipelineStage::LineFilter(LineFilter::not_contains("info")));
+    log_expr
+        .pipeline
+        .push(PipelineStage::LineFilter(LineFilter::not_contains("info")));
 
     let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
@@ -328,7 +331,9 @@ async fn test_line_filter_regex() {
 
     let selector = Selector::new(vec![]);
     let mut log_expr = LogExpr::new(selector);
-    log_expr.pipeline.push(PipelineStage::LineFilter(LineFilter::matches("error.*")));
+    log_expr
+        .pipeline
+        .push(PipelineStage::LineFilter(LineFilter::matches("error.*")));
 
     let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
@@ -350,7 +355,9 @@ async fn test_line_filter_not_regex() {
 
     let selector = Selector::new(vec![]);
     let mut log_expr = LogExpr::new(selector);
-    log_expr.pipeline.push(PipelineStage::LineFilter(LineFilter::not_matches("debug.*")));
+    log_expr
+        .pipeline
+        .push(PipelineStage::LineFilter(LineFilter::not_matches("debug.*")));
 
     let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
@@ -407,11 +414,11 @@ async fn test_log_query_default_limit() {
 
     // Check skip = 0 (can be None or Some(0))
     match &limit.skip {
-        None => {}, // None means skip=0, which is OK
+        None => {} // None means skip=0, which is OK
         Some(skip_expr) => {
             let skip_val = get_literal_usize(skip_expr).expect("skip should be a literal");
             assert_eq!(skip_val, 0, "Expected skip=0");
-        },
+        }
     }
 
     // Check fetch = DEFAULT_LOG_LIMIT (100)
@@ -419,7 +426,7 @@ async fn test_log_query_default_limit() {
         Some(fetch) => {
             let fetch_val = get_literal_usize(fetch).expect("fetch should be a literal");
             assert_eq!(fetch_val, DEFAULT_LOG_LIMIT, "Expected fetch={DEFAULT_LOG_LIMIT}");
-        },
+        }
         None => panic!("Expected fetch limit"),
     }
 }
@@ -443,7 +450,7 @@ async fn test_log_query_custom_limit() {
         Some(fetch) => {
             let fetch_val = get_literal_usize(fetch).expect("fetch should be a literal");
             assert_eq!(fetch_val, 50, "Expected fetch=50");
-        },
+        }
         None => panic!("Expected fetch limit"),
     }
 }
@@ -504,7 +511,9 @@ async fn test_count_over_time_planning() {
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
-    let has_value = projections.iter().any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    let has_value = projections
+        .iter()
+        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
     assert!(has_value, "Plan should have 'value' alias");
 }
 
@@ -530,7 +539,9 @@ async fn test_rate_planning() {
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
-    let has_value = projections.iter().any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    let has_value = projections
+        .iter()
+        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
     assert!(has_value, "Plan should have 'value' alias");
 }
 
@@ -559,7 +570,9 @@ async fn test_bytes_over_time_planning() {
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
-    let has_value = projections.iter().any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    let has_value = projections
+        .iter()
+        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
     assert!(has_value, "Plan should have 'value' alias");
 }
 
@@ -588,7 +601,9 @@ async fn test_bytes_rate_planning() {
 
     // Check for "value" alias in projections
     let projections = collect_projections(plan);
-    let has_value = projections.iter().any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
+    let has_value = projections
+        .iter()
+        .any(|p| p.expr.iter().any(|e| is_alias_named(e, "value").is_some()));
     assert!(has_value, "Plan should have 'value' alias");
 }
 

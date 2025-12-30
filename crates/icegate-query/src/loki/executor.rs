@@ -34,7 +34,11 @@ use crate::{
 /// Parse time string (nanoseconds or RFC3339).
 pub fn parse_time(s: &str) -> DateTime<Utc> {
     s.parse::<i64>().map_or_else(
-        |_| DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)).unwrap_or(DateTime::UNIX_EPOCH),
+        |_| {
+            DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(DateTime::UNIX_EPOCH)
+        },
         DateTime::from_timestamp_nanos,
     )
 }
@@ -96,9 +100,7 @@ pub struct QueryExecutor {
 impl QueryExecutor {
     /// Create a new query executor.
     pub const fn new(engine: Arc<QueryEngine>) -> Self {
-        Self {
-            engine,
-        }
+        Self { engine }
     }
 
     /// Create a DataFusion session context.
@@ -242,8 +244,11 @@ impl QueryExecutor {
         let query_ctx = build_query_context(tenant_id, params.start.as_ref(), params.end.as_ref(), None);
 
         // Parse all matchers
-        let selectors: Vec<Selector> =
-            params.matchers.iter().map(|m| parse_selector(m)).collect::<LokiResult<Vec<_>>>()?;
+        let selectors: Vec<Selector> = params
+            .matchers
+            .iter()
+            .map(|m| parse_selector(m))
+            .collect::<LokiResult<Vec<_>>>()?;
 
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);

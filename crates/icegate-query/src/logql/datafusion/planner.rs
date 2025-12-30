@@ -38,7 +38,13 @@ use crate::{
 /// but in-memory operations (`MemTable`, `map_keys`) create fields without it.
 /// This prevents Arrow schema mismatch errors during joins/unions.
 fn strip_schema_metadata(df: DataFrame) -> datafusion::error::Result<DataFrame> {
-    let select_exprs: Vec<Expr> = df.schema().inner().fields().iter().map(|field| col(field.name().as_str())).collect();
+    let select_exprs: Vec<Expr> = df
+        .schema()
+        .inner()
+        .fields()
+        .iter()
+        .map(|field| col(field.name().as_str()))
+        .collect();
 
     df.select(select_exprs)
 }
@@ -52,10 +58,7 @@ pub struct DataFusionPlanner {
 impl DataFusionPlanner {
     /// Creates a new `DataFusionPlanner`.
     pub const fn new(session_ctx: SessionContext, query_ctx: QueryContext) -> Self {
-        Self {
-            session_ctx,
-            query_ctx,
-        }
+        Self { session_ctx, query_ctx }
     }
 }
 
@@ -79,7 +82,7 @@ impl Planner for DataFusionPlanner {
 
                 // Transform output: hex-encode binary columns, add `level` alias
                 Self::transform_output_columns(df)
-            },
+            }
             LogQLExpr::Metric(metric_expr) => self.plan_metric(metric_expr).await,
         }
     }
@@ -324,9 +327,10 @@ impl DataFusionPlanner {
         group_cols.push(col(COL_ATTR_KEYS));
         group_cols.push(col(COL_ATTR_VALS));
 
-        let df = df.aggregate(group_cols, vec![
-            first_value(col("attributes"), vec![]).alias("attributes"),
-        ])?;
+        let df = df.aggregate(
+            group_cols,
+            vec![first_value(col("attributes"), vec![]).alias("attributes")],
+        )?;
 
         Ok(df)
     }
@@ -352,27 +356,25 @@ impl DataFusionPlanner {
                     Err(QueryError::NotImplemented(
                         "Binary operations not yet implemented".to_string(),
                     ))
-                },
+                }
                 MetricExpr::Literal(_val) => {
                     // TODO: Implement literal value
                     Err(QueryError::NotImplemented(
                         "Literal value not yet implemented".to_string(),
                     ))
-                },
+                }
                 MetricExpr::Vector(_vals) => {
                     // TODO: Implement vector literal
                     Err(QueryError::NotImplemented(
                         "Vector literal not yet implemented".to_string(),
                     ))
-                },
-                MetricExpr::LabelReplace {
-                    ..
-                } => {
+                }
+                MetricExpr::LabelReplace { .. } => {
                     // TODO: Implement label replace
                     Err(QueryError::NotImplemented(
                         "Label replace not yet implemented".to_string(),
                     ))
-                },
+                }
                 MetricExpr::Variable(_) => Err(QueryError::NotImplemented("Variable not yet implemented".to_string())),
                 MetricExpr::Parens(inner) => self.plan_metric(*inner).await,
             }
@@ -426,10 +428,14 @@ impl DataFusionPlanner {
             .ok_or(QueryError::Config("Step parameter is required".to_string()))?
             .num_microseconds()
             .ok_or(QueryError::Config("Step too large".to_string()))?;
-        let range_nanos =
-            agg.range_expr.range.num_nanoseconds().ok_or(QueryError::Config("Range too large".to_string()))?;
-        let offset_nanos =
-            offset_duration.num_nanoseconds().ok_or(QueryError::Config("Offset too large".to_string()))?;
+        let range_nanos = agg
+            .range_expr
+            .range
+            .num_nanoseconds()
+            .ok_or(QueryError::Config("Range too large".to_string()))?;
+        let offset_nanos = offset_duration
+            .num_nanoseconds()
+            .ok_or(QueryError::Config("Offset too large".to_string()))?;
 
         // Common UDAF arguments
         let start_arg = lit(ScalarValue::TimestampMicrosecond(Some(start_micros), None));
@@ -462,7 +468,7 @@ impl DataFusionPlanner {
                     range_arg,
                     offset_arg,
                 ])
-            },
+            }
             RangeAggregationOp::Rate => {
                 let udaf = AggregateUDF::from(super::udaf::RateOverTime::new());
                 udaf.call(vec![
@@ -473,7 +479,7 @@ impl DataFusionPlanner {
                     range_arg,
                     offset_arg,
                 ])
-            },
+            }
             RangeAggregationOp::BytesOverTime => {
                 let udaf = AggregateUDF::from(super::udaf::BytesOverTime::new());
                 udaf.call(vec![
@@ -485,7 +491,7 @@ impl DataFusionPlanner {
                     range_arg,
                     offset_arg,
                 ])
-            },
+            }
             RangeAggregationOp::BytesRate => {
                 let udaf = AggregateUDF::from(super::udaf::BytesRate::new());
                 udaf.call(vec![
@@ -497,7 +503,7 @@ impl DataFusionPlanner {
                     range_arg,
                     offset_arg,
                 ])
-            },
+            }
             RangeAggregationOp::AbsentOverTime => {
                 let udaf = AggregateUDF::from(super::udaf::AbsentOverTime::new());
                 udaf.call(vec![
@@ -508,19 +514,22 @@ impl DataFusionPlanner {
                     range_arg,
                     offset_arg,
                 ])
-            },
+            }
             _ => {
                 return Err(QueryError::Plan(
                     "This range aggregation requires an unwrap expression".to_string(),
                 ));
-            },
+            }
         };
 
         // 5. Aggregate with grouping
-        let df = df.aggregate(grouping_exprs, vec![
-            udaf_expr.alias(COL_RESULT),
-            last_value(col("attributes"), vec![]).alias("attributes"),
-        ])?;
+        let df = df.aggregate(
+            grouping_exprs,
+            vec![
+                udaf_expr.alias(COL_RESULT),
+                last_value(col("attributes"), vec![]).alias("attributes"),
+            ],
+        )?;
 
         // 6. Unnest the list to get individual struct rows
         // UDAF returns List<Struct { timestamp, value }>
@@ -573,7 +582,7 @@ impl DataFusionPlanner {
                         return Err(QueryError::NotImplemented(
                             "Grouping::Without is not yet implemented".to_string(),
                         ));
-                    },
+                    }
                 };
 
                 // Add outer labels to inner grouping
@@ -586,19 +595,19 @@ impl DataFusionPlanner {
                             }
                         }
                         Some(Grouping::By(inner_labels))
-                    },
+                    }
                     Some(Grouping::Without(_)) => {
                         // When outer is By and inner is Without, apply outer By restriction
                         Some(Grouping::By(outer_labels))
-                    },
+                    }
                     None => {
                         // No inner grouping, use outer labels
                         Some(Grouping::By(outer_labels))
-                    },
+                    }
                 };
                 range_agg.grouping = merged_grouping;
                 MetricExpr::RangeAggregation(range_agg)
-            },
+            }
             (expr, _) => expr,
         };
 
@@ -616,7 +625,7 @@ impl DataFusionPlanner {
                     return Err(QueryError::NotImplemented(
                         "Grouping::Without is not yet implemented".to_string(),
                     ));
-                },
+                }
             };
 
             let mut indexed_attributes = Vec::new();
@@ -671,20 +680,20 @@ impl DataFusionPlanner {
             crate::logql::metric::VectorAggregationOp::Max => datafusion::functions_aggregate::expr_fn::max(value_col),
             crate::logql::metric::VectorAggregationOp::Count => {
                 datafusion::functions_aggregate::expr_fn::count(value_col)
-            },
+            }
             crate::logql::metric::VectorAggregationOp::Stddev => {
                 datafusion::functions_aggregate::expr_fn::stddev(value_col)
-            },
+            }
             crate::logql::metric::VectorAggregationOp::Stdvar => {
                 datafusion::functions_aggregate::expr_fn::var_sample(value_col)
-            },
+            }
             // TODO: Implement topk, bottomk, sort, sort_desc
             _ => {
                 return Err(QueryError::NotImplemented(format!(
                     "Vector aggregation op {:?} not supported",
                     agg.op
                 )));
-            },
+            }
         }
         .alias("value");
 
@@ -739,10 +748,10 @@ impl DataFusionPlanner {
             // Note: regex matching on binary columns is not supported, will treat as string
             MatchOp::Re => {
                 datafusion::functions::regex::regexp_like().call(vec![col_expr, lit(matcher.value.as_str())])
-            },
-            MatchOp::Nre => {
-                datafusion::functions::regex::regexp_like().call(vec![col_expr, lit(matcher.value.as_str())]).not()
-            },
+            }
+            MatchOp::Nre => datafusion::functions::regex::regexp_like()
+                .call(vec![col_expr, lit(matcher.value.as_str())])
+                .not(),
         }
     }
 
@@ -780,7 +789,7 @@ impl DataFusionPlanner {
                 PipelineStage::LineFormat(_template) => {
                     // TODO: Implement line_format using template engine
                     df
-                },
+                }
                 PipelineStage::Decolorize => self.apply_decolorize(df)?,
                 PipelineStage::Drop(labels) => Self::apply_drop(df, &labels)?,
                 PipelineStage::Keep(labels) => Self::apply_keep(df, &labels)?,
@@ -803,25 +812,25 @@ impl DataFusionPlanner {
                 LineFilterValue::String(s) => s,
                 LineFilterValue::Ip(_cidr) => {
                     return Err(QueryError::NotImplemented("IP CIDR filtering".into()));
-                },
+                }
             };
 
             let expr = match filter.op {
                 LineFilterOp::Contains => {
                     datafusion::functions::string::contains().call(vec![body_col.clone(), lit(filter_str)])
-                },
-                LineFilterOp::NotContains => {
-                    datafusion::functions::string::contains().call(vec![body_col.clone(), lit(filter_str)]).not()
-                },
+                }
+                LineFilterOp::NotContains => datafusion::functions::string::contains()
+                    .call(vec![body_col.clone(), lit(filter_str)])
+                    .not(),
                 LineFilterOp::Match => {
                     datafusion::functions::regex::regexp_like().call(vec![body_col.clone(), lit(filter_str)])
-                },
-                LineFilterOp::NotMatch => {
-                    datafusion::functions::regex::regexp_like().call(vec![body_col.clone(), lit(filter_str)]).not()
-                },
+                }
+                LineFilterOp::NotMatch => datafusion::functions::regex::regexp_like()
+                    .call(vec![body_col.clone(), lit(filter_str)])
+                    .not(),
                 LineFilterOp::NotPattern => {
                     return Err(QueryError::NotImplemented("pattern matching filter".into()));
-                },
+                }
             };
 
             combined_expr = Some(match combined_expr {
@@ -859,25 +868,23 @@ impl DataFusionPlanner {
                 // For now, we'll just return df as we don't have the UDF registered
                 // TODO: Implement JSON parsing
                 Ok(df)
-            },
-            LogParser::Logfmt {
-                ..
-            } => {
+            }
+            LogParser::Logfmt { .. } => {
                 // TODO: Implement Logfmt parsing
                 Ok(df)
-            },
+            }
             LogParser::Regexp(_pattern) => {
                 // TODO: Implement Regexp parsing
                 Ok(df)
-            },
+            }
             LogParser::Pattern(_pattern) => {
                 // TODO: Implement Pattern parsing
                 Ok(df)
-            },
+            }
             LogParser::Unpack => {
                 // TODO: Implement Unpack
                 Ok(df)
-            },
+            }
         }
     }
 
@@ -887,15 +894,10 @@ impl DataFusionPlanner {
 
         for op in ops {
             match op {
-                LabelFormatOp::Rename {
-                    ..
-                }
-                | LabelFormatOp::Template {
-                    ..
-                } => {
+                LabelFormatOp::Rename { .. } | LabelFormatOp::Template { .. } => {
                     // TODO: Implement label rename
                     // Rename is essentially projecting the src column as dst
-                },
+                }
             }
         }
         Ok(df)
@@ -1007,19 +1009,15 @@ impl DataFusionPlanner {
                 let left_expr = Self::label_filter_to_expr(*left)?;
                 let right_expr = Self::label_filter_to_expr(*right)?;
                 Ok(left_expr.and(right_expr))
-            },
+            }
             LabelFilterExpr::Or(left, right) => {
                 let left_expr = Self::label_filter_to_expr(*left)?;
                 let right_expr = Self::label_filter_to_expr(*right)?;
                 Ok(left_expr.or(right_expr))
-            },
+            }
             LabelFilterExpr::Parens(inner) => Self::label_filter_to_expr(*inner),
             LabelFilterExpr::Matcher(matcher) => Ok(Self::matcher_to_expr(&matcher)),
-            LabelFilterExpr::Number {
-                label,
-                op,
-                value,
-            } => {
+            LabelFilterExpr::Number { label, op, value } => {
                 let internal_name = Self::map_label_to_internal_name(&label);
                 let col_expr = if Self::is_top_level_field(internal_name) {
                     col(internal_name)
@@ -1037,12 +1035,8 @@ impl DataFusionPlanner {
                     ComparisonOp::Neq => col_expr.not_eq(lit(value)),
                 };
                 Ok(expr)
-            },
-            LabelFilterExpr::Duration {
-                label,
-                op,
-                value,
-            } => {
+            }
+            LabelFilterExpr::Duration { label, op, value } => {
                 // Convert duration to nanoseconds and compare
                 let internal_name = Self::map_label_to_internal_name(&label);
                 let col_expr = if Self::is_top_level_field(internal_name) {
@@ -1052,7 +1046,9 @@ impl DataFusionPlanner {
                 };
 
                 use crate::logql::common::ComparisonOp;
-                let nanos = value.num_nanoseconds().ok_or(QueryError::Config("Duration too large".to_string()))?;
+                let nanos = value
+                    .num_nanoseconds()
+                    .ok_or(QueryError::Config("Duration too large".to_string()))?;
                 let expr = match op {
                     ComparisonOp::Gt => col_expr.gt(lit(nanos)),
                     ComparisonOp::Ge => col_expr.gt_eq(lit(nanos)),
@@ -1062,12 +1058,8 @@ impl DataFusionPlanner {
                     ComparisonOp::Neq => col_expr.not_eq(lit(nanos)),
                 };
                 Ok(expr)
-            },
-            LabelFilterExpr::Bytes {
-                label,
-                op,
-                value,
-            } => {
+            }
+            LabelFilterExpr::Bytes { label, op, value } => {
                 // Compare byte values as u64
                 let internal_name = Self::map_label_to_internal_name(&label);
                 let col_expr = if Self::is_top_level_field(internal_name) {
@@ -1086,15 +1078,13 @@ impl DataFusionPlanner {
                     ComparisonOp::Neq => col_expr.not_eq(lit(value)),
                 };
                 Ok(expr)
-            },
-            LabelFilterExpr::Ip {
-                ..
-            } => {
+            }
+            LabelFilterExpr::Ip { .. } => {
                 // TODO: Implement IP filtering using ip_match UDF
                 Err(QueryError::NotImplemented(
                     "IP filtering not yet implemented".to_string(),
                 ))
-            },
+            }
         }
     }
 }

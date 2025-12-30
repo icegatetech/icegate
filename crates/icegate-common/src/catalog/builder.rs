@@ -23,9 +23,7 @@ impl CatalogBuilder {
     pub async fn from_config(config: &CatalogConfig) -> Result<Arc<dyn Catalog>> {
         match &config.backend {
             CatalogBackend::Memory => Self::create_memory_catalog(config).await,
-            CatalogBackend::Rest {
-                uri,
-            } => Self::create_rest_catalog(config, uri).await,
+            CatalogBackend::Rest { uri } => Self::create_rest_catalog(config, uri).await,
         }
     }
 

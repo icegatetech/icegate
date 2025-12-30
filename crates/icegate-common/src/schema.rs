@@ -911,8 +911,13 @@ pub fn metrics_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// These columns are extracted as top-level fields from log query results.
 /// Used by planner (for grouping) and handlers (for output).
-pub const LOG_INDEXED_ATTRIBUTE_COLUMNS: &[&str] =
-    &["cloud_account_id", "service_name", "trace_id", "span_id", "severity_text"];
+pub const LOG_INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &[
+    "cloud_account_id",
+    "service_name",
+    "trace_id",
+    "span_id",
+    "severity_text",
+];
 
 #[cfg(test)]
 mod tests {

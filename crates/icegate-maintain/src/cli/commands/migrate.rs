@@ -18,14 +18,8 @@ use crate::{
 /// Returns an error if migration fails
 pub async fn execute(command: MigrateCommands) -> Result<(), MaintainError> {
     match command {
-        MigrateCommands::Create {
-            config,
-            dry_run,
-        } => create(config, dry_run).await,
-        MigrateCommands::Upgrade {
-            config,
-            dry_run,
-        } => upgrade(config, dry_run).await,
+        MigrateCommands::Create { config, dry_run } => create(config, dry_run).await,
+        MigrateCommands::Upgrade { config, dry_run } => upgrade(config, dry_run).await,
     }
 }
 
@@ -84,15 +78,11 @@ fn report_operations(ops: &[MigrationOperation], dry_run: bool) {
 /// Log a single migration operation
 fn log_operation(op: &MigrationOperation, prefix: &str) {
     match op {
-        MigrationOperation::Create {
-            table_name,
-        } => {
+        MigrationOperation::Create { table_name } => {
             tracing::info!("{} create table: {}", prefix, table_name);
-        },
-        MigrationOperation::Upgrade {
-            table_name,
-        } => {
+        }
+        MigrationOperation::Upgrade { table_name } => {
             tracing::info!("{} upgrade table: {}", prefix, table_name);
-        },
+        }
     }
 }

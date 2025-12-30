@@ -357,7 +357,7 @@ fn extract_timestamp_micros_from_expr(expr: &Arc<dyn PhysicalExpr>) -> Result<i6
                 return Err(DataFusionError::Plan(format!(
                     "Expected TimestampMicrosecond, got: {other:?}"
                 )));
-            },
+            }
         }
     }
     Err(DataFusionError::Plan(
@@ -386,12 +386,12 @@ fn extract_interval_micros_from_expr(expr: &Arc<dyn PhysicalExpr>) -> Result<i64
                 let nano_micros = nanoseconds / 1000;
 
                 return Ok(day_micros + nano_micros);
-            },
+            }
             other => {
                 return Err(DataFusionError::Plan(format!(
                     "Expected IntervalMonthDayNano, got: {other:?}"
                 )));
-            },
+            }
         }
     }
     Err(DataFusionError::Plan(
@@ -1125,7 +1125,7 @@ mod tests {
                 assert_eq!(struct_arr.num_columns(), 2);
                 // Sparse: only 1 grid point has count > 0
                 assert_eq!(struct_arr.len(), 1);
-            },
+            }
             _ => panic!("Expected List, got {result:?}"),
         }
     }
@@ -1141,7 +1141,7 @@ mod tests {
             (ScalarValue::Int64(Some(range)), ScalarValue::Int64(Some(offset))) => {
                 assert_eq!(*range, 50);
                 assert_eq!(*offset, 25);
-            },
+            }
             _ => panic!("Expected Int64 values for range and offset"),
         }
     }
@@ -1189,7 +1189,7 @@ mod tests {
                 // / 100
                 // = 3.
                 // 0
-            },
+            }
             _ => panic!("Expected List"),
         }
     }
@@ -1216,7 +1216,7 @@ mod tests {
                 assert_eq!(u64_arr.value(0), 1);
                 assert_eq!(u64_arr.value(1), 1);
                 assert_eq!(u64_arr.value(2), 1);
-            },
+            }
             _ => panic!("Expected List"),
         }
     }

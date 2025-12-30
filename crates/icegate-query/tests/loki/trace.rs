@@ -17,7 +17,9 @@ use super::harness::{TestServer, write_test_logs};
 async fn test_query_by_trace_id() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3213).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     // Query by trace_id (hex string)
@@ -64,7 +66,9 @@ async fn test_query_by_trace_id() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_query_by_span_id() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3214).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     // Query by span_id (hex string)
@@ -106,7 +110,9 @@ async fn test_query_by_span_id() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_combined_trace_query() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3215).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     // Combined query with service_name and span_id
@@ -144,7 +150,9 @@ async fn test_combined_trace_query() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_nonexistent_trace_id() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3216).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     // Query with non-existent trace_id should return empty
@@ -177,7 +185,9 @@ async fn test_nonexistent_trace_id() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_trace_id_label_values() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3217).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     // Query trace_id label values endpoint
@@ -217,7 +227,9 @@ async fn test_trace_id_label_values() -> Result<(), Box<dyn std::error::Error>> 
 async fn test_span_id_label_values() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3218).await?;
 
-    let table = catalog.load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?).await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
     write_test_logs(&table, &catalog).await?;
 
     // Query span_id label values endpoint

@@ -64,10 +64,7 @@ impl SegmentId {
             path: path_str.to_string(),
         })?;
 
-        Ok(Self {
-            topic,
-            offset,
-        })
+        Ok(Self { topic, offset })
     }
 }
 

@@ -53,18 +53,13 @@ impl WriteResult {
     /// Creates a success result.
     #[must_use]
     pub const fn success(offset: u64, records: usize) -> Self {
-        Self::Success {
-            offset,
-            records,
-        }
+        Self::Success { offset, records }
     }
 
     /// Creates a failure result.
     #[must_use]
     pub fn failed(reason: impl Into<String>) -> Self {
-        Self::Failed {
-            reason: reason.into(),
-        }
+        Self::Failed { reason: reason.into() }
     }
 
     /// Returns true if the write succeeded.
@@ -83,12 +78,8 @@ impl WriteResult {
     #[must_use]
     pub const fn offset(&self) -> Option<u64> {
         match self {
-            Self::Success {
-                offset, ..
-            } => Some(*offset),
-            Self::Failed {
-                ..
-            } => None,
+            Self::Success { offset, .. } => Some(*offset),
+            Self::Failed { .. } => None,
         }
     }
 
@@ -96,12 +87,8 @@ impl WriteResult {
     #[must_use]
     pub const fn records(&self) -> Option<usize> {
         match self {
-            Self::Success {
-                records, ..
-            } => Some(*records),
-            Self::Failed {
-                ..
-            } => None,
+            Self::Success { records, .. } => Some(*records),
+            Self::Failed { .. } => None,
         }
     }
 
@@ -109,12 +96,8 @@ impl WriteResult {
     #[must_use]
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::Success {
-                ..
-            } => None,
-            Self::Failed {
-                reason,
-            } => Some(reason),
+            Self::Success { .. } => None,
+            Self::Failed { reason } => Some(reason),
         }
     }
 }
