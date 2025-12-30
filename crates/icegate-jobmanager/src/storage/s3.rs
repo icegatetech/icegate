@@ -4,7 +4,7 @@ use std::{
 };
 
 use aws_config::timeout::TimeoutConfig;
-use aws_sdk_s3::{primitives::ByteStream, Client};
+use aws_sdk_s3::{Client, primitives::ByteStream};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -137,7 +137,7 @@ impl S3Storage {
         match client.head_bucket().bucket(&config.bucket_name).send().await {
             Ok(_) => {
                 info!("Bucket {} exists", config.bucket_name);
-            },
+            }
             Err(_) => {
                 client
                     .create_bucket()
@@ -146,7 +146,7 @@ impl S3Storage {
                     .await
                     .map_err(|e| Error::Other(format!("Failed to create bucket: {e}")))?;
                 info!("Created bucket {}", config.bucket_name);
-            },
+            }
         }
 
         let retrier = Retrier::new(config.retrier_config.clone());
@@ -174,7 +174,7 @@ impl S3Storage {
         self.metrics.record_s3_operation(operation, &status, start.elapsed());
     }
 
-    fn map_s3_error<E: std::fmt::Debug>(&self, err: &aws_sdk_s3::error::SdkError<E>) -> StorageError {
+    fn map_s3_error<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> StorageError {
         // TODO(med): add job context to errors
         match err {
             aws_sdk_s3::error::SdkError::ServiceError(service_err) => {
@@ -188,12 +188,12 @@ impl S3Storage {
                     500 | 502 | 503 | 504 => StorageError::ServiceUnavailable,
                     _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
                 }
-            },
+            }
             aws_sdk_s3::error::SdkError::TimeoutError(_) => StorageError::Timeout,
             aws_sdk_s3::error::SdkError::DispatchFailure(e) => {
                 // Network/connection errors - should be retryable
                 StorageError::S3(format!("Network error: {e:?}"))
-            },
+            }
             _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
         }
     }
@@ -217,7 +217,7 @@ impl S3Storage {
     }
 
     // parseIterNumFromFilePath parses iterNum from file path
-    fn parse_iter_num_from_path(&self, file_path: &str) -> StorageResult<u64> {
+    fn parse_iter_num_from_path(file_path: &str) -> StorageResult<u64> {
         // Expected format: {prefix}/{jobCode}/state-00001.json
         let parts: Vec<&str> = file_path.split('/').collect();
         if parts.len() < 2 {
@@ -229,11 +229,13 @@ impl S3Storage {
             return Err(StorageError::Other(format!("Invalid filename format {filename}")));
         }
 
-        let iter_num_str =
-            filename.trim_start_matches(JOB_STATE_FILE_PREFIX).trim_end_matches(JOB_STATE_FILE_EXTENSION);
+        let iter_num_str = filename
+            .trim_start_matches(JOB_STATE_FILE_PREFIX)
+            .trim_end_matches(JOB_STATE_FILE_EXTENSION);
 
-        let inv_iter_num: u64 =
-            iter_num_str.parse().map_err(|e| StorageError::Other(format!("Failed to parse iter_num: {e}")))?;
+        let inv_iter_num: u64 = iter_num_str
+            .parse()
+            .map_err(|e| StorageError::Other(format!("Failed to parse iter_num: {e}")))?;
 
         // Restore original iterNum
         Ok(u64::MAX - inv_iter_num)
@@ -286,7 +288,11 @@ impl S3Storage {
             running_at: job.running_at(),
             completed_at: job.completed_at(),
             next_start_at: job.next_start_at(),
-            metadata: if job.metadata().is_empty() { None } else { Some(job.metadata().clone()) },
+            metadata: if job.metadata().is_empty() {
+                None
+            } else {
+                Some(job.metadata().clone())
+            },
         }
     }
 
@@ -346,11 +352,11 @@ impl S3Storage {
             Ok(output) => {
                 self.record_s3_ok("PUT", start);
                 Ok(output.e_tag().map(std::string::ToString::to_string))
-            },
+            }
             Err(e) => {
                 self.record_s3_err("PUT", &e, start);
-                Err(self.map_s3_error(&e))
-            },
+                Err(Self::map_s3_error(&e))
+            }
         }
     }
 
@@ -378,11 +384,11 @@ impl S3Storage {
             Ok(output) => {
                 self.record_s3_ok("PUT", start);
                 Ok(output.e_tag().map(std::string::ToString::to_string))
-            },
+            }
             Err(e) => {
                 self.record_s3_err("PUT", &e, start);
-                Err(self.map_s3_error(&e))
-            },
+                Err(Self::map_s3_error(&e))
+            }
         }
     }
 }
@@ -439,8 +445,8 @@ impl Storage for S3Storage {
             Ok(output) => output,
             Err(e) => {
                 self.record_s3_err("GET", &e, start);
-                return Err(self.map_s3_error(&e));
-            },
+                return Err(Self::map_s3_error(&e));
+            }
         };
 
         let data = output
@@ -479,17 +485,17 @@ impl Storage for S3Storage {
             Ok(output) => {
                 self.record_s3_ok("LIST", start);
                 output
-            },
+            }
             Err(e) => {
                 self.record_s3_err("LIST", &e, start);
-                return Err(self.map_s3_error(&e));
-            },
+                return Err(Self::map_s3_error(&e));
+            }
         };
 
         let contents = result.contents();
         if let Some(object) = contents.first() {
             if let (Some(key), Some(etag)) = (object.key(), object.e_tag()) {
-                let iter_num = self.parse_iter_num_from_path(key)?;
+                let iter_num = Self::parse_iter_num_from_path(key)?;
                 return Ok(JobMeta {
                     code: job_code.clone(),
                     iter_num,
@@ -562,7 +568,7 @@ impl Storage for S3Storage {
                     job.code(),
                     job.iter_num()
                 )));
-            },
+            }
         }
 
         debug!(

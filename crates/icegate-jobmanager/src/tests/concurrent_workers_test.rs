@@ -1,26 +1,18 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicI32, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv, storage_wrapper::CountingStorage};
 use crate::{
-    CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, Storage, TaskCode,
-    TaskDefinition, WorkerConfig,
+    CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, Storage,
+    TaskCode, TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
     s3_storage::{S3Storage, S3StorageConfig},
 };
 
-/// TestConcurrentWorkers verifies that multiple workers can process tasks from the same job
+/// `TestConcurrentWorkers` verifies that multiple workers can process tasks from the same job
 /// concurrently
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_concurrent_workers_s3() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,7 +26,7 @@ async fn test_concurrent_workers_s3() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// TestConcurrentWorkers verifies that multiple workers can process tasks from the same job
+/// `TestConcurrentWorkers` verifies that multiple workers can process tasks from the same job
 /// concurrently
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_concurrent_workers_cached() -> Result<(), Box<dyn std::error::Error>> {
@@ -70,6 +62,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
 
         Box::pin(async move {
             // Create multiple work tasks
+            #[allow(clippy::cast_possible_truncation)]
             for i in 0..secondary_task_count {
                 let secondary_task_def = TaskDefinition::new(
                     TaskCode::new("secondary_task"),
@@ -129,7 +122,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
                 region: "us-east-1".to_string(),
                 bucket_prefix: "jobs".to_string(),
                 request_timeout: Duration::from_secs(5),
-                retrier_config: Default::default(),
+                retrier_config: RetrierConfig::default(),
             },
             job_registry.clone(),
             Metrics::new_disabled(),
@@ -153,7 +146,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(100),
             poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
             ..Default::default()
         },
     };
@@ -166,7 +159,10 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
 
     // 7. Verify final job state
     let cancel_token = CancellationToken::new();
-    let job = s3_storage.clone().get_job(&JobCode::new("test_concurrent_job"), &cancel_token).await?;
+    let job = s3_storage
+        .clone()
+        .get_job(&JobCode::new("test_concurrent_job"), &cancel_token)
+        .await?;
     assert_eq!(*job.status(), JobStatus::Completed);
     assert_eq!(job.iter_num(), max_iterations, "job iteration mismatch");
     assert!(job.all_tasks_completed(), "tasks not complete at all");
@@ -175,7 +171,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
         secondary_task_count + 1,
         "created tasks count mismatch"
     );
-    let timeouts: u64 = job.tasks_as_iter().map(|t| (t.attempt() - 1).max(0) as u64).sum();
+    let timeouts: u64 = job.tasks_as_iter().map(|t| u64::from(t.attempt() - 1)).sum();
     tracing::info!(
         "Tasks with timeout: {}. Timeouts count: {}",
         job.tasks_as_iter().filter(|t| t.attempt() > 1).count(),

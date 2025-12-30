@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, TaskCode, TaskDefinition, WorkerConfig,
+    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
+    TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
     s3_storage::{S3Storage, S3StorageConfig},
 };
@@ -28,66 +29,79 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Start MinIO
     let minio_env = MinIOEnv::new().await?;
 
-    let job_a = JobCode::new("test_two_jobs_a");
-    let job_b = JobCode::new("test_two_jobs_b");
+    let primary_job_code = JobCode::new("test_two_jobs_a");
+    let secondary_job_code = JobCode::new("test_two_jobs_b");
     let task_code = TaskCode::new("simple_task");
 
     // 2. Track executions per job
-    let job_a_count = Arc::new(AtomicU64::new(0));
-    let job_b_count = Arc::new(AtomicU64::new(0));
+    let primary_job_count = Arc::new(AtomicU64::new(0));
+    let secondary_job_count = Arc::new(AtomicU64::new(0));
 
-    let job_a_count_clone = Arc::clone(&job_a_count);
-    let job_b_count_clone = Arc::clone(&job_b_count);
+    let primary_job_count_clone = Arc::clone(&primary_job_count);
+    let secondary_job_count_clone = Arc::clone(&secondary_job_count);
 
     let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
-        let job_a_count = Arc::clone(&job_a_count_clone);
-        let job_b_count = Arc::clone(&job_b_count_clone);
+        let primary_job_count = Arc::clone(&primary_job_count_clone);
+        let secondary_job_count = Arc::clone(&secondary_job_count_clone);
         let task_id = task.id().to_string();
         let payload = task.get_input().to_vec();
 
         Box::pin(async move {
             match payload.as_slice() {
                 b"job_a" => {
-                    job_a_count.fetch_add(1, Ordering::SeqCst);
-                },
+                    primary_job_count.fetch_add(1, Ordering::SeqCst);
+                }
                 b"job_b" => {
-                    job_b_count.fetch_add(1, Ordering::SeqCst);
-                },
-                _ => {},
+                    secondary_job_count.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
             }
 
             manager.complete_task(&task_id, b"done".to_vec())
         })
     });
 
-    let mut executors_a = HashMap::new();
-    executors_a.insert(task_code.clone(), Arc::clone(&executor));
-    let mut executors_b = HashMap::new();
-    executors_b.insert(task_code.clone(), Arc::clone(&executor));
+    let mut primary_executors = HashMap::new();
+    primary_executors.insert(task_code.clone(), Arc::clone(&executor));
+    let mut secondary_executors = HashMap::new();
+    secondary_executors.insert(task_code.clone(), Arc::clone(&executor));
 
-    let mut tasks_a = Vec::new();
+    let mut primary_tasks = Vec::new();
     for _ in 0..tasks_per_iter {
-        tasks_a.push(TaskDefinition::new(
+        primary_tasks.push(TaskDefinition::new(
             task_code.clone(),
             b"job_a".to_vec(),
             ChronoDuration::seconds(2),
         )?);
     }
 
-    let mut tasks_b = Vec::new();
+    let mut secondary_tasks = Vec::new();
     for _ in 0..tasks_per_iter {
-        tasks_b.push(TaskDefinition::new(
+        secondary_tasks.push(TaskDefinition::new(
             task_code.clone(),
             b"job_b".to_vec(),
             ChronoDuration::seconds(2),
         )?);
     }
 
-    let job_def_a = JobDefinition::new(job_a.clone(), tasks_a, executors_a, max_iterations)?;
-    let job_def_b = JobDefinition::new(job_b.clone(), tasks_b, executors_b, max_iterations)?;
+    let primary_job_def = JobDefinition::new(
+        primary_job_code.clone(),
+        primary_tasks,
+        primary_executors,
+        max_iterations,
+    )?;
+    let secondary_job_def = JobDefinition::new(
+        secondary_job_code.clone(),
+        secondary_tasks,
+        secondary_executors,
+        max_iterations,
+    )?;
 
     // 3. Create job definitions
-    let job_registry = Arc::new(JobRegistry::new(vec![job_def_a.clone(), job_def_b.clone()])?);
+    let job_registry = Arc::new(JobRegistry::new(vec![
+        primary_job_def.clone(),
+        secondary_job_def.clone(),
+    ])?);
 
     // 4. Create storage
     let storage = S3Storage::new(
@@ -100,7 +114,7 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
             request_timeout: Duration::from_secs(5),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
         },
         job_registry.clone(),
         Metrics::new_disabled(),
@@ -113,15 +127,17 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(100),
             poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
             ..Default::default()
         },
     };
 
-    let mut manager_env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![
-        job_def_a.clone(),
-        job_def_b.clone(),
-    ])?;
+    let mut manager_env = ManagerEnv::new(
+        Arc::new(storage),
+        config,
+        Arc::clone(&job_registry),
+        vec![primary_job_def.clone(), secondary_job_def.clone()],
+    )?;
 
     // 6. Wait for completion
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(30)).await?;
@@ -129,39 +145,43 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected_executions = (tasks_per_iter as u64) * max_iterations;
     assert_eq!(
-        job_a_count.load(Ordering::SeqCst),
+        primary_job_count.load(Ordering::SeqCst),
         expected_executions,
         "job A tasks should be executed for all iterations"
     );
     assert_eq!(
-        job_b_count.load(Ordering::SeqCst),
+        secondary_job_count.load(Ordering::SeqCst),
         expected_executions,
         "job B tasks should be executed for all iterations"
     );
 
     // 7. Verify final job state
     let cancel_token = CancellationToken::new();
-    let job_a_state = manager_env.storage().get_job(&job_a, &cancel_token).await?;
-    assert_eq!(*job_a_state.status(), JobStatus::Completed);
-    assert_eq!(job_a_state.iter_num(), max_iterations, "job A iteration mismatch");
+    let primary_job_state = manager_env.storage().get_job(&primary_job_code, &cancel_token).await?;
+    assert_eq!(*primary_job_state.status(), JobStatus::Completed);
+    assert_eq!(primary_job_state.iter_num(), max_iterations, "job A iteration mismatch");
     assert_eq!(
-        job_a_state.tasks_as_iter().count(),
+        primary_job_state.tasks_as_iter().count(),
         tasks_per_iter,
         "job A tasks count mismatch"
     );
-    let job_a_timeouts: u64 = job_a_state.tasks_as_iter().map(|t| (t.attempt() - 1).max(0) as u64).sum();
-    assert_eq!(job_a_timeouts, 0, "job A should not have timeouts");
+    let primary_job_timeouts: u64 = primary_job_state.tasks_as_iter().map(|t| u64::from(t.attempt() - 1)).sum();
+    assert_eq!(primary_job_timeouts, 0, "job A should not have timeouts");
 
-    let job_b_state = manager_env.storage().get_job(&job_b, &cancel_token).await?;
-    assert_eq!(*job_b_state.status(), JobStatus::Completed);
-    assert_eq!(job_b_state.iter_num(), max_iterations, "job B iteration mismatch");
+    let secondary_job_state = manager_env.storage().get_job(&secondary_job_code, &cancel_token).await?;
+    assert_eq!(*secondary_job_state.status(), JobStatus::Completed);
     assert_eq!(
-        job_b_state.tasks_as_iter().count(),
+        secondary_job_state.iter_num(),
+        max_iterations,
+        "job B iteration mismatch"
+    );
+    assert_eq!(
+        secondary_job_state.tasks_as_iter().count(),
         tasks_per_iter,
         "job B tasks count mismatch"
     );
-    let job_b_timeouts: u64 = job_b_state.tasks_as_iter().map(|t| u64::from(t.attempt() - 1)).sum();
-    assert_eq!(job_b_timeouts, 0, "job B should not have timeouts");
+    let secondary_job_timeouts: u64 = secondary_job_state.tasks_as_iter().map(|t| u64::from(t.attempt() - 1)).sum();
+    assert_eq!(secondary_job_timeouts, 0, "job B should not have timeouts");
 
     Ok(())
 }

@@ -20,7 +20,7 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
 
     let task = Task::new(
         "worker-1".to_string(),
-        TaskDefinition::new(TaskCode::from("cache_task"), Vec::new(), ChronoDuration::seconds(5))?,
+        &TaskDefinition::new(TaskCode::from("cache_task"), Vec::new(), ChronoDuration::seconds(5))?,
     );
 
     let job_code = JobCode::new("test_cache_job");

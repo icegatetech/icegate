@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{retrier::RetryError, storage::StorageError};
+use crate::{infra::retrier::RetryError, storage::StorageError};
 
 /// Public error type for jobmanager operations.
 #[derive(Error, Debug)]
@@ -22,6 +22,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Error, Debug)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) enum InternalError {
     #[error(transparent)]
     Storage(StorageError),
@@ -40,6 +41,7 @@ pub(crate) enum InternalError {
 }
 
 #[derive(Error, Debug)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) enum JobError {
     #[error("task not found")]
     TaskNotFound,

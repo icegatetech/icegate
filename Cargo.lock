@@ -3587,6 +3587,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "icegate-jobmanager"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "chrono",
+ "dashmap",
+ "futures-util",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
+ "parking_lot",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "icegate-maintain"
 version = "0.1.0"
 dependencies = [
@@ -3895,31 +3920,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
  "jiff-tzdb",
-]
-
-[[package]]
-name = "jobmanager"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "chrono",
- "dashmap",
- "futures-util",
- "opentelemetry 0.31.0",
- "opentelemetry_sdk 0.31.0",
- "parking_lot",
- "rand 0.9.2",
- "serde",
- "serde_json",
- "testcontainers",
- "thiserror 2.0.17",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

@@ -12,12 +12,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, TaskCode, TaskDefinition, WorkerConfig,
+    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
+    TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
     s3_storage::{S3Storage, S3StorageConfig},
 };
 
-/// TestDynamicTaskCreation verifies that an executor can create new tasks dynamically
+/// `TestDynamicTaskCreation` verifies that an executor can create new tasks dynamically
 #[tokio::test]
 async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = super::common::logging::init_test_logging();
@@ -41,6 +42,7 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
             executed.store(true, Ordering::SeqCst);
 
             // Create multiple dynamic tasks
+            #[allow(clippy::cast_possible_truncation)]
             for i in 0..dynamic_task_count {
                 let dynamic_task_def =
                     TaskDefinition::new(TaskCode::new("dynamic_task"), vec![i as u8], ChronoDuration::seconds(5))?;
@@ -91,7 +93,7 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
             request_timeout: Duration::from_secs(5),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
         },
         job_registry.clone(),
         Metrics::new_disabled(),
@@ -104,7 +106,7 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(100),
             poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
             ..Default::default()
         },
     };
@@ -122,13 +124,16 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
     );
     assert_eq!(
         dynamic_tasks_executed.load(Ordering::SeqCst),
-        dynamic_task_count as i32,
+        i32::try_from(dynamic_task_count)?,
         "all dynamic tasks should be executed"
     );
 
     // Verify final job state
     let cancel_token = CancellationToken::new();
-    let job = manager_env.storage().get_job(&JobCode::new("test_dynamic_job"), &cancel_token).await?;
+    let job = manager_env
+        .storage()
+        .get_job(&JobCode::new("test_dynamic_job"), &cancel_token)
+        .await?;
     assert_eq!(*job.status(), JobStatus::Completed);
 
     // Verify task count: 1 init + N dynamic

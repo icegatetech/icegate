@@ -44,8 +44,7 @@ impl Storage for InMemoryStorage {
         let job_guard = self.job.read().await;
         match job_guard.as_ref() {
             Some(job) if job.code() == job_code => Ok(job.clone()),
-            Some(_) => Err(StorageError::NotFound),
-            None => Err(StorageError::NotFound),
+            _ => Err(StorageError::NotFound),
         }
     }
 
@@ -74,8 +73,7 @@ impl Storage for InMemoryStorage {
                 iter_num: job.iter_num(),
                 version: job.version().to_string(),
             }),
-            Some(_) => Err(StorageError::NotFound),
-            None => Err(StorageError::NotFound),
+            _ => Err(StorageError::NotFound),
         }
     }
 
@@ -85,8 +83,7 @@ impl Storage for InMemoryStorage {
         }
         let next_version = self.version_counter.fetch_add(1, Ordering::SeqCst) + 1;
         job.update_version(format!("{next_version}"));
-        let mut job_guard = self.job.write().await;
-        *job_guard = Some(job.clone());
+        *self.job.write().await = Some(job.clone());
         Ok(())
     }
 }

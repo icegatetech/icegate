@@ -47,9 +47,7 @@ pub(crate) trait RetryError: Sized {
 
 impl Retrier {
     pub const fn new(config: RetrierConfig) -> Self {
-        Self {
-            config,
-        }
+        Self { config }
     }
 
     pub async fn retry<F, Fut, T, E>(&self, mut handler: F, cancel_token: &CancellationToken) -> Result<T, E>
@@ -61,7 +59,7 @@ impl Retrier {
         let mut attempt = 0;
         loop {
             let result = tokio::select! {
-                _ = cancel_token.cancelled() => return Err(E::cancelled()),
+                () = cancel_token.cancelled() => return Err(E::cancelled()),
                 result = handler() => result,
             };
 
@@ -80,10 +78,10 @@ impl Retrier {
                     let delay = self.calculate_delay(attempt);
                     debug!("retry attempt {} after {:?}", attempt, delay);
                     tokio::select! {
-                        _ = cancel_token.cancelled() => return Err(E::cancelled()),
-                        _ = sleep(delay) => {}
+                        () = cancel_token.cancelled() => return Err(E::cancelled()),
+                        () = sleep(delay) => {}
                     }
-                },
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -97,7 +95,12 @@ impl Retrier {
         };
 
         // Add randomization to prevent thundering herd
-        let jitter_ms = rand::rng().random_range(0..self.config.rand_delay.as_millis() as u64);
+        let max_jitter = u64::try_from(self.config.rand_delay.as_millis()).unwrap_or(u64::MAX);
+        let jitter_ms = if max_jitter == 0 {
+            0
+        } else {
+            rand::rng().random_range(0..max_jitter)
+        };
         base_delay + Duration::from_millis(jitter_ms)
     }
 }

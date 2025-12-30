@@ -8,7 +8,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{InternalError, Job, JobCode, JobDefinition, JobError, JobRegistry, Metrics, Retrier, RetrierConfig, Storage, StorageError, Task, TaskCode, job_manager::JobManagerImpl};
+use crate::execution::job_manager::JobManagerImpl;
+use crate::{
+    InternalError, Job, JobCode, JobDefinition, JobError, JobRegistry, Metrics, Retrier, RetrierConfig, Storage,
+    StorageError, Task, TaskCode,
+};
 // TODO(low): implement subscription mechanism for job updates between workers - if worker
 // received/saved job, other workers should update their state to reduce races. Can be done via
 // storage wrapper.
@@ -60,6 +64,7 @@ enum MergeDecision {
 }
 
 fn panic_payload_to_string(panic: &(dyn Any + Send)) -> String {
+    #[allow(clippy::option_if_let_else)]
     if let Some(message) = panic.downcast_ref::<&str>() {
         (*message).to_string()
     } else if let Some(message) = panic.downcast_ref::<String>() {
@@ -120,11 +125,11 @@ impl Worker {
 
         loop {
             tokio::select! {
-                _ = cancel_token.cancelled() => {
+                () = cancel_token.cancelled() => {
                     info!("Stopping worker {}", self.id);
                     return Ok(());
                 }
-                _ = sleep(poll_interval) => {
+                () = sleep(poll_interval) => {
                     let work_done = self.process_jobs(&cancel_token).await;
 
                     // Adaptive polling: if no work, increase interval
@@ -135,12 +140,13 @@ impl Worker {
                     };
 
                     // Reduce strong concurrency between workers
-                    let jitter_ms = if !self.config.poll_interval_randomization.is_zero() {
+                    let jitter_ms = if self.config.poll_interval_randomization.is_zero() {
+                        self.config.poll_interval_randomization
+                    } else {
+                        #[allow(clippy::cast_possible_truncation)]
                         Duration::from_millis(rand::rng().random_range(
                             0..self.config.poll_interval_randomization.as_millis() as u64
                         ))
-                    } else {
-                        self.config.poll_interval_randomization
                     };
                     sleep(jitter_ms + poll_interval).await;
                 }
@@ -176,21 +182,21 @@ impl Worker {
                 Err(InternalError::Cancelled) => {
                     debug!("Job creation cancelled");
                     return false;
-                },
+                }
                 Err(e) => {
                     error!("Failed to create new job {}: {}", job_code, e);
                     return false;
-                },
+                }
             },
             // go to process job
             Err(StorageError::Cancelled) => {
                 debug!("Job processing cancelled");
                 return false;
-            },
+            }
             Err(e) => {
                 error!("Failed to get job {} for processing: {}", job_code, e);
                 return false;
-            },
+            }
         };
 
         self.update_cache(job_code.clone(), job.version().to_string(), false);
@@ -228,9 +234,7 @@ impl Worker {
 
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
-                let JobMergeContext {
-                    saved_job, ..
-                } = ctx;
+                let JobMergeContext { saved_job, .. } = ctx;
                 debug!(
                     "Job '{}' already created (id: {}) by worker '{}'",
                     code,
@@ -266,11 +270,11 @@ impl Worker {
                 Err(InternalError::Cancelled) => {
                     debug!("Job iteration start cancelled");
                     return false;
-                },
+                }
                 Err(e) => {
                     error!("Failed to start job iteration: {}", e);
                     return true;
-                },
+                }
             };
         } else if job.is_processed() && job.is_iteration_limit_reached() {
             self.update_cache(job.code().clone(), job.version().to_string(), true);
@@ -313,9 +317,7 @@ impl Worker {
 
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
-                let JobMergeContext {
-                    saved_job, ..
-                } = ctx;
+                let JobMergeContext { saved_job, .. } = ctx;
                 debug!(
                     "Job '{}' already started new iteration (id: {}, iter: {}) by worker '{}'",
                     saved_job.code(),
@@ -347,17 +349,14 @@ impl Worker {
         mut job: Job,
         cancel_token: &CancellationToken,
     ) -> Result<bool, InternalError> {
-        let task_id = match job.pick_task_to_execute(&self.id)? {
-            // TODO(low): think about what to do here, likely we have invalid job state
-            Some(id) => id,
-            None => {
-                debug!("Tasks for job {} not found", job.code());
-                return Ok(false);
-            },
+        // TODO(low): think about what to do here, likely we have invalid job state
+        let Some(task_id) = job.pick_task_to_execute(&self.id)? else {
+            debug!("Tasks for job {} not found", job.code());
+            return Ok(false);
         };
 
         match job.start_task(&task_id, self.id.clone()) {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(JobError::TaskWorkerMismatch) => return Ok(true),
             Err(e) => return Err(InternalError::from(e)),
         }
@@ -368,21 +367,19 @@ impl Worker {
         let worker_id = self.id.clone();
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
-                let JobMergeContext {
-                    mut saved_job, ..
-                } = ctx;
+                let JobMergeContext { mut saved_job, .. } = ctx;
                 match saved_job.start_task(&task_id_clone, worker_id.clone()) {
                     Ok(()) => {
                         debug!("Job has concurrent modification when picking task - retry");
                         Ok(MergeDecision::Retry(saved_job))
-                    },
+                    }
                     Err(JobError::TaskWorkerMismatch) => {
                         debug!("Job has concurrent modification when picking task - skip");
                         Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
-                    },
+                    }
                     Err(e) => {
                         Err(InternalError::from(e)) // Don't retry
-                    },
+                    }
                 }
             })
             .await?;
@@ -429,7 +426,9 @@ impl Worker {
         let wrapper_job = RwLock::new(job);
         let job_manager = JobManagerImpl::new(&wrapper_job, self.id.clone());
 
-        let result = AssertUnwindSafe(executor(task, &job_manager, cancel_token.clone())).catch_unwind().await;
+        let result = AssertUnwindSafe(executor(task, &job_manager, cancel_token.clone()))
+            .catch_unwind()
+            .await;
         let result = match result {
             Ok(result) => result.map_err(InternalError::from),
             Err(panic) => Err(InternalError::Other(format!(
@@ -469,16 +468,16 @@ impl Worker {
                             Ok(()) => {
                                 debug!("Retry to save failed task");
                                 Ok(MergeDecision::Retry(saved_job))
-                            },
+                            }
                             Err(JobError::TaskWorkerMismatch) => {
                                 debug!("Task has stolen when try to save failed task - skip");
                                 Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
-                            },
+                            }
                             Err(e) => Err(InternalError::from(e)),
                         }
                     })
                     .await?;
-            },
+            }
             Ok(()) => {
                 info!("Task '{}' handled successfully", task_id);
 
@@ -499,11 +498,11 @@ impl Worker {
                                 saved_job.try_to_complete(&worker_id)?;
                                 debug!("Retry to save completed task");
                                 Ok(MergeDecision::Retry(saved_job))
-                            },
+                            }
                             Err(JobError::TaskWorkerMismatch) => {
                                 debug!("Task has stolen when try to save completed task - skip");
                                 Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
-                            },
+                            }
                             Err(e) => Err(InternalError::from(e)),
                         }
                     })
@@ -512,7 +511,7 @@ impl Worker {
                 if job.is_processed() {
                     self.job_completed(&job);
                 }
-            },
+            }
         }
 
         Ok(())
@@ -557,7 +556,7 @@ impl Worker {
                                     // Save succeeded: store updated job and stop retrying.
                                     *wrapped_job.lock() = Some(current_job);
                                     Ok((false, SaveOutcome::Saved))
-                                },
+                                }
                                 Err(e) if e.is_conflict() => {
                                     // Conflict: refresh from storage, merge (if needed), and decide if we retry.
                                     let saved_job = storage.get_job(&job_code, cancel_token).await?; // TODO(med): getting a job is not always necessary, for example, it is not necessary when taking a task to work.
@@ -568,13 +567,13 @@ impl Worker {
                                         MergeDecision::Retry(updated_job) => {
                                             *wrapped_job.lock() = Some(updated_job);
                                             Ok((true, SaveOutcome::Saved))
-                                        },
+                                        }
                                         MergeDecision::Done(updated_job, outcome) => {
                                             *wrapped_job.lock() = Some(updated_job);
                                             Ok((false, outcome))
-                                        },
+                                        }
                                     }
-                                },
+                                }
                                 Err(e) => Err(InternalError::from(e)),
                             }
                         }
@@ -585,7 +584,10 @@ impl Worker {
             .await?;
 
         // Return the last job state after retries.
-        let updated_job = wrapped_job.lock().take().ok_or_else(|| InternalError::Other("job state missing".into()))?;
+        let updated_job = wrapped_job
+            .lock()
+            .take()
+            .ok_or_else(|| InternalError::Other("job state missing".into()))?;
         Ok((updated_job, outcome))
     }
 
@@ -617,13 +619,15 @@ impl Worker {
         if let Some(tsk) = job.tasks_as_iter().find(|task| task.id() == task_id) {
             // Calculate duration if start/complete times are available
             let duration = match (tsk.completed_at(), tsk.started_at()) {
-                (Some(completed), Some(started)) => {
-                    completed.signed_duration_since(started).to_std().unwrap_or(Duration::from_secs(0))
-                },
+                (Some(completed), Some(started)) => completed
+                    .signed_duration_since(started)
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(0)),
                 _ => Duration::from_secs(0),
             };
 
-            self.metrics.record_task_processed(job.code(), tsk.code(), tsk.status(), duration);
+            self.metrics
+                .record_task_processed(job.code(), tsk.code(), tsk.status(), duration);
         }
 
         Ok(job)
@@ -633,29 +637,37 @@ impl Worker {
         info!("Job {} completed (iter: {})", job.code(), job.iter_num());
 
         // Calculate duration
-        let duration = if let Some(completed) = job.completed_at() {
-            completed.signed_duration_since(job.started_at()).to_std().unwrap_or(Duration::from_secs(0))
-        } else {
-            Duration::from_secs(0)
-        };
+        let duration = job.completed_at().map_or_else(
+            || Duration::from_secs(0),
+            |completed| {
+                completed
+                    .signed_duration_since(job.started_at())
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(0))
+            },
+        );
 
-        self.metrics.record_job_iteration_complete(job.code(), &crate::JobStatus::Completed, duration);
+        self.metrics
+            .record_job_iteration_complete(job.code(), &crate::JobStatus::Completed, duration);
     }
 
     fn update_cache(&self, job_code: JobCode, version: String, exhausted: bool) {
         let mut cache = self.job_cache.write();
-        cache.insert(job_code, JobCacheEntry {
-            version,
-            next_poll: std::time::Instant::now() + self.config.poll_interval,
-            exhausted,
-        });
+        cache.insert(
+            job_code,
+            JobCacheEntry {
+                version,
+                next_poll: std::time::Instant::now() + self.config.poll_interval,
+                exhausted,
+            },
+        );
     }
 
     fn create_tasks_from_job_def(&self, job_def: &JobDefinition) -> Vec<Task> {
         job_def
             .initial_tasks()
             .iter()
-            .map(|task_def| Task::new(self.id.clone(), task_def.clone()))
+            .map(|task_def| Task::new(self.id.clone(), task_def))
             .collect()
     }
 }

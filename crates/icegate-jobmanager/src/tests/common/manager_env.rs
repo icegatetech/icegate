@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics, Storage};
 
-/// ManagerEnv manages JobsManager lifecycle for integration tests
+/// `ManagerEnv` manages `JobsManager` lifecycle for integration tests
 pub struct ManagerEnv {
     storage: Arc<dyn Storage>,
     job_registry: HashMap<JobCode, JobDefinition>,
@@ -12,19 +12,14 @@ pub struct ManagerEnv {
 }
 
 impl ManagerEnv {
-    /// Create a new ManagerEnv
+    /// Create a new `ManagerEnv`
     pub fn new(
         storage: Arc<dyn Storage>,
         config: JobsManagerConfig,
         job_registry_handle: Arc<JobRegistry>,
         job_registry: Vec<JobDefinition>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let manager = JobsManager::new(
-            storage.clone(),
-            config.clone(),
-            job_registry_handle.clone(),
-            Metrics::new_disabled(),
-        )?;
+        let manager = JobsManager::new(storage.clone(), config, job_registry_handle, Metrics::new_disabled())?;
         let manager_handle = manager.start()?;
 
         // Store job definitions for later checking
@@ -65,12 +60,12 @@ impl ManagerEnv {
                             all_done = false;
                             break;
                         }
-                    },
+                    }
                     Err(_) => {
                         // Job doesn't exist yet or error reading it
                         all_done = false;
                         break;
-                    },
+                    }
                 }
             }
 

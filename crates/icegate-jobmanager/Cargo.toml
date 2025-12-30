@@ -1,5 +1,5 @@
 [package]
-name = "jobmanager"
+name = "icegate-jobmanager"
 description = "Job manager"
 readme = "../../README.md"
 keywords = ["iceberg", "S3", "job", "task"]

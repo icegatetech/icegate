@@ -12,12 +12,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, TaskCode, TaskDefinition, WorkerConfig,
+    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
+    TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
     s3_storage::{S3Storage, S3StorageConfig},
 };
 
-/// TestSimpleJobExecution verifies basic job execution with one task
+/// `TestSimpleJobExecution` verifies basic job execution with one task
 #[tokio::test]
 async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = super::common::logging::init_test_logging();
@@ -77,7 +78,7 @@ async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
             request_timeout: Duration::from_secs(5),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
         },
         job_registry.clone(),
         Metrics::new_disabled(),
@@ -90,7 +91,7 @@ async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(100),
             poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
             ..Default::default()
         },
     };
@@ -111,14 +112,17 @@ async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify job state in storage
     let cancel_token = CancellationToken::new();
-    let job = manager_env.storage().get_job(&JobCode::new("test_simple_job"), &cancel_token).await?;
+    let job = manager_env
+        .storage()
+        .get_job(&JobCode::new("test_simple_job"), &cancel_token)
+        .await?;
     assert_eq!(*job.status(), JobStatus::Completed);
     assert_eq!(job.iter_num(), max_iterations);
 
     Ok(())
 }
 
-/// TestMultiTaskSequence verifies a job with sequential tasks
+/// `TestMultiTaskSequence` verifies a job with sequential tasks
 #[tokio::test]
 async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = super::common::logging::init_test_logging();
@@ -192,7 +196,7 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
             request_timeout: Duration::from_secs(5),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
         },
         job_registry.clone(),
         Metrics::new_disabled(),
@@ -205,7 +209,7 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(100),
             poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
             ..Default::default()
         },
     };
@@ -225,7 +229,10 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify job state in storage
     let cancel_token = CancellationToken::new();
-    let job = manager_env.storage().get_job(&JobCode::new("test_sequence_job"), &cancel_token).await?;
+    let job = manager_env
+        .storage()
+        .get_job(&JobCode::new("test_sequence_job"), &cancel_token)
+        .await?;
     assert_eq!(*job.status(), JobStatus::Completed);
     assert_eq!(job.iter_num(), max_iterations);
 

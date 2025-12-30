@@ -49,14 +49,15 @@ impl JobsManagerHandle {
 
     async fn wait(&mut self) -> Result<(), Error> {
         while let Some(result) = self.join_set.join_next().await {
+            #[allow(clippy::match_same_arms)]
             match result {
-                Ok(Ok(())) => {},
+                Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     // Error is already logged inside the worker task.
-                },
+                }
                 Err(e) => {
                     error!("Worker panicked: {}", e);
-                },
+                }
             }
         }
 
@@ -119,9 +120,6 @@ impl JobsManager {
             });
         }
 
-        Ok(JobsManagerHandle {
-            cancel_token,
-            join_set,
-        })
+        Ok(JobsManagerHandle { cancel_token, join_set })
     }
 }

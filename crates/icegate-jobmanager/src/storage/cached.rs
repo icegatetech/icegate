@@ -33,7 +33,7 @@ impl CachedStorage {
 
     // update_cache_if_newer updates cache only if passed job iteration is newer or equal to current in
     // cache
-    fn update_cache_if_newer(&self, storage_job: &Job, cached_job: &mut CachedJob) {
+    fn update_cache_if_newer(storage_job: &Job, cached_job: &mut CachedJob) {
         if let Some(ref current_job) = cached_job.job {
             if storage_job.iter_num() >= current_job.iter_num() {
                 cached_job.job = Some(storage_job.clone());
@@ -66,11 +66,7 @@ impl Storage for CachedStorage {
         let cached_job = self
             .cache
             .entry(job_code.clone())
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(CachedJob {
-                    job: None,
-                }))
-            })
+            .or_insert_with(|| Arc::new(Mutex::new(CachedJob { job: None })))
             .clone();
 
         let mut cached_job = cached_job.lock().await;
@@ -99,7 +95,7 @@ impl Storage for CachedStorage {
                 Ok(job) => break job,
                 Err(e) if e.is_conflict() => {
                     meta = self.inner.find_job_meta(job_code, cancel_token).await?;
-                },
+                }
                 Err(e) => return Err(e),
             }
         };
@@ -116,11 +112,7 @@ impl Storage for CachedStorage {
         let cached_job = self
             .cache
             .entry(meta.code.clone())
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(CachedJob {
-                    job: None,
-                }))
-            })
+            .or_insert_with(|| Arc::new(Mutex::new(CachedJob { job: None })))
             .clone();
 
         let mut cached_job = cached_job.lock().await;
@@ -147,11 +139,11 @@ impl Storage for CachedStorage {
                 // Invalidate cache so next read fetches fresh state
                 cached_job.job = None;
                 return Err(e);
-            },
+            }
             Err(e) => return Err(e),
         };
 
-        self.update_cache_if_newer(&job, &mut cached_job);
+        Self::update_cache_if_newer(&job, &mut cached_job);
         Ok(job)
     }
 
@@ -170,11 +162,7 @@ impl Storage for CachedStorage {
         let cached_job = self
             .cache
             .entry(job.code().clone())
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(CachedJob {
-                    job: None,
-                }))
-            })
+            .or_insert_with(|| Arc::new(Mutex::new(CachedJob { job: None })))
             .clone();
 
         let mut cached_job = cached_job.lock().await;
@@ -191,12 +179,12 @@ impl Storage for CachedStorage {
                     job.tasks_as_string()
                 );
                 Ok(())
-            },
+            }
             Err(e) if e.is_conflict() => {
                 // Invalidate cache so next get_job fetches fresh state from S3
                 cached_job.job = None;
                 Err(e)
-            },
+            }
             Err(e) => Err(e),
         }
     }

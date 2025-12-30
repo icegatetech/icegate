@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use thiserror::Error as ThisError;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, Job, JobCode, JobDefinition, retrier::RetryError};
+use crate::infra::retrier::RetryError;
+use crate::{Error, Job, JobCode, JobDefinition};
 
 // StorageError - storage-specific errors
 #[derive(ThisError, Debug, Clone)]

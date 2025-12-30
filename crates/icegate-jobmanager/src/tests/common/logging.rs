@@ -43,12 +43,12 @@ pub fn init_test_logging() -> ErrorLogGuard {
     let error_layer = ErrorCountLayer {
         counter: Arc::clone(&counter),
     };
-    let filter = EnvFilter::new("jobmanager=debug");
+    let filter = EnvFilter::new("icegate_jobmanager=debug");
 
-    let _ = tracing_subscriber::registry().with(fmt_layer.with_filter(filter)).with(error_layer).try_init();
+    let _ = tracing_subscriber::registry()
+        .with(fmt_layer.with_filter(filter))
+        .with(error_layer)
+        .try_init();
 
-    ErrorLogGuard {
-        counter,
-        baseline,
-    }
+    ErrorLogGuard { counter, baseline }
 }

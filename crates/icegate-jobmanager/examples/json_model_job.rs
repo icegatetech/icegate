@@ -3,9 +3,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
-use jobmanager::{
-    CachedStorage, ImmutableTask, JobDefinition, JobManager, JobRegistry, JobsManager, JobsManagerConfig, Metrics,
-    S3Storage, TaskDefinition, registry::TaskExecutorFn, s3_storage::S3StorageConfig,
+use icegate_jobmanager::{
+    CachedStorage, Error, ImmutableTask, JobDefinition, JobManager, JobRegistry, JobsManager, JobsManagerConfig,
+    Metrics, RetrierConfig, S3Storage, TaskDefinition, registry::TaskExecutorFn, s3_storage::S3StorageConfig,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{Level, info};
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         region: "us-east-1".to_string(),
         bucket_prefix: "jobs".to_string(),
         request_timeout: Duration::from_secs(5),
-        retrier_config: Default::default(),
+        retrier_config: RetrierConfig::default(),
     };
 
     // Storage needs job definitions for reading job settings (enrich_job).
@@ -53,10 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         |task: Arc<dyn ImmutableTask>, manager: &dyn JobManager, _cancel_token| {
             let fut = async move {
                 info!("Step 1 executing...");
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| Error::Other(format!("system time error: {e}")))?;
                 let data = TaskData {
                     message: "Hello from Step 1".to_string(),
                     value: 42,
-                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    timestamp: timestamp.as_secs(),
                 };
 
                 let output_json = serde_json::to_vec(&data)?;

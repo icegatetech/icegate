@@ -33,7 +33,7 @@ impl Metrics {
         }
     }
 
-    pub fn new(meter: Meter) -> Self {
+    pub fn new(meter: &Meter) -> Self {
         let job_duration = meter
             .f64_histogram("jobmanager_job_duration_seconds")
             .with_description("Duration of job execution from start to finish")
@@ -78,10 +78,13 @@ impl Metrics {
         if !self.enabled {
             return;
         }
-        self.job_duration.record(duration.as_secs_f64(), &[
-            KeyValue::new("code", code.to_string()),
-            KeyValue::new("status", format!("{:?}", status)),
-        ]);
+        self.job_duration.record(
+            duration.as_secs_f64(),
+            &[
+                KeyValue::new("code", code.to_string()),
+                KeyValue::new("status", format!("{status:?}")),
+            ],
+        );
     }
 
     pub fn record_task_processed(
@@ -94,21 +97,27 @@ impl Metrics {
         if !self.enabled {
             return;
         }
-        self.task_duration.record(duration.as_secs_f64(), &[
-            KeyValue::new("job_code", job_code.to_string()),
-            KeyValue::new("task_code", task_code.to_string()),
-            KeyValue::new("status", format!("{:?}", status)),
-        ]);
+        self.task_duration.record(
+            duration.as_secs_f64(),
+            &[
+                KeyValue::new("job_code", job_code.to_string()),
+                KeyValue::new("task_code", task_code.to_string()),
+                KeyValue::new("status", format!("{status:?}")),
+            ],
+        );
     }
 
     pub fn record_s3_operation(&self, operation: &str, status: &str, duration: Duration) {
         if !self.enabled {
             return;
         }
-        self.s3_latency.record(duration.as_secs_f64(), &[
-            KeyValue::new("operation", operation.to_string()),
-            KeyValue::new("http_status", status.to_string()),
-        ]);
+        self.s3_latency.record(
+            duration.as_secs_f64(),
+            &[
+                KeyValue::new("operation", operation.to_string()),
+                KeyValue::new("http_status", status.to_string()),
+            ],
+        );
     }
 
     pub fn record_cache_hit(&self, method: &str) {

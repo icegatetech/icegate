@@ -1,65 +1,43 @@
 #![allow(missing_docs)]
 #![allow(dead_code)]
+#![allow(clippy::redundant_pub_crate)]
 
-mod core;
+pub(crate) mod core;
 mod execution;
 mod infra;
-pub mod storage;
+mod storage;
 
 // Public compatibility modules
 pub mod error {
     pub use crate::core::error::{Error, Result};
 }
-pub mod job {
-    pub use crate::core::job::*;
-}
-pub mod task {
-    pub use crate::core::task::*;
-}
 pub mod registry {
-    pub use crate::core::registry::*;
-}
-pub mod metrics {
-    pub use crate::infra::metrics::*;
-}
-pub mod job_manager {
-    pub use crate::execution::job_manager::*;
-}
-pub mod jobs_manager {
-    pub use crate::execution::jobs_manager::*;
-}
-pub mod worker {
-    pub use crate::execution::worker::*;
-}
-pub mod retrier {
-    pub use crate::infra::retrier::*;
-}
-pub mod cached_storage {
-    pub use crate::storage::cached::*;
+    pub use crate::core::registry::TaskExecutorFn;
 }
 pub mod s3_storage {
-    pub use crate::storage::s3::*;
+    pub use crate::storage::s3::{S3Storage, S3StorageConfig};
 }
 
 // Re-exports
-pub use cached_storage::CachedStorage;
 pub use error::Error;
-pub(crate) use crate::core::error::{InternalError, JobError};
-pub(crate) use job::Job;
-pub use job::{JobCode, JobDefinition, JobStatus};
-pub use job_manager::JobManager;
-pub use jobs_manager::{JobsManager, JobsManagerConfig, JobsManagerHandle};
-pub use metrics::Metrics;
-pub use registry::JobRegistry;
-pub(crate) use retrier::Retrier;
-pub use retrier::RetrierConfig;
-pub use s3_storage::S3Storage;
-pub use storage::JobDefinitionRegistry;
 pub(crate) use storage::{JobMeta, Storage, StorageError, StorageResult};
-pub(crate) use task::Task;
-pub use task::{ImmutableTask, TaskCode, TaskDefinition, TaskStatus};
-pub(crate) use worker::Worker;
-pub use worker::WorkerConfig;
+
+pub(crate) use crate::core::error::{InternalError, JobError};
+pub(crate) use crate::core::job::Job;
+pub use crate::core::job::{JobCode, JobDefinition, JobStatus};
+pub use crate::core::registry::JobRegistry;
+pub(crate) use crate::core::task::Task;
+pub use crate::core::task::{ImmutableTask, TaskCode, TaskDefinition, TaskStatus};
+pub use crate::execution::job_manager::JobManager;
+pub use crate::execution::jobs_manager::{JobsManager, JobsManagerConfig, JobsManagerHandle};
+pub(crate) use crate::execution::worker::Worker;
+pub use crate::execution::worker::WorkerConfig;
+pub use crate::infra::metrics::Metrics;
+pub(crate) use crate::infra::retrier::Retrier;
+pub use crate::infra::retrier::RetrierConfig;
+pub use crate::storage::JobDefinitionRegistry;
+pub use crate::storage::cached::CachedStorage;
+pub use crate::storage::s3::S3Storage;
 
 // Integration tests
 #[cfg(test)]

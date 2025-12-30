@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicI32, AtomicU32, Ordering},
+        atomic::{AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -12,13 +12,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
 use crate::{
-    Error, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, TaskCode, TaskDefinition,
-    WorkerConfig,
+    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
+    TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
     s3_storage::{S3Storage, S3StorageConfig},
 };
 
-/// TestTaskDeadlineExpiry verifies that a task started by one worker is re-picked by another worker
+/// `TestTaskDeadlineExpiry` verifies that a task started by one worker is re-picked by another worker
 /// after its deadline expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
@@ -82,7 +82,7 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
             request_timeout: Duration::from_secs(5),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
         },
         job_registry.clone(),
         Metrics::new_disabled(),
@@ -95,7 +95,7 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(10),
             poll_interval_randomization: Duration::from_millis(0),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
             ..Default::default()
         },
     };
@@ -115,9 +115,12 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify final job state
     let cancel_token = CancellationToken::new();
-    let job = manager_env.storage().get_job(&JobCode::new("test_deadline_job"), &cancel_token).await?;
+    let job = manager_env
+        .storage()
+        .get_job(&JobCode::new("test_deadline_job"), &cancel_token)
+        .await?;
     let tasks = job.get_tasks_by_code(task_def.code());
-    let attempts = tasks.first().map(|t| t.attempts()).unwrap_or(0);
+    let attempts = tasks.first().map_or(0, |t| t.attempts());
     assert_eq!(*job.status(), JobStatus::Completed);
     assert_eq!(
         attempts, expected_attempts,

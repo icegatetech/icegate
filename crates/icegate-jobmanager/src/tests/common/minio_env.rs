@@ -7,7 +7,7 @@ use testcontainers::{
 };
 use tokio::net::TcpStream;
 
-/// MinIOEnv manages a MinIO testcontainer for integration tests
+/// `MinIOEnv` manages a `MinIO` testcontainer for integration tests
 pub struct MinIOEnv {
     _container: ContainerAsync<GenericImage>,
     endpoint: String,
@@ -16,7 +16,7 @@ pub struct MinIOEnv {
 }
 
 impl MinIOEnv {
-    /// Create a new MinIO test environment
+    /// Create a new `MinIO` test environment
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         tracing::info!("Starting MinIO container...");
 
@@ -33,7 +33,7 @@ impl MinIOEnv {
 
         // Get the mapped port for MinIO API
         let port = container.get_host_port_ipv4(9000).await?;
-        let endpoint = format!("http://127.0.0.1:{}", port);
+        let endpoint = format!("http://127.0.0.1:{port}");
 
         tracing::info!("MinIO container started on {}", endpoint);
 
@@ -43,7 +43,7 @@ impl MinIOEnv {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(_) => break,
                 Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(100)).await,
-                Err(err) => return Err(format!("MinIO not reachable: {}", err).into()),
+                Err(err) => return Err(format!("MinIO not reachable: {err}").into()),
             }
         }
 
@@ -55,17 +55,17 @@ impl MinIOEnv {
         })
     }
 
-    /// Get the MinIO API endpoint
+    /// Get the `MinIO` API endpoint
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    /// Get the MinIO username
+    /// Get the `MinIO` username
     pub fn username(&self) -> &str {
         &self.username
     }
 
-    /// Get the MinIO password
+    /// Get the `MinIO` password
     pub fn password(&self) -> &str {
         &self.password
     }

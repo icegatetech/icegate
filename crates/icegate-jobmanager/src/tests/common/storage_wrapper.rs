@@ -11,7 +11,7 @@ use crate::{
     storage::{JobMeta, Storage, StorageResult},
 };
 
-/// CountingStorage wraps Storage and tracks save_job calls.
+/// `CountingStorage` wraps Storage and tracks `save_job` calls.
 pub struct CountingStorage {
     inner: Arc<dyn Storage>,
     put_attempts: AtomicU64,

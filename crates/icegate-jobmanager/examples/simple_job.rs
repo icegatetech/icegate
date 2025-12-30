@@ -7,23 +7,24 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
-use jobmanager::{
-    Error, JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, Metrics, TaskCode, TaskDefinition,
+use icegate_jobmanager::{
+    Error, JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
+    TaskDefinition,
     registry::TaskExecutorFn,
     s3_storage::{S3Storage, S3StorageConfig},
 };
 
 #[tokio::main]
-async fn main() {
-    if let Err(e) = run_simple_job().await {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
-    }
+async fn main() -> Result<(), Error> {
+    run_simple_job().await
 }
 
 async fn run_simple_job() -> Result<(), Error> {
     // Initialize tracing/logging
-    tracing_subscriber::fmt().with_target(false).with_env_filter("jobmanager=debug").init();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_env_filter("icegate_jobmanager=debug")
+        .init();
 
     tracing::info!("Starting simple job example");
 
@@ -71,7 +72,7 @@ async fn run_simple_job() -> Result<(), Error> {
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
             request_timeout: Duration::from_secs(5),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
         },
         job_registry.clone(),
         Metrics::new_disabled(),
@@ -90,7 +91,9 @@ async fn run_simple_job() -> Result<(), Error> {
     tracing::info!("Starting job manager (press Ctrl+C to stop)");
 
     let handle = manager.start()?;
-    tokio::signal::ctrl_c().await.map_err(|e| Error::Other(format!("ctrl_c error: {e}")))?;
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| Error::Other(format!("ctrl_c error: {e}")))?;
     tracing::info!("Received interrupt signal, shutting down...");
     handle.shutdown().await?;
 

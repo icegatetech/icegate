@@ -68,8 +68,7 @@ impl JobStatus {
         let allowed = match self {
             Self::Started => matches!(new, Self::Running | Self::Failed),
             Self::Running => matches!(new, Self::Running | Self::Completed | Self::Failed),
-            Self::Completed => matches!(new, Self::Started),
-            Self::Failed => matches!(new, Self::Started),
+            Self::Completed | Self::Failed => matches!(new, Self::Started),
         };
 
         if allowed {
@@ -195,6 +194,7 @@ impl Job {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
         id: String,
         code: JobCode,
@@ -260,7 +260,7 @@ impl Job {
         Ok(())
     }
 
-    pub(crate) fn add_task(&mut self, task_def: TaskDefinition, worker_id: &str) -> Result<(), JobError> {
+    pub(crate) fn add_task(&mut self, task_def: &TaskDefinition, worker_id: &str) -> Result<(), JobError> {
         let task = Task::new(worker_id.to_string(), task_def);
 
         if self.tasks_by_id.contains_key(task.id()) {
@@ -389,11 +389,7 @@ impl Job {
             return false;
         }
 
-        if let Some(next_start) = self.next_start_at {
-            Utc::now() > next_start
-        } else {
-            true
-        }
+        self.next_start_at.map_or(true, |next_start| Utc::now() > next_start)
     }
 
     // State mutations
@@ -486,11 +482,7 @@ impl Job {
 
     #[allow(dead_code)]
     pub(crate) fn should_poll(&self) -> bool {
-        if let Some(next_start) = self.next_start_at {
-            Utc::now() > next_start
-        } else {
-            true
-        }
+        self.next_start_at.map_or(true, |next_start| Utc::now() > next_start)
     }
 
     pub(crate) fn tasks_as_iter(&self) -> impl Iterator<Item = &Task> {
@@ -498,7 +490,8 @@ impl Job {
     }
 
     pub(crate) fn get_task(&self, task_id: &str) -> Result<Arc<dyn ImmutableTask>, JobError> {
-        self.get_task_arc(task_id).map(|task| Arc::clone(task) as Arc<dyn ImmutableTask>)
+        self.get_task_arc(task_id)
+            .map(|task| Arc::clone(task) as Arc<dyn ImmutableTask>)
     }
 
     pub(crate) fn get_tasks_by_code(&self, code: &TaskCode) -> Vec<Arc<dyn ImmutableTask>> {
@@ -510,15 +503,17 @@ impl Job {
     }
 
     pub(crate) fn tasks_as_string(&self) -> String {
+        use std::fmt::Write as _;
         let mut summary = String::new();
         let mut count = 0;
         for (id, task) in &self.tasks_by_id {
-            summary.push_str(&format!(
+            let _ = write!(
+                summary,
                 "id: {}; code: {}; status: {}; ",
                 id,
                 task.code(),
                 task.status()
-            ));
+            );
             count += 1;
             if count > 3 {
                 summary.push_str("...");

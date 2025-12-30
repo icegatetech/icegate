@@ -23,27 +23,33 @@ pub(crate) struct JobManagerImpl<'a> {
 }
 
 impl<'a> JobManagerImpl<'a> {
-    pub(crate) fn new(job: &'a RwLock<Job>, worker_id: String) -> Self {
-        Self {
-            job,
-            worker_id,
-        }
+    pub(crate) const fn new(job: &'a RwLock<Job>, worker_id: String) -> Self {
+        Self { job, worker_id }
     }
 }
 
-impl<'a> JobManager for JobManagerImpl<'a> {
+impl JobManager for JobManagerImpl<'_> {
     fn add_task(&self, task_def: TaskDefinition) -> Result<(), Error> {
-        self.job.write().add_task(task_def, &self.worker_id).map_err(|e| Error::Other(e.to_string()))?;
+        self.job
+            .write()
+            .add_task(&task_def, &self.worker_id)
+            .map_err(|e| Error::Other(e.to_string()))?;
         Ok(())
     }
 
     fn complete_task(&self, task_id: &str, output: Vec<u8>) -> Result<(), Error> {
-        self.job.write().complete_task(task_id, output).map_err(|e| Error::Other(e.to_string()))?;
+        self.job
+            .write()
+            .complete_task(task_id, output)
+            .map_err(|e| Error::Other(e.to_string()))?;
         Ok(())
     }
 
     fn fail_task(&self, task_id: &str, error_msg: &str) -> Result<(), Error> {
-        self.job.write().fail_task(task_id, error_msg).map_err(|e| Error::Other(e.to_string()))?;
+        self.job
+            .write()
+            .fail_task(task_id, error_msg)
+            .map_err(|e| Error::Other(e.to_string()))?;
         Ok(())
     }
 

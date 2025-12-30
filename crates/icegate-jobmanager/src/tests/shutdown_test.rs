@@ -36,16 +36,17 @@ async fn test_shutdown_cancels_executor() -> Result<(), Box<dyn std::error::Erro
         let _task_id = task.id().to_string();
 
         Box::pin(async move {
-            if let Some(tx) = started_tx.lock().await.take() {
+            let value = started_tx.lock().await.take();
+            if let Some(tx) = value {
                 let _ = tx.send(());
             }
 
             tokio::select! {
-                _ = cancel_token.cancelled() => {
+                () = cancel_token.cancelled() => {
                     cancelled_flag.store(true, Ordering::SeqCst);
                     Ok(())
                 }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
                     Ok(())
                 }
             }

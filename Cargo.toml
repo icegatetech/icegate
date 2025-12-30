@@ -20,21 +20,21 @@ repository = "https://github.com/icegatetech/icegate"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
-unused_imports = "warn"
-unused_variables = "warn"
+unused_imports = "deny"
+unused_variables = "deny"
 dead_code = "deny"
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-perf = { level = "warn", priority = -1 }
-cargo = { level = "warn", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
 correctness = { level = "deny", priority = -1 }
-dbg_macro = "warn"
-todo = "warn"
-unimplemented = "warn"
-print_stdout = "warn"
-print_stderr = "warn"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 must_use_candidate = "allow"

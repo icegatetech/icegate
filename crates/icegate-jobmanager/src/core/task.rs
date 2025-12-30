@@ -72,11 +72,7 @@ impl TaskDefinition {
         if timeout <= Duration::zero() {
             return Err(Error::Other("task timeout must be positive".into()));
         }
-        Ok(Self {
-            code,
-            input,
-            timeout,
-        })
+        Ok(Self { code, input, timeout })
     }
 
     pub const fn code(&self) -> &TaskCode {
@@ -88,7 +84,7 @@ impl TaskDefinition {
         &self.input
     }
 
-    pub fn timeout(&self) -> Duration {
+    pub const fn timeout(&self) -> Duration {
         self.timeout
     }
 }
@@ -125,7 +121,7 @@ pub(crate) struct Task {
 }
 
 impl Task {
-    pub(crate) fn new(created_by_worker: String, task_def: TaskDefinition) -> Self {
+    pub(crate) fn new(created_by_worker: String, task_def: &TaskDefinition) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             code: task_def.code().clone(),
@@ -143,7 +139,8 @@ impl Task {
         }
     }
 
-    pub(crate) fn restore(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn restore(
         id: String,
         code: TaskCode,
         status: TaskStatus,
@@ -196,7 +193,7 @@ impl Task {
         &self.created_by_worker
     }
 
-    pub(crate) fn timeout(&self) -> Duration {
+    pub(crate) const fn timeout(&self) -> Duration {
         self.timeout
     }
 
@@ -230,11 +227,7 @@ impl Task {
 
     // State checks
     pub(crate) fn is_expired(&self) -> bool {
-        if let Some(deadline) = self.deadline_at {
-            Utc::now() > deadline
-        } else {
-            false
-        }
+        self.deadline_at.is_some_and(|deadline| Utc::now() > deadline)
     }
 
     pub(crate) const fn is_completed(&self) -> bool {
@@ -249,15 +242,14 @@ impl Task {
         matches!(self.status, TaskStatus::Started)
     }
 
-    pub(crate) fn is_processed(&self) -> bool {
+    pub(crate) const fn is_processed(&self) -> bool {
         self.is_completed() || self.is_failed()
     }
 
     pub(crate) fn can_be_picked_up(&self) -> bool {
         match self.status {
-            TaskStatus::Todo => true,
+            TaskStatus::Todo | TaskStatus::Failed => true, // TODO(low): add limit on number of attempts
             TaskStatus::Started => self.is_expired(),
-            TaskStatus::Failed => true, // TODO(low): add limit on number of attempts
             TaskStatus::Completed => false,
         }
     }

@@ -12,12 +12,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, TaskCode, TaskDefinition, WorkerConfig,
+    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
+    TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
     s3_storage::{S3Storage, S3StorageConfig},
 };
 
-/// TestJobIterations verifies that a job can complete and restart for multiple iterations
+/// `TestJobIterations` verifies that a job can complete and restart for multiple iterations
 #[tokio::test]
 async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = super::common::logging::init_test_logging();
@@ -70,7 +71,7 @@ async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
             request_timeout: Duration::from_secs(5),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
         },
         job_registry.clone(),
         Metrics::new_disabled(),
@@ -83,7 +84,7 @@ async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(100),
             poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: Default::default(),
+            retrier_config: RetrierConfig::default(),
             ..Default::default()
         },
     };
@@ -103,7 +104,10 @@ async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify final job state
     let cancel_token = CancellationToken::new();
-    let job = manager_env.storage().get_job(&JobCode::new("test_iterations_job"), &cancel_token).await?;
+    let job = manager_env
+        .storage()
+        .get_job(&JobCode::new("test_iterations_job"), &cancel_token)
+        .await?;
     assert_eq!(*job.status(), JobStatus::Completed);
     assert_eq!(job.iter_num(), expected_iterations, "job should be at final iteration");
 
