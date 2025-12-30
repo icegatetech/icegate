@@ -14,7 +14,7 @@ use datafusion::{
     arrow::datatypes::{DataType, IntervalMonthDayNano},
     functions::string::octet_length,
     functions_aggregate::expr_fn::{count, last_value, sum},
-    logical_expr::{Expr, ExprSchemable, ScalarUDF, col, lit, when},
+    logical_expr::{Expr, ExprSchemable, ScalarUDF, col, lit},
     prelude::*,
     scalar::ScalarValue,
 };
@@ -384,7 +384,10 @@ impl DataFusionPlanner {
         if agg.range_expr.unwrap.is_some() {
             Ok(self.plan_unwrap_range_aggregation(agg)?)
         } else {
-            Ok(self.plan_log_range_aggregation(agg).await?)
+            match agg.op {
+                RangeAggregationOp::AbsentOverTime => Ok(self.plan_log_range_absent_aggregation(agg).await?),
+                _ => Ok(self.plan_log_range_aggregation(agg).await?),
+            }
         }
     }
 
@@ -395,14 +398,47 @@ impl DataFusionPlanner {
         ))
     }
 
-    /// Plans a log range aggregation using UDAF-based implementation.
+    /// Plans `absent_over_time` aggregation using a different algorithm.
     ///
-    /// This implementation uses custom aggregate functions that compute
-    /// values for each time grid point in a single pass, then unnest the
-    /// result to produce the output rows.
+    /// `AbsentOverTime` requires fundamentally different logic than other range aggregations:
+    /// - It needs to identify grid points that have NO matching log entries
+    /// - Current inverse mode approach is incomplete and needs rework
     ///
-    /// Supports: `count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`,
-    /// `absent_over_time`.
+    /// TODO: Implement correct `absent_over_time` algorithm
+    /// The algorithm should:
+    /// 1. Generate full grid of timestamps (start to end by step)
+    /// 2. For each grid point, check if ANY log entries fall within its range window
+    /// 3. Emit value=1.0 for grid points with zero matches
+    /// 4. Support proper label grouping
+    #[allow(clippy::unused_async)]
+    async fn plan_log_range_absent_aggregation(
+        &self,
+        _agg: crate::logql::metric::RangeAggregation,
+    ) -> Result<DataFrame> {
+        // FIXME: Placeholder implementation uses incorrect logic
+        // Current inverse mode approach:
+        //   - date_grid(inverse=true) emits grid points each timestamp DOESN'T cover
+        //   - After grouping: count = number of timestamps that excluded this grid point
+        //   - Logic is backwards: count=0 means all timestamps cover it (NOT absent)
+        //
+        // Correct algorithm needed:
+        //   1. Generate complete grid (all timestamps from start to end by step)
+        //   2. Left join with actual log timestamps
+        //   3. Where join produces NULL → that grid point is absent
+        //   4. Emit value=1.0 for those absent points
+        Err(QueryError::NotImplemented(
+            "absent_over_time requires a different algorithm - current inverse mode is incorrect".to_string(),
+        ))
+    }
+
+    /// Plans a log range aggregation using `date_grid` UDF + standard aggregations.
+    ///
+    /// This implementation uses the `date_grid` scalar UDF to generate matching
+    /// grid timestamps for each log entry, then applies standard DataFusion
+    /// aggregation functions (count, sum) to compute the final values.
+    ///
+    /// Supports: `count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`.
+    /// Note: `absent_over_time` is handled separately in `plan_log_range_absent_aggregation`.
     async fn plan_log_range_aggregation(&self, agg: crate::logql::metric::RangeAggregation) -> Result<DataFrame> {
         // 1. Plan the inner LogExpr with extended time range for lookback window
         let offset_duration = agg.range_expr.offset.unwrap_or(TimeDelta::zero());
@@ -450,16 +486,7 @@ impl DataFusionPlanner {
 
         // 3. Apply date_grid UDF to generate grid timestamps for each row
         let date_grid_udf = ScalarUDF::from(super::udf::DateGrid::new());
-
-        // For AbsentOverTime, use inverse mode
-        let mut date_grid_args = vec![col("timestamp"), start_arg, end_arg, step_arg, range_arg, offset_arg];
-
-        // Add inverse parameter for AbsentOverTime
-        let is_absent = matches!(agg.op, RangeAggregationOp::AbsentOverTime);
-        if is_absent {
-            date_grid_args.push(lit(true));
-        }
-
+        let date_grid_args = vec![col("timestamp"), start_arg, end_arg, step_arg, range_arg, offset_arg];
         df = df.with_column("_grid_timestamps", date_grid_udf.call(date_grid_args))?;
 
         // 4. Unnest grid timestamps to expand rows
@@ -473,28 +500,13 @@ impl DataFusionPlanner {
         grouping_exprs.push(array_to_string(map_values(col("attributes")), lit("|||")).alias(COL_ATTR_VALS));
 
         // 6. Build operation-specific aggregation
+        #[allow(clippy::cast_precision_loss)]
         let range_secs = range_nanos as f64 / 1_000_000_000.0;
-        let (agg_expr, divisor) = match agg.op {
-            RangeAggregationOp::CountOverTime => {
-                let expr = count(lit(1)).alias("_agg_value");
-                (expr, 1.0)
-            }
-            RangeAggregationOp::Rate => {
-                let expr = count(lit(1)).alias("_agg_value");
-                (expr, range_secs)
-            }
-            RangeAggregationOp::BytesOverTime => {
-                let expr = sum(octet_length().call(vec![col("body")])).alias("_agg_value");
-                (expr, 1.0)
-            }
-            RangeAggregationOp::BytesRate => {
-                let expr = sum(octet_length().call(vec![col("body")])).alias("_agg_value");
-                (expr, range_secs)
-            }
-            RangeAggregationOp::AbsentOverTime => {
-                // With inverse mode, count how many timestamps excluded each grid point
-                let expr = count(lit(1)).alias("_agg_value");
-                (expr, 1.0)
+
+        let agg_expr = match agg.op {
+            RangeAggregationOp::CountOverTime | RangeAggregationOp::Rate => count(lit(1)).alias("_agg_value"),
+            RangeAggregationOp::BytesOverTime | RangeAggregationOp::BytesRate => {
+                sum(octet_length().call(vec![col("body")])).alias("_agg_value")
             }
             _ => {
                 return Err(QueryError::Plan(
@@ -513,18 +525,20 @@ impl DataFusionPlanner {
         let schema = df.schema().clone();
         let mut select_exprs = vec![col("grid_timestamp").alias("timestamp")];
 
-        let value_expr = if is_absent {
-            // AbsentOverTime: value=1.0 when count=0, else NULL
-            when(col("_agg_value").eq(lit(0i64)), lit(1.0))
-                .otherwise(lit(ScalarValue::Float64(None)))
-                .unwrap()
-                .alias("value")
-        } else if (divisor - 1.0).abs() > f64::EPSILON {
-            // Rate operations: divide by range_seconds
-            (col("_agg_value").cast_to(&DataType::Float64, &schema)? / lit(divisor)).alias("value")
-        } else {
-            // Count/Bytes operations: cast to Float64
-            col("_agg_value").cast_to(&DataType::Float64, &schema)?.alias("value")
+        let value_expr = match agg.op {
+            RangeAggregationOp::CountOverTime | RangeAggregationOp::BytesOverTime => {
+                // Simple cast to Float64, no division
+                col("_agg_value").cast_to(&DataType::Float64, &schema)?.alias("value")
+            }
+            RangeAggregationOp::Rate | RangeAggregationOp::BytesRate => {
+                // Rate operations: divide by range_seconds
+                (col("_agg_value").cast_to(&DataType::Float64, &schema)? / lit(range_secs)).alias("value")
+            }
+            _ => {
+                return Err(QueryError::Plan(
+                    "This range aggregation requires an unwrap expression".to_string(),
+                ));
+            }
         };
 
         select_exprs.push(value_expr);
@@ -532,16 +546,8 @@ impl DataFusionPlanner {
 
         df = df.select(select_exprs)?;
 
-        // 9. Filter for sparse output
-        let df = if is_absent {
-            // AbsentOverTime: keep only non-NULL values (count = 0 cases)
-            df.filter(col("value").is_not_null())?
-        } else {
-            // All others: keep only value > 0
-            df.filter(col("value").gt(lit(0.0)))?
-        };
-
-        Ok(df)
+        // 9. Filter for sparse output (keep only value > 0)
+        Ok(df.filter(col("value").gt(lit(0.0)))?)
     }
 
     fn build_default_label_columns(with: &[&str], without: &[&str]) -> Vec<String> {
