@@ -450,6 +450,11 @@ impl Worker {
         drop(job_manager);
         let mut job = wrapper_job.into_inner();
 
+        // TODO(low): think about to fail the task when expired
+        if result.is_ok() && job.get_task(&task_id)?.is_expired() {
+            info!("Task '{}' exceeded deadline", task_id);
+        }
+
         // Handle result
         match result {
             Err(e) => {

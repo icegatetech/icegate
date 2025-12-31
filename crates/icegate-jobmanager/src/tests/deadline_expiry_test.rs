@@ -44,7 +44,7 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
 
             if attempt <= 3 {
                 // First attempt: exceed deadline so another worker can re-pick.
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
             // Complete successfully (first attempt might be stolen).
@@ -81,7 +81,7 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
             use_ssl: false,
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
-            request_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_millis(200),
             retrier_config: RetrierConfig::default(),
         },
         job_registry.clone(),
@@ -110,7 +110,7 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         attempt_count.load(Ordering::SeqCst),
         expected_attempts,
-        "task should be attempted twice due to deadline expiry"
+        "task should be attempted {expected_attempts} due to deadline expiry"
     );
 
     // Verify final job state
