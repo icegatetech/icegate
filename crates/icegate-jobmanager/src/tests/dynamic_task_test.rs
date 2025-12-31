@@ -21,7 +21,7 @@ use crate::{
 /// `TestDynamicTaskCreation` verifies that an executor can create new tasks dynamically
 #[tokio::test]
 async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> {
-    let _log_guard = super::common::logging::init_test_logging();
+
 
     // 1. Start MinIO
     let minio_env = MinIOEnv::new().await?;

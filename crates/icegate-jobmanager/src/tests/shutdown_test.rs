@@ -21,7 +21,7 @@ use crate::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_shutdown_cancels_executor() -> Result<(), Box<dyn std::error::Error>> {
-    let _log_guard = super::common::logging::init_test_logging();
+
 
     let storage = Arc::new(InMemoryStorage::new());
     let (started_tx, started_rx) = oneshot::channel();

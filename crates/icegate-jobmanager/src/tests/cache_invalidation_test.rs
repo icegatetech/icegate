@@ -9,7 +9,7 @@ use crate::{CachedStorage, Job, JobCode, Metrics, Storage, Task, TaskCode, TaskD
 // TestCacheInvalidation verifies that CachedStorage avoids redundant S3 calls on cache hit.
 #[tokio::test]
 async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
-    let _log_guard = super::common::logging::init_test_logging();
+
 
     let storage = Arc::new(InMemoryStorage::new());
     let cached_storage = Arc::new(CachedStorage::new(

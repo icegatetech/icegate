@@ -22,7 +22,7 @@ use crate::{
 /// after its deadline expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
-    let _log_guard = super::common::logging::init_test_logging();
+
 
     let expected_attempts: u32 = 4;
 

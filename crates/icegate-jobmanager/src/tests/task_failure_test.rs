@@ -21,7 +21,7 @@ use crate::{
 /// `TestTaskFailureAndRetry` verifies that failed tasks are retried
 #[tokio::test]
 async fn test_task_failure_and_retry() -> Result<(), Box<dyn std::error::Error>> {
-    let _log_guard = super::common::logging::init_test_logging();
+
 
     // 1. Start MinIO
     let minio_env = MinIOEnv::new().await?;

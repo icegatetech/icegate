@@ -11,3 +11,6 @@ test:
 
 clean:
 	cargo clean
+
+clippy:
+	cargo clippy -p icegate-jobmanager -- -D warnings
