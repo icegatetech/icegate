@@ -398,37 +398,118 @@ impl DataFusionPlanner {
         ))
     }
 
-    /// Plans `absent_over_time` aggregation using a different algorithm.
+    /// Plans `absent_over_time` aggregation using inverse mode + array intersection.
     ///
     /// `AbsentOverTime` requires fundamentally different logic than other range aggregations:
-    /// - It needs to identify grid points that have NO matching log entries
-    /// - Current inverse mode approach is incomplete and needs rework
+    /// - Uses `date_grid` with `inverse=true` to emit grid points NOT covered by each timestamp
+    /// - Aggregates inverse arrays using `array_intersect_agg` to find grid points excluded by ALL timestamps
+    /// - Grid points in the intersection are absent (no matching log entries)
     ///
-    /// TODO: Implement correct `absent_over_time` algorithm
-    /// The algorithm should:
-    /// 1. Generate full grid of timestamps (start to end by step)
-    /// 2. For each grid point, check if ANY log entries fall within its range window
-    /// 3. Emit value=1.0 for grid points with zero matches
-    /// 4. Support proper label grouping
-    #[allow(clippy::unused_async)]
+    /// Algorithm:
+    /// 1. Apply `date_grid(timestamp, ..., inverse=true)` to get uncovered grid points
+    /// 2. Group by labels and aggregate using `array_intersect_agg`
+    /// 3. Unnest the intersection result to get absent grid points
+    /// 4. Emit value=1.0 for each absent grid point
     async fn plan_log_range_absent_aggregation(
         &self,
-        _agg: crate::logql::metric::RangeAggregation,
+        agg: crate::logql::metric::RangeAggregation,
     ) -> Result<DataFrame> {
-        // FIXME: Placeholder implementation uses incorrect logic
-        // Current inverse mode approach:
-        //   - date_grid(inverse=true) emits grid points each timestamp DOESN'T cover
-        //   - After grouping: count = number of timestamps that excluded this grid point
-        //   - Logic is backwards: count=0 means all timestamps cover it (NOT absent)
-        //
-        // Correct algorithm needed:
-        //   1. Generate complete grid (all timestamps from start to end by step)
-        //   2. Left join with actual log timestamps
-        //   3. Where join produces NULL → that grid point is absent
-        //   4. Emit value=1.0 for those absent points
-        Err(QueryError::NotImplemented(
-            "absent_over_time requires a different algorithm - current inverse mode is incorrect".to_string(),
-        ))
+        use datafusion::{arrow::datatypes::IntervalMonthDayNano, logical_expr::AggregateUDF, prelude::*};
+
+        // 1. Calculate time parameters (same as other range aggregations)
+        let offset_duration = agg.range_expr.offset.unwrap_or(TimeDelta::zero());
+        let adjusted_start = self.query_ctx.start - agg.range_expr.range - offset_duration;
+        let adjusted_end = self.query_ctx.end - offset_duration;
+
+        // 2. Plan inner log query
+        let mut df = self.plan_log(agg.range_expr.log_expr, adjusted_start, adjusted_end).await?;
+
+        // 3. Check if no logs exist - return empty per Prometheus semantics
+        if df.clone().count().await? == 0 {
+            return Ok(df.limit(0, Some(0))?);
+        }
+
+        // 4. Build date_grid UDF arguments (same as other range aggregations)
+        let start_micros = self.query_ctx.start.timestamp_micros();
+        let end_micros = self.query_ctx.end.timestamp_micros();
+        let step_micros = self
+            .query_ctx
+            .step
+            .ok_or(QueryError::Config("Step parameter is required".to_string()))?
+            .num_microseconds()
+            .ok_or(QueryError::Config("Step too large".to_string()))?;
+        let range_nanos = agg
+            .range_expr
+            .range
+            .num_nanoseconds()
+            .ok_or(QueryError::Config("Range too large".to_string()))?;
+        let offset_nanos = offset_duration
+            .num_nanoseconds()
+            .ok_or(QueryError::Config("Offset too large".to_string()))?;
+
+        let start_arg = lit(ScalarValue::TimestampMicrosecond(Some(start_micros), None));
+        let end_arg = lit(ScalarValue::TimestampMicrosecond(Some(end_micros), None));
+        let step_arg = lit(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+            0,
+            0,
+            step_micros * 1000,
+        ))));
+        let range_arg = lit(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+            0,
+            0,
+            range_nanos,
+        ))));
+        let offset_arg = lit(ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(
+            0,
+            0,
+            offset_nanos,
+        ))));
+
+        // 5. Apply date_grid UDF with inverse=true
+        let date_grid_udf = ScalarUDF::from(super::udf::DateGrid::new());
+        let date_grid_args = vec![
+            col("timestamp"),
+            start_arg,
+            end_arg,
+            step_arg,
+            range_arg,
+            offset_arg,
+            lit(true), // inverse=true - returns grid points NOT covered
+        ];
+        df = df.with_column("inverse_grid_timestamps", date_grid_udf.call(date_grid_args))?;
+
+        // 6. Build label grouping expressions (same pattern as other range aggregations)
+        let mut grouping_exprs = Vec::new();
+        grouping_exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
+        grouping_exprs.push(array_to_string(map_keys(col("attributes")), lit("|||")).alias(COL_ATTR_KEYS));
+        grouping_exprs.push(array_to_string(map_values(col("attributes")), lit("|||")).alias(COL_ATTR_VALS));
+
+        // 7. Aggregate using array_intersect_agg UDAF
+        // This finds grid points present in ALL inverse arrays (= absent points)
+        let array_intersect_udaf = AggregateUDF::from(super::udaf::ArrayIntersectAgg::new());
+        df = df.aggregate(
+            grouping_exprs,
+            vec![
+                array_intersect_udaf
+                    .call(vec![col("inverse_grid_timestamps")])
+                    .alias("absent_timestamps"),
+                last_value(col("attributes"), vec![]).alias("attributes"),
+            ],
+        )?;
+
+        // 8. Unnest absent_timestamps to get one row per absent grid point
+        df = df.unnest_columns(&["absent_timestamps"])?;
+        df = df.with_column("timestamp", col("absent_timestamps"))?;
+
+        // 9. Add value=1.0 for all absent points
+        df = df.with_column("value", lit(1.0))?;
+
+        // 10. Select final output columns (match other range aggregations)
+        let mut select_exprs = vec![col("timestamp"), col("value")];
+        select_exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
+        select_exprs.push(col("attributes"));
+
+        Ok(df.select(select_exprs)?)
     }
 
     /// Plans a log range aggregation using `date_grid` UDF + standard aggregations.
@@ -486,7 +567,15 @@ impl DataFusionPlanner {
 
         // 3. Apply date_grid UDF to generate grid timestamps for each row
         let date_grid_udf = ScalarUDF::from(super::udf::DateGrid::new());
-        let date_grid_args = vec![col("timestamp"), start_arg, end_arg, step_arg, range_arg, offset_arg];
+        let date_grid_args = vec![
+            col("timestamp"),
+            start_arg,
+            end_arg,
+            step_arg,
+            range_arg,
+            offset_arg,
+            lit(false),
+        ];
         df = df.with_column("_grid_timestamps", date_grid_udf.call(date_grid_args))?;
 
         // 4. Unnest grid timestamps to expand rows

@@ -301,7 +301,7 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
     ))
 }
 
-/// UDF: `date_grid(timestamp, start, end, step, range, offset)` - calculate step timestamps of
+/// UDF: `date_grid(timestamp, start, end, step, range, offset, inverse)` - calculate step timestamps of
 /// aligning grid
 ///
 /// # Arguments
@@ -311,27 +311,42 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
 /// - `step`: Step between grid points
 /// - `range`: Range window size as interval
 /// - `offset`: Offset for the range window as interval
+/// - `inverse`: Boolean - if true, returns grid points NOT covered by the timestamp
 ///
 /// # References
 /// - [Loki Metric Query](https://grafana.com/blog/how-to-run-faster-loki-metric-queries-with-more-accurate-results/)
 ///
 /// # Returns
-/// A new array with the date bins containing the timestamp point
+/// A new array with the date bins containing (or not containing, if inverse=true) the timestamp point
 ///
 /// # Example
 /// ```sql
 /// SELECT timestamp FROM t;
 /// -- TIMESTAMP '2025-01-02 00:10:30'
 /// -- TIMESTAMP '2025-01-02 00:13:59'
+/// -- Normal mode (inverse=false): returns grid points covered by timestamp
 /// SELECT date_grid(
 ///     timestamp,
 ///     TIMESTAMP '2025-01-02 00:00:00',
 ///     TIMESTAMP '2025-01-03 00:00:00',
 ///     INTERVAL '1 minute',
 ///     INTERVAL '2 minute',
-///     INTERVAL '10 seconds'
+///     INTERVAL '10 seconds',
+///     false
 /// ) FROM logs;
-/// -- [TIMESTAMP '2025-01-02 00:11:00', '2025-01-02 00:11:01', ..., '2025-01-03 00:00:00']
+/// -- [TIMESTAMP '2025-01-02 00:11:00', '2025-01-02 00:12:00']
+///
+/// -- Inverse mode (inverse=true): returns grid points NOT covered by timestamp
+/// SELECT date_grid(
+///     timestamp,
+///     TIMESTAMP '2025-01-02 00:00:00',
+///     TIMESTAMP '2025-01-03 00:05:00',
+///     INTERVAL '1 minute',
+///     INTERVAL '2 minute',
+///     INTERVAL '10 seconds',
+///     true
+/// ) FROM logs;
+/// -- [TIMESTAMP '2025-01-02 00:00:00', '2025-01-02 00:01:00', ..., '2025-01-02 00:10:00', '2025-01-02 00:13:00', ...]
 /// ```
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DateGrid {
@@ -348,7 +363,7 @@ impl DateGrid {
     /// Creates a new `Grid` UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(6, Volatility::Immutable),
+            signature: Signature::any(7, Volatility::Immutable),
         }
     }
 
@@ -391,8 +406,8 @@ impl ScalarUDFImpl for DateGrid {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.len() != 6 {
-            return plan_err!("date_grid requires 6 arguments");
+        if arg_types.len() != 7 {
+            return plan_err!("date_grid requires 7 arguments");
         }
         Ok(DataType::List(arg_types[0].clone().into_nullable_field_ref()))
     }
@@ -408,8 +423,8 @@ impl ScalarUDFImpl for DateGrid {
         };
 
         // Validate argument count
-        if args.args.len() != 6 {
-            return plan_err!("date_grid requires 6 arguments");
+        if args.args.len() != 7 {
+            return plan_err!("date_grid requires 7 arguments");
         }
 
         // Extract arguments
@@ -439,6 +454,12 @@ impl ScalarUDFImpl for DateGrid {
         let step_micros = Self::extract_interval_micros(&args.args[3], "step")?;
         let range_micros = Self::extract_interval_micros(&args.args[4], "range")?;
         let offset_micros = Self::extract_interval_micros(&args.args[5], "offset")?;
+
+        // Extract inverse parameter
+        let inverse = match &args.args[6] {
+            ColumnarValue::Scalar(ScalarValue::Boolean(Some(val))) => *val,
+            _ => return plan_err!("Seventh argument (inverse) must be a Boolean scalar"),
+        };
 
         // Validate step is positive
         if step_micros <= 0 {
@@ -471,11 +492,17 @@ impl ScalarUDFImpl for DateGrid {
                 let lower_grid = t + offset_micros;
                 let upper_grid = t + upper_bound_micros;
 
-                // Binary search for first grid point >= lower_grid
-                let start_idx = grid.partition_point(|&g| g < lower_grid);
-
-                // Collect all matching grid points within the range
-                let matches: Vec<i64> = grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect();
+                // Collect matching grid points based on inverse parameter
+                let matches: Vec<i64> = if inverse {
+                    // Inverse mode: return grid points NOT in the coverage window
+                    grid.iter().copied().filter(|&g| g < lower_grid || g > upper_grid).collect()
+                } else {
+                    // Normal mode: return grid points in the coverage window
+                    // Binary search for first grid point >= lower_grid
+                    let start_idx = grid.partition_point(|&g| g < lower_grid);
+                    // Collect all matching grid points within the range
+                    grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect()
+                };
 
                 list_builder.push(matches);
             }
@@ -623,6 +650,7 @@ mod tests {
     /// - `step`: Step interval between grid points
     /// - `range`: Range window size
     /// - `offset`: Range window offset
+    /// - `inverse`: If true, returns grid points NOT covered by timestamps
     ///
     /// # Returns
     /// `Vec` of `Vec<i64>` where each inner vec is the grid timestamps for one input timestamp
@@ -633,6 +661,7 @@ mod tests {
         step: ScalarValue,
         range: ScalarValue,
         offset: ScalarValue,
+        inverse: bool,
     ) -> Result<Vec<Vec<i64>>> {
         let udf = DateGrid::new();
 
@@ -642,6 +671,7 @@ mod tests {
         let step_arg = ColumnarValue::Scalar(step);
         let range_arg = ColumnarValue::Scalar(range);
         let offset_arg = ColumnarValue::Scalar(offset);
+        let inverse_arg = ColumnarValue::Scalar(ScalarValue::Boolean(Some(inverse)));
 
         let return_field = Arc::new(Field::new(
             "item",
@@ -684,10 +714,19 @@ mod tests {
                 DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::MonthDayNano),
                 false,
             )),
+            Arc::new(Field::new("inverse", DataType::Boolean, false)),
         ];
 
         let args = ScalarFunctionArgs {
-            args: vec![timestamp_arg, start_arg, end_arg, step_arg, range_arg, offset_arg],
+            args: vec![
+                timestamp_arg,
+                start_arg,
+                end_arg,
+                step_arg,
+                range_arg,
+                offset_arg,
+                inverse_arg,
+            ],
             number_rows: timestamps.len(),
             return_field,
             arg_fields,
@@ -812,7 +851,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -839,7 +878,7 @@ mod tests {
         let range = create_interval_micros(180_000_000); // 3 minutes
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 4);
@@ -869,7 +908,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(30_000_000); // 30 seconds
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -896,7 +935,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(-30_000_000); // -30 seconds
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -923,7 +962,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 0); // Empty array
@@ -949,7 +988,7 @@ mod tests {
         let range = create_interval_micros(120_000_000); // 2 minutes
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 2);
@@ -977,7 +1016,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 2);
@@ -1004,7 +1043,7 @@ mod tests {
         let range = create_interval_micros(300_000_000); // 5 minutes
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 3);
 
@@ -1042,7 +1081,7 @@ mod tests {
         let range = create_interval_micros(100_000); // 100ms
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1066,7 +1105,7 @@ mod tests {
         let range = create_interval_micros(10_000_000); // 10 seconds
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 11); // 08:20:00 through 08:20:10 (inclusive)
@@ -1096,7 +1135,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute (same as step)
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1123,7 +1162,7 @@ mod tests {
         let range = create_interval_micros(0); // zero range
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1153,7 +1192,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute (less than step)
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 0); // No matches
@@ -1180,7 +1219,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute (less than step)
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1208,7 +1247,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(-60_000_000); // -1 minute
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1218,7 +1257,7 @@ mod tests {
     // Error cases
 
     #[test]
-    #[should_panic(expected = "requires 6 arguments")]
+    #[should_panic(expected = "requires 7 arguments")]
     fn test_date_grid_wrong_argument_count() {
         // Test error handling: wrong number of arguments
         // Should panic with message "date_grid requires 6 arguments"
@@ -1285,7 +1324,7 @@ mod tests {
         let offset = create_interval_micros(0);
 
         // Should panic
-        let _result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let _result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
     }
 
     #[test]
@@ -1307,6 +1346,195 @@ mod tests {
         let offset = create_interval_micros(0);
 
         // Should panic
-        let _result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let _result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
+    }
+
+    // Inverse mode tests
+
+    #[test]
+    fn test_date_grid_inverse_basic() {
+        // Test inverse mode: returns grid points NOT covered by timestamp
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03, 00:04, 00:05 (1-minute steps) = 6 points
+        // Timestamp: 00:00:30
+        // Range: 1 minute, Offset: 0
+        // inverse: true
+        //
+        // Normal mode matches: 00:01:00 (in [00:00:30, 00:01:30])
+        // Inverse mode: ALL grid points EXCEPT 00:01:00
+        // Expected: [00:00:00, 00:02:00, 00:03:00, 00:04:00, 00:05:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:30"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:05:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 5); // 5 uncovered grid points
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:02:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:03:00"));
+        assert_eq!(result[0][3], timestamp_micros("2025-01-02 00:04:00"));
+        assert_eq!(result[0][4], timestamp_micros("2025-01-02 00:05:00"));
+    }
+
+    #[test]
+    fn test_date_grid_inverse_full_coverage() {
+        // Test inverse mode with full coverage: should return empty
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps) = 4 points
+        // Timestamp: 00:00:00
+        // Range: 10 minutes (covers entire grid), Offset: 0
+        // inverse: true
+        //
+        // Normal mode matches: ALL grid points [00:00:00, 00:01:00, 00:02:00, 00:03:00]
+        // Inverse mode: ALL grid points EXCEPT those covered
+        // Expected: [] (empty - all points are covered)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(600_000_000); // 10 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 0); // Empty - all grid points covered
+    }
+
+    #[test]
+    fn test_date_grid_inverse_no_coverage() {
+        // Test inverse mode with no coverage: should return all grid points
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps) = 4 points
+        // Timestamp: 00:10:00 (far after grid end)
+        // Range: 1 minute, Offset: 0
+        // inverse: true
+        //
+        // Normal mode matches: [] (no coverage)
+        // Inverse mode: ALL grid points (none are covered)
+        // Expected: [00:00:00, 00:01:00, 00:02:00, 00:03:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:10:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 4); // All 4 grid points uncovered
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:01:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:02:00"));
+        assert_eq!(result[0][3], timestamp_micros("2025-01-02 00:03:00"));
+    }
+
+    #[test]
+    fn test_date_grid_inverse_partial_coverage() {
+        // Test inverse mode with partial coverage
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03, 00:04, 00:05 (1-minute steps) = 6 points
+        // Timestamp: 00:00:00
+        // Range: 3 minutes, Offset: 0
+        // inverse: true
+        //
+        // Normal mode matches: [00:00:00, 00:01:00, 00:02:00, 00:03:00] (in [00:00:00, 00:03:00])
+        // Inverse mode: Grid points NOT in [00:00:00, 00:03:00]
+        // Expected: [00:04:00, 00:05:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:05:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(180_000_000); // 3 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2); // 2 uncovered grid points
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:04:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:05:00"));
+    }
+
+    #[test]
+    fn test_date_grid_inverse_with_offset() {
+        // Test inverse mode with offset parameter
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps) = 4 points
+        // Timestamp: 00:00:00
+        // Range: 1 minute, Offset: 30 seconds
+        // inverse: true
+        //
+        // Normal mode:
+        //   - Lower: 00:00:00 + 30s = 00:00:30
+        //   - Upper: 00:00:30 + 1min = 00:01:30
+        //   - Matches: 00:01:00
+        // Inverse mode: All grid points EXCEPT 00:01:00
+        // Expected: [00:00:00, 00:02:00, 00:03:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(30_000_000); // 30 seconds
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 3); // 3 uncovered grid points
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:02:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:03:00"));
+    }
+
+    #[test]
+    fn test_date_grid_inverse_batch_processing() {
+        // Test inverse mode with multiple timestamps
+        //
+        // Grid: 00:00, 00:05, 00:10, 00:15 (5-minute steps) = 4 points
+        // Timestamps: [00:01:00, 00:07:00]
+        // Range: 5 minutes, Offset: 0
+        // inverse: true
+        //
+        // For t1 = 00:01:00:
+        //   - Normal mode matches: 00:05:00
+        //   - Inverse: [00:00:00, 00:10:00, 00:15:00]
+        // For t2 = 00:07:00:
+        //   - Normal mode matches: 00:10:00
+        //   - Inverse: [00:00:00, 00:05:00, 00:15:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:01:00", "2025-01-02 00:07:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:15:00");
+        let step = create_interval_micros(300_000_000); // 5 minutes
+        let range = create_interval_micros(300_000_000); // 5 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 2);
+
+        // First timestamp: inverse excludes 00:05:00
+        assert_eq!(result[0].len(), 3);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:10:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:15:00"));
+
+        // Second timestamp: inverse excludes 00:10:00
+        assert_eq!(result[1].len(), 3);
+        assert_eq!(result[1][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[1][1], timestamp_micros("2025-01-02 00:05:00"));
+        assert_eq!(result[1][2], timestamp_micros("2025-01-02 00:15:00"));
     }
 }
