@@ -12,16 +12,14 @@ use crate::{
     s3_storage::{S3Storage, S3StorageConfig},
 };
 
+// TODO(med): Add a check for the absence of errors in the logs. It won't be easy to do this, because when subscribing to errors and parallel tests, we catch errors from all tests and it's difficult to account for errors only in a specific test.
+
 /// `TestConcurrentWorkers` verifies that multiple workers can process tasks from the same job
 /// concurrently
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_concurrent_workers_s3() -> Result<(), Box<dyn std::error::Error>> {
-    let log_guard = super::common::logging::init_test_logging();
-
     tracing::info!("Running concurrent workers test ({})", "s3");
     run_concurrent_workers_test(false).await?;
-
-    log_guard.assert_no_errors();
 
     Ok(())
 }
@@ -30,12 +28,8 @@ async fn test_concurrent_workers_s3() -> Result<(), Box<dyn std::error::Error>> 
 /// concurrently
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_concurrent_workers_cached() -> Result<(), Box<dyn std::error::Error>> {
-    let log_guard = super::common::logging::init_test_logging();
-
     tracing::info!("Running concurrent workers test ({})", "cached");
     run_concurrent_workers_test(true).await?;
-
-    log_guard.assert_no_errors();
 
     Ok(())
 }

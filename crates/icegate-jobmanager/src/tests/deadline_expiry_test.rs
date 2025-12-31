@@ -22,8 +22,6 @@ use crate::{
 /// after its deadline expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
-
-
     let expected_attempts: u32 = 4;
 
     // 1. Start MinIO

@@ -21,8 +21,6 @@ use crate::{
 /// `TestSimpleJobExecution` verifies basic job execution with one task
 #[tokio::test]
 async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
-
-
     let max_iterations = 1u64;
 
     // 1. Start MinIO
@@ -125,8 +123,6 @@ async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
 /// `TestMultiTaskSequence` verifies a job with sequential tasks
 #[tokio::test]
 async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
-
-
     let max_iterations = 1u64;
 
     // 1. Start MinIO

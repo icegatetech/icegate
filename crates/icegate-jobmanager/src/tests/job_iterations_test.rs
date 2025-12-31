@@ -21,8 +21,6 @@ use crate::{
 /// `TestJobIterations` verifies that a job can complete and restart for multiple iterations
 #[tokio::test]
 async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
-
-
     // 1. Start MinIO
     let minio_env = MinIOEnv::new().await?;
 

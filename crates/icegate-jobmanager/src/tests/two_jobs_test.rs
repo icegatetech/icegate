@@ -21,8 +21,6 @@ use crate::{
 /// Runs two jobs in parallel with two workers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
-
-
     let tasks_per_iter = 3usize;
     let max_iterations = 3u64;
 
