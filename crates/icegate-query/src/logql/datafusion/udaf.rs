@@ -1022,8 +1022,8 @@ impl AggregateUDFImpl for ArrayIntersectAgg {
 /// Accumulator for `array_intersect_agg`.
 #[derive(Debug)]
 struct ArrayIntersectAccumulator {
-    /// Current intersection result (None = first array not yet seen).
-    current_intersection: Option<Arc<TimestampMicrosecondArray>>,
+    /// Current intersection result as raw i64 timestamps (None = first array not yet seen).
+    current_intersection: Option<Vec<i64>>,
 }
 
 impl ArrayIntersectAccumulator {
@@ -1033,23 +1033,24 @@ impl ArrayIntersectAccumulator {
         }
     }
 
-    /// Computes intersection using two-pointer merge algorithm.
-    /// Both arrays are assumed to be sorted (guaranteed by `date_grid` UDF output).
-    fn intersect_arrays(
-        arr1: &Arc<TimestampMicrosecondArray>,
-        arr2: &Arc<TimestampMicrosecondArray>,
-    ) -> Arc<TimestampMicrosecondArray> {
-        let mut result = Vec::new();
+    /// Intersect a sorted timestamp array with a sorted Vec using two-pointer algorithm.
+    /// Extracts values from the array on-demand, avoiding intermediate Vec allocation.
+    /// Both inputs are assumed to be sorted (guaranteed by `date_grid` UDF output).
+    fn intersect_ts_array_with_vec(
+        ts_array: &TimestampMicrosecondArray,
+        vec: &[i64],
+    ) -> Vec<i64> {
+        let mut result = Vec::with_capacity(ts_array.len().min(vec.len()));
         let mut i = 0;
         let mut j = 0;
 
-        while i < arr1.len() && j < arr2.len() {
-            let val1 = arr1.value(i);
-            let val2 = arr2.value(j);
+        while i < ts_array.len() && j < vec.len() {
+            let ts_val = ts_array.value(i);
+            let vec_val = vec[j];
 
-            match val1.cmp(&val2) {
+            match ts_val.cmp(&vec_val) {
                 std::cmp::Ordering::Equal => {
-                    result.push(val1);
+                    result.push(ts_val);
                     i += 1;
                     j += 1;
                 }
@@ -1058,27 +1059,26 @@ impl ArrayIntersectAccumulator {
             }
         }
 
-        Arc::new(TimestampMicrosecondArray::from(result))
+        result
     }
 
-    /// Helper to create a `ScalarValue::List` from an optional timestamp array.
-    fn array_to_list_scalar(array: Option<&Arc<TimestampMicrosecondArray>>) -> ScalarValue {
+    /// Convert a Vec of timestamps to a List scalar value.
+    fn vec_to_list_scalar(vec: Option<&Vec<i64>>) -> ScalarValue {
         let field = Arc::new(Field::new(
             "item",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             true,
         ));
 
-        if let Some(arr) = array {
-            let offsets = OffsetBuffer::from_lengths([arr.len()]);
-            let list_array = ListArray::new(field, offsets, arr.clone() as ArrayRef, None);
-            ScalarValue::List(Arc::new(list_array))
+        let ts_array = if let Some(v) = vec {
+            Arc::new(TimestampMicrosecondArray::from(v.clone())) as ArrayRef
         } else {
-            let empty_array = Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()));
-            let offsets = OffsetBuffer::from_lengths([0]);
-            let list_array = ListArray::new(field, offsets, empty_array, None);
-            ScalarValue::List(Arc::new(list_array))
-        }
+            Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new())) as ArrayRef
+        };
+
+        let offsets = OffsetBuffer::from_lengths([ts_array.len()]);
+        let list_array = ListArray::new(field, offsets, ts_array, None);
+        ScalarValue::List(Arc::new(list_array))
     }
 
     /// Helper to process a `ListArray` of timestamp arrays and update the intersection.
@@ -1097,12 +1097,18 @@ impl ArrayIntersectAccumulator {
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or_else(|| DataFusionError::Plan("Expected TimestampMicrosecondArray".to_string()))?;
 
-            let new_array = Arc::new(ts_array.clone());
-
             // Update intersection
             self.current_intersection = Some(match &self.current_intersection {
-                None => new_array, // First array
-                Some(current) => Self::intersect_arrays(current, &new_array),
+                None => {
+                    // First array: convert to Vec
+                    (0..ts_array.len())
+                        .map(|i| ts_array.value(i))
+                        .collect()
+                }
+                Some(current) => {
+                    // Subsequent arrays: intersect directly without creating intermediate Vec
+                    Self::intersect_ts_array_with_vec(ts_array, current)
+                }
             });
         }
 
@@ -1127,7 +1133,7 @@ impl Accumulator for ArrayIntersectAccumulator {
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
         // Return the final intersection as a List scalar
-        Ok(Self::array_to_list_scalar(self.current_intersection.as_ref()))
+        Ok(Self::vec_to_list_scalar(self.current_intersection.as_ref()))
     }
 
     fn size(&self) -> usize {
@@ -1140,7 +1146,7 @@ impl Accumulator for ArrayIntersectAccumulator {
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
         // Serialize current intersection state
-        let state_value = Self::array_to_list_scalar(self.current_intersection.as_ref());
+        let state_value = Self::vec_to_list_scalar(self.current_intersection.as_ref());
         Ok(vec![state_value])
     }
 
