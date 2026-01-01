@@ -81,6 +81,11 @@ impl JobsManager {
         job_registry: Arc<JobRegistry>,
         metrics: Metrics,
     ) -> Result<Self, Error> {
+        if config.worker_count == 0 {
+            error!("JobsManager initialization requested with worker_count=0");
+            return Err(Error::Other("worker count must be at least 1".to_string()));
+        }
+
         Ok(Self {
             job_registry,
             storage,

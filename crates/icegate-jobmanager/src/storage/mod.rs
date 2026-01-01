@@ -92,8 +92,7 @@ pub trait Storage: Send + Sync {
     /// Find job metadata without loading full job
     async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta>;
 
-    /// Save job with optimistic locking. Updates job.version on success. Returns
-    /// If version mismatch.
+    /// Save job with optimistic locking. Updates job.version on success. Returns `ConcurrentModification` if version mismatch.
     async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()>;
 }
 

@@ -19,8 +19,39 @@ use crate::{
     WorkerConfig, registry::TaskExecutorFn,
 };
 
+#[test]
+fn start_returns_error_when_worker_count_is_zero() -> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
+    let storage = Arc::new(InMemoryStorage::new());
+
+    let executor: TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+    let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), ChronoDuration::seconds(1))?;
+    let mut executors = HashMap::new();
+    executors.insert(TaskCode::new("noop"), executor);
+
+    let job_def = JobDefinition::new(JobCode::new("zero_worker_job"), vec![task_def], executors, 1)?;
+    let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
+
+    let Err(_err) = JobsManager::new(
+        storage,
+        JobsManagerConfig {
+            worker_count: 0,
+            worker_config: WorkerConfig::default(),
+        },
+        job_registry,
+        Metrics::new_disabled(),
+    ) else {
+        panic!("manager creation should fail with zero workers")
+    };
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_shutdown_cancels_executor() -> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
     let storage = Arc::new(InMemoryStorage::new());
     let (started_tx, started_rx) = oneshot::channel();
     let started_tx = Arc::new(Mutex::new(Some(started_tx)));

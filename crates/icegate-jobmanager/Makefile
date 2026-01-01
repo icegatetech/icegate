@@ -1,4 +1,4 @@
-.PHONY: examples-infra-up examples-infra-down tests
+.PHONY: examples-infra-up examples-infra-down test clean clippy
 
 examples-infra-up:
 	cd ./examples && docker compose up --detach
@@ -13,4 +13,4 @@ clean:
 	cargo clean
 
 clippy:
-	cargo clippy -p icegate-jobmanager -- -D warnings
+	cargo clippy -p icegate-jobmanager --all-targets -- -D warnings

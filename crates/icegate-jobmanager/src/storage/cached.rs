@@ -90,15 +90,21 @@ impl Storage for CachedStorage {
         self.record_cache_miss("get_job");
 
         // Keep job lock while fetching to avoid get/save races.
-        let job = loop {
+        let mut job = None;
+        for _ in 0..2 {
             match self.inner.get_job_by_meta(&meta, cancel_token).await {
-                Ok(job) => break job,
+                Ok(found) => {
+                    job = Some(found);
+                    break;
+                }
                 Err(e) if e.is_conflict() => {
                     meta = self.inner.find_job_meta(job_code, cancel_token).await?;
                 }
                 Err(e) => return Err(e),
             }
-        };
+        }
+
+        let job = job.ok_or(StorageError::ConcurrentModification)?;
 
         cached_job.job = Some(job.clone());
         Ok(job)

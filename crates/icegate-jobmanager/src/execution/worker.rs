@@ -122,6 +122,7 @@ impl Worker {
         info!("Starting worker {}", self.id);
 
         let mut poll_interval = self.config.poll_interval;
+        let mut wait_duration = poll_interval;
 
         loop {
             tokio::select! {
@@ -129,28 +130,29 @@ impl Worker {
                     info!("Stopping worker {}", self.id);
                     return Ok(());
                 }
-                () = sleep(poll_interval) => {
-                    let work_done = self.process_jobs(&cancel_token).await;
-
-                    // Adaptive polling: if no work, increase interval
-                    poll_interval = if work_done {
-                        self.config.poll_interval
-                    } else {
-                        std::cmp::min(poll_interval * 2, self.config.max_poll_interval)
-                    };
-
-                    // Reduce strong concurrency between workers
-                    let jitter_ms = if self.config.poll_interval_randomization.is_zero() {
-                        self.config.poll_interval_randomization
-                    } else {
-                        #[allow(clippy::cast_possible_truncation)]
-                        Duration::from_millis(rand::rng().random_range(
-                            0..self.config.poll_interval_randomization.as_millis() as u64
-                        ))
-                    };
-                    sleep(jitter_ms + poll_interval).await;
-                }
+                () = sleep(wait_duration) => {}
             }
+
+            let work_done = self.process_jobs(&cancel_token).await;
+
+            // Adaptive polling: if no work, increase interval
+            poll_interval = if work_done {
+                self.config.poll_interval
+            } else {
+                std::cmp::min(poll_interval * 2, self.config.max_poll_interval)
+            };
+
+            // Reduce strong concurrency between workers
+            let jitter_ms = if self.config.poll_interval_randomization.is_zero() {
+                self.config.poll_interval
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                Duration::from_millis(
+                    rand::rng().random_range(0..self.config.poll_interval_randomization.as_millis() as u64),
+                )
+            };
+
+            wait_duration = jitter_ms + poll_interval;
         }
     }
 
@@ -164,7 +166,7 @@ impl Worker {
                 debug!("Job processed: {}", job_code);
                 continue;
             }
-            debug!("Job processing skiped: {}", job_code);
+            debug!("Job processing skipped: {}", job_code);
         }
 
         work_done

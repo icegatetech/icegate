@@ -18,6 +18,8 @@ use crate::{
 /// concurrently
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_concurrent_workers_s3() -> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
     tracing::info!("Running concurrent workers test ({})", "s3");
     run_concurrent_workers_test(false).await?;
 
@@ -28,6 +30,8 @@ async fn test_concurrent_workers_s3() -> Result<(), Box<dyn std::error::Error>> 
 /// concurrently
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_concurrent_workers_cached() -> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
     tracing::info!("Running concurrent workers test ({})", "cached");
     run_concurrent_workers_test(true).await?;
 

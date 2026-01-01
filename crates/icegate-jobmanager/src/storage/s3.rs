@@ -26,6 +26,7 @@ struct TaskJson {
     id: String,
     code: String,
     status: TaskStatus,
+    created_by_worker: String,
     #[serde(default)]
     timeout_ms: i64,
     #[serde(skip_serializing_if = "String::is_empty", default)]
@@ -135,10 +136,8 @@ impl S3Storage {
 
         // Check if bucket exists, create if needed
         match client.head_bucket().bucket(&config.bucket_name).send().await {
-            Ok(_) => {
-                info!("Bucket {} exists", config.bucket_name);
-            }
-            Err(_) => {
+            Ok(_) => info!("Bucket {} exists", config.bucket_name),
+            Err(aws_sdk_s3::error::SdkError::ServiceError(se)) if se.raw().status().as_u16() == 404 => {
                 client
                     .create_bucket()
                     .bucket(&config.bucket_name)
@@ -147,6 +146,7 @@ impl S3Storage {
                     .map_err(|e| Error::Other(format!("Failed to create bucket: {e}")))?;
                 info!("Created bucket {}", config.bucket_name);
             }
+            Err(e) => return Err(Error::Other(format!("Failed to check bucket: {e}"))),
         }
 
         let retrier = Retrier::new(config.retrier_config.clone());
@@ -263,6 +263,7 @@ impl S3Storage {
             code: task.code().to_string(),
             status: task.status().clone(),
             timeout_ms: task.timeout().num_milliseconds(),
+            created_by_worker: task.created_by_worker().to_string(),
             processing_by: task.processing_by_worker().to_string(),
             started_at: task.started_at(),
             completed_at: task.completed_at(),
@@ -302,7 +303,7 @@ impl S3Storage {
             TaskCode::new(json.code),
             json.status,
             json.processing_by,
-            String::new(),
+            json.created_by_worker,
             chrono::Duration::milliseconds(json.timeout_ms),
             json.started_at,
             json.completed_at,
