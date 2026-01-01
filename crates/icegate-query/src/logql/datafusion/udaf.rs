@@ -1079,10 +1079,10 @@ impl ArrayIntersectAccumulator {
 
     /// Helper to process a `ListArray` of timestamp arrays and update the intersection.
     /// Used by both `update_batch` and `merge_batch`.
-    fn process_list_array(&mut self, list_array: &ListArray, skip_empty: bool) -> Result<()> {
+    fn process_list_array(&mut self, list_array: &ListArray) -> Result<()> {
         for row_idx in 0..list_array.len() {
-            // Skip null rows, and optionally skip empty rows (for merge_batch)
-            if list_array.is_null(row_idx) || (skip_empty && list_array.value_length(row_idx) == 0) {
+            // Skip null rows
+            if list_array.is_null(row_idx) {
                 continue;
             }
 
@@ -1116,7 +1116,7 @@ impl Accumulator for ArrayIntersectAccumulator {
             .downcast_ref::<ListArray>()
             .ok_or_else(|| DataFusionError::Plan("Expected ListArray".to_string()))?;
 
-        self.process_list_array(list_array, false)
+        self.process_list_array(list_array)
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
@@ -1147,7 +1147,7 @@ impl Accumulator for ArrayIntersectAccumulator {
             .downcast_ref::<ListArray>()
             .ok_or_else(|| DataFusionError::Plan("Expected ListArray in state".to_string()))?;
 
-        self.process_list_array(list_array, true)
+        self.process_list_array(list_array)
     }
 }
 
@@ -1795,6 +1795,81 @@ mod tests {
                 assert_eq!(ts_arr.len(), 2);
                 assert_eq!(ts_arr.value(0), 200);
                 assert_eq!(ts_arr.value(1), 300);
+            }
+            _ => panic!("Expected List, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_intersect_agg_merge_empty_intersection() {
+        // Test that merging an empty intersection yields an empty result
+        let mut acc1 = ArrayIntersectAccumulator::new();
+        let mut acc2 = ArrayIntersectAccumulator::new();
+
+        let field = Arc::new(Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ));
+
+        // Acc1: intersection of [100, 200, 300] and [200, 300, 400] = [200, 300]
+        let arr1 = TimestampMicrosecondArray::from(vec![100i64, 200, 300]);
+        let list1 = ListArray::new(
+            field.clone(),
+            OffsetBuffer::from_lengths([arr1.len()]),
+            Arc::new(arr1) as ArrayRef,
+            None,
+        );
+        acc1.update_batch(&[Arc::new(list1) as ArrayRef]).unwrap();
+
+        let arr2 = TimestampMicrosecondArray::from(vec![200i64, 300, 400]);
+        let list2 = ListArray::new(
+            field.clone(),
+            OffsetBuffer::from_lengths([arr2.len()]),
+            Arc::new(arr2) as ArrayRef,
+            None,
+        );
+        acc1.update_batch(&[Arc::new(list2) as ArrayRef]).unwrap();
+
+        // Acc2: intersection of [500, 600] and [700, 800] = [] (empty)
+        let arr3 = TimestampMicrosecondArray::from(vec![500i64, 600]);
+        let list3 = ListArray::new(
+            field.clone(),
+            OffsetBuffer::from_lengths([arr3.len()]),
+            Arc::new(arr3) as ArrayRef,
+            None,
+        );
+        acc2.update_batch(&[Arc::new(list3) as ArrayRef]).unwrap();
+
+        let arr4 = TimestampMicrosecondArray::from(vec![700i64, 800]);
+        let list4 = ListArray::new(
+            field,
+            OffsetBuffer::from_lengths([arr4.len()]),
+            Arc::new(arr4) as ArrayRef,
+            None,
+        );
+        acc2.update_batch(&[Arc::new(list4) as ArrayRef]).unwrap();
+
+        // Get state from acc2 (empty intersection) and merge into acc1
+        let state = acc2.state().unwrap();
+        let state_list = match &state[0] {
+            ScalarValue::List(arr) => arr.clone(),
+            _ => panic!("Expected List state"),
+        };
+
+        acc1.merge_batch(&[state_list as ArrayRef]).unwrap();
+
+        let result = acc1.evaluate().unwrap();
+
+        match result {
+            ScalarValue::List(list_arr) => {
+                let values_array = list_arr.value(0);
+                let ts_arr = values_array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .expect("Expected TimestampMicrosecondArray");
+                // Final intersection: [200, 300] ∩ [] = []
+                assert_eq!(ts_arr.len(), 0);
             }
             _ => panic!("Expected List, got {result:?}"),
         }
