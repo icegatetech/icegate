@@ -1036,10 +1036,7 @@ impl ArrayIntersectAccumulator {
     /// Intersect a sorted timestamp array with a sorted Vec using two-pointer algorithm.
     /// Extracts values from the array on-demand, avoiding intermediate Vec allocation.
     /// Both inputs are assumed to be sorted (guaranteed by `date_grid` UDF output).
-    fn intersect_ts_array_with_vec(
-        ts_array: &TimestampMicrosecondArray,
-        vec: &[i64],
-    ) -> Vec<i64> {
+    fn intersect_ts_array_with_vec(ts_array: &TimestampMicrosecondArray, vec: &[i64]) -> Vec<i64> {
         let mut result = Vec::with_capacity(ts_array.len().min(vec.len()));
         let mut i = 0;
         let mut j = 0;
@@ -1070,11 +1067,10 @@ impl ArrayIntersectAccumulator {
             false,
         ));
 
-        let ts_array = if let Some(v) = vec {
-            Arc::new(TimestampMicrosecondArray::from(v.clone())) as ArrayRef
-        } else {
-            Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new())) as ArrayRef
-        };
+        let ts_array = vec.map_or_else(
+            || Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new())) as ArrayRef,
+            |v| Arc::new(TimestampMicrosecondArray::from(v.clone())) as ArrayRef,
+        );
 
         let offsets = OffsetBuffer::from_lengths([ts_array.len()]);
         let list_array = ListArray::new(field, offsets, ts_array, None);
@@ -1098,18 +1094,10 @@ impl ArrayIntersectAccumulator {
                 .ok_or_else(|| DataFusionError::Plan("Expected TimestampMicrosecondArray".to_string()))?;
 
             // Update intersection
-            self.current_intersection = Some(match &self.current_intersection {
-                None => {
-                    // First array: convert to Vec
-                    (0..ts_array.len())
-                        .map(|i| ts_array.value(i))
-                        .collect()
-                }
-                Some(current) => {
-                    // Subsequent arrays: intersect directly without creating intermediate Vec
-                    Self::intersect_ts_array_with_vec(ts_array, current)
-                }
-            });
+            self.current_intersection = Some(self.current_intersection.as_ref().map_or_else(
+                || (0..ts_array.len()).map(|i| ts_array.value(i)).collect(),
+                |current| Self::intersect_ts_array_with_vec(ts_array, current),
+            ));
         }
 
         Ok(())
