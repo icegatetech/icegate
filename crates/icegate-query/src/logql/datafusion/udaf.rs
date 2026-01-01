@@ -1012,7 +1012,7 @@ impl AggregateUDFImpl for ArrayIntersectAgg {
             DataType::List(Arc::new(Field::new(
                 "item",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
-                true,
+                false,
             ))),
             true,
         ))])
@@ -1067,7 +1067,7 @@ impl ArrayIntersectAccumulator {
         let field = Arc::new(Field::new(
             "item",
             DataType::Timestamp(TimeUnit::Microsecond, None),
-            true,
+            false,
         ));
 
         let ts_array = if let Some(v) = vec {
