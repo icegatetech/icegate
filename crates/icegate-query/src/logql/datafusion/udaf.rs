@@ -1141,7 +1141,7 @@ impl Accumulator for ArrayIntersectAccumulator {
             + self
                 .current_intersection
                 .as_ref()
-                .map_or(0, |v| std::mem::size_of::<i64>() * v.len())
+                .map_or(0, |v| std::mem::size_of::<i64>() * v.capacity())
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
