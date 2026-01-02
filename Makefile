@@ -19,10 +19,10 @@ fmt-fix:
 	cargo +nightly fmt
 
 clippy:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 clippy-fix:
-	cargo clippy --all-targets --fix --allow-dirty
+	cargo clippy --workspace --all-targets --fix --allow-dirty
 
 audit:
 	cargo audit
