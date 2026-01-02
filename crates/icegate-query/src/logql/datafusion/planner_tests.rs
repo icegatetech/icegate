@@ -745,18 +745,23 @@ async fn test_time_grid_gap_filling() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // UDAF-based implementation: count_over_time UDAF handles gap filling
-    // internally by always returning all grid points (with zero counts for
-    // gaps) No Join needed - the UDAF generates a complete time grid
+    // UDF-based implementation: date_grid UDF generates matching grid points,
+    // then we unnest and aggregate with standard count function.
+    // Gap filling happens naturally because non-matching grid points aren't
+    // in the result (sparse representation).
     assert!(
         plan_contains_aggregate(plan),
-        "Plan should contain aggregate for count_over_time"
+        "Plan should contain aggregate for counting"
     );
 
-    // Check plan contains count_over_time UDAF (name may appear in various forms)
+    // Check plan contains date_grid UDF and count aggregation
     let plan_str = format!("{plan:?}").to_lowercase();
     assert!(
-        plan_str.contains("count_over_time") || plan_str.contains("countovertime"),
-        "Plan should reference count_over_time UDAF: {plan_str}"
+        plan_str.contains("date_grid") || plan_str.contains("dategrid"),
+        "Plan should reference date_grid UDF: {plan_str}"
+    );
+    assert!(
+        plan_str.contains("count"),
+        "Plan should reference count aggregation: {plan_str}"
     );
 }
