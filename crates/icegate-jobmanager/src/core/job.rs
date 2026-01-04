@@ -75,8 +75,8 @@ impl JobStatus {
             Ok(())
         } else {
             Err(JobError::InvalidStatusTransition {
-                from: self.to_string(),
-                to: new.to_string(),
+                from: self.clone(),
+                to: new.clone(),
             })
         }
     }

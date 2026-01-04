@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{infra::retrier::RetryError, storage::StorageError};
+use crate::{JobStatus, infra::retrier::RetryError, storage::StorageError};
 
 /// Public error type for jobmanager operations.
 #[derive(Error, Debug)]
@@ -50,7 +50,7 @@ pub(crate) enum JobError {
     TaskWorkerMismatch,
 
     #[error("invalid job status transition from {from} to {to}")]
-    InvalidStatusTransition { from: String, to: String },
+    InvalidStatusTransition { from: JobStatus, to: JobStatus },
 
     #[error("{0}")]
     Other(String),

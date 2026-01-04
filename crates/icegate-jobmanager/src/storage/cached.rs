@@ -98,6 +98,7 @@ impl Storage for CachedStorage {
                     break;
                 }
                 Err(e) if e.is_conflict() => {
+                    debug!("Retry find job {job_code} meta in storage");
                     meta = self.inner.find_job_meta(job_code, cancel_token).await?;
                 }
                 Err(e) => return Err(e),
