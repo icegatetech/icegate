@@ -1,2 +1,5 @@
 [advisories]
-ignore = ["RUSTSEC-2024-0436"]  # paste
+ignore = [
+    "RUSTSEC-2024-0436", # paste` is unmaintained; consider using an alternative
+    "RUSTSEC-2026-0001",  # rkyv, Potential Undefined Behaviors in Arc<T>/Rc<T> impls of from_value on OOM
+]
