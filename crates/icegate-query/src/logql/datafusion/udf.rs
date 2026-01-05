@@ -1885,7 +1885,6 @@ impl ScalarUDFImpl for ParseNumeric {
         Ok(DataType::Float64)
     }
 
-    #[allow(clippy::option_if_let_else)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.is_empty() {
             return exec_err!("parse_numeric requires one argument");
@@ -1895,16 +1894,9 @@ impl ScalarUDFImpl for ParseNumeric {
 
         match value {
             ColumnarValue::Scalar(scalar) => {
-                let result = if let Some(s) = scalar.to_string().strip_prefix("Utf8(") {
-                    if let Some(s) = s.strip_suffix(')') {
-                        // Remove quotes if present
-                        let s = s.trim_matches('"');
-                        s.parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                let result = match scalar {
+                    datafusion::scalar::ScalarValue::Utf8(Some(s)) => s.trim().parse::<f64>().ok(),
+                    _ => None,
                 };
 
                 Ok(ColumnarValue::Scalar(result.map_or_else(
@@ -2006,7 +1998,6 @@ impl ScalarUDFImpl for ParseBytes {
         Ok(DataType::Float64)
     }
 
-    #[allow(clippy::option_if_let_else)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.is_empty() {
             return exec_err!("parse_bytes requires one argument");
@@ -2016,15 +2007,9 @@ impl ScalarUDFImpl for ParseBytes {
 
         match value {
             ColumnarValue::Scalar(scalar) => {
-                let result = if let Some(s) = scalar.to_string().strip_prefix("Utf8(") {
-                    if let Some(s) = s.strip_suffix(')') {
-                        let s = s.trim_matches('"');
-                        Self::parse_byte_string(s)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                let result = match scalar {
+                    datafusion::scalar::ScalarValue::Utf8(Some(s)) => Self::parse_byte_string(s.trim()),
+                    _ => None,
                 };
 
                 Ok(ColumnarValue::Scalar(result.map_or_else(
@@ -2176,7 +2161,6 @@ impl ScalarUDFImpl for ParseDuration {
         Ok(DataType::Float64)
     }
 
-    #[allow(clippy::option_if_let_else)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.len() != 2 {
             return exec_err!("parse_duration requires two arguments");
@@ -2194,19 +2178,13 @@ impl ScalarUDFImpl for ParseDuration {
 
         match value {
             ColumnarValue::Scalar(scalar) => {
-                let result = if let Some(s) = scalar.to_string().strip_prefix("Utf8(") {
-                    if let Some(s) = s.strip_suffix(')') {
-                        let s = s.trim_matches('"');
-                        Self::parse_duration_string(s).map(
-                            |nanos| {
-                                if as_secs { nanos / 1_000_000_000.0 } else { nanos }
-                            },
-                        )
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                let result = match scalar {
+                    datafusion::scalar::ScalarValue::Utf8(Some(s)) => Self::parse_duration_string(s.trim()).map(
+                        |nanos| {
+                            if as_secs { nanos / 1_000_000_000.0 } else { nanos }
+                        },
+                    ),
+                    _ => None,
                 };
 
                 Ok(ColumnarValue::Scalar(result.map_or_else(
