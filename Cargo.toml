@@ -6,6 +6,7 @@ members = [
     "crates/icegate-query",
     "crates/icegate-ingest",
     "crates/icegate-maintain",
+    "crates/icegate-jobmanager",
 ]
 
 [workspace.package]
@@ -19,21 +20,21 @@ repository = "https://github.com/icegatetech/icegate"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
-unused_imports = "warn"
-unused_variables = "warn"
+unused_imports = "deny"
+unused_variables = "deny"
 dead_code = "deny"
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-perf = { level = "warn", priority = -1 }
-cargo = { level = "warn", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
 correctness = { level = "deny", priority = -1 }
-dbg_macro = "warn"
-todo = "warn"
-unimplemented = "warn"
-print_stdout = "warn"
-print_stderr = "warn"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 must_use_candidate = "allow"
@@ -41,6 +42,7 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+single_match_else = "allow"
 
 [workspace.dependencies]
 # Internal crates
@@ -56,7 +58,7 @@ object_store = { version = "0.12", features = ["aws"] }
 thiserror = "2"
 
 # Utilities
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1.19", features = ["v7", "v4", "serde"] }
 
 # ANTLR parser
 antlr4rust = "0.5"
@@ -121,6 +123,6 @@ reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
 testcontainers = { version = "0.26", features = ["http_wait"] }
 testcontainers-modules = { version = "0.14", features = ["minio"] }
-aws-config = "1"
-aws-sdk-s3 = "1"
+aws-config = "1.1"
+aws-sdk-s3 = "1.11"
 criterion = "0.5"
