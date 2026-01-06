@@ -331,9 +331,9 @@ See Section 4 for the actual UDAF-based implementation.
 
 ## 4. Metric Queries and Range Aggregations
 
-> **Implementation Status: ⚠️ Partial**
+> **Implementation Status: ✅ Implemented**
 >
-> Log-range aggregations (`count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`, `absent_over_time`) are fully implemented using custom UDAFs. Unwrap-based aggregations are not implemented.
+> Log-range aggregations (`count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`, `absent_over_time`) and unwrap-based aggregations (`sum_over_time`, `avg_over_time`, `min_over_time`, `max_over_time`, `stddev_over_time`, `stdvar_over_time`, `quantile_over_time`, `first_over_time`, `last_over_time`, `rate_counter`) are fully implemented. `rate_counter` includes Prometheus-compatible counter reset detection.
 
 Metric queries compute aggregated metrics over time ranges, converting log streams into time series data.
 
@@ -436,52 +436,70 @@ async fn plan_log_range_aggregation(&self, agg: RangeAggregation) -> Result<Data
 
 ### 4.2. Unwrap Expressions
 
-> **Implementation Status: ❌ Not Implemented**
+> **Implementation Status: ✅ Implemented**
 >
-> Unwrap-based aggregations return `NotImplemented` error.
+> All 10 unwrap aggregations are implemented with support for numeric extraction and conversion functions.
 
-Unwrap expressions are designed to extract numeric values from labels for use in range aggregations.
+Unwrap expressions extract numeric values from labels for use in range aggregations.
 
-**Not Implemented Functions:**
-- `sum_over_time`, `avg_over_time`, `min_over_time`, `max_over_time`
-- `stddev_over_time`, `stdvar_over_time`, `quantile_over_time`
-- `first_over_time`, `last_over_time`, `rate_counter`
+**Implemented Functions:**
 
-**Current Code:**
-```rust
-fn plan_unwrap_range_aggregation(&self, _agg: RangeAggregation) -> Result<DataFrame> {
-    Err(IceGateError::NotImplemented(
-        "Unwrap aggregation not yet implemented".to_string(),
-    ))
-}
+| Function | Description | Implementation |
+|----------|-------------|----------------|
+| `sum_over_time` | Sum of unwrapped values | DataFusion `sum()` |
+| `avg_over_time` | Average of unwrapped values | DataFusion `avg()` |
+| `min_over_time` | Minimum unwrapped value | DataFusion `min()` |
+| `max_over_time` | Maximum unwrapped value | DataFusion `max()` |
+| `stddev_over_time` | Standard deviation | DataFusion `stddev()` |
+| `stdvar_over_time` | Standard variance | DataFusion `var_sample()` |
+| `quantile_over_time` | Quantile (requires φ parameter) | DataFusion `approx_percentile_cont()` |
+| `first_over_time` | First value in range | DataFusion `first_value()` with timestamp ordering |
+| `last_over_time` | Last value in range | DataFusion `last_value()` with timestamp ordering |
+| `rate_counter` | Rate for counter metrics | LAG window function for reset detection + rate calculation |
+
+**Conversion Functions:**
+
+- **`duration(label)`** - Parse Go-style duration string to nanoseconds (e.g., "5m" → 300000000000)
+- **`duration_seconds(label)`** - Parse duration to seconds (e.g., "5m" → 300.0)
+- **`bytes(label)`** - Parse byte size string to numeric bytes (e.g., "2KB" → 2048)
+- **No conversion** - Direct numeric parsing via `parse_numeric` UDF
+
+**Architecture:**
+
+1. Extract label value via `get_field(attributes, label_name)` or indexed column
+2. Apply conversion UDF (`parse_numeric`, `parse_duration`, `parse_bytes`)
+3. NULL values coalesced to 0.0 for aggregation (tracked via `_has_unwrap_error`)
+4. Grid-based time bucketing via `date_grid` UDF
+5. Aggregation via DataFusion built-in functions
+6. Error tracking: series with conversion errors get `__error__` label
+
+**Counter Reset Detection (rate_counter only):**
+
+`rate_counter` implements Prometheus-compatible counter reset detection:
+
+- Uses LAG window function to get previous value
+- Detects reset when `current_value < previous_value`
+- On reset: assumes counter started from 0, delta = current_value
+- On normal increase: delta = current_value - previous_value
+- Sums deltas across range window, divides by duration
+
+**Example:**
+
+```logql
+# Simple unwrap
+sum_over_time({service="api"} | unwrap latency_ms [5m])
+
+# With duration conversion
+avg_over_time({job="worker"} | unwrap duration(processing_time) [10m])
+
+# With bytes conversion
+sum_over_time({service="api"} | unwrap bytes(response_size) [5m])
+
+# Counter with reset detection
+rate_counter({service="api"} | unwrap request_count [5m])
 ```
 
-**Syntax (for future implementation):**
-- `| unwrap label_name`: Extracts numeric value from the label.
-- `duration()`: Converts duration strings to seconds.
-- `bytes()`: Converts byte strings to numeric values.
-
-**Future Translation to DataFusion:**
-```rust
-// LogQL: rate({job="mysql"} | unwrap bytes(size) [5m])
-// DataFusion: Convert size label to bytes, then calculate rate
-
-// Step 1: Extract and convert the label
-let bytes_value = bytes_converter_udf(
-    map_extract(col("attributes"), lit("size"))
-);
-
-// Step 2: Add as column via projection
-let with_unwrapped = LogicalPlanBuilder::from(base_plan)
-    .project(vec![
-        col("*"),
-        bytes_value.alias("_unwrapped_value")
-    ])?
-    .build()?;
-
-// Step 3: Apply rate calculation
-let rate_window = /* window function on _unwrapped_value */ / lit(300.0);
-```
+**Source:** `crates/icegate-query/src/logql/datafusion/planner.rs:487-622`
 
 ### 4.3. Implementation Example: Complete Metric Query
 
@@ -1072,42 +1090,39 @@ let line_format_udf = create_udf(
 
 ### 7.2. Aggregate UDFs (UDAFs)
 
-> **Note:** Log-range aggregation UDAFs (`count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`, `absent_over_time`) are implemented in `src/query/logql/datafusion/udaf.rs` using a shared `GridAccumulator` pattern. See Section 4.1 for details. Unwrap-based aggregations are not implemented.
+> **Note:** Log-range aggregation UDAFs (`count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`, `absent_over_time`) are implemented in `src/query/logql/datafusion/udaf.rs` using a shared `GridAccumulator` pattern. Unwrap-based aggregations are implemented in `src/query/logql/datafusion/planner.rs` using DataFusion built-in aggregation functions. See Section 4.2 for details.
 
 #### 7.2.1. `quantile_over_time`
 
-> **❌ NOT IMPLEMENTED**: Requires unwrap expression support which is not implemented.
+> **✅ IMPLEMENTED**: Uses DataFusion `approx_percentile_cont()` with unwrap expressions.
 
-Calculates quantiles over time windows.
+Calculates quantiles over time windows using approximate percentile calculations.
 
-**Signature:** `quantile_over_time(φ: Float64, value: Float64) -> Float64`
+**Signature:** `quantile_over_time(φ: Float64, {selector} | unwrap label [range])`
 
 **Implementation:**
+
+Uses DataFusion's built-in `approx_percentile_cont()` aggregate function:
+
 ```rust
-use datafusion::logical_expr::{create_udaf, Accumulator};
-
-#[derive(Debug)]
-struct QuantileAccumulator {
-    values: Vec<f64>,
-    quantile: f64,
-}
-
-impl Accumulator for QuantileAccumulator {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        // Collect values
-        // ...
-    }
-
-    fn evaluate(&mut self) -> Result<ScalarValue> {
-        // Sort values and compute quantile
-        self.values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let index = (self.quantile * (self.values.len() as f64 - 1.0)) as usize;
-        Ok(ScalarValue::Float64(Some(self.values[index])))
-    }
-
-    // ... other methods
+RangeAggregationOp::QuantileOverTime => {
+    let phi = agg
+        .param
+        .ok_or_else(|| QueryError::Plan("quantile_over_time requires a parameter (0.0-1.0)".to_string()))?;
+    approx_percentile_cont(col("unwrapped_value").sort(true, true), lit(phi), None)
 }
 ```
+
+**Example:**
+```logql
+# 95th percentile of latency
+quantile_over_time(0.95, {service="api"} | unwrap latency_ms [5m])
+
+# Median response time
+quantile_over_time(0.5, {service="api"} | unwrap duration(response_time) [10m])
+```
+
+**Source:** `crates/icegate-query/src/logql/datafusion/planner.rs:561-566`
 
 ### 7.3. UDF Registration
 
