@@ -788,41 +788,15 @@ impl DataFusionPlanner {
         // Apply by/without filtering if specified, otherwise group by all labels
         let grouping_exprs = if let Some(ref grouping) = agg.grouping {
             // Get filtered attributes expression to replace the attributes column
-            let (indexed_cols, filtered_attrs_expr) = Self::build_grouping_components(grouping);
+            let (_indexed_cols, filtered_attrs_expr) = Self::build_grouping_components(grouping);
 
             // Replace attributes column with filtered version BEFORE aggregation
             // This ensures last_value preserves the filtered attributes
-            df = df.with_column("attributes", filtered_attrs_expr.clone())?;
+            df = df.with_column("attributes", filtered_attrs_expr)?;
 
-            // For rate_counter with grouping, we need to handle the fact that
-            // _attr_keys and _attr_vals were already created in step 8.5
-            // We need to recreate them with the filtered attributes
-            if agg.op == RangeAggregationOp::RateCounter {
-                use datafusion::functions_nested::{
-                    map_keys::map_keys, map_values::map_values, string::array_to_string,
-                };
-
-                // Update the _attr_keys and _attr_vals columns with filtered attributes
-                df = df.drop_columns(&[COL_ATTR_KEYS, COL_ATTR_VALS])?;
-                df = df.with_column(
-                    COL_ATTR_KEYS,
-                    array_to_string(map_keys(filtered_attrs_expr.clone()), lit("|||")),
-                )?;
-                df = df.with_column(
-                    COL_ATTR_VALS,
-                    array_to_string(map_values(filtered_attrs_expr), lit("|||")),
-                )?;
-
-                // Build grouping with timestamp, filtered indexed columns, and serialized attributes
-                let mut exprs = vec![col("grid_timestamp")];
-                exprs.extend(indexed_cols.iter().map(|c| col(c.as_str())));
-                exprs.push(col(COL_ATTR_KEYS));
-                exprs.push(col(COL_ATTR_VALS));
-                exprs
-            } else {
-                // For other operations, use the filtered grouping helper
-                Self::build_filtered_grouping_exprs(grouping, true)
-            }
+            // Use the filtered grouping helper
+            // Note: RateCounter cannot reach this branch due to validation at lines 687-699
+            Self::build_filtered_grouping_exprs(grouping, true)
         } else {
             // No grouping specified - group by all labels (default behavior)
             if agg.op == RangeAggregationOp::RateCounter {
@@ -1156,12 +1130,16 @@ impl DataFusionPlanner {
                     let outer_grouping_clone = outer_grouping.clone();
 
                     // Merge outer grouping with inner grouping
+                    // The outer aggregation's grouping determines the final result structure,
+                    // so it takes precedence in cross-type merges.
                     let merged_grouping = match (range_agg.grouping.take(), &outer_grouping_clone) {
                         // No inner grouping - use outer grouping
                         (None, _) => Some(outer_grouping_clone),
-                        // Inner grouping exists - merge based on types
+
+                        // Same-type merges: combine label sets
                         (Some(Grouping::By(mut inner_labels)), Grouping::By(outer_labels)) => {
-                            // Both By: merge labels, avoiding duplicates
+                            // Both By: merge inclusion lists, avoiding duplicates
+                            // Example: by (a, b) + by (b, c) → by (a, b, c)
                             for label in outer_labels {
                                 if !inner_labels.iter().any(|l| l.name == label.name) {
                                     inner_labels.push(label.clone());
@@ -1169,22 +1147,34 @@ impl DataFusionPlanner {
                             }
                             Some(Grouping::By(inner_labels))
                         }
-                        (Some(Grouping::By(_)), Grouping::Without(outer_labels)) => {
-                            // Inner By + Outer Without: use outer Without
-                            Some(Grouping::Without(outer_labels.clone()))
-                        }
-                        (Some(Grouping::Without(_)), Grouping::By(outer_labels)) => {
-                            // Inner Without + Outer By: use outer By (more restrictive)
-                            Some(Grouping::By(outer_labels.clone()))
-                        }
                         (Some(Grouping::Without(mut inner_labels)), Grouping::Without(outer_labels)) => {
-                            // Both Without: merge exclusion lists
+                            // Both Without: merge exclusion lists, avoiding duplicates
+                            // Example: without (a) + without (b, c) → without (a, b, c)
                             for label in outer_labels {
                                 if !inner_labels.iter().any(|l| l.name == label.name) {
                                     inner_labels.push(label.clone());
                                 }
                             }
                             Some(Grouping::Without(inner_labels))
+                        }
+
+                        // Cross-type merges: outer grouping takes complete precedence
+                        // Rationale: The outer aggregation defines the final output structure,
+                        // and mixing By/Without semantics is ambiguous. We follow the principle
+                        // that the outer operation's grouping specification is authoritative.
+                        (Some(Grouping::By(_)), Grouping::Without(outer_labels)) => {
+                            // Inner By + Outer Without: discard inner, use outer Without entirely
+                            // Example: sum without (pod) (count by (node)) → group by all labels except pod
+                            // The outer Without defines which labels to exclude from the final result.
+                            Some(Grouping::Without(outer_labels.clone()))
+                        }
+                        (Some(Grouping::Without(_)), Grouping::By(outer_labels)) => {
+                            // Inner Without + Outer By: discard inner, use outer By entirely
+                            // Example: sum by (service) (count without (instance)) → group by service only
+                            // The outer By defines which labels to keep in the final result.
+                            // This is more restrictive than Without, as By explicitly specifies
+                            // the exact labels that should remain.
+                            Some(Grouping::By(outer_labels.clone()))
                         }
                     };
                     range_agg.grouping = merged_grouping;

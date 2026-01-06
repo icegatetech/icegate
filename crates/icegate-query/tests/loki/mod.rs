@@ -5,10 +5,12 @@
 //! - `query_range`: Basic `query_range` and explain endpoint tests
 //! - `metrics`: Metric query tests (`count_over_time`, rate, `bytes_rate`, etc.)
 //! - `unwrap`: Unwrap aggregation tests (`sum_over_time`, `avg_over_time`, etc.)
+//! - `grouping`: Cross-type grouping merge semantics tests
 //! - `labels`: Label metadata endpoint tests (labels, label values, series)
 //! - `tenant`: Tenant isolation tests
 //! - `trace`: Trace ID and span ID query tests
 
+mod grouping;
 mod harness;
 mod labels;
 mod metrics;
