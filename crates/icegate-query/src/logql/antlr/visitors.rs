@@ -732,6 +732,16 @@ impl LogQLExprVisitor {
             return Err(parse_error("Unknown range aggregation operation"));
         };
 
+        // Extract NUMBER parameter if present (for quantile_over_time)
+        let param = if let Some(num) = ctx.NUMBER() {
+            let text = num.get_text();
+            let value = parse_number(&text).map_err(|e| parse_error(format!("Invalid parameter: {text} - {e}")))?;
+
+            Some(value)
+        } else {
+            param // Use param from helper (currently always None for unwrap ops)
+        };
+
         // Get the range expression
         let range_expr = if let Some(log_range) = ctx.logRangeExpr() {
             self.visit_log_range_expr(&log_range)?

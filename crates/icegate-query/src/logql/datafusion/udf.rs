@@ -12,7 +12,7 @@ use datafusion::{
         buffer::{OffsetBuffer, ScalarBuffer},
         datatypes::DataType,
     },
-    common::{Result, datatype::DataTypeExt, exec_err, plan_err},
+    common::{DataFusionError, Result, datatype::DataTypeExt, exec_err, plan_err},
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
 
@@ -301,7 +301,7 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
     ))
 }
 
-/// UDF: `date_grid(timestamp, start, end, step, range, offset)` - calculate step timestamps of
+/// UDF: `date_grid(timestamp, start, end, step, range, offset, inverse)` - calculate step timestamps of
 /// aligning grid
 ///
 /// # Arguments
@@ -311,27 +311,42 @@ fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mod
 /// - `step`: Step between grid points
 /// - `range`: Range window size as interval
 /// - `offset`: Offset for the range window as interval
+/// - `inverse`: Boolean - if true, returns grid points NOT covered by the timestamp
 ///
 /// # References
 /// - [Loki Metric Query](https://grafana.com/blog/how-to-run-faster-loki-metric-queries-with-more-accurate-results/)
 ///
 /// # Returns
-/// A new array with the date bins containing the timestamp point
+/// A new array with the date bins containing (or not containing, if inverse=true) the timestamp point
 ///
 /// # Example
 /// ```sql
 /// SELECT timestamp FROM t;
 /// -- TIMESTAMP '2025-01-02 00:10:30'
 /// -- TIMESTAMP '2025-01-02 00:13:59'
+/// -- Normal mode (inverse=false): returns grid points covered by timestamp
 /// SELECT date_grid(
 ///     timestamp,
 ///     TIMESTAMP '2025-01-02 00:00:00',
 ///     TIMESTAMP '2025-01-03 00:00:00',
 ///     INTERVAL '1 minute',
 ///     INTERVAL '2 minute',
-///     INTERVAL '10 seconds'
+///     INTERVAL '10 seconds',
+///     false
 /// ) FROM logs;
-/// -- [TIMESTAMP '2025-01-02 00:11:00', '2025-01-02 00:11:01', ..., '2025-01-03 00:00:00']
+/// -- [TIMESTAMP '2025-01-02 00:11:00', '2025-01-02 00:12:00']
+///
+/// -- Inverse mode (inverse=true): returns grid points NOT covered by timestamp
+/// SELECT date_grid(
+///     timestamp,
+///     TIMESTAMP '2025-01-02 00:00:00',
+///     TIMESTAMP '2025-01-03 00:05:00',
+///     INTERVAL '1 minute',
+///     INTERVAL '2 minute',
+///     INTERVAL '10 seconds',
+///     true
+/// ) FROM logs;
+/// -- [TIMESTAMP '2025-01-02 00:00:00', '2025-01-02 00:01:00', ..., '2025-01-02 00:10:00', '2025-01-02 00:13:00', ...]
 /// ```
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DateGrid {
@@ -348,7 +363,7 @@ impl DateGrid {
     /// Creates a new `Grid` UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(6, Volatility::Immutable),
+            signature: Signature::any(7, Volatility::Immutable),
         }
     }
 
@@ -391,8 +406,8 @@ impl ScalarUDFImpl for DateGrid {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.len() != 6 {
-            return plan_err!("date_grid requires 6 arguments");
+        if arg_types.len() != 7 {
+            return plan_err!("date_grid requires 7 arguments");
         }
         Ok(DataType::List(arg_types[0].clone().into_nullable_field_ref()))
     }
@@ -408,8 +423,8 @@ impl ScalarUDFImpl for DateGrid {
         };
 
         // Validate argument count
-        if args.args.len() != 6 {
-            return plan_err!("date_grid requires 6 arguments");
+        if args.args.len() != 7 {
+            return plan_err!("date_grid requires 7 arguments");
         }
 
         // Extract arguments
@@ -439,6 +454,12 @@ impl ScalarUDFImpl for DateGrid {
         let step_micros = Self::extract_interval_micros(&args.args[3], "step")?;
         let range_micros = Self::extract_interval_micros(&args.args[4], "range")?;
         let offset_micros = Self::extract_interval_micros(&args.args[5], "offset")?;
+
+        // Extract inverse parameter
+        let inverse = match &args.args[6] {
+            ColumnarValue::Scalar(ScalarValue::Boolean(Some(val))) => *val,
+            _ => return plan_err!("Seventh argument (inverse) must be a Boolean scalar"),
+        };
 
         // Validate step is positive
         if step_micros <= 0 {
@@ -471,11 +492,17 @@ impl ScalarUDFImpl for DateGrid {
                 let lower_grid = t + offset_micros;
                 let upper_grid = t + upper_bound_micros;
 
-                // Binary search for first grid point >= lower_grid
-                let start_idx = grid.partition_point(|&g| g < lower_grid);
-
-                // Collect all matching grid points
-                let matches: Vec<i64> = grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect();
+                // Collect matching grid points based on inverse parameter
+                let matches: Vec<i64> = if inverse {
+                    // Inverse mode: return grid points NOT in the coverage window
+                    grid.iter().copied().filter(|&g| g < lower_grid || g > upper_grid).collect()
+                } else {
+                    // Normal mode: return grid points in the coverage window
+                    // Binary search for first grid point >= lower_grid
+                    let start_idx = grid.partition_point(|&g| g < lower_grid);
+                    // Collect all matching grid points within the range
+                    grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect()
+                };
 
                 list_builder.push(matches);
             }
@@ -500,9 +527,9 @@ impl ScalarUDFImpl for DateGrid {
         let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets_vec));
 
         let field = Arc::new(datafusion::arrow::datatypes::Field::new(
-            "item",
+            "", // Empty name to match return_type promise
             DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
+            true, // Nullable to match return_type promise
         ));
 
         let list_array = ListArray::new(field, offsets, values_array, None);
@@ -515,7 +542,7 @@ impl ScalarUDFImpl for DateGrid {
 mod tests {
     use datafusion::{
         arrow::{
-            array::TimestampMicrosecondArray,
+            array::{Float64Array, TimestampMicrosecondArray},
             datatypes::{Field, Fields, IntervalMonthDayNano, TimeUnit},
         },
         common::{DataFusionError, Result, ScalarValue, config::ConfigOptions},
@@ -623,6 +650,7 @@ mod tests {
     /// - `step`: Step interval between grid points
     /// - `range`: Range window size
     /// - `offset`: Range window offset
+    /// - `inverse`: If true, returns grid points NOT covered by timestamps
     ///
     /// # Returns
     /// `Vec` of `Vec<i64>` where each inner vec is the grid timestamps for one input timestamp
@@ -633,6 +661,7 @@ mod tests {
         step: ScalarValue,
         range: ScalarValue,
         offset: ScalarValue,
+        inverse: bool,
     ) -> Result<Vec<Vec<i64>>> {
         let udf = DateGrid::new();
 
@@ -642,6 +671,7 @@ mod tests {
         let step_arg = ColumnarValue::Scalar(step);
         let range_arg = ColumnarValue::Scalar(range);
         let offset_arg = ColumnarValue::Scalar(offset);
+        let inverse_arg = ColumnarValue::Scalar(ScalarValue::Boolean(Some(inverse)));
 
         let return_field = Arc::new(Field::new(
             "item",
@@ -684,10 +714,19 @@ mod tests {
                 DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::MonthDayNano),
                 false,
             )),
+            Arc::new(Field::new("inverse", DataType::Boolean, false)),
         ];
 
         let args = ScalarFunctionArgs {
-            args: vec![timestamp_arg, start_arg, end_arg, step_arg, range_arg, offset_arg],
+            args: vec![
+                timestamp_arg,
+                start_arg,
+                end_arg,
+                step_arg,
+                range_arg,
+                offset_arg,
+                inverse_arg,
+            ],
             number_rows: timestamps.len(),
             return_field,
             arg_fields,
@@ -812,7 +851,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -839,7 +878,7 @@ mod tests {
         let range = create_interval_micros(180_000_000); // 3 minutes
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 4);
@@ -869,7 +908,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(30_000_000); // 30 seconds
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -896,7 +935,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(-30_000_000); // -30 seconds
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -923,7 +962,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 0); // Empty array
@@ -949,7 +988,7 @@ mod tests {
         let range = create_interval_micros(120_000_000); // 2 minutes
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 2);
@@ -977,7 +1016,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 2);
@@ -1004,7 +1043,7 @@ mod tests {
         let range = create_interval_micros(300_000_000); // 5 minutes
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 3);
 
@@ -1042,7 +1081,7 @@ mod tests {
         let range = create_interval_micros(100_000); // 100ms
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1066,7 +1105,7 @@ mod tests {
         let range = create_interval_micros(10_000_000); // 10 seconds
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 11); // 08:20:00 through 08:20:10 (inclusive)
@@ -1096,7 +1135,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute (same as step)
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1123,7 +1162,7 @@ mod tests {
         let range = create_interval_micros(0); // zero range
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1153,7 +1192,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute (less than step)
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 0); // No matches
@@ -1180,7 +1219,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute (less than step)
         let offset = create_interval_micros(0);
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1208,7 +1247,7 @@ mod tests {
         let range = create_interval_micros(60_000_000); // 1 minute
         let offset = create_interval_micros(-60_000_000); // -1 minute
 
-        let result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 1);
@@ -1218,11 +1257,10 @@ mod tests {
     // Error cases
 
     #[test]
-    #[should_panic(expected = "requires 6 arguments")]
+    #[should_panic(expected = "requires 7 arguments")]
     fn test_date_grid_wrong_argument_count() {
         // Test error handling: wrong number of arguments
         // Should panic with message "date_grid requires 6 arguments"
-        // (This tests the bug fix from current "requires 5 arguments")
 
         let udf = DateGrid::new();
         let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
@@ -1286,7 +1324,7 @@ mod tests {
         let offset = create_interval_micros(0);
 
         // Should panic
-        let _result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let _result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
     }
 
     #[test]
@@ -1308,6 +1346,1067 @@ mod tests {
         let offset = create_interval_micros(0);
 
         // Should panic
-        let _result = execute_date_grid(&timestamps, start, end, step, range, offset).unwrap();
+        let _result = execute_date_grid(&timestamps, start, end, step, range, offset, false).unwrap();
     }
+
+    // Inverse mode tests
+
+    #[test]
+    fn test_date_grid_inverse_basic() {
+        // Test inverse mode: returns grid points NOT covered by timestamp
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03, 00:04, 00:05 (1-minute steps) = 6 points
+        // Timestamp: 00:00:30
+        // Range: 1 minute, Offset: 0
+        // inverse: true
+        //
+        // Normal mode matches: 00:01:00 (in [00:00:30, 00:01:30])
+        // Inverse mode: ALL grid points EXCEPT 00:01:00
+        // Expected: [00:00:00, 00:02:00, 00:03:00, 00:04:00, 00:05:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:30"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:05:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 5); // 5 uncovered grid points
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:02:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:03:00"));
+        assert_eq!(result[0][3], timestamp_micros("2025-01-02 00:04:00"));
+        assert_eq!(result[0][4], timestamp_micros("2025-01-02 00:05:00"));
+    }
+
+    #[test]
+    fn test_date_grid_inverse_full_coverage() {
+        // Test inverse mode with full coverage: should return empty
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps) = 4 points
+        // Timestamp: 00:00:00
+        // Range: 10 minutes (covers entire grid), Offset: 0
+        // inverse: true
+        //
+        // Normal mode matches: ALL grid points [00:00:00, 00:01:00, 00:02:00, 00:03:00]
+        // Inverse mode: ALL grid points EXCEPT those covered
+        // Expected: [] (empty - all points are covered)
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(600_000_000); // 10 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 0); // Empty - all grid points covered
+    }
+
+    #[test]
+    fn test_date_grid_inverse_no_coverage() {
+        // Test inverse mode with no coverage: should return all grid points
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps) = 4 points
+        // Timestamp: 00:10:00 (far after grid end)
+        // Range: 1 minute, Offset: 0
+        // inverse: true
+        //
+        // Normal mode matches: [] (no coverage)
+        // Inverse mode: ALL grid points (none are covered)
+        // Expected: [00:00:00, 00:01:00, 00:02:00, 00:03:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:10:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 4); // All 4 grid points uncovered
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:01:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:02:00"));
+        assert_eq!(result[0][3], timestamp_micros("2025-01-02 00:03:00"));
+    }
+
+    #[test]
+    fn test_date_grid_inverse_partial_coverage() {
+        // Test inverse mode with partial coverage
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03, 00:04, 00:05 (1-minute steps) = 6 points
+        // Timestamp: 00:00:00
+        // Range: 3 minutes, Offset: 0
+        // inverse: true
+        //
+        // Normal mode matches: [00:00:00, 00:01:00, 00:02:00, 00:03:00] (in [00:00:00, 00:03:00])
+        // Inverse mode: Grid points NOT in [00:00:00, 00:03:00]
+        // Expected: [00:04:00, 00:05:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:05:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(180_000_000); // 3 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2); // 2 uncovered grid points
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:04:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:05:00"));
+    }
+
+    #[test]
+    fn test_date_grid_inverse_with_offset() {
+        // Test inverse mode with offset parameter
+        //
+        // Grid: 00:00, 00:01, 00:02, 00:03 (1-minute steps) = 4 points
+        // Timestamp: 00:00:00
+        // Range: 1 minute, Offset: 30 seconds
+        // inverse: true
+        //
+        // Normal mode:
+        //   - Lower: 00:00:00 + 30s = 00:00:30
+        //   - Upper: 00:00:30 + 1min = 00:01:30
+        //   - Matches: 00:01:00
+        // Inverse mode: All grid points EXCEPT 00:01:00
+        // Expected: [00:00:00, 00:02:00, 00:03:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:00:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:03:00");
+        let step = create_interval_micros(60_000_000); // 1 minute
+        let range = create_interval_micros(60_000_000); // 1 minute
+        let offset = create_interval_micros(30_000_000); // 30 seconds
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 3); // 3 uncovered grid points
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:02:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:03:00"));
+    }
+
+    #[test]
+    fn test_date_grid_inverse_batch_processing() {
+        // Test inverse mode with multiple timestamps
+        //
+        // Grid: 00:00, 00:05, 00:10, 00:15 (5-minute steps) = 4 points
+        // Timestamps: [00:01:00, 00:07:00]
+        // Range: 5 minutes, Offset: 0
+        // inverse: true
+        //
+        // For t1 = 00:01:00:
+        //   - Normal mode matches: 00:05:00
+        //   - Inverse: [00:00:00, 00:10:00, 00:15:00]
+        // For t2 = 00:07:00:
+        //   - Normal mode matches: 00:10:00
+        //   - Inverse: [00:00:00, 00:05:00, 00:15:00]
+
+        let timestamps = create_timestamps(&["2025-01-02 00:01:00", "2025-01-02 00:07:00"]);
+        let start = timestamp_micros("2025-01-02 00:00:00");
+        let end = timestamp_micros("2025-01-02 00:15:00");
+        let step = create_interval_micros(300_000_000); // 5 minutes
+        let range = create_interval_micros(300_000_000); // 5 minutes
+        let offset = create_interval_micros(0);
+
+        let result = execute_date_grid(&timestamps, start, end, step, range, offset, true).unwrap();
+
+        assert_eq!(result.len(), 2);
+
+        // First timestamp: inverse excludes 00:05:00
+        assert_eq!(result[0].len(), 3);
+        assert_eq!(result[0][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[0][1], timestamp_micros("2025-01-02 00:10:00"));
+        assert_eq!(result[0][2], timestamp_micros("2025-01-02 00:15:00"));
+
+        // Second timestamp: inverse excludes 00:10:00
+        assert_eq!(result[1].len(), 3);
+        assert_eq!(result[1][0], timestamp_micros("2025-01-02 00:00:00"));
+        assert_eq!(result[1][1], timestamp_micros("2025-01-02 00:05:00"));
+        assert_eq!(result[1][2], timestamp_micros("2025-01-02 00:15:00"));
+    }
+
+    // ParseNumeric UDF tests
+
+    /// Helper to execute `parse_numeric` UDF
+    fn execute_parse_numeric(values: &[Option<&str>]) -> Result<Vec<Option<f64>>> {
+        let udf = ParseNumeric::new();
+        let string_array = StringArray::from(values.to_vec());
+        let arg = ColumnarValue::Array(Arc::new(string_array) as ArrayRef);
+
+        let return_field = Arc::new(Field::new("item", DataType::Float64, true));
+        let arg_fields = vec![Arc::new(Field::new("value", DataType::Utf8, true))];
+
+        let args = ScalarFunctionArgs {
+            args: vec![arg],
+            number_rows: values.len(),
+            return_field,
+            arg_fields,
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+
+        let result = udf.invoke_with_args(args)?;
+
+        match result {
+            ColumnarValue::Array(arr) => {
+                let float_arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+                Ok((0..float_arr.len())
+                    .map(|i| {
+                        if float_arr.is_null(i) {
+                            None
+                        } else {
+                            Some(float_arr.value(i))
+                        }
+                    })
+                    .collect())
+            }
+            ColumnarValue::Scalar(_) => Err(DataFusionError::Execution("Expected array result".to_string())),
+        }
+    }
+
+    #[test]
+    fn test_parse_numeric_valid_integers() {
+        let result = execute_parse_numeric(&[Some("42"), Some("0"), Some("-123")]).unwrap();
+        assert_eq!(result, vec![Some(42.0), Some(0.0), Some(-123.0)]);
+    }
+
+    #[test]
+    fn test_parse_numeric_valid_floats() {
+        let result = execute_parse_numeric(&[Some("3.15"), Some("-2.5"), Some("0.001")]).unwrap();
+        assert_eq!(result, vec![Some(3.15), Some(-2.5), Some(0.001)]);
+    }
+
+    #[test]
+    fn test_parse_numeric_scientific_notation() {
+        let result = execute_parse_numeric(&[Some("1e3"), Some("2.5e-2"), Some("-1.5E+4")]).unwrap();
+        assert_eq!(result, vec![Some(1000.0), Some(0.025), Some(-15000.0)]);
+    }
+
+    #[test]
+    fn test_parse_numeric_invalid_returns_null() {
+        let result = execute_parse_numeric(&[Some("invalid"), Some("12.34.56"), Some("abc123")]).unwrap();
+        assert_eq!(result, vec![None, None, None]);
+    }
+
+    #[test]
+    fn test_parse_numeric_null_input() {
+        let result = execute_parse_numeric(&[None, Some("42"), None]).unwrap();
+        assert_eq!(result, vec![None, Some(42.0), None]);
+    }
+
+    #[test]
+    fn test_parse_numeric_whitespace() {
+        let result = execute_parse_numeric(&[Some("  42  "), Some("\t3.15\n"), Some(" ")]).unwrap();
+        assert_eq!(result, vec![Some(42.0), Some(3.15), None]);
+    }
+
+    // ParseBytes UDF tests
+
+    /// Helper to execute `parse_bytes` UDF
+    fn execute_parse_bytes(values: &[Option<&str>]) -> Result<Vec<Option<f64>>> {
+        let udf = ParseBytes::new();
+        let string_array = StringArray::from(values.to_vec());
+        let arg = ColumnarValue::Array(Arc::new(string_array) as ArrayRef);
+
+        let return_field = Arc::new(Field::new("item", DataType::Float64, true));
+        let arg_fields = vec![Arc::new(Field::new("value", DataType::Utf8, true))];
+
+        let args = ScalarFunctionArgs {
+            args: vec![arg],
+            number_rows: values.len(),
+            return_field,
+            arg_fields,
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+
+        let result = udf.invoke_with_args(args)?;
+
+        match result {
+            ColumnarValue::Array(arr) => {
+                let float_arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+                Ok((0..float_arr.len())
+                    .map(|i| {
+                        if float_arr.is_null(i) {
+                            None
+                        } else {
+                            Some(float_arr.value(i))
+                        }
+                    })
+                    .collect())
+            }
+            ColumnarValue::Scalar(_) => Err(DataFusionError::Execution("Expected array result".to_string())),
+        }
+    }
+
+    #[test]
+    fn test_parse_bytes_basic_units() {
+        let result = execute_parse_bytes(&[Some("100B"), Some("10KB"), Some("5MB")]).unwrap();
+        assert_eq!(
+            result,
+            vec![Some(100.0), Some(10.0 * 1024.0), Some(5.0 * 1024.0 * 1024.0)]
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_large_units() {
+        let result = execute_parse_bytes(&[Some("2GB"), Some("1TB"), Some("0.5PB")]).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                Some(2.0 * 1024.0 * 1024.0 * 1024.0),
+                Some(1024.0 * 1024.0 * 1024.0 * 1024.0),
+                Some(0.5 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_fractional() {
+        let result = execute_parse_bytes(&[Some("5.5MB"), Some("1.25GB"), Some("0.1KB")]).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                Some(5.5 * 1024.0 * 1024.0),
+                Some(1.25 * 1024.0 * 1024.0 * 1024.0),
+                Some(0.1 * 1024.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_case_insensitive() {
+        let result = execute_parse_bytes(&[Some("10kb"), Some("5Mb"), Some("2GB")]).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                Some(10.0 * 1024.0),
+                Some(5.0 * 1024.0 * 1024.0),
+                Some(2.0 * 1024.0 * 1024.0 * 1024.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_alternative_formats() {
+        let result = execute_parse_bytes(&[Some("10K"), Some("5M"), Some("2KiB")]).unwrap();
+        assert_eq!(
+            result,
+            vec![Some(10.0 * 1024.0), Some(5.0 * 1024.0 * 1024.0), Some(2.0 * 1024.0)]
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_invalid_returns_null() {
+        let result = execute_parse_bytes(&[Some("invalid"), Some("10XB"), Some("abc")]).unwrap();
+        assert_eq!(result, vec![None, None, None]);
+    }
+
+    #[test]
+    fn test_parse_bytes_null_input() {
+        let result = execute_parse_bytes(&[None, Some("10KB"), None]).unwrap();
+        assert_eq!(result, vec![None, Some(10.0 * 1024.0), None]);
+    }
+
+    #[test]
+    fn test_parse_bytes_whitespace() {
+        let result = execute_parse_bytes(&[Some("  10KB  "), Some("\t5MB\n")]).unwrap();
+        assert_eq!(result, vec![Some(10.0 * 1024.0), Some(5.0 * 1024.0 * 1024.0)]);
+    }
+
+    // ParseDuration UDF tests
+
+    /// Helper to execute `parse_duration` UDF
+    fn execute_parse_duration(values: &[Option<&str>], as_seconds: bool) -> Result<Vec<Option<f64>>> {
+        let udf = ParseDuration::new();
+        let string_array = StringArray::from(values.to_vec());
+        let arg1 = ColumnarValue::Array(Arc::new(string_array) as ArrayRef);
+        let arg2 = ColumnarValue::Scalar(ScalarValue::Boolean(Some(as_seconds)));
+
+        let return_field = Arc::new(Field::new("item", DataType::Float64, true));
+        let arg_fields = vec![
+            Arc::new(Field::new("value", DataType::Utf8, true)),
+            Arc::new(Field::new("as_seconds", DataType::Boolean, false)),
+        ];
+
+        let func_args = ScalarFunctionArgs {
+            args: vec![arg1, arg2],
+            number_rows: values.len(),
+            return_field,
+            arg_fields,
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+
+        let result = udf.invoke_with_args(func_args)?;
+
+        match result {
+            ColumnarValue::Array(arr) => {
+                let float_arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+                Ok((0..float_arr.len())
+                    .map(|i| {
+                        if float_arr.is_null(i) {
+                            None
+                        } else {
+                            Some(float_arr.value(i))
+                        }
+                    })
+                    .collect())
+            }
+            ColumnarValue::Scalar(_) => Err(DataFusionError::Execution("Expected array result".to_string())),
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_seconds_basic() {
+        let result = execute_parse_duration(&[Some("5s"), Some("10m"), Some("2h")], true).unwrap();
+        assert_eq!(result, vec![Some(5.0), Some(600.0), Some(7200.0)]);
+    }
+
+    #[test]
+    fn test_parse_duration_nanoseconds_basic() {
+        let result = execute_parse_duration(&[Some("5s"), Some("10ms"), Some("100ns")], false).unwrap();
+        assert_eq!(result, vec![Some(5_000_000_000.0), Some(10_000_000.0), Some(100.0)]);
+    }
+
+    #[test]
+    fn test_parse_duration_compound() {
+        let result = execute_parse_duration(&[Some("1h30m"), Some("1h30m45s"), Some("2m30s")], true).unwrap();
+        assert_eq!(result, vec![Some(5400.0), Some(5445.0), Some(150.0)]);
+    }
+
+    #[test]
+    fn test_parse_duration_fractional() {
+        let result = execute_parse_duration(&[Some("1.5s"), Some("2.5m"), Some("0.5h")], true).unwrap();
+        assert_eq!(result, vec![Some(1.5), Some(150.0), Some(1800.0)]);
+    }
+
+    #[test]
+    fn test_parse_duration_milliseconds_microseconds() {
+        let result = execute_parse_duration(&[Some("500ms"), Some("100us"), Some("50ns")], false).unwrap();
+        assert_eq!(result, vec![Some(500_000_000.0), Some(100_000.0), Some(50.0)]);
+    }
+
+    #[test]
+    fn test_parse_duration_complex_compound() {
+        let result = execute_parse_duration(&[Some("1h2m3s4ms5us6ns")], false).unwrap();
+        // 1h = 3,600,000,000,000 ns
+        // 2m = 120,000,000,000 ns
+        // 3s = 3,000,000,000 ns
+        // 4ms = 4,000,000 ns
+        // 5us = 5,000 ns
+        // 6ns = 6 ns
+        let expected = 3_600_000_000_000.0 + 120_000_000_000.0 + 3_000_000_000.0 + 4_000_000.0 + 5_000.0 + 6.0;
+        assert_eq!(result, vec![Some(expected)]);
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_returns_null() {
+        let result = execute_parse_duration(&[Some("invalid"), Some("10x"), Some("abc")], true).unwrap();
+        assert_eq!(result, vec![None, None, None]);
+    }
+
+    #[test]
+    fn test_parse_duration_null_input() {
+        let result = execute_parse_duration(&[None, Some("5s"), None], true).unwrap();
+        assert_eq!(result, vec![None, Some(5.0), None]);
+    }
+
+    #[test]
+    fn test_parse_duration_whitespace() {
+        let result = execute_parse_duration(&[Some("  5s  "), Some("\t10m\n")], true).unwrap();
+        assert_eq!(result, vec![Some(5.0), Some(600.0)]);
+    }
+
+    #[test]
+    fn test_parse_duration_zero() {
+        let result = execute_parse_duration(&[Some("0s"), Some("0m"), Some("0h")], true).unwrap();
+        assert_eq!(result, vec![Some(0.0), Some(0.0), Some(0.0)]);
+    }
+}
+
+/// UDF: `parse_numeric(value)` - parses string to Float64.
+///
+/// # Arguments
+/// - `value`: A `String` column
+///
+/// # Returns
+/// Parsed Float64 value, or NULL if parsing fails.
+///
+/// # Example
+/// ```sql
+/// SELECT parse_numeric('42.5') -- 42.5
+/// SELECT parse_numeric('invalid') -- NULL
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ParseNumeric {
+    signature: Signature,
+}
+
+impl Default for ParseNumeric {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ParseNumeric {
+    /// Creates a new `ParseNumeric` UDF.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ParseNumeric {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
+        "parse_numeric"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.is_empty() {
+            return exec_err!("parse_numeric requires one argument");
+        }
+
+        let value = &args.args[0];
+
+        match value {
+            ColumnarValue::Scalar(scalar) => {
+                let result = match scalar {
+                    datafusion::scalar::ScalarValue::Utf8(Some(s)) => s.trim().parse::<f64>().ok(),
+                    _ => None,
+                };
+
+                Ok(ColumnarValue::Scalar(result.map_or_else(
+                    || datafusion::scalar::ScalarValue::Float64(None),
+                    |v| datafusion::scalar::ScalarValue::Float64(Some(v)),
+                )))
+            }
+            ColumnarValue::Array(array) => {
+                let string_array = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| DataFusionError::Execution("Expected StringArray".to_string()))?;
+
+                let result: datafusion::arrow::array::Float64Array = string_array
+                    .iter()
+                    .map(|opt_str| opt_str.and_then(|s| s.trim().parse::<f64>().ok()))
+                    .collect();
+
+                Ok(ColumnarValue::Array(Arc::new(result)))
+            }
+        }
+    }
+}
+
+/// UDF: `parse_bytes(value)` - parses humanized byte string to Float64.
+///
+/// # Arguments
+/// - `value`: A `String` column containing byte values like "10KB", "5.5MB"
+///
+/// # Returns
+/// Parsed byte count as Float64, or NULL if parsing fails.
+///
+/// # Supported Units
+/// B, KB, MB, GB, TB, PB (1024-based), also `KiB`, `MiB`, `GiB`, etc.
+///
+/// # Example
+/// ```sql
+/// SELECT parse_bytes('10KB') -- 10240.0
+/// SELECT parse_bytes('5.5MB') -- 5767168.0
+/// SELECT parse_bytes('invalid') -- NULL
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ParseBytes {
+    signature: Signature,
+}
+
+impl Default for ParseBytes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ParseBytes {
+    /// Creates a new `ParseBytes` UDF.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+
+    /// Parse a byte string like "10KB" to float
+    fn parse_byte_string(s: &str) -> Option<f64> {
+        let s = s.trim();
+
+        // Find where the unit starts (first non-digit, non-dot character)
+        let unit_start = s.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+
+        let (num_str, unit_str) = s.split_at(unit_start);
+        let num: f64 = num_str.trim().parse().ok()?;
+
+        let multiplier = match unit_str.trim().to_uppercase().as_str() {
+            "B" => 1.0,
+            "KB" | "K" | "KIB" => 1024.0,
+            "MB" | "M" | "MIB" => 1024.0 * 1024.0,
+            "GB" | "G" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+            "TB" | "T" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+            "PB" | "P" | "PIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+            _ => return None,
+        };
+
+        Some(num * multiplier)
+    }
+}
+
+impl ScalarUDFImpl for ParseBytes {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
+        "parse_bytes"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.is_empty() {
+            return exec_err!("parse_bytes requires one argument");
+        }
+
+        let value = &args.args[0];
+
+        match value {
+            ColumnarValue::Scalar(scalar) => {
+                let result = match scalar {
+                    datafusion::scalar::ScalarValue::Utf8(Some(s)) => Self::parse_byte_string(s.trim()),
+                    _ => None,
+                };
+
+                Ok(ColumnarValue::Scalar(result.map_or_else(
+                    || datafusion::scalar::ScalarValue::Float64(None),
+                    |v| datafusion::scalar::ScalarValue::Float64(Some(v)),
+                )))
+            }
+            ColumnarValue::Array(array) => {
+                let string_array = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| DataFusionError::Execution("Expected StringArray".to_string()))?;
+
+                let result: datafusion::arrow::array::Float64Array = string_array
+                    .iter()
+                    .map(|opt_str| opt_str.and_then(Self::parse_byte_string))
+                    .collect();
+
+                Ok(ColumnarValue::Array(Arc::new(result)))
+            }
+        }
+    }
+}
+
+/// UDF: `parse_duration(value, as_seconds)` - parses Go-style duration to Float64.
+///
+/// # Arguments
+/// - `value`: A `String` column containing durations like "5s", "1h30m", "500ms"
+/// - `as_seconds`: Boolean - true to return seconds, false to return nanoseconds
+///
+/// # Returns
+/// Parsed duration as Float64, or NULL if parsing fails.
+///
+/// # Supported Units
+/// ns, us (µs), ms, s, m, h (can be combined like "1h30m45s")
+///
+/// # Example
+/// ```sql
+/// SELECT parse_duration('5s', true) -- 5.0 seconds
+/// SELECT parse_duration('1h30m', true) -- 5400.0 seconds
+/// SELECT parse_duration('500ms', false) -- 500000000.0 nanoseconds
+/// SELECT parse_duration('invalid', true) -- NULL
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ParseDuration {
+    signature: Signature,
+}
+
+impl Default for ParseDuration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ParseDuration {
+    /// Creates a new `ParseDuration` UDF.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+
+    /// Parse a Go-style duration string like "1h30m45s" to nanoseconds
+    fn parse_duration_string(s: &str) -> Option<f64> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        let mut total_nanos = 0.0;
+        let mut current_num = String::new();
+
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let c = chars[i];
+
+            if c.is_ascii_digit() || c == '.' {
+                current_num.push(c);
+                i += 1;
+            } else {
+                // Found a unit character
+                if current_num.is_empty() {
+                    return None;
+                }
+
+                let num: f64 = current_num.parse().ok()?;
+                current_num.clear();
+
+                // Determine the unit
+                let unit = if c == 'h' {
+                    i += 1;
+                    3_600_000_000_000.0 // hours to nanoseconds
+                } else if c == 'm' {
+                    // Check if next char is 's' (milliseconds)
+                    if i + 1 < chars.len() && chars[i + 1] == 's' {
+                        i += 2;
+                        1_000_000.0 // milliseconds to nanoseconds
+                    } else {
+                        i += 1;
+                        60_000_000_000.0 // minutes to nanoseconds
+                    }
+                } else if c == 's' {
+                    i += 1;
+                    1_000_000_000.0 // seconds to nanoseconds
+                } else if c == 'n' && i + 1 < chars.len() && chars[i + 1] == 's' {
+                    i += 2;
+                    1.0 // nanoseconds
+                } else if c == 'u' || c == 'µ' {
+                    // microseconds (us or µs)
+                    if i + 1 < chars.len() && chars[i + 1] == 's' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    1_000.0 // microseconds to nanoseconds
+                } else {
+                    return None; // Unknown unit
+                };
+
+                total_nanos += num * unit;
+            }
+        }
+
+        if !current_num.is_empty() {
+            // Trailing number without unit
+            return None;
+        }
+
+        Some(total_nanos)
+    }
+}
+
+impl ScalarUDFImpl for ParseDuration {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
+        "parse_duration"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.len() != 2 {
+            return exec_err!("parse_duration requires two arguments");
+        }
+
+        let value = &args.args[0];
+        let as_seconds = &args.args[1];
+
+        // Extract as_seconds boolean value
+        let as_secs = match as_seconds {
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(b))) => *b,
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(None)) => false,
+            _ => return exec_err!("Second argument must be a boolean"),
+        };
+
+        match value {
+            ColumnarValue::Scalar(scalar) => {
+                let result = match scalar {
+                    datafusion::scalar::ScalarValue::Utf8(Some(s)) => Self::parse_duration_string(s.trim()).map(
+                        |nanos| {
+                            if as_secs { nanos / 1_000_000_000.0 } else { nanos }
+                        },
+                    ),
+                    _ => None,
+                };
+
+                Ok(ColumnarValue::Scalar(result.map_or_else(
+                    || datafusion::scalar::ScalarValue::Float64(None),
+                    |v| datafusion::scalar::ScalarValue::Float64(Some(v)),
+                )))
+            }
+            ColumnarValue::Array(array) => {
+                let string_array = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| DataFusionError::Execution("Expected StringArray".to_string()))?;
+
+                let result: datafusion::arrow::array::Float64Array = string_array
+                    .iter()
+                    .map(|opt_str| {
+                        opt_str
+                            .and_then(Self::parse_duration_string)
+                            .map(|nanos| if as_secs { nanos / 1_000_000_000.0 } else { nanos })
+                    })
+                    .collect();
+
+                Ok(ColumnarValue::Array(Arc::new(result)))
+            }
+        }
+    }
+}
+
+/// UDF: `map_insert(map, key, value)` - inserts a key-value pair into a map.
+///
+/// # Arguments
+/// - `map`: A `Map<String, String>` column
+/// - `key`: A `String` - the key to insert
+/// - `value`: A `String` - the value to insert
+///
+/// # Returns
+/// A new map with the key-value pair inserted. If the key already exists, the
+/// value is updated.
+///
+/// # Example
+/// ```sql
+/// SELECT map_insert(attributes, '__error__', 'true')
+/// -- Inserts or updates the __error__ key with value 'true'
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct MapInsert {
+    signature: Signature,
+}
+
+impl Default for MapInsert {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MapInsert {
+    /// Creates a new `MapInsert` UDF.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::any(3, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for MapInsert {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
+        "map_insert"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if arg_types.is_empty() {
+            return plan_err!("map_insert requires three arguments");
+        }
+        Ok(arg_types[0].clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.len() != 3 {
+            return exec_err!("map_insert requires three arguments: map, key, value");
+        }
+
+        let map_arg = &args.args[0];
+        let key_arg = &args.args[1];
+        let value_arg = &args.args[2];
+
+        // Extract scalar key and value
+        let insert_key = match key_arg {
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(s))) => s.clone(),
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(None)) => {
+                return exec_err!("map_insert key cannot be NULL");
+            }
+            _ => return exec_err!("map_insert key must be a string scalar"),
+        };
+
+        let insert_value = match value_arg {
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(s))) => s.clone(),
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(None)) => {
+                return exec_err!("map_insert value cannot be NULL");
+            }
+            _ => return exec_err!("map_insert value must be a string scalar"),
+        };
+
+        if let ColumnarValue::Array(array) = map_arg {
+            let map_array = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| DataFusionError::Execution("Expected MapArray".to_string()))?;
+
+            let result = insert_key_into_map(map_array, &insert_key, &insert_value)?;
+            Ok(ColumnarValue::Array(Arc::new(result)))
+        } else {
+            exec_err!("map_insert requires map to be an array (batch)")
+        }
+    }
+}
+
+/// Helper function to insert a key-value pair into each map in the array
+fn insert_key_into_map(map_array: &MapArray, insert_key: &str, insert_value: &str) -> Result<MapArray> {
+    let offsets = map_array.offsets();
+    let keys = map_array
+        .keys()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| DataFusionError::Execution("Map keys must be strings".to_string()))?;
+    let values = map_array
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| DataFusionError::Execution("Map values must be strings".to_string()))?;
+
+    let original_entries_field = map_array.entries().fields().clone();
+
+    let mut new_keys = StringBuilder::new();
+    let mut new_values = StringBuilder::new();
+    let mut new_offsets: Vec<i32> = Vec::with_capacity(map_array.len() + 1);
+    new_offsets.push(0);
+
+    let mut current_offset: i32 = 0;
+
+    for row_idx in 0..map_array.len() {
+        if map_array.is_null(row_idx) {
+            new_offsets.push(current_offset);
+            continue;
+        }
+
+        #[allow(clippy::cast_sign_loss)]
+        let start = offsets[row_idx] as usize;
+        #[allow(clippy::cast_sign_loss)]
+        let end = offsets[row_idx + 1] as usize;
+
+        let mut key_found = false;
+
+        // Copy existing entries, updating if key matches
+        for entry_idx in start..end {
+            if keys.is_null(entry_idx) {
+                continue;
+            }
+
+            let key = keys.value(entry_idx);
+
+            new_keys.append_value(key);
+            if key == insert_key {
+                // Update existing key
+                new_values.append_value(insert_value);
+                key_found = true;
+            } else {
+                // Copy existing entry
+                if values.is_null(entry_idx) {
+                    new_values.append_null();
+                } else {
+                    new_values.append_value(values.value(entry_idx));
+                }
+            }
+            current_offset += 1;
+        }
+
+        // If key not found, append it
+        if !key_found {
+            new_keys.append_value(insert_key);
+            new_values.append_value(insert_value);
+            current_offset += 1;
+        }
+
+        new_offsets.push(current_offset);
+    }
+
+    // Build the struct array for map entries
+    let new_keys_array: ArrayRef = Arc::new(new_keys.finish());
+    let new_values_array: ArrayRef = Arc::new(new_values.finish());
+
+    let struct_array = datafusion::arrow::array::StructArray::try_new(
+        original_entries_field,
+        vec![new_keys_array, new_values_array],
+        None,
+    )?;
+
+    let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(new_offsets));
+
+    let null_buffer = if map_array.null_count() > 0 {
+        map_array.nulls().cloned()
+    } else {
+        None
+    };
+
+    let original_map_field = match map_array.data_type() {
+        DataType::Map(field, _) => field.clone(),
+        _ => return exec_err!("Expected Map data type"),
+    };
+
+    Ok(MapArray::new(
+        original_map_field,
+        offset_buffer,
+        struct_array,
+        null_buffer,
+        false,
+    ))
 }
