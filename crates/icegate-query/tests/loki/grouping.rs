@@ -405,9 +405,8 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
 
     // Query: sum by (service_name, account_id) (avg_over_time({service_name="api"} | unwrap value [1m]) by (account_id))
     // Tests same-type grouping (By + By)
-    // Current behavior: outer By(service_name, account_id) is used (both labels present in output)
-    // Note: According to code comments, intersection should be computed, but actual behavior
-    // appears to use the outer grouping specification
+    // Expected behavior: inner By(account_id) and outer By(service_name, account_id) are merged (union)
+    // Result: By(service_name, account_id) - both labels present in output
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))

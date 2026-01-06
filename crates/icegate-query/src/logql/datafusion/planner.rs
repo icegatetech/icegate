@@ -1195,9 +1195,9 @@ impl DataFusionPlanner {
         // LogQL: sum by (label1, label2) (...)
         // DataFusion: group_expr = [col("label1"), col("label2")]
         let mut group_exprs = if let Some(grouping) = &agg.grouping {
-            let (labels, _udf, is_without) = match grouping {
-                Grouping::By(labels) => (labels, ScalarUDF::from(super::udf::MapKeepKeys::new()), false),
-                Grouping::Without(labels) => (labels, ScalarUDF::from(super::udf::MapDropKeys::new()), true),
+            let (labels, is_without) = match grouping {
+                Grouping::By(labels) => (labels, false),
+                Grouping::Without(labels) => (labels, true),
             };
 
             let mut indexed_attributes = Vec::new();
