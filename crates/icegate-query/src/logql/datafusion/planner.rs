@@ -631,6 +631,14 @@ impl DataFusionPlanner {
                 let phi = agg
                     .param
                     .ok_or_else(|| QueryError::Plan("quantile_over_time requires a parameter (0.0-1.0)".to_string()))?;
+
+                // Validate parameter range
+                if !(0.0..=1.0).contains(&phi) {
+                    return Err(QueryError::Plan(format!(
+                        "quantile_over_time parameter must be between 0.0 and 1.0, got: {phi}"
+                    )));
+                }
+
                 approx_percentile_cont(col("unwrapped_value").sort(true, true), lit(phi), None)
             }
             _ => {

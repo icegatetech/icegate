@@ -400,6 +400,20 @@ fn test_unwrap_with_conversion() {
 }
 
 #[test]
+fn test_quantile_over_time_param_parsing() {
+    // Test that parser correctly extracts parameters
+    assert_parses(r#"quantile_over_time(0.0, {app="foo"} | unwrap value [5m])"#);
+    assert_parses(r#"quantile_over_time(0.5, {app="foo"} | unwrap value [5m])"#);
+    assert_parses(r#"quantile_over_time(0.95, {app="foo"} | unwrap value [5m])"#);
+    assert_parses(r#"quantile_over_time(1.0, {app="foo"} | unwrap value [5m])"#);
+
+    // Parser should accept any valid positive number (validation happens in planner)
+    assert_parses(r#"quantile_over_time(1.5, {app="foo"} | unwrap value [5m])"#);
+    assert_parses(r#"quantile_over_time(2.0, {app="foo"} | unwrap value [5m])"#);
+    assert_parses(r#"quantile_over_time(0.999, {app="foo"} | unwrap value [5m])"#);
+}
+
+#[test]
 fn test_rate_counter() {
     assert_parses(r#"rate_counter({job="app"} | json | unwrap counter [1m])"#);
 }

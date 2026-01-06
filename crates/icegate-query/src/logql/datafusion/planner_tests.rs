@@ -968,6 +968,53 @@ async fn test_quantile_over_time_missing_param_error() {
 }
 
 #[tokio::test]
+async fn test_quantile_over_time_param_out_of_range() {
+    use crate::logql::{
+        log::UnwrapExpr,
+        metric::{MetricExpr, RangeAggregation, RangeAggregationOp, RangeExpr},
+    };
+
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![LabelMatcher::new("service", MatchOp::Eq, "test")]);
+    let log_expr = LogExpr::new(selector);
+
+    // Test parameter > 1.0
+    let range_expr = RangeExpr::new(log_expr.clone(), TimeDelta::minutes(5)).with_unwrap(UnwrapExpr::new("value"));
+    let agg = RangeAggregation::new(RangeAggregationOp::QuantileOverTime, range_expr).with_param(1.5);
+    let expr = LogQLExpr::Metric(MetricExpr::RangeAggregation(agg));
+    let result = planner.plan(expr).await;
+    assert!(result.is_err(), "quantile_over_time with parameter > 1.0 should error");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("between 0.0 and 1.0"),
+        "Error should mention valid range: {err}"
+    );
+
+    // Test parameter < 0.0
+    let range_expr = RangeExpr::new(log_expr.clone(), TimeDelta::minutes(5)).with_unwrap(UnwrapExpr::new("value"));
+    let agg = RangeAggregation::new(RangeAggregationOp::QuantileOverTime, range_expr).with_param(-0.1);
+    let expr = LogQLExpr::Metric(MetricExpr::RangeAggregation(agg));
+    let result = planner.plan(expr).await;
+    assert!(result.is_err(), "quantile_over_time with parameter < 0.0 should error");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("between 0.0 and 1.0"),
+        "Error should mention valid range: {err}"
+    );
+
+    // Test boundary values (should succeed)
+    for phi in [0.0, 0.5, 1.0] {
+        let range_expr = RangeExpr::new(log_expr.clone(), TimeDelta::minutes(5)).with_unwrap(UnwrapExpr::new("value"));
+        let agg = RangeAggregation::new(RangeAggregationOp::QuantileOverTime, range_expr).with_param(phi);
+        let expr = LogQLExpr::Metric(MetricExpr::RangeAggregation(agg));
+        let result = planner.plan(expr).await;
+        assert!(result.is_ok(), "quantile_over_time with parameter {phi} should succeed");
+    }
+}
+
+#[tokio::test]
 async fn test_stddev_stdvar_over_time() {
     use crate::logql::{
         log::UnwrapExpr,
