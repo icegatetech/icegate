@@ -553,9 +553,6 @@ impl DataFusionPlanner {
                 // Add indexed columns NOT in exclusion list
                 // Skip trace_id and span_id as they are FixedSizeBinary and can't be grouped
                 for &col_name in LOG_INDEXED_ATTRIBUTE_COLUMNS {
-                    if col_name == "trace_id" || col_name == "span_id" {
-                        continue; // Skip binary columns - they can't be grouped in DataFusion
-                    }
                     if !excluded_indexed_cols.contains(&col_name) {
                         grouping_exprs.push(col(col_name));
                     }
@@ -632,10 +629,7 @@ impl DataFusionPlanner {
                 let indexed_cols: Vec<String> = LOG_INDEXED_ATTRIBUTE_COLUMNS
                     .iter()
                     .copied()
-                    .filter(|c| {
-                        // Skip binary columns and excluded columns
-                        (*c != "trace_id" && *c != "span_id") && !excluded_indexed_cols.contains(c)
-                    })
+                    .filter(|c| !excluded_indexed_cols.contains(c))
                     .map(ToString::to_string)
                     .collect();
 
@@ -1215,9 +1209,6 @@ impl DataFusionPlanner {
                 // Add all indexed columns that are NOT excluded and exist in schema
                 // Skip trace_id and span_id as they are FixedSizeBinary and can't be grouped
                 for &col_name in LOG_INDEXED_ATTRIBUTE_COLUMNS {
-                    if col_name == "trace_id" || col_name == "span_id" {
-                        continue; // Skip binary columns - they can't be grouped in DataFusion
-                    }
                     if !excluded_indexed_cols.contains(&col_name) && schema.inner().column_with_name(col_name).is_some()
                     {
                         indexed_attributes.push(col_name);

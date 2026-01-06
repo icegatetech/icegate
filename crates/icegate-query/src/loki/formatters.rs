@@ -5,6 +5,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use datafusion::arrow::array::FixedSizeBinaryArray;
 use datafusion::arrow::{
     array::{
         Array, Float64Array, Int64Array, MapArray, RecordBatch, StringArray, TimestampMicrosecondArray,
@@ -413,6 +414,18 @@ fn extract_metric_labels(
             if !arr.is_null(row) {
                 let label_name = map_column_to_label(col_name);
                 labels.insert(interner.intern(label_name), interner.intern(arr.value(row)));
+            }
+        }
+        // trace or span id are stored as fixed-size binary arrays
+        if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            if !arr.is_null(row) {
+                // Convert binary trace_id/span_id to hex string
+                use std::fmt::Write;
+                let hex_value = arr.value(row).iter().fold(String::new(), |mut acc, b| {
+                    let _ = write!(acc, "{b:02x}");
+                    acc
+                });
+                labels.insert(interner.intern(col_name), interner.intern(&hex_value));
             }
         }
     }

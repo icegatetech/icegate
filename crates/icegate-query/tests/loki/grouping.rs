@@ -462,3 +462,269 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
     server.shutdown().await;
     Ok(())
 }
+
+/// Test grouping by binary columns (`trace_id`, `span_id`)
+///
+/// Verifies that `FixedSizeBinary` columns can be used in GROUP BY operations.
+#[tokio::test]
+async fn test_grouping_by_binary_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start(3253).await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_binary_grouping_test_logs(&table, &catalog).await?;
+
+    // Test 1: Group by trace_id (FixedSizeBinary(16))
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "sum by (trace_id) (count_over_time({service_name=\"api\"}[1m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    println!("Test grouping by trace_id:");
+    println!("Status: {}", status);
+    println!("Body: {}", serde_json::to_string_pretty(&body)?);
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    if !result.is_empty() {
+        // Verify trace_id is present in results
+        for series in result {
+            let metric = series["metric"].as_object().expect("metric should be an object");
+            assert!(
+                metric.contains_key("trace_id"),
+                "trace_id should be present in grouped output"
+            );
+        }
+    }
+
+    // Test 2: Group by span_id (FixedSizeBinary(8))
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "sum by (span_id) (count_over_time({service_name=\"api\"}[1m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    println!("\nTest grouping by span_id:");
+    println!("Status: {}", status);
+    println!("Body: {}", serde_json::to_string_pretty(&body)?);
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    if !result.is_empty() {
+        // Verify span_id is present in results
+        for series in result {
+            let metric = series["metric"].as_object().expect("metric should be an object");
+            assert!(
+                metric.contains_key("span_id"),
+                "span_id should be present in grouped output"
+            );
+        }
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Write test logs with distinct binary column values for grouping tests
+async fn write_binary_grouping_test_logs(
+    table: &Table,
+    catalog: &Arc<dyn iceberg::Catalog>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let unique_suffix = format!(
+        "binary-grouping-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let now_micros = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as i64;
+
+    let batch = build_binary_grouping_test_batch(table, now_micros)?;
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
+
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::builder().build(),
+        table.metadata().current_schema().clone(),
+    );
+
+    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+    let mut data_file_writer = data_file_writer_builder.build(None).await?;
+
+    data_file_writer.write(batch).await?;
+    let data_files = data_file_writer.close().await?;
+
+    let tx = Transaction::new(table);
+    let action = tx.fast_append();
+    let action = action.add_data_files(data_files);
+    let tx = action.apply(Transaction::new(table))?;
+    tx.commit(&**catalog).await?;
+
+    Ok(())
+}
+
+/// Build a `RecordBatch` with test logs containing distinct binary column values
+fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    // Create 4 log entries with different trace_id/span_id combinations
+    let tenant_id: ArrayRef = Arc::new(StringArray::from(vec![
+        "test-tenant",
+        "test-tenant",
+        "test-tenant",
+        "test-tenant",
+    ]));
+
+    let timestamps: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros,
+        now_micros + 1000,
+        now_micros + 2000,
+        now_micros + 3000,
+    ]));
+
+    // Create distinct trace_id values (FixedSizeBinary(16))
+    let mut trace_id_builder = FixedSizeBinaryBuilder::with_capacity(4, 16);
+    trace_id_builder.append_value([1u8; 16])?;
+    trace_id_builder.append_value([2u8; 16])?;
+    trace_id_builder.append_value([1u8; 16])?; // Duplicate trace_id
+    trace_id_builder.append_value([3u8; 16])?;
+    let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
+
+    // Create distinct span_id values (FixedSizeBinary(8))
+    let mut span_id_builder = FixedSizeBinaryBuilder::with_capacity(4, 8);
+    span_id_builder.append_value([10u8; 8])?;
+    span_id_builder.append_value([20u8; 8])?;
+    span_id_builder.append_value([30u8; 8])?;
+    span_id_builder.append_value([10u8; 8])?; // Duplicate span_id
+    let span_id: ArrayRef = Arc::new(span_id_builder.finish());
+
+    let service_name: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("api"),
+        Some("api"),
+        Some("api"),
+        Some("api"),
+    ]));
+
+    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("acc-1"),
+        Some("acc-1"),
+        Some("acc-1"),
+        Some("acc-1"),
+    ]));
+
+    let severity_text: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("INFO"),
+        Some("INFO"),
+        Some("INFO"),
+        Some("INFO"),
+    ]));
+
+    let severity_number: ArrayRef = Arc::new(Int32Array::from(vec![Some(9), Some(9), Some(9), Some(9)]));
+
+    let body: ArrayRef = Arc::new(StringArray::from(vec![
+        "Test log 1",
+        "Test log 2",
+        "Test log 3",
+        "Test log 4",
+    ]));
+
+    // Build attributes MAP with minimal data
+    let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
+        table.metadata().current_schema(),
+    )?);
+
+    let attributes_field = arrow_schema.field(11);
+    let (key_field, value_field) = match attributes_field.data_type() {
+        DataType::Map(entries_field, _) => match entries_field.data_type() {
+            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
+            _ => panic!("Expected Struct type for map entries"),
+        },
+        _ => panic!("Expected Map type for attributes field"),
+    };
+
+    let field_names = MapFieldNames {
+        entry: "key_value".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let key_builder = StringBuilder::new();
+    let value_builder = StringBuilder::new();
+    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
+        .with_keys_field(key_field)
+        .with_values_field(value_field);
+
+    // Create minimal empty maps for each row
+    for _ in 0..4 {
+        attributes_builder.append(true)?; // Empty map entry
+    }
+    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+
+    // Need to add missing columns
+    let observed_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros,
+        now_micros + 1000,
+        now_micros + 2000,
+        now_micros + 3000,
+    ]));
+
+    let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros, now_micros, now_micros, now_micros,
+    ]));
+
+    let flags: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>, None, None, None]));
+    let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![0, 0, 0, 0]));
+
+    RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            tenant_id,
+            cloud_account_id,
+            service_name,
+            timestamps,
+            observed_timestamp,
+            ingested_timestamp,
+            trace_id,
+            span_id,
+            severity_number,
+            severity_text,
+            body,
+            attributes,
+            flags,
+            dropped_attributes_count,
+        ],
+    )
+    .map_err(Into::into)
+}
