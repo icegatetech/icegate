@@ -15,6 +15,7 @@ use datafusion::{
     arrow::datatypes::{DataType, IntervalMonthDayNano},
     functions::string::octet_length,
     functions_aggregate::expr_fn::{count, last_value, sum},
+    functions_window::lead_lag::lag,
     logical_expr::{Expr, ExprSchemable, ScalarUDF, col, lit, when},
     prelude::*,
     scalar::ScalarValue,
@@ -484,6 +485,19 @@ impl DataFusionPlanner {
         last_value(col("attributes"), vec![]).alias("attributes")
     }
 
+    /// Plans unwrap-based range aggregations.
+    ///
+    /// # Counter Reset Detection (`rate_counter` only)
+    ///
+    /// For `rate_counter`, implements Prometheus-compatible counter reset detection:
+    /// - Uses LAG window function to track previous values per time series
+    /// - Detects resets when value decreases (current < previous)
+    /// - On reset: assumes counter started from 0, delta = `current_value`
+    /// - Sums deltas across range window and divides by duration
+    ///
+    /// References:
+    /// - <https://prometheus.io/docs/prometheus/latest/querying/functions/#rate>
+    /// - <https://promlabs.com/blog/2021/01/29/how-exactly-does-promql-calculate-rates/>
     async fn plan_unwrap_range_aggregation(&self, agg: crate::logql::metric::RangeAggregation) -> Result<DataFrame> {
         use datafusion::functions_aggregate::expr_fn::approx_percentile_cont;
 
@@ -538,12 +552,67 @@ impl DataFusionPlanner {
         df = df.unnest_columns(&["_grid_timestamps"])?;
         df = df.with_column("grid_timestamp", col("_grid_timestamps"))?;
 
-        // 9. Build grouping expressions (same as plan_log_range_aggregation)
-        let grouping_exprs = Self::build_label_grouping_exprs(true);
+        // 8.5. Add counter reset detection for rate_counter
+        if agg.op == RangeAggregationOp::RateCounter {
+            use datafusion::functions_nested::{map_keys::map_keys, map_values::map_values, string::array_to_string};
+
+            // Create serialized attribute columns for partitioning (MAP can't be used in PARTITION BY)
+            df = df.with_column(COL_ATTR_KEYS, array_to_string(map_keys(col("attributes")), lit("|||")))?;
+            df = df.with_column(
+                COL_ATTR_VALS,
+                array_to_string(map_values(col("attributes")), lit("|||")),
+            )?;
+
+            // Build partition expressions: grid_timestamp + all label columns
+            let mut partition_exprs = vec![col("grid_timestamp")];
+            partition_exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
+            partition_exprs.push(col(COL_ATTR_KEYS));
+            partition_exprs.push(col(COL_ATTR_VALS));
+
+            // LAG(unwrapped_value, 1) OVER (PARTITION BY ... ORDER BY timestamp)
+            let lag_expr = lag(col("unwrapped_value"), Some(1), None)
+                .partition_by(partition_exprs)
+                .order_by(vec![col("timestamp").sort(true, true)])
+                .build()?
+                .alias("prev_value");
+
+            df = df.window(vec![lag_expr])?;
+
+            // Detect counter reset: current < previous
+            let reset_detected = col("prev_value")
+                .is_not_null()
+                .and(col("unwrapped_value").lt(col("prev_value")));
+
+            // Calculate delta with Prometheus semantics:
+            // - First value (prev IS NULL): delta = 0
+            // - Reset (current < prev): delta = current (assume counter started from 0)
+            // - Normal (current >= prev): delta = current - prev
+            let delta_expr = when(col("prev_value").is_null(), lit(0.0))
+                .when(reset_detected, col("unwrapped_value"))
+                .otherwise(col("unwrapped_value") - col("prev_value"))?;
+
+            df = df.with_column("delta", delta_expr)?;
+        }
+
+        // 9. Build grouping expressions
+        // For rate_counter, _attr_keys and _attr_vals already exist from step 8.5
+        // For other operations, we need to create them as part of the grouping
+        let grouping_exprs = if agg.op == RangeAggregationOp::RateCounter {
+            // Use existing serialized columns
+            let mut exprs = vec![col("grid_timestamp")];
+            exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
+            exprs.push(col(COL_ATTR_KEYS));
+            exprs.push(col(COL_ATTR_VALS));
+            exprs
+        } else {
+            // Create serialized columns as part of grouping
+            Self::build_label_grouping_exprs(true)
+        };
 
         // 10. Apply operation-specific aggregation
         let agg_expr = match agg.op {
-            RangeAggregationOp::SumOverTime | RangeAggregationOp::RateCounter => sum(col("unwrapped_value")),
+            RangeAggregationOp::SumOverTime => sum(col("unwrapped_value")),
+            RangeAggregationOp::RateCounter => sum(col("delta")),
             RangeAggregationOp::AvgOverTime => avg(col("unwrapped_value")),
             RangeAggregationOp::MinOverTime => min(col("unwrapped_value")),
             RangeAggregationOp::MaxOverTime => max(col("unwrapped_value")),

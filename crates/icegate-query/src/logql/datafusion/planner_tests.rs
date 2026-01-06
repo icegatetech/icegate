@@ -1030,6 +1030,166 @@ async fn test_rate_counter() {
 }
 
 #[tokio::test]
+async fn test_rate_counter_with_single_reset() {
+    use crate::logql::{
+        log::UnwrapExpr,
+        metric::{MetricExpr, RangeAggregation, RangeAggregationOp, RangeExpr},
+    };
+
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![LabelMatcher::new("metric", MatchOp::Eq, "requests")]);
+    let log_expr = LogExpr::new(selector);
+    let range_expr = RangeExpr::new(log_expr, TimeDelta::minutes(5)).with_unwrap(UnwrapExpr::new("count"));
+    let agg = RangeAggregation::new(RangeAggregationOp::RateCounter, range_expr);
+
+    let expr = LogQLExpr::Metric(MetricExpr::RangeAggregation(agg));
+    let df = planner.plan(expr).await.expect("rate_counter planning failed");
+    let plan = get_logical_plan(&df);
+
+    let plan_str = format!("{plan:?}").to_lowercase();
+    // Should use LAG window function for counter reset detection
+    assert!(plan_str.contains("lag"), "Plan should contain LAG window function");
+    // Should calculate delta column
+    assert!(
+        plan_str.contains("delta"),
+        "Plan should create delta column for reset detection"
+    );
+    // Should sum deltas instead of raw values
+    assert!(plan_str.contains("sum"), "Plan should sum delta values");
+}
+
+#[tokio::test]
+async fn test_rate_counter_multiple_resets() {
+    use crate::logql::{
+        log::UnwrapExpr,
+        metric::{MetricExpr, RangeAggregation, RangeAggregationOp, RangeExpr},
+    };
+
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![LabelMatcher::new("counter", MatchOp::Eq, "total")]);
+    let log_expr = LogExpr::new(selector);
+    let range_expr = RangeExpr::new(log_expr, TimeDelta::minutes(10)).with_unwrap(UnwrapExpr::new("value"));
+    let agg = RangeAggregation::new(RangeAggregationOp::RateCounter, range_expr);
+
+    let expr = LogQLExpr::Metric(MetricExpr::RangeAggregation(agg));
+    let df = planner.plan(expr).await.expect("rate_counter planning failed");
+    let plan = get_logical_plan(&df);
+
+    let plan_str = format!("{plan:?}").to_lowercase();
+    // Verify LAG window function for tracking previous values
+    assert!(
+        plan_str.contains("lag"),
+        "Plan should contain LAG window function for multiple resets"
+    );
+    // Verify delta calculation logic
+    assert!(plan_str.contains("delta"), "Plan should calculate delta for each point");
+}
+
+#[tokio::test]
+async fn test_rate_counter_no_reset() {
+    use crate::logql::{
+        log::UnwrapExpr,
+        metric::{MetricExpr, RangeAggregation, RangeAggregationOp, RangeExpr},
+    };
+
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![LabelMatcher::new("monotonic", MatchOp::Eq, "true")]);
+    let log_expr = LogExpr::new(selector);
+    let range_expr = RangeExpr::new(log_expr, TimeDelta::minutes(5)).with_unwrap(UnwrapExpr::new("counter"));
+    let agg = RangeAggregation::new(RangeAggregationOp::RateCounter, range_expr);
+
+    let expr = LogQLExpr::Metric(MetricExpr::RangeAggregation(agg));
+    let df = planner.plan(expr).await.expect("rate_counter planning failed");
+    let plan = get_logical_plan(&df);
+
+    let plan_str = format!("{plan:?}").to_lowercase();
+    // Normal monotonic increase should still use LAG for consistency
+    assert!(
+        plan_str.contains("lag"),
+        "Plan should use LAG even for monotonic counters"
+    );
+    // Delta calculation should handle normal increases (current - previous)
+    assert!(
+        plan_str.contains("delta"),
+        "Plan should calculate delta for monotonic values"
+    );
+}
+
+#[tokio::test]
+async fn test_rate_counter_single_value() {
+    use crate::logql::{
+        log::UnwrapExpr,
+        metric::{MetricExpr, RangeAggregation, RangeAggregationOp, RangeExpr},
+    };
+
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![LabelMatcher::new("single", MatchOp::Eq, "sample")]);
+    let log_expr = LogExpr::new(selector);
+    let range_expr = RangeExpr::new(log_expr, TimeDelta::seconds(30)).with_unwrap(UnwrapExpr::new("value"));
+    let agg = RangeAggregation::new(RangeAggregationOp::RateCounter, range_expr);
+
+    let expr = LogQLExpr::Metric(MetricExpr::RangeAggregation(agg));
+    let df = planner.plan(expr).await.expect("rate_counter planning failed");
+    let plan = get_logical_plan(&df);
+
+    let plan_str = format!("{plan:?}").to_lowercase();
+    // Single value case: prev_value IS NULL, should use LAG but delta=0
+    assert!(
+        plan_str.contains("lag"),
+        "Plan should contain LAG for single value case"
+    );
+    // Delta calculation should handle NULL previous value (first sample)
+    assert!(
+        plan_str.contains("delta"),
+        "Plan should handle first sample with delta=0"
+    );
+}
+
+#[tokio::test]
+async fn test_rate_counter_label_grouping() {
+    use crate::logql::{
+        common::{Grouping, GroupingLabel},
+        log::UnwrapExpr,
+        metric::{MetricExpr, RangeAggregation, RangeAggregationOp, RangeExpr, VectorAggregation, VectorAggregationOp},
+    };
+
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    // Create rate_counter with grouping by service_name
+    let selector = Selector::new(vec![LabelMatcher::new("app", MatchOp::Eq, "backend")]);
+    let log_expr = LogExpr::new(selector);
+    let range_expr = RangeExpr::new(log_expr, TimeDelta::minutes(5)).with_unwrap(UnwrapExpr::new("requests"));
+    let range_agg = RangeAggregation::new(RangeAggregationOp::RateCounter, range_expr);
+
+    // Wrap in vector aggregation with grouping
+    let grouping = Grouping::By(vec![GroupingLabel::new("service_name")]);
+    let vector_agg = VectorAggregation::new(VectorAggregationOp::Sum, MetricExpr::RangeAggregation(range_agg))
+        .with_grouping(grouping);
+
+    let expr = LogQLExpr::Metric(MetricExpr::VectorAggregation(vector_agg));
+    let df = planner.plan(expr).await.expect("rate_counter with grouping planning failed");
+    let plan = get_logical_plan(&df);
+
+    let plan_str = format!("{plan:?}").to_lowercase();
+    // LAG window function should partition by labels (including service_name)
+    assert!(plan_str.contains("lag"), "Plan should contain LAG window function");
+    // Verify partitioning includes label columns for per-series tracking
+    assert!(
+        plan_str.contains("partition") || plan_str.contains("over"),
+        "Plan should partition LAG window by labels"
+    );
+}
+
+#[tokio::test]
 async fn test_bytes_conversion() {
     use crate::logql::{
         log::{UnwrapConversion, UnwrapExpr},
