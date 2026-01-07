@@ -797,7 +797,7 @@ async fn test_max_over_time_with_without_grouping() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test]
-async fn test_sum_over_time_with_grouping_rejected() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_sum_over_time_grouping_via_vector_aggregation() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3234).await?;
 
     let table = catalog
@@ -849,7 +849,7 @@ async fn test_sum_over_time_with_grouping_rejected() -> Result<(), Box<dyn std::
 }
 
 #[tokio::test]
-async fn test_rate_counter_with_grouping_rejected() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_rate_counter_grouping_via_vector_aggregation() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3235).await?;
 
     let table = catalog
