@@ -544,7 +544,8 @@ impl DataFusionPlanner {
                     // Serialize filtered MAP for grouping
                     grouping_exprs
                         .push(array_to_string(map_keys(filtered_attrs.clone()), lit("|||")).alias(COL_ATTR_KEYS));
-                    grouping_exprs.push(array_to_string(map_values(filtered_attrs.clone()), lit("|||")).alias(COL_ATTR_VALS));
+                    grouping_exprs
+                        .push(array_to_string(map_values(filtered_attrs.clone()), lit("|||")).alias(COL_ATTR_VALS));
                 }
 
                 (grouping_exprs, filtered_attrs)
@@ -589,7 +590,8 @@ impl DataFusionPlanner {
                     // Serialize filtered MAP for grouping
                     grouping_exprs
                         .push(array_to_string(map_keys(filtered_attrs.clone()), lit("|||")).alias(COL_ATTR_KEYS));
-                    grouping_exprs.push(array_to_string(map_values(filtered_attrs.clone()), lit("|||")).alias(COL_ATTR_VALS));
+                    grouping_exprs
+                        .push(array_to_string(map_values(filtered_attrs.clone()), lit("|||")).alias(COL_ATTR_VALS));
                 }
 
                 (grouping_exprs, filtered_attrs)
