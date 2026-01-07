@@ -310,21 +310,24 @@ async fn test_cross_type_grouping_by_inner_without_outer() -> Result<(), Box<dyn
     assert_eq!(body["status"], "success");
 
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if !result.is_empty() {
-        // Verify the result structure
-        for series in result {
-            let metric = series["metric"].as_object().expect("metric should be an object");
+    assert!(
+        !result.is_empty(),
+        "Expected non-empty result after writing grouping test data for cross-type By/Without merge"
+    );
 
-            // Without(pod) means pod should NOT appear in the metric labels
-            assert!(
-                !metric.contains_key("pod"),
-                "pod label should not appear in result with Without(pod) grouping"
-            );
+    // Verify the result structure
+    for series in result {
+        let metric = series["metric"].as_object().expect("metric should be an object");
 
-            // Other labels (service_name, node, instance) should be present
-            // (at least some of them, depending on the data)
-            println!("Series metric labels: {:?}", metric.keys().collect::<Vec<_>>());
-        }
+        // Without(pod) means pod should NOT appear in the metric labels
+        assert!(
+            !metric.contains_key("pod"),
+            "pod label should not appear in result with Without(pod) grouping"
+        );
+
+        // Other labels (service_name, node, instance) should be present
+        // (at least some of them, depending on the data)
+        println!("Series metric labels: {:?}", metric.keys().collect::<Vec<_>>());
     }
 
     server.shutdown().await;
@@ -364,29 +367,32 @@ async fn test_cross_type_grouping_without_inner_by_outer() -> Result<(), Box<dyn
     assert_eq!(body["status"], "success");
 
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if !result.is_empty() {
-        // Verify the result structure
-        for series in result {
-            let metric = series["metric"].as_object().expect("metric should be an object");
+    assert!(
+        !result.is_empty(),
+        "Expected non-empty result after writing grouping test data for cross-type Without/By merge"
+    );
 
-            // By(service_name) means ONLY service_name should appear in the result
-            // (plus possibly __name__ and other internal labels)
-            println!("Series metric labels: {:?}", metric.keys().collect::<Vec<_>>());
+    // Verify the result structure
+    for series in result {
+        let metric = series["metric"].as_object().expect("metric should be an object");
 
-            // service_name should be present (output as "service" for Loki compatibility)
+        // By(service_name) means ONLY service_name should appear in the result
+        // (plus possibly __name__ and other internal labels)
+        println!("Series metric labels: {:?}", metric.keys().collect::<Vec<_>>());
+
+        // service_name should be present (output as "service" for Loki compatibility)
+        assert!(
+            metric.contains_key("service") || metric.contains_key("service_name"),
+            "service_name should be present in result with By(service_name) grouping"
+        );
+
+        // Other labels (node, pod, instance) should NOT be present
+        for label in &["node", "pod", "instance"] {
             assert!(
-                metric.contains_key("service") || metric.contains_key("service_name"),
-                "service_name should be present in result with By(service_name) grouping"
+                !metric.contains_key(*label),
+                "{} label should not appear in result with By(service_name) grouping",
+                label
             );
-
-            // Other labels (node, pod, instance) should NOT be present
-            for label in &["node", "pod", "instance"] {
-                assert!(
-                    !metric.contains_key(*label),
-                    "{} label should not appear in result with By(service_name) grouping",
-                    label
-                );
-            }
         }
     }
 
@@ -428,34 +434,37 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
     assert_eq!(body["status"], "success");
 
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if !result.is_empty() {
-        // Verify the result structure
-        for series in result {
-            let metric = series["metric"].as_object().expect("metric should be an object");
+    assert!(
+        !result.is_empty(),
+        "Expected non-empty result after writing grouping test data for same-type By/By merge"
+    );
 
-            println!("Series metric labels: {:?}", metric.keys().collect::<Vec<_>>());
+    // Verify the result structure
+    for series in result {
+        let metric = series["metric"].as_object().expect("metric should be an object");
 
-            // Both labels from outer By should be present
-            // account_id (output as "cloud_account_id")
+        println!("Series metric labels: {:?}", metric.keys().collect::<Vec<_>>());
+
+        // Both labels from outer By should be present
+        // account_id (output as "cloud_account_id")
+        assert!(
+            metric.contains_key("cloud_account_id") || metric.contains_key("account_id"),
+            "account_id should be present in output"
+        );
+
+        // service_name (output as "service")
+        assert!(
+            metric.contains_key("service") || metric.contains_key("service_name"),
+            "service_name should be present in output"
+        );
+
+        // Other labels (pod, instance, node) should NOT be present
+        for label in &["pod", "instance", "node"] {
             assert!(
-                metric.contains_key("cloud_account_id") || metric.contains_key("account_id"),
-                "account_id should be present in output"
+                !metric.contains_key(*label),
+                "{} label should not appear in result",
+                label
             );
-
-            // service_name (output as "service")
-            assert!(
-                metric.contains_key("service") || metric.contains_key("service_name"),
-                "service_name should be present in output"
-            );
-
-            // Other labels (pod, instance, node) should NOT be present
-            for label in &["pod", "instance", "node"] {
-                assert!(
-                    !metric.contains_key(*label),
-                    "{} label should not appear in result",
-                    label
-                );
-            }
         }
     }
 
@@ -501,15 +510,18 @@ async fn test_grouping_by_binary_columns() -> Result<(), Box<dyn std::error::Err
     assert_eq!(body["status"], "success");
 
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if !result.is_empty() {
-        // Verify trace_id is present in results
-        for series in result {
-            let metric = series["metric"].as_object().expect("metric should be an object");
-            assert!(
-                metric.contains_key("trace_id"),
-                "trace_id should be present in grouped output"
-            );
-        }
+    assert!(
+        !result.is_empty(),
+        "Expected non-empty result after writing binary grouping test data (grouping by trace_id)"
+    );
+
+    // Verify trace_id is present in results
+    for series in result {
+        let metric = series["metric"].as_object().expect("metric should be an object");
+        assert!(
+            metric.contains_key("trace_id"),
+            "trace_id should be present in grouped output"
+        );
     }
 
     // Test 2: Group by span_id (FixedSizeBinary(8))
@@ -538,15 +550,18 @@ async fn test_grouping_by_binary_columns() -> Result<(), Box<dyn std::error::Err
     assert_eq!(body["status"], "success");
 
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if !result.is_empty() {
-        // Verify span_id is present in results
-        for series in result {
-            let metric = series["metric"].as_object().expect("metric should be an object");
-            assert!(
-                metric.contains_key("span_id"),
-                "span_id should be present in grouped output"
-            );
-        }
+    assert!(
+        !result.is_empty(),
+        "Expected non-empty result after writing binary grouping test data (grouping by span_id)"
+    );
+
+    // Verify span_id is present in results
+    for series in result {
+        let metric = series["metric"].as_object().expect("metric should be an object");
+        assert!(
+            metric.contains_key("span_id"),
+            "span_id should be present in grouped output"
+        );
     }
 
     server.shutdown().await;

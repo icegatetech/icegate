@@ -67,7 +67,7 @@ impl Planner for DataFusionPlanner {
     type Plan = DataFrame;
 
     async fn plan(&self, expr: LogQLExpr) -> Result<Self::Plan> {
-        match expr {
+        let df = match expr {
             LogQLExpr::Log(log_expr) => {
                 let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
 
@@ -79,13 +79,12 @@ impl Planner for DataFusionPlanner {
                 // Apply limit only for log queries (not metrics)
                 // Uses context limit or Loki default of 100 entries
                 let limit = self.query_ctx.limit.unwrap_or(DEFAULT_LOG_LIMIT);
-                let df = df.limit(0, Some(limit))?;
-
-                // Transform output: hex-encode binary columns, add `level` alias
-                Self::transform_output_columns(df)
+                df.limit(0, Some(limit))?
             }
-            LogQLExpr::Metric(metric_expr) => self.plan_metric(metric_expr).await,
-        }
+            LogQLExpr::Metric(metric_expr) => self.plan_metric(metric_expr).await?,
+        };
+        // Transform output: hex-encode binary columns, add `level` alias
+        Self::transform_output_columns(df)
     }
 }
 
@@ -551,7 +550,6 @@ impl DataFusionPlanner {
                 }
 
                 // Add indexed columns NOT in exclusion list
-                // Skip trace_id and span_id as they are FixedSizeBinary and can't be grouped
                 for &col_name in LOG_INDEXED_ATTRIBUTE_COLUMNS {
                     if !excluded_indexed_cols.contains(&col_name) {
                         grouping_exprs.push(col(col_name));
@@ -1207,7 +1205,7 @@ impl DataFusionPlanner {
                 }
 
                 // Add all indexed columns that are NOT excluded and exist in schema
-                // Skip trace_id and span_id as they are FixedSizeBinary and can't be grouped
+                // Binary columns (trace_id, span_id) are included and will be converted to hex in transform_output_columns
                 for &col_name in LOG_INDEXED_ATTRIBUTE_COLUMNS {
                     if !excluded_indexed_cols.contains(&col_name) && schema.inner().column_with_name(col_name).is_some()
                     {
