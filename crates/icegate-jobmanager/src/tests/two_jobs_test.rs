@@ -11,8 +11,9 @@ use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
+use crate::storage::Storage;
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
+    CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
     s3_storage::{S3Storage, S3StorageConfig},
@@ -104,22 +105,28 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     ])?);
 
     // 4. Create storage
-    let storage = S3Storage::new(
-        S3StorageConfig {
-            endpoint: minio_env.endpoint().to_string(),
-            access_key_id: minio_env.username().to_string(),
-            secret_access_key: minio_env.password().to_string(),
-            bucket_name: "test-jobs".to_string(),
-            use_ssl: false,
-            region: "us-east-1".to_string(),
-            bucket_prefix: "jobs".to_string(),
-            request_timeout: Duration::from_secs(5),
-            retrier_config: RetrierConfig::default(),
-        },
-        job_registry.clone(),
+    let storage = Arc::new(
+        S3Storage::new(
+            S3StorageConfig {
+                endpoint: minio_env.endpoint().to_string(),
+                access_key_id: minio_env.username().to_string(),
+                secret_access_key: minio_env.password().to_string(),
+                bucket_name: "test-jobs".to_string(),
+                use_ssl: false,
+                region: "us-east-1".to_string(),
+                bucket_prefix: "jobs".to_string(),
+                request_timeout: Duration::from_millis(100),
+                retrier_config: RetrierConfig::default(),
+            },
+            job_registry.clone(),
+            Metrics::new_disabled(),
+        )
+        .await?,
+    );
+    let storage = Arc::new(CachedStorage::new(
+        storage.clone() as Arc<dyn Storage>,
         Metrics::new_disabled(),
-    )
-    .await?;
+    ));
 
     // 5. Start manager with 2 workers
     let config = JobsManagerConfig {
@@ -133,7 +140,7 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut manager_env = ManagerEnv::new(
-        Arc::new(storage),
+        storage,
         config,
         Arc::clone(&job_registry),
         vec![primary_job_def.clone(), secondary_job_def.clone()],
