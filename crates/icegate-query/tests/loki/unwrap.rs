@@ -452,7 +452,6 @@ async fn test_stddev_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test]
-#[ignore = "Parser does not extract quantile parameter yet (visitor returns None for param)"]
 async fn test_quantile_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start(3225).await?;
 

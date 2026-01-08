@@ -630,8 +630,8 @@ impl DataFusionPlanner {
             .as_ref()
             .ok_or_else(|| QueryError::Plan("Unwrap expression required for this aggregation".to_string()))?;
 
-        // 1.5. Validate grouping support
-        // Per Loki spec: sum_over_time, rate, rate_counter, and absent_over_time don't support grouping
+        // 1.5. Validate grouping support for unwrap-based range aggregations
+        // Per Loki spec: sum_over_time and rate_counter don't support grouping with unwrap expressions
         if agg.grouping.is_some() {
             match agg.op {
                 RangeAggregationOp::SumOverTime | RangeAggregationOp::RateCounter => {
