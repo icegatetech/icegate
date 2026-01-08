@@ -15,14 +15,26 @@ use crate::{
     JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
-    s3_storage::{S3Storage, S3StorageConfig},
+    s3_storage::{JobStateCodecKind, S3Storage, S3StorageConfig},
 };
 
 /// `TestSimpleJobExecution` verifies basic job execution with one task
 #[tokio::test]
-async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_simple_job_execution_json() -> Result<(), Box<dyn std::error::Error>> {
     super::common::init_tracing();
 
+    run_simple_job_execution(JobStateCodecKind::Json).await
+}
+
+/// `TestSimpleJobExecution` verifies basic job execution with one task
+#[tokio::test]
+async fn test_simple_job_execution_cbor() -> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
+    run_simple_job_execution(JobStateCodecKind::Cbor).await
+}
+
+async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dyn std::error::Error>> {
     let max_iterations = 1u64;
 
     // 1. Start MinIO
@@ -38,7 +50,7 @@ async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
     let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let executed = Arc::clone(&executed_clone);
         let task_input = Arc::clone(&task_input_clone);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
         let input = task.get_input().to_vec();
 
         Box::pin(async move {
@@ -61,8 +73,8 @@ async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
         JobCode::new("test_simple_job"),
         vec![task_def],
         executors,
-        max_iterations,
-    )?;
+    )?
+    .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -77,6 +89,7 @@ async fn test_simple_job_execution() -> Result<(), Box<dyn std::error::Error>> {
             use_ssl: false,
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
+            job_state_codec: codec,
             request_timeout: Duration::from_secs(5),
             retrier_config: RetrierConfig::default(),
         },
@@ -139,7 +152,7 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
     let first_executed_clone = Arc::clone(&first_task_executed);
     let first_task_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let executed = Arc::clone(&first_executed_clone);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
 
         Box::pin(async move {
             executed.store(true, Ordering::SeqCst);
@@ -159,7 +172,7 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
     let second_executed_clone = Arc::clone(&second_task_executed);
     let second_task_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let executed = Arc::clone(&second_executed_clone);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
         let input = task.get_input().to_vec();
 
         Box::pin(async move {
@@ -179,8 +192,8 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
         JobCode::new("test_sequence_job"),
         vec![first_task_def],
         executors,
-        max_iterations,
-    )?;
+    )?
+    .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -195,6 +208,7 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
             use_ssl: false,
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
+            job_state_codec: JobStateCodecKind::Json,
             request_timeout: Duration::from_secs(5),
             retrier_config: RetrierConfig::default(),
         },

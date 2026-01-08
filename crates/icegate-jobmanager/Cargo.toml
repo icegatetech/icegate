@@ -31,6 +31,7 @@ aws-config = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_cbor = "0.11"
 
 # Metrics
 opentelemetry = { version = "0.31.0", features = ["metrics"] }

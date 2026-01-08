@@ -15,7 +15,7 @@ pub mod registry {
     pub use crate::core::registry::TaskExecutorFn;
 }
 pub mod s3_storage {
-    pub use crate::storage::s3::{S3Storage, S3StorageConfig};
+    pub use crate::storage::s3::{JobStateCodecKind, S3Storage, S3StorageConfig};
 }
 
 // Re-exports

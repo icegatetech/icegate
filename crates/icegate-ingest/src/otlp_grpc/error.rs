@@ -35,6 +35,7 @@ impl From<GrpcError> for Status {
             | IngestError::Config(_)
             | IngestError::Iceberg(_)
             | IngestError::Join(_)
+            | IngestError::Shift(_)
             | IngestError::Other(_)
             | IngestError::Multiple(_) => (Code::Internal, err.0.to_string()),
         };

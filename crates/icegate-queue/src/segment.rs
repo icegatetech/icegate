@@ -68,6 +68,91 @@ impl SegmentId {
     }
 }
 
+// TODO(crit): check
+/// Status of a queue segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SegmentStatus {
+    /// Segment is being written.
+    Writing,
+    /// Segment write completed successfully.
+    Complete,
+    /// Segment has been compacted to Iceberg.
+    Compacted,
+    /// Segment write failed.
+    Failed,
+}
+
+/// Metadata for a queue segment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentMetadata {
+    /// Topic name.
+    pub topic: Topic,
+    /// Segment offset.
+    pub offset: u64,
+    /// Number of records in the segment.
+    pub record_count: i64,
+    /// Size of the segment in bytes.
+    pub size_bytes: u64,
+    /// Number of row groups in the segment.
+    pub row_group_count: usize,
+    /// Segment status.
+    pub status: SegmentStatus,
+    /// Schema fingerprint (hash of Arrow schema).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_fingerprint: Option<String>,
+    /// Creation timestamp (Unix epoch millis).
+    pub created_at: u128,
+}
+
+impl SegmentMetadata {
+    /// Creates new segment metadata.
+    #[must_use]
+    pub fn new(
+        topic: impl Into<Topic>,
+        offset: u64,
+        record_count: i64,
+        size_bytes: u64,
+        row_group_count: usize,
+    ) -> Self {
+        Self {
+            topic: topic.into(),
+            offset,
+            record_count,
+            size_bytes,
+            row_group_count,
+            status: SegmentStatus::Complete,
+            schema_fingerprint: None,
+            // Safe cast: millis since epoch won't overflow u64 until year 584,554,049 AD
+            #[allow(clippy::cast_possible_truncation)]
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        }
+    }
+
+    /// Creates a segment ID from this metadata.
+    #[must_use]
+    pub fn segment_id(&self) -> SegmentId {
+        SegmentId::new(&self.topic, self.offset)
+    }
+
+    /// Sets the schema fingerprint.
+    #[must_use]
+    pub fn with_schema_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.schema_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Sets the status.
+    #[must_use]
+    pub const fn with_status(mut self, status: SegmentStatus) -> Self {
+        self.status = status;
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

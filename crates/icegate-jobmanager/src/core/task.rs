@@ -41,7 +41,9 @@ impl From<&str> for TaskCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
+    // TODO(med): add status transitions
     Todo,      // task is waiting to be picked up by a worker
+    Blocked,   // task is blocked by dependencies
     Started,   // task is currently being executed by a worker
     Completed, // task finished successfully
     Failed,    // task execution failed, task will be processed again
@@ -51,6 +53,7 @@ impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Todo => write!(f, "todo"),
+            Self::Blocked => write!(f, "blocked"),
             Self::Started => write!(f, "started"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
@@ -65,14 +68,21 @@ pub struct TaskDefinition {
     code: TaskCode,
     input: Vec<u8>,
     timeout: Duration,
+    depends_on: Vec<Uuid>,
 }
 
 impl TaskDefinition {
     pub fn new(code: TaskCode, input: Vec<u8>, timeout: Duration) -> Result<Self, Error> {
+        // TODO(crit): add setting to max input size
         if timeout <= Duration::zero() {
             return Err(Error::Other("task timeout must be positive".into()));
         }
-        Ok(Self { code, input, timeout })
+        Ok(Self {
+            code,
+            input,
+            timeout,
+            depends_on: Vec::new(),
+        })
     }
 
     pub const fn code(&self) -> &TaskCode {
@@ -87,15 +97,27 @@ impl TaskDefinition {
     pub const fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    /// Sets task dependencies by task id.
+    pub fn with_dependencies(mut self, depends_on: Vec<Uuid>) -> Self {
+        self.depends_on = depends_on;
+        self
+    }
+
+    /// Returns dependency task ids.
+    pub fn depends_on(&self) -> &[Uuid] {
+        &self.depends_on
+    }
 }
 
 /// Read-only view of a task for workers and clients.
 pub trait ImmutableTask: Send + Sync {
-    fn id(&self) -> &str;
+    fn id(&self) -> &Uuid;
     fn code(&self) -> &TaskCode;
     fn get_input(&self) -> &[u8];
     fn get_output(&self) -> &[u8];
     fn get_error(&self) -> &str;
+    fn depends_on(&self) -> &[Uuid];
     fn is_expired(&self) -> bool;
     fn is_completed(&self) -> bool;
     fn is_failed(&self) -> bool;
@@ -105,11 +127,11 @@ pub trait ImmutableTask: Send + Sync {
 // Task - internal task representation
 #[derive(Debug, Clone)]
 pub(crate) struct Task {
-    id: String,
+    id: Uuid,
     code: TaskCode,
     status: TaskStatus,
-    processing_by_worker: String,
-    created_by_worker: String,
+    processing_by_worker: Option<Uuid>,
+    created_by_worker: Uuid,
     timeout: Duration,
     started_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
@@ -118,15 +140,21 @@ pub(crate) struct Task {
     input: Vec<u8>,
     output: Vec<u8>,
     error_msg: String,
+    depends_on: Vec<Uuid>,
 }
 
 impl Task {
-    pub(crate) fn new(created_by_worker: String, task_def: &TaskDefinition) -> Self {
+    pub(crate) fn new(created_by_worker: Uuid, task_def: &TaskDefinition) -> Self {
+        let status = if task_def.depends_on().is_empty() {
+            TaskStatus::Todo
+        } else {
+            TaskStatus::Blocked
+        };
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: Uuid::new_v4(),
             code: task_def.code().clone(),
-            status: TaskStatus::Todo,
-            processing_by_worker: String::new(),
+            status,
+            processing_by_worker: None,
             created_by_worker,
             timeout: task_def.timeout(),
             started_at: None,
@@ -136,16 +164,17 @@ impl Task {
             input: task_def.input().to_vec(),
             output: Vec::new(),
             error_msg: String::new(),
+            depends_on: task_def.depends_on().to_vec(),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) const fn restore(
-        id: String,
+        id: Uuid,
         code: TaskCode,
         status: TaskStatus,
-        processing_by_worker: String,
-        created_by_worker: String,
+        processing_by_worker: Option<Uuid>,
+        created_by_worker: Uuid,
         timeout: Duration,
         started_at: Option<DateTime<Utc>>,
         completed_at: Option<DateTime<Utc>>,
@@ -154,6 +183,7 @@ impl Task {
         input: Vec<u8>,
         output: Vec<u8>,
         error_msg: String,
+        depends_on: Vec<Uuid>,
     ) -> Self {
         Self {
             id,
@@ -169,11 +199,12 @@ impl Task {
             input,
             output,
             error_msg,
+            depends_on,
         }
     }
 
     // Accessors
-    pub(crate) fn id(&self) -> &str {
+    pub(crate) const fn id(&self) -> &Uuid {
         &self.id
     }
 
@@ -185,12 +216,12 @@ impl Task {
         &self.status
     }
 
-    pub(crate) fn processing_by_worker(&self) -> &str {
-        &self.processing_by_worker
+    pub(crate) const fn processing_by_worker(&self) -> Option<Uuid> {
+        self.processing_by_worker
     }
 
-    pub(crate) fn created_by_worker(&self) -> &str {
-        &self.created_by_worker
+    pub(crate) const fn created_by_worker(&self) -> Uuid {
+        self.created_by_worker
     }
 
     pub(crate) const fn timeout(&self) -> Duration {
@@ -225,6 +256,10 @@ impl Task {
         &self.error_msg
     }
 
+    pub(crate) fn depends_on(&self) -> &[Uuid] {
+        &self.depends_on
+    }
+
     // State checks
     pub(crate) fn is_expired(&self) -> bool {
         self.deadline_at.is_some_and(|deadline| Utc::now() > deadline)
@@ -249,14 +284,21 @@ impl Task {
     pub(crate) fn can_be_picked_up(&self) -> bool {
         match self.status {
             TaskStatus::Todo | TaskStatus::Failed => true, // TODO(low): add limit on number of attempts
+            TaskStatus::Blocked => false,
             TaskStatus::Started => self.is_expired(),
             TaskStatus::Completed => false,
         }
     }
 
-    pub(crate) fn start(&mut self, worker_id: String) -> Result<(), JobError> {
+    pub(crate) fn unblock(&mut self) {
+        if matches!(self.status, TaskStatus::Blocked) {
+            self.status = TaskStatus::Todo;
+        }
+    }
+
+    pub(crate) fn start(&mut self, worker_id: Uuid) -> Result<(), JobError> {
         if !self.can_be_picked_up() {
-            if self.processing_by_worker != worker_id {
+            if self.processing_by_worker != Some(worker_id) {
                 return Err(JobError::TaskWorkerMismatch);
             }
             return Err(JobError::Other(format!(
@@ -266,7 +308,7 @@ impl Task {
         }
 
         self.status = TaskStatus::Started;
-        self.processing_by_worker = worker_id;
+        self.processing_by_worker = Some(worker_id);
         let now = Utc::now();
         self.started_at = Some(now);
         self.deadline_at = Some(now + self.timeout);
@@ -308,7 +350,7 @@ impl Task {
 
 // ImmutableTask implementation for Task
 impl ImmutableTask for Task {
-    fn id(&self) -> &str {
+    fn id(&self) -> &Uuid {
         &self.id
     }
 
@@ -326,6 +368,10 @@ impl ImmutableTask for Task {
 
     fn get_error(&self) -> &str {
         self.error_msg()
+    }
+
+    fn depends_on(&self) -> &[Uuid] {
+        self.depends_on()
     }
 
     fn is_expired(&self) -> bool {

@@ -11,7 +11,7 @@ use icegate_jobmanager::{
     Error, JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
-    s3_storage::{S3Storage, S3StorageConfig},
+    s3_storage::{JobStateCodecKind, S3Storage, S3StorageConfig},
 };
 use rand::Rng;
 
@@ -34,7 +34,7 @@ async fn run_simple_seq_job() -> Result<(), Error> {
 
     // Create executors for both steps
     let first_step_executor: TaskExecutorFn = Arc::new(|task, manager, _cancel_token| {
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
 
         Box::pin(async move {
             tracing::info!("[FirstStep] Started, task_id: {}", task_id);
@@ -64,7 +64,7 @@ async fn run_simple_seq_job() -> Result<(), Error> {
     });
 
     let second_step_executor: TaskExecutorFn = Arc::new(|task, manager, _cancel_token| {
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
         let input = String::from_utf8_lossy(task.get_input()).to_string();
 
         Box::pin(async move {
@@ -87,7 +87,6 @@ async fn run_simple_seq_job() -> Result<(), Error> {
         JobCode::new("simple sequence job"),
         vec![task_def],
         task_executors,
-        0, // max_iterations (0 = unlimited)
     )?;
 
     // Create job definitions
@@ -103,6 +102,7 @@ async fn run_simple_seq_job() -> Result<(), Error> {
             use_ssl: false,
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
+            job_state_codec: JobStateCodecKind::Json,
             request_timeout: Duration::from_secs(5),
             retrier_config: RetrierConfig::default(),
         },

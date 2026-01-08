@@ -40,6 +40,10 @@ pub enum IngestError {
     #[error("join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 
+    /// Shift operation error
+    #[error("shift error: {0}")]
+    Shift(String),
+
     /// Other errors
     #[error("other error: {0}")]
     Other(#[from] Box<dyn Error + Send + Sync>),
@@ -60,5 +64,11 @@ impl From<icegate_common::error::CommonError> for IngestError {
             CommonError::Io(e) => Self::Io(e),
             CommonError::ObjectStore(e) => Self::Config(format!("object store error: {e}")),
         }
+    }
+}
+
+impl From<arrow::error::ArrowError> for IngestError {
+    fn from(err: arrow::error::ArrowError) -> Self {
+        Self::Other(Box::new(err))
     }
 }

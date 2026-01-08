@@ -138,6 +138,7 @@ pub fn logs_schema() -> Result<Schema> {
 /// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn logs_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
+    // TODO(crit): remove cloud_account_id - we can't control it because it comes from inside the records.
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(1)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?

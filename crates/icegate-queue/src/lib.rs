@@ -45,9 +45,11 @@ mod config;
 mod error;
 mod segment;
 mod writer;
+mod reader;
 
 pub use channel::{Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult, channel};
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
+pub use reader::QueueReader;
 pub use segment::SegmentId;
 pub use writer::QueueWriter;

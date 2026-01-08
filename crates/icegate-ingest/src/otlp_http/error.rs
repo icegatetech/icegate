@@ -42,6 +42,7 @@ impl IntoResponse for OtlpError {
             | IngestError::Config(_)
             | IngestError::Iceberg(_)
             | IngestError::Join(_)
+            | IngestError::Shift(_)
             | IngestError::Other(_)
             | IngestError::Multiple(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::Internal),
         };

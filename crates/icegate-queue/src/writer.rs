@@ -1,4 +1,4 @@
-//! Queue writer for durable Parquet segments on object storage.
+//! Queue writer for durable Parquet segments on object storage. A common component for storage, it doesn't know what data it uses.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -217,8 +217,8 @@ impl QueueWriter {
 
     /// Writes a batch to object storage, returning the offset and record count.
     ///
-    /// This is the core write method used internally. For normal usage, prefer
-    /// using the channel-based approach via `start()`.
+    /// This is the core write method used internally. For normal usage, prefer using the channel-based approach via `start()`.
+    /// Now we always have one row group for each parquet file, because group_by_column is always optional.
     async fn write_batch(
         &self,
         topic: &Topic,

@@ -46,17 +46,17 @@ impl ManagerEnv {
             let mut all_done = true;
 
             for (job_code, job_def) in &self.job_registry {
-                // Skip unlimited jobs (max_iterations == 0)
-                if job_def.max_iterations() == 0 {
+                // Skip unlimited jobs
+                let Some(max_iterations) = job_def.max_iterations() else {
                     continue;
-                }
+                };
 
                 match self.storage.get_job(job_code, &cancel_token).await {
                     Ok(job) => {
                         // Job is not done if:
                         // 1. Not processed yet, OR
                         // 2. Hasn't reached the iteration limit
-                        if !job.is_processed() || job.iter_num() < job_def.max_iterations() {
+                        if !job.is_processed() || job.iter_num() < max_iterations {
                             all_done = false;
                             break;
                         }

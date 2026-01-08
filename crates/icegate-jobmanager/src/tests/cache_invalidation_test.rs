@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::common::in_memory_storage::InMemoryStorage;
 use crate::{CachedStorage, Job, JobCode, Metrics, Storage, Task, TaskCode, TaskDefinition};
@@ -17,16 +18,17 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
         Metrics::new_disabled(),
     ));
     let cancel_token = CancellationToken::new();
+    let worker_id = Uuid::from_u128(1);
 
     let task = Task::new(
-        "worker-1".to_string(),
+        worker_id,
         &TaskDefinition::new(TaskCode::from("cache_task"), Vec::new(), ChronoDuration::seconds(5))?,
     );
 
     let job_code = JobCode::new("test_cache_job");
 
-    let mut job = Job::new(job_code.clone(), vec![task], HashMap::new(), "worker-1".to_string(), 1);
-    job.work("worker-1")?;
+    let mut job = Job::new(job_code.clone(), vec![task], HashMap::new(), worker_id, Some(1), None);
+    job.work(&worker_id)?;
 
     storage.save_job(&mut job, &cancel_token).await?;
     assert_eq!(storage.version(), 1);

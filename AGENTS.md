@@ -181,3 +181,4 @@ The project uses `rustfmt` for code formatting. Configuration is in `rustfmt.tom
 - ALWAYS prefer editing an existing file to creating a new one
 - NEVER proactively create documentation files (*.md) or README files unless explicitly requested
 - Ensure each file is finishing by new line, do not duplicate if it already exists
+- It is better to give an error than to use/calculate/show invalid data.

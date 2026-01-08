@@ -3,13 +3,14 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use chrono::Duration as ChronoDuration;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv, storage_wrapper::CountingStorage};
 use crate::{
     CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, Storage,
     TaskCode, TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
-    s3_storage::{S3Storage, S3StorageConfig},
+    s3_storage::{JobStateCodecKind, S3Storage, S3StorageConfig},
 };
 
 // TODO(med): Add a check for the absence of errors in the logs. It won't be easy to do this, because when subscribing to errors and parallel tests, we catch errors from all tests and it's difficult to account for errors only in a specific test.
@@ -47,8 +48,8 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     let minio_env = MinIOEnv::new().await?;
 
     // 2. Track execution
-    let executed_primary_tasks: Arc<DashMap<String, bool>> = Arc::new(DashMap::new());
-    let executed_sec_tasks: Arc<DashMap<String, bool>> = Arc::new(DashMap::new());
+    let executed_primary_tasks: Arc<DashMap<Uuid, bool>> = Arc::new(DashMap::new());
+    let executed_sec_tasks: Arc<DashMap<Uuid, bool>> = Arc::new(DashMap::new());
 
     let executed_primary_tasks_counter = Arc::clone(&executed_primary_tasks);
     let executed_sec_tasks_counter = Arc::clone(&executed_sec_tasks);
@@ -56,7 +57,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     // Init task executor
     let primary_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let executed = Arc::clone(&executed_primary_tasks_counter);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
 
         Box::pin(async move {
             // Create multiple work tasks
@@ -70,7 +71,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
                 manager.add_task(secondary_task_def)?;
             }
 
-            executed.insert(task_id.clone(), true);
+            executed.insert(task_id, true);
 
             manager.complete_task(&task_id, Vec::new())
         })
@@ -79,14 +80,14 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     // Work task executor
     let secondary_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let executed = Arc::clone(&executed_sec_tasks_counter);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
 
         Box::pin(async move {
             // Simulate some work
             tokio::time::sleep(Duration::from_millis(20)).await;
 
             // Track execution
-            executed.insert(task_id.clone(), true);
+            executed.insert(task_id, true);
 
             manager.complete_task(&task_id, b"done".to_vec())
         })
@@ -102,8 +103,8 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
         JobCode::new("test_concurrent_job"),
         vec![primary_task_def],
         executors,
-        max_iterations,
-    )?;
+    )?
+    .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -119,6 +120,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
                 use_ssl: false,
                 region: "us-east-1".to_string(),
                 bucket_prefix: "jobs".to_string(),
+                job_state_codec: JobStateCodecKind::Json,
                 request_timeout: Duration::from_secs(5),
                 retrier_config: RetrierConfig::default(),
             },
