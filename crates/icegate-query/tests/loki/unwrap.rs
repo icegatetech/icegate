@@ -715,23 +715,20 @@ async fn test_avg_over_time_with_by_grouping() -> Result<(), Box<dyn std::error:
 
     // Verify that result has service_name label but not other labels
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if result.is_empty() {
-        panic!("Result is empty!");
-    } else {
-        let series = &result[0];
-        let metric = series["metric"].as_object().expect("metric should be an object");
-        // Note: "service_name" column is output as "service" for Loki compatibility
-        assert!(
-            metric.contains_key("service") || metric.contains_key("service_name"),
-            "Should have service or service_name label"
-        );
-        // Attributes should be filtered - only service_name grouping
-        // Verify we don't have other indexed columns like account_id
-        assert!(
-            !metric.contains_key("account_id"),
-            "Should NOT have account_id label (filtered by 'by' clause)"
-        );
-    }
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
+    // Attributes should be filtered - only service_name grouping
+    // Verify we don't have other indexed columns like account_id
+    assert!(
+        !metric.contains_key("account_id"),
+        "Should NOT have account_id label (filtered by 'by' clause)"
+    );
 
     server.shutdown().await;
     Ok(())
@@ -771,26 +768,23 @@ async fn test_max_over_time_with_without_grouping() -> Result<(), Box<dyn std::e
 
     // Verify that result has labels but NOT account_id
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if result.is_empty() {
-        panic!("Result is empty!");
-    } else {
-        let series = &result[0];
-        let metric = series["metric"].as_object().expect("metric should be an object");
-        assert!(
-            !metric.contains_key("account_id"),
-            "Should NOT have account_id label (filtered by 'without' clause)"
-        );
-        // Note: "service_name" column is output as "service" for Loki compatibility
-        assert!(
-            metric.contains_key("service") || metric.contains_key("service_name"),
-            "Should have service or service_name label"
-        );
-        // Should also have level/severity_text since it wasn't excluded
-        assert!(
-            metric.contains_key("level") || metric.contains_key("severity_text"),
-            "Should have level or severity_text label"
-        );
-    }
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    assert!(
+        !metric.contains_key("account_id"),
+        "Should NOT have account_id label (filtered by 'without' clause)"
+    );
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
+    // Should also have level/severity_text since it wasn't excluded
+    assert!(
+        metric.contains_key("level") || metric.contains_key("severity_text"),
+        "Should have level or severity_text label"
+    );
 
     server.shutdown().await;
     Ok(())
@@ -832,17 +826,14 @@ async fn test_sum_over_time_grouping_via_vector_aggregation() -> Result<(), Box<
 
     // Verify that result has service_name label
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if result.is_empty() {
-        panic!("Result is empty!");
-    } else {
-        let series = &result[0];
-        let metric = series["metric"].as_object().expect("metric should be an object");
-        // Note: "service_name" column is output as "service" for Loki compatibility
-        assert!(
-            metric.contains_key("service") || metric.contains_key("service_name"),
-            "Should have service or service_name label"
-        );
-    }
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
 
     server.shutdown().await;
     Ok(())
@@ -883,17 +874,14 @@ async fn test_rate_counter_grouping_via_vector_aggregation() -> Result<(), Box<d
 
     // Verify that result has service_name label
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if result.is_empty() {
-        panic!("Result is empty!");
-    } else {
-        let series = &result[0];
-        let metric = series["metric"].as_object().expect("metric should be an object");
-        // Note: "service_name" column is output as "service" for Loki compatibility
-        assert!(
-            metric.contains_key("service") || metric.contains_key("service_name"),
-            "Should have service or service_name label"
-        );
-    }
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
 
     server.shutdown().await;
     Ok(())
@@ -933,22 +921,19 @@ async fn test_min_over_time_with_by_multiple_labels() -> Result<(), Box<dyn std:
 
     // Verify that result has both service_name and level labels
     let result = body["data"]["result"].as_array().expect("result should be an array");
-    if result.is_empty() {
-        panic!("Result is empty!");
-    } else {
-        let series = &result[0];
-        let metric = series["metric"].as_object().expect("metric should be an object");
-        // Note: "service_name" column is output as "service" for Loki compatibility
-        assert!(
-            metric.contains_key("service") || metric.contains_key("service_name"),
-            "Should have service or service_name label"
-        );
-        // Note: 'level' is mapped to 'severity_text' internally
-        assert!(
-            metric.contains_key("level") || metric.contains_key("severity_text"),
-            "Should have level or severity_text label"
-        );
-    }
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
+    // Note: 'level' is mapped to 'severity_text' internally
+    assert!(
+        metric.contains_key("level") || metric.contains_key("severity_text"),
+        "Should have level or severity_text label"
+    );
 
     server.shutdown().await;
     Ok(())

@@ -742,7 +742,7 @@ impl DataFusionPlanner {
             df = df.with_column("attributes", filtered_attrs_expr)?;
 
             // Return the grouping expressions
-            // Note: RateCounter cannot reach this branch due to validation at lines 687-699
+            // Note: RateCounter cannot reach this branch due to validation at 1.5 step
             grouping_exprs
         } else {
             // No grouping specified - group by all labels (default behavior)
