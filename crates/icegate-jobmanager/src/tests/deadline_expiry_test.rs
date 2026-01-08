@@ -89,9 +89,9 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // 5. Start manager with enough workers for all expected attempts
+    // 5. Start manager with 2 workers
     let config = JobsManagerConfig {
-        worker_count: expected_attempts as usize,
+        worker_count: 3,
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(10),
             poll_interval_randomization: Duration::from_millis(0),
