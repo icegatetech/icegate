@@ -10,8 +10,8 @@ All code you write MUST be fully optimized.
 
 - maximizing algorithmic big-O efficiency for memory and runtime
 - using parallelization and SIMD where appropriate
-- following proper style conventions for Rust (e.g. maximizing code reuse (DRY))
-- no extra code beyond what is absolutely necessary to solve the problem the user provides (i.e. no technical debt)
+- following proper style conventions for Rust (e.g., maximizing code reuse (DRY))
+- no extra code beyond what is necessary to solve the problem the user provides (i.e., no technical debt)
 
 Before completing a task, perform an additional optimization pass to verify the code meets these standards. If optimization opportunities remain, address them before handing off to the user.
 
@@ -20,18 +20,18 @@ Before completing a task, perform an additional optimization pass to verify the 
 - Use `cargo` for project management, building, and dependency management.
 - Use `serde` with `serde_json` for JSON serialization/deserialization.
 - Use `axum` for creating any web servers or HTTP APIs.
-    - Keep request handlers async, returning `Result<Response, AppError>` to centralize error handling.
-    - Use layered extractors and shared state structs instead of global mutable data.
-    - Add `tower` middleware (timeouts, tracing, compression) for observability and resilience.
-    - Offload CPU-bound work to `tokio::task::spawn_blocking` or background services to avoid blocking the reactor.
+  - Keep request handlers async, returning `Result<Response, AppError>` to centralize error handling.
+  - Use layered extractors and shared state structs instead of global mutable data.
+  - Add `tower` middleware (timeouts, tracing, compression) for observability and resilience.
+  - Offload CPU-bound work to `tokio::task::spawn_blocking` or background services to avoid blocking the reactor.
 - When reporting errors to the console, use `tracing::error!` or `log::error!` instead of `println!`.
 
 ## Code Style and Formatting
 
 - **MUST** use meaningful, descriptive variable and function names
 - **MUST** follow Rust API Guidelines and idiomatic Rust conventions
-- **MUST** use 4 spaces for indentation (never tabs)
-- **NEVER** use emoji, or unicode that emulates emoji (e.g. ✓, ✗). The only exception is when writing tests and testing the impact of multibyte characters.
+- **MUST** use four spaces for indentation (never tabs)
+- **NEVER** use emoji, or Unicode that emulates emoji (e.g., ✓, ✗). The only exception is when writing tests and testing the impact of multibyte characters.
 - Use snake_case for functions/variables/modules, PascalCase for types/traits, SCREAMING_SNAKE_CASE for constants
 - Limit line length to 100 characters (rustfmt default)
 - Assume the user is a Python expert, but a Rust novice. Include additional code comments around Rust-specific nuances that a Python developer may not recognize.
@@ -40,7 +40,7 @@ Before completing a task, perform an additional optimization pass to verify the 
 
 - **MUST** include doc comments for all public functions, structs, enums, and methods
 - **MUST** document function parameters, return values, and errors
-- Keep comments up-to-date with code changes
+- Keep comments up to date with code changes
 - Include examples in doc comments for complex functions
 
 Example doc comment:
@@ -101,7 +101,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - **MUST** keep types focused on a single responsibility
 - **MUST** derive common traits: `Debug`, `Clone`, `PartialEq` where appropriate
 - Use `#[derive(Default)]` when a sensible default exists
-- Prefer composition over inheritance-like patterns
+- Prefer composition to inheritance-like patterns
 - Use builder pattern for complex struct construction
 - Make fields private by default; provide accessor methods when needed
 
