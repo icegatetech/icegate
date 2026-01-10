@@ -15,6 +15,7 @@ use datafusion::{
     arrow::datatypes::{DataType, IntervalMonthDayNano},
     functions::string::octet_length,
     functions_aggregate::expr_fn::{count, last_value, sum},
+    functions_nested::make_array::make_array,
     functions_window::lead_lag::lag,
     logical_expr::{Expr, ExprSchemable, ScalarUDF, col, lit, when},
     prelude::*,
@@ -497,9 +498,7 @@ impl DataFusionPlanner {
         grouping: &crate::logql::common::Grouping,
         include_timestamp: bool,
     ) -> (Vec<Expr>, Expr) {
-        use datafusion::functions_nested::{
-            make_array::make_array, map_keys::map_keys, map_values::map_values, string::array_to_string,
-        };
+        use datafusion::functions_nested::{map_keys::map_keys, map_values::map_values, string::array_to_string};
 
         use crate::logql::common::Grouping;
 
