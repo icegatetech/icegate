@@ -529,12 +529,17 @@ impl DataFusionPlanner {
                 grouping_exprs.extend(indexed_cols.iter().map(|c| col(*c)));
 
                 // Filter attributes MAP to keep only specified labels
-                let filtered_attrs = {
-                    // Always use MapKeepKeys, even with empty array (creates empty MAP)
-                    let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
-                    let label_array = make_array(attr_labels.iter().map(|l| lit(*l)).collect());
-                    udf.call(vec![col("attributes"), label_array])
+                // Always use MapKeepKeys UDF to ensure consistent MAP schema (keys and values as strings)
+                // When attr_labels is empty, use a typed empty array to filter out all attributes
+                let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
+                let label_array = if attr_labels.is_empty() {
+                    // Create typed empty array using arrow_cast to avoid type inference issues
+                    // This ensures MapKeepKeys receives a List(Utf8) argument
+                    datafusion::functions::core::arrow_cast().call(vec![make_array(vec![]), lit("List(Utf8)")])
+                } else {
+                    make_array(attr_labels.iter().map(|l| lit(*l)).collect())
                 };
+                let filtered_attrs = udf.call(vec![col("attributes"), label_array]);
 
                 if attr_labels.is_empty() {
                     // No attributes to group by - use empty MAP serialization
@@ -852,6 +857,14 @@ impl DataFusionPlanner {
         if schema.inner().column_with_name("attributes").is_some() {
             select_exprs.push(col("attributes"));
         }
+        // If grouping was specified, create serialized MAP columns from the filtered attributes
+        // These are needed for vector aggregation to further group by MAP attributes
+        if agg.grouping.is_some() && schema.inner().column_with_name("attributes").is_some() {
+            use datafusion::functions_nested::{map_keys::map_keys, map_values::map_values, string::array_to_string};
+
+            select_exprs.push(array_to_string(map_keys(col("attributes")), lit("|||")).alias(COL_ATTR_KEYS));
+            select_exprs.push(array_to_string(map_values(col("attributes")), lit("|||")).alias(COL_ATTR_VALS));
+        }
 
         df = df.select(select_exprs)?;
 
@@ -1052,18 +1065,18 @@ impl DataFusionPlanner {
         Self::build_default_label_columns(with, without).into_iter().map(col).collect()
     }
 
-    async fn plan_vector_aggregation(&self, agg: crate::logql::metric::VectorAggregation) -> Result<DataFrame> {
-        use crate::logql::{common::Grouping, metric::MetricExpr};
-
-        // 1. Push grouping down to inner RangeAggregation if present
-        // For queries like `sum by (level) (count_over_time({...}[1m]))`,
-        // we need the inner range aggregation to also group by `level`.
-        // However, some range aggregations (sum_over_time, rate_counter) don't support
-        // grouping, so we handle grouping at the vector aggregation level instead.
-        let inner_expr = match (*agg.expr, &agg.grouping) {
+    /// Pushes outer grouping down to an inner `RangeAggregation` when supported.
+    ///
+    /// For queries like `sum by (level) (count_over_time({...}[1m]))`, we need the inner
+    /// range aggregation to also group by `level`. However, some range aggregations
+    /// (`sum_over_time`, `rate_counter`) don't support grouping, so we skip pushdown
+    /// and handle grouping at the vector aggregation level instead.
+    fn push_grouping_to_inner_expr(
+        inner_expr: MetricExpr,
+        outer_grouping: Option<&crate::logql::common::Grouping>,
+    ) -> MetricExpr {
+        match (inner_expr, outer_grouping) {
             (MetricExpr::RangeAggregation(mut range_agg), Some(outer_grouping)) => {
-                use crate::logql::metric::RangeAggregationOp;
-
                 // Check if this range aggregation supports grouping
                 // Per Loki spec: sum_over_time and rate_counter don't support grouping
                 let supports_grouping = !matches!(
@@ -1072,134 +1085,106 @@ impl DataFusionPlanner {
                 );
 
                 if supports_grouping {
-                    // Merge outer grouping into inner range aggregation
-                    // Clone the entire grouping (By or Without)
-                    let outer_grouping_clone = outer_grouping.clone();
-
-                    // Merge outer grouping with inner grouping
-                    // The outer aggregation's grouping determines the final result structure,
-                    // so it takes precedence in cross-type merges.
-                    let merged_grouping = match (range_agg.grouping.take(), &outer_grouping_clone) {
-                        // No inner grouping - use outer grouping
-                        (None, _) => Some(outer_grouping_clone),
-
-                        // Same-type merges: combine label sets
-                        (Some(Grouping::By(mut inner_labels)), Grouping::By(outer_labels)) => {
-                            // Both By: merge inclusion lists, avoiding duplicates
-                            // Example: by (a, b) + by (b, c) → by (a, b, c)
-                            for label in outer_labels {
-                                if !inner_labels.iter().any(|l| l.name == label.name) {
-                                    inner_labels.push(label.clone());
-                                }
-                            }
-                            Some(Grouping::By(inner_labels))
-                        }
-                        (Some(Grouping::Without(mut inner_labels)), Grouping::Without(outer_labels)) => {
-                            // Both Without: merge exclusion lists, avoiding duplicates
-                            // Example: without (a) + without (b, c) → without (a, b, c)
-                            for label in outer_labels {
-                                if !inner_labels.iter().any(|l| l.name == label.name) {
-                                    inner_labels.push(label.clone());
-                                }
-                            }
-                            Some(Grouping::Without(inner_labels))
-                        }
-
-                        // Cross-type merges: outer grouping takes complete precedence
-                        // Rationale: The outer aggregation defines the final output structure,
-                        // and mixing By/Without semantics is ambiguous. We follow the principle
-                        // that the outer operation's grouping specification is authoritative.
-                        (Some(Grouping::By(_)), Grouping::Without(outer_labels)) => {
-                            // Inner By + Outer Without: discard inner, use outer Without entirely
-                            // Example: sum without (pod) (count by (node)) → group by all labels except pod
-                            // The outer Without defines which labels to exclude from the final result.
-                            Some(Grouping::Without(outer_labels.clone()))
-                        }
-                        (Some(Grouping::Without(_)), Grouping::By(outer_labels)) => {
-                            // Inner Without + Outer By: discard inner, use outer By entirely
-                            // Example: sum by (service) (count without (instance)) → group by service only
-                            // The outer By defines which labels to keep in the final result.
-                            // This is more restrictive than Without, as By explicitly specifies
-                            // the exact labels that should remain.
-                            Some(Grouping::By(outer_labels.clone()))
-                        }
-                    };
-                    range_agg.grouping = merged_grouping;
+                    range_agg.grouping = Some(Self::merge_groupings(range_agg.grouping.take(), outer_grouping));
                 }
                 // If !supports_grouping, we don't push grouping down - handle at vector agg level
                 MetricExpr::RangeAggregation(range_agg)
             }
             (expr, _) => expr,
-        };
+        }
+    }
 
-        // 2. Plan the inner MetricExpr (now with merged grouping)
-        // Note: We don't clear agg.grouping after pushdown because the vector aggregation
-        // still needs to group by the same labels to preserve the series structure
-        let df = self.plan_metric(inner_expr).await?;
-        let schema = df.schema();
+    /// Merges inner and outer grouping clauses.
+    ///
+    /// The outer aggregation's grouping determines the final result structure,
+    /// so it takes precedence in cross-type merges.
+    fn merge_groupings(
+        inner_grouping: Option<crate::logql::common::Grouping>,
+        outer_grouping: &crate::logql::common::Grouping,
+    ) -> crate::logql::common::Grouping {
+        use crate::logql::common::Grouping;
 
-        // 3. Identify grouping columns for the vector aggregation
-        // LogQL: sum by (label1, label2) (...)
-        // DataFusion: group_expr = [col("label1"), col("label2")]
-        let mut group_exprs = if let Some(grouping) = &agg.grouping {
-            let (labels, is_without) = match grouping {
-                Grouping::By(labels) => (labels, false),
-                Grouping::Without(labels) => (labels, true),
-            };
+        match (inner_grouping, outer_grouping) {
+            // No inner grouping - use outer grouping
+            (None, _) => outer_grouping.clone(),
 
-            let mut indexed_attributes = Vec::new();
-
-            if is_without {
-                // Without: include all indexed columns EXCEPT those in labels
-                let mut excluded_indexed_cols = Vec::new();
-                for l in labels {
-                    let mapped_name = Self::map_label_to_internal_name(&l.name);
-                    if Self::is_top_level_field(mapped_name) && schema.inner().column_with_name(mapped_name).is_some() {
-                        excluded_indexed_cols.push(mapped_name);
+            // Same-type merges: combine label sets
+            (Some(Grouping::By(mut inner_labels)), Grouping::By(outer_labels)) => {
+                // Both By: merge inclusion lists, avoiding duplicates
+                // Example: by (a, b) + by (b, c) → by (a, b, c)
+                for label in outer_labels {
+                    if !inner_labels.iter().any(|l| l.name == label.name) {
+                        inner_labels.push(label.clone());
                     }
                 }
-
-                // Add all indexed columns that are NOT excluded and exist in schema
-                // Binary columns (trace_id, span_id) are included and will be converted to hex in transform_output_columns
-                for &col_name in LOG_INDEXED_ATTRIBUTE_COLUMNS {
-                    if !excluded_indexed_cols.contains(&col_name) && schema.inner().column_with_name(col_name).is_some()
-                    {
-                        indexed_attributes.push(col_name);
+                Grouping::By(inner_labels)
+            }
+            (Some(Grouping::Without(mut inner_labels)), Grouping::Without(outer_labels)) => {
+                // Both Without: merge exclusion lists, avoiding duplicates
+                // Example: without (a) + without (b, c) → without (a, b, c)
+                for label in outer_labels {
+                    if !inner_labels.iter().any(|l| l.name == label.name) {
+                        inner_labels.push(label.clone());
                     }
                 }
-            } else {
-                // By: include only specified labels
-                for l in labels {
-                    // Map Loki label names to column names (e.g., level -> severity_text)
-                    let mapped_name = Self::map_label_to_internal_name(&l.name);
-                    // Check if column exists directly in schema (using mapped name)
-                    if Self::is_top_level_field(mapped_name) && schema.inner().column_with_name(mapped_name).is_some() {
-                        indexed_attributes.push(mapped_name);
-                    } else if schema.inner().column_with_name("attributes").is_none() {
-                        // Column doesn't exist and no attributes map - the label isn't available
-                        return Err(QueryError::NotImplemented(format!(
-                            "Label '{}' not available in aggregation result.",
-                            l.name
-                        )));
-                    }
-                    // Note: Labels from attributes MAP are not added to indexed_attributes
-                    // because DataFusion can't group by MAP types. The range aggregation
-                    // already handled attribute filtering via serialization.
-                }
+                Grouping::Without(inner_labels)
             }
 
-            // Build expressions from indexed attributes only
-            // Note: We don't add attributes MAP to grouping because:
-            // 1. DataFusion can't group by MAP data types
-            // 2. Range aggregations already handle attribute filtering via serialization (_attr_keys/_attr_vals)
-            // 3. For vector aggs wrapping range aggs, the range agg already filtered attributes
-            indexed_attributes.iter().map(|c| col((*c).to_string())).collect()
-        } else {
-            vec![]
-        };
-        group_exprs.push(col("timestamp"));
+            // Cross-type merges: outer grouping takes complete precedence
+            // Rationale: The outer aggregation defines the final output structure,
+            // and mixing By/Without semantics is ambiguous. We follow the principle
+            // that the outer operation's grouping specification is authoritative.
+            (Some(Grouping::By(_)), Grouping::Without(outer_labels)) => {
+                // Inner By + Outer Without: discard inner, use outer Without entirely
+                // Example: sum without (pod) (count by (node)) → group by all labels except pod
+                // The outer Without defines which labels to exclude from the final result.
+                Grouping::Without(outer_labels.clone())
+            }
+            (Some(Grouping::Without(_)), Grouping::By(outer_labels)) => {
+                // Inner Without + Outer By: discard inner, use outer By entirely
+                // Example: sum by (service) (count without (instance)) → group by service only
+                // The outer By defines which labels to keep in the final result.
+                // This is more restrictive than Without, as By explicitly specifies
+                // the exact labels that should remain.
+                Grouping::By(outer_labels.clone())
+            }
+        }
+    }
 
-        // 4. Identify aggregation function
+    async fn plan_vector_aggregation(&self, agg: crate::logql::metric::VectorAggregation) -> Result<DataFrame> {
+        // Push grouping down to inner RangeAggregation if present
+        let inner_expr = Self::push_grouping_to_inner_expr(*agg.expr, agg.grouping.as_ref());
+
+        // Plan the inner MetricExpr (now with merged grouping)
+        // Note: We don't clear agg.grouping after pushdown because the vector aggregation
+        // still needs to group by the same labels to preserve the series structure
+        let mut df = self.plan_metric(inner_expr).await?;
+
+        // Build grouping expressions and filter attributes if grouping is specified
+        // Apply by/without filtering if specified, otherwise group by all labels
+        let group_exprs = if let Some(ref grouping) = agg.grouping {
+            // Get both grouping expressions and filtered attributes in one call
+            // This avoids duplicate computation of indexed columns and attribute labels
+            let (mut grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
+            grouping_exprs.push(col("timestamp"));
+
+            // Replace attributes column with filtered version BEFORE aggregation
+            // This ensures last_value preserves the filtered attributes
+            df = df.with_column("attributes", filtered_attrs_expr)?;
+
+            // Return the grouping expressions
+            // Note: RateCounter cannot reach this branch due to validation at 1.5 step
+            grouping_exprs
+        } else {
+            // Use existing serialized columns
+            let mut exprs = vec![col("timestamp")];
+            exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
+            exprs.push(col(COL_ATTR_KEYS));
+            exprs.push(col(COL_ATTR_VALS));
+            exprs
+        };
+
+        // Identify aggregation function
         // LogQL: sum, avg, min, max, count, stddev, stdvar, bottomk, topk
         // We need to map agg.op to DataFusion aggregate functions.
         // For now, we'll implement a few common ones.
@@ -1209,19 +1194,13 @@ impl DataFusionPlanner {
         let value_col = col("value");
 
         let aggr_expr = match agg.op {
-            crate::logql::metric::VectorAggregationOp::Sum => datafusion::functions_aggregate::expr_fn::sum(value_col),
-            crate::logql::metric::VectorAggregationOp::Avg => datafusion::functions_aggregate::expr_fn::avg(value_col),
-            crate::logql::metric::VectorAggregationOp::Min => datafusion::functions_aggregate::expr_fn::min(value_col),
-            crate::logql::metric::VectorAggregationOp::Max => datafusion::functions_aggregate::expr_fn::max(value_col),
-            crate::logql::metric::VectorAggregationOp::Count => {
-                datafusion::functions_aggregate::expr_fn::count(value_col)
-            }
-            crate::logql::metric::VectorAggregationOp::Stddev => {
-                datafusion::functions_aggregate::expr_fn::stddev(value_col)
-            }
-            crate::logql::metric::VectorAggregationOp::Stdvar => {
-                datafusion::functions_aggregate::expr_fn::var_sample(value_col)
-            }
+            crate::logql::metric::VectorAggregationOp::Sum => sum(value_col),
+            crate::logql::metric::VectorAggregationOp::Avg => avg(value_col),
+            crate::logql::metric::VectorAggregationOp::Min => min(value_col),
+            crate::logql::metric::VectorAggregationOp::Max => max(value_col),
+            crate::logql::metric::VectorAggregationOp::Count => count(value_col),
+            crate::logql::metric::VectorAggregationOp::Stddev => stddev(value_col),
+            crate::logql::metric::VectorAggregationOp::Stdvar => var_sample(value_col),
             // TODO: Implement topk, bottomk, sort, sort_desc
             _ => {
                 return Err(QueryError::NotImplemented(format!(
@@ -1232,8 +1211,7 @@ impl DataFusionPlanner {
         }
         .alias("value");
 
-        // 5. Apply aggregation using DataFrame API
-        Ok(df.aggregate(group_exprs, vec![aggr_expr])?)
+        Ok(df.aggregate(group_exprs, vec![aggr_expr, Self::preserve_attributes_column()])?)
     }
 
     /// Apply selector matchers to filter a `DataFrame`.
@@ -1508,10 +1486,7 @@ impl DataFusionPlanner {
         let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
 
         // Create filtered attributes expression
-        let filtered_attrs = udf.call(vec![
-            col("attributes"),
-            datafusion::functions_nested::make_array::make_array(label_literals),
-        ]);
+        let filtered_attrs = udf.call(vec![col("attributes"), make_array(label_literals)]);
 
         // Select all columns, replacing attributes with filtered version
         let select_exprs: Vec<Expr> = df
@@ -1550,10 +1525,7 @@ impl DataFusionPlanner {
         let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
 
         // Create filtered attributes expression
-        let filtered_attrs = udf.call(vec![
-            col("attributes"),
-            datafusion::functions_nested::make_array::make_array(label_literals),
-        ]);
+        let filtered_attrs = udf.call(vec![col("attributes"), make_array(label_literals)]);
 
         // Select all columns, replacing attributes with filtered version
         let select_exprs: Vec<Expr> = df

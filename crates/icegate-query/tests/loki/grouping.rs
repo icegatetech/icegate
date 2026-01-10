@@ -613,6 +613,162 @@ async fn write_binary_grouping_test_logs(
     Ok(())
 }
 
+/// Test grouping by attributes from the MAP column
+///
+/// Verifies that labels stored in the attributes MAP are correctly filtered and used for grouping.
+/// This test addresses the original issue where attribute MAP grouping was not working correctly.
+#[tokio::test]
+async fn test_attribute_map_grouping() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start(3254).await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_grouping_test_logs(&table, &catalog).await?;
+
+    // Test 1: Group by mix of indexed column (service_name) and attribute MAP labels (pod, node)
+    // Query: sum by (service_name, pod, node) (sum_over_time({cloud_account_id="acc-1"} | unwrap value [1m]))
+    // - service_name is an indexed column
+    // - pod and node are from the attributes MAP
+    // Note: Using sum_over_time with unwrap because attribute MAP filtering is only implemented
+    // for unwrap-based range aggregations (see build_grouping_with_filtered_attrs)
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "sum by (service_name, pod, node) (sum_over_time({cloud_account_id=\"acc-1\"} | unwrap value [1m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    println!("Test grouping by mixed indexed and MAP attributes:");
+    println!("Status: {}", status);
+    println!("Body: {}", serde_json::to_string_pretty(&body)?);
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    assert!(
+        !result.is_empty(),
+        "Expected non-empty result after writing grouping test data (grouping by mixed attributes)"
+    );
+
+    // Each series should have distinct combinations of service_name, pod, and node
+    // We wrote 6 logs with different combinations:
+    // - api/pod-a/node1, api/pod-b/node1, api/pod-c/node2
+    // - backend/pod-d/node1, backend/pod-e/node2, backend/pod-f/node2
+    assert!(
+        result.len() >= 4,
+        "Expected at least 4 distinct series for different service_name/pod/node combinations, got {}",
+        result.len()
+    );
+
+    // Verify each series has the expected labels
+    for series in result {
+        let metric = series["metric"].as_object().expect("metric should be an object");
+
+        // service_name should be present (output as "service")
+        assert!(
+            metric.contains_key("service") || metric.contains_key("service_name"),
+            "service_name should be present in grouped output"
+        );
+
+        // pod should be present (from attributes MAP)
+        assert!(
+            metric.contains_key("pod"),
+            "pod (from attributes MAP) should be present in grouped output"
+        );
+
+        // node should be present (from attributes MAP)
+        assert!(
+            metric.contains_key("node"),
+            "node (from attributes MAP) should be present in grouped output"
+        );
+
+        // instance should NOT be present (not in grouping clause)
+        assert!(
+            !metric.contains_key("instance"),
+            "instance should not be present in output (not in by clause)"
+        );
+
+        println!("Series labels: {:?}", metric);
+    }
+
+    // Test 2: Group by only MAP attributes (pod, instance)
+    // This tests that MAP-only grouping works correctly without any indexed columns
+    let resp2 = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "sum by (pod, instance) (sum_over_time({cloud_account_id=\"acc-1\"} | unwrap value [1m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status2 = resp2.status();
+    let body2: Value = resp2.json().await?;
+
+    println!("\nTest grouping by MAP attributes only:");
+    println!("Status: {}", status2);
+    println!("Body: {}", serde_json::to_string_pretty(&body2)?);
+
+    assert_eq!(status2, 200, "Response body: {}", body2);
+    assert_eq!(body2["status"], "success");
+
+    let result2 = body2["data"]["result"].as_array().expect("result should be an array");
+    assert!(
+        !result2.is_empty(),
+        "Expected non-empty result for MAP-only attribute grouping"
+    );
+
+    // All 6 logs have distinct pod+instance combinations
+    assert_eq!(
+        result2.len(),
+        6,
+        "Expected 6 distinct series for different pod/instance combinations, got {}",
+        result2.len()
+    );
+
+    // Verify each series has pod and instance but NOT service_name
+    for series in result2 {
+        let metric = series["metric"].as_object().expect("metric should be an object");
+
+        assert!(
+            metric.contains_key("pod"),
+            "pod should be present in MAP-only grouped output"
+        );
+        assert!(
+            metric.contains_key("instance"),
+            "instance should be present in MAP-only grouped output"
+        );
+
+        // service_name should NOT be present (not in grouping clause)
+        assert!(
+            !metric.contains_key("service") && !metric.contains_key("service_name"),
+            "service_name should not be present in output (not in by clause)"
+        );
+
+        println!("MAP-only series labels: {:?}", metric);
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
+
 /// Build a `RecordBatch` with test logs containing distinct binary column values
 fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<RecordBatch, Box<dyn std::error::Error>> {
     // Create 4 log entries with different trace_id/span_id combinations
