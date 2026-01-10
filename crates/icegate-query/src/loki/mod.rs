@@ -12,4 +12,4 @@ mod routes;
 mod server;
 
 pub use config::LokiConfig;
-pub use server::run;
+pub use server::{run, run_with_port_tx};

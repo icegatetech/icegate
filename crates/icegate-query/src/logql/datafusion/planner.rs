@@ -1162,7 +1162,8 @@ impl DataFusionPlanner {
 
         // Build grouping expressions and filter attributes if grouping is specified
         // Apply by/without filtering if specified, otherwise group by all labels
-        let group_exprs = if let Some(ref grouping) = agg.grouping {
+        // Also track whether we should preserve attributes in the output
+        let (group_exprs, preserve_attrs) = if let Some(ref grouping) = agg.grouping {
             // Get both grouping expressions and filtered attributes in one call
             // This avoids duplicate computation of indexed columns and attribute labels
             let (mut grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
@@ -1172,16 +1173,15 @@ impl DataFusionPlanner {
             // This ensures last_value preserves the filtered attributes
             df = df.with_column("attributes", filtered_attrs_expr)?;
 
-            // Return the grouping expressions
-            // Note: RateCounter cannot reach this branch due to validation at 1.5 step
-            grouping_exprs
+            // Return the grouping expressions and flag to preserve attributes
+            (grouping_exprs, true)
         } else {
-            // Use existing serialized columns
-            let mut exprs = vec![col("timestamp")];
-            exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
-            exprs.push(col(COL_ATTR_KEYS));
-            exprs.push(col(COL_ATTR_VALS));
-            exprs
+            // No grouping specified - collapse all series, group only by timestamp
+            // This allows aggregations like sum() to combine values across all series
+            // Do not reference COL_ATTR_KEYS or COL_ATTR_VALS as they may not exist
+            // from the inner range aggregation
+            // Also don't preserve attributes since we're collapsing all labels
+            (vec![col("timestamp")], false)
         };
 
         // Identify aggregation function
@@ -1211,7 +1211,15 @@ impl DataFusionPlanner {
         }
         .alias("value");
 
-        Ok(df.aggregate(group_exprs, vec![aggr_expr, Self::preserve_attributes_column()])?)
+        // Only preserve attributes when grouping is specified
+        // When collapsing all series (no grouping), we don't want any labels in output
+        let agg_exprs = if preserve_attrs {
+            vec![aggr_expr, Self::preserve_attributes_column()]
+        } else {
+            vec![aggr_expr]
+        };
+
+        Ok(df.aggregate(group_exprs, agg_exprs)?)
     }
 
     /// Apply selector matchers to filter a `DataFrame`.

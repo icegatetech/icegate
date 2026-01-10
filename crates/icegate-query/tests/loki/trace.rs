@@ -15,7 +15,7 @@ use super::harness::{TestServer, write_test_logs};
 
 #[tokio::test]
 async fn test_query_by_trace_id() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3213).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -64,7 +64,7 @@ async fn test_query_by_trace_id() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_query_by_span_id() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3214).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -108,7 +108,7 @@ async fn test_query_by_span_id() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_combined_trace_query() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3215).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -148,7 +148,7 @@ async fn test_combined_trace_query() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_nonexistent_trace_id() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3216).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -183,7 +183,7 @@ async fn test_nonexistent_trace_id() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_trace_id_label_values() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3217).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -225,7 +225,7 @@ async fn test_trace_id_label_values() -> Result<(), Box<dyn std::error::Error>> 
 
 #[tokio::test]
 async fn test_span_id_label_values() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3218).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)

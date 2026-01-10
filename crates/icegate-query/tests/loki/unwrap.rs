@@ -237,7 +237,7 @@ async fn write_test_logs_with_metrics(
 
 #[tokio::test]
 async fn test_sum_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3220).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -285,7 +285,7 @@ async fn test_sum_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_avg_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3221).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -319,7 +319,7 @@ async fn test_avg_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_min_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3222).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -370,7 +370,7 @@ async fn test_min_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_max_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3223).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -419,7 +419,7 @@ async fn test_max_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_stddev_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3224).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -453,7 +453,7 @@ async fn test_stddev_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>
 
 #[tokio::test]
 async fn test_quantile_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3225).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -487,7 +487,7 @@ async fn test_quantile_over_time_unwrap() -> Result<(), Box<dyn std::error::Erro
 
 #[tokio::test]
 async fn test_first_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3226).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -521,7 +521,7 @@ async fn test_first_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>>
 
 #[tokio::test]
 async fn test_last_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3227).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -555,7 +555,7 @@ async fn test_last_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> 
 
 #[tokio::test]
 async fn test_rate_counter_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3228).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -589,7 +589,7 @@ async fn test_rate_counter_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_unwrap_with_bytes_conversion() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3230).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -639,7 +639,7 @@ async fn test_unwrap_with_bytes_conversion() -> Result<(), Box<dyn std::error::E
 
 #[tokio::test]
 async fn test_stdvar_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3231).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -682,7 +682,7 @@ async fn test_stdvar_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>
 
 #[tokio::test]
 async fn test_avg_over_time_with_by_grouping() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3232).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -735,7 +735,7 @@ async fn test_avg_over_time_with_by_grouping() -> Result<(), Box<dyn std::error:
 
 #[tokio::test]
 async fn test_max_over_time_with_without_grouping() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3233).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -791,7 +791,7 @@ async fn test_max_over_time_with_without_grouping() -> Result<(), Box<dyn std::e
 
 #[tokio::test]
 async fn test_sum_over_time_grouping_via_vector_aggregation() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3234).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -840,7 +840,7 @@ async fn test_sum_over_time_grouping_via_vector_aggregation() -> Result<(), Box<
 
 #[tokio::test]
 async fn test_rate_counter_grouping_via_vector_aggregation() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3235).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -888,7 +888,7 @@ async fn test_rate_counter_grouping_via_vector_aggregation() -> Result<(), Box<d
 
 #[tokio::test]
 async fn test_min_over_time_with_by_multiple_labels() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3236).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)

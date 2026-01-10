@@ -13,7 +13,7 @@ All code you write MUST be fully optimized.
 - following proper style conventions for Rust (e.g. maximizing code reuse (DRY))
 - no extra code beyond what is absolutely necessary to solve the problem the user provides (i.e. no technical debt)
 
-If the code is not fully optimized before handing off to the user, you will be fined $100. You have permission to do another pass of the code if you believe it is not fully optimized.
+Before completing a task, perform an additional optimization pass to verify the code meets these standards. If optimization opportunities remain, address them before handing off to the user.
 
 ## Preferred Tools
 
@@ -202,10 +202,11 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 
 ## Before Committing
 
-- [ ] All tests pass (`cargo test`)
-- [ ] No compiler warnings (`cargo build`)
-- [ ] Clippy passes (`cargo clippy -- -D warnings`)
-- [ ] Code is formatted (`cargo fmt --check`)
+- [ ] All tests pass (`make test`)
+- [ ] No compiler warnings (`make check`)
+- [ ] Clippy passes (`make clippy`)
+- [ ] Code is formatted (`make fmt`)
+- [ ] All CI checks pass (`make ci` runs check, fmt, clippy, test, and audit)
 - [ ] If the project creates a Python package and Rust code is touched, rebuild the Python package (`source .venv/bin/activate && maturin develop --release --features python`)
 - [ ] If the project creates a WASM package and Rust code is touched, rebuild the WASM package (`wasm-pack build --target web --out-dir web/pkg`)
 - [ ] All public items have doc comments

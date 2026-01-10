@@ -279,7 +279,7 @@ async fn write_grouping_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> 
 
 #[tokio::test]
 async fn test_cross_type_grouping_by_inner_without_outer() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3250).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -336,7 +336,7 @@ async fn test_cross_type_grouping_by_inner_without_outer() -> Result<(), Box<dyn
 
 #[tokio::test]
 async fn test_cross_type_grouping_without_inner_by_outer() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3251).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -402,7 +402,7 @@ async fn test_cross_type_grouping_without_inner_by_outer() -> Result<(), Box<dyn
 
 #[tokio::test]
 async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3252).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -477,7 +477,7 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
 /// Verifies that `FixedSizeBinary` columns can be used in GROUP BY operations.
 #[tokio::test]
 async fn test_grouping_by_binary_columns() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3253).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -619,7 +619,7 @@ async fn write_binary_grouping_test_logs(
 /// This test addresses the original issue where attribute MAP grouping was not working correctly.
 #[tokio::test]
 async fn test_attribute_map_grouping() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3254).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -898,4 +898,201 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         ],
     )
     .map_err(Into::into)
+}
+
+/// Test vector aggregation without grouping collapses all series
+///
+/// When no `by` or `without` clause is specified on a vector aggregation,
+/// all series should be collapsed into a single result per timestamp.
+/// This tests the fix where `plan_vector_aggregation` groups only by timestamp
+/// when `agg.grouping.is_none()`.
+#[tokio::test]
+async fn test_vector_aggregation_without_grouping_collapses_series() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_grouping_test_logs(&table, &catalog).await?;
+
+    // Query: sum(count_over_time({cloud_account_id="acc-1"}[1m]))
+    // This has no `by` or `without` clause, so all series should be collapsed.
+    // The test data has 6 logs with different service_name, pod, node, instance values.
+    // Without grouping, sum should combine them all into a single series.
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            ("query", "sum(count_over_time({cloud_account_id=\"acc-1\"}[1m]))"),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    println!("Test vector aggregation without grouping:");
+    println!("Status: {}", status);
+    println!("Body: {}", serde_json::to_string_pretty(&body)?);
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    assert!(
+        !result.is_empty(),
+        "Expected non-empty result after writing grouping test data"
+    );
+
+    // Key assertion: Without grouping, all series should collapse into ONE series
+    // (one per timestamp, but the result array should have only one series entry)
+    assert_eq!(
+        result.len(),
+        1,
+        "Without grouping, vector aggregation should collapse all series into ONE series. \
+         Got {} series instead. This indicates the fix for grouping-by-all-labels is not working.",
+        result.len()
+    );
+
+    // The single series should have minimal or empty metric labels
+    // (since we're aggregating across all labels)
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+
+    println!("Collapsed series metric labels: {:?}", metric);
+
+    // The metric should have very few labels (ideally none except internal ones)
+    // since we're aggregating without grouping
+    assert!(
+        !metric.contains_key("service") && !metric.contains_key("service_name"),
+        "service_name should not be present when aggregating without grouping"
+    );
+    assert!(
+        !metric.contains_key("pod"),
+        "pod should not be present when aggregating without grouping"
+    );
+    assert!(
+        !metric.contains_key("node"),
+        "node should not be present when aggregating without grouping"
+    );
+    assert!(
+        !metric.contains_key("instance"),
+        "instance should not be present when aggregating without grouping"
+    );
+
+    // Verify the values array has data points
+    let values = series["values"].as_array().expect("values should be an array");
+    assert!(!values.is_empty(), "The collapsed series should have value data points");
+
+    // The sum should be the total count of all logs (6 logs written in test data)
+    // Note: The actual value depends on how many logs fall within the time range,
+    // but it should be > 0
+    for value in values {
+        let count_str = value[1].as_str().expect("value should be a string");
+        let count: f64 = count_str.parse().expect("value should be a number");
+        println!("Aggregated count at timestamp: {}", count);
+        assert!(count > 0.0, "Aggregated count should be positive, got {}", count);
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Test that vector aggregation with explicit grouping still works correctly
+///
+/// This is a regression test to ensure the fix for no-grouping doesn't break
+/// the case where grouping IS specified.
+#[tokio::test]
+async fn test_vector_aggregation_with_grouping_preserves_series() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_grouping_test_logs(&table, &catalog).await?;
+
+    // Query: sum by (service_name) (count_over_time({cloud_account_id="acc-1"}[1m]))
+    // With `by (service_name)`, we expect separate series for "api" and "backend"
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "sum by (service_name) (count_over_time({cloud_account_id=\"acc-1\"}[1m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    println!("Test vector aggregation with grouping:");
+    println!("Status: {}", status);
+    println!("Body: {}", serde_json::to_string_pretty(&body)?);
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    assert!(
+        !result.is_empty(),
+        "Expected non-empty result after writing grouping test data"
+    );
+
+    // With grouping by service_name, we expect 2 series: "api" and "backend"
+    // (based on the test data in build_grouping_test_record_batch)
+    assert_eq!(
+        result.len(),
+        2,
+        "With grouping by service_name, expected 2 series (api and backend), got {}",
+        result.len()
+    );
+
+    // Verify each series has the service_name label
+    let mut found_services: Vec<String> = Vec::new();
+    for series in result {
+        let metric = series["metric"].as_object().expect("metric should be an object");
+
+        // service_name should be present (output as "service")
+        let service = metric
+            .get("service")
+            .or_else(|| metric.get("service_name"))
+            .expect("service_name should be present in grouped output")
+            .as_str()
+            .expect("service should be a string");
+
+        found_services.push(service.to_string());
+
+        // Other labels (pod, node, instance) should NOT be present
+        // since we're only grouping by service_name
+        assert!(
+            !metric.contains_key("pod"),
+            "pod should not be present when grouping only by service_name"
+        );
+        assert!(
+            !metric.contains_key("node"),
+            "node should not be present when grouping only by service_name"
+        );
+
+        println!("Series with service_name={}: {:?}", service, metric);
+    }
+
+    // Verify we have both expected services
+    assert!(
+        found_services.contains(&"api".to_string()),
+        "Expected to find 'api' service in results"
+    );
+    assert!(
+        found_services.contains(&"backend".to_string()),
+        "Expected to find 'backend' service in results"
+    );
+
+    server.shutdown().await;
+    Ok(())
 }
