@@ -237,7 +237,7 @@ async fn write_test_logs_with_metrics(
 
 #[tokio::test]
 async fn test_sum_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3220).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -285,7 +285,7 @@ async fn test_sum_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_avg_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3221).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -319,7 +319,7 @@ async fn test_avg_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_min_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3222).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -370,7 +370,7 @@ async fn test_min_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_max_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3223).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -419,7 +419,7 @@ async fn test_max_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_stddev_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3224).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -452,9 +452,8 @@ async fn test_stddev_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test]
-#[ignore = "Parser does not extract quantile parameter yet (visitor returns None for param)"]
 async fn test_quantile_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3225).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -488,7 +487,7 @@ async fn test_quantile_over_time_unwrap() -> Result<(), Box<dyn std::error::Erro
 
 #[tokio::test]
 async fn test_first_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3226).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -522,7 +521,7 @@ async fn test_first_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>>
 
 #[tokio::test]
 async fn test_last_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3227).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -556,7 +555,7 @@ async fn test_last_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> 
 
 #[tokio::test]
 async fn test_rate_counter_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3228).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -590,7 +589,7 @@ async fn test_rate_counter_unwrap() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_unwrap_with_bytes_conversion() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3230).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -640,7 +639,7 @@ async fn test_unwrap_with_bytes_conversion() -> Result<(), Box<dyn std::error::E
 
 #[tokio::test]
 async fn test_stdvar_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3231).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -676,6 +675,264 @@ async fn test_stdvar_over_time_unwrap() -> Result<(), Box<dyn std::error::Error>
         let values = series["values"].as_array().expect("values should be an array");
         assert!(!values.is_empty(), "Should have time series values");
     }
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_avg_over_time_with_by_grouping() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs_with_metrics(&table, &catalog).await?;
+
+    // Query: avg_over_time({service_name="api-server"} | unwrap latency_ms [5m]) by (service_name)
+    // Should group only by service_name, ignoring other labels
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "avg by (service_name) (avg_over_time({service_name=\"api-server\"} | unwrap latency_ms [5m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["data"]["resultType"], "matrix");
+
+    // Verify that result has service_name label but not other labels
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
+    // Attributes should be filtered - only service_name grouping
+    // Verify we don't have other indexed columns like account_id
+    assert!(
+        !metric.contains_key("account_id"),
+        "Should NOT have account_id label (filtered by 'by' clause)"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_max_over_time_with_without_grouping() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs_with_metrics(&table, &catalog).await?;
+
+    // Query: max_over_time({service_name="api-server"} | unwrap latency_ms [5m]) without (account_id)
+    // Should group by all labels EXCEPT account_id
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "max without (account_id) (max_over_time({service_name=\"api-server\"} | unwrap latency_ms [5m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["data"]["resultType"], "matrix");
+
+    // Verify that result has labels but NOT account_id
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    assert!(
+        !metric.contains_key("account_id"),
+        "Should NOT have account_id label (filtered by 'without' clause)"
+    );
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
+    // Should also have level/severity_text since it wasn't excluded
+    assert!(
+        metric.contains_key("level") || metric.contains_key("severity_text"),
+        "Should have level or severity_text label"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sum_over_time_grouping_via_vector_aggregation() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs_with_metrics(&table, &catalog).await?;
+
+    // Query: sum_over_time({service_name="api-server"} | unwrap latency_ms [5m]) by (service_name)
+    // Should return an error because sum_over_time does not support grouping
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "sum by (service_name) (sum_over_time({service_name=\"api-server\"} | unwrap latency_ms [5m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    // Should succeed - grouping is handled at vector aggregation level
+    // sum_over_time itself doesn't support grouping, but when wrapped in a vector aggregation,
+    // the grouping is applied to the vector aggregation output
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    // Verify that result has service_name label
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rate_counter_grouping_via_vector_aggregation() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs_with_metrics(&table, &catalog).await?;
+
+    // Query: sum by (service_name) (rate_counter({service_name="api-server"} | unwrap counter [5m]))
+    // This uses vector aggregation with grouping. While rate_counter itself doesn't support grouping,
+    // when wrapped in a vector aggregation, the grouping is handled at the vector aggregation level.
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "sum by (service_name) (rate_counter({service_name=\"api-server\"} | unwrap counter [5m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    // Should succeed - grouping is handled at vector aggregation level
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    // Verify that result has service_name label
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_min_over_time_with_by_multiple_labels() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs_with_metrics(&table, &catalog).await?;
+
+    // Query: min_over_time({service_name="api-server"} | unwrap latency_ms [5m]) by (service_name, level)
+    // Should group by both service_name and severity_text (level)
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/query_range", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .query(&[
+            (
+                "query",
+                "min by (service_name, level) (min_over_time({service_name=\"api-server\"} | unwrap latency_ms [5m]))",
+            ),
+            ("step", "60s"),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["data"]["resultType"], "matrix");
+
+    // Verify that result has both service_name and level labels
+    let result = body["data"]["result"].as_array().expect("result should be an array");
+    assert!(!result.is_empty(), "Result should not be empty");
+    let series = &result[0];
+    let metric = series["metric"].as_object().expect("metric should be an object");
+    // Note: "service_name" column is output as "service" for Loki compatibility
+    assert!(
+        metric.contains_key("service") || metric.contains_key("service_name"),
+        "Should have service or service_name label"
+    );
+    // Note: 'level' is mapped to 'severity_text' internally
+    assert!(
+        metric.contains_key("level") || metric.contains_key("severity_text"),
+        "Should have level or severity_text label"
+    );
 
     server.shutdown().await;
     Ok(())

@@ -14,7 +14,7 @@ use super::harness::{TestServer, write_test_logs};
 
 #[tokio::test]
 async fn test_labels_endpoint() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3208).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -74,7 +74,7 @@ async fn test_labels_endpoint() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_label_values_endpoint() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3209).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -167,7 +167,7 @@ async fn test_label_values_endpoint() -> Result<(), Box<dyn std::error::Error>> 
 
 #[tokio::test]
 async fn test_series_endpoint() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3210).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)

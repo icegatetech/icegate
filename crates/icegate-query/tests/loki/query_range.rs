@@ -14,7 +14,7 @@ use super::harness::{TestServer, write_test_logs};
 
 #[tokio::test]
 async fn test_query_range_endpoint() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3201).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     // Insert test data
     let table = catalog
@@ -73,7 +73,7 @@ async fn test_query_range_endpoint() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_log_vs_metric_response_types() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3203).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
