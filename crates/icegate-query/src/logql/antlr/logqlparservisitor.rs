@@ -224,6 +224,26 @@ pub trait LogQLParserVisitor<'input>: ParseTreeVisitor<'input,LogQLParserContext
 	fn visit_keepExpr(&mut self, ctx: &KeepExprContext<'input>) { self.visit_children(ctx) }
 
 	/**
+	 * Visit a parse tree produced by {@link LogQLParser#dropKeepList}.
+	 * @param ctx the parse tree
+	 */
+	fn visit_dropKeepList(&mut self, ctx: &DropKeepListContext<'input>) { self.visit_children(ctx) }
+
+	/**
+	 * Visit a parse tree produced by the {@code dropKeepMatcher}
+	 * labeled alternative in {@link LogQLParser#dropKeepItem}.
+	 * @param ctx the parse tree
+	 */
+	fn visit_dropKeepMatcher(&mut self, ctx: &DropKeepMatcherContext<'input>) { self.visit_children(ctx) }
+
+	/**
+	 * Visit a parse tree produced by the {@code dropKeepSimple}
+	 * labeled alternative in {@link LogQLParser#dropKeepItem}.
+	 * @param ctx the parse tree
+	 */
+	fn visit_dropKeepSimple(&mut self, ctx: &DropKeepSimpleContext<'input>) { self.visit_children(ctx) }
+
+	/**
 	 * Visit a parse tree produced by {@link LogQLParser#jsonParser}.
 	 * @param ctx the parse tree
 	 */
@@ -1059,6 +1079,32 @@ pub trait LogQLParserVisitorCompat<'input>:ParseTreeVisitorCompat<'input, Node= 
 	 * @param ctx the parse tree
 	 */
 		fn visit_keepExpr(&mut self, ctx: &KeepExprContext<'input>) -> Self::Return {
+			self.visit_children(ctx)
+		}
+
+	/**
+	 * Visit a parse tree produced by {@link LogQLParser#dropKeepList}.
+	 * @param ctx the parse tree
+	 */
+		fn visit_dropKeepList(&mut self, ctx: &DropKeepListContext<'input>) -> Self::Return {
+			self.visit_children(ctx)
+		}
+
+	/**
+	 * Visit a parse tree produced by the {@code dropKeepMatcher}
+	 * labeled alternative in {@link LogQLParser#dropKeepItem}.
+	 * @param ctx the parse tree
+	 */
+		fn visit_dropKeepMatcher(&mut self, ctx: &DropKeepMatcherContext<'input>) -> Self::Return {
+			self.visit_children(ctx)
+		}
+
+	/**
+	 * Visit a parse tree produced by the {@code dropKeepSimple}
+	 * labeled alternative in {@link LogQLParser#dropKeepItem}.
+	 * @param ctx the parse tree
+	 */
+		fn visit_dropKeepSimple(&mut self, ctx: &DropKeepSimpleContext<'input>) -> Self::Return {
 			self.visit_children(ctx)
 		}
 
@@ -1952,6 +1998,21 @@ where
 
 	fn visit_keepExpr(&mut self, ctx: &KeepExprContext<'input>){
 		let result = <Self as LogQLParserVisitorCompat>::visit_keepExpr(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+	}
+
+	fn visit_dropKeepList(&mut self, ctx: &DropKeepListContext<'input>){
+		let result = <Self as LogQLParserVisitorCompat>::visit_dropKeepList(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+	}
+
+	fn visit_dropKeepMatcher(&mut self, ctx: &DropKeepMatcherContext<'input>){
+		let result = <Self as LogQLParserVisitorCompat>::visit_dropKeepMatcher(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+	}
+
+	fn visit_dropKeepSimple(&mut self, ctx: &DropKeepSimpleContext<'input>){
+		let result = <Self as LogQLParserVisitorCompat>::visit_dropKeepSimple(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
 	}
 

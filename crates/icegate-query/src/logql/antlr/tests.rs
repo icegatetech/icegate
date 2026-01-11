@@ -315,6 +315,46 @@ fn test_keep_labels() {
 }
 
 #[test]
+fn test_drop_with_equals_matcher() {
+    assert_parses(r#"{job="app"} | json | drop level="debug""#);
+}
+
+#[test]
+fn test_drop_with_not_equals_matcher() {
+    assert_parses(r#"{job="app"} | json | drop level!="info""#);
+}
+
+#[test]
+fn test_drop_with_regex_matcher() {
+    assert_parses(r#"{job="app"} | json | drop level=~"debug|info""#);
+}
+
+#[test]
+fn test_drop_with_not_regex_matcher() {
+    assert_parses(r#"{job="app"} | json | drop app!~"test.*""#);
+}
+
+#[test]
+fn test_keep_with_equals_matcher() {
+    assert_parses(r#"{job="app"} | json | keep level="info""#);
+}
+
+#[test]
+fn test_keep_with_matchers() {
+    assert_parses(r#"{job="app"} | json | keep level="info", service="api""#);
+}
+
+#[test]
+fn test_drop_mixed_simple_and_matchers() {
+    assert_parses(r#"{job="app"} | json | drop method, level="debug", app=~"test.*""#);
+}
+
+#[test]
+fn test_keep_mixed_simple_and_matchers() {
+    assert_parses(r#"{job="app"} | json | keep service, level="info""#);
+}
+
+#[test]
 fn test_decolorize() {
     assert_parses(r#"{job="app"} | decolorize"#);
 }

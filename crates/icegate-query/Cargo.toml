@@ -41,6 +41,8 @@ tokio-util = { workspace = true }
 # CLI
 clap = { workspace = true }
 
+regex = { workspace = true }
+
 # Configuration
 serde = { workspace = true }
 serde_json = { workspace = true }

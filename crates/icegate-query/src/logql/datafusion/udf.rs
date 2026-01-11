@@ -4,7 +4,7 @@
 //! map filtering functions needed for `keep`, `drop`, `by`, and `without`
 //! operations.
 
-use std::{any::Any, collections::HashSet, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use datafusion::{
     arrow::{
@@ -16,20 +16,27 @@ use datafusion::{
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
 
-/// UDF: `map_keep_keys(map, keys_array)` - keeps only keys present in array.
+/// UDF: `map_keep_keys(map, keys, values, ops)` - keeps only specified keys with optional matcher filtering.
 ///
 /// # Arguments
 /// - `map`: A `Map<String, String>` column
-/// - `keys_array`: An `Array<String>` of keys to keep
+/// - `keys`: An `Array<String>` of keys to keep
+/// - `values`: An `Array<String>` of values to match (NULL for simple name-based)
+/// - `ops`: An `Array<String>` of operators (=, !=, =~, !~) (NULL for simple name-based)
 ///
 /// # Returns
-/// A new map containing only the key-value pairs where the key is in
-/// `keys_array`.
+/// A new map containing only the key-value pairs that match the filter criteria.
 ///
-/// # Example
+/// # Examples
 /// ```sql
-/// SELECT map_keep_keys(attributes, ARRAY['level', 'service']) FROM logs
+/// -- Simple name-based: keep only 'level' and 'service' keys
+/// SELECT map_keep_keys(attributes, ARRAY['level', 'service'], ARRAY[NULL, NULL], ARRAY[NULL, NULL])
 /// -- {level: "info", service: "api", method: "GET"} → {level: "info", service: "api"}
+///
+/// -- With matchers: keep 'level' and 'service' if service="api"
+/// SELECT map_keep_keys(attributes, ARRAY['level', 'service'], ARRAY[NULL, 'api'], ARRAY[NULL, '='])
+/// -- {level: "info", service: "api"} → {level: "info", service: "api"}
+/// -- {level: "info", service: "web"} → {level: "info"}
 /// ```
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct MapKeepKeys {
@@ -46,7 +53,7 @@ impl MapKeepKeys {
     /// Creates a new `MapKeepKeys` UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: Signature::any(4, Volatility::Immutable),
         }
     }
 }
@@ -77,19 +84,27 @@ impl ScalarUDFImpl for MapKeepKeys {
     }
 }
 
-/// UDF: `map_drop_keys(map, keys_array)` - removes keys present in array.
+/// UDF: `map_drop_keys(map, keys, values, ops)` - removes specified keys with optional matcher filtering.
 ///
 /// # Arguments
 /// - `map`: A `Map<String, String>` column
-/// - `keys_array`: An `Array<String>` of keys to drop
+/// - `keys`: An `Array<String>` of keys to drop
+/// - `values`: An `Array<String>` of values to match (NULL for simple name-based)
+/// - `ops`: An `Array<String>` of operators (=, !=, =~, !~) (NULL for simple name-based)
 ///
 /// # Returns
-/// A new map with the key-value pairs removed where the key is in `keys_array`.
+/// A new map with the key-value pairs removed that match the filter criteria.
 ///
-/// # Example
+/// # Examples
 /// ```sql
-/// SELECT map_drop_keys(attributes, ARRAY['method']) FROM logs
+/// -- Simple name-based: drop 'method' key unconditionally
+/// SELECT map_drop_keys(attributes, ARRAY['method'], ARRAY[NULL], ARRAY[NULL])
 /// -- {level: "info", service: "api", method: "GET"} → {level: "info", service: "api"}
+///
+/// -- With matchers: drop 'level' only when value is "debug"
+/// SELECT map_drop_keys(attributes, ARRAY['level'], ARRAY['debug'], ARRAY['='])
+/// -- {level: "debug", service: "api"} → {service: "api"}
+/// -- {level: "info", service: "api"} → {level: "info", service: "api"}
 /// ```
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct MapDropKeys {
@@ -106,7 +121,7 @@ impl MapDropKeys {
     /// Creates a new `MapDropKeys` UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: Signature::any(4, Volatility::Immutable),
         }
     }
 }
@@ -136,18 +151,22 @@ impl ScalarUDFImpl for MapDropKeys {
     }
 }
 
-/// Core implementation for map key filtering.
+/// Core implementation for map key filtering with matcher support.
 ///
 /// # Arguments
-/// - `args`: Two `ColumnarValue`s: the map and the keys array
+/// - `args`: 4 `ColumnarValue`s: map, keys, values, ops
+///   - `map`: Map<String, String> column
+///   - `keys`: Array of key names
+///   - `values`: Array of values (NULL for simple name-based matching)
+///   - `ops`: Array of operators (NULL for simple name-based matching)
 /// - `keep_mode`: If true, keep only keys in array; if false, drop keys in array
 ///
 /// # Returns
 /// A new `MapArray` with filtered entries.
 fn filter_map_keys(args: &[ColumnarValue], keep_mode: bool) -> Result<ColumnarValue> {
-    if args.len() != 2 {
+    if args.len() != 4 {
         return plan_err!(
-            "map_{}_keys requires exactly 2 arguments, got {}",
+            "map_{}_keys requires exactly 4 arguments, got {}",
             if keep_mode { "keep" } else { "drop" },
             args.len()
         );
@@ -157,18 +176,27 @@ fn filter_map_keys(args: &[ColumnarValue], keep_mode: bool) -> Result<ColumnarVa
     let map_array = arrays[0]
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| datafusion::error::DataFusionError::Execution("First argument must be a map".to_string()))?;
+        .ok_or_else(|| DataFusionError::Execution("First argument must be a map".to_string()))?;
 
-    // Extract filter keys from the second argument (could be ListArray or
-    // StringArray)
+    // Extract filter keys, values, and ops
     let filter_keys = extract_filter_keys(&arrays[1])?;
+    let filter_values = extract_filter_values(&arrays[2])?;
+    let filter_ops = extract_filter_ops(&arrays[3])?;
 
-    // Build HashSet for O(1) lookup
-    let filter_set: HashSet<&str> = filter_keys.iter().map(String::as_str).collect();
+    if filter_keys.len() != filter_values.len() || filter_keys.len() != filter_ops.len() {
+        return plan_err!(
+            "Keys, values, and ops arrays must have the same length: keys={}, values={}, ops={}",
+            filter_keys.len(),
+            filter_values.len(),
+            filter_ops.len()
+        );
+    }
 
-    // Process each row and build new MapArray
-    let result = build_filtered_map(map_array, &filter_set, keep_mode)?;
+    // Build matcher specifications
+    let matchers = build_matchers(&filter_keys, &filter_values, &filter_ops);
 
+    // Process with conditional matching (handles both simple and matcher-based)
+    let result = build_filtered_map_conditional(map_array, &matchers, keep_mode)?;
     Ok(ColumnarValue::from(Arc::new(result) as ArrayRef))
 }
 
@@ -197,108 +225,6 @@ fn extract_filter_keys(array: &ArrayRef) -> Result<Vec<String>> {
     }
 
     plan_err!("Second argument must be an array of strings")
-}
-
-/// Build a new `MapArray` with filtered entries, preserving original schema
-/// metadata.
-fn build_filtered_map(map_array: &MapArray, filter_set: &HashSet<&str>, keep_mode: bool) -> Result<MapArray> {
-    let offsets = map_array.offsets();
-    let keys = map_array
-        .keys()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Map keys must be strings".to_string()))?;
-    let values = map_array
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Map values must be strings".to_string()))?;
-
-    // Extract the original entries field from the map's data type to preserve
-    // metadata
-    let original_entries_field = map_array.entries().fields().clone();
-
-    // Build new arrays for the filtered map
-    let mut new_keys = StringBuilder::new();
-    let mut new_values = StringBuilder::new();
-    let mut new_offsets: Vec<i32> = Vec::with_capacity(map_array.len() + 1);
-    new_offsets.push(0);
-
-    let mut current_offset: i32 = 0;
-
-    for row_idx in 0..map_array.len() {
-        if map_array.is_null(row_idx) {
-            // Null row - keep offset the same
-            new_offsets.push(current_offset);
-            continue;
-        }
-
-        #[allow(clippy::cast_sign_loss)]
-        let start = offsets[row_idx] as usize;
-        #[allow(clippy::cast_sign_loss)]
-        let end = offsets[row_idx + 1] as usize;
-
-        for entry_idx in start..end {
-            if keys.is_null(entry_idx) {
-                continue;
-            }
-
-            let key = keys.value(entry_idx);
-            let should_include = if keep_mode {
-                filter_set.contains(key)
-            } else {
-                !filter_set.contains(key)
-            };
-
-            if should_include {
-                new_keys.append_value(key);
-                if values.is_null(entry_idx) {
-                    new_values.append_null();
-                } else {
-                    new_values.append_value(values.value(entry_idx));
-                }
-                current_offset += 1;
-            }
-        }
-
-        new_offsets.push(current_offset);
-    }
-
-    // Build the struct array for map entries using the original field definitions
-    let new_keys_array: ArrayRef = Arc::new(new_keys.finish());
-    let new_values_array: ArrayRef = Arc::new(new_values.finish());
-
-    let struct_array = datafusion::arrow::array::StructArray::try_new(
-        original_entries_field,
-        vec![new_keys_array, new_values_array],
-        None,
-    )?;
-
-    // Create the MapArray with the original entries field (preserving metadata)
-    let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(new_offsets));
-
-    // Handle nulls from original map
-    let null_buffer = if map_array.null_count() > 0 {
-        map_array.nulls().cloned()
-    } else {
-        None
-    };
-
-    // Get the original map field which contains the field name and metadata
-    let original_map_field = match map_array.data_type() {
-        DataType::Map(field, _) => field.clone(),
-        _ => {
-            return exec_err!("Expected Map data type");
-        }
-    };
-
-    Ok(MapArray::new(
-        original_map_field,
-        offset_buffer,
-        struct_array,
-        null_buffer,
-        false,
-    ))
 }
 
 /// UDF: `date_grid(timestamp, start, end, step, range, offset, inverse)` - calculate step timestamps of
@@ -430,9 +356,7 @@ impl ScalarUDFImpl for DateGrid {
         // Extract arguments
         let timestamp_array = match &args.args[0] {
             ColumnarValue::Array(arr) => arr.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
-                    "First argument must be TimestampMicrosecond array".to_string(),
-                )
+                DataFusionError::Execution("First argument must be TimestampMicrosecond array".to_string())
             })?,
             ColumnarValue::Scalar(_) => {
                 return plan_err!("First argument must be an array, not a scalar");
@@ -515,7 +439,7 @@ impl ScalarUDFImpl for DateGrid {
 
         for matches in list_builder {
             let len = i32::try_from(matches.len())
-                .map_err(|_| datafusion::error::DataFusionError::Execution("ListArray overflow".to_string()))?;
+                .map_err(|_| DataFusionError::Execution("ListArray overflow".to_string()))?;
             for timestamp in matches {
                 values_vec.push(timestamp);
             }
@@ -543,62 +467,12 @@ mod tests {
     use datafusion::{
         arrow::{
             array::{Float64Array, TimestampMicrosecondArray},
-            datatypes::{Field, Fields, IntervalMonthDayNano, TimeUnit},
+            datatypes::{Field, IntervalMonthDayNano, TimeUnit},
         },
         common::{DataFusionError, Result, ScalarValue, config::ConfigOptions},
     };
 
     use super::*;
-
-    /// Helper to create a simple `MapArray` for testing.
-    fn create_test_map(entries: &[Vec<(&str, &str)>]) -> MapArray {
-        let mut keys = StringBuilder::new();
-        let mut values = StringBuilder::new();
-        let mut offsets: Vec<i32> = vec![0];
-        let mut current_offset: i32 = 0;
-
-        for row in entries {
-            for (k, v) in row {
-                keys.append_value(*k);
-                values.append_value(*v);
-                current_offset += 1;
-            }
-            offsets.push(current_offset);
-        }
-
-        let keys_array: ArrayRef = Arc::new(keys.finish());
-        let values_array: ArrayRef = Arc::new(values.finish());
-
-        let struct_fields = Fields::from(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Utf8, true),
-        ]);
-
-        let entries_field = Arc::new(Field::new("entries", DataType::Struct(struct_fields.clone()), false));
-
-        let struct_array =
-            datafusion::arrow::array::StructArray::try_new(struct_fields, vec![keys_array, values_array], None)
-                .unwrap();
-
-        let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
-        MapArray::new(entries_field, offset_buffer, struct_array, None, false)
-    }
-
-    /// Helper to create a `ListArray` of filter keys.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    fn create_filter_keys(keys: &[&str]) -> ListArray {
-        let string_array = StringArray::from(keys.to_vec());
-        let values: ArrayRef = Arc::new(string_array);
-
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, keys.len() as i32]));
-
-        ListArray::new(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
-            offsets,
-            values,
-            None,
-        )
-    }
 
     // DateGrid test helpers
 
@@ -763,70 +637,6 @@ mod tests {
             }
             ColumnarValue::Scalar(_) => Err(DataFusionError::Plan("Expected Array result".to_string())),
         }
-    }
-
-    #[test]
-    fn test_map_keep_keys_basic() {
-        let map = create_test_map(&[vec![("level", "info"), ("service", "api"), ("method", "GET")]]);
-
-        let _filter = create_filter_keys(&["level", "service"]);
-        let filter_set: HashSet<&str> = ["level", "service"].into_iter().collect();
-
-        let result = build_filtered_map(&map, &filter_set, true).unwrap();
-
-        assert_eq!(result.len(), 1);
-        let offsets = result.offsets();
-        assert_eq!(offsets[1] - offsets[0], 2); // 2 entries kept
-    }
-
-    #[test]
-    fn test_map_drop_keys_basic() {
-        let map = create_test_map(&[vec![("level", "info"), ("service", "api"), ("method", "GET")]]);
-
-        let filter_set: HashSet<&str> = std::iter::once("method").collect();
-
-        let result = build_filtered_map(&map, &filter_set, false).unwrap();
-
-        assert_eq!(result.len(), 1);
-        let offsets = result.offsets();
-        assert_eq!(offsets[1] - offsets[0], 2); // 2 entries remain (level,
-        // service)
-    }
-
-    #[test]
-    fn test_map_filter_empty_filter() {
-        let map = create_test_map(&[vec![("level", "info"), ("service", "api")]]);
-
-        let filter_set: HashSet<&str> = HashSet::new();
-
-        // keep mode with empty filter = keep nothing
-        let result_keep = build_filtered_map(&map, &filter_set, true).unwrap();
-        let offsets = result_keep.offsets();
-        assert_eq!(offsets[1] - offsets[0], 0);
-
-        // drop mode with empty filter = drop nothing (keep all)
-        let result_drop = build_filtered_map(&map, &filter_set, false).unwrap();
-        let offsets = result_drop.offsets();
-        assert_eq!(offsets[1] - offsets[0], 2);
-    }
-
-    #[test]
-    fn test_map_filter_multiple_rows() {
-        let map = create_test_map(&[
-            vec![("a", "1"), ("b", "2"), ("c", "3")],
-            vec![("a", "4"), ("d", "5")],
-            vec![("b", "6")],
-        ]);
-
-        let filter_set: HashSet<&str> = ["a", "b"].into_iter().collect();
-
-        let result = build_filtered_map(&map, &filter_set, true).unwrap();
-
-        assert_eq!(result.len(), 3);
-        let offsets = result.offsets();
-        assert_eq!(offsets[1] - offsets[0], 2); // row 0: a, b
-        assert_eq!(offsets[2] - offsets[1], 1); // row 1: a
-        assert_eq!(offsets[3] - offsets[2], 1); // row 2: b
     }
 
     // DateGrid UDF tests
@@ -1833,6 +1643,283 @@ mod tests {
         let result = execute_parse_duration(&[Some("0s"), Some("0m"), Some("0h")], true).unwrap();
         assert_eq!(result, vec![Some(0.0), Some(0.0), Some(0.0)]);
     }
+
+    // Map filtering with matchers tests
+
+    /// Helper to create a `MapArray` for testing map filtering.
+    fn create_test_map_for_filter(entries: &[Vec<(&str, &str)>]) -> MapArray {
+        use std::sync::Arc;
+
+        use datafusion::arrow::{
+            array::{ArrayRef, StringBuilder, StructArray},
+            buffer::{OffsetBuffer, ScalarBuffer},
+            datatypes::{DataType, Fields},
+        };
+
+        let mut keys = StringBuilder::new();
+        let mut values = StringBuilder::new();
+        let mut offsets: Vec<i32> = vec![0];
+        let mut current_offset: i32 = 0;
+
+        for row in entries {
+            for (k, v) in row {
+                keys.append_value(*k);
+                values.append_value(*v);
+                current_offset += 1;
+            }
+            offsets.push(current_offset);
+        }
+
+        let keys_array: ArrayRef = Arc::new(keys.finish());
+        let values_array: ArrayRef = Arc::new(values.finish());
+
+        let struct_fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]);
+
+        let entries_field = Arc::new(Field::new("entries", DataType::Struct(struct_fields.clone()), false));
+
+        let struct_array = StructArray::try_new(struct_fields, vec![keys_array, values_array], None).unwrap();
+
+        let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+        MapArray::new(entries_field, offset_buffer, struct_array, None, false)
+    }
+
+    /// Helper to create filter arrays for testing.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn create_filter_arrays(
+        keys: &[&str],
+        values: &[Option<&str>],
+        ops: &[Option<&str>],
+    ) -> (ListArray, ListArray, ListArray) {
+        use std::sync::Arc;
+
+        use datafusion::arrow::{
+            array::{ArrayRef, ListArray, StringArray},
+            buffer::{OffsetBuffer, ScalarBuffer},
+            datatypes::DataType,
+        };
+
+        // Keys array
+        let keys_string_array = StringArray::from(keys.to_vec());
+        let keys_values: ArrayRef = Arc::new(keys_string_array);
+        let keys_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, keys.len() as i32]));
+        let keys_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            keys_offsets,
+            keys_values,
+            None,
+        );
+
+        // Values array (with nulls for simple names)
+        let values_string_array: StringArray = values.iter().copied().collect();
+        let values_values: ArrayRef = Arc::new(values_string_array);
+        let values_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, values.len() as i32]));
+        let values_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            values_offsets,
+            values_values,
+            None,
+        );
+
+        // Ops array (with nulls for simple names)
+        let ops_string_array: StringArray = ops.iter().copied().collect();
+        let ops_values: ArrayRef = Arc::new(ops_string_array);
+        let ops_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, ops.len() as i32]));
+        let ops_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            ops_offsets,
+            ops_values,
+            None,
+        );
+
+        (keys_array, values_array, ops_array)
+    }
+
+    #[test]
+    fn test_map_drop_keys_with_equals_matcher() {
+        // Test: drop level="debug"
+        // Input: {level: "debug", service: "api", method: "GET"}
+        // Expected: {service: "api", method: "GET"}
+        let map_array = create_test_map_for_filter(&[vec![("level", "debug"), ("service", "api"), ("method", "GET")]]);
+
+        let (keys, values, ops) = create_filter_arrays(&["level"], &[Some("debug")], &[Some("=")]);
+
+        let args = vec![
+            ColumnarValue::Array(Arc::new(map_array)),
+            ColumnarValue::Array(Arc::new(keys)),
+            ColumnarValue::Array(Arc::new(values)),
+            ColumnarValue::Array(Arc::new(ops)),
+        ];
+
+        let result = filter_map_keys(&args, false).unwrap();
+
+        if let ColumnarValue::Array(result_array) = result {
+            let result_map = result_array.as_any().downcast_ref::<MapArray>().unwrap();
+            let keys_array = result_map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+
+            // Should have 2 keys: service, method
+            assert_eq!(keys_array.len(), 2);
+            assert!(keys_array.iter().any(|k| k == Some("service")));
+            assert!(keys_array.iter().any(|k| k == Some("method")));
+            assert!(!keys_array.iter().any(|k| k == Some("level")));
+        } else {
+            panic!("Expected array result");
+        }
+    }
+
+    #[test]
+    fn test_map_drop_keys_with_not_equals_matcher() {
+        // Test: drop level!="debug"
+        // Input: {level: "info", service: "api"}
+        // Expected: {service: "api"} (level removed because it's "info" != "debug")
+        let map_array = create_test_map_for_filter(&[vec![("level", "info"), ("service", "api")]]);
+
+        let (keys, values, ops) = create_filter_arrays(&["level"], &[Some("debug")], &[Some("!=")]);
+
+        let args = vec![
+            ColumnarValue::Array(Arc::new(map_array)),
+            ColumnarValue::Array(Arc::new(keys)),
+            ColumnarValue::Array(Arc::new(values)),
+            ColumnarValue::Array(Arc::new(ops)),
+        ];
+
+        let result = filter_map_keys(&args, false).unwrap();
+
+        if let ColumnarValue::Array(result_array) = result {
+            let result_map = result_array.as_any().downcast_ref::<MapArray>().unwrap();
+            let keys_array = result_map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+
+            // Should have 1 key: service
+            assert_eq!(keys_array.len(), 1);
+            assert!(keys_array.iter().any(|k| k == Some("service")));
+            assert!(!keys_array.iter().any(|k| k == Some("level")));
+        } else {
+            panic!("Expected array result");
+        }
+    }
+
+    #[test]
+    fn test_map_drop_keys_with_regex_matcher() {
+        // Test: drop level=~"debug|info"
+        // Input: {level: "debug", service: "api"}
+        // Expected: {service: "api"}
+        let map_array = create_test_map_for_filter(&[vec![("level", "debug"), ("service", "api")]]);
+
+        let (keys, values, ops) = create_filter_arrays(&["level"], &[Some("debug|info")], &[Some("=~")]);
+
+        let args = vec![
+            ColumnarValue::Array(Arc::new(map_array)),
+            ColumnarValue::Array(Arc::new(keys)),
+            ColumnarValue::Array(Arc::new(values)),
+            ColumnarValue::Array(Arc::new(ops)),
+        ];
+
+        let result = filter_map_keys(&args, false).unwrap();
+
+        if let ColumnarValue::Array(result_array) = result {
+            let result_map = result_array.as_any().downcast_ref::<MapArray>().unwrap();
+            let keys_array = result_map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+
+            assert_eq!(keys_array.len(), 1);
+            assert!(keys_array.iter().any(|k| k == Some("service")));
+        } else {
+            panic!("Expected array result");
+        }
+    }
+
+    #[test]
+    fn test_map_drop_keys_mixed_simple_and_matchers() {
+        // Test: drop method, level="debug"
+        // Input: {level: "debug", service: "api", method: "GET"}
+        // Expected: {service: "api"}
+        let map_array = create_test_map_for_filter(&[vec![("level", "debug"), ("service", "api"), ("method", "GET")]]);
+
+        let (keys, values, ops) =
+            create_filter_arrays(&["method", "level"], &[None, Some("debug")], &[None, Some("=")]);
+
+        let args = vec![
+            ColumnarValue::Array(Arc::new(map_array)),
+            ColumnarValue::Array(Arc::new(keys)),
+            ColumnarValue::Array(Arc::new(values)),
+            ColumnarValue::Array(Arc::new(ops)),
+        ];
+
+        let result = filter_map_keys(&args, false).unwrap();
+
+        if let ColumnarValue::Array(result_array) = result {
+            let result_map = result_array.as_any().downcast_ref::<MapArray>().unwrap();
+            let keys_array = result_map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+
+            // Should have 1 key: service
+            assert_eq!(keys_array.len(), 1);
+            assert!(keys_array.iter().any(|k| k == Some("service")));
+        } else {
+            panic!("Expected array result");
+        }
+    }
+
+    #[test]
+    fn test_map_keep_keys_with_equals_matcher() {
+        // Test: keep level="info"
+        // Input: {level: "info", service: "api", method: "GET"}
+        // Expected: {level: "info"}
+        let map_array = create_test_map_for_filter(&[vec![("level", "info"), ("service", "api"), ("method", "GET")]]);
+
+        let (keys, values, ops) = create_filter_arrays(&["level"], &[Some("info")], &[Some("=")]);
+
+        let args = vec![
+            ColumnarValue::Array(Arc::new(map_array)),
+            ColumnarValue::Array(Arc::new(keys)),
+            ColumnarValue::Array(Arc::new(values)),
+            ColumnarValue::Array(Arc::new(ops)),
+        ];
+
+        let result = filter_map_keys(&args, true).unwrap();
+
+        if let ColumnarValue::Array(result_array) = result {
+            let result_map = result_array.as_any().downcast_ref::<MapArray>().unwrap();
+            let keys_array = result_map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+
+            // Should have 1 key: level
+            assert_eq!(keys_array.len(), 1);
+            assert!(keys_array.iter().any(|k| k == Some("level")));
+        } else {
+            panic!("Expected array result");
+        }
+    }
+
+    #[test]
+    fn test_map_keep_keys_mixed_simple_and_matchers() {
+        // Test: keep level, service="api"
+        // Input: {level: "info", service: "api", method: "GET"}
+        // Expected: {level: "info", service: "api"}
+        let map_array = create_test_map_for_filter(&[vec![("level", "info"), ("service", "api"), ("method", "GET")]]);
+
+        let (keys, values, ops) = create_filter_arrays(&["level", "service"], &[None, Some("api")], &[None, Some("=")]);
+
+        let args = vec![
+            ColumnarValue::Array(Arc::new(map_array)),
+            ColumnarValue::Array(Arc::new(keys)),
+            ColumnarValue::Array(Arc::new(values)),
+            ColumnarValue::Array(Arc::new(ops)),
+        ];
+
+        let result = filter_map_keys(&args, true).unwrap();
+
+        if let ColumnarValue::Array(result_array) = result {
+            let result_map = result_array.as_any().downcast_ref::<MapArray>().unwrap();
+            let keys_array = result_map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+
+            // Should have 2 keys: level, service
+            assert_eq!(keys_array.len(), 2);
+            assert!(keys_array.iter().any(|k| k == Some("level")));
+            assert!(keys_array.iter().any(|k| k == Some("service")));
+        } else {
+            panic!("Expected array result");
+        }
+    }
 }
 
 /// UDF: `parse_numeric(value)` - parses string to Float64.
@@ -2409,4 +2496,215 @@ fn insert_key_into_map(map_array: &MapArray, insert_key: &str, insert_value: &st
         null_buffer,
         false,
     ))
+}
+
+/// Extract filter values from an array (handles NULL for simple name-based filtering).
+fn extract_filter_values(array: &ArrayRef) -> Result<Vec<Option<String>>> {
+    // Try ListArray first (from make_array())
+    if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
+        let values = list_array.values();
+        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
+            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
+        }
+    }
+
+    // Try GenericListArray<i64> (LargeList)
+    if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i64>>() {
+        let values = list_array.values();
+        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
+            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
+        }
+    }
+
+    plan_err!("Values argument must be an array of strings")
+}
+
+/// Extract filter operators from an array (handles NULL for simple name-based filtering).
+fn extract_filter_ops(array: &ArrayRef) -> Result<Vec<Option<String>>> {
+    // Try ListArray first (from make_array())
+    if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
+        let values = list_array.values();
+        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
+            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
+        }
+    }
+
+    // Try GenericListArray<i64> (LargeList)
+    if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i64>>() {
+        let values = list_array.values();
+        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
+            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
+        }
+    }
+
+    plan_err!("Ops argument must be an array of strings")
+}
+
+/// Matcher specification for conditional filtering.
+#[derive(Debug, Clone)]
+struct MatcherSpec {
+    /// The key name.
+    key: String,
+    /// The value pattern (None for simple name-based matching).
+    value: Option<String>,
+    /// The operator (None for simple name-based matching).
+    op: Option<String>,
+}
+
+/// Build matcher specifications from keys, values, and ops arrays.
+fn build_matchers(keys: &[String], values: &[Option<String>], ops: &[Option<String>]) -> Vec<MatcherSpec> {
+    let mut matchers = Vec::with_capacity(keys.len());
+
+    for (idx, key) in keys.iter().enumerate() {
+        let value = values[idx].clone();
+        let op = ops[idx].clone();
+
+        matchers.push(MatcherSpec {
+            key: key.clone(),
+            value,
+            op,
+        });
+    }
+
+    matchers
+}
+
+/// Build a new `MapArray` with conditional matcher-based filtering.
+fn build_filtered_map_conditional(map_array: &MapArray, matchers: &[MatcherSpec], keep_mode: bool) -> Result<MapArray> {
+    let offsets = map_array.offsets();
+    let keys = map_array
+        .keys()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| DataFusionError::Execution("Map keys must be strings".to_string()))?;
+    let values = map_array
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| DataFusionError::Execution("Map values must be strings".to_string()))?;
+
+    let original_entries_field = map_array.entries().fields().clone();
+
+    // Build new arrays for the filtered map
+    let mut new_keys = StringBuilder::new();
+    let mut new_values = StringBuilder::new();
+    let mut new_offsets: Vec<i32> = Vec::with_capacity(map_array.len() + 1);
+    new_offsets.push(0);
+
+    let mut current_offset: i32 = 0;
+
+    for row_idx in 0..map_array.len() {
+        if map_array.is_null(row_idx) {
+            new_offsets.push(current_offset);
+            continue;
+        }
+
+        #[allow(clippy::cast_sign_loss)]
+        let start = offsets[row_idx] as usize;
+        #[allow(clippy::cast_sign_loss)]
+        let end = offsets[row_idx + 1] as usize;
+
+        for entry_idx in start..end {
+            if keys.is_null(entry_idx) {
+                continue;
+            }
+
+            let key = keys.value(entry_idx);
+            let value = if values.is_null(entry_idx) {
+                None
+            } else {
+                Some(values.value(entry_idx))
+            };
+
+            // Find matcher for this key
+            let matcher = matchers.iter().find(|m| m.key == key);
+
+            let should_include = if let Some(matcher) = matcher {
+                // Matcher found - evaluate condition
+                if matcher.value.is_none() || matcher.op.is_none() {
+                    // Simple name-based matching (no value/op specified)
+                    keep_mode
+                } else if let (Some(map_value), Some(matcher_value), Some(matcher_op)) =
+                    (value, matcher.value.as_ref(), matcher.op.as_ref())
+                {
+                    // Conditional matching - evaluate the matcher
+                    let is_match = evaluate_matcher(map_value, matcher_value, matcher_op)?;
+
+                    if keep_mode { is_match } else { !is_match }
+                } else {
+                    // Map value is NULL - skip matching
+                    !keep_mode
+                }
+            } else {
+                // Key not in matcher list
+                !keep_mode
+            };
+
+            if should_include {
+                new_keys.append_value(key);
+                if let Some(v) = value {
+                    new_values.append_value(v);
+                } else {
+                    new_values.append_null();
+                }
+                current_offset += 1;
+            }
+        }
+
+        new_offsets.push(current_offset);
+    }
+
+    // Build the struct array for map entries
+    let new_keys_array: ArrayRef = Arc::new(new_keys.finish());
+    let new_values_array: ArrayRef = Arc::new(new_values.finish());
+
+    let struct_array = datafusion::arrow::array::StructArray::try_new(
+        original_entries_field,
+        vec![new_keys_array, new_values_array],
+        None,
+    )?;
+
+    let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(new_offsets));
+
+    let null_buffer = if map_array.null_count() > 0 {
+        map_array.nulls().cloned()
+    } else {
+        None
+    };
+
+    let original_map_field = match map_array.data_type() {
+        DataType::Map(field, _) => field.clone(),
+        _ => return exec_err!("Expected Map data type"),
+    };
+
+    Ok(MapArray::new(
+        original_map_field,
+        offset_buffer,
+        struct_array,
+        null_buffer,
+        false,
+    ))
+}
+
+/// Evaluate if a value matches a pattern using the specified operator.
+///
+/// Supports: `=` (equals), `!=` (not equals), `=~` (regex match), `!~` (regex not match)
+fn evaluate_matcher(value: &str, pattern: &str, op: &str) -> Result<bool> {
+    match op {
+        "=" => Ok(value == pattern),
+        "!=" => Ok(value != pattern),
+        "=~" => {
+            // Regex match
+            let re = regex::Regex::new(pattern)
+                .map_err(|e| DataFusionError::Execution(format!("Invalid regex pattern '{pattern}': {e}")))?;
+            Ok(re.is_match(value))
+        }
+        "!~" => {
+            // Regex not match
+            let re = regex::Regex::new(pattern)
+                .map_err(|e| DataFusionError::Execution(format!("Invalid regex pattern '{pattern}': {e}")))?;
+            Ok(!re.is_match(value))
+        }
+        _ => exec_err!("Unknown matcher operator: {}", op),
+    }
 }

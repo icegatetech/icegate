@@ -538,7 +538,21 @@ impl DataFusionPlanner {
                 } else {
                     make_array(attr_labels.iter().map(|l| lit(*l)).collect())
                 };
-                let filtered_attrs = udf.call(vec![col("attributes"), label_array]);
+
+                // For grouping (by/without), we only filter by key names (no matchers)
+                // Pass NULL arrays for values and ops (simple name-based filtering)
+                let null_values = if attr_labels.is_empty() {
+                    datafusion::functions::core::arrow_cast().call(vec![make_array(vec![]), lit("List(Utf8)")])
+                } else {
+                    make_array(vec![lit(ScalarValue::Utf8(None)); attr_labels.len()])
+                };
+                let null_ops = if attr_labels.is_empty() {
+                    datafusion::functions::core::arrow_cast().call(vec![make_array(vec![]), lit("List(Utf8)")])
+                } else {
+                    make_array(vec![lit(ScalarValue::Utf8(None)); attr_labels.len()])
+                };
+
+                let filtered_attrs = udf.call(vec![col("attributes"), label_array, null_values, null_ops]);
 
                 if attr_labels.is_empty() {
                     // No attributes to group by - use empty MAP serialization
@@ -582,7 +596,13 @@ impl DataFusionPlanner {
                 } else {
                     let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
                     let label_array = make_array(excluded_attr_labels.iter().map(|l| lit(*l)).collect());
-                    udf.call(vec![col("attributes"), label_array])
+
+                    // For grouping (by/without), we only filter by key names (no matchers)
+                    // Pass NULL arrays for values and ops (simple name-based filtering)
+                    let null_values = make_array(vec![lit(ScalarValue::Utf8(None)); excluded_attr_labels.len()]);
+                    let null_ops = make_array(vec![lit(ScalarValue::Utf8(None)); excluded_attr_labels.len()]);
+
+                    udf.call(vec![col("attributes"), label_array, null_values, null_ops])
                 };
 
                 if excluded_attr_labels.is_empty() {
@@ -1477,23 +1497,46 @@ impl DataFusionPlanner {
     }
 
     /// Apply `LogQL` `drop` operator - removes specified labels from attributes
-    /// map.
+    /// map with optional matcher-based filtering.
     ///
     /// Uses the `map_drop_keys` UDF to filter the attributes map, removing
-    /// entries whose keys match the specified labels.
-    fn apply_drop(df: DataFrame, labels: &[crate::logql::common::LabelExtraction]) -> Result<DataFrame> {
+    /// entries whose keys match the specified labels, optionally with value matching.
+    fn apply_drop(df: DataFrame, labels: &[crate::logql::log::DropKeepLabel]) -> Result<DataFrame> {
         if labels.is_empty() {
             return Ok(df);
         }
 
-        // Build array of label names to drop
-        let label_literals: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
+        // Build parallel arrays for keys, values, and ops
+        let keys: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
+
+        let values: Vec<Expr> = labels
+            .iter()
+            .map(|l| {
+                l.matcher
+                    .as_ref()
+                    .map_or_else(|| lit(ScalarValue::Utf8(None)), |m| lit(m.value.as_str()))
+            })
+            .collect();
+
+        let ops: Vec<Expr> = labels
+            .iter()
+            .map(|l| {
+                l.matcher
+                    .as_ref()
+                    .map_or_else(|| lit(ScalarValue::Utf8(None)), |matcher| lit(matcher.op.as_str()))
+            })
+            .collect();
 
         // Get the map_drop_keys UDF
         let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
 
-        // Create filtered attributes expression
-        let filtered_attrs = udf.call(vec![col("attributes"), make_array(label_literals)]);
+        // Create filtered attributes expression with all 4 arguments
+        let filtered_attrs = udf.call(vec![
+            col("attributes"),
+            make_array(keys),
+            make_array(values),
+            make_array(ops),
+        ]);
 
         // Select all columns, replacing attributes with filtered version
         let select_exprs: Vec<Expr> = df
@@ -1514,25 +1557,48 @@ impl DataFusionPlanner {
     }
 
     /// Apply `LogQL` `keep` operator - keeps only specified labels in
-    /// attributes map.
+    /// attributes map with optional matcher-based filtering.
     ///
     /// Uses the `map_keep_keys` UDF to filter the attributes map, keeping
-    /// only entries whose keys match the specified labels.
-    fn apply_keep(df: DataFrame, labels: &[crate::logql::common::LabelExtraction]) -> Result<DataFrame> {
+    /// only entries whose keys match the specified labels, optionally with value matching.
+    fn apply_keep(df: DataFrame, labels: &[crate::logql::log::DropKeepLabel]) -> Result<DataFrame> {
         if labels.is_empty() {
             // keep with empty list = keep nothing (empty attributes)
             // But this might be unexpected, so we return as-is for now
             return Ok(df);
         }
 
-        // Build array of label names to keep
-        let label_literals: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
+        // Build parallel arrays for keys, values, and ops
+        let keys: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
+
+        let values: Vec<Expr> = labels
+            .iter()
+            .map(|l| {
+                l.matcher
+                    .as_ref()
+                    .map_or_else(|| lit(ScalarValue::Utf8(None)), |matcher| lit(matcher.value.as_str()))
+            })
+            .collect();
+
+        let ops: Vec<Expr> = labels
+            .iter()
+            .map(|l| {
+                l.matcher
+                    .as_ref()
+                    .map_or_else(|| lit(ScalarValue::Utf8(None)), |matcher| lit(matcher.op.as_str()))
+            })
+            .collect();
 
         // Get the map_keep_keys UDF
         let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
 
-        // Create filtered attributes expression
-        let filtered_attrs = udf.call(vec![col("attributes"), make_array(label_literals)]);
+        // Create filtered attributes expression with all 4 arguments
+        let filtered_attrs = udf.call(vec![
+            col("attributes"),
+            make_array(keys),
+            make_array(values),
+            make_array(ops),
+        ]);
 
         // Select all columns, replacing attributes with filtered version
         let select_exprs: Vec<Expr> = df

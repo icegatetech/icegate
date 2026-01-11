@@ -6,6 +6,7 @@
 //! - `metrics`: Metric query tests (`count_over_time`, rate, `bytes_rate`, etc.)
 //! - `unwrap`: Unwrap aggregation tests (`sum_over_time`, `avg_over_time`, etc.)
 //! - `grouping`: Cross-type grouping merge semantics tests
+//! - `pipeline`: Pipeline stage tests (drop, keep)
 //! - `labels`: Label metadata endpoint tests (labels, label values, series)
 //! - `tenant`: Tenant isolation tests
 //! - `trace`: Trace ID and span ID query tests
@@ -14,6 +15,7 @@ mod grouping;
 mod harness;
 mod labels;
 mod metrics;
+mod pipeline;
 mod query_range;
 mod tenant;
 mod trace;
