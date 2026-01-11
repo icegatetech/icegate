@@ -25,7 +25,6 @@ use crate::error::Result;
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
-/// - `cloud_account_id` (identity)
 /// - day(`timestamp`)
 ///
 /// # Sorting
@@ -135,14 +134,11 @@ pub fn logs_schema() -> Result<Schema> {
 ///
 /// Partitions by:
 /// - `tenant_id` (identity transform)
-/// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn logs_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
-    // TODO(crit): remove cloud_account_id - we can't control it because it comes from inside the records.
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(1)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
-        .add_partition_field("cloud_account_id", "cloud_account_id", Transform::Identity)?
         .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
         .build()?;
 
@@ -194,7 +190,6 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
-/// - `cloud_account_id` (identity)
 /// - day(`timestamp`)
 ///
 /// # Sorting
@@ -400,13 +395,11 @@ pub fn spans_schema() -> Result<Schema> {
 ///
 /// Partitions by:
 /// - `tenant_id` (identity transform)
-/// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn spans_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(2)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
-        .add_partition_field("cloud_account_id", "cloud_account_id", Transform::Identity)?
         .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
         .build()?;
 
@@ -453,7 +446,6 @@ pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
-/// - `cloud_account_id` (identity)
 /// - day(`timestamp`)
 ///
 /// # Sorting
@@ -539,13 +531,11 @@ pub fn events_schema() -> Result<Schema> {
 ///
 /// Partitions by:
 /// - `tenant_id` (identity transform)
-/// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn events_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(3)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
-        .add_partition_field("cloud_account_id", "cloud_account_id", Transform::Identity)?
         .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
         .build()?;
 
@@ -597,7 +587,6 @@ pub fn events_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
-/// - `cloud_account_id` (identity)
 /// - day(`timestamp`)
 ///
 /// # Sorting
@@ -845,13 +834,11 @@ pub fn metrics_schema() -> Result<Schema> {
 ///
 /// Partitions by:
 /// - `tenant_id` (identity transform)
-/// - `cloud_account_id` (identity transform)
 /// - day(`timestamp`) (day transform)
 pub fn metrics_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
     let spec = PartitionSpec::builder(schema.clone())
         .with_spec_id(4)
         .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
-        .add_partition_field("cloud_account_id", "cloud_account_id", Transform::Identity)?
         .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
         .build()?;
 

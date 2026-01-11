@@ -61,12 +61,8 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     let mut executors = HashMap::new();
     executors.insert(TaskCode::new("hanging_task"), executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("test_deadline_job"),
-        vec![task_def.clone()],
-        executors,
-    )?
-    .with_max_iterations(1)?;
+    let job_def = JobDefinition::new(JobCode::new("test_deadline_job"), vec![task_def.clone()], executors)?
+        .with_max_iterations(1)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);

@@ -73,7 +73,6 @@ pub struct TaskDefinition {
 
 impl TaskDefinition {
     pub fn new(code: TaskCode, input: Vec<u8>, timeout: Duration) -> Result<Self, Error> {
-        // TODO(crit): add setting to max input size
         if timeout <= Duration::zero() {
             return Err(Error::Other("task timeout must be positive".into()));
         }
@@ -99,6 +98,7 @@ impl TaskDefinition {
     }
 
     /// Sets task dependencies by task id.
+    #[must_use]
     pub fn with_dependencies(mut self, depends_on: Vec<Uuid>) -> Self {
         self.depends_on = depends_on;
         self
@@ -284,9 +284,8 @@ impl Task {
     pub(crate) fn can_be_picked_up(&self) -> bool {
         match self.status {
             TaskStatus::Todo | TaskStatus::Failed => true, // TODO(low): add limit on number of attempts
-            TaskStatus::Blocked => false,
+            TaskStatus::Blocked | TaskStatus::Completed => false,
             TaskStatus::Started => self.is_expired(),
-            TaskStatus::Completed => false,
         }
     }
 

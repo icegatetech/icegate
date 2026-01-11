@@ -50,12 +50,8 @@ async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
     let mut executors = HashMap::new();
     executors.insert(TaskCode::new("iteration_task"), executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("test_iterations_job"),
-        vec![task_def],
-        executors,
-    )?
-    .with_max_iterations(expected_iterations)?;
+    let job_def = JobDefinition::new(JobCode::new("test_iterations_job"), vec![task_def], executors)?
+        .with_max_iterations(expected_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);

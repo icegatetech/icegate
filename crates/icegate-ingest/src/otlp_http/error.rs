@@ -45,6 +45,10 @@ impl IntoResponse for OtlpError {
             | IngestError::Shift(_)
             | IngestError::Other(_)
             | IngestError::Multiple(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::Internal),
+
+            IngestError::Cancelled => (StatusCode::REQUEST_TIMEOUT, ErrorType::Internal),
+
+            IngestError::MaxAttemptsReached => (StatusCode::SERVICE_UNAVAILABLE, ErrorType::Internal),
         };
 
         (status, Json(ErrorResponse::new(error_type, self.0.to_string()))).into_response()

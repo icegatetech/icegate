@@ -52,11 +52,7 @@ pub async fn run_simple_job(codec: JobStateCodecKind, bucket_prefix: String) -> 
     task_executors.insert(TaskCode::new("my task code"), task_executor);
 
     // 3. Define the job
-    let job_def = JobDefinition::new(
-        JobCode::new("simple job"),
-        vec![task_def],
-        task_executors,
-    )?;
+    let job_def = JobDefinition::new(JobCode::new("simple job"), vec![task_def], task_executors)?;
 
     // 4. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);

@@ -3,15 +3,15 @@ use std::{any::Any, collections::HashMap, panic::AssertUnwindSafe, sync::Arc};
 use futures_util::FutureExt;
 use parking_lot::{Mutex, RwLock};
 use rand::Rng;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::execution::job_manager::JobManagerImpl;
 use crate::{
-    InternalError, Job, JobCode, JobDefinition, JobError, JobRegistry, Metrics, Retrier, RetrierConfig, Storage,
-    StorageError, Task, TaskCode,
+    InternalError, Job, JobCode, JobError, JobRegistry, Metrics, Retrier, RetrierConfig, Storage, StorageError,
+    TaskCode,
 };
 // TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
 // Can be done via storage wrapper.
@@ -223,16 +223,17 @@ impl Worker {
     #[tracing::instrument(skip(self, cancel_token), fields(worker_id = %self.id, job_code = %code))]
     async fn create_new_job(&self, code: &JobCode, cancel_token: &CancellationToken) -> Result<Job, InternalError> {
         let job_def = self.job_registry.get_job(code)?;
-        let tasks = self.create_tasks_from_job_def(&job_def);
+        let task_defs = job_def.initial_tasks().to_vec();
 
         let job = Job::new(
             code.clone(),
-            tasks,
+            task_defs,
             HashMap::new(),
             self.id,
             job_def.max_iterations(),
             job_def.iteration_interval(),
-        );
+            job_def.task_limits(),
+        )?;
 
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
@@ -243,8 +244,7 @@ impl Worker {
                     saved_job.id(),
                     saved_job.updated_by_worker_id()
                 );
-                // TODO(low): in saveJobState on ConcurrentModification error we re-read job, which is unnecessary
-                // in this case.
+                // TODO(low): in saveJobState on ConcurrentModification error we re-read job, which is unnecessary in this case.
                 Ok(MergeDecision::Done(saved_job, SaveOutcome::Skipped)) // Someone beat us to it
             })
             .await?;
@@ -313,9 +313,9 @@ impl Worker {
         cancel_token: &CancellationToken,
     ) -> Result<Job, InternalError> {
         let job_def = self.job_registry.get_job(job.code())?;
-        let tasks = self.create_tasks_from_job_def(&job_def);
+        let task_defs = job_def.initial_tasks().to_vec();
 
-        job.next_iteration(tasks, self.id)?;
+        job.next_iteration(task_defs, self.id)?;
 
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
@@ -426,11 +426,12 @@ impl Worker {
 
         // Execute task (wrap Job with moving)
         let wrapper_job = RwLock::new(job);
-        let job_manager = JobManagerImpl::new(&wrapper_job, self.id);
-
-        let result = AssertUnwindSafe(executor(task, &job_manager, cancel_token.clone()))
-            .catch_unwind()
-            .await;
+        let result = {
+            let job_manager = JobManagerImpl::new(&wrapper_job, self.id);
+            AssertUnwindSafe(executor(task, &job_manager, cancel_token.clone()))
+                .catch_unwind()
+                .await
+        };
         let result = match result {
             Ok(result) => result.map_err(InternalError::from),
             Err(panic) => Err(InternalError::Other(format!(
@@ -449,7 +450,6 @@ impl Worker {
 
         // Recover ownership. Since executor is done and dropped (it was awaited), and job_manager is local,
         // we should satisfy unique access.
-        drop(job_manager);
         let mut job = wrapper_job.into_inner();
 
         // TODO(low): think about to fail the task when expired
@@ -668,13 +668,5 @@ impl Worker {
                 exhausted,
             },
         );
-    }
-
-    fn create_tasks_from_job_def(&self, job_def: &JobDefinition) -> Vec<Task> {
-        job_def
-            .initial_tasks()
-            .iter()
-            .map(|task_def| Task::new(self.id, task_def))
-            .collect()
     }
 }

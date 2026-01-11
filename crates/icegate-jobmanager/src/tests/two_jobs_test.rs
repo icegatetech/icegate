@@ -85,18 +85,10 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
         )?);
     }
 
-    let primary_job_def = JobDefinition::new(
-        primary_job_code.clone(),
-        primary_tasks,
-        primary_executors,
-    )?
-    .with_max_iterations(max_iterations)?;
-    let secondary_job_def = JobDefinition::new(
-        secondary_job_code.clone(),
-        secondary_tasks,
-        secondary_executors,
-    )?
-    .with_max_iterations(max_iterations)?;
+    let primary_job_def = JobDefinition::new(primary_job_code.clone(), primary_tasks, primary_executors)?
+        .with_max_iterations(max_iterations)?;
+    let secondary_job_def = JobDefinition::new(secondary_job_code.clone(), secondary_tasks, secondary_executors)?
+        .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![

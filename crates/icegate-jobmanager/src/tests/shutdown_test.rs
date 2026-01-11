@@ -30,8 +30,8 @@ fn start_returns_error_when_worker_count_is_zero() -> Result<(), Box<dyn std::er
     let mut executors = HashMap::new();
     executors.insert(TaskCode::new("noop"), executor);
 
-    let job_def = JobDefinition::new(JobCode::new("zero_worker_job"), vec![task_def], executors)?
-        .with_max_iterations(1)?;
+    let job_def =
+        JobDefinition::new(JobCode::new("zero_worker_job"), vec![task_def], executors)?.with_max_iterations(1)?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
 
     let Err(_err) = JobsManager::new(

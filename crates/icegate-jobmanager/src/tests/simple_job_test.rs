@@ -69,12 +69,8 @@ async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dy
     let mut executors = HashMap::new();
     executors.insert(TaskCode::new("simple_task"), executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("test_simple_job"),
-        vec![task_def],
-        executors,
-    )?
-    .with_max_iterations(max_iterations)?;
+    let job_def = JobDefinition::new(JobCode::new("test_simple_job"), vec![task_def], executors)?
+        .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -188,12 +184,8 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
     executors.insert(TaskCode::new("first_task"), first_task_executor);
     executors.insert(TaskCode::new("second_task"), second_task_executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("test_sequence_job"),
-        vec![first_task_def],
-        executors,
-    )?
-    .with_max_iterations(max_iterations)?;
+    let job_def = JobDefinition::new(JobCode::new("test_sequence_job"), vec![first_task_def], executors)?
+        .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);

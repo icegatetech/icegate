@@ -136,7 +136,7 @@ pub fn logs_to_record_batch(request: &ExportLogsServiceRequest, tenant_id: Optio
                 // tenant_id
                 tenant_id_builder.append_value(tenant);
 
-                // cloud_account_id (use default if not provided - required for partitioning)
+                // cloud_account_id (use default if not provided - required by schema)
                 let acc = account_id.as_deref().unwrap_or(DEFAULT_ACCOUNT_ID);
                 account_id_builder.append_value(acc);
 

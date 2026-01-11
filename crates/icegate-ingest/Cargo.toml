@@ -17,10 +17,6 @@ workspace = true
 name = "ingest"
 path = "src/main.rs"
 
-[[bin]]
-name = "shifter"
-path = "src/bin/shifter.rs"
-
 [dependencies]
 icegate-common = { workspace = true }
 icegate-jobmanager = { path = "../icegate-jobmanager" }

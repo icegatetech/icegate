@@ -1,100 +1,133 @@
 //! Queue reader for reading Parquet segments from object storage.
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore};
+use icegate_common::retrier::{Retrier, RetrierConfig};
+use object_store::{ObjectStore, path::Path};
 use parquet::{
-    arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
+    arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     errors::ParquetError,
-    file::reader::{FileReader, SerializedFileReader},
     file::metadata::{ParquetMetaData, ParquetMetaDataReader},
+    file::statistics::Statistics,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{
-    error::Result,
-    segment::{SegmentId, SegmentMetadata, SegmentStatus},
     Topic,
+    error::{QueueError, Result},
+    segment::SegmentId,
 };
 
-// TODO(crit): check
-// TODO(crit): тут же не нужен recover?
+// Reference to record batches (row groups) inside a WAL segment.
+//
+// Schema:
+// `SegmentsPlan`
+//   groups: [`GroupedSegmentsPlan`]
+//     `group_col_val`: String
+//     segments: [`SegmentRecordBatcheIdxs`]
+//       `segment_offset`: u64
+//       `record_batch_idxs`: [usize]
+
+/// Result of planning segments record batches for processing.
+#[derive(Debug, Clone)]
+pub struct SegmentsPlan {
+    /// Grouped record batches in segments keyed by a column value.
+    pub groups: Vec<GroupedSegmentsPlan>,
+    /// Last segment offset observed in the planned segments.
+    pub last_segment_offset: Option<u64>,
+}
+
+/// Grouped record batches in segments keyed by a column value.
+#[derive(Debug, Clone)]
+pub struct GroupedSegmentsPlan {
+    /// Grouping key from the requested column.
+    pub group_col_val: String,
+    /// WAL segment references for the group.
+    pub segments: Vec<SegmentRecordBatcheIdxs>,
+}
+
+/// Record batches indexes (row group) in segment (WAL file).
+#[derive(Debug, Clone)]
+pub struct SegmentRecordBatcheIdxs {
+    /// WAL segment offset.
+    pub segment_offset: u64,
+    /// Row group indices inside the segment.
+    pub record_batch_idxs: Vec<usize>,
+}
+
+struct RowGroupsInSegments {
+    segments: BTreeMap<u64, Vec<usize>>,
+    row_group_count: usize,
+}
+
+impl RowGroupsInSegments {
+    const fn new() -> Self {
+        Self {
+            segments: BTreeMap::new(),
+            row_group_count: 0,
+        }
+    }
+
+    fn push(&mut self, offset: u64, row_groups: Vec<usize>) {
+        if row_groups.is_empty() {
+            return;
+        }
+        self.row_group_count += row_groups.len();
+        self.segments.entry(offset).or_default().extend(row_groups);
+    }
+
+    fn take(&mut self) -> Vec<SegmentRecordBatcheIdxs> {
+        self.row_group_count = 0;
+        let segments = std::mem::take(&mut self.segments);
+        segments
+            .into_iter()
+            .map(|(offset, row_groups)| SegmentRecordBatcheIdxs {
+                segment_offset: offset,
+                record_batch_idxs: row_groups,
+            })
+            .collect()
+    }
+}
 
 /// Queue reader for reading Parquet segments from object storage.
 ///
-/// Provides methods to read segments by topic and offset range, with optional row group filtering.
-pub struct QueueReader<S: ObjectStore> {
+/// Provides methods to list segments and read record batches.
+pub struct QueueReader {
     /// Base path for queue segments.
     base_path: String,
 
     /// Object store backend.
-    store: Arc<S>,
+    store: Arc<dyn ObjectStore>,
 
-    /// Batch size for reading.
-    batch_size: usize,
+    retrier: Retrier,
 }
 
-impl<S: ObjectStore> QueueReader<S> {
+impl QueueReader {
     /// Creates a new queue reader.
-    pub fn new(base_path: impl Into<String>, store: Arc<S>) -> Self {
+    pub fn new(base_path: impl Into<String>, store: Arc<dyn ObjectStore>) -> Self {
         Self {
             base_path: base_path.into(),
             store,
-            batch_size: 8192,
+            retrier: Retrier::new(RetrierConfig::default()),
         }
-    }
-
-    /// Sets the batch size for reading.
-    #[must_use]
-    pub const fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size;
-        self
-    }
-
-    /// Reads a single segment by topic and offset.
-    ///
-    /// Returns all record batches from the segment.
-    pub async fn read_segment(&self, topic: &Topic, offset: u64) -> Result<Vec<RecordBatch>> {
-        let segment_id = SegmentId::new(topic, offset);
-        let data = self.fetch_segment_data(&segment_id).await?;
-        self.parse_parquet(&data)
-    }
-
-    /// Reads raw parquet bytes for a segment by topic and offset.
-    pub async fn read_segment_data(&self, topic: &Topic, offset: u64) -> Result<Bytes> {
-        let segment_id = SegmentId::new(topic, offset);
-        self.fetch_segment_data(&segment_id).await
-    }
-
-    /// Reads specific row groups from a segment by topic and offset.
-    ///
-    /// Returns record batches only for the requested row groups.
-    pub async fn read_segment_row_groups(
-        &self,
-        topic: &Topic,
-        offset: u64,
-        row_groups: &[usize],
-    ) -> Result<Vec<RecordBatch>> {
-        // TODO(crit): сейчас читаем весь файл. Нужно строить ChunkReader поверх ObjectStore (range fetch), передавать его в parquet reader/metadata reader.
-
-        if row_groups.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let segment_id = SegmentId::new(topic, offset);
-        let data = self.fetch_segment_data(&segment_id).await?;
-        self.parse_parquet_with_row_groups(&data, row_groups.to_vec())
     }
 
     /// Lists segments for a topic starting from a given offset.
     ///
     /// Returns segment IDs sorted by offset.
-    pub async fn list_segments_from(&self, topic: &Topic, start_offset: u64) -> Result<Vec<SegmentId>> {
-        // TODO(crit): что если много файлов скопилось - надо как-то разделять
-        // TODO(crit): посмотреть тут про порядок
+    pub async fn list_segments(
+        &self,
+        topic: &Topic,
+        start_offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<SegmentId>> {
+        // TODO(high): if a lot of files have accumulated, we need to somehow batch them.
         // Build prefix path - handle empty base_path
         let prefix = if self.base_path.is_empty() {
             Path::from(topic.as_str())
@@ -116,7 +149,7 @@ impl<S: ObjectStore> QueueReader<S> {
             // All the .parquet under the prefix will be returned. This is the expected behavior for “zero offset".
             prefix.clone()
         } else {
-            let segment_path = SegmentId::new(topic, start_offset - 1).to_path();
+            let segment_path = SegmentId::new(topic, start_offset - 1).to_relative_path();
             if self.base_path.is_empty() {
                 segment_path
             } else {
@@ -129,9 +162,19 @@ impl<S: ObjectStore> QueueReader<S> {
             self.base_path, topic, start_offset, prefix, offset_path
         );
 
-        // TODO(crit): если возвращается стрим, может прокидывать наверх тоже стрим? И сверху решать когда закончить?
-        let list_stream = self.store.list_with_offset(Some(&prefix), &offset_path);
-        let items: Vec<_> = list_stream.try_collect().await?;
+        let store = Arc::clone(&self.store);
+        let items: Vec<_> = self
+            .retry(cancel_token, move || {
+                let store = Arc::clone(&store);
+                let prefix = prefix.clone();
+                let offset_path = offset_path.clone();
+                async move {
+                    let list_stream = store.list_with_offset(Some(&prefix), &offset_path);
+                    let items: Vec<_> = list_stream.try_collect().await?;
+                    Ok(items)
+                }
+            })
+            .await?;
 
         debug!("list_segments_from: found {} items", items.len());
 
@@ -155,7 +198,7 @@ impl<S: ObjectStore> QueueReader<S> {
                         return None;
                     };
                     let relative_path_obj = Path::from(relative_path);
-                    match SegmentId::from_path(&relative_path_obj) {
+                    match SegmentId::from_relative_path(&relative_path_obj) {
                         Ok(seg) => {
                             debug!("list_segments_from: parsed segment {:?}", seg);
                             Some(seg)
@@ -180,84 +223,200 @@ impl<S: ObjectStore> QueueReader<S> {
         Ok(segments)
     }
 
-    /// Reads segment metadata directly from parquet file.
-    pub async fn read_metadata(&self, topic: &Topic, offset: u64) -> Result<SegmentMetadata> {
-        // TODO(crit): если разбивать shift таски по партицям, то нужно читать только мету, кажется сейчас читается весь файл
-        let segment_id = SegmentId::new(topic, offset);
-        let path = self.segment_path(&segment_id);
+    /// Lists segments and plans row groups grouped by column value.
+    pub async fn plan_segments(
+        &self,
+        topic: &Topic,
+        start_offset: u64,
+        group_by_column_name: &str,
+        max_row_groups_per_group: usize,
+        cancel_token: &CancellationToken,
+    ) -> Result<SegmentsPlan> {
+        let segments = self.list_segments(topic, start_offset, cancel_token).await?;
+        if segments.is_empty() {
+            return Ok(SegmentsPlan {
+                groups: Vec::new(),
+                last_segment_offset: None,
+            });
+        }
 
-        // Get object metadata (size, last_modified)
-        let object_meta = self.store.head(&path).await?;
+        let last_offset = segments.last().map(|segment| segment.offset);
+        let groups = self
+            .plan_record_batches(
+                segments.as_slice(),
+                group_by_column_name,
+                max_row_groups_per_group,
+                cancel_token,
+            )
+            .await?;
 
-        // Get parquet data and parse metadata
-        let data = self.store.get(&path).await?.bytes().await?;
-        let parquet_reader = SerializedFileReader::new(data)?;
-        let parquet_meta = parquet_reader.metadata();
-
-        let record_count = parquet_meta.file_metadata().num_rows();
-        let row_group_count = parquet_meta.num_row_groups();
-
-        #[allow(clippy::cast_sign_loss)]
-        let created_at = object_meta.last_modified.timestamp_millis() as u128;
-
-        Ok(SegmentMetadata {
-            topic: topic.clone(),
-            offset,
-            record_count,
-            size_bytes: object_meta.size,
-            row_group_count,
-            status: SegmentStatus::Complete,
-            schema_fingerprint: None,
-            created_at,
+        Ok(SegmentsPlan {
+            groups,
+            last_segment_offset: last_offset,
         })
     }
 
-    /// Reads Parquet footer metadata using range requests (no full file download).
-    pub async fn read_parquet_metadata(&self, topic: &Topic, offset: u64) -> Result<ParquetMetaData> {
-        // TODO(crit): этим методом мы нарушаем концепцию queue, т.к. сейчас она не зависит от данных. С другой стороны мы в Shift знаем, что это parquet файлы.
-        // TODO(crit): проверить на оптимальность чтения
+    /// Reads specific record batches (by index) from a segment by topic and offset.
+    pub async fn read_segment(
+        &self,
+        topic: &Topic,
+        offset: u64,
+        record_batch_idxs: &[usize],
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<RecordBatch>> {
+        if record_batch_idxs.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let segment_id = SegmentId::new(topic, offset);
         let path = self.segment_path(&segment_id);
-        let object_meta = self.store.head(&path).await?;
+        let store = Arc::clone(&self.store);
+        let path_for_head = path.clone();
+        let object_meta = self
+            .retry(cancel_token, move || {
+                let store = Arc::clone(&store);
+                let path = path_for_head.clone();
+                async move { Ok(store.head(&path).await?) }
+            })
+            .await?;
+
+        let reader = ParquetObjectReader::new(Arc::clone(&self.store), path).with_file_size(object_meta.size);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+        let stream = builder
+            .with_batch_size(8192)
+            .with_row_groups(record_batch_idxs.to_vec())
+            .build()?;
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok(batches)
+    }
+
+    /// Plan to read record batches grouped by column value across a list of segments.
+    async fn plan_record_batches(
+        &self,
+        segments: &[SegmentId],
+        group_by_column_name: &str,
+        max_row_groups_per_group: usize,
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<GroupedSegmentsPlan>> {
+        if max_row_groups_per_group == 0 {
+            return Err(QueueError::Config(
+                "max_row_groups_per_group must be greater than zero".to_string(),
+            ));
+        }
+
+        let mut grouped_chunks: HashMap<String, RowGroupsInSegments> = HashMap::new();
+        let mut grouped = Vec::new();
+
+        for segment in segments {
+            let wal_offset = segment.offset;
+            let parquet_meta = self.read_parquet_metadata(&segment.topic, wal_offset, cancel_token).await?;
+            let schema = parquet_meta.file_metadata().schema_descr();
+            let column_idx = schema
+                .columns()
+                .iter()
+                .position(|col| col.name() == group_by_column_name)
+                .ok_or_else(|| {
+                    QueueError::Metadata(format!(
+                        "column '{group_by_column_name}' not found in parquet schema for segment {wal_offset}"
+                    ))
+                })?;
+
+            let mut saw_row_groups = false;
+            for (row_group_idx, row_group) in parquet_meta.row_groups().iter().enumerate() {
+                let group_key = group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
+                saw_row_groups = true;
+
+                let chunk = grouped_chunks.entry(group_key.clone()).or_insert_with(RowGroupsInSegments::new);
+                chunk.push(wal_offset, vec![row_group_idx]);
+                if chunk.row_group_count == max_row_groups_per_group {
+                    let segments = chunk.take();
+                    grouped.push(GroupedSegmentsPlan {
+                        group_col_val: group_key,
+                        segments,
+                    });
+                }
+            }
+
+            if !saw_row_groups {
+                return Err(QueueError::Metadata(format!(
+                    "no row groups found in WAL segment {wal_offset}"
+                )));
+            }
+        }
+
+        for (group_key, mut chunk) in grouped_chunks {
+            let segments = chunk.take();
+            if segments.is_empty() {
+                continue;
+            }
+            grouped.push(GroupedSegmentsPlan {
+                group_col_val: group_key,
+                segments,
+            });
+        }
+
+        Ok(grouped)
+    }
+
+    /// Reads Parquet footer metadata using range requests (no full file download).
+    async fn read_parquet_metadata(
+        &self,
+        topic: &Topic,
+        offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> Result<ParquetMetaData> {
+        let segment_id = SegmentId::new(topic, offset);
+        let path = self.segment_path(&segment_id);
+        let store = Arc::clone(&self.store);
+        let path_for_head = path.clone();
+        let object_meta = self
+            .retry(cancel_token, move || {
+                let store = Arc::clone(&store);
+                let path = path_for_head.clone();
+                async move { Ok(store.head(&path).await?) }
+            })
+            .await?;
         let file_size = object_meta.size;
 
         if file_size < 8 {
-            return Err(crate::error::QueueError::Parquet(ParquetError::EOF(
+            return Err(QueueError::Parquet(ParquetError::EOF(
                 "file size is smaller than parquet footer".to_string(),
             )));
         }
 
-        let mut tail_len = std::cmp::min(file_size as usize, 64 * 1024);
+        let file_size_usize = usize::try_from(file_size)
+            .map_err(|_| QueueError::Metadata(format!("file size {file_size} exceeds addressable size")))?;
+        let mut tail_len = std::cmp::min(file_size_usize, 64 * 1024);
 
         loop {
             let start = file_size - tail_len as u64;
-            let data = self.store.get_range(&path, start..file_size).await?;
-            let bytes = Bytes::from(data);
+            let store = Arc::clone(&self.store);
+            let path = path.clone();
+            let data = self
+                .retry(cancel_token, move || {
+                    let store = Arc::clone(&store);
+                    let path = path.clone();
+                    async move { Ok(store.get_range(&path, start..file_size).await?) }
+                })
+                .await?;
+            let bytes = data;
             let mut reader = ParquetMetaDataReader::new();
 
             match reader.try_parse_sized(&bytes, file_size) {
-                Ok(()) => return reader.finish().map_err(crate::error::QueueError::Parquet),
+                Ok(()) => return reader.finish().map_err(QueueError::Parquet),
                 Err(ParquetError::NeedMoreData(need)) => {
                     if need as u64 > file_size {
-                        return Err(crate::error::QueueError::Parquet(ParquetError::NeedMoreData(need)));
+                        return Err(QueueError::Parquet(ParquetError::NeedMoreData(need)));
                     }
                     if need <= tail_len {
-                        return Err(crate::error::QueueError::Parquet(ParquetError::NeedMoreData(need)));
+                        return Err(QueueError::Parquet(ParquetError::NeedMoreData(need)));
                     }
                     tail_len = need;
                 }
-                Err(e) => return Err(crate::error::QueueError::Parquet(e)),
+                Err(e) => return Err(QueueError::Parquet(e)),
             }
         }
-    }
-
-    /// Fetches raw segment data from object storage.
-    async fn fetch_segment_data(&self, segment_id: &SegmentId) -> Result<Bytes> {
-        let path = self.segment_path(segment_id);
-        let result = self.store.get(&path).await?;
-        let data = result.bytes().await?;
-        Ok(data)
     }
 
     /// Builds the full path for a segment, handling empty `base_path`.
@@ -270,24 +429,82 @@ impl<S: ObjectStore> QueueReader<S> {
         }
     }
 
-    /// Parses Parquet data into record batches.
-    fn parse_parquet(&self, data: &Bytes) -> Result<Vec<RecordBatch>> {
-        let reader = ParquetRecordBatchReaderBuilder::try_new(data.clone())?
-            .with_batch_size(self.batch_size)
-            .build()?;
+    async fn retry<T, Fut, F>(&self, cancel_token: &CancellationToken, mut op: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let result = self
+            .retrier
+            .retry::<_, _, Result<T>, QueueError>(
+                || {
+                    let fut = op();
+                    async move {
+                        match fut.await {
+                            Ok(value) => Ok((false, Ok(value))),
+                            Err(err) => Ok((true, Err(err))),
+                        }
+                    }
+                },
+                cancel_token,
+            )
+            .await?;
 
-        let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(batches)
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => Err(err),
+        }
     }
+}
 
-    /// Parses Parquet data into record batches with row group filtering.
-    fn parse_parquet_with_row_groups(&self, data: &Bytes, row_groups: Vec<usize>) -> Result<Vec<RecordBatch>> {
-        let reader = ParquetRecordBatchReaderBuilder::try_new(data.clone())?
-            .with_batch_size(self.batch_size)
-            .with_row_groups(row_groups)
-            .build()?;
+fn group_key_from_row_group(
+    row_group: &parquet::file::metadata::RowGroupMetaData,
+    column_idx: usize,
+    column_name: &str,
+    row_group_idx: usize,
+) -> Result<String> {
+    let column = row_group.column(column_idx);
+    let stats = column.statistics().ok_or_else(|| {
+        QueueError::Metadata(format!(
+            "missing statistics for '{column_name}' in row group {row_group_idx}"
+        ))
+    })?;
 
-        let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(batches)
+    match stats {
+        Statistics::ByteArray(byte_stats) => {
+            let min = byte_stats.min_bytes_opt().ok_or_else(|| {
+                QueueError::Metadata(format!(
+                    "missing min statistic for '{column_name}' in row group {row_group_idx}"
+                ))
+            })?;
+            let max = byte_stats.max_bytes_opt().ok_or_else(|| {
+                QueueError::Metadata(format!(
+                    "missing max statistic for '{column_name}' in row group {row_group_idx}"
+                ))
+            })?;
+
+            if min != max {
+                return Err(QueueError::Metadata(format!(
+                    "row group {row_group_idx} contains multiple values for '{column_name}'"
+                )));
+            }
+
+            let value = std::str::from_utf8(min).map_err(|e| {
+                QueueError::Metadata(format!(
+                    "invalid utf8 in '{column_name}' stats for row group {row_group_idx}: {e}"
+                ))
+            })?;
+
+            if value.is_empty() {
+                return Err(QueueError::Metadata(format!(
+                    "empty value in stats for '{column_name}' row group {row_group_idx}"
+                )));
+            }
+
+            Ok(value.to_string())
+        }
+        _ => Err(QueueError::Metadata(format!(
+            "unsupported stats type for '{column_name}' in row group {row_group_idx}"
+        ))),
     }
 }

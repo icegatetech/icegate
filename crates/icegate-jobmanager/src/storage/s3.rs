@@ -169,7 +169,9 @@ impl S3Storage {
         registry: Arc<dyn JobDefinitionRegistry>,
         metrics: Metrics,
     ) -> Result<Self, Error> {
-        // TODO(crit): add creds options
+        info!("Starting jobmanager with s3 storage {}", config.endpoint);
+
+        // TODO(med): add creds options
         let credentials = aws_sdk_s3::config::Credentials::new(
             config.access_key_id.clone(),
             config.secret_access_key.clone(),
@@ -202,22 +204,60 @@ impl S3Storage {
         // TODO(med): add check that conditional requests work for specific S3.
         // For example, old Minio versions ignore the header and atomicity breaks
 
-        // Check if bucket exists, create if needed
-        match client.head_bucket().bucket(&config.bucket_name).send().await {
-            Ok(_) => info!("Bucket {} exists", config.bucket_name),
-            Err(aws_sdk_s3::error::SdkError::ServiceError(se)) if se.raw().status().as_u16() == 404 => {
-                client
-                    .create_bucket()
-                    .bucket(&config.bucket_name)
-                    .send()
-                    .await
-                    .map_err(|e| Error::Other(format!("Failed to create bucket: {e}")))?;
-                info!("Created bucket {}", config.bucket_name);
-            }
-            Err(e) => return Err(Error::Other(format!("Failed to check bucket: {e}"))),
-        }
-
         let retrier = Retrier::new(config.retrier_config.clone());
+        let cancel_token = CancellationToken::new();
+
+        // Check if bucket exists, create if needed
+        let bucket_name = config.bucket_name.clone();
+        let client_for_retry = client.clone();
+        retrier
+            .retry(
+                move || {
+                    let client = client_for_retry.clone();
+                    let bucket_name = bucket_name.clone();
+                    async move {
+                        match client.head_bucket().bucket(&bucket_name).send().await {
+                            Ok(_) => {
+                                info!("Bucket {} exists", bucket_name);
+                                Ok((false, ()))
+                            }
+                            Err(aws_sdk_s3::error::SdkError::ServiceError(se)) if se.raw().status().as_u16() == 404 => {
+                                match client.create_bucket().bucket(&bucket_name).send().await {
+                                    Ok(_) => {
+                                        info!("Created bucket {}", bucket_name);
+                                        Ok((false, ()))
+                                    }
+                                    Err(aws_sdk_s3::error::SdkError::ServiceError(se))
+                                        if se.raw().status().as_u16() == 409 =>
+                                    {
+                                        info!("Bucket {} already exists", bucket_name);
+                                        Ok((false, ()))
+                                    }
+                                    Err(e) => {
+                                        let mapped = Self::map_s3_error(&e);
+                                        if mapped.is_retryable() {
+                                            Ok((true, ()))
+                                        } else {
+                                            Err(mapped)
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let mapped = Self::map_s3_error(&e);
+                                if mapped.is_retryable() {
+                                    Ok((true, ()))
+                                } else {
+                                    Err(mapped)
+                                }
+                            }
+                        }
+                    }
+                },
+                &cancel_token,
+            )
+            .await
+            .map_err(|e| Error::Other(format!("Failed to init bucket: {e}")))?;
 
         Ok(Self {
             client,
@@ -300,9 +340,7 @@ impl S3Storage {
             return Err(StorageError::Other(format!("Invalid filename format {filename}")));
         }
 
-        let iter_num_str = filename
-            .trim_start_matches(JOB_STATE_FILE_PREFIX)
-            .trim_end_matches(extension);
+        let iter_num_str = filename.trim_start_matches(JOB_STATE_FILE_PREFIX).trim_end_matches(extension);
 
         let inv_iter_num: u64 = iter_num_str
             .parse()
@@ -327,6 +365,7 @@ impl S3Storage {
             job_json,
             job_def.max_iterations(),
             job_def.iteration_interval(),
+            job_def.task_limits(),
             version,
         ))
     }
@@ -395,6 +434,7 @@ impl S3Storage {
         json: JobJson,
         max_iterations: Option<u64>,
         iteration_interval: Option<chrono::Duration>,
+        task_limits: crate::TaskLimits,
         version: &str,
     ) -> Job {
         let tasks: Vec<Task> = json.tasks.into_iter().map(Self::task_from_json).collect();
@@ -414,6 +454,7 @@ impl S3Storage {
             json.metadata.unwrap_or_default(),
             max_iterations,
             iteration_interval,
+            task_limits,
         )
     }
 

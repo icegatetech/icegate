@@ -5,7 +5,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use chrono::Duration as ChronoDuration;
 use icegate_jobmanager::{
     CachedStorage, Error, ImmutableTask, JobDefinition, JobManager, JobRegistry, JobsManager, JobsManagerConfig,
-    Metrics, RetrierConfig, S3Storage, TaskDefinition, registry::TaskExecutorFn,
+    Metrics, RetrierConfig, S3Storage, TaskDefinition,
+    registry::TaskExecutorFn,
     s3_storage::{JobStateCodecKind, S3StorageConfig},
 };
 use serde::{Deserialize, Serialize};

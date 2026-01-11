@@ -83,11 +83,7 @@ async fn run_simple_seq_job() -> Result<(), Error> {
     task_executors.insert(TaskCode::new("first_step"), first_step_executor);
     task_executors.insert(TaskCode::new("second_step"), second_step_executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("simple sequence job"),
-        vec![task_def],
-        task_executors,
-    )?;
+    let job_def = JobDefinition::new(JobCode::new("simple sequence job"), vec![task_def], task_executors)?;
 
     // Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);

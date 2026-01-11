@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-
 use uuid::Uuid;
 
 use crate::{Error, ImmutableTask, Job, TaskCode, TaskDefinition};

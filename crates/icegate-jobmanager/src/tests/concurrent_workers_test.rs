@@ -99,12 +99,8 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     executors.insert(TaskCode::new("primary_task"), primary_executor);
     executors.insert(TaskCode::new("secondary_task"), secondary_executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("test_concurrent_job"),
-        vec![primary_task_def],
-        executors,
-    )?
-    .with_max_iterations(max_iterations)?;
+    let job_def = JobDefinition::new(JobCode::new("test_concurrent_job"), vec![primary_task_def], executors)?
+        .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);

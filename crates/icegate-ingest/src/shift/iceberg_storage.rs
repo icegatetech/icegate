@@ -1,7 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arrow::{compute::SortOptions, record_batch::RecordBatch};
 use iceberg::{
+    Catalog, NamespaceIdent, TableIdent,
     arrow::RecordBatchPartitionSplitter,
     spec::{DataFile, DataFileFormat},
     table::Table,
@@ -9,20 +15,28 @@ use iceberg::{
     writer::{
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
+            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
             rolling_writer::RollingFileWriterBuilder,
-            ParquetWriterBuilder,
         },
-        partitioning::{fanout_writer::FanoutWriter, PartitioningWriter},
+        partitioning::{PartitioningWriter, fanout_writer::FanoutWriter},
     },
-    Catalog,
+};
+use icegate_common::{
+    ICEGATE_NAMESPACE,
+    retrier::{Retrier, RetrierConfig},
 };
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::offset::OFFSET_SUMMARY_KEY;
+use super::{config::ShiftConfig, parquet_meta_reader::data_files_from_parquet_paths};
 use crate::error::{IngestError, Result};
+
+/// Key for storing the queue offset in snapshot summary.
+const OFFSET_SUMMARY_KEY: &str = "icegate.queue.offset";
 
 /// Result of writing batches into parquet data files.
 pub struct WrittenDataFiles {
@@ -32,23 +46,49 @@ pub struct WrittenDataFiles {
     pub rows_written: usize,
 }
 
-/// Iceberg writer for shift operations.
-pub struct Writer {
-    table: Table,
-    catalog: Arc<dyn Catalog>,
+/// Iceberg storage for shift operations.
+pub struct IcebergStorage {
+    loader: TableLoader,
     row_group_size: usize,
     max_file_size_bytes: usize,
+    retrier: Retrier,
 }
 
-impl Writer {
-    /// Creates a new shift writer for the provided table and catalog.
-    pub fn new(table: Table, catalog: Arc<dyn Catalog>, row_group_size: usize, max_file_size_bytes: usize) -> Self {
+impl IcebergStorage {
+    /// Creates a new Iceberg storage for the provided table and catalog.
+    pub fn new(catalog: Arc<dyn Catalog>, table: impl Into<String>, shift_config: &ShiftConfig) -> Self {
+        let table_ident = TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.into());
         Self {
-            table,
-            catalog,
-            row_group_size,
-            max_file_size_bytes,
+            loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
+            row_group_size: shift_config.write.row_group_size,
+            max_file_size_bytes: shift_config.write.max_file_size_mb,
+            retrier: Retrier::new(RetrierConfig::default()),
         }
+    }
+
+    async fn load_table(&self, cancel_token: &CancellationToken) -> Result<Table> {
+        self.retry(cancel_token, || self.loader.load_cached()).await
+    }
+
+    async fn load_table_fresh(&self, cancel_token: &CancellationToken) -> Result<Table> {
+        self.retry(cancel_token, || self.loader.load_fresh()).await
+    }
+
+    /// Returns the last committed WAL offset from the Iceberg snapshot summary.
+    pub async fn get_committed_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
+        let table = self.load_table_fresh(cancel_token).await?;
+        Ok(get_committed_offset(&table))
+    }
+
+    /// Builds Iceberg data files from parquet file paths by reading parquet metadata.
+    pub async fn data_files_from_parquet_paths(
+        &self,
+        parquet_paths: &[String],
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<DataFile>> {
+        let table = self.load_table_fresh(cancel_token).await?;
+        self.retry(cancel_token, || data_files_from_parquet_paths(&table, parquet_paths))
+            .await
     }
 
     /// Writes record batches into parquet data files without committing to Iceberg.
@@ -56,7 +96,24 @@ impl Writer {
     /// 1. Sorts the batches by the table's sort order
     /// 2. Splits data by partition using `RecordBatchPartitionSplitter`
     /// 3. Writes each partition's data using `FanoutWriter`
-    pub async fn write_parquet_files(&self, batches: Vec<RecordBatch>) -> Result<WrittenDataFiles> {
+    pub async fn write_parquet_files(
+        &self,
+        batches: Vec<RecordBatch>,
+        cancel_token: &CancellationToken,
+    ) -> Result<WrittenDataFiles> {
+        let batches = Arc::new(batches);
+        self.retry(cancel_token, || {
+            let batches = Arc::clone(&batches);
+            async move { self.write_parquet_files_once(batches.as_ref().clone(), cancel_token).await }
+        })
+        .await
+    }
+
+    async fn write_parquet_files_once(
+        &self,
+        batches: Vec<RecordBatch>,
+        cancel_token: &CancellationToken,
+    ) -> Result<WrittenDataFiles> {
         // TODO(high): We have problem. If the number of batches in the WAL file is large, then we will create a large number of small parquet files for Iceberg (for each batch).
         // We either need to process several WAL files in one task, or compact Iceberg parquet files separately, or pre-partition records into a WAL Writer.
 
@@ -70,10 +127,11 @@ impl Writer {
         tracing::info!("Start writting parquet file. Batches: {}", batches.len());
         let queue_schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
-        let sorted_batch = sort_by_table_order(&self.table, combined_batch)?;
+        let table = self.load_table(cancel_token).await?;
+        let sorted_batch = sort_by_table_order(&table, combined_batch)?;
         tracing::debug!("Sorted batch has {} rows", sorted_batch.num_rows());
 
-        let location_generator = DefaultLocationGenerator::new(self.table.metadata().clone())
+        let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
             .map_err(|e| IngestError::Shift(format!("failed to create location generator: {e}")))?;
 
         // Generate unique file prefix with UUID to avoid conflicts
@@ -87,13 +145,12 @@ impl Writer {
             .set_max_row_group_size(self.row_group_size)
             .build();
 
-        let parquet_writer_builder =
-            ParquetWriterBuilder::new(writer_props, self.table.metadata().current_schema().clone());
+        let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table.metadata().current_schema().clone());
 
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
             self.max_file_size_bytes,
-            self.table.file_io().clone(),
+            table.file_io().clone(),
             location_generator,
             file_name_generator,
         );
@@ -105,8 +162,8 @@ impl Writer {
 
         // Create partition splitter to compute partition keys from source columns
         let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
-            self.table.metadata().current_schema().clone(),
-            self.table.metadata().default_partition_spec().clone(),
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().clone(),
         )
         .map_err(|e| IngestError::Shift(format!("failed to create partition splitter: {e}")))?;
 
@@ -134,7 +191,11 @@ impl Writer {
             .await
             .map_err(|e| IngestError::Shift(format!("failed to close fanout writer: {e}")))?;
 
-        tracing::info!("Complite write {} parquet files for {} partitions", data_files.len(), partitioned_batches_len);
+        tracing::info!(
+            "Complite write {} parquet files for {} partitions",
+            data_files.len(),
+            partitioned_batches_len
+        );
 
         Ok(WrittenDataFiles {
             data_files,
@@ -143,7 +204,33 @@ impl Writer {
     }
 
     /// Commits parquet data files to Iceberg with offset tracking.
-    pub async fn commit_data_files(&self, data_files: Vec<DataFile>, record_type: &str, last_offset: u64) -> Result<usize> {
+    pub async fn commit_data_files(
+        &self,
+        data_files: Vec<DataFile>,
+        record_type: &str,
+        last_offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> Result<usize> {
+        let data_files = Arc::new(data_files);
+        let record_type = record_type.to_string();
+        self.retry(cancel_token, || {
+            let data_files = Arc::clone(&data_files);
+            let record_type = record_type.clone();
+            async move {
+                self.commit_data_files_once(data_files.as_ref().clone(), &record_type, last_offset, cancel_token)
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn commit_data_files_once(
+        &self,
+        data_files: Vec<DataFile>,
+        record_type: &str,
+        last_offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> Result<usize> {
         if data_files.is_empty() {
             return Ok(0);
         }
@@ -159,36 +246,33 @@ impl Writer {
             record_type
         );
 
-        let tx = Transaction::new(&self.table);
-
-        // TODO(crit): merge with offset.rs
+        let table = self.load_table_fresh(cancel_token).await?;
+        let tx = Transaction::new(&table);
 
         // Store offset in snapshot summary properties
         let mut snapshot_props = HashMap::new();
         snapshot_props.insert(OFFSET_SUMMARY_KEY.to_string(), last_offset.to_string());
         tracing::debug!("Setting snapshot property: {}={}", OFFSET_SUMMARY_KEY, last_offset);
 
-        tracing::debug!("Building fast append action with {} data files", data_files.len());
         let append_action = tx
             .fast_append()
             .set_snapshot_properties(snapshot_props)
             .add_data_files(data_files);
-        tracing::debug!("Fast append action built");
-
-        tracing::debug!("Applying fast append action to transaction");
         let tx = append_action
             .apply(tx)
             .map_err(|e| IngestError::Shift(format!("failed to apply fast append: {e}")))?;
         tracing::debug!("Fast append applied to transaction");
 
         // Commit transaction
-        tracing::info!("Committing transaction to catalog (this may take a moment)...");
-        let commit_result = tx.commit(self.catalog.as_ref()).await;
+        let commit_result = tx
+            .commit(self.loader.catalog())
+            .await
+            .map_err(|e| IngestError::Shift(format!("failed to commit transaction: {e}")));
         match &commit_result {
             Ok(_) => tracing::debug!("Transaction commit succeeded"),
             Err(e) => tracing::error!("Transaction commit failed: {e}"),
         }
-        commit_result.map_err(|e| IngestError::Shift(format!("failed to commit transaction: {e}")))?;
+        commit_result?;
 
         tracing::info!(
             "Committed {} rows to Iceberg table, offset updated to {}",
@@ -198,6 +282,47 @@ impl Writer {
 
         Ok(total_rows)
     }
+
+    async fn retry<F, Fut, T>(&self, cancel_token: &CancellationToken, mut op: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let result = self
+            .retrier
+            .retry::<_, _, Result<T>, IngestError>(
+                || {
+                    let fut = op();
+                    async move {
+                        match fut.await {
+                            Ok(value) => Ok((false, Ok(value))),
+                            Err(err) => Ok((true, Err(err))),
+                        }
+                    }
+                },
+                cancel_token,
+            )
+            .await?;
+
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// Retrieves the last committed offset from the current snapshot's summary.
+///
+/// Returns `None` if no snapshot exists or no offset has been committed yet.
+#[must_use]
+fn get_committed_offset(table: &Table) -> Option<u64> {
+    table.metadata().current_snapshot().and_then(|snapshot| {
+        snapshot
+            .summary()
+            .additional_properties
+            .get(OFFSET_SUMMARY_KEY)
+            .and_then(|v| v.parse::<u64>().ok())
+    })
 }
 
 /// Sorts a record batch by the table's sort order.
@@ -255,4 +380,57 @@ fn sort_by_table_order(table: &Table, batch: RecordBatch) -> Result<RecordBatch>
     let sorted_batch = RecordBatch::try_new(batch_schema, sorted_columns)?;
 
     Ok(sorted_batch)
+}
+
+// Table loader with caching
+struct TableLoader {
+    catalog: Arc<dyn Catalog>,
+    table_ident: TableIdent,
+    cache: RwLock<Option<CachedTable>>,
+    ttl: Duration,
+}
+
+struct CachedTable {
+    table: Table,
+    loaded_at: Instant,
+}
+
+impl TableLoader {
+    fn new(catalog: Arc<dyn Catalog>, table_ident: TableIdent, ttl_secs: u64) -> Self {
+        Self {
+            catalog,
+            table_ident,
+            cache: RwLock::new(None),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    fn catalog(&self) -> &dyn Catalog {
+        self.catalog.as_ref()
+    }
+
+    async fn load_cached(&self) -> Result<Table> {
+        if let Some(cached) = self.cache.read().await.as_ref() {
+            if cached.loaded_at.elapsed() <= self.ttl {
+                return Ok(cached.table.clone());
+            }
+        }
+
+        self.load_fresh().await
+    }
+
+    async fn load_fresh(&self) -> Result<Table> {
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(|e| IngestError::Shift(format!("failed to load table '{}': {e}", self.table_ident.name())))?;
+
+        *self.cache.write().await = Some(CachedTable {
+            table: table.clone(),
+            loaded_at: Instant::now(),
+        });
+
+        Ok(table)
+    }
 }

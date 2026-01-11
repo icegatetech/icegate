@@ -1,6 +1,10 @@
 # Per-tenant task model
 Data flow: Client -> Ingestor -> WAL -> Shifter (multiple tasks) -> Iceberg.
 
+## Ingestor's tasks
+- Minimize the number of requests to S3. Moreover, the priority is to minimize file write requests (in AWS, writing is 10 times more expensive than reading).
+- Do not delay the response to the client and guarantee data recording (respond only after WAL recording).
+
 ## Core rules
 - each Ingest request is appended to a single WAL file.
 - Shifter create one task per tenant (partition).

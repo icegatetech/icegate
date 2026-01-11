@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::common::in_memory_storage::InMemoryStorage;
-use crate::{CachedStorage, Job, JobCode, Metrics, Storage, Task, TaskCode, TaskDefinition};
+use crate::{CachedStorage, Job, JobCode, Metrics, Storage, TaskCode, TaskDefinition, TaskLimits};
 
 // TestCacheInvalidation verifies that CachedStorage avoids redundant S3 calls on cache hit.
 #[tokio::test]
@@ -20,14 +20,19 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
     let cancel_token = CancellationToken::new();
     let worker_id = Uuid::from_u128(1);
 
-    let task = Task::new(
-        worker_id,
-        &TaskDefinition::new(TaskCode::from("cache_task"), Vec::new(), ChronoDuration::seconds(5))?,
-    );
+    let task_def = TaskDefinition::new(TaskCode::from("cache_task"), Vec::new(), ChronoDuration::seconds(5))?;
 
     let job_code = JobCode::new("test_cache_job");
 
-    let mut job = Job::new(job_code.clone(), vec![task], HashMap::new(), worker_id, Some(1), None);
+    let mut job = Job::new(
+        job_code.clone(),
+        vec![task_def],
+        HashMap::new(),
+        worker_id,
+        Some(1),
+        None,
+        TaskLimits::default(),
+    )?;
     job.work(&worker_id)?;
 
     storage.save_job(&mut job, &cancel_token).await?;

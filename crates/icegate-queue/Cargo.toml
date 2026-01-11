@@ -20,9 +20,11 @@ parquet = { workspace = true }
 
 # Storage abstraction (S3, GCS, Azure, local filesystem)
 object_store = { workspace = true }
+icegate-common = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["sync", "rt", "fs"] }
+tokio-util = { workspace = true }
 futures = { workspace = true }
 
 # Serialization for metadata

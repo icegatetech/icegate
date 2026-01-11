@@ -81,11 +81,33 @@ pub enum QueueError {
     #[error("channel closed")]
     ChannelClosed,
 
+    /// Operation cancelled.
+    #[error("operation cancelled")]
+    Cancelled,
+
+    /// Retry attempts exhausted.
+    #[error("max retry attempts reached")]
+    MaxAttemptsReached,
+
     /// Configuration error.
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// Metadata or data layout error.
+    #[error("metadata error: {0}")]
+    Metadata(String),
+
     /// Multiple errors occurred.
     #[error("multiple errors occurred: {0:?}")]
     Multiple(Vec<Self>),
+}
+
+impl icegate_common::RetryError for QueueError {
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn max_attempts() -> Self {
+        Self::MaxAttemptsReached
+    }
 }

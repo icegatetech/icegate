@@ -31,3 +31,6 @@ thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

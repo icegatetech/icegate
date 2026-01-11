@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{registry::TaskExecutorFn, Error, ImmutableTask, JobError, Task, TaskCode, TaskDefinition, TaskStatus};
+use crate::{Error, ImmutableTask, JobError, Task, TaskCode, TaskDefinition, TaskStatus, registry::TaskExecutorFn};
 
 /// Job identifier used to select a job definition and persisted state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,8 +38,6 @@ impl From<&str> for JobCode {
         Self(s.to_string())
     }
 }
-
-// TODO(crit): shift джобу надо запускать не чаще чем раз в интервал. Нужно добавить такйо функционал в джобу и воркер.
 
 /// Job lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,17 +86,30 @@ impl JobStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TaskLimits {
+    pub max_input_bytes: usize,
+    pub max_output_bytes: usize,
+}
+
+impl Default for TaskLimits {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: 100 * 1024 * 1024,
+            max_output_bytes: 100 * 1024 * 1024,
+        }
+    }
+}
+
 /// Immutable job definition with initial tasks and executors.
 #[derive(Clone)]
 pub struct JobDefinition {
-    // TODO(crit): add schedule time - after successful completion of a job, set `next_start_at` field.
-    // Then worker should remember the next start time to avoid reading this job unnecessarily (only read at next scheduled start).
-    // Need to shifter job.
     code: JobCode,
     initial_tasks: Vec<TaskDefinition>,
     task_executors: HashMap<TaskCode, TaskExecutorFn>,
     max_iterations: Option<u64>, // None = unlimited
     iteration_interval: Option<Duration>,
+    task_limits: TaskLimits,
 }
 
 impl JobDefinition {
@@ -129,6 +140,7 @@ impl JobDefinition {
             task_executors,
             max_iterations: None,
             iteration_interval: None,
+            task_limits: TaskLimits::default(),
         })
     }
 
@@ -148,8 +160,12 @@ impl JobDefinition {
         self.max_iterations
     }
 
-    pub fn iteration_interval(&self) -> Option<Duration> {
+    pub const fn iteration_interval(&self) -> Option<Duration> {
         self.iteration_interval
+    }
+
+    pub const fn task_limits(&self) -> TaskLimits {
+        self.task_limits
     }
 
     pub fn with_max_iterations(mut self, max_iterations: u64) -> Result<Self, Error> {
@@ -166,6 +182,12 @@ impl JobDefinition {
         }
         self.iteration_interval = Some(iteration_interval);
         Ok(self)
+    }
+
+    #[must_use]
+    pub const fn with_task_limits(mut self, task_limits: TaskLimits) -> Self {
+        self.task_limits = task_limits;
+        self
     }
 }
 
@@ -185,24 +207,27 @@ pub(crate) struct Job {
     version: String,
     max_iterations: Option<u64>, // None = unlimited, from JobDefinition TODO(low): extract to new settings structure
     iteration_interval: Option<Duration>,
+    task_limits: TaskLimits,
 }
 
 impl Job {
     pub(crate) fn new(
         code: JobCode,
-        tasks: Vec<Task>,
+        task_defs: Vec<TaskDefinition>,
         metadata: HashMap<String, serde_json::Value>,
         worker_id: Uuid,
         max_iterations: Option<u64>,
         iteration_interval: Option<Duration>,
-    ) -> Self {
-        // TODO(crit): ожидать TaskDef, а не Task
+        task_limits: TaskLimits,
+    ) -> Result<Self, JobError> {
         let mut tasks_by_id = HashMap::new();
-        for task in tasks {
+        for task_def in task_defs {
+            Self::validate_task_input(task_def.input(), task_limits)?;
+            let task = Task::new(worker_id, &task_def);
             tasks_by_id.insert(*task.id(), Arc::new(task));
         }
 
-        Self {
+        Ok(Self {
             id: Uuid::new_v4(),
             code,
             iter_num: 1,
@@ -217,7 +242,8 @@ impl Job {
             version: String::new(),
             max_iterations,
             iteration_interval,
-        }
+            task_limits,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -236,6 +262,7 @@ impl Job {
         metadata: HashMap<String, serde_json::Value>,
         max_iterations: Option<u64>,
         iteration_interval: Option<Duration>,
+        task_limits: TaskLimits,
     ) -> Self {
         let mut tasks_by_id = HashMap::new();
         for task in tasks {
@@ -257,16 +284,12 @@ impl Job {
             version,
             max_iterations,
             iteration_interval,
+            task_limits,
         }
     }
 
     // Prepares the job for the next iteration
-    pub(crate) fn next_iteration(
-        &mut self,
-        tasks: Vec<Task>,
-        worker_id: Uuid,
-    ) -> Result<(), JobError> {
-        // TODO(crit): ожидать TaskDef, а не Task
+    pub(crate) fn next_iteration(&mut self, task_defs: Vec<TaskDefinition>, worker_id: Uuid) -> Result<(), JobError> {
         if !self.is_ready_to_next_iteration() {
             return Err(JobError::Other("job is not ready to next iteration".into()));
         }
@@ -279,12 +302,13 @@ impl Job {
 
         *self = Self::new(
             self.code.clone(),
-            tasks,
+            task_defs,
             old_metadata,
             worker_id,
             self.max_iterations,
             self.iteration_interval,
-        );
+            self.task_limits,
+        )?;
         self.id = old_id;
         // TODO(low): in the future, a mechanism for restarting the sequence is needed (currently the maximum sequence is 10^20).
         // Sequential uuid will not work, as there may be a race when creating a new job by different workers.
@@ -295,6 +319,7 @@ impl Job {
     }
 
     pub(crate) fn add_task(&mut self, task_def: &TaskDefinition, worker_id: Uuid) -> Result<Uuid, JobError> {
+        Self::validate_task_input(task_def.input(), self.task_limits)?;
         let task = Task::new(worker_id, task_def);
 
         if self.tasks_by_id.contains_key(task.id()) {
@@ -307,7 +332,7 @@ impl Job {
         // Validate dependencies exist
         for dep_id in task_def.depends_on() {
             if !self.tasks_by_id.contains_key(dep_id) {
-                return Err(JobError::Other(format!("dependency task '{}' not found", dep_id)));
+                return Err(JobError::Other(format!("dependency task '{dep_id}' not found")));
             }
         }
 
@@ -320,13 +345,14 @@ impl Job {
         let task_arc = self.get_task_arc_mut(task_id)?;
 
         let task = Arc::make_mut(task_arc); // Copy on write: clone only if refcount > 1
-        task.start(worker_id.clone())?;
+        task.start(worker_id)?;
         self.updated_by_worker_id = worker_id;
 
         Ok(())
     }
 
     pub(crate) fn complete_task(&mut self, task_id: &Uuid, output: Vec<u8>) -> Result<(), JobError> {
+        Self::validate_task_output(&output, self.task_limits)?;
         let task_arc = self.get_task_arc_mut(task_id)?;
 
         let task = Arc::make_mut(task_arc);
@@ -475,6 +501,28 @@ impl Job {
         self.version = version;
     }
 
+    fn validate_task_input(input: &[u8], task_limits: TaskLimits) -> Result<(), JobError> {
+        if input.len() > task_limits.max_input_bytes {
+            return Err(JobError::Other(format!(
+                "task input size {} exceeds limit {}",
+                input.len(),
+                task_limits.max_input_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_task_output(output: &[u8], task_limits: TaskLimits) -> Result<(), JobError> {
+        if output.len() > task_limits.max_output_bytes {
+            return Err(JobError::Other(format!(
+                "task output size {} exceeds limit {}",
+                output.len(),
+                task_limits.max_output_bytes
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn work(&mut self, worker_id: &Uuid) -> Result<(), JobError> {
         self.status.transition_to(JobStatus::Running)?;
         self.updated_by_worker_id = *worker_id;
@@ -537,7 +585,7 @@ impl Job {
             if (task_arc.created_by_worker() == *worker_id && task_arc.processing_by_worker().is_none())
                 || task_arc.processing_by_worker() == Some(*worker_id)
             {
-                self.tasks_by_id.insert(exist_task_id.clone(), Arc::clone(task_arc));
+                self.tasks_by_id.insert(*exist_task_id, Arc::clone(task_arc));
             }
         }
 
@@ -637,7 +685,7 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
     use chrono::{DateTime, Duration, Utc};
     use uuid::Uuid;
@@ -663,6 +711,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn restore_job(
         id: Uuid,
         status: JobStatus,
@@ -691,6 +740,7 @@ mod tests {
             metadata,
             max_iterations,
             iteration_interval,
+            TaskLimits::default(),
         )
     }
 
@@ -698,16 +748,22 @@ mod tests {
     fn test_pick_task_to_execute_todo() {
         let task_id = Uuid::from_u128(1);
         let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(101),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(100),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
-        let picked = job.pick_task_to_execute(&Uuid::from_u128(100)).unwrap();
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
         assert_eq!(picked, Some(task_id));
     }
 
@@ -717,16 +773,22 @@ mod tests {
         let commit_id = Uuid::from_u128(3);
         let shift = make_task(shift_id, "shift", TaskStatus::Todo, Vec::new());
         let commit = make_task(commit_id, "commit", TaskStatus::Blocked, vec![shift_id]);
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(102),
+            JobStatus::Started,
             vec![shift, commit],
-            HashMap::new(),
-            Uuid::from_u128(100),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
-        let picked = job.pick_task_to_execute(&Uuid::from_u128(100)).unwrap();
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
         assert_eq!(picked, Some(shift_id));
         let commit_status = job.get_task_arc(&commit_id).unwrap().status().clone();
         assert_eq!(commit_status, TaskStatus::Blocked);
@@ -738,16 +800,22 @@ mod tests {
         let commit_id = Uuid::from_u128(5);
         let shift = make_task(shift_id, "shift", TaskStatus::Completed, Vec::new());
         let commit = make_task(commit_id, "commit", TaskStatus::Blocked, vec![shift_id]);
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(103),
+            JobStatus::Started,
             vec![shift, commit],
-            HashMap::new(),
-            Uuid::from_u128(100),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
-        let picked = job.pick_task_to_execute(&Uuid::from_u128(100)).unwrap();
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
         assert_eq!(picked, Some(commit_id));
         let commit_status = job.get_task_arc(&commit_id).unwrap().status().clone();
         assert_eq!(commit_status, TaskStatus::Todo);
@@ -756,16 +824,22 @@ mod tests {
     #[test]
     fn test_pick_task_to_execute_returns_none_when_no_pickable() {
         let started = make_task(Uuid::from_u128(6), "started", TaskStatus::Started, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(104),
+            JobStatus::Started,
             vec![started],
-            HashMap::new(),
-            Uuid::from_u128(100),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
-        let picked = job.pick_task_to_execute(&Uuid::from_u128(100)).unwrap();
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
         assert!(picked.is_none());
     }
 
@@ -773,16 +847,22 @@ mod tests {
     fn test_pick_task_to_execute_failed_task() {
         let failed_id = Uuid::from_u128(7);
         let failed = make_task(failed_id, "failed", TaskStatus::Failed, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(105),
+            JobStatus::Started,
             vec![failed],
-            HashMap::new(),
-            Uuid::from_u128(100),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
-        let picked = job.pick_task_to_execute(&Uuid::from_u128(100)).unwrap();
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
         assert_eq!(picked, Some(failed_id));
     }
 
@@ -805,32 +885,44 @@ mod tests {
             Vec::new(),
         );
 
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(106),
+            JobStatus::Started,
             vec![expired],
-            HashMap::new(),
-            Uuid::from_u128(100),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
-        let picked = job.pick_task_to_execute(&Uuid::from_u128(100)).unwrap();
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
         assert_eq!(picked, Some(Uuid::from_u128(8)));
     }
 
     #[test]
     fn test_pick_task_to_execute_all_tasks_completed_error() {
         let completed = make_task(Uuid::from_u128(9), "done", TaskStatus::Completed, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(107),
+            JobStatus::Started,
             vec![completed],
-            HashMap::new(),
-            Uuid::from_u128(100),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
-        let err = job.pick_task_to_execute(&Uuid::from_u128(100)).unwrap_err();
+        let err = job.pick_task_to_execute(&worker_id).unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
     }
 
@@ -842,16 +934,22 @@ mod tests {
             TaskStatus::Blocked,
             vec![Uuid::from_u128(11)],
         );
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(108),
+            JobStatus::Started,
             vec![commit],
-            HashMap::new(),
-            Uuid::from_u128(100),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
-        let err = job.pick_task_to_execute(&Uuid::from_u128(100)).unwrap_err();
+        let err = job.pick_task_to_execute(&worker_id).unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
     }
 
@@ -878,8 +976,7 @@ mod tests {
             metadata.clone(),
         );
 
-        let new_task_id = Uuid::from_u128(23);
-        let new_task = make_task(new_task_id, "new", TaskStatus::Todo, Vec::new());
+        let new_task = TaskDefinition::new(TaskCode::new("new"), Vec::new(), Duration::seconds(5)).unwrap();
         let before = Utc::now();
         job.next_iteration(vec![new_task], worker_id).unwrap();
 
@@ -890,7 +987,7 @@ mod tests {
         assert_eq!(job.max_iterations, Some(5));
         assert_eq!(job.metadata, metadata);
         assert!(job.started_at >= before);
-        assert!(job.tasks_by_id.contains_key(&new_task_id));
+        assert_eq!(job.tasks_by_id.len(), 1);
         assert!(!job.tasks_by_id.contains_key(&old_task_id));
     }
 
@@ -975,6 +1072,7 @@ mod tests {
             HashMap::new(),
             None,
             Some(Duration::seconds(60)),
+            TaskLimits::default(),
         );
 
         assert!(!job.is_ready_to_next_iteration());
@@ -1001,8 +1099,7 @@ mod tests {
             HashMap::new(),
         );
 
-        let new_task_id = Uuid::from_u128(39);
-        let new_task = make_task(new_task_id, "new", TaskStatus::Todo, Vec::new());
+        let new_task = TaskDefinition::new(TaskCode::new("new"), Vec::new(), Duration::seconds(5)).unwrap();
         job.next_iteration(vec![new_task], worker_id).unwrap();
 
         assert_eq!(job.id, job_id);
@@ -1033,8 +1130,7 @@ mod tests {
             HashMap::new(),
         );
 
-        let new_task_id = Uuid::from_u128(43);
-        let new_task = make_task(new_task_id, "new", TaskStatus::Todo, Vec::new());
+        let new_task = TaskDefinition::new(TaskCode::new("new"), Vec::new(), Duration::seconds(5)).unwrap();
         job.next_iteration(vec![new_task], worker_id).unwrap();
 
         assert_eq!(job.id, job_id);
@@ -1046,13 +1142,19 @@ mod tests {
     fn test_add_task_with_dependencies_ok() {
         let dep_id = Uuid::from_u128(40);
         let dep_task = make_task(dep_id, "dep", TaskStatus::Completed, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(400);
+        let mut job = restore_job(
+            Uuid::from_u128(401),
+            JobStatus::Started,
             vec![dep_task],
-            HashMap::new(),
-            Uuid::from_u128(400),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         let task_def = TaskDefinition::new(TaskCode::new("child"), vec![1, 2, 3], Duration::seconds(5))
@@ -1068,13 +1170,19 @@ mod tests {
     #[test]
     fn test_add_task_missing_dependency() {
         let task = make_task(Uuid::from_u128(41), "root", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(402);
+        let mut job = restore_job(
+            Uuid::from_u128(403),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(402),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         let task_def = TaskDefinition::new(TaskCode::new("child"), Vec::new(), Duration::seconds(5))
@@ -1088,13 +1196,19 @@ mod tests {
     fn test_start_task_ok() {
         let task_id = Uuid::from_u128(50);
         let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(500);
+        let mut job = restore_job(
+            Uuid::from_u128(501),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(500),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         let worker_id = Uuid::from_u128(501);
@@ -1109,13 +1223,19 @@ mod tests {
     #[test]
     fn test_start_task_not_found() {
         let task = make_task(Uuid::from_u128(51), "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(502);
+        let mut job = restore_job(
+            Uuid::from_u128(503),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(502),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         let err = job.start_task(&Uuid::from_u128(999), Uuid::from_u128(503)).unwrap_err();
@@ -1141,13 +1261,19 @@ mod tests {
             String::new(),
             Vec::new(),
         );
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(504);
+        let mut job = restore_job(
+            Uuid::from_u128(505),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(504),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         let err = job.start_task(&task_id, Uuid::from_u128(602)).unwrap_err();
@@ -1158,13 +1284,19 @@ mod tests {
     fn test_complete_task_ok() {
         let task_id = Uuid::from_u128(60);
         let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(600);
+        let mut job = restore_job(
+            Uuid::from_u128(601),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(600),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         job.start_task(&task_id, Uuid::from_u128(601)).unwrap();
@@ -1179,13 +1311,19 @@ mod tests {
     fn test_complete_task_wrong_status() {
         let task_id = Uuid::from_u128(61);
         let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(602);
+        let mut job = restore_job(
+            Uuid::from_u128(603),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(602),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         let err = job.complete_task(&task_id, vec![1]).unwrap_err();
@@ -1196,13 +1334,19 @@ mod tests {
     fn test_fail_task_ok() {
         let task_id = Uuid::from_u128(70);
         let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(700);
+        let mut job = restore_job(
+            Uuid::from_u128(701),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(700),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         job.start_task(&task_id, Uuid::from_u128(701)).unwrap();
@@ -1217,13 +1361,19 @@ mod tests {
     fn test_fail_task_wrong_status() {
         let task_id = Uuid::from_u128(71);
         let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(702);
+        let mut job = restore_job(
+            Uuid::from_u128(703),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(702),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         let err = job.fail_task(&task_id, "boom").unwrap_err();
@@ -1233,13 +1383,19 @@ mod tests {
     #[test]
     fn test_work_ok() {
         let task = make_task(Uuid::from_u128(80), "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(800);
+        let mut job = restore_job(
+            Uuid::from_u128(801),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(800),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         let worker_id = Uuid::from_u128(801);
@@ -1597,16 +1753,119 @@ mod tests {
     #[test]
     fn test_update_version() {
         let task = make_task(Uuid::from_u128(150), "todo", TaskStatus::Todo, Vec::new());
-        let mut job = Job::new(
-            JobCode::new("job"),
+        let worker_id = Uuid::from_u128(1500);
+        let mut job = restore_job(
+            Uuid::from_u128(1501),
+            JobStatus::Started,
             vec![task],
-            HashMap::new(),
-            Uuid::from_u128(1500),
+            1,
             Some(1),
             None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
         );
 
         job.update_version("v1".to_string());
         assert_eq!(job.version(), "v1");
+    }
+
+    #[test]
+    fn test_task_limits_default() {
+        let limits = TaskLimits::default();
+        assert!(limits.max_input_bytes > 100);
+        assert!(limits.max_output_bytes > 100);
+    }
+
+    #[test]
+    fn test_job_definition_with_task_limits() {
+        let mut executors = HashMap::new();
+        let executor: crate::registry::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        executors.insert(TaskCode::new("noop"), executor);
+        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
+        let limits = TaskLimits {
+            max_input_bytes: 1,
+            max_output_bytes: 2,
+        };
+
+        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors)
+            .unwrap()
+            .with_task_limits(limits);
+
+        assert_eq!(job_def.task_limits().max_input_bytes, 1);
+        assert_eq!(job_def.task_limits().max_output_bytes, 2);
+    }
+
+    #[test]
+    fn test_job_new_rejects_oversized_input() {
+        let task_def = TaskDefinition::new(TaskCode::new("too_big"), vec![0; 5], Duration::seconds(5)).unwrap();
+        let limits = TaskLimits {
+            max_input_bytes: 4,
+            max_output_bytes: 10,
+        };
+
+        let err = Job::new(
+            JobCode::new("job"),
+            vec![task_def],
+            HashMap::new(),
+            Uuid::from_u128(1600),
+            None,
+            None,
+            limits,
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(err, JobError::Other(_)));
+    }
+
+    #[test]
+    fn test_add_task_rejects_oversized_input() {
+        let limits = TaskLimits {
+            max_input_bytes: 4,
+            max_output_bytes: 10,
+        };
+        let init_def = TaskDefinition::new(TaskCode::new("init"), vec![0; 1], Duration::seconds(5)).unwrap();
+        let mut job = Job::new(
+            JobCode::new("job"),
+            vec![init_def],
+            HashMap::new(),
+            Uuid::from_u128(1700),
+            None,
+            None,
+            limits,
+        )
+        .unwrap();
+
+        let task_def = TaskDefinition::new(TaskCode::new("child"), vec![0; 5], Duration::seconds(5)).unwrap();
+        let err = job.add_task(&task_def, Uuid::from_u128(1701)).err().unwrap();
+        assert!(matches!(err, JobError::Other(_)));
+    }
+
+    #[test]
+    fn test_complete_task_rejects_oversized_output() {
+        let limits = TaskLimits {
+            max_input_bytes: 4,
+            max_output_bytes: 4,
+        };
+        let init_def = TaskDefinition::new(TaskCode::new("init"), vec![0; 1], Duration::seconds(5)).unwrap();
+        let mut job = Job::new(
+            JobCode::new("job"),
+            vec![init_def],
+            HashMap::new(),
+            Uuid::from_u128(1800),
+            None,
+            None,
+            limits,
+        )
+        .unwrap();
+
+        let task_id = *job.tasks_as_iter().next().unwrap().id();
+        job.start_task(&task_id, Uuid::from_u128(1801)).unwrap();
+
+        let err = job.complete_task(&task_id, vec![0; 5]).err().unwrap();
+        assert!(matches!(err, JobError::Other(_)));
     }
 }

@@ -72,12 +72,8 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
     executors.insert(TaskCode::new("init_task"), init_executor);
     executors.insert(TaskCode::new("dynamic_task"), dynamic_executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("test_dynamic_job"),
-        vec![init_task_def],
-        executors,
-    )?
-    .with_max_iterations(1)?;
+    let job_def =
+        JobDefinition::new(JobCode::new("test_dynamic_job"), vec![init_task_def], executors)?.with_max_iterations(1)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);

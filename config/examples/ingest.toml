@@ -33,6 +33,29 @@ backend = { s3 = { bucket = "warehouse", region = "us-east-1", endpoint = "https
 # Storage properties (optional)
 [storage.properties]
 
+# Shift Configuration
+[shift.read]
+# max_record_batches_per_task = 128
+
+[shift.write]
+# row_group_size = 10000
+# max_file_size_mb = 100
+# table_cache_ttl_secs = 60
+
+[shift.jobsmanager]
+# poll_interval_ms = 1000
+# iteration_interval_millisecs = 300
+
+# Job storage for shift operations
+[shift.jobsmanager.storage]
+endpoint = "http://127.0.0.1:9000"
+bucket = "jobs"
+prefix = "shifter"
+region = "us-east-1"
+use_ssl = false
+job_state_codec = "json"
+request_timeout_secs = 5
+
 # OTLP HTTP Server
 [otlp_http]
 enabled = true

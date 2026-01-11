@@ -46,6 +46,8 @@ pub async fn data_files_from_parquet_paths(table: &Table, parquet_paths: &[Strin
             .await
             .map_err(|e| IngestError::Shift(format!("failed to read parquet metadata '{path}': {e}")))?;
         let record_count = parquet_metadata.file_metadata().num_rows();
+        let record_count = u64::try_from(record_count)
+            .map_err(|_| IngestError::Shift(format!("parquet record count {record_count} is negative")))?;
 
         let partition = partition_from_path(path, partition_spec, &partition_type)?;
         let data_file = DataFileBuilder::default()
@@ -53,7 +55,7 @@ pub async fn data_files_from_parquet_paths(table: &Table, parquet_paths: &[Strin
             .file_path(path.clone())
             .file_format(DataFileFormat::Parquet)
             .file_size_in_bytes(file_size_in_bytes)
-            .record_count(record_count as u64)
+            .record_count(record_count)
             .partition_spec_id(table.metadata().default_partition_spec_id())
             .partition(partition)
             .build()
@@ -70,7 +72,6 @@ fn partition_from_path(
     partition_spec: &iceberg::spec::PartitionSpec,
     partition_type: &iceberg::spec::StructType,
 ) -> Result<Struct> {
-    // TODO(crit): зачем?
     if partition_spec.is_unpartitioned() {
         return Ok(Struct::empty());
     }
@@ -105,7 +106,6 @@ fn partition_from_path(
 }
 
 fn parse_partition_literal(field_type: &Type, value: &str) -> Result<Literal> {
-    // TODO(crit): зачем?
     match field_type {
         Type::Primitive(PrimitiveType::String) => Ok(Literal::string(value)),
         Type::Primitive(PrimitiveType::Int) => value

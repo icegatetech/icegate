@@ -44,6 +44,14 @@ pub enum IngestError {
     #[error("shift error: {0}")]
     Shift(String),
 
+    /// Operation cancelled.
+    #[error("operation cancelled")]
+    Cancelled,
+
+    /// Retry attempts exhausted.
+    #[error("max retry attempts reached")]
+    MaxAttemptsReached,
+
     /// Other errors
     #[error("other error: {0}")]
     Other(#[from] Box<dyn Error + Send + Sync>),
@@ -70,5 +78,15 @@ impl From<icegate_common::error::CommonError> for IngestError {
 impl From<arrow::error::ArrowError> for IngestError {
     fn from(err: arrow::error::ArrowError) -> Self {
         Self::Other(Box::new(err))
+    }
+}
+
+impl icegate_common::RetryError for IngestError {
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn max_attempts() -> Self {
+        Self::MaxAttemptsReached
     }
 }

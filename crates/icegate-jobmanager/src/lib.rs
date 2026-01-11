@@ -24,7 +24,7 @@ pub(crate) use storage::{JobMeta, Storage, StorageError, StorageResult};
 
 pub(crate) use crate::core::error::{InternalError, JobError};
 pub(crate) use crate::core::job::Job;
-pub use crate::core::job::{JobCode, JobDefinition, JobStatus};
+pub use crate::core::job::{JobCode, JobDefinition, JobStatus, TaskLimits};
 pub use crate::core::registry::JobRegistry;
 pub(crate) use crate::core::task::Task;
 pub use crate::core::task::{ImmutableTask, TaskCode, TaskDefinition, TaskStatus};
