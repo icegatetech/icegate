@@ -173,6 +173,7 @@ Use rules in `rustfmt.toml` to generate well-formatted code.
 ### Code Style
 
 The project uses `rustfmt` for code formatting. Configuration is in `rustfmt.toml`.
+@RUST.md
 
 ### Important Instructions
 

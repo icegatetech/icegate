@@ -40,7 +40,8 @@ use icegate_query::{
     loki::LokiConfig,
 };
 use reqwest::Client;
-use tokio::time::{Duration, sleep};
+use tokio::sync::oneshot;
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Test server configuration and handles
@@ -52,8 +53,11 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    /// Start a new test server on the given port
-    pub async fn start(port: u16) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
+    /// Start a new test server on an ephemeral port (OS-assigned)
+    ///
+    /// Uses port 0 to let the OS assign an available port, avoiding port conflicts
+    /// when running tests in parallel.
+    pub async fn start() -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
         let warehouse_path = tempfile::tempdir()?;
         let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
 
@@ -63,10 +67,11 @@ impl TestServer {
             properties: std::collections::HashMap::default(),
         };
 
+        // Use port 0 for ephemeral port assignment
         let loki_config = LokiConfig {
             enabled: true,
             host: "127.0.0.1".to_string(),
-            port,
+            port: 0,
         };
 
         let catalog = CatalogBuilder::from_config(&catalog_config).await?;
@@ -89,7 +94,7 @@ impl TestServer {
 
         let _ = catalog.create_table(&namespace_ident, table_creation).await?;
 
-        // Start server
+        // Start server with port notification channel
         let query_engine = Arc::new(
             QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
                 .await
@@ -100,14 +105,20 @@ impl TestServer {
         let cancel_token_clone = cancel_token.clone();
         let server_engine = Arc::clone(&query_engine);
 
+        // Create oneshot channel to receive the actual bound port
+        let (port_tx, port_rx) = oneshot::channel::<u16>();
+
         let server_handle = tokio::spawn(async move {
-            icegate_query::loki::run(server_engine, loki_config, cancel_token_clone)
+            icegate_query::loki::run_with_port_tx(server_engine, loki_config, cancel_token_clone, Some(port_tx))
                 .await
                 .unwrap();
         });
 
-        // Wait for server to start
-        sleep(Duration::from_secs(2)).await;
+        // Wait for the server to bind and receive the actual port
+        let actual_port = tokio::time::timeout(Duration::from_secs(10), port_rx)
+            .await
+            .expect("Timed out waiting for server to start")
+            .expect("Failed to receive port from server");
 
         // Leak the tempdir to keep it alive for the duration of the test
         // (it will be cleaned up when the process exits)
@@ -116,7 +127,7 @@ impl TestServer {
         Ok((
             Self {
                 client: Client::new(),
-                base_url: format!("http://127.0.0.1:{port}"),
+                base_url: format!("http://127.0.0.1:{actual_port}"),
                 cancel_token,
                 server_handle,
             },

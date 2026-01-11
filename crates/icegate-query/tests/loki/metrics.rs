@@ -15,7 +15,7 @@ use super::harness::{TestServer, write_test_logs};
 
 #[tokio::test]
 async fn test_count_over_time_metric() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3204).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -84,7 +84,7 @@ async fn test_count_over_time_metric() -> Result<(), Box<dyn std::error::Error>>
 
 #[tokio::test]
 async fn test_bytes_over_time_metric() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3205).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -140,7 +140,7 @@ async fn test_bytes_over_time_metric() -> Result<(), Box<dyn std::error::Error>>
 
 #[tokio::test]
 async fn test_rate() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3206).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
@@ -192,7 +192,7 @@ async fn test_rate() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_bytes_rate() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3207).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     let table = catalog
         .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)

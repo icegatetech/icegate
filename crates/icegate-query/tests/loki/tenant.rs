@@ -14,7 +14,7 @@ use super::harness::{TestServer, write_test_logs_for_tenant};
 
 #[tokio::test]
 async fn test_tenant_isolation() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3211).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     // Insert test data for two different tenants
     let table = catalog
@@ -131,7 +131,7 @@ async fn test_tenant_isolation() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_labels_tenant_isolation() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, catalog) = TestServer::start(3212).await?;
+    let (server, catalog) = TestServer::start().await?;
 
     // Insert test data for two different tenants
     let table = catalog

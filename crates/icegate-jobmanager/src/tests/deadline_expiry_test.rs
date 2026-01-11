@@ -11,15 +11,15 @@ use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
 use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
+use crate::storage::Storage;
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
+    CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
     s3_storage::{JobStateCodecKind, S3Storage, S3StorageConfig},
 };
 
-/// `TestTaskDeadlineExpiry` verifies that a task started by one worker is re-picked by another worker
-/// after its deadline expires.
+/// `TestTaskDeadlineExpiry` verifies that a task started by one worker is re-picked by another worker after its deadline expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     super::common::init_tracing();
@@ -72,27 +72,33 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
     // 4. Create storage
-    let storage = S3Storage::new(
-        S3StorageConfig {
-            endpoint: minio_env.endpoint().to_string(),
-            access_key_id: minio_env.username().to_string(),
-            secret_access_key: minio_env.password().to_string(),
-            bucket_name: "test-jobs".to_string(),
-            use_ssl: false,
-            region: "us-east-1".to_string(),
-            bucket_prefix: "jobs".to_string(),
-            job_state_codec: JobStateCodecKind::Json,
-            request_timeout: Duration::from_millis(200),
-            retrier_config: RetrierConfig::default(),
-        },
-        job_registry.clone(),
+    let storage = Arc::new(
+        S3Storage::new(
+            S3StorageConfig {
+                endpoint: minio_env.endpoint().to_string(),
+                access_key_id: minio_env.username().to_string(),
+                secret_access_key: minio_env.password().to_string(),
+                bucket_name: "test-jobs".to_string(),
+                use_ssl: false,
+                region: "us-east-1".to_string(),
+                bucket_prefix: "jobs".to_string(),
+                job_state_codec: JobStateCodecKind::Json,
+                request_timeout: Duration::from_millis(100),
+                retrier_config: RetrierConfig::default(),
+            },
+            job_registry.clone(),
+            Metrics::new_disabled(),
+        )
+        .await?,
+    );
+    let storage = Arc::new(CachedStorage::new(
+        storage.clone() as Arc<dyn Storage>,
         Metrics::new_disabled(),
-    )
-    .await?;
+    ));
 
-    // 5. Start manager with 2 workers
+    // 5. Start manager
     let config = JobsManagerConfig {
-        worker_count: 3,
+        worker_count: 3, // need more concurrency for small resources system
         worker_config: WorkerConfig {
             poll_interval: Duration::from_millis(10),
             poll_interval_randomization: Duration::from_millis(0),
@@ -101,7 +107,7 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let mut manager_env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![job_def])?;
+    let mut manager_env = ManagerEnv::new(storage, config, Arc::clone(&job_registry), vec![job_def])?;
 
     // 6. Wait for job completion (should re-pick after deadline expires)
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(15)).await?;

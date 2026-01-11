@@ -508,6 +508,7 @@ impl Storage for S3Storage {
         job_opt.ok_or_else(|| StorageError::Other("retry finished without job".into()))
     }
 
+    #[tracing::instrument(skip(self, cancel_token), fields(job_version = %job_meta.version))]
     async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
         if cancel_token.is_cancelled() {
             return Err(StorageError::Cancelled);
@@ -548,6 +549,7 @@ impl Storage for S3Storage {
         Ok(job)
     }
 
+    #[tracing::instrument(skip(self, cancel_token), fields(job_code = %job_code))]
     async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta> {
         if cancel_token.is_cancelled() {
             return Err(StorageError::Cancelled);
@@ -591,6 +593,7 @@ impl Storage for S3Storage {
     }
 
     // SaveJob saves job atomically with Version check
+    #[tracing::instrument(skip(self, cancel_token, job), fields(job_version = %job.version()))]
     async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
         if cancel_token.is_cancelled() {
             return Err(StorageError::Cancelled);
