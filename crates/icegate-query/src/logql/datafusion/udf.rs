@@ -16,6 +16,19 @@ use datafusion::{
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
 
+/// Helper function to create signature for map filter UDFs.
+fn create_map_filter_signature() -> Signature {
+    Signature::any(4, Volatility::Immutable)
+}
+
+/// Helper function to validate and return the map type for map filter UDFs.
+fn map_filter_return_type(arg_types: &[DataType], udf_name: &str) -> Result<DataType> {
+    if arg_types.is_empty() {
+        return plan_err!("{} requires at least one argument", udf_name);
+    }
+    Ok(arg_types[0].clone())
+}
+
 /// UDF: `map_keep_keys(map, keys, values, ops)` - keeps only specified keys with optional matcher filtering.
 ///
 /// # Arguments
@@ -53,7 +66,7 @@ impl MapKeepKeys {
     /// Creates a new `MapKeepKeys` UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(4, Volatility::Immutable),
+            signature: create_map_filter_signature(),
         }
     }
 }
@@ -72,11 +85,7 @@ impl ScalarUDFImpl for MapKeepKeys {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        // Return same map type as input
-        if arg_types.is_empty() {
-            return plan_err!("map_keep_keys requires at least one argument");
-        }
-        Ok(arg_types[0].clone())
+        map_filter_return_type(arg_types, self.name())
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -121,7 +130,7 @@ impl MapDropKeys {
     /// Creates a new `MapDropKeys` UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(4, Volatility::Immutable),
+            signature: create_map_filter_signature(),
         }
     }
 }
@@ -140,10 +149,7 @@ impl ScalarUDFImpl for MapDropKeys {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types.is_empty() {
-            return plan_err!("map_drop_keys requires at least one argument");
-        }
-        Ok(arg_types[0].clone())
+        map_filter_return_type(arg_types, self.name())
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -2549,13 +2555,18 @@ struct MatcherSpec {
     value: Option<String>,
     /// The operator (None for simple name-based matching).
     op: Option<String>,
+    /// Pre-compiled regex for regex operators (None for non-regex ops).
+    regex: Option<regex::Regex>,
 }
 
 /// Build matcher specifications from keys, values, and ops arrays.
 ///
+/// Pre-compiles regex patterns once per UDF invocation for optimal performance.
+///
 /// # Errors
 ///
-/// Returns an error if any matcher has inconsistent value/op state (one is `None` while the other is `Some`).
+/// Returns an error if any matcher has inconsistent value/op state (one is `None` while the other is `Some`)
+/// or if a regex pattern fails to compile.
 fn build_matchers(keys: &[String], values: &[Option<String>], ops: &[Option<String>]) -> Result<Vec<MatcherSpec>> {
     let mut matchers = Vec::with_capacity(keys.len());
 
@@ -2577,11 +2588,28 @@ fn build_matchers(keys: &[String], values: &[Option<String>], ops: &[Option<Stri
             );
         }
 
+        // Pre-compile regex patterns for regex operators
+        let regex = if let (Some(pattern), Some(operator)) = (&value, &op) {
+            if operator == "=~" || operator == "!~" {
+                // Compile regex once here instead of on every evaluate_matcher call
+                Some(regex::Regex::new(pattern).map_err(|e| {
+                    DataFusionError::Plan(format!(
+                        "Invalid regex pattern '{pattern}' for key '{key}' at index {idx}: {e}"
+                    ))
+                })?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Only push after validation succeeds
         matchers.push(MatcherSpec {
             key: key.clone(),
             value,
             op,
+            regex,
         });
     }
 
@@ -2646,8 +2674,8 @@ fn build_filtered_map_conditional(map_array: &MapArray, matchers: &[MatcherSpec]
                 } else if let (Some(map_value), Some(matcher_value), Some(matcher_op)) =
                     (value, matcher.value.as_ref(), matcher.op.as_ref())
                 {
-                    // Conditional matching - evaluate the matcher
-                    let is_match = evaluate_matcher(map_value, matcher_value, matcher_op)?;
+                    // Conditional matching - evaluate the matcher with pre-compiled regex
+                    let is_match = evaluate_matcher(map_value, matcher_value, matcher_op, matcher.regex.as_ref())?;
 
                     if keep_mode { is_match } else { !is_match }
                 } else {
@@ -2708,21 +2736,38 @@ fn build_filtered_map_conditional(map_array: &MapArray, matchers: &[MatcherSpec]
 /// Evaluate if a value matches a pattern using the specified operator.
 ///
 /// Supports: `=` (equals), `!=` (not equals), `=~` (regex match), `!~` (regex not match)
-fn evaluate_matcher(value: &str, pattern: &str, op: &str) -> Result<bool> {
+///
+/// # Arguments
+///
+/// * `value` - The value to match against
+/// * `pattern` - The pattern to match
+/// * `op` - The operator to use
+/// * `pre_compiled_regex` - Optional pre-compiled regex for performance optimization
+fn evaluate_matcher(value: &str, pattern: &str, op: &str, pre_compiled_regex: Option<&regex::Regex>) -> Result<bool> {
     match op {
         "=" => Ok(value == pattern),
         "!=" => Ok(value != pattern),
         "=~" => {
-            // Regex match
-            let re = regex::Regex::new(pattern)
-                .map_err(|e| DataFusionError::Execution(format!("Invalid regex pattern '{pattern}': {e}")))?;
-            Ok(re.is_match(value))
+            // Regex match - use pre-compiled regex if available
+            if let Some(re) = pre_compiled_regex {
+                Ok(re.is_match(value))
+            } else {
+                // Fallback to compiling (should not happen if build_matchers works correctly)
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| DataFusionError::Execution(format!("Invalid regex pattern '{pattern}': {e}")))?;
+                Ok(re.is_match(value))
+            }
         }
         "!~" => {
-            // Regex not match
-            let re = regex::Regex::new(pattern)
-                .map_err(|e| DataFusionError::Execution(format!("Invalid regex pattern '{pattern}': {e}")))?;
-            Ok(!re.is_match(value))
+            // Regex not match - use pre-compiled regex if available
+            if let Some(re) = pre_compiled_regex {
+                Ok(!re.is_match(value))
+            } else {
+                // Fallback to compiling (should not happen if build_matchers works correctly)
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| DataFusionError::Execution(format!("Invalid regex pattern '{pattern}': {e}")))?;
+                Ok(!re.is_match(value))
+            }
         }
         _ => exec_err!("Unknown matcher operator: {}", op),
     }

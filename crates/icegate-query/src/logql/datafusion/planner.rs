@@ -1496,79 +1496,10 @@ impl DataFusionPlanner {
         Ok(df)
     }
 
-    /// Apply `LogQL` `drop` operator - removes specified labels from attributes
-    /// map with optional matcher-based filtering.
+    /// Build parallel arrays for keys, values, and ops from `DropKeepLabel` slices.
     ///
-    /// Uses the `map_drop_keys` UDF to filter the attributes map, removing
-    /// entries whose keys match the specified labels, optionally with value matching.
-    fn apply_drop(df: DataFrame, labels: &[crate::logql::log::DropKeepLabel]) -> Result<DataFrame> {
-        if labels.is_empty() {
-            return Ok(df);
-        }
-
-        // Build parallel arrays for keys, values, and ops
-        let keys: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
-
-        let values: Vec<Expr> = labels
-            .iter()
-            .map(|l| {
-                l.matcher
-                    .as_ref()
-                    .map_or_else(|| lit(ScalarValue::Utf8(None)), |m| lit(m.value.as_str()))
-            })
-            .collect();
-
-        let ops: Vec<Expr> = labels
-            .iter()
-            .map(|l| {
-                l.matcher
-                    .as_ref()
-                    .map_or_else(|| lit(ScalarValue::Utf8(None)), |matcher| lit(matcher.op.as_str()))
-            })
-            .collect();
-
-        // Get the map_drop_keys UDF
-        let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
-
-        // Create filtered attributes expression with all 4 arguments
-        let filtered_attrs = udf.call(vec![
-            col("attributes"),
-            make_array(keys),
-            make_array(values),
-            make_array(ops),
-        ]);
-
-        // Select all columns, replacing attributes with filtered version
-        let select_exprs: Vec<Expr> = df
-            .schema()
-            .inner()
-            .fields()
-            .iter()
-            .map(|field| {
-                if field.name() == "attributes" {
-                    filtered_attrs.clone().alias("attributes")
-                } else {
-                    col(field.name().as_str())
-                }
-            })
-            .collect();
-
-        Ok(df.select(select_exprs)?)
-    }
-
-    /// Apply `LogQL` `keep` operator - keeps only specified labels in
-    /// attributes map with optional matcher-based filtering.
-    ///
-    /// Uses the `map_keep_keys` UDF to filter the attributes map, keeping
-    /// only entries whose keys match the specified labels, optionally with value matching.
-    fn apply_keep(df: DataFrame, labels: &[crate::logql::log::DropKeepLabel]) -> Result<DataFrame> {
-        if labels.is_empty() {
-            // keep with empty list = keep nothing (empty attributes)
-            // But this might be unexpected, so we return as-is for now
-            return Ok(df);
-        }
-
-        // Build parallel arrays for keys, values, and ops
+    /// Returns a tuple of (keys, values, ops) as `Vec<Expr>`.
+    fn build_drop_keep_arrays(labels: &[crate::logql::log::DropKeepLabel]) -> (Vec<Expr>, Vec<Expr>, Vec<Expr>) {
         let keys: Vec<Expr> = labels.iter().map(|l| lit(l.name.as_str())).collect();
 
         let values: Vec<Expr> = labels
@@ -1589,18 +1520,13 @@ impl DataFusionPlanner {
             })
             .collect();
 
-        // Get the map_keep_keys UDF
-        let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
+        (keys, values, ops)
+    }
 
-        // Create filtered attributes expression with all 4 arguments
-        let filtered_attrs = udf.call(vec![
-            col("attributes"),
-            make_array(keys),
-            make_array(values),
-            make_array(ops),
-        ]);
-
-        // Select all columns, replacing attributes with filtered version
+    /// Apply a filter UDF to the attributes column and select all columns.
+    ///
+    /// Replaces the attributes column with the filtered version and preserves all other columns.
+    fn apply_attributes_filter(df: DataFrame, filtered_attrs: &Expr) -> Result<DataFrame> {
         let select_exprs: Vec<Expr> = df
             .schema()
             .inner()
@@ -1616,6 +1542,50 @@ impl DataFusionPlanner {
             .collect();
 
         Ok(df.select(select_exprs)?)
+    }
+
+    /// Apply `LogQL` `drop` operator - removes specified labels from attributes
+    /// map with optional matcher-based filtering.
+    ///
+    /// Uses the `map_drop_keys` UDF to filter the attributes map, removing
+    /// entries whose keys match the specified labels, optionally with value matching.
+    fn apply_drop(df: DataFrame, labels: &[crate::logql::log::DropKeepLabel]) -> Result<DataFrame> {
+        if labels.is_empty() {
+            return Ok(df);
+        }
+
+        let (keys, values, ops) = Self::build_drop_keep_arrays(labels);
+        let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
+        let filtered_attrs = udf.call(vec![
+            col("attributes"),
+            make_array(keys),
+            make_array(values),
+            make_array(ops),
+        ]);
+
+        Self::apply_attributes_filter(df, &filtered_attrs)
+    }
+
+    /// Apply `LogQL` `keep` operator - keeps only specified labels in
+    /// attributes map with optional matcher-based filtering.
+    ///
+    /// Uses the `map_keep_keys` UDF to filter the attributes map, keeping
+    /// only entries whose keys match the specified labels, optionally with value matching.
+    fn apply_keep(df: DataFrame, labels: &[crate::logql::log::DropKeepLabel]) -> Result<DataFrame> {
+        if labels.is_empty() {
+            return Ok(df);
+        }
+
+        let (keys, values, ops) = Self::build_drop_keep_arrays(labels);
+        let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
+        let filtered_attrs = udf.call(vec![
+            col("attributes"),
+            make_array(keys),
+            make_array(values),
+            make_array(ops),
+        ]);
+
+        Self::apply_attributes_filter(df, &filtered_attrs)
     }
 
     fn apply_label_filter(df: DataFrame, filter_expr: crate::logql::log::LabelFilterExpr) -> Result<DataFrame> {
