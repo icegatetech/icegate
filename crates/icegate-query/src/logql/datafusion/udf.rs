@@ -193,7 +193,7 @@ fn filter_map_keys(args: &[ColumnarValue], keep_mode: bool) -> Result<ColumnarVa
     }
 
     // Build matcher specifications
-    let matchers = build_matchers(&filter_keys, &filter_values, &filter_ops);
+    let matchers = build_matchers(&filter_keys, &filter_values, &filter_ops)?;
 
     // Process with conditional matching (handles both simple and matcher-based)
     let result = build_filtered_map_conditional(map_array, &matchers, keep_mode)?;
@@ -2552,13 +2552,32 @@ struct MatcherSpec {
 }
 
 /// Build matcher specifications from keys, values, and ops arrays.
-fn build_matchers(keys: &[String], values: &[Option<String>], ops: &[Option<String>]) -> Vec<MatcherSpec> {
+///
+/// # Errors
+///
+/// Returns an error if any matcher has inconsistent value/op state (one is `None` while the other is `Some`).
+fn build_matchers(keys: &[String], values: &[Option<String>], ops: &[Option<String>]) -> Result<Vec<MatcherSpec>> {
     let mut matchers = Vec::with_capacity(keys.len());
 
     for (idx, key) in keys.iter().enumerate() {
         let value = values[idx].clone();
         let op = ops[idx].clone();
 
+        // Validate consistency: both None or both Some
+        let value_is_none = value.is_none();
+        let op_is_none = op.is_none();
+
+        if value_is_none != op_is_none {
+            return plan_err!(
+                "Matcher validation failed for key '{}' at index {}: value and op must both be None (simple name) or both be Some (conditional). Found value={:?}, op={:?}",
+                key,
+                idx,
+                value,
+                op
+            );
+        }
+
+        // Only push after validation succeeds
         matchers.push(MatcherSpec {
             key: key.clone(),
             value,
@@ -2566,7 +2585,7 @@ fn build_matchers(keys: &[String], values: &[Option<String>], ops: &[Option<Stri
         });
     }
 
-    matchers
+    Ok(matchers)
 }
 
 /// Build a new `MapArray` with conditional matcher-based filtering.
