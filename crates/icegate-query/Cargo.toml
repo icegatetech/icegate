@@ -64,7 +64,12 @@ chrono = { workspace = true }
 # Utilities
 itoa = { workspace = true }
 
+[[bench]]
+name = "loki_queries"
+harness = false
+
 [dev-dependencies]
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
+rand = { workspace = true }

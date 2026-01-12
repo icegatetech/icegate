@@ -1,4 +1,4 @@
-.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci
+.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench
 
 dev:
 	PROFILE=debug docker compose -f config/docker/docker-compose.yml up --watch --build
@@ -29,5 +29,8 @@ audit:
 
 install:
 	cargo install cargo-audit
+
+bench:
+	cargo bench --package icegate-query
 
 ci: check fmt clippy test audit
