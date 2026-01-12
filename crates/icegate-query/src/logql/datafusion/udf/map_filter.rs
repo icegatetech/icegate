@@ -1,6 +1,6 @@
 //! Map filtering UDFs for `LogQL` keep/drop/by/without operations.
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use datafusion::{
     arrow::{
@@ -202,14 +202,15 @@ fn filter_map_keys(args: &[ColumnarValue], keep_mode: bool) -> Result<ColumnarVa
     Ok(ColumnarValue::from(Arc::new(result) as ArrayRef))
 }
 
-/// Extract filter keys from an array (handles both `ListArray<String>` and
-/// `StringArray`).
-fn extract_filter_keys(array: &ArrayRef) -> Result<Vec<String>> {
+/// Generic helper to extract string array from a list array.
+///
+/// Handles both `ListArray` and `GenericListArray<i64>` (`LargeList`).
+fn extract_string_array_from_list(array: &ArrayRef, error_msg: &str) -> Result<Vec<Option<String>>> {
     // Try ListArray first (from make_array())
     if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
         let values = list_array.values();
         if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
-            return Ok(string_array.iter().filter_map(|s| s.map(String::from)).collect());
+            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
         }
     }
 
@@ -217,58 +218,33 @@ fn extract_filter_keys(array: &ArrayRef) -> Result<Vec<String>> {
     if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i64>>() {
         let values = list_array.values();
         if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
-            return Ok(string_array.iter().filter_map(|s| s.map(String::from)).collect());
+            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
         }
     }
 
-    // Try direct StringArray
+    plan_err!("{error_msg}")
+}
+
+/// Extract filter keys from an array (handles both `ListArray<String>` and `StringArray`).
+fn extract_filter_keys(array: &ArrayRef) -> Result<Vec<String>> {
+    // Try direct StringArray first for backwards compatibility
     if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
         return Ok(string_array.iter().filter_map(|s| s.map(String::from)).collect());
     }
 
-    plan_err!("Second argument must be an array of strings")
+    // Use generic helper for list arrays, filtering out None values
+    let with_nulls = extract_string_array_from_list(array, "Second argument must be an array of strings")?;
+    Ok(with_nulls.into_iter().flatten().collect())
 }
 
 /// Extract filter values from an array (handles NULL for simple name-based filtering).
 fn extract_filter_values(array: &ArrayRef) -> Result<Vec<Option<String>>> {
-    // Try ListArray first (from make_array())
-    if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
-        let values = list_array.values();
-        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
-            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
-        }
-    }
-
-    // Try GenericListArray<i64> (LargeList)
-    if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i64>>() {
-        let values = list_array.values();
-        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
-            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
-        }
-    }
-
-    plan_err!("Values argument must be an array of strings")
+    extract_string_array_from_list(array, "Values argument must be an array of strings")
 }
 
 /// Extract filter operators from an array (handles NULL for simple name-based filtering).
 fn extract_filter_ops(array: &ArrayRef) -> Result<Vec<Option<String>>> {
-    // Try ListArray first (from make_array())
-    if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
-        let values = list_array.values();
-        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
-            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
-        }
-    }
-
-    // Try GenericListArray<i64> (LargeList)
-    if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i64>>() {
-        let values = list_array.values();
-        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
-            return Ok(string_array.iter().map(|s| s.map(String::from)).collect());
-        }
-    }
-
-    plan_err!("Ops argument must be an array of strings")
+    extract_string_array_from_list(array, "Ops argument must be an array of strings")
 }
 
 /// Matcher specification for conditional filtering.
@@ -357,6 +333,9 @@ fn build_filtered_map_conditional(map_array: &MapArray, matchers: &[MatcherSpec]
 
     let original_entries_field = map_array.entries().fields().clone();
 
+    // Build matcher map once for O(1) lookups instead of O(n) per entry
+    let matcher_map: HashMap<&str, &MatcherSpec> = matchers.iter().map(|m| (m.key.as_str(), m)).collect();
+
     // Build new arrays for the filtered map
     let mut new_keys = StringBuilder::new();
     let mut new_values = StringBuilder::new();
@@ -388,8 +367,8 @@ fn build_filtered_map_conditional(map_array: &MapArray, matchers: &[MatcherSpec]
                 Some(values.value(entry_idx))
             };
 
-            // Find matcher for this key
-            let matcher = matchers.iter().find(|m| m.key == key);
+            // Look up matcher for this key (O(1) instead of O(n))
+            let matcher = matcher_map.get(key).copied();
 
             let should_include = if let Some(matcher) = matcher {
                 // Matcher found - evaluate condition

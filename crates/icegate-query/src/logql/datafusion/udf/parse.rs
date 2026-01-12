@@ -133,27 +133,36 @@ impl ParseBytes {
         }
     }
 
-    /// Parse a byte string like "10KB" to float
+    /// Parse a byte string like "10KB" to float.
+    ///
+    /// Handles both unit-suffixed strings (e.g., "10KB") and unitless numeric strings (e.g., "1024").
+    /// Unitless strings are treated as raw bytes.
     fn parse_byte_string(s: &str) -> Option<f64> {
         let s = s.trim();
 
         // Find where the unit starts (first non-digit, non-dot character)
-        let unit_start = s.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+        let unit_start = s.find(|c: char| !c.is_ascii_digit() && c != '.');
 
-        let (num_str, unit_str) = s.split_at(unit_start);
-        let num: f64 = num_str.trim().parse().ok()?;
+        if let Some(unit_start_idx) = unit_start {
+            // Has a unit suffix
+            let (num_str, unit_str) = s.split_at(unit_start_idx);
+            let num: f64 = num_str.trim().parse().ok()?;
 
-        let multiplier = match unit_str.trim().to_uppercase().as_str() {
-            "B" => 1.0,
-            "KB" | "K" | "KIB" => 1024.0,
-            "MB" | "M" | "MIB" => 1024.0 * 1024.0,
-            "GB" | "G" | "GIB" => 1024.0 * 1024.0 * 1024.0,
-            "TB" | "T" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-            "PB" | "P" | "PIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-            _ => return None,
-        };
+            let multiplier = match unit_str.trim().to_uppercase().as_str() {
+                "B" => 1.0,
+                "KB" | "K" | "KIB" => 1024.0,
+                "MB" | "M" | "MIB" => 1024.0 * 1024.0,
+                "GB" | "G" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+                "TB" | "T" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+                "PB" | "P" | "PIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+                _ => return None,
+            };
 
-        Some(num * multiplier)
+            Some(num * multiplier)
+        } else {
+            // No unit suffix - treat as raw bytes
+            s.parse::<f64>().ok()
+        }
     }
 }
 
@@ -295,14 +304,14 @@ impl ParseDuration {
                 } else if c == 'n' && i + 1 < chars.len() && chars[i + 1] == 's' {
                     i += 2;
                     1.0 // nanoseconds
-                } else if c == 'u' || c == 'µ' {
-                    // microseconds (us or µs)
+                } else if c == 'u' || c == 'µ' || c == 'μ' {
+                    // microseconds - must be followed by 's' (us, µs, or μs)
                     if i + 1 < chars.len() && chars[i + 1] == 's' {
                         i += 2;
+                        1_000.0 // microseconds to nanoseconds
                     } else {
-                        i += 1;
+                        return None; // Invalid: bare 'u'/'µ'/'μ' without 's'
                     }
-                    1_000.0 // microseconds to nanoseconds
                 } else {
                     return None; // Unknown unit
                 };

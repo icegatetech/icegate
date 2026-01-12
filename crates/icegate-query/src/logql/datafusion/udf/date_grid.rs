@@ -94,9 +94,20 @@ impl DateGrid {
             }
 
             let day_micros = i64::from(days) * 86_400_000_000;
-            let nano_micros = nanoseconds / 1000;
 
-            Ok(day_micros + nano_micros)
+            // Round to nearest microsecond instead of truncating
+            let nano_micros = if nanoseconds >= 0 {
+                (nanoseconds + 500) / 1000
+            } else {
+                (nanoseconds - 500) / 1000
+            };
+
+            // Use checked addition to prevent overflow
+            let total = day_micros.checked_add(nano_micros).ok_or_else(|| {
+                DataFusionError::Plan("Interval overflow when converting to microseconds".to_string())
+            })?;
+
+            Ok(total)
         } else {
             plan_err!("{param_name} must be an IntervalMonthDayNano scalar")
         }
@@ -125,6 +136,9 @@ impl ScalarUDFImpl for DateGrid {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         use datafusion::common::ScalarValue;
+
+        // Define a reasonable maximum grid size to prevent excessive memory allocation
+        const MAX_GRID_POINTS: i64 = 10_000; // 10K points max
 
         // Validate argument count
         if args.args.len() != 7 {
@@ -168,9 +182,35 @@ impl ScalarUDFImpl for DateGrid {
             return plan_err!("step must be positive");
         }
 
+        // Validate time range
+        if end_micros < start_micros {
+            return plan_err!("end timestamp must be greater than or equal to start timestamp");
+        }
+
+        // Calculate grid size safely to prevent overflow/excessive allocation
+        let time_range = end_micros
+            .checked_sub(start_micros)
+            .ok_or_else(|| DataFusionError::Plan("Time range calculation overflow".to_string()))?;
+
+        let num_points_i64 = time_range
+            .checked_div(step_micros)
+            .ok_or_else(|| DataFusionError::Plan("Grid calculation overflow".to_string()))?
+            .checked_add(1)
+            .ok_or_else(|| DataFusionError::Plan("Grid size calculation overflow".to_string()))?;
+
+        if num_points_i64 > MAX_GRID_POINTS {
+            return plan_err!(
+                "Grid size too large: {} points exceeds maximum of {}",
+                num_points_i64,
+                MAX_GRID_POINTS
+            );
+        }
+
+        // Safe to cast after bounds check; on 32-bit systems this is validated by MAX_GRID_POINTS limit
+        let num_points = usize::try_from(num_points_i64)
+            .map_err(|_| DataFusionError::Plan("Grid size exceeds usize capacity".to_string()))?;
+
         // Generate grid timestamps
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let num_points = ((end_micros - start_micros) / step_micros + 1) as usize;
         let grid: Vec<i64> = (0..num_points)
             .map(|i| {
                 #[allow(clippy::cast_possible_wrap)]

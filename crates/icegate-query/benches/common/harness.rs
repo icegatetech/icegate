@@ -98,11 +98,21 @@ impl TestServer {
                 .unwrap();
         });
 
-        let actual_port = tokio::time::timeout(Duration::from_secs(10), port_rx)
-            .await
-            .expect("Timed out waiting for server to start")
-            .expect("Failed to receive port from server");
+        let actual_port = match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
+            Ok(Ok(port)) => port,
+            Ok(Err(_)) => {
+                cancel_token.cancel();
+                panic!("Failed to receive port from server");
+            }
+            Err(_) => {
+                cancel_token.cancel();
+                panic!("Timed out waiting for server to start");
+            }
+        };
 
+        // SAFETY: Intentionally leak the TempDir to keep it alive for the benchmark/server lifetime.
+        // The spawned server requires a persistent filesystem path that outlives this function.
+        // This is an acceptable leak in the benchmark harness context.
         Box::leak(Box::new(warehouse_path));
 
         Ok((
