@@ -93,11 +93,9 @@ impl DateGrid {
                 return plan_err!("Month intervals are not supported, use days or smaller units");
             }
 
-            let day_micros = i64::from(days)
-                .checked_mul(86_400_000_000)
-                .ok_or_else(|| {
-                    DataFusionError::Plan("Interval overflow when converting days to microseconds".to_string())
-                })?;
+            let day_micros = i64::from(days).checked_mul(86_400_000_000).ok_or_else(|| {
+                DataFusionError::Plan("Interval overflow when converting days to microseconds".to_string())
+            })?;
 
             // Round to nearest microsecond instead of truncating
             let nano_micros = if nanoseconds >= 0 {
