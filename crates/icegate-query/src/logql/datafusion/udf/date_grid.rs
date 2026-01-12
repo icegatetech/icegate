@@ -71,7 +71,7 @@ impl Default for DateGrid {
 }
 
 impl DateGrid {
-    /// Creates a new `Grid` UDF.
+    /// Creates a new `DateGrid` UDF.
     pub fn new() -> Self {
         Self {
             signature: Signature::any(7, Volatility::Immutable),
