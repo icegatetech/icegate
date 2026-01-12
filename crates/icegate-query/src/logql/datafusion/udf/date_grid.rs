@@ -93,7 +93,11 @@ impl DateGrid {
                 return plan_err!("Month intervals are not supported, use days or smaller units");
             }
 
-            let day_micros = i64::from(days) * 86_400_000_000;
+            let day_micros = i64::from(days)
+                .checked_mul(86_400_000_000)
+                .ok_or_else(|| {
+                    DataFusionError::Plan("Interval overflow when converting days to microseconds".to_string())
+                })?;
 
             // Round to nearest microsecond instead of truncating
             let nano_micros = if nanoseconds >= 0 {
@@ -219,7 +223,7 @@ impl ScalarUDFImpl for DateGrid {
             })
             .collect();
 
-        let upper_bound_micros = range_micros + offset_micros;
+        let upper_bound_micros = range_micros.saturating_add(offset_micros);
 
         // Process each timestamp and collect matching grid points
         let mut list_builder: Vec<Vec<i64>> = Vec::with_capacity(timestamp_array.len());
@@ -231,8 +235,8 @@ impl ScalarUDFImpl for DateGrid {
                 let t = timestamp_array.value(i);
 
                 // Grid point g matches if: t + offset <= g <= t + upper_bound
-                let lower_grid = t + offset_micros;
-                let upper_grid = t + upper_bound_micros;
+                let lower_grid = t.saturating_add(offset_micros);
+                let upper_grid = t.saturating_add(upper_bound_micros);
 
                 // Collect matching grid points based on inverse parameter
                 let matches: Vec<i64> = if inverse {
