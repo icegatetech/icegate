@@ -4,7 +4,7 @@ use std::{any::Any, sync::Arc};
 
 use datafusion::{
     arrow::{
-        array::{Array, ListArray, TimestampMicrosecondArray},
+        array::{Array, LargeListArray, TimestampMicrosecondArray},
         buffer::{OffsetBuffer, ScalarBuffer},
         datatypes::{DataType, TimeUnit},
     },
@@ -133,7 +133,7 @@ impl ScalarUDFImpl for DateGrid {
         if arg_types.len() != 7 {
             return plan_err!("date_grid requires 7 arguments");
         }
-        Ok(DataType::List(arg_types[0].clone().into_nullable_field_ref()))
+        Ok(DataType::LargeList(arg_types[0].clone().into_nullable_field_ref()))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -221,7 +221,9 @@ impl ScalarUDFImpl for DateGrid {
             })
             .collect();
 
-        let upper_bound_micros = range_micros.saturating_add(offset_micros);
+        let upper_bound_micros = range_micros
+            .checked_add(offset_micros)
+            .ok_or_else(|| DataFusionError::Execution("Overflow when computing range + offset bounds".to_string()))?;
 
         // Process each timestamp and collect matching grid points
         let mut list_builder: Vec<Vec<i64>> = Vec::with_capacity(timestamp_array.len());
@@ -233,8 +235,16 @@ impl ScalarUDFImpl for DateGrid {
                 let t = timestamp_array.value(i);
 
                 // Grid point g matches if: t + offset <= g <= t + upper_bound
-                let lower_grid = t.saturating_add(offset_micros);
-                let upper_grid = t.saturating_add(upper_bound_micros);
+                let lower_grid = t.checked_add(offset_micros).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Overflow when computing lower grid bound: timestamp {t} + offset {offset_micros}"
+                    ))
+                })?;
+                let upper_grid = t.checked_add(upper_bound_micros).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Overflow when computing upper grid bound: timestamp {t} + upper_bound {upper_bound_micros}"
+                    ))
+                })?;
 
                 // Collect matching grid points based on inverse parameter
                 let matches: Vec<i64> = if inverse {
@@ -252,18 +262,20 @@ impl ScalarUDFImpl for DateGrid {
             }
         }
 
-        // Build the ListArray result
-        let mut offset = 0i32;
-        let mut offsets_vec = vec![0i32];
+        // Build the LargeListArray result (uses i64 offsets to prevent overflow)
+        let mut offset = 0i64;
+        let mut offsets_vec = vec![0i64];
         let mut values_vec = Vec::new();
 
         for matches in list_builder {
-            let len = i32::try_from(matches.len())
-                .map_err(|_| DataFusionError::Execution("ListArray overflow".to_string()))?;
+            let len = i64::try_from(matches.len())
+                .map_err(|_| DataFusionError::Execution("List length exceeds i64 capacity".to_string()))?;
             for timestamp in matches {
                 values_vec.push(timestamp);
             }
-            offset += len;
+            offset = offset.checked_add(len).ok_or_else(|| {
+                DataFusionError::Execution("Offset overflow when building LargeListArray".to_string())
+            })?;
             offsets_vec.push(offset);
         }
 
@@ -276,7 +288,7 @@ impl ScalarUDFImpl for DateGrid {
             true, // Nullable to match return_type promise
         ));
 
-        let list_array = ListArray::new(field, offsets, values_array, None);
+        let list_array = LargeListArray::new(field, offsets, values_array, None);
 
         Ok(ColumnarValue::Array(Arc::new(list_array)))
     }
