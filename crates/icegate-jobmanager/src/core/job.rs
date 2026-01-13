@@ -95,8 +95,8 @@ pub struct TaskLimits {
 impl Default for TaskLimits {
     fn default() -> Self {
         Self {
-            max_input_bytes: 100 * 1024 * 1024,
-            max_output_bytes: 100 * 1024 * 1024,
+            max_input_bytes: 10 * 1024 * 1024,  // 10MB
+            max_output_bytes: 10 * 1024 * 1024, // 10MB
         }
     }
 }
@@ -193,6 +193,7 @@ impl JobDefinition {
 
 #[derive(Clone)]
 pub(crate) struct Job {
+    // TODO(low): extract settings fields to new settings structure
     id: Uuid,
     code: JobCode,
     iter_num: u64,
@@ -205,8 +206,8 @@ pub(crate) struct Job {
     next_start_at: Option<DateTime<Utc>>,
     metadata: HashMap<String, serde_json::Value>,
     version: String,
-    max_iterations: Option<u64>, // None = unlimited, from JobDefinition TODO(low): extract to new settings structure
-    iteration_interval: Option<Duration>,
+    max_iterations: Option<u64>,          // None = unlimited
+    iteration_interval: Option<Duration>, // None = unlimited
     task_limits: TaskLimits,
 }
 

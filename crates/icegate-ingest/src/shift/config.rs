@@ -7,52 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::IngestError;
 
-/// Configuration for the shift process.
-///
-/// Controls how data is moved from the queue to Iceberg tables.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ShiftConfig {
-    /// WAL read settings.
-    pub read: ShiftReadConfig,
-    /// Iceberg write settings.
-    pub write: ShiftWriteConfig,
-    /// Jobs manager settings.
-    pub jobsmanager: ShiftJobsManagerConfig,
-}
-
-/// WAL read settings for shift.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ShiftReadConfig {
-    /// Maximum number of row groups to process per shift task.
-    pub max_record_batches_per_task: usize,
-}
-
-/// Iceberg write settings for shift.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ShiftWriteConfig {
-    /// Parquet row group size (number of rows per row group).
-    pub row_group_size: usize,
-    /// Maximum file size in MB before rolling to a new file.
-    pub max_file_size_mb: usize,
-    /// Time-to-live for cached Iceberg table metadata, in seconds.
-    pub table_cache_ttl_secs: u64,
-}
-
-/// Jobs manager settings for shift.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ShiftJobsManagerConfig {
-    /// Polling interval in milliseconds for job manager workers.
-    pub poll_interval_ms: u64,
-    /// Interval between job iterations, in milliseconds.
-    pub iteration_interval_millisecs: u64,
-    /// Job storage configuration.
-    pub storage: JobsStorageConfig,
-}
-
 /// Job state serialization format.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,34 +40,6 @@ pub struct JobsStorageConfig {
     pub access_key_id: Option<String>,
     /// Secret access key for S3 (falls back to env if not set).
     pub secret_access_key: Option<String>,
-}
-
-impl Default for ShiftReadConfig {
-    fn default() -> Self {
-        Self {
-            max_record_batches_per_task: 128,
-        }
-    }
-}
-
-impl Default for ShiftWriteConfig {
-    fn default() -> Self {
-        Self {
-            row_group_size: 10_000,
-            max_file_size_mb: 100,
-            table_cache_ttl_secs: 60,
-        }
-    }
-}
-
-impl Default for ShiftJobsManagerConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval_ms: 1000,
-            iteration_interval_millisecs: 300,
-            storage: JobsStorageConfig::default(),
-        }
-    }
 }
 
 impl Default for JobsStorageConfig {
@@ -232,6 +158,95 @@ impl JobsStorageConfig {
     }
 }
 
+/// WAL read settings for shift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShiftReadConfig {
+    /// Maximum number of row groups to process per shift task.
+    pub max_record_batches_per_task: usize,
+}
+
+/// Iceberg write settings for shift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShiftWriteConfig {
+    /// Parquet row group size (number of rows per row group).
+    pub row_group_size: usize,
+    /// Maximum file size in MB before rolling to a new file.
+    pub max_file_size_mb: usize,
+    /// Time-to-live for cached Iceberg table metadata, in seconds.
+    pub table_cache_ttl_secs: u64,
+}
+
+/// Jobs manager settings for shift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShiftJobsManagerConfig {
+    /// Polling interval in milliseconds for job manager workers.
+    pub poll_interval_ms: u64,
+    /// Interval between job iterations, in milliseconds.
+    pub iteration_interval_millisecs: u64,
+    /// Job storage configuration.
+    pub storage: JobsStorageConfig,
+}
+
+impl Default for ShiftReadConfig {
+    fn default() -> Self {
+        Self {
+            max_record_batches_per_task: 128,
+        }
+    }
+}
+
+impl Default for ShiftWriteConfig {
+    fn default() -> Self {
+        Self {
+            row_group_size: 10_000,
+            max_file_size_mb: 100,
+            table_cache_ttl_secs: 60,
+        }
+    }
+}
+
+impl Default for ShiftTimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            plan_base_ms: 10_000,
+            shift_base_ms: 10_000,
+            shift_per_record_batch_ms: 50,
+            shift_per_segment_ms: 300,
+            commit_base_ms: 30_000,
+            commit_per_parquet_file_ms: 100,
+        }
+    }
+}
+
+impl Default for ShiftJobsManagerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: 60000,
+            iteration_interval_millisecs: 300,
+            storage: JobsStorageConfig::default(),
+        }
+    }
+}
+
+/// Configuration for the shift process.
+///
+/// Controls how data is moved from the queue to Iceberg tables.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShiftConfig {
+    /// WAL read settings.
+    pub read: ShiftReadConfig,
+    /// Iceberg write settings.
+    pub write: ShiftWriteConfig,
+    /// Task timeout estimation settings.
+    pub timeouts: ShiftTimeoutsConfig,
+    /// Jobs manager settings.
+    pub jobsmanager: ShiftJobsManagerConfig,
+}
+
 impl ShiftConfig {
     /// Validates configuration values.
     pub fn validate(&self) -> Result<(), IngestError> {
@@ -265,8 +280,64 @@ impl ShiftConfig {
                 "jobsmanager.iteration_interval_millisecs must be greater than zero".to_string(),
             ));
         }
+        self.timeouts.validate()?;
         self.jobsmanager.storage.validate()?;
 
+        Ok(())
+    }
+}
+
+/// Timeout settings for shift-related tasks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShiftTimeoutsConfig {
+    /// Base timeout for plan task in milliseconds.
+    pub plan_base_ms: u64,
+    /// Base timeout for shift task in milliseconds.
+    pub shift_base_ms: u64,
+    /// Additional timeout per record batch in milliseconds.
+    pub shift_per_record_batch_ms: u64,
+    /// Additional timeout per segment in milliseconds.
+    pub shift_per_segment_ms: u64,
+    /// Base timeout for commit task in milliseconds.
+    pub commit_base_ms: u64,
+    /// Additional timeout per parquet file in milliseconds.
+    pub commit_per_parquet_file_ms: u64,
+}
+
+impl ShiftTimeoutsConfig {
+    /// Validates timeout configuration values.
+    pub fn validate(&self) -> Result<(), IngestError> {
+        if self.plan_base_ms == 0 {
+            return Err(IngestError::Config(
+                "timeouts.plan_base_ms must be greater than zero".to_string(),
+            ));
+        }
+        if self.shift_base_ms == 0 {
+            return Err(IngestError::Config(
+                "timeouts.shift_base_ms must be greater than zero".to_string(),
+            ));
+        }
+        if self.shift_per_record_batch_ms == 0 {
+            return Err(IngestError::Config(
+                "timeouts.shift_per_record_batch_ms must be greater than zero".to_string(),
+            ));
+        }
+        if self.shift_per_segment_ms == 0 {
+            return Err(IngestError::Config(
+                "timeouts.shift_per_segment_ms must be greater than zero".to_string(),
+            ));
+        }
+        if self.commit_base_ms == 0 {
+            return Err(IngestError::Config(
+                "timeouts.commit_base_ms must be greater than zero".to_string(),
+            ));
+        }
+        if self.commit_per_parquet_file_ms == 0 {
+            return Err(IngestError::Config(
+                "timeouts.commit_per_parquet_file_ms must be greater than zero".to_string(),
+            ));
+        }
         Ok(())
     }
 }

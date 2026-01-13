@@ -29,9 +29,9 @@ use crate::{
 // Schema:
 // `SegmentsPlan`
 //   groups: [`GroupedSegmentsPlan`]
-//     `group_col_val`: String
+//   row_groups_total: usize
 //     segments: [`SegmentRecordBatcheIdxs`]
-//       `segment_offset`: u64
+//     row_groups_total: usize
 //       `record_batch_idxs`: [usize]
 
 /// Result of planning segments record batches for processing.
@@ -41,6 +41,10 @@ pub struct SegmentsPlan {
     pub groups: Vec<GroupedSegmentsPlan>,
     /// Last segment offset observed in the planned segments.
     pub last_segment_offset: Option<u64>,
+    /// Number of segments scanned in the plan.
+    pub segments_count: usize,
+    /// Total number of row groups across all planned segments.
+    pub record_batches_total: usize,
 }
 
 /// Grouped record batches in segments keyed by a column value.
@@ -50,6 +54,10 @@ pub struct GroupedSegmentsPlan {
     pub group_col_val: String,
     /// WAL segment references for the group.
     pub segments: Vec<SegmentRecordBatcheIdxs>,
+    /// Number of segments in the group.
+    pub segments_count: usize,
+    /// Total number of row groups in the grouped segments.
+    pub record_batches_total: usize,
 }
 
 /// Record batches indexes (row group) in segment (WAL file).
@@ -74,24 +82,30 @@ impl RowGroupsInSegments {
         }
     }
 
-    fn push(&mut self, offset: u64, row_groups: Vec<usize>) {
+    fn push(&mut self, offset: u64, row_groups: Vec<usize>) -> Result<()> {
         if row_groups.is_empty() {
-            return;
+            return Ok(());
         }
-        self.row_group_count += row_groups.len();
+        self.row_group_count = self
+            .row_group_count
+            .checked_add(row_groups.len())
+            .ok_or_else(|| QueueError::Metadata("row group count overflow".to_string()))?;
         self.segments.entry(offset).or_default().extend(row_groups);
+        Ok(())
     }
 
-    fn take(&mut self) -> Vec<SegmentRecordBatcheIdxs> {
+    fn take(&mut self) -> (Vec<SegmentRecordBatcheIdxs>, usize) {
+        let row_group_count = self.row_group_count;
         self.row_group_count = 0;
         let segments = std::mem::take(&mut self.segments);
-        segments
+        let segments = segments
             .into_iter()
             .map(|(offset, row_groups)| SegmentRecordBatcheIdxs {
                 segment_offset: offset,
                 record_batch_idxs: row_groups,
             })
-            .collect()
+            .collect();
+        (segments, row_group_count)
     }
 }
 
@@ -237,11 +251,13 @@ impl QueueReader {
             return Ok(SegmentsPlan {
                 groups: Vec::new(),
                 last_segment_offset: None,
+                segments_count: 0,
+                record_batches_total: 0,
             });
         }
 
         let last_offset = segments.last().map(|segment| segment.offset);
-        let groups = self
+        let (groups, row_groups_total) = self
             .plan_record_batches(
                 segments.as_slice(),
                 group_by_column_name,
@@ -253,6 +269,8 @@ impl QueueReader {
         Ok(SegmentsPlan {
             groups,
             last_segment_offset: last_offset,
+            segments_count: segments.len(),
+            record_batches_total: row_groups_total,
         })
     }
 
@@ -298,7 +316,7 @@ impl QueueReader {
         group_by_column_name: &str,
         max_row_groups_per_group: usize,
         cancel_token: &CancellationToken,
-    ) -> Result<Vec<GroupedSegmentsPlan>> {
+    ) -> Result<(Vec<GroupedSegmentsPlan>, usize)> {
         if max_row_groups_per_group == 0 {
             return Err(QueueError::Config(
                 "max_row_groups_per_group must be greater than zero".to_string(),
@@ -307,6 +325,7 @@ impl QueueReader {
 
         let mut grouped_chunks: HashMap<String, RowGroupsInSegments> = HashMap::new();
         let mut grouped = Vec::new();
+        let mut row_groups_total = 0usize;
 
         for segment in segments {
             let wal_offset = segment.offset;
@@ -328,12 +347,19 @@ impl QueueReader {
                 saw_row_groups = true;
 
                 let chunk = grouped_chunks.entry(group_key.clone()).or_insert_with(RowGroupsInSegments::new);
-                chunk.push(wal_offset, vec![row_group_idx]);
+                let row_groups = vec![row_group_idx];
+                row_groups_total = row_groups_total
+                    .checked_add(row_groups.len())
+                    .ok_or_else(|| QueueError::Metadata("row group total overflow".to_string()))?;
+                chunk.push(wal_offset, row_groups)?;
                 if chunk.row_group_count == max_row_groups_per_group {
-                    let segments = chunk.take();
+                    let (segments, row_groups_total) = chunk.take();
+                    let segments_count = segments.len();
                     grouped.push(GroupedSegmentsPlan {
                         group_col_val: group_key,
                         segments,
+                        segments_count,
+                        record_batches_total: row_groups_total,
                     });
                 }
             }
@@ -346,17 +372,20 @@ impl QueueReader {
         }
 
         for (group_key, mut chunk) in grouped_chunks {
-            let segments = chunk.take();
+            let (segments, row_groups_total) = chunk.take();
             if segments.is_empty() {
                 continue;
             }
+            let segments_count = segments.len();
             grouped.push(GroupedSegmentsPlan {
                 group_col_val: group_key,
                 segments,
+                segments_count,
+                record_batches_total: row_groups_total,
             });
         }
 
-        Ok(grouped)
+        Ok((grouped, row_groups_total))
     }
 
     /// Reads Parquet footer metadata using range requests (no full file download).

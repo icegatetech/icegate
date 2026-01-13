@@ -8,6 +8,8 @@ pub mod executor;
 pub mod iceberg_storage;
 /// Parquet metadata reader utilities for shift operations.
 pub mod parquet_meta_reader;
+/// Task timeout estimation utilities.
+mod timeout;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -25,6 +27,7 @@ use icegate_jobmanager::{
 };
 use icegate_queue::QueueReader;
 pub use parquet_meta_reader::data_files_from_parquet_paths;
+use timeout::TimeoutEstimator;
 
 use crate::error::{IngestError, Result};
 
@@ -46,13 +49,24 @@ impl Shifter {
         shift_config: Arc<ShiftConfig>,
         jobs_storage: S3StorageConfig,
     ) -> Result<Self> {
-        let executor = Arc::new(
-            Executor::new(catalog, queue_reader, shift_config.clone(), LOGS_TOPIC, LOGS_TABLE)
-                .map_err(map_shift_error)?,
-        );
+        shift_config.validate()?;
+        let storage = Arc::new(IcebergStorage::new(
+            Arc::clone(&catalog),
+            LOGS_TABLE,
+            shift_config.as_ref(),
+        ));
+        let timeouts = TimeoutEstimator::new(&shift_config.timeouts)?;
+        let plan_timeout = timeouts.plan_timeout();
+        let executor = Arc::new(Executor::new(
+            queue_reader,
+            shift_config.clone(),
+            storage,
+            timeouts,
+            LOGS_TOPIC,
+        ));
 
-        let initial_task = TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), vec![], ChronoDuration::minutes(10))
-            .map_err(map_shift_error)?;
+        let initial_task =
+            TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), vec![], plan_timeout).map_err(map_shift_error)?;
 
         let mut executors = HashMap::new();
         executors.insert(TaskCode::new(PLAN_TASK_CODE), Arc::clone(&executor).plan_executor());

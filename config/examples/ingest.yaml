@@ -36,6 +36,13 @@ shift:
     # row_group_size: 10000
     # max_file_size_mb: 100
     # table_cache_ttl_secs: 60
+  timeouts:
+    # plan_base_ms: 60000
+    # shift_base_ms: 120000
+    # shift_per_record_batch_ms: 200
+    # shift_per_segment_ms: 300
+    # commit_base_ms: 30000
+    # commit_per_parquet_file_ms: 100
   jobsmanager:
     # poll_interval_ms: 1000
     # iteration_interval_millisecs: 300

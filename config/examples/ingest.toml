@@ -42,6 +42,14 @@ backend = { s3 = { bucket = "warehouse", region = "us-east-1", endpoint = "https
 # max_file_size_mb = 100
 # table_cache_ttl_secs = 60
 
+[shift.timeouts]
+# plan_base_ms = 60000
+# shift_base_ms = 120000
+# shift_per_record_batch_ms = 200
+# shift_per_segment_ms = 300
+# commit_base_ms = 30000
+# commit_per_parquet_file_ms = 100
+
 [shift.jobsmanager]
 # poll_interval_ms = 1000
 # iteration_interval_millisecs = 300

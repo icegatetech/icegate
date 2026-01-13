@@ -1,31 +1,27 @@
 //! Task executors for shift operations.
 //!
-//! Implements the plan -> shift -> commit pipeline for WAL processing.
+//! Implements the plan -> shift -> commit pipeline for WAL segments processing.
 
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use chrono::Duration as ChronoDuration;
-use iceberg::Catalog;
 use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition, registry::TaskExecutorFn};
 use icegate_queue::{QueueReader, SegmentsPlan};
 use serde::{Deserialize, Serialize};
 
-use super::{config::ShiftConfig, iceberg_storage::IcebergStorage};
+use super::{config::ShiftConfig, iceberg_storage::IcebergStorage, timeout::TimeoutEstimator};
 
-/// Task code for plan WAL segments.
+/// Task code for plan segments.
 pub const PLAN_TASK_CODE: &str = "plan";
-/// Task code for shifting WAL segments into Iceberg.
+/// Task code for shifting segments into Iceberg.
 pub const SHIFT_TASK_CODE: &str = "shift";
 /// Task code for committing shifted data to Iceberg.
 pub const COMMIT_TASK_CODE: &str = "commit";
 
-// TODO(crit): добавить расчет таймаута тасок
-
-/// WAL segment metadata used for shift input. Segments are WAL files.
+/// Segment metadata used for shift input. Segments are WAL files.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SegmentToRead {
-    /// WAL segment offset.
+    /// segment offset.
     pub segment_offset: u64,
     /// Batch offsets for this tenant inside the segment. Batches are grouped by column.
     pub record_batch_idxs: Vec<usize>,
@@ -36,7 +32,7 @@ pub struct SegmentToRead {
 pub struct ShiftInput {
     /// Tenant identifier handled by this task.
     pub tenant_id: String,
-    /// WAL segments to read and shift.
+    /// segments to read and shift.
     pub segments: Vec<SegmentToRead>,
 }
 
@@ -50,7 +46,7 @@ pub struct ShiftOutput {
 /// Input for the commit task.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommitInput {
-    /// Highest WAL offset to commit in snapshot summary.
+    /// Highest segments offset to commit in snapshot summary.
     pub last_offset: u64,
 }
 
@@ -60,33 +56,29 @@ pub struct Executor {
     storage: Arc<IcebergStorage>,
     shift_config: Arc<ShiftConfig>,
     topic: String,
+    timeouts: TimeoutEstimator,
 }
 
 impl Executor {
     /// Creates a new executor and initializes shared dependencies.
     pub fn new(
-        catalog: Arc<dyn Catalog>,
         queue_reader: Arc<QueueReader>,
         shift_config: Arc<ShiftConfig>,
+        storage: Arc<IcebergStorage>,
+        timeouts: TimeoutEstimator,
         topic: impl Into<String>,
-        table: impl Into<String>,
-    ) -> Result<Self, icegate_jobmanager::Error> {
-        shift_config
-            .validate()
-            .map_err(|e| icegate_jobmanager::Error::TaskExecution(format!("invalid shift config: {e}")))?;
-
-        let storage = Arc::new(IcebergStorage::new(catalog, table, shift_config.as_ref()));
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             queue_reader,
             storage,
             shift_config,
             topic: topic.into(),
-        })
+            timeouts,
+        }
     }
     /// Creates executor for the plan task.
     pub fn plan_executor(self: Arc<Self>) -> TaskExecutorFn {
-        // NOTICE: There is no guarantee of order inside the WAL files (segments), we just accept data from clients. Most likely, clients sort data by time (but this is not accurate).
+        // NOTICE: There is no guarantee of order inside the segments (WAL files), we just accept data from clients. Most likely, clients sort data by time (but this is not accurate).
 
         Arc::new(
             move |task: Arc<dyn ImmutableTask>, manager: &dyn JobManager, cancel_token| {
@@ -122,17 +114,19 @@ impl Executor {
                         )
                         .await
                         .map_err(|e| {
-                            icegate_jobmanager::Error::TaskExecution(format!("failed to plan WAL record batches: {e}"))
+                            icegate_jobmanager::Error::TaskExecution(format!(
+                                "failed to plan segment record batches: {e}"
+                            ))
                         })?;
 
                     if plan.last_segment_offset.is_none() {
                         // TODO(high): now we are completing the job iteration and producing a lot of files, it may be worth restarting the task.
-                        tracing::info!("plan: no WAL segments found for topic '{}'", topic);
+                        tracing::info!("plan: no segments found for topic '{}'", topic);
                         return manager.complete_task(&task_id, Vec::new());
                     }
 
                     let last_offset = plan.last_segment_offset.unwrap_or(0);
-                    let shift_task_ids = Self::schedule_shift_tasks(manager, plan)?;
+                    let shift_task_ids = Self::schedule_shift_tasks(manager, plan, &executor.timeouts)?;
 
                     tracing::info!(
                         "plan: scheduling shift for {} tasks (last_offset={})",
@@ -141,12 +135,16 @@ impl Executor {
                     );
 
                     let commit_input = CommitInput { last_offset };
+                    let commit_timeout = executor
+                        .timeouts
+                        .commit_timeout(shift_task_ids.len())
+                        .map_err(|e| icegate_jobmanager::Error::TaskExecution(e.to_string()))?;
                     let commit_task = TaskDefinition::new(
                         TaskCode::new(COMMIT_TASK_CODE),
                         serde_json::to_vec(&commit_input).map_err(|e| {
                             icegate_jobmanager::Error::TaskExecution(format!("failed to serialize commit input: {e}"))
                         })?,
-                        ChronoDuration::minutes(10),
+                        commit_timeout,
                     )?
                     .with_dependencies(shift_task_ids);
 
@@ -173,24 +171,29 @@ impl Executor {
 
                     let input: ShiftInput = parse_task_input(task.as_ref())?;
                     if input.segments.is_empty() {
-                        tracing::error!("shift: no WAL files provided, skipping");
+                        tracing::error!("shift: no segments provided, skipping");
                         return manager.complete_task(&task_id, Vec::new());
                     }
 
                     let mut batches: Vec<RecordBatch> = Vec::new();
 
-                    for wal_file in &input.segments {
-                        let wal_offset = wal_file.segment_offset;
-                        let wal_batches = executor
+                    for segment in &input.segments {
+                        let segment_batches = executor
                             .queue_reader
-                            .read_segment(&executor.topic, wal_offset, &wal_file.record_batch_idxs, &cancel_token)
+                            .read_segment(
+                                &executor.topic,
+                                segment.segment_offset,
+                                &segment.record_batch_idxs,
+                                &cancel_token,
+                            )
                             .await
                             .map_err(|e| {
                                 icegate_jobmanager::Error::TaskExecution(format!(
-                                    "failed to read WAL segment {wal_offset} row groups: {e}"
+                                    "failed to read segment {} row groups: {e}",
+                                    segment.segment_offset
                                 ))
                             })?;
-                        batches.extend(wal_batches);
+                        batches.extend(segment_batches);
                     }
 
                     if batches.is_empty() {
@@ -308,10 +311,11 @@ impl Executor {
     fn schedule_shift_tasks(
         manager: &dyn JobManager,
         plan: SegmentsPlan,
+        timeouts: &TimeoutEstimator,
     ) -> Result<Vec<uuid::Uuid>, icegate_jobmanager::Error> {
         let mut shift_task_ids = Vec::new();
         for group in plan.groups {
-            let wal_files = group
+            let segments = group
                 .segments
                 .into_iter()
                 .map(|segment| SegmentToRead {
@@ -320,17 +324,24 @@ impl Executor {
                 })
                 .collect::<Vec<_>>();
 
-            if wal_files.is_empty() {
+            if segments.is_empty() {
                 continue;
             }
 
-            let task_id = create_shift_task(manager, &group.group_col_val, wal_files)?;
+            let task_id = create_shift_task(
+                manager,
+                &group.group_col_val,
+                segments,
+                group.segments_count,
+                group.record_batches_total,
+                timeouts,
+            )?;
             shift_task_ids.push(task_id);
         }
 
         if shift_task_ids.is_empty() {
             return Err(icegate_jobmanager::Error::TaskExecution(
-                "no tenant WAL files to schedule".to_string(),
+                "no tenant segments to schedule".to_string(),
             ));
         }
 
@@ -346,18 +357,24 @@ fn parse_task_input<T: for<'de> Deserialize<'de>>(task: &dyn ImmutableTask) -> R
 fn create_shift_task(
     manager: &dyn JobManager,
     tenant_id: &str,
-    wal_files: Vec<SegmentToRead>,
+    segments: Vec<SegmentToRead>,
+    segments_count: usize,
+    record_batches_total: usize,
+    timeouts: &TimeoutEstimator,
 ) -> Result<uuid::Uuid, icegate_jobmanager::Error> {
     let shift_input = ShiftInput {
         tenant_id: tenant_id.to_string(),
-        segments: wal_files,
+        segments,
     };
 
+    let shift_timeout = timeouts
+        .shift_timeout(segments_count, record_batches_total)
+        .map_err(|e| icegate_jobmanager::Error::TaskExecution(e.to_string()))?;
     let shift_task = TaskDefinition::new(
         TaskCode::new(SHIFT_TASK_CODE),
         serde_json::to_vec(&shift_input)
             .map_err(|e| icegate_jobmanager::Error::TaskExecution(format!("failed to serialize shift input: {e}")))?,
-        ChronoDuration::minutes(10),
+        shift_timeout,
     )?;
 
     manager.add_task(shift_task)
