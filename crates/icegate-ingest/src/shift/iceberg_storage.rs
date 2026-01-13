@@ -75,19 +75,19 @@ impl IcebergStorage {
     }
 
     /// Returns the last committed WAL offset from the Iceberg snapshot summary.
-    pub async fn get_committed_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
+    pub async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
         let table = self.load_table_fresh(cancel_token).await?;
         Ok(get_committed_offset(&table))
     }
 
     /// Builds Iceberg data files from parquet file paths by reading parquet metadata.
-    pub async fn data_files_from_parquet_paths(
+    pub async fn get_data_files(
         &self,
-        parquet_paths: &[String],
+        file_paths: &[String],
         cancel_token: &CancellationToken,
     ) -> Result<Vec<DataFile>> {
         let table = self.load_table_fresh(cancel_token).await?;
-        self.retry(cancel_token, || data_files_from_parquet_paths(&table, parquet_paths))
+        self.retry(cancel_token, || data_files_from_parquet_paths(&table, file_paths))
             .await
     }
 
@@ -96,7 +96,7 @@ impl IcebergStorage {
     /// 1. Sorts the batches by the table's sort order
     /// 2. Splits data by partition using `RecordBatchPartitionSplitter`
     /// 3. Writes each partition's data using `FanoutWriter`
-    pub async fn write_parquet_files(
+    pub async fn write_record_batches(
         &self,
         batches: Vec<RecordBatch>,
         cancel_token: &CancellationToken,
@@ -204,7 +204,7 @@ impl IcebergStorage {
     }
 
     /// Commits parquet data files to Iceberg with offset tracking.
-    pub async fn commit_data_files(
+    pub async fn commit(
         &self,
         data_files: Vec<DataFile>,
         record_type: &str,

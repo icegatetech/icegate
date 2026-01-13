@@ -13,7 +13,7 @@ use tokio::{
     time::timeout,
 };
 
-use super::common::in_memory_storage::InMemoryStorage;
+use crate::storage::in_memory::InMemoryStorage;
 use crate::{
     JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, Metrics, TaskCode, TaskDefinition,
     WorkerConfig, registry::TaskExecutorFn,

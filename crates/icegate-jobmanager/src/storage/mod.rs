@@ -1,4 +1,5 @@
 pub(crate) mod cached;
+pub(crate) mod in_memory;
 pub(crate) mod s3;
 
 use async_trait::async_trait;

@@ -4,7 +4,7 @@ use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::common::in_memory_storage::InMemoryStorage;
+use crate::storage::in_memory::InMemoryStorage;
 use crate::{CachedStorage, Job, JobCode, Metrics, Storage, TaskCode, TaskDefinition, TaskLimits};
 
 // TestCacheInvalidation verifies that CachedStorage avoids redundant S3 calls on cache hit.
