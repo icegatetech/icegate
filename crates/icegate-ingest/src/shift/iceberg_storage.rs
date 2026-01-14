@@ -50,7 +50,7 @@ pub struct WrittenDataFiles {
 pub struct IcebergStorage {
     loader: TableLoader,
     row_group_size: usize,
-    max_file_size_bytes: usize,
+    max_file_size_mb: usize,
     retrier: Retrier,
 }
 
@@ -61,7 +61,7 @@ impl IcebergStorage {
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,
-            max_file_size_bytes: shift_config.write.max_file_size_mb,
+            max_file_size_mb: shift_config.write.max_file_size_mb,
             retrier: Retrier::new(RetrierConfig::default()),
         }
     }
@@ -77,7 +77,13 @@ impl IcebergStorage {
     /// Returns the last committed WAL offset from the Iceberg snapshot summary.
     pub async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
         let table = self.load_table_fresh(cancel_token).await?;
-        Ok(get_committed_offset(&table))
+        Ok(table.metadata().current_snapshot().and_then(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get(OFFSET_SUMMARY_KEY)
+                .and_then(|v| v.parse::<u64>().ok())
+        }))
     }
 
     /// Builds Iceberg data files from parquet file paths by reading parquet metadata.
@@ -124,7 +130,7 @@ impl IcebergStorage {
             });
         }
 
-        tracing::info!("Start writting parquet file. Batches: {}", batches.len());
+        tracing::info!("Start writing parquet file. Batches: {}", batches.len());
         let queue_schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
         let table = self.load_table(cancel_token).await?;
@@ -149,7 +155,7 @@ impl IcebergStorage {
 
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
-            self.max_file_size_bytes,
+            self.max_file_size_mb * 1024 * 1024,
             table.file_io().clone(),
             location_generator,
             file_name_generator,
@@ -192,7 +198,7 @@ impl IcebergStorage {
             .map_err(|e| IngestError::Shift(format!("failed to close fanout writer: {e}")))?;
 
         tracing::info!(
-            "Complite write {} parquet files for {} partitions",
+            "Complete write {} parquet files for {} partitions",
             data_files.len(),
             partitioned_batches_len
         );
@@ -309,20 +315,6 @@ impl IcebergStorage {
             Err(err) => Err(err),
         }
     }
-}
-
-/// Retrieves the last committed offset from the current snapshot's summary.
-///
-/// Returns `None` if no snapshot exists or no offset has been committed yet.
-#[must_use]
-fn get_committed_offset(table: &Table) -> Option<u64> {
-    table.metadata().current_snapshot().and_then(|snapshot| {
-        snapshot
-            .summary()
-            .additional_properties
-            .get(OFFSET_SUMMARY_KEY)
-            .and_then(|v| v.parse::<u64>().ok())
-    })
 }
 
 /// Sorts a record batch by the table's sort order.

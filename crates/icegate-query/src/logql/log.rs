@@ -93,6 +93,39 @@ impl LabelMatcher {
     }
 }
 
+/// Label specification for drop/keep pipeline operations.
+///
+/// Supports both simple label names and conditional matching:
+/// - `drop user_id` - Simple name (drops all occurrences)
+/// - `drop user_id="value"` - Conditional (drops only when value matches)
+/// - `drop user_id=~"pattern"` - Regex conditional
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropKeepLabel {
+    /// The label name
+    pub name: String,
+    /// Optional matcher for conditional operations
+    pub matcher: Option<LabelMatcher>,
+}
+
+impl DropKeepLabel {
+    /// Create a new `DropKeepLabel` with just a name (unconditional).
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            matcher: None,
+        }
+    }
+
+    /// Create a new `DropKeepLabel` with a matcher (conditional).
+    pub fn with_matcher(matcher: LabelMatcher) -> Self {
+        let name = matcher.label.clone();
+        Self {
+            name,
+            matcher: Some(matcher),
+        }
+    }
+}
+
 /// Pipeline stage in a log query.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineStage {
@@ -107,9 +140,9 @@ pub enum PipelineStage {
     /// Decolorize: `| decolorize`
     Decolorize,
     /// Drop labels: `| drop label1, label2`
-    Drop(Vec<LabelExtraction>),
+    Drop(Vec<DropKeepLabel>),
     /// Keep labels: `| keep label1, label2`
-    Keep(Vec<LabelExtraction>),
+    Keep(Vec<DropKeepLabel>),
     /// Label filter: `| label > 10`, `| label = "value"`
     LabelFilter(LabelFilterExpr),
 }

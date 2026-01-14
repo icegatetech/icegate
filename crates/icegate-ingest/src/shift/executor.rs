@@ -219,7 +219,7 @@ impl Executor {
 
                     let start_offset = executor
                         .storage
-                        .get_committed_offset(&cancel_token)
+                        .get_last_offset(&cancel_token)
                         .await
                         .map_err(|e| {
                             icegate_jobmanager::Error::TaskExecution(format!("failed to read committed offset: {e}"))
@@ -329,7 +329,7 @@ impl Executor {
 
                     let write_result = executor
                         .storage
-                        .write_parquet_files(batches, &cancel_token)
+                        .write_record_batches(batches, &cancel_token)
                         .await
                         .map_err(|e| icegate_jobmanager::Error::TaskExecution(e.to_string()))?;
 
@@ -373,7 +373,7 @@ impl Executor {
 
                     let input: CommitInput = parse_task_input(task.as_ref())?;
                     // Let's check if we have already recorded a commit, but did not have time to complete the job.
-                    let committed_offset = executor.storage.get_committed_offset(&cancel_token).await.map_err(|e| {
+                    let committed_offset = executor.storage.get_last_offset(&cancel_token).await.map_err(|e| {
                         icegate_jobmanager::Error::TaskExecution(format!("failed to read committed offset: {e}"))
                     })?;
                     if committed_offset.is_some_and(|offset| offset >= input.last_offset) {
@@ -415,13 +415,13 @@ impl Executor {
 
                     let data_files = executor
                         .storage
-                        .data_files_from_parquet_paths(&parquet_files, &cancel_token)
+                        .get_data_files(&parquet_files, &cancel_token)
                         .await
                         .map_err(|e| icegate_jobmanager::Error::TaskExecution(e.to_string()))?;
 
                     executor
                         .storage
-                        .commit_data_files(data_files, &executor.topic, input.last_offset, &cancel_token)
+                        .commit(data_files, &executor.topic, input.last_offset, &cancel_token)
                         .await
                         .map_err(|e| icegate_jobmanager::Error::TaskExecution(e.to_string()))?;
 

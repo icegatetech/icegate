@@ -224,8 +224,8 @@ impl Default for ShiftTimeoutsConfig {
 impl Default for ShiftJobsManagerConfig {
     fn default() -> Self {
         Self {
-            poll_interval_ms: 60000,
-            iteration_interval_millisecs: 300,
+            poll_interval_ms: 1_000,              // 1 sec
+            iteration_interval_millisecs: 30_000, // 30 sec
             storage: JobsStorageConfig::default(),
         }
     }
@@ -262,7 +262,7 @@ impl ShiftConfig {
         }
         if self.read.max_record_batches_per_task == 0 {
             return Err(IngestError::Config(
-                "max_row_groups_per_task must be greater than zero".to_string(),
+                "max_record_batches_per_task must be greater than zero".to_string(),
             ));
         }
         if self.write.table_cache_ttl_secs == 0 {

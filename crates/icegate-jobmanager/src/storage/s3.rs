@@ -75,11 +75,13 @@ impl JobStateCodec for CborJobStateCodec {
     }
 
     fn serialize(&self, job: &JobJson) -> StorageResult<Vec<u8>> {
-        serde_cbor::to_vec(job).map_err(|e| StorageError::Serialization(e.to_string()))
+        let mut buffer = Vec::new();
+        ciborium::ser::into_writer(job, &mut buffer).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        Ok(buffer)
     }
 
     fn deserialize(&self, data: &[u8]) -> StorageResult<JobJson> {
-        serde_cbor::from_slice(data).map_err(|e| StorageError::Serialization(e.to_string()))
+        ciborium::de::from_reader(data).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 }
 
