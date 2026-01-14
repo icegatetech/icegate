@@ -41,6 +41,8 @@ tokio-util = { workspace = true }
 # CLI
 clap = { workspace = true }
 
+regex = { workspace = true }
+
 # Configuration
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -63,10 +65,11 @@ chrono = { workspace = true }
 itoa = { workspace = true }
 
 [[bench]]
-name = "count_over_time"
+name = "loki_queries"
 harness = false
 
 [dev-dependencies]
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
+rand = { workspace = true }

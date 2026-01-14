@@ -27,7 +27,7 @@ Core log queries and metric aggregations (`rate`, `count_over_time`, `bytes_over
 | **Line Filters** | ⚠️ Partial | **Implemented:** `|=` (contains), `!=` (not contains), `|~` (regex), `!~` (not regex).<br>**Missing:** `!>` (not pattern) returns `NotImplemented` error. IP filtering returns `NotImplemented` error. |
 | **Pipeline Parsers** | ❌ Missing | `json`, `logfmt`, `regexp`, `pattern`, `unpack` are all placeholders (no-ops). |
 | **Pipeline Formatting** | ❌ Missing | `label_format`, `line_format`, `decolorize` are placeholders (no-ops). |
-| **Label Management** | ⚠️ Partial | **Implemented:** `drop` and `keep` with simple names and `=` matcher via UDFs.<br>**Missing:** `!=`, `=~`, `!~` matchers for drop/keep expressions. |
+| **Label Management** | ✅ Implemented | **Implemented:** `drop` and `keep` with simple names and all matcher types (`=`, `!=`, `=~`, `!~`) via UDFs. Supports mixed operations combining simple names and matchers in single expression. |
 | **Label Filters** | ⚠️ Partial | **Implemented:** Numeric, Duration, and Bytes comparisons (`>`, `>=`, `<`, `<=`, `=`, `!=`).<br>**Missing:** IP filtering returns `NotImplemented` error. |
 | **Log-Range Aggregation** | ✅ Implemented | `count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`, `absent_over_time` with grid-based time bucketing and `offset` modifier support. |
 | **Unwrap Aggregation** | ✅ Implemented | All 10 unwrap aggregations implemented: `sum_over_time`, `avg_over_time`, `min_over_time`, `max_over_time`, `stddev_over_time`, `stdvar_over_time`, `quantile_over_time`, `first_over_time`, `last_over_time`, `rate_counter`. Supports `duration()` and `bytes()` conversion functions. **Note:** `rate_counter` includes Prometheus-compatible counter reset detection. |

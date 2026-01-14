@@ -18,8 +18,8 @@ use crate::{
         common::{ComparisonOp, Grouping, GroupingLabel, LabelExtraction, LabelFormatOp, MatchOp, parse_error},
         expr::LogQLExpr,
         log::{
-            LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr, LogParser,
-            PipelineStage, Selector, UnwrapConversion, UnwrapExpr,
+            DropKeepLabel, LabelFilterExpr, LabelMatcher, LineFilter, LineFilterOp, LineFilterValue, LogExpr,
+            LogParser, PipelineStage, Selector, UnwrapConversion, UnwrapExpr,
         },
         metric::{
             AtModifier, BinaryOp, BinaryOpModifier, MatchingLabels, MetricExpr, RangeAggregation, RangeAggregationOp,
@@ -261,6 +261,37 @@ fn visit_label_extractions(ctx: &LabelExtractionsContextAll) -> Result<Vec<Label
     }
 
     Ok(extractions)
+}
+
+/// Visit drop/keep list - handles both simple names and matcher expressions.
+fn visit_drop_keep_list(ctx: &DropKeepListContextAll) -> Result<Vec<DropKeepLabel>> {
+    let mut labels = Vec::new();
+
+    for item_ctx in ctx.dropKeepItem_all() {
+        match item_ctx.as_ref() {
+            DropKeepItemContextAll::DropKeepSimpleContext(c) => {
+                // Simple name: drop level
+                let name = c
+                    .ATTRIBUTE()
+                    .ok_or_else(|| parse_error("Missing attribute in drop/keep"))?
+                    .get_text();
+                labels.push(DropKeepLabel::new(name));
+            }
+
+            DropKeepItemContextAll::DropKeepMatcherContext(c) => {
+                // Matcher: drop level="debug", drop level=~".*"
+                let matcher_ctx = c.matcher().ok_or_else(|| parse_error("Missing matcher in drop/keep"))?;
+                let matcher = visit_matcher(&matcher_ctx)?;
+                labels.push(DropKeepLabel::with_matcher(matcher));
+            }
+
+            DropKeepItemContextAll::Error(_) => {
+                return Err(parse_error("Error in drop/keep item"));
+            }
+        }
+    }
+
+    Ok(labels)
 }
 
 /// Visit grouping clause.
@@ -1016,8 +1047,8 @@ impl LogQLExprVisitor {
 
         // Drop
         if let Some(drop_expr) = ctx.dropExpr() {
-            if let Some(extractions) = drop_expr.labelExtractions() {
-                let fields = visit_label_extractions(&extractions)?;
+            if let Some(drop_keep_list) = drop_expr.dropKeepList() {
+                let fields = visit_drop_keep_list(&drop_keep_list)?;
                 return Ok(PipelineStage::Drop(fields));
             }
             return Ok(PipelineStage::Drop(Vec::new()));
@@ -1025,8 +1056,8 @@ impl LogQLExprVisitor {
 
         // Keep
         if let Some(keep_expr) = ctx.keepExpr() {
-            if let Some(extractions) = keep_expr.labelExtractions() {
-                let fields = visit_label_extractions(&extractions)?;
+            if let Some(drop_keep_list) = keep_expr.dropKeepList() {
+                let fields = visit_drop_keep_list(&drop_keep_list)?;
                 return Ok(PipelineStage::Keep(fields));
             }
             return Ok(PipelineStage::Keep(Vec::new()));
