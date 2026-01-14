@@ -10,6 +10,8 @@ pub mod iceberg_storage;
 pub mod parquet_meta_reader;
 /// Task timeout estimation utilities.
 mod timeout;
+#[cfg(test)]
+mod pipeline_tests;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -25,7 +27,7 @@ use icegate_jobmanager::{
     CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics, S3Storage,
     TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
 };
-use icegate_queue::QueueReader;
+use icegate_queue::ParquetQueueReader;
 pub use parquet_meta_reader::data_files_from_parquet_paths;
 use timeout::TimeoutEstimator;
 
@@ -45,7 +47,7 @@ impl Shifter {
     /// Create a new shifter instance.
     pub async fn new(
         catalog: Arc<dyn Catalog>,
-        queue_reader: Arc<QueueReader>,
+        queue_reader: Arc<ParquetQueueReader>,
         shift_config: Arc<ShiftConfig>,
         jobs_storage: S3StorageConfig,
     ) -> Result<Self> {

@@ -36,6 +36,7 @@ impl InMemoryStorage {
 }
 
 #[async_trait::async_trait]
+#[allow(private_interfaces)]
 impl Storage for InMemoryStorage {
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
         if cancel_token.is_cancelled() {

@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use icegate_common::{catalog::CatalogBuilder, create_object_store};
-use icegate_queue::{QueueConfig, QueueReader, QueueWriter, channel};
+use icegate_queue::{QueueConfig, ParquetQueueReader, QueueWriter, channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::{IngestConfig, error::Result, shift::Shifter};
@@ -68,7 +68,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let catalog = CatalogBuilder::from_config(&config.catalog).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
-    let queue_reader = Arc::new(QueueReader::new(queue_config.base_path.clone(), Arc::clone(&store)));
+    let queue_reader = Arc::new(ParquetQueueReader::new(queue_config.base_path.clone(), Arc::clone(&store)));
     let shifter = Shifter::new(catalog, queue_reader, shift_config, jobs_storage).await?;
     let shifter_handle = shifter.start()?;
 

@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use async_trait::async_trait;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use icegate_common::retrier::{Retrier, RetrierConfig};
@@ -109,10 +110,33 @@ impl RowGroupsInSegments {
     }
 }
 
+/// Queue reader dependency surface for shift executors.
+#[async_trait]
+pub trait QueueReader: Send + Sync {
+    /// Build a plan of record batches to process.
+    async fn plan_segments(
+        &self,
+        topic: &Topic,
+        start_offset: u64,
+        group_by_column_name: &str,
+        max_record_batches_per_task: usize,
+        cancel_token: &CancellationToken,
+    ) -> Result<SegmentsPlan>;
+
+    /// Read record batches for a specific segment.
+    async fn read_segment(
+        &self,
+        topic: &Topic,
+        offset: u64,
+        record_batch_idxs: &[usize],
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<RecordBatch>>;
+}
+
 /// Queue reader for reading Parquet segments from object storage.
 ///
 /// Provides methods to list segments and read record batches.
-pub struct QueueReader {
+pub struct ParquetQueueReader {
     /// Base path for queue segments.
     base_path: String,
 
@@ -122,7 +146,7 @@ pub struct QueueReader {
     retrier: Retrier,
 }
 
-impl QueueReader {
+impl ParquetQueueReader {
     /// Creates a new queue reader.
     pub fn new(base_path: impl Into<String>, store: Arc<dyn ObjectStore>) -> Self {
         Self {
@@ -343,7 +367,7 @@ impl QueueReader {
 
             let mut saw_row_groups = false;
             for (row_group_idx, row_group) in parquet_meta.row_groups().iter().enumerate() {
-                let group_key = group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
+                let group_key = Self::group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
                 saw_row_groups = true;
 
                 let chunk = grouped_chunks.entry(group_key.clone()).or_insert_with(RowGroupsInSegments::new);
@@ -484,56 +508,88 @@ impl QueueReader {
             Err(err) => Err(err),
         }
     }
+
+    fn group_key_from_row_group(
+        row_group: &parquet::file::metadata::RowGroupMetaData,
+        column_idx: usize,
+        column_name: &str,
+        row_group_idx: usize,
+    ) -> Result<String> {
+        let column = row_group.column(column_idx);
+        let stats = column.statistics().ok_or_else(|| {
+            QueueError::Metadata(format!(
+                "missing statistics for '{column_name}' in row group {row_group_idx}"
+            ))
+        })?;
+
+        match stats {
+            Statistics::ByteArray(byte_stats) => {
+                let min = byte_stats.min_bytes_opt().ok_or_else(|| {
+                    QueueError::Metadata(format!(
+                        "missing min statistic for '{column_name}' in row group {row_group_idx}"
+                    ))
+                })?;
+                let max = byte_stats.max_bytes_opt().ok_or_else(|| {
+                    QueueError::Metadata(format!(
+                        "missing max statistic for '{column_name}' in row group {row_group_idx}"
+                    ))
+                })?;
+
+                if min != max {
+                    return Err(QueueError::Metadata(format!(
+                        "row group {row_group_idx} contains multiple values for '{column_name}'"
+                    )));
+                }
+
+                let value = std::str::from_utf8(min).map_err(|e| {
+                    QueueError::Metadata(format!(
+                        "invalid utf8 in '{column_name}' stats for row group {row_group_idx}: {e}"
+                    ))
+                })?;
+
+                if value.is_empty() {
+                    return Err(QueueError::Metadata(format!(
+                        "empty value in stats for '{column_name}' row group {row_group_idx}"
+                    )));
+                }
+
+                Ok(value.to_string())
+            }
+            _ => Err(QueueError::Metadata(format!(
+                "unsupported stats type for '{column_name}' in row group {row_group_idx}"
+            ))),
+        }
+    }
 }
 
-fn group_key_from_row_group(
-    row_group: &parquet::file::metadata::RowGroupMetaData,
-    column_idx: usize,
-    column_name: &str,
-    row_group_idx: usize,
-) -> Result<String> {
-    let column = row_group.column(column_idx);
-    let stats = column.statistics().ok_or_else(|| {
-        QueueError::Metadata(format!(
-            "missing statistics for '{column_name}' in row group {row_group_idx}"
-        ))
-    })?;
+#[async_trait]
+impl QueueReader for ParquetQueueReader {
+    async fn plan_segments(
+        &self,
+        topic: &Topic,
+        start_offset: u64,
+        group_by_column_name: &str,
+        max_record_batches_per_task: usize,
+        cancel_token: &CancellationToken,
+    ) -> Result<SegmentsPlan> {
+        ParquetQueueReader::plan_segments(
+            self,
+            topic,
+            start_offset,
+            group_by_column_name,
+            max_record_batches_per_task,
+            cancel_token,
+        )
+        .await
+    }
 
-    match stats {
-        Statistics::ByteArray(byte_stats) => {
-            let min = byte_stats.min_bytes_opt().ok_or_else(|| {
-                QueueError::Metadata(format!(
-                    "missing min statistic for '{column_name}' in row group {row_group_idx}"
-                ))
-            })?;
-            let max = byte_stats.max_bytes_opt().ok_or_else(|| {
-                QueueError::Metadata(format!(
-                    "missing max statistic for '{column_name}' in row group {row_group_idx}"
-                ))
-            })?;
-
-            if min != max {
-                return Err(QueueError::Metadata(format!(
-                    "row group {row_group_idx} contains multiple values for '{column_name}'"
-                )));
-            }
-
-            let value = std::str::from_utf8(min).map_err(|e| {
-                QueueError::Metadata(format!(
-                    "invalid utf8 in '{column_name}' stats for row group {row_group_idx}: {e}"
-                ))
-            })?;
-
-            if value.is_empty() {
-                return Err(QueueError::Metadata(format!(
-                    "empty value in stats for '{column_name}' row group {row_group_idx}"
-                )));
-            }
-
-            Ok(value.to_string())
-        }
-        _ => Err(QueueError::Metadata(format!(
-            "unsupported stats type for '{column_name}' in row group {row_group_idx}"
-        ))),
+    async fn read_segment(
+        &self,
+        topic: &Topic,
+        offset: u64,
+        record_batch_idxs: &[usize],
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<RecordBatch>> {
+        ParquetQueueReader::read_segment(self, topic, offset, record_batch_idxs, cancel_token).await
     }
 }

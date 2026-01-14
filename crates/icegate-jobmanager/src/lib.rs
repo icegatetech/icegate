@@ -38,6 +38,7 @@ pub use crate::infra::retrier::RetrierConfig;
 pub use crate::storage::JobDefinitionRegistry;
 pub use crate::storage::cached::CachedStorage;
 pub use crate::storage::s3::S3Storage;
+pub use crate::storage::in_memory::InMemoryStorage;
 
 // Integration tests
 #[cfg(test)]

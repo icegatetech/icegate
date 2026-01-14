@@ -26,6 +26,7 @@ icegate-common = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "fs"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
+async-trait = "0.1"
 
 # Serialization for metadata
 serde = { workspace = true }
