@@ -409,6 +409,42 @@ pub trait LogQLParserBaseListener<'input>:
      * Enter a parse tree produced by \{@link LogQLParserBaseParser#s}.
      * @param ctx the parse tree
      */
+    fn enter_dropkeeplist(&mut self, _ctx: &DropKeepListContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_dropkeeplist(&mut self, _ctx: &DropKeepListContext<'input>) {}
+
+
+    /**
+     * Enter a parse tree produced by \{@link LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn enter_dropkeepmatcher(&mut self, _ctx: &DropKeepMatcherContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_dropkeepmatcher(&mut self, _ctx: &DropKeepMatcherContext<'input>) {}
+
+
+    /**
+     * Enter a parse tree produced by \{@link LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn enter_dropkeepsimple(&mut self, _ctx: &DropKeepSimpleContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_dropkeepsimple(&mut self, _ctx: &DropKeepSimpleContext<'input>) {}
+
+
+    /**
+     * Enter a parse tree produced by \{@link LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
     fn enter_jsonparser(&mut self, _ctx: &JsonParserContext<'input>) {}
     /**
      * Exit a parse tree produced by \{@link  LogQLParserBaseParser#s}.

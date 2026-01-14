@@ -161,15 +161,24 @@ decolorizeExpr
  *------------------------------------------------------------------
 */
 // https://clickhouse.com/docs/sql-reference/statements/select#dynamic-column-selection
-// TODO: Loki supports all matchers (=, !=, =~, !~) for drop/keep expressions
+// Drop and keep now support matchers (=, !=, =~, !~) in addition to simple names
 // Example: drop level, method="GET", app=~"api.*", err!=""
-// Current grammar only supports simple names and = matcher via labelExtractionExpr
 dropExpr
-    : DROP labelExtractions
+    : DROP dropKeepList
     ;
 
 keepExpr
-    : KEEP labelExtractions
+    : KEEP dropKeepList
+    ;
+
+// Drop/keep list supports both simple names and matcher expressions
+dropKeepList
+    : dropKeepItem (COMMA dropKeepItem)*
+    ;
+
+dropKeepItem
+    : matcher      #dropKeepMatcher    // Matcher: level="debug", level=~".*"
+    | ATTRIBUTE    #dropKeepSimple     // Simple name: level
     ;
 
 // JSON parser - extracts fields from JSON logs

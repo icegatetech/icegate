@@ -112,6 +112,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Date and time
 chrono = { version = "0.4", features = ["serde"] }
 
+# Regex for matcher evaluation
+regex = "1.12"
+
 # Utilities
 itoa = "1"
 bytes = "1"

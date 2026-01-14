@@ -368,6 +368,40 @@ fn enter_keepExpr(&mut self, _ctx: &KeepExprContext<'input>) { }
  */
 fn exit_keepExpr(&mut self, _ctx: &KeepExprContext<'input>) { }
 /**
+ * Enter a parse tree produced by {@link LogQLParser#dropKeepList}.
+ * @param ctx the parse tree
+ */
+fn enter_dropKeepList(&mut self, _ctx: &DropKeepListContext<'input>) { }
+/**
+ * Exit a parse tree produced by {@link LogQLParser#dropKeepList}.
+ * @param ctx the parse tree
+ */
+fn exit_dropKeepList(&mut self, _ctx: &DropKeepListContext<'input>) { }
+/**
+ * Enter a parse tree produced by the {@code dropKeepMatcher}
+ * labeled alternative in {@link LogQLParser#dropKeepItem}.
+ * @param ctx the parse tree
+ */
+fn enter_dropKeepMatcher(&mut self, _ctx: &DropKeepMatcherContext<'input>) { }
+/**
+ * Exit a parse tree produced by the {@code dropKeepMatcher}
+ * labeled alternative in {@link LogQLParser#dropKeepItem}.
+ * @param ctx the parse tree
+ */
+fn exit_dropKeepMatcher(&mut self, _ctx: &DropKeepMatcherContext<'input>) { }
+/**
+ * Enter a parse tree produced by the {@code dropKeepSimple}
+ * labeled alternative in {@link LogQLParser#dropKeepItem}.
+ * @param ctx the parse tree
+ */
+fn enter_dropKeepSimple(&mut self, _ctx: &DropKeepSimpleContext<'input>) { }
+/**
+ * Exit a parse tree produced by the {@code dropKeepSimple}
+ * labeled alternative in {@link LogQLParser#dropKeepItem}.
+ * @param ctx the parse tree
+ */
+fn exit_dropKeepSimple(&mut self, _ctx: &DropKeepSimpleContext<'input>) { }
+/**
  * Enter a parse tree produced by {@link LogQLParser#jsonParser}.
  * @param ctx the parse tree
  */

@@ -26,7 +26,7 @@ use icegate_common::{
 use crate::logql::{
     common::MatchOp,
     expr::LogQLExpr,
-    log::{LabelMatcher, LineFilter, LogExpr, PipelineStage, Selector},
+    log::{DropKeepLabel, LabelMatcher, LineFilter, LogExpr, PipelineStage, Selector},
     metric::MetricExpr,
     planner::{DEFAULT_LOG_LIMIT, Planner, QueryContext, SortDirection},
 };
@@ -1389,4 +1389,268 @@ async fn test_unwrap_coalesce_null_to_zero() {
         plan_str.contains("coalesce"),
         "Plan should use coalesce to replace NULL with 0.0 for aggregation"
     );
+}
+
+// ============================================================================
+// Drop/Keep Pipeline Stage Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_drop_with_equals_matcher() {
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![]);
+    let mut log_expr = LogExpr::new(selector);
+
+    // Create: drop level="debug"
+    let matcher = LabelMatcher::new("level", MatchOp::Eq, "debug");
+    log_expr
+        .pipeline
+        .push(PipelineStage::Drop(vec![DropKeepLabel::with_matcher(matcher)]));
+
+    let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
+    let plan = get_logical_plan(&df);
+    let plan_str = format!("{plan:?}").to_lowercase();
+
+    // Verify map_drop_keys UDF is used
+    assert!(
+        plan_str.contains("mapdropkeys"),
+        "Plan should use map_drop_keys UDF for drop operation"
+    );
+
+    // Verify the plan contains the key "level"
+    assert!(plan_str.contains("level"), "Plan should contain the label 'level'");
+
+    // Verify the plan contains the value "debug"
+    assert!(plan_str.contains("debug"), "Plan should contain the value 'debug'");
+}
+
+#[tokio::test]
+async fn test_drop_with_regex_matcher() {
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![]);
+    let mut log_expr = LogExpr::new(selector);
+
+    // Create: drop level=~"debug|info"
+    let matcher = LabelMatcher::new("level", MatchOp::Re, "debug|info");
+    log_expr
+        .pipeline
+        .push(PipelineStage::Drop(vec![DropKeepLabel::with_matcher(matcher)]));
+
+    let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
+    let plan = get_logical_plan(&df);
+    let plan_str = format!("{plan:?}").to_lowercase();
+
+    // Verify map_drop_keys UDF is used
+    assert!(
+        plan_str.contains("mapdropkeys"),
+        "Plan should use map_drop_keys UDF for drop operation"
+    );
+
+    // Verify the plan contains the regex pattern
+    assert!(
+        plan_str.contains("debug|info"),
+        "Plan should contain the regex pattern 'debug|info'"
+    );
+
+    // Verify the plan contains the =~ operator
+    assert!(
+        plan_str.contains("=~"),
+        "Plan should contain the regex match operator '=~'"
+    );
+}
+
+#[tokio::test]
+async fn test_drop_mixed_simple_and_matchers() {
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![]);
+    let mut log_expr = LogExpr::new(selector);
+
+    // Create: drop method, level="debug"
+    let matcher = LabelMatcher::new("level", MatchOp::Eq, "debug");
+    log_expr.pipeline.push(PipelineStage::Drop(vec![
+        DropKeepLabel::new("method"),         // Simple name
+        DropKeepLabel::with_matcher(matcher), // With matcher
+    ]));
+
+    let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
+    let plan = get_logical_plan(&df);
+    let plan_str = format!("{plan:?}").to_lowercase();
+
+    // Verify map_drop_keys UDF is used
+    assert!(
+        plan_str.contains("mapdropkeys"),
+        "Plan should use map_drop_keys UDF for drop operation"
+    );
+
+    // Verify both keys are present
+    assert!(plan_str.contains("method"), "Plan should contain the label 'method'");
+    assert!(plan_str.contains("level"), "Plan should contain the label 'level'");
+
+    // Verify the matcher value is present
+    assert!(plan_str.contains("debug"), "Plan should contain the value 'debug'");
+}
+
+#[tokio::test]
+async fn test_keep_with_equals_matcher() {
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![]);
+    let mut log_expr = LogExpr::new(selector);
+
+    // Create: keep level="info"
+    let matcher = LabelMatcher::new("level", MatchOp::Eq, "info");
+    log_expr
+        .pipeline
+        .push(PipelineStage::Keep(vec![DropKeepLabel::with_matcher(matcher)]));
+
+    let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
+    let plan = get_logical_plan(&df);
+    let plan_str = format!("{plan:?}").to_lowercase();
+
+    // Verify map_keep_keys UDF is used
+    assert!(
+        plan_str.contains("mapkeepkeys"),
+        "Plan should use map_keep_keys UDF for keep operation"
+    );
+
+    // Verify the plan contains the key "level"
+    assert!(plan_str.contains("level"), "Plan should contain the label 'level'");
+
+    // Verify the plan contains the value "info"
+    assert!(plan_str.contains("info"), "Plan should contain the value 'info'");
+}
+
+#[tokio::test]
+async fn test_keep_with_not_equals_matcher() {
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![]);
+    let mut log_expr = LogExpr::new(selector);
+
+    // Create: keep level!="error"
+    let matcher = LabelMatcher::new("level", MatchOp::Neq, "error");
+    log_expr
+        .pipeline
+        .push(PipelineStage::Keep(vec![DropKeepLabel::with_matcher(matcher)]));
+
+    let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
+    let plan = get_logical_plan(&df);
+    let plan_str = format!("{plan:?}").to_lowercase();
+
+    // Verify map_keep_keys UDF is used
+    assert!(
+        plan_str.contains("mapkeepkeys"),
+        "Plan should use map_keep_keys UDF for keep operation"
+    );
+
+    // Verify the plan contains the key "level"
+    assert!(plan_str.contains("level"), "Plan should contain the label 'level'");
+
+    // Verify the plan contains the value "error"
+    assert!(plan_str.contains("error"), "Plan should contain the value 'error'");
+
+    // Verify the plan contains the != operator
+    assert!(
+        plan_str.contains("!="),
+        "Plan should contain the not-equals operator '!='"
+    );
+}
+
+#[tokio::test]
+async fn test_keep_mixed_simple_and_matchers() {
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![]);
+    let mut log_expr = LogExpr::new(selector);
+
+    // Create: keep level, service="api"
+    let matcher = LabelMatcher::new("service", MatchOp::Eq, "api");
+    log_expr.pipeline.push(PipelineStage::Keep(vec![
+        DropKeepLabel::new("level"),          // Simple name
+        DropKeepLabel::with_matcher(matcher), // With matcher
+    ]));
+
+    let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
+    let plan = get_logical_plan(&df);
+    let plan_str = format!("{plan:?}").to_lowercase();
+
+    // Verify map_keep_keys UDF is used
+    assert!(
+        plan_str.contains("mapkeepkeys"),
+        "Plan should use map_keep_keys UDF for keep operation"
+    );
+
+    // Verify both keys are present
+    assert!(plan_str.contains("level"), "Plan should contain the label 'level'");
+    assert!(plan_str.contains("service"), "Plan should contain the label 'service'");
+
+    // Verify the matcher value is present
+    assert!(plan_str.contains("api"), "Plan should contain the value 'api'");
+}
+
+#[tokio::test]
+async fn test_drop_simple_names_backward_compat() {
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![]);
+    let mut log_expr = LogExpr::new(selector);
+
+    // Create: drop method, level (simple names only - backward compatibility test)
+    log_expr.pipeline.push(PipelineStage::Drop(vec![
+        DropKeepLabel::new("method"),
+        DropKeepLabel::new("level"),
+    ]));
+
+    let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
+    let plan = get_logical_plan(&df);
+    let plan_str = format!("{plan:?}").to_lowercase();
+
+    // Verify map_drop_keys UDF is used
+    assert!(
+        plan_str.contains("mapdropkeys"),
+        "Plan should use map_drop_keys UDF for drop operation"
+    );
+
+    // Verify both keys are present
+    assert!(plan_str.contains("method"), "Plan should contain the label 'method'");
+    assert!(plan_str.contains("level"), "Plan should contain the label 'level'");
+}
+
+#[tokio::test]
+async fn test_keep_simple_names_backward_compat() {
+    let (session_ctx, query_ctx) = create_test_context().await;
+    let planner = DataFusionPlanner::new(session_ctx, query_ctx);
+
+    let selector = Selector::new(vec![]);
+    let mut log_expr = LogExpr::new(selector);
+
+    // Create: keep service, app (simple names only - backward compatibility test)
+    log_expr.pipeline.push(PipelineStage::Keep(vec![
+        DropKeepLabel::new("service"),
+        DropKeepLabel::new("app"),
+    ]));
+
+    let df = planner.plan(LogQLExpr::Log(log_expr)).await.expect("Planning failed");
+    let plan = get_logical_plan(&df);
+    let plan_str = format!("{plan:?}").to_lowercase();
+
+    // Verify map_keep_keys UDF is used
+    assert!(
+        plan_str.contains("mapkeepkeys"),
+        "Plan should use map_keep_keys UDF for keep operation"
+    );
+
+    // Verify both keys are present
+    assert!(plan_str.contains("service"), "Plan should contain the label 'service'");
+    assert!(plan_str.contains("app"), "Plan should contain the label 'app'");
 }

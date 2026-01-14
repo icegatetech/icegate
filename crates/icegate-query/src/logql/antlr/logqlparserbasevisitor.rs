@@ -174,6 +174,21 @@ pub trait LogQLParserBaseVisitor<'input>:
             self.visit_children(ctx)
         }
 
+	// Visit a parse tree produced by LogQLParser#dropKeepList.
+	fn visit_dropkeeplist(&mut self, ctx: &DropKeepListContext<'input>) {
+            self.visit_children(ctx)
+        }
+
+	// Visit a parse tree produced by LogQLParser#dropKeepMatcher.
+	fn visit_dropkeepmatcher(&mut self, ctx: &DropKeepMatcherContext<'input>) {
+            self.visit_children(ctx)
+        }
+
+	// Visit a parse tree produced by LogQLParser#dropKeepSimple.
+	fn visit_dropkeepsimple(&mut self, ctx: &DropKeepSimpleContext<'input>) {
+            self.visit_children(ctx)
+        }
+
 	// Visit a parse tree produced by LogQLParser#jsonParser.
 	fn visit_jsonparser(&mut self, ctx: &JsonParserContext<'input>) {
             self.visit_children(ctx)

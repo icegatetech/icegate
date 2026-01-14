@@ -81,7 +81,7 @@ impl GroupingLabel {
     }
 }
 
-/// Label extraction specification for parsers and drop/keep operations.
+/// Label extraction specification for parsers (json, logfmt, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelExtraction {
     /// The label name to extract to
