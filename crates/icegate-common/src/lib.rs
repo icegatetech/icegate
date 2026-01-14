@@ -27,10 +27,6 @@ pub const METRICS_TABLE_FQN: &str = "iceberg.icegate.metrics";
 /// Default tenant ID when not provided in request metadata.
 pub const DEFAULT_TENANT_ID: &str = "default";
 
-/// Default account ID when not provided in resource attributes.
-/// Required because `cloud_account_id` is a partition column.
-pub const DEFAULT_ACCOUNT_ID: &str = "default";
-
 /// Topic name for logs in the WAL queue.
 pub const LOGS_TOPIC: &str = "logs";
 

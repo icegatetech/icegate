@@ -56,7 +56,7 @@ pub async fn ingest_logs(
     let tenant_id = None;
 
     // Transform OTLP logs to Arrow RecordBatch
-    let Some(batch) = transform::logs_to_record_batch(&export_request, tenant_id) else {
+    let Some(batch) = transform::logs_to_record_batch(&export_request, tenant_id)? else {
         // No records to process - return success with 0 rejected
         return Ok(Json(ExportLogsResponse::default()));
     };

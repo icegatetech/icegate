@@ -13,10 +13,7 @@ use std::{
 };
 
 use datafusion::arrow::{
-    array::{
-        ArrayRef, FixedSizeBinaryBuilder, Int32Array, MapBuilder, MapFieldNames, RecordBatch, StringArray,
-        StringBuilder, TimestampMicrosecondArray,
-    },
+    array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray},
     datatypes::DataType,
 };
 use datafusion::parquet::file::properties::WriterProperties;
@@ -50,7 +47,7 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
         "test-tenant",
         "test-tenant",
     ]));
-    let account_id: ArrayRef = Arc::new(StringArray::from(vec![
+    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![
         Some("acc-1"),
         Some("acc-1"),
         Some("acc-1"),
@@ -81,7 +78,6 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
     let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
         now_micros, now_micros, now_micros, now_micros, now_micros,
     ]));
-    let severity_number: ArrayRef = Arc::new(Int32Array::from(vec![Some(9), Some(9), Some(9), Some(9), Some(9)]));
     let severity_text: ArrayRef = Arc::new(StringArray::from(vec![
         Some("INFO"),
         Some("INFO"),
@@ -96,14 +92,12 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
         Some("Request processed"),
         Some("Request processed"),
     ]));
-    let flags: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>, None, None, None, None]));
-    let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![0, 0, 0, 0, 0]));
 
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(11);
+    let attributes_field = arrow_schema.field(10);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -158,15 +152,23 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
 
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    for i in 0..5 {
-        trace_id_builder.append_value([i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i])?;
+    let mut trace_id_builder = StringBuilder::new();
+    // Hex-encoded trace IDs (16 bytes → 32 hex chars)
+    for i in 0u8..5 {
+        trace_id_builder.append_value(format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i
+        ));
     }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
-    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
-    for i in 0..5_u8 {
-        span_id_builder.append_value([i, i, i, i, i, i, i, i])?;
+    let mut span_id_builder = StringBuilder::new();
+    // Hex-encoded span IDs (8 bytes → 16 hex chars)
+    for i in 0u8..5 {
+        span_id_builder.append_value(format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            i, i, i, i, i, i, i, i
+        ));
     }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
@@ -174,19 +176,16 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
         arrow_schema.clone(),
         vec![
             tenant_id,
-            account_id,
+            cloud_account_id,
             service_name,
             timestamp,
             observed_timestamp,
             ingested_timestamp,
             trace_id,
             span_id,
-            severity_number,
             severity_text,
             body,
             attributes,
-            flags,
-            dropped_attributes_count,
         ],
     )
     .map_err(Into::into)
