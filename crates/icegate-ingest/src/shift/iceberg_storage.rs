@@ -130,7 +130,7 @@ impl IcebergStorage {
             });
         }
 
-        tracing::info!("Start writting parquet file. Batches: {}", batches.len());
+        tracing::info!("Start writing parquet file. Batches: {}", batches.len());
         let queue_schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
         let table = self.load_table(cancel_token).await?;
