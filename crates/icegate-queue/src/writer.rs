@@ -409,7 +409,11 @@ impl QueueWriter {
     ///
     /// Uses `If-None-Match: *` for atomic write (fails if file exists).
     async fn try_write(&self, segment_id: &SegmentId, data: Bytes) -> Result<()> {
-        let full_path = Path::from(format!("{}/{}", self.config.base_path, segment_id.to_relative_path()));
+        let full_path = if self.config.base_path.is_empty() {
+            segment_id.to_relative_path()
+        } else {
+            Path::from(format!("{}/{}", self.config.base_path, segment_id.to_relative_path()))
+        };
 
         let opts = PutOptions {
             mode: PutMode::Create, // If-None-Match: *

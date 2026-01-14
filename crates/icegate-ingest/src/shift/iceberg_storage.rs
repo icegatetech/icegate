@@ -50,7 +50,7 @@ pub struct WrittenDataFiles {
 pub struct IcebergStorage {
     loader: TableLoader,
     row_group_size: usize,
-    max_file_size_bytes: usize,
+    max_file_size_mb: usize,
     retrier: Retrier,
 }
 
@@ -61,7 +61,7 @@ impl IcebergStorage {
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,
-            max_file_size_bytes: shift_config.write.max_file_size_mb,
+            max_file_size_mb: shift_config.write.max_file_size_mb,
             retrier: Retrier::new(RetrierConfig::default()),
         }
     }
@@ -155,7 +155,7 @@ impl IcebergStorage {
 
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
-            self.max_file_size_bytes,
+            self.max_file_size_mb * 1024 * 1024,
             table.file_io().clone(),
             location_generator,
             file_name_generator,
@@ -198,7 +198,7 @@ impl IcebergStorage {
             .map_err(|e| IngestError::Shift(format!("failed to close fanout writer: {e}")))?;
 
         tracing::info!(
-            "Complite write {} parquet files for {} partitions",
+            "Complete write {} parquet files for {} partitions",
             data_files.len(),
             partitioned_batches_len
         );

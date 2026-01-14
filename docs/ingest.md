@@ -7,7 +7,7 @@ Data flow: Client -> Ingestor -> WAL -> Shifter (multiple tasks) -> Iceberg.
 
 ## Core rules
 - each Ingest request is appended to a single WAL file.
-- Shifter create one task per tenant (partition).
+- Shifter creates one task per tenant (partition).
 - Each task produces one Parquet file for its tenant (partition).
 - A task reads only WAL files that contain data for its tenant (partition).
 

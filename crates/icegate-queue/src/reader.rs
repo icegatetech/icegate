@@ -30,7 +30,7 @@ use crate::{
 // `SegmentsPlan`
 //   groups: [`GroupedSegmentsPlan`]
 //   row_groups_total: usize
-//     segments: [`SegmentRecordBatcheIdxs`]
+//     segments: [`SegmentRecordBatchIdxs`]
 //     row_groups_total: usize
 //       `record_batch_idxs`: [usize]
 
@@ -53,7 +53,7 @@ pub struct GroupedSegmentsPlan {
     /// Grouping key from the requested column.
     pub group_col_val: String,
     /// WAL segment references for the group.
-    pub segments: Vec<SegmentRecordBatcheIdxs>,
+    pub segments: Vec<SegmentRecordBatchIdxs>,
     /// Number of segments in the group.
     pub segments_count: usize,
     /// Total number of row groups in the grouped segments.
@@ -62,7 +62,7 @@ pub struct GroupedSegmentsPlan {
 
 /// Record batches indexes (row group) in segment (WAL file).
 #[derive(Debug, Clone)]
-pub struct SegmentRecordBatcheIdxs {
+pub struct SegmentRecordBatchIdxs {
     /// WAL segment offset.
     pub segment_offset: u64,
     /// Row group indices inside the segment.
@@ -94,13 +94,13 @@ impl RowGroupsInSegments {
         Ok(())
     }
 
-    fn take(&mut self) -> (Vec<SegmentRecordBatcheIdxs>, usize) {
+    fn take(&mut self) -> (Vec<SegmentRecordBatchIdxs>, usize) {
         let row_group_count = self.row_group_count;
         self.row_group_count = 0;
         let segments = std::mem::take(&mut self.segments);
         let segments = segments
             .into_iter()
-            .map(|(offset, row_groups)| SegmentRecordBatcheIdxs {
+            .map(|(offset, row_groups)| SegmentRecordBatchIdxs {
                 segment_offset: offset,
                 record_batch_idxs: row_groups,
             })
