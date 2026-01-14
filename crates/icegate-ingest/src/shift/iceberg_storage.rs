@@ -77,7 +77,13 @@ impl IcebergStorage {
     /// Returns the last committed WAL offset from the Iceberg snapshot summary.
     pub async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
         let table = self.load_table_fresh(cancel_token).await?;
-        Ok(get_committed_offset(&table))
+        Ok(table.metadata().current_snapshot().and_then(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get(OFFSET_SUMMARY_KEY)
+                .and_then(|v| v.parse::<u64>().ok())
+        }))
     }
 
     /// Builds Iceberg data files from parquet file paths by reading parquet metadata.
@@ -309,20 +315,6 @@ impl IcebergStorage {
             Err(err) => Err(err),
         }
     }
-}
-
-/// Retrieves the last committed offset from the current snapshot's summary.
-///
-/// Returns `None` if no snapshot exists or no offset has been committed yet.
-#[must_use]
-fn get_committed_offset(table: &Table) -> Option<u64> {
-    table.metadata().current_snapshot().and_then(|snapshot| {
-        snapshot
-            .summary()
-            .additional_properties
-            .get(OFFSET_SUMMARY_KEY)
-            .and_then(|v| v.parse::<u64>().ok())
-    })
 }
 
 /// Sorts a record batch by the table's sort order.
