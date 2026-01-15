@@ -471,7 +471,7 @@ impl QueueReader {
                     async move {
                         match fut.await {
                             Ok(value) => Ok((false, Ok(value))),
-                            Err(err) => Ok((true, Err(err))),
+                            Err(err) => Ok((err.is_retryable(), Err(err))),
                         }
                     }
                 },
