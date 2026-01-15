@@ -52,4 +52,4 @@ pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
 pub use reader::{GroupedSegmentsPlan, ParquetQueueReader, QueueReader, SegmentRecordBatchIdxs, SegmentsPlan};
 pub use segment::SegmentId;
-pub use writer::QueueWriter;
+pub use writer::{NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome};

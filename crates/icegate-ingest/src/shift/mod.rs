@@ -1,21 +1,28 @@
 //! Shift operations: moving data from WAL to Iceberg.
 
+/// Commit task runner for shift operations.
+pub mod commit_runner;
 /// Configuration for shift operations.
 pub mod config;
 /// Task executors for shift operations.
 pub mod executor;
 /// Iceberg writer utilities for shift operations.
 pub mod iceberg_storage;
+/// Metrics and instrumentation helpers for shift operations.
+pub mod instrumentation;
 /// Parquet metadata reader utilities for shift operations.
 pub mod parquet_meta_reader;
-#[cfg(test)]
-mod pipeline_tests;
+/// Plan task runner for shift operations.
+pub mod plan_runner;
+/// Shift task runner for shift operations.
+pub mod shift_runner;
 /// Task timeout estimation utilities.
 mod timeout;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
+use commit_runner::CommitTaskRunnerImpl;
 pub use config::ShiftConfig;
 pub use executor::{
     COMMIT_TASK_CODE, CommitInput, Executor, PLAN_TASK_CODE, SHIFT_TASK_CODE, SegmentToRead, ShiftInput, ShiftOutput,
@@ -28,10 +35,19 @@ use icegate_jobmanager::{
     TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
 };
 use icegate_queue::ParquetQueueReader;
+use instrumentation::{
+    CommitTaskRunnerWithMetrics, PlanTaskRunnerWithMetrics, QueueReaderWithMetrics, ShiftTaskRunnerWithMetrics,
+    StorageWithMetrics,
+};
 pub use parquet_meta_reader::data_files_from_parquet_paths;
+use plan_runner::PlanTaskRunnerImpl;
+use shift_runner::ShiftTaskRunnerImpl;
 use timeout::TimeoutEstimator;
 
-use crate::error::{IngestError, Result};
+use crate::{
+    error::{IngestError, Result},
+    infra::metrics::ShiftMetrics,
+};
 
 /// Runs shift jobs inside the ingest process.
 pub struct Shifter {
@@ -50,6 +66,7 @@ impl Shifter {
         queue_reader: Arc<ParquetQueueReader>,
         shift_config: Arc<ShiftConfig>,
         jobs_storage: S3StorageConfig,
+        shift_metrics: ShiftMetrics,
     ) -> Result<Self> {
         shift_config.validate()?;
         let storage = Arc::new(IcebergStorage::new(
@@ -59,13 +76,40 @@ impl Shifter {
         ));
         let timeouts = TimeoutEstimator::new(&shift_config.timeouts)?;
         let plan_timeout = timeouts.plan_timeout();
-        let executor = Arc::new(Executor::new(
-            queue_reader,
+        let queue_reader = Arc::new(QueueReaderWithMetrics::new(queue_reader, shift_metrics.clone()));
+        let plan_runner = Arc::new(PlanTaskRunnerImpl::new(
+            Arc::clone(&queue_reader),
+            Arc::clone(&storage),
             shift_config.clone(),
-            storage,
             timeouts,
             LOGS_TOPIC,
         ));
+        let plan_runner = Arc::new(PlanTaskRunnerWithMetrics::new(
+            plan_runner,
+            shift_metrics.clone(),
+            LOGS_TOPIC,
+        ));
+
+        let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), LOGS_TOPIC));
+        let shift_storage_for_runner = Arc::clone(&shift_storage);
+        let shift_runner = Arc::new(ShiftTaskRunnerImpl::new(
+            queue_reader,
+            shift_storage_for_runner,
+            LOGS_TOPIC,
+        ));
+        let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(
+            shift_runner,
+            shift_metrics.clone(),
+            LOGS_TOPIC,
+        ));
+        let commit_runner = Arc::new(CommitTaskRunnerImpl::new(Arc::clone(&shift_storage), LOGS_TOPIC));
+        let commit_runner = Arc::new(CommitTaskRunnerWithMetrics::new(
+            commit_runner,
+            shift_metrics,
+            LOGS_TOPIC,
+        ));
+
+        let executor = Arc::new(Executor::new(plan_runner, shift_runner, commit_runner));
 
         let initial_task =
             TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), vec![], plan_timeout).map_err(map_shift_error)?;

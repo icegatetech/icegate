@@ -114,7 +114,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - Follow the Arrange-Act-Assert pattern
 - Do not commit commented-out tests
 - Use `#[cfg(test)]` modules for test code
-- Never check the error text in tests, only the types.
+- Never check the error text in tests, only the error types.
 
 ## Imports and Dependencies
 

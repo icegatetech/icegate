@@ -55,6 +55,8 @@ axum = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 opentelemetry-proto = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -65,7 +67,3 @@ clap = { workspace = true }
 
 # Async utils
 async-trait = "0.1"
-
-[dev-dependencies]
-mockall = "0.13"
-tempfile = { workspace = true }

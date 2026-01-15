@@ -12,6 +12,12 @@ pub struct InMemoryStorage {
     get_by_meta_calls: AtomicU64,
 }
 
+impl Default for InMemoryStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self {

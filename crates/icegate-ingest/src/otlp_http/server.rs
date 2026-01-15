@@ -6,12 +6,15 @@ use icegate_queue::WriteChannel;
 use tokio_util::sync::CancellationToken;
 
 use super::OtlpHttpConfig;
+use crate::infra::metrics::OtlpMetrics;
 
 /// Shared application state for OTLP HTTP server
 #[derive(Clone)]
 pub struct OtlpHttpState {
     /// Write channel for sending batches to the WAL queue.
     pub write_channel: WriteChannel,
+    /// Metrics recorder for OTLP intake.
+    pub metrics: OtlpMetrics,
 }
 
 /// Run the OTLP HTTP server
@@ -21,12 +24,13 @@ pub struct OtlpHttpState {
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
     write_channel: WriteChannel,
+    metrics: OtlpMetrics,
     config: OtlpHttpConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = OtlpHttpState { write_channel };
+    let state = OtlpHttpState { write_channel, metrics };
 
     let app = super::routes::routes(state);
 

@@ -34,8 +34,8 @@ serde_json = { workspace = true }
 ciborium = "0.2"
 
 # Metrics
-opentelemetry = { version = "0.31.0", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31.0", features = ["metrics"] }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 
 # Utilities

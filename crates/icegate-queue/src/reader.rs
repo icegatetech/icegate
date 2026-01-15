@@ -509,51 +509,50 @@ impl ParquetQueueReader {
             Err(err) => Err(err),
         }
     }
-}
 
-fn group_key_from_row_group(
-    row_group: &parquet::file::metadata::RowGroupMetaData,
-    column_idx: usize,
-    column_name: &str,
-    row_group_idx: usize,
-) -> Result<String> {
-    let column = row_group.column(column_idx);
-    let stats = column.statistics().ok_or_else(|| {
-        QueueError::Metadata(format!(
-            "missing statistics for '{column_name}' in row group {row_group_idx}"
-        ))
-    })?;
+    fn group_key_from_row_group(
+        row_group: &parquet::file::metadata::RowGroupMetaData,
+        column_idx: usize,
+        column_name: &str,
+        row_group_idx: usize,
+    ) -> Result<String> {
+        let column = row_group.column(column_idx);
+        let stats = column.statistics().ok_or_else(|| {
+            QueueError::Metadata(format!(
+                "missing statistics for '{column_name}' in row group {row_group_idx}"
+            ))
+        })?;
 
-    match stats {
-        Statistics::ByteArray(byte_stats) => {
-            let min = byte_stats.min_bytes_opt().ok_or_else(|| {
-                QueueError::Metadata(format!(
-                    "missing min statistic for '{column_name}' in row group {row_group_idx}"
-                ))
-            })?;
-            let max = byte_stats.max_bytes_opt().ok_or_else(|| {
-                QueueError::Metadata(format!(
-                    "missing max statistic for '{column_name}' in row group {row_group_idx}"
-                ))
-            })?;
+        match stats {
+            Statistics::ByteArray(byte_stats) => {
+                let min = byte_stats.min_bytes_opt().ok_or_else(|| {
+                    QueueError::Metadata(format!(
+                        "missing min statistic for '{column_name}' in row group {row_group_idx}"
+                    ))
+                })?;
+                let max = byte_stats.max_bytes_opt().ok_or_else(|| {
+                    QueueError::Metadata(format!(
+                        "missing max statistic for '{column_name}' in row group {row_group_idx}"
+                    ))
+                })?;
 
-            if min != max {
-                return Err(QueueError::Metadata(format!(
-                    "row group {row_group_idx} contains multiple values for '{column_name}'"
-                )));
-            }
+                if min != max {
+                    return Err(QueueError::Metadata(format!(
+                        "row group {row_group_idx} contains multiple values for '{column_name}'"
+                    )));
+                }
 
-            let value = std::str::from_utf8(min).map_err(|e| {
-                QueueError::Metadata(format!(
-                    "invalid utf8 in '{column_name}' stats for row group {row_group_idx}: {e}"
-                ))
-            })?;
+                let value = std::str::from_utf8(min).map_err(|e| {
+                    QueueError::Metadata(format!(
+                        "invalid utf8 in '{column_name}' stats for row group {row_group_idx}: {e}"
+                    ))
+                })?;
 
-            if value.is_empty() {
-                return Err(QueueError::Metadata(format!(
-                    "empty value in stats for '{column_name}' row group {row_group_idx}"
-                )));
-            }
+                if value.is_empty() {
+                    return Err(QueueError::Metadata(format!(
+                        "empty value in stats for '{column_name}' row group {row_group_idx}"
+                    )));
+                }
 
                 Ok(value.to_string())
             }
@@ -574,7 +573,7 @@ impl QueueReader for ParquetQueueReader {
         max_record_batches_per_task: usize,
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan> {
-        ParquetQueueReader::plan_segments(
+        Self::plan_segments(
             self,
             topic,
             start_offset,
@@ -592,6 +591,6 @@ impl QueueReader for ParquetQueueReader {
         record_batch_idxs: &[usize],
         cancel_token: &CancellationToken,
     ) -> Result<Vec<RecordBatch>> {
-        ParquetQueueReader::read_segment(self, topic, offset, record_batch_idxs, cancel_token).await
+        Self::read_segment(self, topic, offset, record_batch_idxs, cancel_token).await
     }
 }

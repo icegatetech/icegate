@@ -1,5 +1,7 @@
 //! OTLP HTTP request handlers
 
+use std::time::Instant;
+
 use axum::{
     Json,
     body::Bytes,
@@ -21,13 +23,19 @@ use super::{
     },
     server::OtlpHttpState,
 };
-use crate::{error::IngestError, transform};
+use crate::{error::IngestError, infra::metrics::OtlpRequestRecorder, transform};
 
 /// Content type for protobuf.
 const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
 
 /// Content type for JSON.
 const CONTENT_TYPE_JSON: &str = "application/json";
+
+const SIGNAL_LOGS: &str = "logs";
+const PROTOCOL_HTTP: &str = "http";
+const WAL_REASON_CHANNEL_CLOSED: &str = "channel_closed";
+const STATUS_OK: &str = "ok";
+const STATUS_ERROR: &str = "error";
 
 /// Handle OTLP logs ingestion.
 ///
@@ -48,21 +56,30 @@ pub async fn ingest_logs(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or(CONTENT_TYPE_PROTOBUF);
+    let encoding = otlp_encoding_from_content_type(content_type);
+    let request_metrics = OtlpRequestRecorder::new(&state.metrics, PROTOCOL_HTTP, SIGNAL_LOGS, encoding);
+    request_metrics.record_request_size(body.len());
 
     // Parse the request based on content type
-    let export_request = parse_logs_request(content_type, &body)?;
+    let export_request = request_metrics
+        .record_decode(content_type, || parse_logs_request(content_type, &body))
+        .map_err(OtlpError::from)?;
 
     // TODO: Extract tenant_id from authentication
     let tenant_id = None;
 
     // Transform OTLP logs to Arrow RecordBatch
-    let Some(batch) = transform::logs_to_record_batch(&export_request, tenant_id) else {
+    let batch = request_metrics.record_transform(|| transform::logs_to_record_batch(&export_request, tenant_id));
+    let Some(batch) = batch else {
         // No records to process - return success with 0 rejected
+        request_metrics.record_records_per_request(0);
+        request_metrics.finish_ok();
         return Ok(Json(ExportLogsResponse::default()));
     };
 
     let record_count = batch.num_rows();
     debug!(records = record_count, "Transformed OTLP logs to RecordBatch");
+    request_metrics.record_records_per_request(record_count);
 
     // Create write request for the WAL queue
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -74,14 +91,22 @@ pub async fn ingest_logs(
     };
 
     // Send to WAL queue
+    let enqueue_start = Instant::now();
     state.write_channel.send(write_request).await.map_err(|e| {
+        request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
+        request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
+        request_metrics.finish_error();
         OtlpError(IngestError::Io(std::io::Error::other(format!(
             "WAL queue unavailable: {e}"
         ))))
     })?;
+    request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_OK);
 
     // Wait for write result
+    let ack_start = Instant::now();
     let result = response_rx.await.map_err(|e| {
+        request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
+        request_metrics.finish_error();
         OtlpError(IngestError::Io(std::io::Error::other(format!(
             "Failed to receive write result: {e}"
         ))))
@@ -90,10 +115,14 @@ pub async fn ingest_logs(
     match result {
         WriteResult::Success { offset, records } => {
             debug!(offset, records, "Logs written to WAL");
+            request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_OK);
+            request_metrics.finish_ok();
             Ok(Json(ExportLogsResponse::default()))
         }
         WriteResult::Failed { reason } => {
             // Return partial success with all records rejected
+            request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
+            request_metrics.finish_partial();
             Ok(Json(ExportLogsResponse {
                 partial_success: Some(LogsPartialSuccess {
                     rejected_log_records: record_count as i64,
@@ -105,19 +134,18 @@ pub async fn ingest_logs(
 }
 
 /// Parse logs request from either protobuf or JSON encoding.
-fn parse_logs_request(content_type: &str, body: &Bytes) -> OtlpResult<ExportLogsServiceRequest> {
+fn parse_logs_request(content_type: &str, body: &Bytes) -> Result<ExportLogsServiceRequest, IngestError> {
     if content_type.starts_with(CONTENT_TYPE_PROTOBUF) {
         // Decode protobuf
         ExportLogsServiceRequest::decode(body.as_ref())
-            .map_err(|e| OtlpError(IngestError::Decode(format!("Failed to decode protobuf: {e}"))))
+            .map_err(|e| IngestError::Decode(format!("Failed to decode protobuf: {e}")))
     } else if content_type.starts_with(CONTENT_TYPE_JSON) {
         // Decode JSON using serde
-        serde_json::from_slice(body.as_ref())
-            .map_err(|e| OtlpError(IngestError::Decode(format!("Failed to decode JSON: {e}"))))
+        serde_json::from_slice(body.as_ref()).map_err(|e| IngestError::Decode(format!("Failed to decode JSON: {e}")))
     } else {
-        Err(OtlpError(IngestError::Validation(format!(
+        Err(IngestError::Validation(format!(
             "Unsupported Content-Type: {content_type}. Expected application/x-protobuf or application/json"
-        ))))
+        )))
     }
 }
 
@@ -159,6 +187,17 @@ pub async fn health() -> impl IntoResponse {
     })
 }
 
+/// Resolve OTLP encoding from Content-Type.
+fn otlp_encoding_from_content_type(content_type: &str) -> &'static str {
+    if content_type.starts_with("application/x-protobuf") {
+        "protobuf"
+    } else if content_type.starts_with("application/json") {
+        "json"
+    } else {
+        "unknown"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Bytes;
@@ -182,6 +221,7 @@ mod tests {
                         }),
                     }],
                     dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: None,
@@ -198,6 +238,7 @@ mod tests {
                         flags: 0,
                         trace_id: vec![0; 16],
                         span_id: vec![0; 8],
+                        event_name: String::new(),
                     }],
                     schema_url: String::new(),
                 }],

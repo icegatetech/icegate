@@ -1,6 +1,10 @@
 //! Queue writer for durable Parquet segments on object storage. A common component for storage, it doesn't know what data it uses.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arrow::{
     array::ArrayRef,
@@ -42,6 +46,9 @@ pub struct QueueWriter {
 
     /// Per-topic batch accumulators.
     accumulators: Arc<RwLock<HashMap<Topic, TopicAccumulator>>>,
+
+    /// Events handler for queue writer operations.
+    events: Arc<dyn QueueWriterEvents>,
 }
 
 impl QueueWriter {
@@ -52,7 +59,15 @@ impl QueueWriter {
             store,
             offsets: Arc::new(RwLock::new(HashMap::new())),
             accumulators: Arc::new(RwLock::new(HashMap::new())),
+            events: Arc::new(NoopQueueWriterEvents),
         }
+    }
+
+    /// Set a custom events handler.
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<dyn QueueWriterEvents>) -> Self {
+        self.events = events;
+        self
     }
 
     /// Starts the writer, consuming from the provided receiver.
@@ -120,12 +135,24 @@ impl QueueWriter {
     #[allow(clippy::significant_drop_tightening)] // Lock must be held while checking flush condition
     async fn handle_request(&self, request: WriteRequest) -> Result<()> {
         let topic = request.topic.clone();
-        let should_flush = {
+        let (pending_batches, pending_records, pending_bytes, should_flush) = {
             let mut accumulators = self.accumulators.write().await;
             let accumulator = accumulators.entry(topic.clone()).or_insert_with(TopicAccumulator::new);
             accumulator.add(request.batch, request.response_tx);
-            accumulator.should_flush(&self.config)
+            (
+                accumulator.pending_batches(),
+                accumulator.pending_records(),
+                accumulator.pending_bytes(),
+                accumulator.should_flush(&self.config),
+            )
         };
+
+        self.events.on_accumulator_state_update(
+            topic.as_str(),
+            saturating_u64(pending_batches),
+            saturating_u64(pending_records),
+            saturating_u64(pending_bytes),
+        );
 
         if should_flush {
             self.flush_topic(&topic).await?;
@@ -162,6 +189,7 @@ impl QueueWriter {
 
     /// Flushes all accumulated batches for a topic.
     async fn flush_topic(&self, topic: &Topic) -> Result<()> {
+        let flush_start = Instant::now();
         let (batches, responses) = {
             let mut accumulators = self.accumulators.write().await;
             if let Some(accumulator) = accumulators.get_mut(topic) {
@@ -170,6 +198,8 @@ impl QueueWriter {
                 return Ok(());
             }
         };
+
+        self.events.on_accumulator_state_update(topic.as_str(), 0, 0, 0);
 
         if batches.is_empty() {
             return Ok(());
@@ -181,6 +211,8 @@ impl QueueWriter {
         let concatenated = match TopicAccumulator::concat_batches(&batches) {
             Ok(batch) => batch,
             Err(e) => {
+                self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
+                self.events.on_write_error(topic.as_str(), write_error_reason(&e));
                 TopicAccumulator::send_failure(responses, &e.to_string());
                 return Err(e);
             }
@@ -188,11 +220,14 @@ impl QueueWriter {
 
         // Write the concatenated batch
         match self.write_batch(topic, concatenated, None).await {
-            Ok((offset, _)) => {
+            Ok(offset) => {
+                self.events.on_flush_finish(topic.as_str(), "ok", flush_start.elapsed());
                 TopicAccumulator::send_success(responses, offset, total_records);
                 Ok(())
             }
             Err(e) => {
+                self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
+                self.events.on_write_error(topic.as_str(), write_error_reason(&e));
                 TopicAccumulator::send_failure(responses, &e.to_string());
                 Err(e)
             }
@@ -215,19 +250,14 @@ impl QueueWriter {
         Ok(())
     }
 
-    /// Writes a batch to object storage, returning the offset and record count.
+    /// Writes a batch to object storage, returning the offset.
     ///
     /// This is the core write method used internally. For normal usage, prefer using the channel-based approach via `start()`.
     /// Now we always have one row group for each parquet file, because `group_by_column` is always optional.
-    async fn write_batch(
-        &self,
-        topic: &Topic,
-        batch: RecordBatch,
-        group_by_column: Option<String>,
-    ) -> Result<(u64, usize)> {
+    async fn write_batch(&self, topic: &Topic, batch: RecordBatch, group_by_column: Option<String>) -> Result<u64> {
         let record_count = batch.num_rows();
         if record_count == 0 {
-            return Ok((self.get_current_offset(topic).await, 0));
+            return Ok(self.get_current_offset(topic).await);
         }
 
         // Prepare batches (optionally grouped by column)
@@ -246,7 +276,17 @@ impl QueueWriter {
             .write_with_retry(topic, parquet_bytes, record_count, size_bytes, row_group_count)
             .await?;
 
-        Ok((offset, record_count))
+        self.events.on_write_complete(
+            topic.as_str(),
+            WriteBatchOutcome {
+                offset,
+                records: saturating_u64(record_count),
+                size_bytes,
+                row_groups: saturating_u64(row_group_count),
+            },
+        );
+
+        Ok(offset)
     }
 
     /// Groups a record batch by the values in a column.
@@ -377,6 +417,7 @@ impl QueueWriter {
                 }
                 Err(QueueError::AlreadyExists { .. }) => {
                     attempts += 1;
+                    self.events.on_write_retry(topic.as_str(), "already_exists");
                     if attempts >= max_attempts {
                         return Err(QueueError::Write {
                             topic: topic.clone(),
@@ -533,6 +574,68 @@ impl QueueWriter {
     }
 }
 
+/// Write outcome details for a single WAL segment.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteBatchOutcome {
+    /// Offset of the written segment.
+    pub offset: u64,
+    /// Total records written in the segment.
+    pub records: u64,
+    /// Segment size in bytes.
+    pub size_bytes: u64,
+    /// Row groups per segment.
+    pub row_groups: u64,
+}
+
+/// Events interface for queue writer instrumentation.
+pub trait QueueWriterEvents: Send + Sync {
+    /// Record accumulator state for a topic.
+    fn on_accumulator_state_update(&self, _topic: &str, _batches: u64, _records: u64, _bytes: u64) {}
+
+    /// Record flush completion for a topic.
+    fn on_flush_finish(&self, _topic: &str, _status: &str, _duration: Duration) {}
+
+    /// Record a successful write outcome for a topic.
+    fn on_write_complete(&self, _topic: &str, _outcome: WriteBatchOutcome) {}
+
+    /// Record write retry attempt.
+    fn on_write_retry(&self, _topic: &str, _reason: &str) {}
+
+    /// Record write error.
+    fn on_write_error(&self, _topic: &str, _reason: &str) {}
+}
+
+/// No-op events implementation.
+#[derive(Debug, Default)]
+pub struct NoopQueueWriterEvents;
+
+impl QueueWriterEvents for NoopQueueWriterEvents {}
+
+fn write_error_reason(error: &QueueError) -> &'static str {
+    match error {
+        QueueError::ObjectStore(_) => "object_store",
+        QueueError::Parquet(_) => "parquet",
+        QueueError::Arrow(_) => "arrow",
+        QueueError::Config(_) => "config",
+        QueueError::Write { source, .. } => {
+            if source.downcast_ref::<object_store::Error>().is_some() {
+                "object_store"
+            } else if source.downcast_ref::<parquet::errors::ParquetError>().is_some() {
+                "parquet"
+            } else if source.downcast_ref::<arrow::error::ArrowError>().is_some() {
+                "arrow"
+            } else {
+                "other"
+            }
+        }
+        _ => "other",
+    }
+}
+
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::{
@@ -571,10 +674,9 @@ mod tests {
         let writer = QueueWriter::new(config, store.clone());
 
         let batch = test_batch();
-        let (offset, count) = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
+        let offset = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
 
         assert_eq!(offset, 0);
-        assert_eq!(count, 4);
 
         // Verify file exists
         let path = Path::from("queue/logs/00000000000000000000.parquet");
@@ -589,13 +691,12 @@ mod tests {
         let writer = QueueWriter::new(config, store.clone());
 
         let batch = test_batch();
-        let (offset, count) = writer
+        let offset = writer
             .write_batch(&"logs".to_string(), batch, Some("tenant_id".to_string()))
             .await
             .unwrap();
 
         assert_eq!(offset, 0);
-        assert_eq!(count, 4);
     }
 
     #[tokio::test]
@@ -606,11 +707,11 @@ mod tests {
 
         let batch = test_batch();
 
-        let (offset1, _) = writer.write_batch(&"logs".to_string(), batch.clone(), None).await.unwrap();
+        let offset1 = writer.write_batch(&"logs".to_string(), batch.clone(), None).await.unwrap();
 
-        let (offset2, _) = writer.write_batch(&"logs".to_string(), batch.clone(), None).await.unwrap();
+        let offset2 = writer.write_batch(&"logs".to_string(), batch.clone(), None).await.unwrap();
 
-        let (offset3, _) = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
+        let offset3 = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
 
         assert_eq!(offset1, 0);
         assert_eq!(offset2, 1);
@@ -672,7 +773,7 @@ mod tests {
 
         // First write should start at offset 0
         let batch = test_batch();
-        let (offset, _) = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
+        let offset = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
         assert_eq!(offset, 0);
     }
 
@@ -693,7 +794,7 @@ mod tests {
         writer2.recover().await.unwrap();
 
         // New write should continue from offset 3
-        let (offset, _) = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        let offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
         assert_eq!(offset, 3);
     }
 
@@ -714,8 +815,8 @@ mod tests {
         writer2.recover().await.unwrap();
 
         // Writes should continue from recovered offsets
-        let (logs_offset, _) = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
-        let (events_offset, _) = writer2.write_batch(&"events".to_string(), test_batch(), None).await.unwrap();
+        let logs_offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        let events_offset = writer2.write_batch(&"events".to_string(), test_batch(), None).await.unwrap();
 
         assert_eq!(logs_offset, 2);
         assert_eq!(events_offset, 1);

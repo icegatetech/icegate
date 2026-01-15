@@ -246,7 +246,7 @@ pub fn logs_to_record_batch(request: &ExportLogsServiceRequest, tenant_id: Optio
     }
 
     // Build arrays
-    let schema = Arc::new(logs_arrow_schema());
+    let schema = Arc::new(schema);
     let columns: Vec<ArrayRef> = vec![
         Arc::new(tenant_id_builder.finish()),
         Arc::new(account_id_builder.finish()),
@@ -348,6 +348,7 @@ mod tests {
                         }),
                     }],
                     dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: None,
@@ -369,6 +370,7 @@ mod tests {
                         flags: 0,
                         trace_id: vec![0; 16],
                         span_id: vec![0; 8],
+                        event_name: String::new(),
                     }],
                     schema_url: String::new(),
                 }],

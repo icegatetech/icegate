@@ -5,17 +5,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow::{
-    array::{ArrayRef, make_array},
-    compute::SortOptions,
-    datatypes::{DataType, Schema},
-    record_batch::RecordBatch,
-};
-use arrow_data::ArrayData;
+use arrow::{compute::SortOptions, record_batch::RecordBatch};
 use async_trait::async_trait;
 use iceberg::{
     Catalog, NamespaceIdent, TableIdent,
-    arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema},
+    arrow::RecordBatchPartitionSplitter,
     spec::{DataFile, DataFileFormat},
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
