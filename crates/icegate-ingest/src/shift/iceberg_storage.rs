@@ -6,7 +6,7 @@ use std::{
 };
 
 use arrow::{
-    array::{make_array, ArrayRef},
+    array::{ArrayRef, make_array},
     compute::SortOptions,
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
@@ -14,26 +14,24 @@ use arrow::{
 use arrow_data::ArrayData;
 use async_trait::async_trait;
 use iceberg::{
-    arrow::{schema_to_arrow_schema, RecordBatchPartitionSplitter},
+    Catalog, NamespaceIdent, TableIdent,
+    arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema},
     spec::{DataFile, DataFileFormat},
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
     writer::{
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
+            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
             rolling_writer::RollingFileWriterBuilder,
-            ParquetWriterBuilder,
         },
-        partitioning::{fanout_writer::FanoutWriter, PartitioningWriter},
+        partitioning::{PartitioningWriter, fanout_writer::FanoutWriter},
     },
-    Catalog,
-    NamespaceIdent,
-    TableIdent,
 };
 use icegate_common::{
-    retrier::{Retrier, RetrierConfig},
     ICEGATE_NAMESPACE,
+    retrier::{Retrier, RetrierConfig},
 };
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};

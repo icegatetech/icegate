@@ -5,8 +5,8 @@ use std::{
     sync::Arc,
 };
 
-use async_trait::async_trait;
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use futures::TryStreamExt;
 use icegate_common::retrier::{Retrier, RetrierConfig};
 use object_store::{ObjectStore, path::Path};
@@ -367,7 +367,8 @@ impl ParquetQueueReader {
 
             let mut saw_row_groups = false;
             for (row_group_idx, row_group) in parquet_meta.row_groups().iter().enumerate() {
-                let group_key = Self::group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
+                let group_key =
+                    Self::group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
                 saw_row_groups = true;
 
                 let chunk = grouped_chunks.entry(group_key.clone()).or_insert_with(RowGroupsInSegments::new);

@@ -6,6 +6,16 @@ use std::{
 };
 
 use iceberg::{Catalog, NamespaceIdent, TableCreation};
+use icegate_common::{
+    ICEGATE_NAMESPACE, LOGS_TABLE, LOGS_TOPIC,
+    catalog::{CatalogBackend, CatalogBuilder, CatalogConfig},
+    schema::{logs_partition_spec, logs_schema, logs_sort_order},
+};
+use icegate_jobmanager::{
+    InMemoryStorage, JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, Metrics, TaskCode,
+    TaskDefinition, WorkerConfig,
+};
+use icegate_queue::{ParquetQueueReader, QueueConfig, QueueWriter, WriteRequest, WriteResult, channel};
 use object_store::memory::InMemory;
 use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
@@ -14,19 +24,8 @@ use opentelemetry_proto::tonic::{
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use icegate_common::{
-    catalog::{CatalogBackend, CatalogBuilder, CatalogConfig}, schema::{logs_partition_spec, logs_schema, logs_sort_order}, ICEGATE_NAMESPACE,
-    LOGS_TABLE,
-    LOGS_TOPIC,
-};
-use icegate_jobmanager::{
-    InMemoryStorage, JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, Metrics, TaskCode,
-    TaskDefinition, WorkerConfig,
-};
-use icegate_queue::{channel, ParquetQueueReader, QueueConfig, QueueWriter, WriteRequest, WriteResult};
-
 use super::timeout::TimeoutEstimator;
-use super::{Executor, IcebergStorage, ShiftConfig, COMMIT_TASK_CODE, PLAN_TASK_CODE, SHIFT_TASK_CODE};
+use super::{COMMIT_TASK_CODE, Executor, IcebergStorage, PLAN_TASK_CODE, SHIFT_TASK_CODE, ShiftConfig};
 use crate::transform::logs_to_record_batch;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -129,9 +128,8 @@ fn logs_batch(
     record_count: usize,
 ) -> Result<arrow::record_batch::RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
     let request = export_logs_request(record_count)?;
-    Ok(logs_to_record_batch(&request, Some(tenant_id)).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "failed to build record batch")
-    })?)
+    Ok(logs_to_record_batch(&request, Some(tenant_id))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "failed to build record batch"))?)
 }
 
 fn export_logs_request(

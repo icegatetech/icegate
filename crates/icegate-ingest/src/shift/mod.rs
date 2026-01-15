@@ -8,10 +8,10 @@ pub mod executor;
 pub mod iceberg_storage;
 /// Parquet metadata reader utilities for shift operations.
 pub mod parquet_meta_reader;
-/// Task timeout estimation utilities.
-mod timeout;
 #[cfg(test)]
 mod pipeline_tests;
+/// Task timeout estimation utilities.
+mod timeout;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use icegate_jobmanager::{registry::TaskExecutorFn, ImmutableTask, JobManager, TaskCode, TaskDefinition};
+use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition, registry::TaskExecutorFn};
 use icegate_queue::{QueueReader, SegmentsPlan, Topic};
 use serde::{Deserialize, Serialize};
 
