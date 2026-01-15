@@ -51,7 +51,6 @@ icegate-queue = { path = "crates/icegate-queue" }
 
 # Arrow ecosystem (must match iceberg's version)
 arrow = { version = "57", default-features = false, features = ["prettyprint"] }
-arrow-data = "57"
 parquet = { version = "57", default-features = false, features = ["arrow", "object_store", "zstd"] }
 object_store = { version = "0.12", features = ["aws"] }
 

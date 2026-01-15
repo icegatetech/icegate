@@ -24,7 +24,6 @@ icegate-queue = { path = "../icegate-queue" }
 
 # Apache Arrow
 arrow = { workspace = true }
-arrow-data = { workspace = true }
 parquet = { workspace = true }
 
 # Iceberg
