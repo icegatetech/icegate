@@ -13,6 +13,10 @@ pub enum Error {
     #[error("operation cancelled")]
     Cancelled,
 
+    /// Task execution failed. Call this from client task executor.
+    #[error("{0}")]
+    TaskExecution(String),
+
     /// Generic error message.
     #[error("{0}")]
     Other(String),
@@ -76,7 +80,7 @@ impl From<Error> for InternalError {
         match err {
             Error::Cancelled => Self::Cancelled,
             Error::Serialization(e) => Self::Other(e.to_string()),
-            Error::Other(msg) => Self::Other(msg),
+            Error::Other(msg) | Error::TaskExecution(msg) => Self::Other(msg),
         }
     }
 }

@@ -5,7 +5,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use chrono::Duration as ChronoDuration;
 use icegate_jobmanager::{
     CachedStorage, Error, ImmutableTask, JobDefinition, JobManager, JobRegistry, JobsManager, JobsManagerConfig,
-    Metrics, RetrierConfig, S3Storage, TaskDefinition, registry::TaskExecutorFn, s3_storage::S3StorageConfig,
+    Metrics, RetrierConfig, S3Storage, TaskDefinition,
+    registry::TaskExecutorFn,
+    s3_storage::{JobStateCodecKind, S3StorageConfig},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{Level, info};
@@ -34,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use_ssl: false,
         region: "us-east-1".to_string(),
         bucket_prefix: "jobs".to_string(),
+        job_state_codec: JobStateCodecKind::Json,
         request_timeout: Duration::from_secs(5),
         retrier_config: RetrierConfig::default(),
     };
@@ -100,8 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("JSON model job-{}", Uuid::new_v4()).into(),
         vec![task1_def, task2_def],
         executors,
-        3, // max iterations
-    )?;
+    )?
+    .with_max_iterations(3)?;
 
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
     // retrier was unused.

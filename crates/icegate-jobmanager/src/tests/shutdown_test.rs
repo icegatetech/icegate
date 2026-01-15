@@ -13,7 +13,7 @@ use tokio::{
     time::timeout,
 };
 
-use super::common::in_memory_storage::InMemoryStorage;
+use crate::storage::in_memory::InMemoryStorage;
 use crate::{
     JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, Metrics, TaskCode, TaskDefinition,
     WorkerConfig, registry::TaskExecutorFn,
@@ -30,7 +30,8 @@ fn start_returns_error_when_worker_count_is_zero() -> Result<(), Box<dyn std::er
     let mut executors = HashMap::new();
     executors.insert(TaskCode::new("noop"), executor);
 
-    let job_def = JobDefinition::new(JobCode::new("zero_worker_job"), vec![task_def], executors, 1)?;
+    let job_def =
+        JobDefinition::new(JobCode::new("zero_worker_job"), vec![task_def], executors)?.with_max_iterations(1)?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
 
     let Err(_err) = JobsManager::new(
@@ -62,7 +63,7 @@ async fn test_shutdown_cancels_executor() -> Result<(), Box<dyn std::error::Erro
     let executor: TaskExecutorFn = Arc::new(move |task, _manager, cancel_token| {
         let cancelled_flag = Arc::clone(&cancelled_flag);
         let started_tx = Arc::clone(&started_tx);
-        let _task_id = task.id().to_string();
+        let _task_id = *task.id();
 
         Box::pin(async move {
             let value = started_tx.lock().await.take();
@@ -86,7 +87,8 @@ async fn test_shutdown_cancels_executor() -> Result<(), Box<dyn std::error::Erro
     let mut executors = HashMap::new();
     executors.insert(TaskCode::new("long_task"), executor);
 
-    let job_def = JobDefinition::new(JobCode::new("shutdown_job"), vec![task_def], executors, 1)?;
+    let job_def =
+        JobDefinition::new(JobCode::new("shutdown_job"), vec![task_def], executors)?.with_max_iterations(1)?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
 
     let manager = JobsManager::new(

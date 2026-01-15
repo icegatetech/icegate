@@ -10,12 +10,11 @@ use uuid::Uuid;
 
 use crate::execution::job_manager::JobManagerImpl;
 use crate::{
-    InternalError, Job, JobCode, JobDefinition, JobError, JobRegistry, Metrics, Retrier, RetrierConfig, Storage,
-    StorageError, Task, TaskCode,
+    InternalError, Job, JobCode, JobError, JobRegistry, Metrics, Retrier, RetrierConfig, Storage, StorageError,
+    TaskCode,
 };
-// TODO(low): implement subscription mechanism for job updates between workers - if worker
-// received/saved job, other workers should update their state to reduce races. Can be done via
-// storage wrapper.
+// TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
+// Can be done via storage wrapper.
 
 #[derive(Clone)]
 pub struct WorkerConfig {
@@ -77,7 +76,7 @@ fn panic_payload_to_string(panic: &(dyn Any + Send)) -> String {
 // Worker - iterates through jobs and executes tasks from jobs. Can execute only one task at a time.
 // Task processing concurrency is controlled by number of workers.
 pub(crate) struct Worker {
-    id: String,
+    id: Uuid,
     job_registry: Arc<JobRegistry>,
     storage: Arc<dyn Storage>,
     config: WorkerConfig,
@@ -91,7 +90,7 @@ pub(crate) struct Worker {
 // TODO(med): cancel task if timeout
 
 impl Worker {
-    pub(crate) fn id(&self) -> &str {
+    pub(crate) const fn id(&self) -> &Uuid {
         &self.id
     }
 
@@ -104,7 +103,7 @@ impl Worker {
         let retrier = Retrier::new(config.retrier_config.clone());
 
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: Uuid::new_v4(),
             job_registry,
             storage,
             config,
@@ -224,15 +223,17 @@ impl Worker {
     #[tracing::instrument(skip(self, cancel_token), fields(worker_id = %self.id, job_code = %code))]
     async fn create_new_job(&self, code: &JobCode, cancel_token: &CancellationToken) -> Result<Job, InternalError> {
         let job_def = self.job_registry.get_job(code)?;
-        let tasks = self.create_tasks_from_job_def(&job_def);
+        let task_defs = job_def.initial_tasks().to_vec();
 
         let job = Job::new(
             code.clone(),
-            tasks,
+            task_defs,
             HashMap::new(),
-            self.id.clone(),
+            self.id,
             job_def.max_iterations(),
-        );
+            job_def.iteration_interval(),
+            job_def.task_limits(),
+        )?;
 
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
@@ -243,8 +244,7 @@ impl Worker {
                     saved_job.id(),
                     saved_job.updated_by_worker_id()
                 );
-                // TODO(low): in saveJobState on ConcurrentModification error we re-read job, which is unnecessary
-                // in this case.
+                // TODO(low): in saveJobState on ConcurrentModification error we re-read job, which is unnecessary in this case.
                 Ok(MergeDecision::Done(saved_job, SaveOutcome::Skipped)) // Someone beat us to it
             })
             .await?;
@@ -313,9 +313,9 @@ impl Worker {
         cancel_token: &CancellationToken,
     ) -> Result<Job, InternalError> {
         let job_def = self.job_registry.get_job(job.code())?;
-        let tasks = self.create_tasks_from_job_def(&job_def);
+        let task_defs = job_def.initial_tasks().to_vec();
 
-        job.next_iteration(tasks, self.id.clone(), job_def.max_iterations())?;
+        job.next_iteration(task_defs, self.id)?;
 
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
@@ -357,7 +357,7 @@ impl Worker {
             return Ok(false);
         };
 
-        match job.start_task(&task_id, self.id.clone()) {
+        match job.start_task(&task_id, self.id) {
             Ok(()) => {}
             Err(JobError::TaskWorkerMismatch) => return Ok(true),
             Err(e) => return Err(InternalError::from(e)),
@@ -365,12 +365,12 @@ impl Worker {
 
         debug!("Task '{}' started", task_id);
 
-        let task_id_clone = task_id.clone();
-        let worker_id = self.id.clone();
+        let task_id_clone = task_id;
+        let worker_id = self.id;
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
                 let JobMergeContext { mut saved_job, .. } = ctx;
-                match saved_job.start_task(&task_id_clone, worker_id.clone()) {
+                match saved_job.start_task(&task_id_clone, worker_id) {
                     Ok(()) => {
                         debug!("Job has concurrent modification when picking task - retry");
                         Ok(MergeDecision::Retry(saved_job))
@@ -416,21 +416,22 @@ impl Worker {
     async fn execute_task(
         &self,
         job: Job,
-        task_id: &str,
+        task_id: &Uuid,
         cancel_token: CancellationToken,
     ) -> Result<(), InternalError> {
-        let task_id = task_id.to_string();
+        let task_id = *task_id;
         let task = job.get_task(&task_id)?;
 
         let executor = self.job_registry.get_task_executor(job.code(), &task.code().clone())?;
 
         // Execute task (wrap Job with moving)
         let wrapper_job = RwLock::new(job);
-        let job_manager = JobManagerImpl::new(&wrapper_job, self.id.clone());
-
-        let result = AssertUnwindSafe(executor(task, &job_manager, cancel_token.clone()))
-            .catch_unwind()
-            .await;
+        let result = {
+            let job_manager = JobManagerImpl::new(&wrapper_job, self.id);
+            AssertUnwindSafe(executor(task, &job_manager, cancel_token.clone()))
+                .catch_unwind()
+                .await
+        };
         let result = match result {
             Ok(result) => result.map_err(InternalError::from),
             Err(panic) => Err(InternalError::Other(format!(
@@ -449,7 +450,6 @@ impl Worker {
 
         // Recover ownership. Since executor is done and dropped (it was awaited), and job_manager is local,
         // we should satisfy unique access.
-        drop(job_manager);
         let mut job = wrapper_job.into_inner();
 
         // TODO(low): think about to fail the task when expired
@@ -460,11 +460,11 @@ impl Worker {
         // Handle result
         match result {
             Err(e) => {
-                info!("Task '{}' execution failed: {}", task_id, e);
+                error!("Task '{}' execution failed: {}", task_id, e);
                 job.fail_task(&task_id, &e.to_string())?;
 
-                let worker_id = self.id.clone();
-                let task_id_clone = task_id.clone();
+                let worker_id = self.id;
+                let task_id_clone = task_id;
                 _ = self
                     .save_processed_task(job, &task_id, &cancel_token, move |ctx| {
                         let JobMergeContext {
@@ -488,8 +488,8 @@ impl Worker {
             Ok(()) => {
                 info!("Task '{}' handled successfully", task_id);
 
-                let worker_id = self.id.clone();
-                let task_id_clone = task_id.clone();
+                let worker_id = self.id;
+                let task_id_clone = task_id;
 
                 job.try_to_complete(&worker_id)?;
 
@@ -601,7 +601,7 @@ impl Worker {
     async fn save_processed_task<F>(
         &self,
         job: Job,
-        task_id: &str,
+        task_id: &Uuid,
         cancel_token: &CancellationToken,
         concurrent_modification_handler: F,
     ) -> Result<Job, InternalError>
@@ -668,13 +668,5 @@ impl Worker {
                 exhausted,
             },
         );
-    }
-
-    fn create_tasks_from_job_def(&self, job_def: &JobDefinition) -> Vec<Task> {
-        job_def
-            .initial_tasks()
-            .iter()
-            .map(|task_def| Task::new(self.id.clone(), task_def))
-            .collect()
     }
 }

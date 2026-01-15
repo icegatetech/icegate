@@ -96,7 +96,7 @@ impl JobsManager {
 
     /// Start worker tasks and return a handle for lifecycle control.
     pub fn start(&self) -> Result<JobsManagerHandle, Error> {
-        info!("Starting {} workers", self.config.worker_count);
+        info!("Starting jobmanager with {} workers", self.config.worker_count);
 
         let cancel_token = CancellationToken::new();
         let mut join_set = JoinSet::new();

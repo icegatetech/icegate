@@ -17,4 +17,7 @@ pub mod otlp_http;
 /// OTLP to Arrow transform utilities (shared by gRPC and HTTP)
 pub mod transform;
 
+/// Shift operations: moving data from WAL to Iceberg
+pub mod shift;
+
 pub use config::IngestConfig;

@@ -9,28 +9,92 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use crate::{
     Error, Job, JobCode, JobDefinitionRegistry, JobMeta, JobStatus, Metrics, Retrier, RetrierConfig, Storage,
     StorageError, StorageResult, Task, TaskCode, TaskStatus,
 };
 
-// TODO(low): need mechanism to clean up old job states. Required for iter num restart and reduced
-// storage load TODO(high): add test s3 storage with Toxiproxy for testing network problems
+// TODO(low): need mechanism to clean up old job states. Required for iter num restart and reduced storage load
+// TODO(high): add test s3 storage with Toxiproxy for testing network problems (chaos test))
 
 const JOB_STATE_FILE_PREFIX: &str = "state-";
-const JOB_STATE_FILE_EXTENSION: &str = ".json";
+
+trait JobStateCodec: Send + Sync {
+    fn file_extension(&self) -> &'static str;
+    fn content_type(&self) -> &'static str;
+    fn serialize(&self, job: &JobJson) -> StorageResult<Vec<u8>>;
+    fn deserialize(&self, data: &[u8]) -> StorageResult<JobJson>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum JobStateCodecKind {
+    Json,
+    Cbor,
+}
+
+impl JobStateCodecKind {
+    fn build(self) -> Arc<dyn JobStateCodec> {
+        match self {
+            Self::Json => Arc::new(JsonJobStateCodec),
+            Self::Cbor => Arc::new(CborJobStateCodec),
+        }
+    }
+}
+
+struct JsonJobStateCodec;
+
+impl JobStateCodec for JsonJobStateCodec {
+    fn file_extension(&self) -> &'static str {
+        ".json"
+    }
+
+    fn content_type(&self) -> &'static str {
+        "application/json"
+    }
+
+    fn serialize(&self, job: &JobJson) -> StorageResult<Vec<u8>> {
+        serde_json::to_vec_pretty(job).map_err(|e| StorageError::Serialization(e.to_string()))
+    }
+
+    fn deserialize(&self, data: &[u8]) -> StorageResult<JobJson> {
+        serde_json::from_slice(data).map_err(|e| StorageError::Serialization(e.to_string()))
+    }
+}
+
+struct CborJobStateCodec;
+
+impl JobStateCodec for CborJobStateCodec {
+    fn file_extension(&self) -> &'static str {
+        ".cbor"
+    }
+
+    fn content_type(&self) -> &'static str {
+        "application/cbor"
+    }
+
+    fn serialize(&self, job: &JobJson) -> StorageResult<Vec<u8>> {
+        let mut buffer = Vec::new();
+        ciborium::ser::into_writer(job, &mut buffer).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        Ok(buffer)
+    }
+
+    fn deserialize(&self, data: &[u8]) -> StorageResult<JobJson> {
+        ciborium::de::from_reader(data).map_err(|e| StorageError::Serialization(e.to_string()))
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TaskJson {
-    id: String,
+    id: Uuid,
     code: String,
     status: TaskStatus,
-    created_by_worker: String,
+    created_by_worker: Uuid,
     #[serde(default)]
     timeout_ms: i64,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    processing_by: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    processing_by: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,16 +108,18 @@ struct TaskJson {
     output: Vec<u8>,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     error: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    depends_on: Vec<Uuid>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JobJson {
-    id: String,
+    id: Uuid,
     code: String,
     iter_num: u64,
     status: JobStatus,
     tasks: Vec<TaskJson>,
-    updated_by: String,
+    updated_by: Uuid,
     started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     running_at: Option<DateTime<Utc>>,
@@ -80,6 +146,8 @@ pub struct S3StorageConfig {
     pub region: String,
     /// Prefix for job state objects.
     pub bucket_prefix: String,
+    /// Job state serialization codec.
+    pub job_state_codec: JobStateCodecKind,
     /// Request timeout for S3 operations.
     pub request_timeout: Duration,
     /// Retry policy configuration.
@@ -87,11 +155,12 @@ pub struct S3StorageConfig {
 }
 
 pub struct S3Storage {
+    // TODO(med): save job settings separately and provide an API for changing settings
     client: Client,
     bucket_name: String,
     bucket_prefix: String,
-    registry: Arc<dyn JobDefinitionRegistry>, /* TODO(med): save job settings separately and provide an API for
-                                               * changing settings */
+    codec: Arc<dyn JobStateCodec>,
+    registry: Arc<dyn JobDefinitionRegistry>,
     retrier: Retrier,
     metrics: Metrics,
 }
@@ -102,6 +171,9 @@ impl S3Storage {
         registry: Arc<dyn JobDefinitionRegistry>,
         metrics: Metrics,
     ) -> Result<Self, Error> {
+        info!("Starting jobmanager with s3 storage {}", config.endpoint);
+
+        // TODO(med): add creds options
         let credentials = aws_sdk_s3::config::Credentials::new(
             config.access_key_id.clone(),
             config.secret_access_key.clone(),
@@ -131,30 +203,69 @@ impl S3Storage {
         let s3_config = s3_config_builder.build();
         let client = Client::from_conf(s3_config);
 
-        // TODO(med): add check that conditional requests work for specific S3. For example, old Minio
-        // versions ignore the header and atomicity breaks
-
-        // Check if bucket exists, create if needed
-        match client.head_bucket().bucket(&config.bucket_name).send().await {
-            Ok(_) => info!("Bucket {} exists", config.bucket_name),
-            Err(aws_sdk_s3::error::SdkError::ServiceError(se)) if se.raw().status().as_u16() == 404 => {
-                client
-                    .create_bucket()
-                    .bucket(&config.bucket_name)
-                    .send()
-                    .await
-                    .map_err(|e| Error::Other(format!("Failed to create bucket: {e}")))?;
-                info!("Created bucket {}", config.bucket_name);
-            }
-            Err(e) => return Err(Error::Other(format!("Failed to check bucket: {e}"))),
-        }
+        // TODO(med): add check that conditional requests work for specific S3.
+        // For example, old Minio versions ignore the header and atomicity breaks
 
         let retrier = Retrier::new(config.retrier_config.clone());
+        let cancel_token = CancellationToken::new();
+
+        // Check if bucket exists, create if needed
+        let bucket_name = config.bucket_name.clone();
+        let client_for_retry = client.clone();
+        retrier
+            .retry(
+                move || {
+                    let client = client_for_retry.clone();
+                    let bucket_name = bucket_name.clone();
+                    async move {
+                        match client.head_bucket().bucket(&bucket_name).send().await {
+                            Ok(_) => {
+                                info!("Bucket {} exists", bucket_name);
+                                Ok((false, ()))
+                            }
+                            Err(aws_sdk_s3::error::SdkError::ServiceError(se)) if se.raw().status().as_u16() == 404 => {
+                                match client.create_bucket().bucket(&bucket_name).send().await {
+                                    Ok(_) => {
+                                        info!("Created bucket {}", bucket_name);
+                                        Ok((false, ()))
+                                    }
+                                    Err(aws_sdk_s3::error::SdkError::ServiceError(se))
+                                        if se.raw().status().as_u16() == 409 =>
+                                    {
+                                        info!("Bucket {} already exists", bucket_name);
+                                        Ok((false, ()))
+                                    }
+                                    Err(e) => {
+                                        let mapped = Self::map_s3_error(&e);
+                                        if mapped.is_retryable() {
+                                            Ok((true, ()))
+                                        } else {
+                                            Err(mapped)
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let mapped = Self::map_s3_error(&e);
+                                if mapped.is_retryable() {
+                                    Ok((true, ()))
+                                } else {
+                                    Err(mapped)
+                                }
+                            }
+                        }
+                    }
+                },
+                &cancel_token,
+            )
+            .await
+            .map_err(|e| Error::Other(format!("Failed to init bucket: {e}")))?;
 
         Ok(Self {
             client,
             bucket_name: config.bucket_name,
             bucket_prefix: config.bucket_prefix,
+            codec: config.job_state_codec.build(),
             registry,
             retrier,
             metrics,
@@ -204,34 +315,34 @@ impl S3Storage {
 
     // buildStatePath builds path to state file with inverted iterNum for S3 sorting
     fn build_state_path(&self, job_code: &JobCode, iter_num: u64) -> String {
-        // Invert iterNum so new files are at the beginning of list (S3 sorts by name) and LIST request is
-        // fast
+        // Invert iterNum so new files are at the beginning of list (S3 sorts by name) and LIST request is fast.
+        // If we use generic `ObjectStore`, then it does not guarantee the order.
         let inv_iter_num = u64::MAX - iter_num;
+        let extension = self.codec.file_extension();
         format!(
             "{}{}{:020}{}",
             self.build_job_path(job_code),
             JOB_STATE_FILE_PREFIX,
             inv_iter_num,
-            JOB_STATE_FILE_EXTENSION
+            extension
         )
     }
 
     // parseIterNumFromFilePath parses iterNum from file path
-    fn parse_iter_num_from_path(file_path: &str) -> StorageResult<u64> {
-        // Expected format: {prefix}/{jobCode}/state-00001.json
+    fn parse_iter_num_from_path(&self, file_path: &str) -> StorageResult<u64> {
+        // Expected format: {prefix}/{jobCode}/state-00001{ext}
         let parts: Vec<&str> = file_path.split('/').collect();
         if parts.len() < 2 {
             return Err(StorageError::Other(format!("Cannot split file path {file_path}")));
         }
 
         let filename = parts[parts.len() - 1];
-        if !filename.starts_with(JOB_STATE_FILE_PREFIX) || !filename.ends_with(JOB_STATE_FILE_EXTENSION) {
+        let extension = self.codec.file_extension();
+        if !filename.starts_with(JOB_STATE_FILE_PREFIX) || !filename.ends_with(extension) {
             return Err(StorageError::Other(format!("Invalid filename format {filename}")));
         }
 
-        let iter_num_str = filename
-            .trim_start_matches(JOB_STATE_FILE_PREFIX)
-            .trim_end_matches(JOB_STATE_FILE_EXTENSION);
+        let iter_num_str = filename.trim_start_matches(JOB_STATE_FILE_PREFIX).trim_end_matches(extension);
 
         let inv_iter_num: u64 = iter_num_str
             .parse()
@@ -241,30 +352,34 @@ impl S3Storage {
         Ok(u64::MAX - inv_iter_num)
     }
 
-    fn serialize_job(job: &Job) -> StorageResult<Vec<u8>> {
+    fn serialize_job(&self, job: &Job) -> StorageResult<Vec<u8>> {
         let job_json = Self::job_to_json(job);
-        serde_json::to_vec_pretty(&job_json).map_err(|e| StorageError::Serialization(e.to_string()))
+        self.codec.serialize(&job_json)
     }
 
     fn deserialize_job(&self, data: &[u8], version: &str) -> StorageResult<Job> {
-        // TODO(med): replace native json format with binary format like MessagePack or CBOR for best
-        // performance.
-        let job_json: JobJson = serde_json::from_slice(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let job_json = self.codec.deserialize(data)?;
         let job_def = self
             .registry
             .get_job(&JobCode::new(job_json.code.as_str()))
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        Ok(Self::job_from_json(job_json, job_def.max_iterations(), version))
+        Ok(Self::job_from_json(
+            job_json,
+            job_def.max_iterations(),
+            job_def.iteration_interval(),
+            job_def.task_limits(),
+            version,
+        ))
     }
 
     fn task_to_json(task: &Task) -> TaskJson {
         TaskJson {
-            id: task.id().to_string(),
+            id: *task.id(),
             code: task.code().to_string(),
             status: task.status().clone(),
             timeout_ms: task.timeout().num_milliseconds(),
-            created_by_worker: task.created_by_worker().to_string(),
-            processing_by: task.processing_by_worker().to_string(),
+            created_by_worker: task.created_by_worker(),
+            processing_by: task.processing_by_worker(),
             started_at: task.started_at(),
             completed_at: task.completed_at(),
             deadline_at: task.deadline_at(),
@@ -272,6 +387,7 @@ impl S3Storage {
             input: task.input().to_vec(),
             output: task.output().to_vec(),
             error: task.error_msg().to_string(),
+            depends_on: task.depends_on().to_vec(),
         }
     }
 
@@ -279,12 +395,12 @@ impl S3Storage {
         let tasks: Vec<TaskJson> = job.tasks_as_iter().map(Self::task_to_json).collect();
 
         JobJson {
-            id: job.id().to_string(),
+            id: *job.id(),
             code: job.code().to_string(),
             iter_num: job.iter_num(),
             status: job.status().clone(),
             tasks,
-            updated_by: job.updated_by_worker_id().to_string(),
+            updated_by: job.updated_by_worker_id(),
             started_at: job.started_at(),
             running_at: job.running_at(),
             completed_at: job.completed_at(),
@@ -312,10 +428,17 @@ impl S3Storage {
             json.input,
             json.output,
             json.error,
+            json.depends_on,
         )
     }
 
-    fn job_from_json(json: JobJson, max_iterations: u64, version: &str) -> Job {
+    fn job_from_json(
+        json: JobJson,
+        max_iterations: Option<u64>,
+        iteration_interval: Option<chrono::Duration>,
+        task_limits: crate::TaskLimits,
+        version: &str,
+    ) -> Job {
         let tasks: Vec<Task> = json.tasks.into_iter().map(Self::task_from_json).collect();
 
         Job::restore(
@@ -332,6 +455,8 @@ impl S3Storage {
             json.next_start_at,
             json.metadata.unwrap_or_default(),
             max_iterations,
+            iteration_interval,
+            task_limits,
         )
     }
 
@@ -344,7 +469,7 @@ impl S3Storage {
             .bucket(&self.bucket_name)
             .key(key)
             .body(ByteStream::from(job_serialized))
-            .content_type("application/json")
+            .content_type(self.codec.content_type())
             .if_none_match("*")
             .send()
             .await;
@@ -376,7 +501,7 @@ impl S3Storage {
             .bucket(&self.bucket_name)
             .key(key)
             .body(ByteStream::from(job_serialized))
-            .content_type("application/json")
+            .content_type(self.codec.content_type())
             .if_match(version)
             .send()
             .await;
@@ -401,8 +526,8 @@ impl Storage for S3Storage {
         if cancel_token.is_cancelled() {
             return Err(StorageError::Cancelled);
         }
-        // TODO(low): perhaps should try to get current job iteration first and read new file on miss. But
-        // if job has few tasks, we'll miss often and make extra requests
+        // TODO(low): perhaps should try to get current job iteration first and read new file on miss.
+        // But if job has few tasks, we'll miss often and make extra requests
 
         let job_code_for_retry = job_code.clone();
         let job_opt = self
@@ -498,7 +623,7 @@ impl Storage for S3Storage {
         let contents = result.contents();
         if let Some(object) = contents.first() {
             if let (Some(key), Some(etag)) = (object.key(), object.e_tag()) {
-                let iter_num = Self::parse_iter_num_from_path(key)?;
+                let iter_num = self.parse_iter_num_from_path(key)?;
                 return Ok(JobMeta {
                     code: job_code.clone(),
                     iter_num,
@@ -518,7 +643,7 @@ impl Storage for S3Storage {
         }
         let is_new_iter = job.is_started();
         let version = job.version().to_string();
-        let data = Arc::new(Self::serialize_job(job)?);
+        let data = Arc::new(self.serialize_job(job)?);
         let key = self.build_state_path(job.code(), job.iter_num());
 
         if job.is_started() {

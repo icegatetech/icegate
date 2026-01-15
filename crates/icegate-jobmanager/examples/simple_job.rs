@@ -11,15 +11,16 @@ use icegate_jobmanager::{
     Error, JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition,
     registry::TaskExecutorFn,
-    s3_storage::{S3Storage, S3StorageConfig},
+    s3_storage::{JobStateCodecKind, S3Storage, S3StorageConfig},
 };
 
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    run_simple_job().await
+    run_simple_job(JobStateCodecKind::Json, "simple-json".to_string()).await
 }
 
-async fn run_simple_job() -> Result<(), Error> {
+pub async fn run_simple_job(codec: JobStateCodecKind, bucket_prefix: String) -> Result<(), Error> {
     // Initialize tracing/logging
     tracing_subscriber::fmt()
         .with_target(false)
@@ -34,7 +35,7 @@ async fn run_simple_job() -> Result<(), Error> {
     // 2. Map executor for task
     let task_executor: TaskExecutorFn = Arc::new(|task, manager, _cancel_token| {
         // Extract task ID before async block to avoid Send trait issues
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
 
         Box::pin(async move {
             tracing::info!("Executing task: {}", task_id);
@@ -51,12 +52,7 @@ async fn run_simple_job() -> Result<(), Error> {
     task_executors.insert(TaskCode::new("my task code"), task_executor);
 
     // 3. Define the job
-    let job_def = JobDefinition::new(
-        JobCode::new("simple job"),
-        vec![task_def],
-        task_executors,
-        0, // max_iterations (0 = unlimited)
-    )?;
+    let job_def = JobDefinition::new(JobCode::new("simple job"), vec![task_def], task_executors)?;
 
     // 4. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
@@ -70,7 +66,8 @@ async fn run_simple_job() -> Result<(), Error> {
             bucket_name: "jobs".to_string(),
             use_ssl: false,
             region: "us-east-1".to_string(),
-            bucket_prefix: "jobs".to_string(),
+            bucket_prefix: bucket_prefix.clone(),
+            job_state_codec: codec,
             request_timeout: Duration::from_secs(5),
             retrier_config: RetrierConfig::default(),
         },

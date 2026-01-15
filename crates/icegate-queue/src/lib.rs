@@ -43,11 +43,13 @@ mod accumulator;
 mod channel;
 mod config;
 mod error;
+mod reader;
 mod segment;
 mod writer;
 
 pub use channel::{Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult, channel};
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
+pub use reader::{GroupedSegmentsPlan, QueueReader, SegmentRecordBatchIdxs, SegmentsPlan};
 pub use segment::SegmentId;
 pub use writer::QueueWriter;

@@ -19,13 +19,18 @@ path = "src/main.rs"
 
 [dependencies]
 icegate-common = { workspace = true }
+icegate-jobmanager = { path = "../icegate-jobmanager" }
 icegate-queue = { path = "../icegate-queue" }
 
 # Apache Arrow
 arrow = { workspace = true }
+parquet = { workspace = true }
 
 # Iceberg
 iceberg = { workspace = true }
+
+# Object Store
+object_store = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -40,6 +45,8 @@ serde_json = { workspace = true }
 
 # Utilities
 hex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 # HTTP server
 axum = { workspace = true }

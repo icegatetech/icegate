@@ -15,7 +15,7 @@ use crate::{
     JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
-    s3_storage::{S3Storage, S3StorageConfig},
+    s3_storage::{JobStateCodecKind, S3Storage, S3StorageConfig},
 };
 
 /// `TestDynamicTaskCreation` verifies that an executor can create new tasks dynamically
@@ -36,7 +36,7 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
     // Initial task creates multiple dynamic tasks
     let init_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let executed = Arc::clone(&init_executed_clone);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
 
         Box::pin(async move {
             executed.store(true, Ordering::SeqCst);
@@ -58,7 +58,7 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
     // Dynamic task executor
     let dynamic_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let executed = Arc::clone(&dynamic_executed_clone);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
 
         Box::pin(async move {
             executed.fetch_add(1, Ordering::SeqCst);
@@ -72,12 +72,8 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
     executors.insert(TaskCode::new("init_task"), init_executor);
     executors.insert(TaskCode::new("dynamic_task"), dynamic_executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("test_dynamic_job"),
-        vec![init_task_def],
-        executors,
-        1, // max_iterations
-    )?;
+    let job_def =
+        JobDefinition::new(JobCode::new("test_dynamic_job"), vec![init_task_def], executors)?.with_max_iterations(1)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -92,6 +88,7 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
             use_ssl: false,
             region: "us-east-1".to_string(),
             bucket_prefix: "jobs".to_string(),
+            job_state_codec: JobStateCodecKind::Json,
             request_timeout: Duration::from_secs(5),
             retrier_config: RetrierConfig::default(),
         },

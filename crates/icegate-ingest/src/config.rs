@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{otlp_grpc::OtlpGrpcConfig, otlp_http::OtlpHttpConfig};
 use crate::error::Result;
+use crate::shift::ShiftConfig;
 
 /// Ingest binary configuration
 ///
@@ -26,6 +27,9 @@ pub struct IngestConfig {
     /// Queue configuration for WAL-based ingestion
     #[serde(default)]
     pub queue: Option<QueueConfig>,
+    /// Shift configuration for moving WAL to Iceberg
+    #[serde(default)]
+    pub shift: ShiftConfig,
     /// OTLP HTTP server
     pub otlp_http: OtlpHttpConfig,
     /// OTLP gRPC server
@@ -54,6 +58,7 @@ impl IngestConfig {
         self.storage.validate()?;
         self.otlp_http.validate()?;
         self.otlp_grpc.validate()?;
+        self.shift.validate()?;
 
         // Check for port conflicts among enabled servers
         check_port_conflicts(&[&self.otlp_http, &self.otlp_grpc])?;

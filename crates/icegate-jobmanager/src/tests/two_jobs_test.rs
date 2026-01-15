@@ -16,7 +16,7 @@ use crate::{
     CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
-    s3_storage::{S3Storage, S3StorageConfig},
+    s3_storage::{JobStateCodecKind, S3Storage, S3StorageConfig},
 };
 
 /// Runs two jobs in parallel with two workers.
@@ -44,7 +44,7 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let primary_job_count = Arc::clone(&primary_job_count_clone);
         let secondary_job_count = Arc::clone(&secondary_job_count_clone);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
         let payload = task.get_input().to_vec();
 
         Box::pin(async move {
@@ -85,18 +85,10 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
         )?);
     }
 
-    let primary_job_def = JobDefinition::new(
-        primary_job_code.clone(),
-        primary_tasks,
-        primary_executors,
-        max_iterations,
-    )?;
-    let secondary_job_def = JobDefinition::new(
-        secondary_job_code.clone(),
-        secondary_tasks,
-        secondary_executors,
-        max_iterations,
-    )?;
+    let primary_job_def = JobDefinition::new(primary_job_code.clone(), primary_tasks, primary_executors)?
+        .with_max_iterations(max_iterations)?;
+    let secondary_job_def = JobDefinition::new(secondary_job_code.clone(), secondary_tasks, secondary_executors)?
+        .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![
@@ -115,6 +107,7 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
                 use_ssl: false,
                 region: "us-east-1".to_string(),
                 bucket_prefix: "jobs".to_string(),
+                job_state_codec: JobStateCodecKind::Json,
                 request_timeout: Duration::from_millis(100),
                 retrier_config: RetrierConfig::default(),
             },

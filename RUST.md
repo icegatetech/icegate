@@ -104,6 +104,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - Prefer composition to inheritance-like patterns
 - Use builder pattern for complex struct construction
 - Make fields private by default; provide accessor methods when needed
+- ALWAYS prefer to group the description of the structure and its implementation
 
 ## Testing
 
@@ -113,6 +114,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - Follow the Arrange-Act-Assert pattern
 - Do not commit commented-out tests
 - Use `#[cfg(test)]` modules for test code
+- Never check the error text in tests, only the types.
 
 ## Imports and Dependencies
 

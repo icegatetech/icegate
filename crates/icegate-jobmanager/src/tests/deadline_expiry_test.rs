@@ -16,7 +16,7 @@ use crate::{
     CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,
     registry::TaskExecutorFn,
-    s3_storage::{S3Storage, S3StorageConfig},
+    s3_storage::{JobStateCodecKind, S3Storage, S3StorageConfig},
 };
 
 /// `TestTaskDeadlineExpiry` verifies that a task started by one worker is re-picked by another worker after its deadline expires.
@@ -36,7 +36,7 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
 
     let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
         let count = Arc::clone(&attempt_count_clone);
-        let task_id = task.id().to_string();
+        let task_id = *task.id();
 
         Box::pin(async move {
             let attempt = count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -61,12 +61,8 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     let mut executors = HashMap::new();
     executors.insert(TaskCode::new("hanging_task"), executor);
 
-    let job_def = JobDefinition::new(
-        JobCode::new("test_deadline_job"),
-        vec![task_def.clone()],
-        executors,
-        1, // max_iterations
-    )?;
+    let job_def = JobDefinition::new(JobCode::new("test_deadline_job"), vec![task_def.clone()], executors)?
+        .with_max_iterations(1)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -82,6 +78,7 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
                 use_ssl: false,
                 region: "us-east-1".to_string(),
                 bucket_prefix: "jobs".to_string(),
+                job_state_codec: JobStateCodecKind::Json,
                 request_timeout: Duration::from_millis(100),
                 retrier_config: RetrierConfig::default(),
             },

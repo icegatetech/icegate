@@ -20,7 +20,7 @@ pub struct SegmentId {
 impl SegmentId {
     /// Creates a new segment ID.
     #[must_use]
-    pub fn new(topic: impl Into<Topic>, offset: u64) -> Self {
+    pub(crate) fn new(topic: impl Into<Topic>, offset: u64) -> Self {
         Self {
             topic: topic.into(),
             offset,
@@ -31,7 +31,7 @@ impl SegmentId {
     ///
     /// Format: `{topic}/{offset}.parquet`
     #[must_use]
-    pub fn to_path(&self) -> Path {
+    pub(crate) fn to_relative_path(&self) -> Path {
         Path::from(format!(
             "{}/{:0>width$}.parquet",
             self.topic,
@@ -43,7 +43,7 @@ impl SegmentId {
     /// Parses a segment ID from an object store path.
     ///
     /// Expected format: `{topic}/{offset}.parquet`
-    pub fn from_path(path: &Path) -> Result<Self, QueueError> {
+    pub(crate) fn from_relative_path(path: &Path) -> Result<Self, QueueError> {
         let path_str = path.as_ref();
         let parts: Vec<&str> = path_str.split('/').collect();
 
@@ -75,13 +75,13 @@ mod tests {
     #[test]
     fn test_segment_id_to_path() {
         let id = SegmentId::new("logs", 42);
-        assert_eq!(id.to_path().as_ref(), "logs/00000000000000000042.parquet");
+        assert_eq!(id.to_relative_path().as_ref(), "logs/00000000000000000042.parquet");
     }
 
     #[test]
     fn test_segment_id_from_path() {
         let path = Path::from("logs/00000000000000000042.parquet");
-        let id = SegmentId::from_path(&path).unwrap();
+        let id = SegmentId::from_relative_path(&path).unwrap();
         assert_eq!(id.topic, "logs");
         assert_eq!(id.offset, 42);
     }
@@ -89,16 +89,19 @@ mod tests {
     #[test]
     fn test_segment_id_from_path_to_string() {
         let path = Path::from("logs/00000000000000000042.parquet");
-        let id = SegmentId::from_path(&path).unwrap();
+        let id = SegmentId::from_relative_path(&path).unwrap();
         assert_eq!(id.topic, "logs");
         assert_eq!(id.offset, 42);
-        assert_eq!(format!("{}", id.to_path()), "logs/00000000000000000042.parquet");
+        assert_eq!(
+            format!("{}", id.to_relative_path()),
+            "logs/00000000000000000042.parquet"
+        );
     }
 
     #[test]
     fn test_segment_id_from_path_nested_topic() {
         let path = Path::from("tenant/acme/logs/00000000000000000001.parquet");
-        let id = SegmentId::from_path(&path).unwrap();
+        let id = SegmentId::from_relative_path(&path).unwrap();
         assert_eq!(id.topic, "tenant/acme/logs");
         assert_eq!(id.offset, 1);
     }
@@ -106,8 +109,8 @@ mod tests {
     #[test]
     fn test_segment_id_roundtrip() {
         let original = SegmentId::new("events", 999);
-        let path = original.to_path();
-        let parsed = SegmentId::from_path(&path).unwrap();
+        let path = original.to_relative_path();
+        let parsed = SegmentId::from_relative_path(&path).unwrap();
         assert_eq!(original, parsed);
     }
 }
