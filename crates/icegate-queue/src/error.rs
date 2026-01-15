@@ -1,6 +1,6 @@
 //! Error types for the queue crate.
 
-use std::io;
+use std::{error::Error, io};
 
 /// Result type for queue operations.
 pub type Result<T> = std::result::Result<T, QueueError>;
@@ -110,4 +110,63 @@ impl icegate_common::RetryError for QueueError {
     fn max_attempts() -> Self {
         Self::MaxAttemptsReached
     }
+}
+
+impl QueueError {
+    /// Returns true when the error can be retried safely.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Write { source, .. } | Self::Read { source, .. } => is_retryable_error_chain(source.as_ref()),
+            Self::ObjectStore(err) => is_retryable_object_store(err),
+            Self::Io(err) => is_retryable_io(err),
+            Self::Multiple(errors) => errors.iter().all(Self::is_retryable),
+            Self::Cancelled
+            | Self::MaxAttemptsReached
+            | Self::AlreadyExists { .. }
+            | Self::Recovery { .. }
+            | Self::InvalidPath { .. }
+            | Self::Parquet(_)
+            | Self::Arrow(_)
+            | Self::Json(_)
+            | Self::ChannelClosed
+            | Self::Config(_)
+            | Self::Metadata(_) => false,
+        }
+    }
+}
+
+fn is_retryable_object_store(err: &object_store::Error) -> bool {
+    match err {
+        object_store::Error::Generic { source, .. } => is_retryable_error_chain(source.as_ref()),
+        _ => false,
+    }
+}
+
+fn is_retryable_error_chain(err: &(dyn Error + 'static)) -> bool {
+    let mut current: Option<&(dyn Error + 'static)> = Some(err);
+    while let Some(error) = current {
+        if let Some(io_err) = error.downcast_ref::<io::Error>() {
+            if is_retryable_io(io_err) {
+                return true;
+            }
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn is_retryable_io(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    )
 }

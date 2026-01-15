@@ -36,6 +36,10 @@ pub enum IngestError {
     #[error("iceberg error: {0}")]
     Iceberg(#[from] iceberg::Error),
 
+    /// Arrow error.
+    #[error("arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+
     /// Runtime error
     #[error("join error: {0}")]
     Join(#[from] tokio::task::JoinError),
@@ -75,10 +79,62 @@ impl From<icegate_common::error::CommonError> for IngestError {
     }
 }
 
-impl From<arrow::error::ArrowError> for IngestError {
-    fn from(err: arrow::error::ArrowError) -> Self {
-        Self::Other(Box::new(err))
+impl IngestError {
+    /// Returns true when the error can be retried safely.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Iceberg(err) => err.retryable(),
+            Self::Io(err) => is_retryable_io(err),
+            Self::Queue(err) => err.is_retryable(),
+            Self::Other(err) => is_retryable_error_chain(err.as_ref()),
+            Self::Multiple(errors) => errors.iter().all(Self::is_retryable),
+            Self::Decode(_)
+            | Self::Validation(_)
+            | Self::NotImplemented(_)
+            | Self::Config(_)
+            | Self::Cancelled
+            | Self::MaxAttemptsReached
+            | Self::Arrow(_)
+            | Self::Join(_)
+            | Self::Shift(_) => false,
+        }
     }
+}
+
+fn is_retryable_error_chain(err: &(dyn Error + 'static)) -> bool {
+    let mut current: Option<&(dyn Error + 'static)> = Some(err);
+    while let Some(error) = current {
+        if let Some(io_err) = error.downcast_ref::<io::Error>() {
+            if is_retryable_io(io_err) {
+                return true;
+            }
+        }
+
+        if let Some(iceberg_err) = error.downcast_ref::<iceberg::Error>() {
+            if iceberg_err.retryable() {
+                return true;
+            }
+        }
+
+        current = error.source();
+    }
+    false
+}
+
+fn is_retryable_io(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    )
 }
 
 impl icegate_common::RetryError for IngestError {

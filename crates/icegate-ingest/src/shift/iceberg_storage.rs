@@ -282,7 +282,7 @@ impl IcebergStorage {
             usize::try_from(total_rows).map_err(|_| IngestError::Shift("row count exceeds usize".to_string()))?;
 
         tracing::info!(
-            "Start commiting Iceberg with {} parquet files with {} total rows for '{}'",
+            "Start committing Iceberg with {} parquet files with {} total rows for '{}'",
             data_files.len(),
             total_rows,
             record_type
@@ -339,8 +339,8 @@ impl IcebergStorage {
                         match fut.await {
                             Ok(value) => Ok((false, Ok(value))),
                             Err(err) => {
-                                tracing::warn!(?err, "Iceberg storage operation failed, retrying");
-                                Ok((true, Err(err)))
+                                tracing::debug!(?err, "Iceberg storage operation failed, retrying");
+                                Ok((err.is_retryable(), Err(err)))
                             }
                         }
                     }
