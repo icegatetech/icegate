@@ -5,10 +5,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow::{compute::SortOptions, record_batch::RecordBatch};
+use arrow::{
+    array::{make_array, ArrayRef},
+    compute::SortOptions,
+    datatypes::{DataType, Schema},
+    record_batch::RecordBatch,
+};
+use arrow_data::ArrayData;
 use async_trait::async_trait;
 use iceberg::{
-    arrow::RecordBatchPartitionSplitter, spec::{DataFile, DataFileFormat}, table::Table,
+    arrow::{schema_to_arrow_schema, RecordBatchPartitionSplitter},
+    spec::{DataFile, DataFileFormat},
+    table::Table,
     transaction::{ApplyTransactionAction, Transaction},
     writer::{
         base_writer::data_file_writer::DataFileWriterBuilder,
@@ -330,7 +338,10 @@ impl IcebergStorage {
                     async move {
                         match fut.await {
                             Ok(value) => Ok((false, Ok(value))),
-                            Err(err) => Ok((true, Err(err))),
+                            Err(err) => {
+                                tracing::warn!(?err, "Iceberg storage operation failed, retrying");
+                                Ok((true, Err(err)))
+                            }
                         }
                     }
                 },
