@@ -12,8 +12,7 @@ use std::sync::Arc;
 use datafusion::{
     arrow::{
         array::{
-            ArrayRef, FixedSizeBinaryBuilder, Int32Array, MapBuilder, MapFieldNames, RecordBatch, StringArray,
-            StringBuilder, TimestampMicrosecondArray,
+            ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
         },
         datatypes::DataType,
     },
@@ -160,7 +159,7 @@ pub async fn write_test_logs_for_tenant(
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(vec![tenant_id, tenant_id, tenant_id]));
-    let account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
+    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
     let service_name_arr: ArrayRef = Arc::new(StringArray::from(vec![
         Some(service_name),
         Some(service_name),
@@ -179,21 +178,18 @@ pub async fn write_test_logs_for_tenant(
     let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
         now_micros, now_micros, now_micros,
     ]));
-    let severity_number: ArrayRef = Arc::new(Int32Array::from(vec![Some(9), Some(9), Some(13)]));
-    let severity_text: ArrayRef = Arc::new(StringArray::from(vec![Some("INFO"), Some("INFO"), Some("WARN")]));
+    let severity_text: ArrayRef = Arc::new(StringArray::from(vec![Some("INFO"), Some("WARN"), Some("ERROR")]));
     let body: ArrayRef = Arc::new(StringArray::from(vec![
         Some(format!("{} message 1", body_prefix)),
         Some(format!("{} message 2", body_prefix)),
         Some(format!("{} message 3", body_prefix)),
     ]));
-    let flags: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>, None, None]));
-    let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![0, 0, 0]));
 
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(11);
+    let attributes_field = arrow_schema.field(10);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -213,49 +209,75 @@ pub async fn write_test_logs_for_tenant(
         .with_keys_field(key_field)
         .with_values_field(value_field);
 
-    for _ in 0..3 {
+    // Test data trace_id and span_id values as hex strings
+    let trace_ids = [
+        "0102030405060708090a0b0c0d0e0f10",
+        "1112131415161718191a1b1c1d1e1f20",
+        "2122232425262728292a2b2c2d2e2f30",
+    ];
+    let span_ids = ["0102030405060708", "1112131415161718", "2122232425262728"];
+    let severity_texts = ["INFO", "WARN", "ERROR"];
+    let bodies = [
+        format!("{} message 1", body_prefix),
+        format!("{} message 2", body_prefix),
+        format!("{} message 3", body_prefix),
+    ];
+
+    for i in 0..3 {
+        // tenant_marker
         attributes_builder.keys().append_value("tenant_marker");
         attributes_builder.values().append_value(tenant_id);
+        // service_name (duplicate indexed column into attributes)
+        attributes_builder.keys().append_value("service_name");
+        attributes_builder.values().append_value(service_name);
+        // cloud_account_id (duplicate indexed column into attributes)
+        attributes_builder.keys().append_value("cloud_account_id");
+        attributes_builder.values().append_value("acc-1");
+        // trace_id (duplicate indexed column into attributes)
+        attributes_builder.keys().append_value("trace_id");
+        attributes_builder.values().append_value(trace_ids[i]);
+        // span_id (duplicate indexed column into attributes)
+        attributes_builder.keys().append_value("span_id");
+        attributes_builder.values().append_value(span_ids[i]);
+        // severity_text (duplicate indexed column into attributes)
+        attributes_builder.keys().append_value("severity_text");
+        attributes_builder.values().append_value(severity_texts[i]);
+        // body (duplicate indexed column into attributes)
+        attributes_builder.keys().append_value("body");
+        attributes_builder.values().append_value(bodies[i].as_str());
         attributes_builder.append(true)?;
     }
 
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    trace_id_builder.append_value([
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    ])?;
-    trace_id_builder.append_value([
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-    ])?;
-    trace_id_builder.append_value([
-        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
-    ])?;
+    let mut trace_id_builder = StringBuilder::new();
+    // Hex-encoded trace IDs (16 bytes → 32 hex chars)
+    for tid in trace_ids {
+        trace_id_builder.append_value(tid);
+    }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
-    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
-    span_id_builder.append_value([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])?;
-    span_id_builder.append_value([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18])?;
-    span_id_builder.append_value([0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28])?;
+    let mut span_id_builder = StringBuilder::new();
+    // Hex-encoded span IDs (8 bytes → 16 hex chars)
+    for sid in span_ids {
+        span_id_builder.append_value(sid);
+    }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
     let batch = RecordBatch::try_new(
         arrow_schema.clone(),
         vec![
             tenant_id_arr,
-            account_id,
+            cloud_account_id,
             service_name_arr,
             timestamp,
             observed_timestamp,
             ingested_timestamp,
             trace_id,
             span_id,
-            severity_number,
             severity_text,
             body,
             attributes,
-            flags,
-            dropped_attributes_count,
         ],
     )?;
 
@@ -290,6 +312,7 @@ pub async fn write_test_logs_for_tenant(
 }
 
 /// Write standard test log data to an Iceberg table
+#[allow(clippy::too_many_lines)]
 pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Result<(), Box<dyn std::error::Error>> {
     let now_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -297,7 +320,7 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         .as_micros() as i64;
 
     let tenant_id: ArrayRef = Arc::new(StringArray::from(vec!["test-tenant", "test-tenant", "test-tenant"]));
-    let account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
+    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
     let service_name: ArrayRef = Arc::new(StringArray::from(vec![
         Some("frontend"),
         Some("frontend"),
@@ -316,21 +339,18 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
     let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
         now_micros, now_micros, now_micros,
     ]));
-    let severity_number: ArrayRef = Arc::new(Int32Array::from(vec![Some(9), Some(9), Some(13)]));
-    let severity_text: ArrayRef = Arc::new(StringArray::from(vec![Some("INFO"), Some("INFO"), Some("WARN")]));
+    let severity_text: ArrayRef = Arc::new(StringArray::from(vec![Some("INFO"), Some("WARN"), Some("ERROR")]));
     let body: ArrayRef = Arc::new(StringArray::from(vec![
         Some("User logged in successfully"),
         Some("Page rendered in 120ms"),
         Some("Database connection slow"),
     ]));
-    let flags: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>, None, None]));
-    let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![0, 0, 0]));
 
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(11);
+    let attributes_field = arrow_schema.field(10);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -350,62 +370,108 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         .with_keys_field(key_field)
         .with_values_field(value_field);
 
+    // Test data trace_id and span_id values as hex strings
+    let trace_ids = [
+        "0102030405060708090a0b0c0d0e0f10",
+        "1112131415161718191a1b1c1d1e1f20",
+        "2122232425262728292a2b2c2d2e2f30",
+    ];
+    let span_ids = ["0102030405060708", "1112131415161718", "2122232425262728"];
+    let severity_texts = ["INFO", "WARN", "ERROR"];
+    let bodies = [
+        "User logged in successfully",
+        "Page rendered in 120ms",
+        "Database connection slow",
+    ];
+
     // Row 0
     attributes_builder.keys().append_value("user_id");
     attributes_builder.values().append_value("user-123");
     attributes_builder.keys().append_value("request_id");
     attributes_builder.values().append_value("req-456");
+    // Duplicate indexed columns into attributes
+    attributes_builder.keys().append_value("service_name");
+    attributes_builder.values().append_value("frontend");
+    attributes_builder.keys().append_value("cloud_account_id");
+    attributes_builder.values().append_value("acc-1");
+    attributes_builder.keys().append_value("trace_id");
+    attributes_builder.values().append_value(trace_ids[0]);
+    attributes_builder.keys().append_value("span_id");
+    attributes_builder.values().append_value(span_ids[0]);
+    attributes_builder.keys().append_value("severity_text");
+    attributes_builder.values().append_value(severity_texts[0]);
+    attributes_builder.keys().append_value("body");
+    attributes_builder.values().append_value(bodies[0]);
     attributes_builder.append(true)?;
     // Row 1
     attributes_builder.keys().append_value("page");
     attributes_builder.values().append_value("/dashboard");
     attributes_builder.keys().append_value("latency_ms");
     attributes_builder.values().append_value("120");
+    // Duplicate indexed columns into attributes
+    attributes_builder.keys().append_value("service_name");
+    attributes_builder.values().append_value("frontend");
+    attributes_builder.keys().append_value("cloud_account_id");
+    attributes_builder.values().append_value("acc-1");
+    attributes_builder.keys().append_value("trace_id");
+    attributes_builder.values().append_value(trace_ids[1]);
+    attributes_builder.keys().append_value("span_id");
+    attributes_builder.values().append_value(span_ids[1]);
+    attributes_builder.keys().append_value("severity_text");
+    attributes_builder.values().append_value(severity_texts[1]);
+    attributes_builder.keys().append_value("body");
+    attributes_builder.values().append_value(bodies[1]);
     attributes_builder.append(true)?;
     // Row 2
     attributes_builder.keys().append_value("db_host");
     attributes_builder.values().append_value("db-primary");
     attributes_builder.keys().append_value("query_time_ms");
     attributes_builder.values().append_value("250");
+    // Duplicate indexed columns into attributes
+    attributes_builder.keys().append_value("service_name");
+    attributes_builder.values().append_value("backend");
+    attributes_builder.keys().append_value("cloud_account_id");
+    attributes_builder.values().append_value("acc-1");
+    attributes_builder.keys().append_value("trace_id");
+    attributes_builder.values().append_value(trace_ids[2]);
+    attributes_builder.keys().append_value("span_id");
+    attributes_builder.values().append_value(span_ids[2]);
+    attributes_builder.keys().append_value("severity_text");
+    attributes_builder.values().append_value(severity_texts[2]);
+    attributes_builder.keys().append_value("body");
+    attributes_builder.values().append_value(bodies[2]);
     attributes_builder.append(true)?;
 
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    trace_id_builder.append_value([
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    ])?;
-    trace_id_builder.append_value([
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-    ])?;
-    trace_id_builder.append_value([
-        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
-    ])?;
+    let mut trace_id_builder = StringBuilder::new();
+    // Hex-encoded trace IDs (16 bytes → 32 hex chars)
+    for tid in trace_ids {
+        trace_id_builder.append_value(tid);
+    }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
-    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
-    span_id_builder.append_value([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])?;
-    span_id_builder.append_value([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18])?;
-    span_id_builder.append_value([0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28])?;
+    let mut span_id_builder = StringBuilder::new();
+    // Hex-encoded span IDs (8 bytes → 16 hex chars)
+    for sid in span_ids {
+        span_id_builder.append_value(sid);
+    }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
     let batch = RecordBatch::try_new(
         arrow_schema.clone(),
         vec![
             tenant_id,
-            account_id,
+            cloud_account_id,
             service_name,
             timestamp,
             observed_timestamp,
             ingested_timestamp,
             trace_id,
             span_id,
-            severity_number,
             severity_text,
             body,
             attributes,
-            flags,
-            dropped_attributes_count,
         ],
     )?;
 

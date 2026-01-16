@@ -12,8 +12,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use datafusion::arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Int32Array, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
-    TimestampMicrosecondArray,
+    ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::parquet::file::properties::WriterProperties;
@@ -155,11 +154,8 @@ pub async fn write_benchmark_logs(
     let mut timestamps = Vec::with_capacity(count);
     let mut observed_timestamps = Vec::with_capacity(count);
     let mut ingested_timestamps = Vec::with_capacity(count);
-    let mut severity_numbers = Vec::with_capacity(count);
     let mut severity_texts = Vec::with_capacity(count);
     let mut bodies = Vec::with_capacity(count);
-    let mut flags = Vec::with_capacity(count);
-    let mut dropped_attrs = Vec::with_capacity(count);
 
     let body_strs: Vec<String> = (0..count).map(|i| format!("Request processed successfully {}", i)).collect();
 
@@ -171,11 +167,8 @@ pub async fn write_benchmark_logs(
         timestamps.push(ts);
         observed_timestamps.push(ts);
         ingested_timestamps.push(now_micros);
-        severity_numbers.push(Some(9));
         severity_texts.push(Some("INFO"));
         bodies.push(Some(body_str.as_str()));
-        flags.push(None::<i32>);
-        dropped_attrs.push(0);
     }
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids));
@@ -184,17 +177,16 @@ pub async fn write_benchmark_logs(
     let timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps));
     let observed_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(observed_timestamps));
     let ingested_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(ingested_timestamps));
-    let severity_number_arr: ArrayRef = Arc::new(Int32Array::from(severity_numbers));
     let severity_text_arr: ArrayRef = Arc::new(StringArray::from(severity_texts));
     let body_arr: ArrayRef = Arc::new(StringArray::from(bodies));
-    let flags_arr: ArrayRef = Arc::new(Int32Array::from(flags));
-    let dropped_attrs_arr: ArrayRef = Arc::new(Int32Array::from(dropped_attrs));
 
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(11);
+    let attributes_field = arrow_schema
+        .field_with_name("attributes")
+        .expect("Schema must contain an 'attributes' field");
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -222,14 +214,13 @@ pub async fn write_benchmark_logs(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
+    // Create hex-encoded trace and span IDs (matching logs schema)
+    let mut trace_id_builder = StringBuilder::new();
+    let mut span_id_builder = StringBuilder::new();
 
     for _ in 0..count {
-        trace_id_builder.append_value([
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-        ])?;
-        span_id_builder.append_value([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])?;
+        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
+        span_id_builder.append_value("0102030405060708");
     }
 
     let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
@@ -246,12 +237,9 @@ pub async fn write_benchmark_logs(
             ingested_timestamp_arr,
             trace_id_arr,
             span_id_arr,
-            severity_number_arr,
             severity_text_arr,
             body_arr,
             attributes_arr,
-            flags_arr,
-            dropped_attrs_arr,
         ],
     )?;
 
@@ -293,11 +281,8 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
     let mut timestamps = Vec::with_capacity(count);
     let mut observed_timestamps = Vec::with_capacity(count);
     let mut ingested_timestamps = Vec::with_capacity(count);
-    let mut severity_numbers = Vec::with_capacity(count);
     let mut severity_texts = Vec::with_capacity(count);
     let mut bodies = Vec::with_capacity(count);
-    let mut flags = Vec::with_capacity(count);
-    let mut dropped_attrs = Vec::with_capacity(count);
 
     let body_strs: Vec<String> = (0..count).map(|i| format!("Request processed {}", i)).collect();
 
@@ -309,11 +294,8 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
         timestamps.push(ts);
         observed_timestamps.push(ts);
         ingested_timestamps.push(now_micros);
-        severity_numbers.push(Some(9));
         severity_texts.push(Some("INFO"));
         bodies.push(Some(body_str.as_str()));
-        flags.push(None::<i32>);
-        dropped_attrs.push(0);
     }
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids));
@@ -322,17 +304,16 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
     let timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps));
     let observed_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(observed_timestamps));
     let ingested_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(ingested_timestamps));
-    let severity_number_arr: ArrayRef = Arc::new(Int32Array::from(severity_numbers));
     let severity_text_arr: ArrayRef = Arc::new(StringArray::from(severity_texts));
     let body_arr: ArrayRef = Arc::new(StringArray::from(bodies));
-    let flags_arr: ArrayRef = Arc::new(Int32Array::from(flags));
-    let dropped_attrs_arr: ArrayRef = Arc::new(Int32Array::from(dropped_attrs));
 
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(11);
+    let attributes_field = arrow_schema
+        .field_with_name("attributes")
+        .expect("Schema must contain an 'attributes' field");
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -364,14 +345,13 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
+    // Create hex-encoded trace and span IDs (matching logs schema)
+    let mut trace_id_builder = StringBuilder::new();
+    let mut span_id_builder = StringBuilder::new();
 
     for _ in 0..count {
-        trace_id_builder.append_value([
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-        ])?;
-        span_id_builder.append_value([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])?;
+        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
+        span_id_builder.append_value("0102030405060708");
     }
 
     let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
@@ -388,12 +368,9 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
             ingested_timestamp_arr,
             trace_id_arr,
             span_id_arr,
-            severity_number_arr,
             severity_text_arr,
             body_arr,
             attributes_arr,
-            flags_arr,
-            dropped_attrs_arr,
         ],
     )?;
 
@@ -424,11 +401,8 @@ pub async fn write_benchmark_logs_with_varied_labels(
     let mut timestamps = Vec::with_capacity(count);
     let mut observed_timestamps = Vec::with_capacity(count);
     let mut ingested_timestamps = Vec::with_capacity(count);
-    let mut severity_numbers = Vec::with_capacity(count);
     let mut severity_texts = Vec::with_capacity(count);
     let mut bodies = Vec::with_capacity(count);
-    let mut flags = Vec::with_capacity(count);
-    let mut dropped_attrs = Vec::with_capacity(count);
 
     let body_strs: Vec<String> = (0..count).map(|i| format!("Request {} processed", i)).collect();
 
@@ -440,11 +414,8 @@ pub async fn write_benchmark_logs_with_varied_labels(
         timestamps.push(ts);
         observed_timestamps.push(ts);
         ingested_timestamps.push(now_micros);
-        severity_numbers.push(Some(9));
         severity_texts.push(Some("INFO"));
         bodies.push(Some(body_str.as_str()));
-        flags.push(None::<i32>);
-        dropped_attrs.push(0);
     }
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids));
@@ -453,17 +424,16 @@ pub async fn write_benchmark_logs_with_varied_labels(
     let timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps));
     let observed_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(observed_timestamps));
     let ingested_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(ingested_timestamps));
-    let severity_number_arr: ArrayRef = Arc::new(Int32Array::from(severity_numbers));
     let severity_text_arr: ArrayRef = Arc::new(StringArray::from(severity_texts));
     let body_arr: ArrayRef = Arc::new(StringArray::from(bodies));
-    let flags_arr: ArrayRef = Arc::new(Int32Array::from(flags));
-    let dropped_attrs_arr: ArrayRef = Arc::new(Int32Array::from(dropped_attrs));
 
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(11);
+    let attributes_field = arrow_schema
+        .field_with_name("attributes")
+        .expect("Schema must contain an 'attributes' field");
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -496,14 +466,13 @@ pub async fn write_benchmark_logs_with_varied_labels(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
+    // Create hex-encoded trace and span IDs (matching logs schema)
+    let mut trace_id_builder = StringBuilder::new();
+    let mut span_id_builder = StringBuilder::new();
 
     for _ in 0..count {
-        trace_id_builder.append_value([
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-        ])?;
-        span_id_builder.append_value([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])?;
+        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
+        span_id_builder.append_value("0102030405060708");
     }
 
     let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
@@ -520,12 +489,9 @@ pub async fn write_benchmark_logs_with_varied_labels(
             ingested_timestamp_arr,
             trace_id_arr,
             span_id_arr,
-            severity_number_arr,
             severity_text_arr,
             body_arr,
             attributes_arr,
-            flags_arr,
-            dropped_attrs_arr,
         ],
     )?;
 

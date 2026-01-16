@@ -30,7 +30,7 @@ These tables implement the OpenTelemetry Protocol (OTLP) data model for observab
 - **Metrics:** All metric types (gauge, sum, histogram, exponential histogram, summary)
 
 All tables include:
-- Multi-tenancy support (tenant_id, account_id)
+- Multi-tenancy support (tenant_id, cloud_account_id)
 - Time-based partitioning for efficient querying
 - Sorted data for better predicate pushdown
 - W3C trace context fields for correlation
@@ -50,13 +50,12 @@ The tables use the following Parquet optimizations:
 
 **Partitioning Strategy:**
 - `tenant_id` (identity) - Multi-tenancy isolation
-- `account_id` (identity) - Account-level partitioning (optional field, NULL values grouped together)
 - `day(timestamp)` - Time-based partitioning for efficient time-range queries
 
 **Sorting Strategy (table-specific):**
-- **Logs/Events:** `service_name` + `timestamp DESC` - Groups by service, recent-first
-- **Spans:** `trace_id` + `timestamp` - Groups by trace for efficient trace reconstruction
-- **Metrics:** `metric_name` + `service_name` + `timestamp DESC` - Groups by metric type and service
+- **Logs/Events:** `cloud_account_id` + `service_name` + `timestamp DESC` - Groups by account and service, recent-first
+- **Spans:** `cloud_account_id` + `service_name` + `trace_id` + `timestamp DESC` - Groups by account, service, and trace, recent-first
+- **Metrics:** `cloud_account_id` + `metric_name` + `service_name` + `service_instance_id` + `timestamp DESC` - Groups by account, metric, service, and service instance, recent-first
 
 ---
 
@@ -71,7 +70,7 @@ Based on OpenTelemetry LogRecord message from `opentelemetry/proto/logs/v1/logs.
 CREATE TABLE iceberg.triplecloud.logs (
     -- Multi-tenancy fields
     tenant_id VARCHAR NOT NULL,
-    account_id VARCHAR,              -- Optional for flexibility
+    cloud_account_id VARCHAR,        -- Optional for flexibility
     service_name VARCHAR,            -- Optional for flexibility
 
     -- Timestamp fields (microsecond precision)
@@ -80,27 +79,22 @@ CREATE TABLE iceberg.triplecloud.logs (
     ingested_timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,
 
     -- W3C trace context (for correlation with spans)
-    trace_id VARBINARY,  -- 16 bytes (128-bit trace ID)
-    span_id VARBINARY,   -- 8 bytes (64-bit span ID)
+    trace_id VARCHAR,    -- W3C trace ID as hex string (32 chars)
+    span_id VARCHAR,     -- W3C span ID as hex string (16 chars)
 
     -- Severity information
-    severity_number INTEGER,
     severity_text VARCHAR,
 
     -- Log body (simplified from AnyValue variant to String)
     body VARCHAR,                    -- Optional - may be empty for some log records
 
     -- Attributes (merged from resource, scope, and log-level attributes)
-    attributes MAP(VARCHAR, VARCHAR) NOT NULL,
-
-    -- Flags and monitoring
-    flags INTEGER,
-    dropped_attributes_count INTEGER NOT NULL
+    attributes MAP(VARCHAR, VARCHAR) NOT NULL
 )
 WITH (
     format = 'PARQUET',
-    partitioning = ARRAY['tenant_id', 'account_id', 'day(timestamp)'],
-    sorted_by = ARRAY['service_name', 'timestamp DESC'],  -- timestamp descending for recent-first ordering
+    partitioning = ARRAY['tenant_id', 'day(timestamp)'],
+    sorted_by = ARRAY['cloud_account_id', 'service_name', 'timestamp DESC'],  -- Recent-first within account and service
     compression_codec = 'ZSTD',
     format_version = 2
 );
@@ -129,12 +123,13 @@ Based on OpenTelemetry Span message from `opentelemetry/proto/trace/v1/trace.pro
 CREATE TABLE iceberg.triplecloud.spans (
     -- Multi-tenancy fields
     tenant_id VARCHAR NOT NULL,
-    account_id VARCHAR,              -- Optional for flexibility
+    cloud_account_id VARCHAR,        -- Optional for flexibility
+    service_name VARCHAR,            -- Optional for flexibility
 
     -- Trace identifiers (W3C trace context) - sorted by these for trace analysis
-    trace_id VARBINARY NOT NULL,      -- 16 bytes (128-bit)
-    span_id VARBINARY NOT NULL,       -- 8 bytes (64-bit)
-    parent_span_id VARBINARY,         -- 8 bytes (64-bit)
+    trace_id VARCHAR NOT NULL,        -- W3C trace ID as hex string (32 chars)
+    span_id VARCHAR NOT NULL,         -- W3C span ID as hex string (16 chars)
+    parent_span_id VARCHAR,           -- W3C span ID as hex string (16 chars)
 
     -- Timestamp fields
     timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,
@@ -169,8 +164,8 @@ CREATE TABLE iceberg.triplecloud.spans (
 
     -- Nested links (HAS trace_id/span_id - references linked span)
     links ARRAY(ROW(
-        trace_id VARBINARY,           -- 16 bytes
-        span_id VARBINARY,            -- 8 bytes
+        trace_id VARCHAR,             -- W3C trace ID as hex string (32 chars)
+        span_id VARCHAR,              -- W3C span ID as hex string (16 chars)
         trace_state VARCHAR,
         attributes MAP(VARCHAR, VARCHAR),
         dropped_attributes_count INTEGER,
@@ -179,8 +174,8 @@ CREATE TABLE iceberg.triplecloud.spans (
 )
 WITH (
     format = 'PARQUET',
-    partitioning = ARRAY['tenant_id', 'account_id', 'day(timestamp)'],
-    sorted_by = ARRAY['trace_id', 'timestamp'],  -- Sort by trace for efficient trace reconstruction
+    partitioning = ARRAY['tenant_id', 'day(timestamp)'],
+    sorted_by = ARRAY['cloud_account_id', 'service_name', 'trace_id', 'timestamp DESC'],  -- Recent-first within account, service, and trace
     compression_codec = 'ZSTD',
     format_version = 2
 );
@@ -210,7 +205,7 @@ See: https://opentelemetry.io/docs/specs/semconv/general/events/
 CREATE TABLE iceberg.triplecloud.events (
     -- Multi-tenancy fields
     tenant_id VARCHAR NOT NULL,
-    account_id VARCHAR,              -- Optional for flexibility
+    cloud_account_id VARCHAR,        -- Optional for flexibility
     service_name VARCHAR,            -- Optional for flexibility
 
     -- Timestamp fields
@@ -223,16 +218,16 @@ CREATE TABLE iceberg.triplecloud.events (
     event_name VARCHAR NOT NULL,
 
     -- Trace context (for correlation)
-    trace_id VARBINARY,               -- 16 bytes
-    span_id VARBINARY,                -- 8 bytes
+    trace_id VARCHAR,                 -- W3C trace ID as hex string (32 chars)
+    span_id VARCHAR,                  -- W3C span ID as hex string (16 chars)
 
     -- Event attributes
     attributes MAP(VARCHAR, VARCHAR) NOT NULL
 )
 WITH (
     format = 'PARQUET',
-    partitioning = ARRAY['tenant_id', 'account_id', 'day(timestamp)'],
-    sorted_by = ARRAY['service_name', 'timestamp DESC'],  -- timestamp descending for recent-first ordering
+    partitioning = ARRAY['tenant_id', 'day(timestamp)'],
+    sorted_by = ARRAY['cloud_account_id', 'service_name', 'timestamp DESC'],  -- Recent-first within account and service
     compression_codec = 'ZSTD',
     format_version = 2
 );
@@ -262,8 +257,9 @@ Combines all metric types (gauge, sum, histogram, exponential_histogram, summary
 CREATE TABLE iceberg.triplecloud.metrics (
     -- Multi-tenancy fields
     tenant_id VARCHAR NOT NULL,
-    account_id VARCHAR,              -- Optional for flexibility
+    cloud_account_id VARCHAR,        -- Optional for flexibility
     service_name VARCHAR NOT NULL,
+    service_instance_id VARCHAR,     -- Optional for flexibility
 
     -- Timestamp fields
     timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,
@@ -318,15 +314,15 @@ CREATE TABLE iceberg.triplecloud.metrics (
         timestamp TIMESTAMP(6) WITH TIME ZONE,
         value_double DOUBLE,
         value_int BIGINT,
-        span_id VARBINARY,                -- 8 bytes
-        trace_id VARBINARY,               -- 16 bytes
+        span_id VARCHAR,                  -- W3C span ID as hex string (16 chars)
+        trace_id VARCHAR,                 -- W3C trace ID as hex string (32 chars)
         attributes MAP(VARCHAR, VARCHAR)
     ))
 )
 WITH (
     format = 'PARQUET',
-    partitioning = ARRAY['tenant_id', 'account_id', 'day(timestamp)'],
-    sorted_by = ARRAY['metric_name', 'service_name', 'timestamp DESC'],  -- Group by metric, then service, recent-first
+    partitioning = ARRAY['tenant_id', 'day(timestamp)'],
+    sorted_by = ARRAY['cloud_account_id', 'metric_name', 'service_name', 'service_instance_id', 'timestamp DESC'],  -- Recent-first within account, metric, service, and service instance
     compression_codec = 'ZSTD',
     format_version = 2
 );
@@ -395,7 +391,7 @@ SELECT
     sum
 FROM iceberg.triplecloud.metrics
 WHERE tenant_id = 'tenant-123'
-  AND account_id = 'account-456'
+  AND cloud_account_id = 'account-456'
   AND date(timestamp) = DATE '2025-01-01'
   AND metric_type = 'histogram'
 ORDER BY timestamp;
@@ -430,8 +426,8 @@ Rust types from `schema.rs` mapped to Trino SQL types:
 | `Boolean` | `BOOLEAN` | True/false value |
 | `Double` | `DOUBLE` | 64-bit floating point |
 | `Timestamp` | `TIMESTAMP(6) WITH TIME ZONE` | Microsecond precision with timezone |
-| `Fixed(16)` | `VARBINARY` | 16-byte binary (trace_id) |
-| `Fixed(8)` | `VARBINARY` | 8-byte binary (span_id) |
+| `String` (trace_id) | `VARCHAR` | W3C trace ID as hex string (32 chars) |
+| `String` (span_id) | `VARCHAR` | W3C span ID as hex string (16 chars) |
 | `Map<String, String>` | `MAP(VARCHAR, VARCHAR)` | Key-value pairs |
 | `List<T>` | `ARRAY(T)` | Array of elements |
 | `Struct` | `ROW(...)` | Nested structure with named fields |
@@ -446,16 +442,19 @@ Rust types from `schema.rs` mapped to Trino SQL types:
 - Monitor partition sizes - aim for partitions with 100+ MB of data
 
 ### Sorting
-- `service_name` + `timestamp` sorting enables efficient predicate pushdown
-- Add additional sort columns if you frequently filter on other fields
+- Sorting by `cloud_account_id` first provides good data locality within tenant partitions
+- Additional sort columns (`metric_name`, `service_name`, `trace_id`) enable efficient predicate pushdown on sorted data
+- Descending timestamp ordering (recent-first) optimizes for common query patterns accessing recent data
 
 ### Compression
 - ZSTD provides excellent compression with good read/write performance
 - Alternative: Use SNAPPY for faster writes if compression ratio is less critical
 
 ### Query Optimization
-- Always filter on partition columns (tenant_id, account_id, timestamp)
+- **Partition columns:** `tenant_id` and `day(timestamp)` - filtering on these enables partition pruning
+- **Sort columns:** `cloud_account_id`, `metric_name`, `service_name`, `trace_id` - filtering on these benefits from optimized scanning of sorted data (predicate pushdown)
 - Use `date(timestamp)` in WHERE clauses to enable partition pruning
+- Filter on both partition and sort columns for best performance
 - Run `ANALYZE` after bulk data loads to update statistics
 
 ### Maintenance
@@ -475,12 +474,20 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 
 ---
 
-**Version:** 1.1
-**Last Updated:** 2025-11-12
+**Version:** 1.2
+**Last Updated:** 2025-01-13
 **Schema Source:** `src/common/schema.rs`
 
+**Notable Changes in v1.2:**
+- Renamed `account_id` to `cloud_account_id` across all tables for consistency with OTLP attribute naming
+- Added `service_name` field to spans table (previously missing, now optional for flexibility)
+- Added `service_instance_id` field to metrics table for service instance identification
+- Updated sorting strategies:
+  - Logs/Events: `cloud_account_id` → `service_name` → `timestamp DESC`
+  - Spans: `cloud_account_id` → `service_name` → `trace_id` → `timestamp DESC`
+  - Metrics: `cloud_account_id` → `metric_name` → `service_name` → `service_instance_id` → `timestamp DESC`
+
 **Notable Changes in v1.1:**
-- Updated field optionality: `account_id`, `service_name`, and `body` are now optional where applicable
-- Removed `service_name` field from spans table (use attributes map for service identification)
+- Updated field optionality: `cloud_account_id`, `service_name`, and `body` are now optional where applicable
 - Updated sorting strategies: logs/events use descending timestamp, spans sorted by trace_id
 - Adjusted Parquet row group size to 64 MB and page size to 1 MB for better performance
