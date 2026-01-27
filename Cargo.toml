@@ -73,9 +73,9 @@ antlr4rust = "0.5"
 # Patches: DataFusion 51 + Arrow 57 compat (upstream PR #1830 closed), memory catalog enhancements
 # Upstream plan: Switch back when DataFusion 51 officially supported upstream
 # Maintenance: develop branch rebased on upstream main; run `make ci` after each sync
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "f1ba3920de5fb7494ef3f83be495d2de43e230e9" }
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "6946f3197bc3958d38af275933c188b957920a88" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "6946f3197bc3958d38af275933c188b957920a88" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "6946f3197bc3958d38af275933c188b957920a88" }
 
 # DataFusion
 datafusion = "51"
