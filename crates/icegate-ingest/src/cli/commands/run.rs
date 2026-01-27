@@ -103,17 +103,15 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let mut handles = Vec::new();
 
     if let Some(metrics_runtime) = metrics_runtime.as_ref() {
-        if config.metrics.enabled {
-            let metrics_config = config.metrics.clone();
-            let token = cancel_token.clone();
-            let registry = metrics_runtime.registry();
-            let handle = tokio::spawn(async move {
-                run_metrics_server(metrics_config, registry, token)
-                    .await
-                    .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
-            });
-            handles.push(handle);
-        }
+        let metrics_config = config.metrics.clone();
+        let token = cancel_token.clone();
+        let registry = metrics_runtime.registry();
+        let handle = tokio::spawn(async move {
+            run_metrics_server(metrics_config, registry, token)
+                .await
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+        });
+        handles.push(handle);
     }
 
     // OTLP HTTP server

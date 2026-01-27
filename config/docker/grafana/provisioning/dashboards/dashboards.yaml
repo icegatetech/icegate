@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Icegate dashboards
+    orgId: 1
+    folder: Icegate
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

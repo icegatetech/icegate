@@ -66,4 +66,4 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 
 # Async utils
-async-trait = "0.1"
+async-trait = { workspace = true }

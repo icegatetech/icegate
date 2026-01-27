@@ -7,7 +7,7 @@ use icegate_queue::{QueueReader, SegmentsPlan, Topic};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    commit_runner::{CommitFailureReason, CommitResult, CommitTaskFailure, CommitTaskRunner},
+    commit_runner::{CommitResult, CommitTaskFailure, CommitTaskRunner},
     executor::TaskStatus,
     iceberg_storage::{Storage, WrittenDataFiles},
     plan_runner::{PlanTaskResult, PlanTaskRunner},
@@ -55,7 +55,11 @@ where
                     .record_plan_duration(start.elapsed(), &self.topic, plan_result.status.as_str());
 
                 let backlog = plan_result.last_offset.map_or(0, |last_offset| {
-                    last_offset.saturating_sub(plan_result.start_offset).saturating_add(1)
+                    if last_offset >= plan_result.start_offset {
+                        last_offset - plan_result.start_offset + 1
+                    } else {
+                        0
+                    }
                 });
                 self.metrics.record_backlog_segments(backlog, &self.topic);
 
@@ -68,6 +72,9 @@ where
                 } else if matches!(plan_result.status, TaskStatus::Cancelled) {
                     self.metrics
                         .record_task_failure(super::PLAN_TASK_CODE, "cancelled", &self.topic);
+                } else {
+                    self.metrics
+                        .record_task_failure(super::PLAN_TASK_CODE, plan_result.status.as_str(), &self.topic);
                 }
                 Ok(plan_result)
             }
@@ -192,17 +199,17 @@ where
         let result = self.inner.run(task, manager, cancel_token).await;
         match &result {
             Ok(commit_result) => {
-                if matches!(commit_result.status, TaskStatus::Cancelled) {
+                if commit_result.already_committed {
+                    self.metrics.add_already_committed(&self.topic);
+                }
+                if matches!(commit_result.status, TaskStatus::Ok) {
+                    self.metrics.record_task_success(super::COMMIT_TASK_CODE, &self.topic);
+                } else {
                     self.metrics.record_task_failure(
                         super::COMMIT_TASK_CODE,
-                        CommitFailureReason::Cancelled.as_str(),
+                        commit_result.status.as_str(),
                         &self.topic,
                     );
-                } else {
-                    if commit_result.already_committed {
-                        self.metrics.add_already_committed(&self.topic);
-                    }
-                    self.metrics.record_task_success(super::COMMIT_TASK_CODE, &self.topic);
                 }
             }
             Err(failure) => {

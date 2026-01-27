@@ -120,13 +120,8 @@ where
         Arc::new(
             move |task: Arc<dyn ImmutableTask>, manager: &dyn JobManager, cancel_token| {
                 let executor = Arc::clone(&self);
-                let task_id = *task.id();
 
                 let fut = async move {
-                    if cancel_token.is_cancelled() {
-                        return manager.complete_task(&task_id, Vec::new());
-                    }
-
                     executor
                         .shift_runner
                         .run(task, manager, &cancel_token)

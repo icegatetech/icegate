@@ -331,8 +331,13 @@ impl IcebergStorage {
                         match fut.await {
                             Ok(value) => Ok((false, Ok(value))),
                             Err(err) => {
-                                tracing::debug!(?err, "Iceberg storage operation failed, retrying");
-                                Ok((err.is_retryable(), Err(err)))
+                                let retryable = err.is_retryable();
+                                if retryable {
+                                    tracing::debug!(?err, retryable, "Iceberg storage operation failed, retrying");
+                                } else {
+                                    tracing::debug!(?err, retryable, "Iceberg storage operation failed, not retryable");
+                                }
+                                Ok((retryable, Err(err)))
                             }
                         }
                     }

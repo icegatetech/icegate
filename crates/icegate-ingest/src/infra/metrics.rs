@@ -646,6 +646,7 @@ impl<'a> OtlpRequestRecorder<'a> {
     where
         F: FnOnce() -> Result<T, IngestError>,
     {
+        // metric uses only in http hanler (TODO: otlp_grpc/services.rs:56)
         let start = Instant::now();
         match decode() {
             Ok(value) => {

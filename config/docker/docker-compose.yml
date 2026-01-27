@@ -179,6 +179,7 @@ services:
       - "9092:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
     depends_on:
       ingest:
         condition: service_started
@@ -197,6 +198,7 @@ services:
       - "3000:3000"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
@@ -208,5 +210,6 @@ services:
 
 volumes:
   minio-data:
+  prometheus-data:
   grafana-data:
   nessie-data:
