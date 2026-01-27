@@ -130,7 +130,7 @@ impl MetricsRuntime {
 }
 
 /// Build a router serving Prometheus metrics.
-pub fn metrics_router(registry: Arc<Registry>, path: &str) -> Router {
+fn metrics_router(registry: Arc<Registry>, path: &str) -> Router {
     Router::new().route(path, get(metrics_handler)).layer(Extension(registry))
 }
 
