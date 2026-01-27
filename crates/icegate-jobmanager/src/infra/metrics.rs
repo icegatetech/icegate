@@ -25,41 +25,41 @@ impl Metrics {
 
         Self {
             enabled: false,
-            job_duration: meter.f64_histogram("jobmanager_job_duration_seconds").build(),
-            task_duration: meter.f64_histogram("jobmanager_task_duration_seconds").build(),
-            s3_latency: meter.f64_histogram("jobmanager_storage_s3_latency_seconds").build(),
-            cache_hits: meter.u64_counter("jobmanager_storage_cache_hits_total").build(),
-            cache_misses: meter.u64_counter("jobmanager_storage_cache_misses_total").build(),
+            job_duration: meter.f64_histogram("icegate_jobmanager_job_duration").build(),
+            task_duration: meter.f64_histogram("icegate_jobmanager_task_duration").build(),
+            s3_latency: meter.f64_histogram("icegate_jobmanager_storage_s3_latency").build(),
+            cache_hits: meter.u64_counter("icegate_jobmanager_storage_cache_hits").build(),
+            cache_misses: meter.u64_counter("icegate_jobmanager_storage_cache_misses").build(),
         }
     }
 
     pub fn new(meter: &Meter) -> Self {
         let job_duration = meter
-            .f64_histogram("jobmanager_job_duration_seconds")
+            .f64_histogram("icegate_jobmanager_job_duration")
             .with_description("Duration of job execution from start to finish")
             .with_unit("s")
             .build();
 
         let task_duration = meter
-            .f64_histogram("jobmanager_task_duration_seconds")
+            .f64_histogram("icegate_jobmanager_task_duration")
             .with_description("Duration of individual task execution")
             .with_unit("s")
             .build();
 
         let s3_latency = meter
-            .f64_histogram("jobmanager_storage_s3_latency_seconds")
+            .f64_histogram("icegate_jobmanager_storage_s3_latency")
             .with_description("Latency of S3 GET and PUT operations")
             .with_unit("s")
             .build();
 
         let cache_hits = meter
-            .u64_counter("jobmanager_storage_cache_hits_total")
+            .u64_counter("icegate_jobmanager_storage_cache_hits")
             .with_description("Total number of cache hits")
             .with_unit("1")
             .build();
 
         let cache_misses = meter
-            .u64_counter("jobmanager_storage_cache_misses_total")
+            .u64_counter("icegate_jobmanager_storage_cache_misses")
             .with_description("Total number of cache misses")
             .with_unit("1")
             .build();

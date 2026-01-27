@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use icegate_queue::{QueueWriterEvents, WriteBatchOutcome};
 use opentelemetry::{
@@ -750,6 +753,7 @@ impl<'a> OtlpRequestRecorder<'a> {
 #[derive(Clone)]
 pub struct WalWriterMetrics {
     enabled: bool,
+    inner: Arc<dyn QueueWriterEvents>,
     pending_batches: Gauge<u64>,
     pending_records: Gauge<u64>,
     pending_bytes: Gauge<u64>,
@@ -763,12 +767,13 @@ pub struct WalWriterMetrics {
 
 impl WalWriterMetrics {
     /// Build a metrics recorder that performs no-ops.
-    pub fn new_disabled() -> Self {
+    pub fn new_disabled(inner: Arc<dyn QueueWriterEvents>) -> Self {
         let provider = SdkMeterProvider::builder().build();
         let meter = provider.meter("ingest_wal");
 
         Self {
             enabled: false,
+            inner,
             pending_batches: meter.u64_gauge("icegate_ingest_wal_pending_batches").build(),
             pending_records: meter.u64_gauge("icegate_ingest_wal_pending_records").build(),
             pending_bytes: meter.u64_gauge("icegate_ingest_wal_pending_bytes").build(),
@@ -782,7 +787,7 @@ impl WalWriterMetrics {
     }
 
     /// Build a metrics recorder using the provided meter.
-    pub fn new(meter: &Meter) -> Self {
+    pub fn new(meter: &Meter, inner: Arc<dyn QueueWriterEvents>) -> Self {
         let pending_batches = meter
             .u64_gauge("icegate_ingest_wal_pending_batches")
             .with_description("Number of batches in WAL accumulator")
@@ -825,6 +830,7 @@ impl WalWriterMetrics {
 
         Self {
             enabled: true,
+            inner,
             pending_batches,
             pending_records,
             pending_bytes,
@@ -840,6 +846,7 @@ impl WalWriterMetrics {
 
 impl QueueWriterEvents for WalWriterMetrics {
     fn on_accumulator_state_update(&self, topic: &str, batches: u64, records: u64, bytes: u64) {
+        self.inner.on_accumulator_state_update(topic, batches, records, bytes);
         if !self.enabled {
             return;
         }
@@ -851,6 +858,7 @@ impl QueueWriterEvents for WalWriterMetrics {
     }
 
     fn on_flush_finish(&self, topic: &str, status: &str, duration: Duration) {
+        self.inner.on_flush_finish(topic, status, duration);
         if !self.enabled {
             return;
         }
@@ -865,6 +873,7 @@ impl QueueWriterEvents for WalWriterMetrics {
 
     #[allow(clippy::cast_precision_loss)]
     fn on_write_complete(&self, topic: &str, outcome: WriteBatchOutcome) {
+        self.inner.on_write_complete(topic, outcome);
         if !self.enabled {
             return;
         }
@@ -875,6 +884,7 @@ impl QueueWriterEvents for WalWriterMetrics {
     }
 
     fn on_write_retry(&self, topic: &str, reason: &str) {
+        self.inner.on_write_retry(topic, reason);
         if !self.enabled {
             return;
         }
@@ -888,6 +898,7 @@ impl QueueWriterEvents for WalWriterMetrics {
     }
 
     fn on_write_error(&self, topic: &str, reason: &str) {
+        self.inner.on_write_error(topic, reason);
         if !self.enabled {
             return;
         }

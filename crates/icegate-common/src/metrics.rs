@@ -10,7 +10,7 @@ use axum::{
     routing::get,
 };
 use opentelemetry::metrics::{Meter, MeterProvider as _};
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{Aggregation, Instrument, InstrumentKind, SdkMeterProvider, Stream};
 use prometheus::{Encoder, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -106,7 +106,10 @@ impl MetricsRuntime {
             .with_registry(registry.clone())
             .build()
             .map_err(|err| CommonError::Config(format!("failed to build prometheus exporter: {err}")))?;
-        let meter_provider = SdkMeterProvider::builder().with_reader(exporter).build();
+        let meter_provider = SdkMeterProvider::builder()
+            .with_reader(exporter)
+            .with_view(histogram_view)
+            .build();
         let meter = meter_provider.meter(service_name);
 
         Ok(Self {
@@ -127,6 +130,45 @@ impl MetricsRuntime {
     pub fn registry(&self) -> Arc<Registry> {
         Arc::new(self.registry.clone())
     }
+}
+
+fn histogram_view(inst: &Instrument) -> Option<Stream> {
+    if inst.kind() != InstrumentKind::Histogram {
+        return None;
+    }
+
+    let boundaries: &[f64] = if inst.unit() == "s" || inst.name().contains("duration") {
+        &[0.01, 0.1, 0.2, 0.4, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0]
+    } else if inst.unit() == "By" || inst.name().contains("bytes") {
+        &[
+            512.0,
+            1_024.0,
+            2_048.0,
+            4_096.0,
+            8_192.0,
+            16_384.0,
+            32_768.0,
+            65_536.0,
+            131_072.0,
+            262_144.0,
+            524_288.0,
+            1_048_576.0,
+            2_097_152.0,
+            4_194_304.0,
+            8_388_608.0,
+            16_777_216.0,
+        ]
+    } else {
+        return None;
+    };
+
+    Stream::builder()
+        .with_aggregation(Aggregation::ExplicitBucketHistogram {
+            boundaries: boundaries.to_vec(),
+            record_min_max: true,
+        })
+        .build()
+        .ok()
 }
 
 /// Build a router serving Prometheus metrics.

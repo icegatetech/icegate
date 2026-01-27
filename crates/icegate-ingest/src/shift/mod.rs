@@ -31,8 +31,8 @@ use iceberg::Catalog;
 pub use iceberg_storage::{IcebergStorage, WrittenDataFiles};
 use icegate_common::{LOGS_TABLE, LOGS_TOPIC};
 use icegate_jobmanager::{
-    CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics, S3Storage,
-    TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
+    CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
+    Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
 };
 use icegate_queue::ParquetQueueReader;
 use instrumentation::{
@@ -67,6 +67,7 @@ impl Shifter {
         shift_config: Arc<ShiftConfig>,
         jobs_storage: S3StorageConfig,
         shift_metrics: ShiftMetrics,
+        jobs_manager_metrics: JobMetrics,
     ) -> Result<Self> {
         shift_config.validate()?;
         let storage = Arc::new(IcebergStorage::new(
@@ -133,11 +134,11 @@ impl Shifter {
         let job_registry = Arc::new(JobRegistry::new(vec![job_def]).map_err(map_shift_error)?);
 
         let s3_storage = Arc::new(
-            S3Storage::new(jobs_storage, job_registry.clone(), Metrics::new_disabled())
+            S3Storage::new(jobs_storage, job_registry.clone(), jobs_manager_metrics.clone())
                 .await
                 .map_err(map_shift_error)?,
         );
-        let cached_storage = Arc::new(CachedStorage::new(s3_storage, Metrics::new_disabled()));
+        let cached_storage = Arc::new(CachedStorage::new(s3_storage, jobs_manager_metrics.clone()));
 
         let manager_config = JobsManagerConfig {
             worker_count: 1,
@@ -147,8 +148,13 @@ impl Shifter {
             },
         };
 
-        let manager = JobsManager::new(cached_storage, manager_config, job_registry, Metrics::new_disabled())
-            .map_err(map_shift_error)?;
+        let manager = JobsManager::new(
+            cached_storage,
+            manager_config,
+            job_registry,
+            jobs_manager_metrics.clone(),
+        )
+        .map_err(map_shift_error)?;
 
         Ok(Self { manager })
     }
