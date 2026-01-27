@@ -11,10 +11,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::{
-    array::{
-        ArrayRef, FixedSizeBinaryBuilder, Int32Array, MapBuilder, MapFieldNames, RecordBatch, StringArray,
-        StringBuilder, TimestampMicrosecondArray,
-    },
+    array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray},
     datatypes::DataType,
 };
 use datafusion::parquet::file::properties::WriterProperties;
@@ -50,7 +47,7 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         "test-tenant",
         "test-tenant",
     ]));
-    let account_id: ArrayRef = Arc::new(StringArray::from(vec![
+    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![
         Some("acc-1"),
         Some("acc-1"),
         Some("acc-1"),
@@ -85,14 +82,6 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
     let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
         now_micros, now_micros, now_micros, now_micros, now_micros, now_micros,
     ]));
-    let severity_number: ArrayRef = Arc::new(Int32Array::from(vec![
-        Some(9),
-        Some(9),
-        Some(9),
-        Some(9),
-        Some(9),
-        Some(9),
-    ]));
     let severity_text: ArrayRef = Arc::new(StringArray::from(vec![
         Some("INFO"),
         Some("INFO"),
@@ -109,14 +98,12 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         Some("Task completed"),
         Some("Task completed"),
     ]));
-    let flags: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>, None, None, None, None, None]));
-    let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![0, 0, 0, 0, 0, 0]));
 
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(11);
+    let attributes_field = arrow_schema.field(10);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -204,15 +191,23 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
 
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    for i in 0..6 {
-        trace_id_builder.append_value([i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i])?;
+    let mut trace_id_builder = StringBuilder::new();
+    // Hex-encoded trace IDs (16 bytes → 32 hex chars)
+    for i in 0u8..6 {
+        trace_id_builder.append_value(format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i
+        ));
     }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
-    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
-    for i in 0..6 {
-        span_id_builder.append_value([i, i, i, i, i, i, i, i])?;
+    let mut span_id_builder = StringBuilder::new();
+    // Hex-encoded span IDs (8 bytes → 16 hex chars)
+    for i in 0u8..6 {
+        span_id_builder.append_value(format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            i, i, i, i, i, i, i, i
+        ));
     }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
@@ -220,19 +215,16 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         arrow_schema.clone(),
         vec![
             tenant_id,
-            account_id,
+            cloud_account_id,
             service_name,
             timestamp,
             observed_timestamp,
             ingested_timestamp,
             trace_id,
             span_id,
-            severity_number,
             severity_text,
             body,
             attributes,
-            flags,
-            dropped_attributes_count,
         ],
     )
     .map_err(Into::into)
@@ -409,10 +401,10 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
         .await?;
     write_grouping_test_logs(&table, &catalog).await?;
 
-    // Query: sum by (service_name, account_id) (avg_over_time({service_name="api"} | unwrap value [1m]) by (account_id))
+    // Query: sum by (service_name, cloud_account_id) (avg_over_time({service_name="api"} | unwrap value [1m]) by (cloud_account_id))
     // Tests same-type grouping (By + By)
-    // Expected behavior: inner By(account_id) and outer By(service_name, account_id) are merged (union)
-    // Result: By(service_name, account_id) - both labels present in output
+    // Expected behavior: inner By(cloud_account_id) and outer By(service_name, cloud_account_id) are merged (union)
+    // Result: By(service_name, cloud_account_id) - both labels present in output
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
@@ -420,7 +412,7 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
         .query(&[
             (
                 "query",
-                "sum by (service_name, account_id) (avg_over_time({service_name=\"api\"} | unwrap value [1m]) by (account_id))",
+                "sum by (service_name, cloud_account_id) (avg_over_time({service_name=\"api\"} | unwrap value [1m]) by (cloud_account_id))",
             ),
             ("step", "60s"),
         ])
@@ -446,10 +438,10 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
         println!("Series metric labels: {:?}", metric.keys().collect::<Vec<_>>());
 
         // Both labels from outer By should be present
-        // account_id (output as "cloud_account_id")
+        // cloud_account_id
         assert!(
-            metric.contains_key("cloud_account_id") || metric.contains_key("account_id"),
-            "account_id should be present in output"
+            metric.contains_key("cloud_account_id"),
+            "cloud_account_id should be present in output"
         );
 
         // service_name (output as "service")
@@ -472,9 +464,9 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Test grouping by binary columns (`trace_id`, `span_id`)
+/// Test grouping by `trace_id` and `span_id` columns
 ///
-/// Verifies that `FixedSizeBinary` columns can be used in GROUP BY operations.
+/// Verifies that hex-encoded `trace_id` and `span_id` string columns can be used in GROUP BY operations.
 #[tokio::test]
 async fn test_grouping_by_binary_columns() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start().await?;
@@ -484,7 +476,7 @@ async fn test_grouping_by_binary_columns() -> Result<(), Box<dyn std::error::Err
         .await?;
     write_binary_grouping_test_logs(&table, &catalog).await?;
 
-    // Test 1: Group by trace_id (FixedSizeBinary(16))
+    // Test 1: Group by trace_id (hex-encoded string)
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
@@ -524,7 +516,7 @@ async fn test_grouping_by_binary_columns() -> Result<(), Box<dyn std::error::Err
         );
     }
 
-    // Test 2: Group by span_id (FixedSizeBinary(8))
+    // Test 2: Group by span_id (hex-encoded string)
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
@@ -786,20 +778,20 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         now_micros + 3000,
     ]));
 
-    // Create distinct trace_id values (FixedSizeBinary(16))
-    let mut trace_id_builder = FixedSizeBinaryBuilder::with_capacity(4, 16);
-    trace_id_builder.append_value([1u8; 16])?;
-    trace_id_builder.append_value([2u8; 16])?;
-    trace_id_builder.append_value([1u8; 16])?; // Duplicate trace_id
-    trace_id_builder.append_value([3u8; 16])?;
+    // Create distinct trace_id values (hex-encoded strings, 16 bytes → 32 hex chars)
+    let mut trace_id_builder = StringBuilder::with_capacity(4, 4 * 32);
+    trace_id_builder.append_value("01010101010101010101010101010101");
+    trace_id_builder.append_value("02020202020202020202020202020202");
+    trace_id_builder.append_value("01010101010101010101010101010101"); // Duplicate trace_id
+    trace_id_builder.append_value("03030303030303030303030303030303");
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
-    // Create distinct span_id values (FixedSizeBinary(8))
-    let mut span_id_builder = FixedSizeBinaryBuilder::with_capacity(4, 8);
-    span_id_builder.append_value([10u8; 8])?;
-    span_id_builder.append_value([20u8; 8])?;
-    span_id_builder.append_value([30u8; 8])?;
-    span_id_builder.append_value([10u8; 8])?; // Duplicate span_id
+    // Create distinct span_id values (hex-encoded strings, 8 bytes → 16 hex chars)
+    let mut span_id_builder = StringBuilder::with_capacity(4, 4 * 16);
+    span_id_builder.append_value("0a0a0a0a0a0a0a0a");
+    span_id_builder.append_value("1414141414141414");
+    span_id_builder.append_value("1e1e1e1e1e1e1e1e");
+    span_id_builder.append_value("0a0a0a0a0a0a0a0a"); // Duplicate span_id
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
     let service_name: ArrayRef = Arc::new(StringArray::from(vec![
@@ -823,8 +815,6 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         Some("INFO"),
     ]));
 
-    let severity_number: ArrayRef = Arc::new(Int32Array::from(vec![Some(9), Some(9), Some(9), Some(9)]));
-
     let body: ArrayRef = Arc::new(StringArray::from(vec![
         "Test log 1",
         "Test log 2",
@@ -837,7 +827,7 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(11);
+    let attributes_field = arrow_schema.field(10);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -875,9 +865,6 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         now_micros, now_micros, now_micros, now_micros,
     ]));
 
-    let flags: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>, None, None, None]));
-    let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![0, 0, 0, 0]));
-
     RecordBatch::try_new(
         arrow_schema.clone(),
         vec![
@@ -889,12 +876,9 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
             ingested_timestamp,
             trace_id,
             span_id,
-            severity_number,
             severity_text,
             body,
             attributes,
-            flags,
-            dropped_attributes_count,
         ],
     )
     .map_err(Into::into)

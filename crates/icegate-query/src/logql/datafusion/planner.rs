@@ -84,15 +84,11 @@ impl Planner for DataFusionPlanner {
             }
             LogQLExpr::Metric(metric_expr) => self.plan_metric(metric_expr).await?,
         };
-        // Transform output: hex-encode binary columns, add `level` alias
-        Self::transform_output_columns(df)
+        Ok(df)
     }
 }
 
 impl DataFusionPlanner {
-    /// Binary columns that need hex encoding for output.
-    const BINARY_COLUMNS: [&'static str; 2] = ["trace_id", "span_id"];
-
     async fn plan_log(&self, expr: LogExpr, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<DataFrame> {
         // 1. Scan the logs table from iceberg.icegate namespace
         let df = self.session_ctx.table(LOGS_TABLE_FQN).await?;
@@ -181,26 +177,12 @@ impl DataFusionPlanner {
         let log_expr = LogExpr::new(selector);
         let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
 
-        // Select value column (handle indexed vs attribute columns)
+        // Always use attributes map for label API consistency
+        // Even if the label has an indexed column, we want the attributes value
         let internal_name = Self::map_label_to_internal_name(label_name);
-        let value_expr = if Self::is_top_level_field(internal_name) {
-            // Binary columns (trace_id, span_id) need to be converted to hex strings
-            // Cast FixedSizeBinary to Binary first since encode() requires Binary type
-            if Self::is_binary_column(internal_name) {
-                datafusion::functions::encoding::encode()
-                    .call(vec![
-                        col(internal_name).cast_to(&DataType::Binary, df.schema())?,
-                        lit("hex"),
-                    ])
-                    .alias("value")
-            } else {
-                col(internal_name).alias("value")
-            }
-        } else {
-            datafusion::functions::core::get_field()
-                .call(vec![col("attributes"), lit(label_name)])
-                .alias("value")
-        };
+        let value_expr = datafusion::functions::core::get_field()
+            .call(vec![col("attributes"), lit(internal_name)])
+            .alias("value");
 
         // Filter nulls, get distinct, sort
         let df = df
@@ -210,50 +192,6 @@ impl DataFusionPlanner {
             .sort(vec![col("value").sort(true, true)])?;
 
         Ok(df)
-    }
-
-    /// Check if a column stores binary data (`trace_id`, `span_id`).
-    fn is_binary_column(name: &str) -> bool {
-        matches!(name, "trace_id" | "span_id")
-    }
-
-    /// Transform output columns for Loki/Grafana compatibility:
-    /// - Encode binary columns (`trace_id`, `span_id`) to hex strings
-    /// - Add `level` column as alias of `severity_text` (Grafana expects `level` label)
-    ///
-    /// This ensures that all output from log queries has:
-    /// - String-typed trace/span IDs (simplifies handler code)
-    /// - Grafana-compatible `level` label for log level filtering
-    fn transform_output_columns(df: DataFrame) -> Result<DataFrame> {
-        let schema = df.schema().clone();
-
-        // Build select expressions with transformations
-        let mut select_exprs: Vec<Expr> = schema
-            .inner()
-            .fields()
-            .iter()
-            .map(|field| {
-                let name = field.name().as_str();
-                if Self::BINARY_COLUMNS.contains(&name) {
-                    // encode(cast(col, Binary), 'hex') converts FixedSizeBinary to hex string
-                    datafusion::functions::encoding::encode()
-                        .call(vec![
-                            col(name).cast_to(&DataType::Binary, &schema).unwrap_or_else(|_| col(name)),
-                            lit("hex"),
-                        ])
-                        .alias(name)
-                } else {
-                    col(name)
-                }
-            })
-            .collect();
-
-        // Add `level` as alias of `severity_text` for Grafana compatibility
-        if schema.has_column_with_unqualified_name("severity_text") {
-            select_exprs.push(col("severity_text").alias("level"));
-        }
-
-        Ok(df.select(select_exprs)?)
     }
 
     /// Plan a query for distinct series (unique label combinations).
@@ -293,24 +231,8 @@ impl DataFusionPlanner {
         }
 
         // Build select with serialized attributes for grouping
-        // Convert binary columns to hex strings for proper grouping and output
-        // Cast FixedSizeBinary to Binary first since encode() requires Binary type
-        let schema = df.schema().clone();
-        let mut select_cols: Vec<Expr> = LOG_INDEXED_ATTRIBUTE_COLUMNS
-            .iter()
-            .map(|&c| {
-                if Self::is_binary_column(c) {
-                    datafusion::functions::encoding::encode()
-                        .call(vec![
-                            col(c).cast_to(&DataType::Binary, &schema).unwrap_or_else(|_| col(c)),
-                            lit("hex"),
-                        ])
-                        .alias(c)
-                } else {
-                    col(c)
-                }
-            })
-            .collect();
+        // All indexed columns are now strings - direct references
+        let mut select_cols: Vec<Expr> = LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|&c| col(c)).collect();
         // Add `level` as alias of `severity_text` for Grafana compatibility
         select_cols.push(col("severity_text").alias("level"));
         select_cols.push(col("attributes"));
@@ -1259,9 +1181,9 @@ impl DataFusionPlanner {
     /// Handles both indexed columns (e.g., `service_name`, `severity_text`) and
     /// attributes from the MAP column.
     ///
-    /// For binary columns (`trace_id`, `span_id`), the user-provided hex string
-    /// is decoded to binary for comparison with the stored `FixedSizeBinary`
-    /// value.
+    /// Indexed columns are used for WHERE clause filtering (fast),
+    /// then all subsequent operations use the attributes map.
+    /// All columns are now strings - no binary encoding/decoding needed.
     pub fn matcher_to_expr(matcher: &LabelMatcher) -> Expr {
         let mapped_label = Self::map_label_to_internal_name(&matcher.label);
         let col_expr = if Self::is_top_level_field(&matcher.label) {
@@ -1272,14 +1194,8 @@ impl DataFusionPlanner {
             datafusion::functions::core::get_field().call(vec![col("attributes"), lit(matcher.label.as_str())])
         };
 
-        // For binary columns (trace_id, span_id), decode the hex string to binary
-        // to compare with the stored FixedSizeBinary value
-        let val = if Self::is_binary_column(mapped_label) {
-            // decode(value, 'hex') converts hex string to Binary
-            datafusion::functions::encoding::decode().call(vec![lit(matcher.value.as_str()), lit("hex")])
-        } else {
-            lit(matcher.value.as_str())
-        };
+        // All columns are strings now - no binary decoding
+        let val = lit(matcher.value.as_str());
 
         match matcher.op {
             MatchOp::Eq => col_expr.eq(val),
@@ -1305,7 +1221,6 @@ impl DataFusionPlanner {
         match name {
             "level" | "detected_level" => "severity_text",
             "service" => "service_name",
-            "account_id" => "cloud_account_id",
             _ => name,
         }
     }

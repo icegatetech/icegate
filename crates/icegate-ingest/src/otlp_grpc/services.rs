@@ -67,6 +67,9 @@ impl LogsService for OtlpGrpcService {
         let tenant_id = None; // Will use default
 
         // Transform OTLP logs to Arrow RecordBatch
+        let Some(batch) = transform::logs_to_record_batch(&export_request, tenant_id)
+            .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))?
+        else {
         let batch = request_metrics.record_transform(|| transform::logs_to_record_batch(&export_request, tenant_id));
         let Some(batch) = batch else {
             // No records to process - return success with 0 rejected
