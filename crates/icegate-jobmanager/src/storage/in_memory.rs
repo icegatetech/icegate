@@ -12,6 +12,12 @@ pub struct InMemoryStorage {
     get_by_meta_calls: AtomicU64,
 }
 
+impl Default for InMemoryStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
@@ -36,6 +42,7 @@ impl InMemoryStorage {
 }
 
 #[async_trait::async_trait]
+#[allow(private_interfaces)]
 impl Storage for InMemoryStorage {
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
         if cancel_token.is_cancelled() {

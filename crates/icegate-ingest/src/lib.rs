@@ -5,6 +5,9 @@ mod config;
 /// Error types for ingest operations.
 pub mod error;
 
+/// Internal infrastructure utilities.
+pub mod infra;
+
 /// CLI module for the ingest binary
 pub mod cli;
 

@@ -6,6 +6,7 @@ use std::{
 };
 
 use arrow::{compute::SortOptions, record_batch::RecordBatch};
+use async_trait::async_trait;
 use iceberg::{
     Catalog, NamespaceIdent, TableIdent,
     arrow::RecordBatchPartitionSplitter,
@@ -44,6 +45,33 @@ pub struct WrittenDataFiles {
     pub data_files: Vec<DataFile>,
     /// Total rows written across all data files.
     pub rows_written: usize,
+}
+
+/// Iceberg storage dependency surface for shift executors.
+#[async_trait]
+pub trait Storage: Send + Sync {
+    /// Fetch the last committed offset, if any.
+    async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>>;
+
+    /// Write parquet files from record batches without committing.
+    async fn write_record_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+        cancel_token: &CancellationToken,
+    ) -> Result<WrittenDataFiles>;
+
+    /// Build Iceberg data files from parquet paths.
+    async fn get_data_files(&self, parquet_paths: &[String], cancel_token: &CancellationToken)
+    -> Result<Vec<DataFile>>;
+
+    /// Commit data files to Iceberg with the provided offset.
+    async fn commit(
+        &self,
+        data_files: Vec<DataFile>,
+        record_type: &str,
+        last_offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> Result<usize>;
 }
 
 /// Iceberg storage for shift operations.
@@ -302,7 +330,15 @@ impl IcebergStorage {
                     async move {
                         match fut.await {
                             Ok(value) => Ok((false, Ok(value))),
-                            Err(err) => Ok((err.is_retryable(), Err(err))),
+                            Err(err) => {
+                                let retryable = err.is_retryable();
+                                if retryable {
+                                    tracing::debug!(?err, retryable, "Iceberg storage operation failed, retrying");
+                                } else {
+                                    tracing::debug!(?err, retryable, "Iceberg storage operation failed, not retryable");
+                                }
+                                Ok((retryable, Err(err)))
+                            }
                         }
                     }
                 },
@@ -314,6 +350,39 @@ impl IcebergStorage {
             Ok(value) => Ok(value),
             Err(err) => Err(err),
         }
+    }
+}
+
+#[async_trait]
+impl Storage for IcebergStorage {
+    async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
+        self.get_last_offset(cancel_token).await
+    }
+
+    async fn write_record_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+        cancel_token: &CancellationToken,
+    ) -> Result<WrittenDataFiles> {
+        self.write_record_batches(batches, cancel_token).await
+    }
+
+    async fn get_data_files(
+        &self,
+        parquet_paths: &[String],
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<DataFile>> {
+        self.get_data_files(parquet_paths, cancel_token).await
+    }
+
+    async fn commit(
+        &self,
+        data_files: Vec<DataFile>,
+        record_type: &str,
+        last_offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> Result<usize> {
+        self.commit(data_files, record_type, last_offset, cancel_token).await
     }
 }
 

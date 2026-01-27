@@ -55,6 +55,8 @@ axum = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 opentelemetry-proto = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -62,3 +64,6 @@ tracing-subscriber = { workspace = true }
 
 # CLI
 clap = { workspace = true }
+
+# Async utils
+async-trait = { workspace = true }

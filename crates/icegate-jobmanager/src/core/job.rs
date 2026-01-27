@@ -194,6 +194,7 @@ impl JobDefinition {
 #[derive(Clone)]
 pub(crate) struct Job {
     // TODO(low): extract settings fields to new settings structure
+    // TODO(low): make UUID as microtype (different for job, task)
     id: Uuid,
     code: JobCode,
     iter_num: u64,

@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
 use super::{OtlpGrpcConfig, services::OtlpGrpcService};
+use crate::infra::metrics::OtlpMetrics;
 
 /// Run the OTLP gRPC server.
 ///
@@ -29,11 +30,12 @@ use super::{OtlpGrpcConfig, services::OtlpGrpcService};
 /// - The server encounters a fatal error during operation
 pub async fn run(
     write_channel: WriteChannel,
+    metrics: OtlpMetrics,
     config: OtlpGrpcConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", config.host, config.port).parse()?;
-    let service = OtlpGrpcService::new(write_channel);
+    let service = OtlpGrpcService::new(write_channel, metrics);
 
     tracing::info!("Starting OTLP gRPC server on {}", addr);
 

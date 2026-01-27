@@ -100,11 +100,29 @@ impl TopicAccumulator {
         self.batches.len()
     }
 
+    /// Returns the number of pending batches.
+    #[must_use]
+    pub fn pending_batches(&self) -> usize {
+        self.batches.len()
+    }
+
     /// Returns the total record count.
     #[cfg(test)]
     #[must_use]
     pub const fn total_records(&self) -> usize {
         self.total_records
+    }
+
+    /// Returns the total pending record count.
+    #[must_use]
+    pub const fn pending_records(&self) -> usize {
+        self.total_records
+    }
+
+    /// Returns the estimated pending bytes.
+    #[must_use]
+    pub const fn pending_bytes(&self) -> usize {
+        self.total_bytes
     }
 
     /// Takes all accumulated batches and responses, resetting the accumulator.

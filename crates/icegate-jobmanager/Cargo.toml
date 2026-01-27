@@ -34,8 +34,8 @@ serde_json = { workspace = true }
 ciborium = "0.2"
 
 # Metrics
-opentelemetry = { version = "0.31.0", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31.0", features = ["metrics"] }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 
 # Utilities
@@ -46,7 +46,7 @@ futures-util = "0.3"
 
 # Concurrency
 parking_lot = "0.12"
-async-trait = "0.1"
+async-trait = { workspace = true }
 dashmap = "6.1.0"
 tracing-subscriber = { workspace = true }
 

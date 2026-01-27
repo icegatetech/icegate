@@ -36,6 +36,8 @@ pub mod catalog;
 pub mod config;
 /// Error types for common operations.
 pub mod error;
+/// Prometheus metrics utilities.
+pub mod metrics;
 /// Retry utilities.
 pub mod retrier;
 /// Schema definitions for Iceberg tables.
@@ -47,6 +49,7 @@ pub mod storage;
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig};
 pub use config::{ServerConfig, check_port_conflicts, load_config_file};
 pub use error::Result;
+pub use metrics::{MetricsConfig, MetricsRuntime, run_metrics_server};
 pub use retrier::{Retrier, RetrierConfig, RetryError};
 pub use storage::{
     ObjectStoreWithPath, S3Config, StorageBackend, StorageConfig, create_local_store, create_memory_store,

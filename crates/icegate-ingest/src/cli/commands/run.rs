@@ -2,11 +2,16 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icegate_common::{catalog::CatalogBuilder, create_object_store};
-use icegate_queue::{QueueConfig, QueueReader, QueueWriter, channel};
+use icegate_common::{MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
+use icegate_queue::{ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use tokio_util::sync::CancellationToken;
 
-use crate::{IngestConfig, error::Result, shift::Shifter};
+use crate::{
+    IngestConfig,
+    error::Result,
+    infra::metrics::{OtlpMetrics, ShiftMetrics, WalWriterMetrics},
+    shift::Shifter,
+};
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors
@@ -58,7 +63,15 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let mut queue_config = queue_config;
     queue_config.base_path = normalized_path;
 
-    let writer = QueueWriter::new(queue_config.clone(), Arc::clone(&store));
+    let metrics_runtime = if config.metrics.enabled {
+        Some(Arc::new(MetricsRuntime::new("ingest")?))
+    } else {
+        None
+    };
+    let wal_writer_metrics = metrics_runtime.as_ref().map_or_else(WalWriterMetrics::new_disabled, |runtime| {
+        WalWriterMetrics::new(&runtime.meter())
+    });
+    let writer = QueueWriter::new(queue_config.clone(), Arc::clone(&store)).with_events(Arc::new(wal_writer_metrics));
     let writer_handle = writer.start(write_rx);
 
     tracing::info!("WAL queue initialized successfully");
@@ -68,8 +81,17 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let catalog = CatalogBuilder::from_config(&config.catalog).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
-    let queue_reader = Arc::new(QueueReader::new(queue_config.base_path.clone(), Arc::clone(&store)));
-    let shifter = Shifter::new(catalog, queue_reader, shift_config, jobs_storage).await?;
+    let queue_reader = Arc::new(ParquetQueueReader::new(
+        queue_config.base_path.clone(),
+        Arc::clone(&store),
+    ));
+    let shift_metrics = metrics_runtime.as_ref().map_or_else(ShiftMetrics::new_disabled, |runtime| {
+        ShiftMetrics::new(&runtime.meter())
+    });
+    let otlp_metrics = metrics_runtime
+        .as_ref()
+        .map_or_else(OtlpMetrics::new_disabled, |runtime| OtlpMetrics::new(&runtime.meter()));
+    let shifter = Shifter::new(catalog, queue_reader, shift_config, jobs_storage, shift_metrics).await?;
     let shifter_handle = shifter.start()?;
 
     tracing::info!("Shifter started successfully");
@@ -80,12 +102,26 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     // Spawn server tasks
     let mut handles = Vec::new();
 
+    if let Some(metrics_runtime) = metrics_runtime.as_ref() {
+        let metrics_config = config.metrics.clone();
+        let token = cancel_token.clone();
+        let registry = metrics_runtime.registry();
+        let handle = tokio::spawn(async move {
+            run_metrics_server(metrics_config, registry, token)
+                .await
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+        });
+        handles.push(handle);
+    }
+
     // OTLP HTTP server
     if config.otlp_http.enabled {
         let write_channel = write_tx.clone();
         let http_config = config.otlp_http.clone();
         let token = cancel_token.clone();
-        let handle = tokio::spawn(async move { crate::otlp_http::run(write_channel, http_config, token).await });
+        let metrics = otlp_metrics.clone();
+        let handle =
+            tokio::spawn(async move { crate::otlp_http::run(write_channel, metrics, http_config, token).await });
         handles.push(handle);
     }
 
@@ -94,7 +130,9 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         let write_channel = write_tx.clone();
         let grpc_config = config.otlp_grpc.clone();
         let token = cancel_token.clone();
-        let handle = tokio::spawn(async move { crate::otlp_grpc::run(write_channel, grpc_config, token).await });
+        let metrics = otlp_metrics.clone();
+        let handle =
+            tokio::spawn(async move { crate::otlp_grpc::run(write_channel, metrics, grpc_config, token).await });
         handles.push(handle);
     }
 

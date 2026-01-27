@@ -34,3 +34,8 @@ tracing = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+axum = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-prometheus = { workspace = true }
+prometheus = { workspace = true }

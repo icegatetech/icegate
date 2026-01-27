@@ -59,6 +59,7 @@ thiserror = "2"
 
 # Utilities
 uuid = { version = "1.19", features = ["v7", "v4", "serde"] }
+async-trait = "0.1"
 
 # ANTLR parser
 antlr4rust = "0.5"
@@ -99,11 +100,15 @@ axum-extra = { version = "0.9", features = ["query"] }
 tower-http = { version = "0.5", features = ["trace"] }
 
 # gRPC server
-tonic = "0.12"
-prost = "0.13"
+tonic = "0.14"
+prost = "0.14"
 
 # OpenTelemetry proto (with tonic service generation)
-opentelemetry-proto = { version = "0.27", features = ["gen-tonic", "logs", "trace", "metrics"] }
+opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic", "logs", "trace", "metrics"] }
+opentelemetry = { version = "0.31.0", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31.0", features = ["metrics"] }
+opentelemetry-prometheus = "0.31.0"
+prometheus = "0.14.0"
 
 # Logging
 tracing = "0.1"

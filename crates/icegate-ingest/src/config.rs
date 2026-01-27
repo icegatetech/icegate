@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use icegate_common::{CatalogConfig, StorageConfig, check_port_conflicts, load_config_file};
+use icegate_common::{CatalogConfig, MetricsConfig, StorageConfig, check_port_conflicts, load_config_file};
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,9 @@ pub struct IngestConfig {
     pub otlp_http: OtlpHttpConfig,
     /// OTLP gRPC server
     pub otlp_grpc: OtlpGrpcConfig,
+    /// Metrics configuration
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 impl IngestConfig {
@@ -59,9 +62,10 @@ impl IngestConfig {
         self.otlp_http.validate()?;
         self.otlp_grpc.validate()?;
         self.shift.validate()?;
+        self.metrics.validate()?;
 
         // Check for port conflicts among enabled servers
-        check_port_conflicts(&[&self.otlp_http, &self.otlp_grpc])?;
+        check_port_conflicts(&[&self.otlp_http, &self.otlp_grpc, &self.metrics])?;
 
         Ok(())
     }

@@ -3,6 +3,8 @@
 //! Implements the `OpenTelemetry` Protocol service traits for logs, traces, and
 //! metrics ingestion via gRPC.
 
+use std::time::Instant;
+
 use icegate_common::LOGS_TOPIC;
 use icegate_queue::WriteChannel;
 use opentelemetry_proto::tonic::collector::{
@@ -10,10 +12,19 @@ use opentelemetry_proto::tonic::collector::{
     metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse, metrics_service_server::MetricsService},
     trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse, trace_service_server::TraceService},
 };
+use prost::Message;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
+use crate::infra::metrics::{OtlpMetrics, OtlpRequestRecorder};
 use crate::transform;
+
+const SIGNAL_LOGS: &str = "logs";
+const PROTOCOL_GRPC: &str = "grpc";
+const ENCODING_PROTOBUF: &str = "protobuf";
+const STATUS_OK: &str = "ok";
+const STATUS_ERROR: &str = "error";
+const WAL_REASON_CHANNEL_CLOSED: &str = "channel_closed";
 
 /// OTLP gRPC service implementation.
 ///
@@ -23,12 +34,14 @@ use crate::transform;
 pub struct OtlpGrpcService {
     /// Write channel for sending batches to the WAL queue.
     write_channel: WriteChannel,
+    /// Metrics recorder for OTLP intake.
+    metrics: OtlpMetrics,
 }
 
 impl OtlpGrpcService {
     /// Create a new OTLP gRPC service.
-    pub const fn new(write_channel: WriteChannel) -> Self {
-        Self { write_channel }
+    pub const fn new(write_channel: WriteChannel, metrics: OtlpMetrics) -> Self {
+        Self { write_channel, metrics }
     }
 }
 
@@ -44,21 +57,30 @@ impl LogsService for OtlpGrpcService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+        let request_size = request.get_ref().encoded_len();
+        let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_LOGS, ENCODING_PROTOBUF);
+        request_metrics.record_request_size(request_size);
+        // TODO(med): instrument gRPC decoding time by wrapping tonic/prost codec; handler receives decoded payload.
         let export_request = request.into_inner();
 
         // Extract tenant_id from metadata (TODO: implement proper tenant extraction)
         let tenant_id = None; // Will use default
 
         // Transform OTLP logs to Arrow RecordBatch
-        let Some(batch) = transform::logs_to_record_batch(&export_request, tenant_id)
-            .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))?
-        else {
+        let batch = request_metrics.record_transform(|| {
+            transform::logs_to_record_batch(&export_request, tenant_id)
+                .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))
+        })?;
+        let Some(batch) = batch else {
             // No records to process - return success with 0 rejected
+            request_metrics.record_records_per_request(0);
+            request_metrics.finish_ok();
             return Ok(Response::new(ExportLogsServiceResponse { partial_success: None }));
         };
 
         let record_count = batch.num_rows();
         debug!(records = record_count, "Transformed OTLP logs to RecordBatch");
+        request_metrics.record_records_per_request(record_count);
 
         // Create write request for the WAL queue
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -70,23 +92,34 @@ impl LogsService for OtlpGrpcService {
         };
 
         // Send to WAL queue
-        self.write_channel
-            .send(write_request)
-            .await
-            .map_err(|e| Status::unavailable(format!("WAL queue unavailable: {e}")))?;
+        let enqueue_start = Instant::now();
+        self.write_channel.send(write_request).await.map_err(|e| {
+            request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
+            request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
+            request_metrics.finish_error();
+            Status::unavailable(format!("WAL queue unavailable: {e}"))
+        })?;
+        request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_OK);
 
         // Wait for write result
-        let result = response_rx
-            .await
-            .map_err(|e| Status::internal(format!("Failed to receive write result: {e}")))?;
+        let ack_start = Instant::now();
+        let result = response_rx.await.map_err(|e| {
+            request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
+            request_metrics.finish_error();
+            Status::internal(format!("Failed to receive write result: {e}"))
+        })?;
 
         match result {
             icegate_queue::WriteResult::Success { offset, records } => {
                 debug!(offset, records, "Logs written to WAL");
+                request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_OK);
+                request_metrics.finish_ok();
                 Ok(Response::new(ExportLogsServiceResponse { partial_success: None }))
             }
             icegate_queue::WriteResult::Failed { reason } => {
                 // Return partial success with all records rejected
+                request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
+                request_metrics.finish_partial();
                 Ok(Response::new(ExportLogsServiceResponse {
                     partial_success: Some(
                         opentelemetry_proto::tonic::collector::logs::v1::ExportLogsPartialSuccess {
