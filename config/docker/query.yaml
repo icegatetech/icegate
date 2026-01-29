@@ -25,3 +25,9 @@ tempo:
   enabled: true
   host: 0.0.0.0
   port: 3200
+
+tracing:
+  enabled: true
+  service_name: icegate-query
+  otlp_endpoint: http://jaeger:4317
+  sample_ratio: 1.0

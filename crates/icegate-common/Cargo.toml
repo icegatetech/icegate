@@ -13,6 +13,9 @@ repository = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+testing = ["testcontainers", "aws-config", "aws-sdk-s3"]
+
 [dependencies]
 # Iceberg
 iceberg = { workspace = true }
@@ -31,6 +34,7 @@ thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -39,3 +43,12 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-prometheus = { workspace = true }
 prometheus = { workspace = true }
+
+# OpenTelemetry tracing
+tracing-opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+
+# Testing utilities (optional feature)
+testcontainers = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }

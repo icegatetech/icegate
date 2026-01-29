@@ -44,6 +44,12 @@ pub mod retrier;
 pub mod schema;
 /// Storage configuration.
 pub mod storage;
+/// OpenTelemetry tracing configuration and utilities.
+pub mod tracing;
+
+/// Testing utilities (available only with `testing` feature).
+#[cfg(feature = "testing")]
+pub mod testing;
 
 // Re-export commonly used types
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig};
@@ -55,3 +61,4 @@ pub use storage::{
     ObjectStoreWithPath, S3Config, StorageBackend, StorageConfig, create_local_store, create_memory_store,
     create_object_store, create_s3_store,
 };
+pub use tracing::{TracingConfig, TracingGuard, init_tracing};

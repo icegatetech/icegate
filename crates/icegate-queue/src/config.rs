@@ -58,7 +58,7 @@ impl Default for QueueConfig {
             compression: CompressionCodec::default(),
             max_records_per_flush: 10_000,
             max_bytes_per_flush: 64 * 1024 * 1024, // 64 MB
-            flush_interval_ms: 1000,               // 1 second
+            flush_interval_ms: 100,                // 100ms
         }
     }
 }
@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(config.write_retries, 3);
         assert_eq!(config.max_records_per_flush, 10_000);
         assert_eq!(config.max_bytes_per_flush, 64 * 1024 * 1024);
-        assert_eq!(config.flush_interval_ms, 1000);
+        assert_eq!(config.flush_interval_ms, 100);
     }
 
     #[test]

@@ -44,6 +44,9 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     tracing::info!("Loading configuration from {:?}", config_path);
     let config = QueryConfig::from_file(config_path)?;
 
+    // Initialize tracing with OpenTelemetry
+    let tracing_guard = icegate_common::init_tracing(&config.tracing)?;
+
     tracing::info!("Configuration loaded successfully");
 
     // Initialize catalog
@@ -116,6 +119,9 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     }
 
     tracing::info!("All query servers stopped gracefully");
+
+    // Keep tracing guard alive until the very end
+    drop(tracing_guard);
 
     Ok(())
 }

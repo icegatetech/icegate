@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use icegate_common::{CatalogConfig, StorageConfig, check_port_conflicts, load_config_file};
+use icegate_common::{CatalogConfig, StorageConfig, TracingConfig, check_port_conflicts, load_config_file};
 use serde::{Deserialize, Serialize};
 
 use super::{engine::QueryEngineConfig, loki::LokiConfig, prometheus::PrometheusConfig, tempo::TempoConfig};
@@ -31,6 +31,9 @@ pub struct QueryConfig {
     pub prometheus: PrometheusConfig,
     /// Tempo API server
     pub tempo: TempoConfig,
+    /// Tracing configuration
+    #[serde(default)]
+    pub tracing: TracingConfig,
 }
 
 impl QueryConfig {
@@ -57,6 +60,7 @@ impl QueryConfig {
         self.loki.validate()?;
         self.prometheus.validate()?;
         self.tempo.validate()?;
+        self.tracing.validate()?;
 
         // Check for port conflicts among enabled servers
         check_port_conflicts(&[&self.loki, &self.prometheus, &self.tempo])?;

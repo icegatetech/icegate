@@ -103,8 +103,7 @@ services:
       dockerfile: config/docker/Dockerfile
       args:
         PROFILE: ${PROFILE:-release}
-        SERVICE: maintain
-    command: ["migrate", "create", "--config", "/etc/icegate/maintain.yaml"]
+    command: ["/usr/local/bin/maintain", "migrate", "create", "--config", "/etc/icegate/maintain.yaml"]
     volumes:
       - ./maintain.yaml:/etc/icegate/maintain.yaml:ro
     depends_on:
@@ -123,8 +122,7 @@ services:
       dockerfile: config/docker/Dockerfile
       args:
         PROFILE: ${PROFILE:-release}
-        SERVICE: query
-    command: ["run", "--config", "/etc/icegate/query.yaml"]
+    command: ["/usr/local/bin/query", "run", "--config", "/etc/icegate/query.yaml"]
     deploy:
       replicas: ${QUERY_REPLICAS:-1}
     ports:
@@ -136,11 +134,14 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_started
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
       RUST_LOG: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     develop:
       watch:
         - action: rebuild
@@ -152,8 +153,7 @@ services:
       dockerfile: config/docker/Dockerfile
       args:
         PROFILE: ${PROFILE:-release}
-        SERVICE: ingest
-    command: ["run", "--config", "/etc/icegate/ingest.yaml"]
+    command: ["/usr/local/bin/ingest", "run", "--config", "/etc/icegate/ingest.yaml"]
     ports:
       - "4317:4317"
       - "4318:4318"
@@ -163,11 +163,14 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_started
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
       RUST_LOG: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     develop:
       watch:
         - action: rebuild
@@ -183,6 +186,15 @@ services:
     depends_on:
       ingest:
         condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: "badger"
+    restart: unless-stopped
 
   otelgen:
     image: ghcr.io/krzko/otelgen:latest
