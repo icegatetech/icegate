@@ -84,7 +84,7 @@ impl QueueWriter {
 
         // Spawn flush ticker task
         // To make a flush interval is more precise make the check interval is smaller than the one
-        let check_flush_interval = Duration::from_millis(writer.config.flush_interval_ms / 2);
+        let check_flush_interval = Duration::from_millis(writer.config.flush_interval_ms / 4);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(check_flush_interval);
             loop {

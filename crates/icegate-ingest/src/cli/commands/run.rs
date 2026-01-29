@@ -46,9 +46,12 @@ async fn shutdown_signal() {
 /// Starts all enabled OTLP servers and runs until Ctrl+C
 pub async fn execute(config_path: PathBuf) -> Result<()> {
     // Load configuration
-    tracing::info!("Loading configuration from {:?}", config_path);
-    let config = IngestConfig::from_file(config_path)?;
+    let config = IngestConfig::from_file(&config_path)?;
 
+    // Initialize tracing with OpenTelemetry
+    let tracing_guard = icegate_common::init_tracing(&config.tracing)?;
+
+    tracing::info!("Loading configuration from {:?}", config_path);
     tracing::info!("Configuration loaded successfully");
 
     // Initialize WAL queue based on queue config's base_path
@@ -186,5 +189,10 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     drop(write_tx);
 
     // Wait for the writer task to finish
-    Ok(writer_handle.await??)
+    writer_handle.await??;
+
+    // Keep tracing guard alive until the very end
+    drop(tracing_guard);
+
+    Ok(())
 }

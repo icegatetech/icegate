@@ -40,3 +40,9 @@ metrics:
   host: 0.0.0.0
   port: 9091
   path: /metrics
+
+tracing:
+  enabled: true
+  service_name: icegate-ingest
+  otlp_endpoint: http://jaeger:4317
+  sample_ratio: 1.0

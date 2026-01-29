@@ -5,7 +5,9 @@
 
 use std::path::Path;
 
-use icegate_common::{CatalogConfig, MetricsConfig, StorageConfig, check_port_conflicts, load_config_file};
+use icegate_common::{
+    CatalogConfig, MetricsConfig, StorageConfig, TracingConfig, check_port_conflicts, load_config_file,
+};
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +39,9 @@ pub struct IngestConfig {
     /// Metrics configuration
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Tracing configuration
+    #[serde(default)]
+    pub tracing: TracingConfig,
 }
 
 impl IngestConfig {
@@ -63,6 +68,7 @@ impl IngestConfig {
         self.otlp_grpc.validate()?;
         self.shift.validate()?;
         self.metrics.validate()?;
+        self.tracing.validate()?;
 
         // Check for port conflicts among enabled servers
         check_port_conflicts(&[&self.otlp_http, &self.otlp_grpc, &self.metrics])?;

@@ -13,6 +13,10 @@ categories = ["database", "data-structures"]
 [lints]
 workspace = true
 
+[[bench]]
+name = "queue_s3_bench"
+harness = false
+
 [dependencies]
 # Arrow ecosystem
 arrow = { workspace = true }
@@ -44,3 +48,6 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+criterion = { workspace = true }
+icegate-common = { workspace = true, features = ["testing"] }
+uuid = { workspace = true, features = ["v4"]}

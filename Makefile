@@ -1,6 +1,7 @@
 .PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench
 
 dev:
+	PROFILE=debug docker build --build-arg PROFILE=debug -f config/docker/Dockerfile .
 	PROFILE=debug docker compose -f config/docker/docker-compose.yml up --watch --build
 
 debug:
