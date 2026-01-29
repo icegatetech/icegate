@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use icegate_common::{MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
-use icegate_queue::{ParquetQueueReader, QueueConfig, QueueWriter, channel};
+use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -68,9 +68,10 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     } else {
         None
     };
-    let wal_writer_metrics = metrics_runtime.as_ref().map_or_else(WalWriterMetrics::new_disabled, |runtime| {
-        WalWriterMetrics::new(&runtime.meter())
-    });
+    let wal_writer_metrics = metrics_runtime.as_ref().map_or_else(
+        || WalWriterMetrics::new_disabled(Arc::new(NoopQueueWriterEvents)),
+        |runtime| WalWriterMetrics::new(&runtime.meter(), Arc::new(NoopQueueWriterEvents)),
+    );
     let writer = QueueWriter::new(queue_config.clone(), Arc::clone(&store)).with_events(Arc::new(wal_writer_metrics));
     let writer_handle = writer.start(write_rx);
 
@@ -88,10 +89,23 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let shift_metrics = metrics_runtime.as_ref().map_or_else(ShiftMetrics::new_disabled, |runtime| {
         ShiftMetrics::new(&runtime.meter())
     });
+    let jobsmanager_metrics = metrics_runtime
+        .as_ref()
+        .map_or_else(icegate_jobmanager::Metrics::new_disabled, |runtime| {
+            icegate_jobmanager::Metrics::new(&runtime.meter())
+        });
     let otlp_metrics = metrics_runtime
         .as_ref()
         .map_or_else(OtlpMetrics::new_disabled, |runtime| OtlpMetrics::new(&runtime.meter()));
-    let shifter = Shifter::new(catalog, queue_reader, shift_config, jobs_storage, shift_metrics).await?;
+    let shifter = Shifter::new(
+        catalog,
+        queue_reader,
+        shift_config,
+        jobs_storage,
+        shift_metrics,
+        jobsmanager_metrics,
+    )
+    .await?;
     let shifter_handle = shifter.start()?;
 
     tracing::info!("Shifter started successfully");
