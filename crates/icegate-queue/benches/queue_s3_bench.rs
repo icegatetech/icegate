@@ -225,8 +225,8 @@ fn read_performance(c: &mut Criterion) {
         });
     });
 
-    // Benchmark 8: Plan segments - list and plan segments for reading
-    group.bench_function("plan_segments", |b| {
+    // Benchmark 8: List and count segments
+    group.bench_function("list_segments_count", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let cancel = CancellationToken::new();

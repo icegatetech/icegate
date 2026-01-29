@@ -36,7 +36,6 @@ pub async fn setup_queue_test() -> Result<(MinIOContainer, Arc<dyn ObjectStore>,
 ///
 /// Returns an error if `RecordBatch` creation fails.
 pub fn test_batch(rows: usize, tenant_cardinality: usize) -> Result<RecordBatch, arrow::error::ArrowError> {
-    // Import from benches/common/data.rs module
     use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 

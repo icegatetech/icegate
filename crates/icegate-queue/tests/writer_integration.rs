@@ -150,7 +150,11 @@ async fn test_write_empty_batch() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify no file was created
     let path = Path::from("queue/logs/00000000000000000000.parquet");
-    assert!(store.head(&path).await.is_err(), "Empty batch should not create a file");
+    let head_result = store.head(&path).await;
+    assert!(
+        matches!(head_result, Err(object_store::Error::NotFound { .. })),
+        "Empty batch should not create a file, expected NotFound error"
+    );
 
     drop(tx);
     handle.await.unwrap().unwrap();

@@ -50,4 +50,4 @@ rand = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 criterion = { workspace = true }
 icegate-common = { workspace = true, features = ["testing"] }
-uuid = { version = "1.11", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"]}

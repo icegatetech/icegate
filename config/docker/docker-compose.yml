@@ -76,7 +76,7 @@ services:
       start_period: 10s
 
   trino:
-    image: trinodb/trino:latest
+    image: trinodb/trino:469
     ports:
       - "8080:8080"
     volumes:
@@ -177,7 +177,7 @@ services:
           path: ../../crates
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.2.0
     ports:
       - "9092:9090"
     volumes:
@@ -188,7 +188,7 @@ services:
         condition: service_started
 
   jaeger:
-    image: jaegertracing/all-in-one:latest
+    image: jaegertracing/all-in-one:1.76.0
     ports:
       - "16686:16686"
     environment:
@@ -197,7 +197,7 @@ services:
     restart: unless-stopped
 
   otelgen:
-    image: ghcr.io/krzko/otelgen:latest
+    image: ghcr.io/krzko/otelgen:v0.26.0
     command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]
     depends_on:
       ingest:

@@ -164,7 +164,8 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
                 tracing_subscriber::EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
             )
-            .init();
+            .try_init()
+            .ok();
 
         return Ok(TracingGuard { provider: None });
     }
@@ -211,7 +212,8 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
-        .init();
+        .try_init()
+        .ok();
 
     Ok(TracingGuard {
         provider: Some(tracer_provider),
