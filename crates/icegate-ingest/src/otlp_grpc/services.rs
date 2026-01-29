@@ -57,6 +57,7 @@ impl LogsService for OtlpGrpcService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+        debug!("Start handle OTLP GRPC request");
         let request_size = request.get_ref().encoded_len();
         let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_LOGS, ENCODING_PROTOBUF);
         request_metrics.record_request_size(request_size);
@@ -111,7 +112,7 @@ impl LogsService for OtlpGrpcService {
 
         match result {
             icegate_queue::WriteResult::Success { offset, records } => {
-                debug!(offset, records, "Logs written to WAL");
+                debug!(offset, records, "OTLP GRPC request ended successfully");
                 request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_OK);
                 request_metrics.finish_ok();
                 Ok(Response::new(ExportLogsServiceResponse { partial_success: None }))

@@ -133,7 +133,9 @@ impl QueueWriter {
     /// The batch is added to the topic's accumulator. If thresholds are met,
     /// a flush is triggered automatically.
     #[allow(clippy::significant_drop_tightening)] // Lock must be held while checking flush condition
+    #[tracing::instrument(skip(self, request), fields(topic = %request.topic))]
     async fn handle_request(&self, request: WriteRequest) -> Result<()> {
+        debug!("Start handle request to WAL");
         let topic = request.topic.clone();
         let (pending_batches, pending_records, pending_bytes, should_flush) = {
             let mut accumulators = self.accumulators.write().await;
@@ -162,6 +164,7 @@ impl QueueWriter {
     }
 
     /// Flushes all topics that have exceeded their time threshold.
+    #[tracing::instrument(skip(self))]
     async fn flush_due_topics(&self) -> Result<()> {
         let topics_to_flush: Vec<Topic> = {
             let accumulators = self.accumulators.read().await;
@@ -188,6 +191,7 @@ impl QueueWriter {
     }
 
     /// Flushes all accumulated batches for a topic.
+    #[tracing::instrument(skip(self), fields(topic = %topic))]
     async fn flush_topic(&self, topic: &Topic) -> Result<()> {
         let flush_start = Instant::now();
         let (batches, responses) = {
@@ -199,9 +203,11 @@ impl QueueWriter {
             }
         };
 
+        debug!(batches = batches.len(), "Flushing topic batches");
         self.events.on_accumulator_state_update(topic.as_str(), 0, 0, 0);
 
         if batches.is_empty() {
+            debug!("No batches to flush");
             return Ok(());
         }
 
@@ -222,6 +228,7 @@ impl QueueWriter {
         match self.write_batch(topic, concatenated, None).await {
             Ok(offset) => {
                 self.events.on_flush_finish(topic.as_str(), "ok", flush_start.elapsed());
+                debug!(offset, "Flush completed");
                 TopicAccumulator::send_success(responses, offset, total_records);
                 Ok(())
             }
@@ -254,9 +261,14 @@ impl QueueWriter {
     ///
     /// This is the core write method used internally. For normal usage, prefer using the channel-based approach via `start()`.
     /// Now we always have one row group for each parquet file, because `group_by_column` is always optional.
+    #[tracing::instrument(
+        skip(self, batch),
+        fields(topic = %topic)
+    )]
     async fn write_batch(&self, topic: &Topic, batch: RecordBatch, group_by_column: Option<String>) -> Result<u64> {
         let record_count = batch.num_rows();
         if record_count == 0 {
+            debug!("Empty batch, skipping write");
             return Ok(self.get_current_offset(topic).await);
         }
 
@@ -270,11 +282,15 @@ impl QueueWriter {
         let parquet_bytes = self.batches_to_parquet(&batches)?;
         let row_group_count = batches.len();
         let size_bytes = parquet_bytes.len() as u64;
+        debug!(
+            records = record_count,
+            size_bytes,
+            row_groups = row_group_count,
+            "Parquet payload prepared"
+        );
 
         // Write with retry on conflict
-        let offset = self
-            .write_with_retry(topic, parquet_bytes, record_count, size_bytes, row_group_count)
-            .await?;
+        let offset = self.write_with_retry(topic, parquet_bytes).await?;
 
         self.events.on_write_complete(
             topic.as_str(),
@@ -391,14 +407,8 @@ impl QueueWriter {
     }
 
     /// Writes Parquet bytes to object storage with retry on conflict.
-    async fn write_with_retry(
-        &self,
-        topic: &Topic,
-        data: Bytes,
-        record_count: usize,
-        size_bytes: u64,
-        row_group_count: usize,
-    ) -> Result<u64> {
+    #[tracing::instrument(skip(self, data), fields(topic = %topic))]
+    async fn write_with_retry(&self, topic: &Topic, data: Bytes) -> Result<u64> {
         let mut attempts = 0;
         let max_attempts = self.config.write_retries;
 
@@ -408,10 +418,7 @@ impl QueueWriter {
 
             match self.try_write(&segment_id, data.clone()).await {
                 Ok(()) => {
-                    debug!(
-                        "Wrote segment {}/{} ({} records, {} bytes, {} row groups)",
-                        topic, offset, record_count, size_bytes, row_group_count
-                    );
+                    debug!("Wrote segment {}/{}", topic, offset);
 
                     return Ok(offset);
                 }
@@ -439,6 +446,7 @@ impl QueueWriter {
                     #[allow(clippy::cast_sign_loss)]
                     // SAFETY: the `interval` can't be negative
                     let delay = self.config.flush_interval_ms + rand::random_range(-interval..=interval) as u64;
+                    debug!(offset, attempt = attempts, delay_ms = delay, "Retrying segment write");
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
                 Err(e) => return Err(e),
@@ -449,7 +457,12 @@ impl QueueWriter {
     /// Attempts to write a segment to object storage.
     ///
     /// Uses `If-None-Match: *` for atomic write (fails if file exists).
+    #[tracing::instrument(
+        skip(self, data),
+        fields(topic = %segment_id.topic, offset = segment_id.offset)
+    )]
     async fn try_write(&self, segment_id: &SegmentId, data: Bytes) -> Result<()> {
+        debug!("Try to save segments in store");
         let full_path = if self.config.base_path.is_empty() {
             segment_id.to_relative_path()
         } else {

@@ -106,7 +106,7 @@ prost = "0.14"
 # OpenTelemetry proto (with tonic service generation)
 opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic", "logs", "trace", "metrics"] }
 opentelemetry = { version = "0.31.0", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31.0", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31.0", features = ["metrics", "spec_unstable_metrics_views"] }
 opentelemetry-prometheus = "0.31.0"
 prometheus = "0.14.0"
 
