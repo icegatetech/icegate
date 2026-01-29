@@ -76,7 +76,7 @@ services:
       start_period: 10s
 
   trino:
-    image: trinodb/trino:469
+    image: trinodb/trino:479
     ports:
       - "8080:8080"
     volumes:
@@ -135,7 +135,7 @@ services:
       migrate:
         condition: service_completed_successfully
       jaeger:
-        condition: service_started
+        condition: service_healthy
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -164,20 +164,26 @@ services:
       migrate:
         condition: service_completed_successfully
       jaeger:
-        condition: service_started
+        condition: service_healthy
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
       RUST_LOG: info
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/4317' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     develop:
       watch:
         - action: rebuild
           path: ../../crates
 
   prometheus:
-    image: prom/prometheus:v3.2.0
+    image: prom/prometheus:v3.9.1
     ports:
       - "9092:9090"
     volumes:
@@ -195,13 +201,18 @@ services:
       COLLECTOR_OTLP_ENABLED: "true"
       SPAN_STORAGE_TYPE: "badger"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   otelgen:
-    image: ghcr.io/krzko/otelgen:v0.26.0
+    image: ghcr.io/krzko/otelgen:v0.5.2
     command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]
     depends_on:
       ingest:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   grafana:
