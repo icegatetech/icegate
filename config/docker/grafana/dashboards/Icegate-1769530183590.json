@@ -4166,7 +4166,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (operation) (delta(icegate_jobmanager_storage_s3_latency_seconds_count[5m]))\n",
+          "expr": "sum by (operation) (irate(icegate_jobmanager_storage_s3_latency_seconds_count[5m]))\n",
           "legendFormat": "{{operation}}",
           "range": true,
           "refId": "A"
