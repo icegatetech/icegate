@@ -4815,7 +4815,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "sum by (operation) (delta(icegate_jobmanager_storage_s3_latency_seconds_count[5m]))\n",
-          "legendFormat": "{{status}}",
+          "legendFormat": "{{operation}}",
           "range": true,
           "refId": "A"
         }
