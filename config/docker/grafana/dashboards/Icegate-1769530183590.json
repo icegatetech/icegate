@@ -662,7 +662,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{signal}} - {{status}} - p50",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
@@ -671,7 +671,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{signal}} - {{status}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p90-histogram_quantile"
         },
@@ -680,7 +680,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "{{signal}} - {{status}} - p99",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p50-histogram_quantile"
         }
@@ -1160,7 +1160,7 @@
           "editorMode": "code",
           "expr": "\nhistogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_seconds_bucket[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{topic}} - {{status}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
@@ -1170,7 +1170,7 @@
           "expr": "histogram_quantile(0.5, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_seconds_bucket[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{topic}} - {{status}} - p50",
           "range": true,
           "refId": "A"
         }
@@ -1180,7 +1180,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "",
+      "description": "Number of batches in the accumulator",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1195,7 +1195,7 @@
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
-            "fillOpacity": 9,
+            "fillOpacity": 0,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
@@ -1233,8 +1233,7 @@
                 "value": 80
               }
             ]
-          },
-          "unit": "cps"
+          }
         },
         "overrides": []
       },
@@ -1244,8 +1243,7 @@
         "x": 18,
         "y": 13
       },
-      "id": 48,
-      "maxDataPoints": 500,
+      "id": 49,
       "options": {
         "legend": {
           "calcs": [],
@@ -1256,7 +1254,7 @@
         "tooltip": {
           "hideZeros": false,
           "mode": "multi",
-          "sort": "desc"
+          "sort": "none"
         }
       },
       "pluginVersion": "12.3.1",
@@ -1264,24 +1262,13 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_seconds_count[1m]))",
-          "fromExploreMetrics": false,
-          "legendFormat": "{{topic}} - {{status}}",
-          "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
-        },
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_seconds_bucket[1m])))",
-          "fromExploreMetrics": false,
-          "hide": true,
-          "legendFormat": "p50",
+          "expr": "icegate_ingest_wal_pending_batches",
+          "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "WAL: flush finished count [1m]",
+      "title": "WAL: pending batches to flush",
       "type": "timeseries"
     },
     {
@@ -1644,7 +1631,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "cps"
         },
         "overrides": []
       },
@@ -1653,6 +1641,102 @@
         "w": 6,
         "x": 18,
         "y": 19
+      },
+      "id": 48,
+      "maxDataPoints": 500,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "sum by (topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_seconds_count[1m]))",
+          "fromExploreMetrics": false,
+          "legendFormat": "{{topic}} - {{status}}",
+          "range": true,
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
+        }
+      ],
+      "title": "WAL: flush finished count [1m]",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 9,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 25
       },
       "id": 34,
       "maxDataPoints": 500,
@@ -1674,14 +1758,14 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic, reason) (rate(icegate_ingest_wal_write_retries_total_total[1m]))",
+          "expr": "sum by (topic) (rate(icegate_ingest_wal_segments_total_total[1m]))",
           "fromExploreMetrics": false,
-          "legendFormat": "{{topic}} - {{reason}}",
+          "legendFormat": "{{topic}}",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
+          "refId": "A"
         }
       ],
-      "title": "WAL: number of write retries [1m]",
+      "title": "WAL: write segments count [1m]",
       "type": "timeseries"
     },
     {
@@ -1690,7 +1774,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 31
       },
       "id": 5,
       "panels": [],
@@ -1760,7 +1844,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 26
+        "y": 32
       },
       "id": 1,
       "options": {
@@ -1853,7 +1937,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 26
+        "y": 32
       },
       "id": 2,
       "options": {
@@ -1947,7 +2031,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 26
+        "y": 32
       },
       "id": 3,
       "options": {
@@ -2040,7 +2124,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 26
+        "y": 32
       },
       "id": 4,
       "options": {
@@ -2134,7 +2218,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 32
+        "y": 38
       },
       "id": 6,
       "maxDataPoints": 500,
@@ -2248,7 +2332,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 32
+        "y": 38
       },
       "id": 7,
       "options": {
@@ -2351,7 +2435,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 32
+        "y": 38
       },
       "id": 8,
       "options": {
@@ -2444,7 +2528,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 32
+        "y": 38
       },
       "id": 9,
       "options": {
@@ -2546,7 +2630,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 38
+        "y": 44
       },
       "id": 10,
       "options": {
@@ -2649,7 +2733,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 38
+        "y": 44
       },
       "id": 11,
       "options": {
@@ -2752,7 +2836,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 38
+        "y": 44
       },
       "id": 12,
       "options": {
@@ -2846,7 +2930,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 38
+        "y": 44
       },
       "id": 13,
       "options": {
@@ -2940,7 +3024,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 44
+        "y": 50
       },
       "id": 14,
       "options": {
@@ -3043,7 +3127,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 44
+        "y": 50
       },
       "id": 15,
       "options": {
@@ -3145,7 +3229,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 44
+        "y": 50
       },
       "id": 16,
       "options": {
@@ -3239,7 +3323,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 44
+        "y": 50
       },
       "id": 19,
       "interval": "1m",
@@ -3333,7 +3417,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 50
+        "y": 56
       },
       "id": 17,
       "options": {
@@ -3426,7 +3510,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 50
+        "y": 56
       },
       "id": 18,
       "options": {
@@ -3462,7 +3546,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 62
       },
       "id": 37,
       "panels": [],
@@ -3532,7 +3616,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 57
+        "y": 63
       },
       "id": 38,
       "options": {
@@ -3625,7 +3709,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 57
+        "y": 63
       },
       "id": 39,
       "options": {
@@ -3718,7 +3802,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 57
+        "y": 63
       },
       "id": 40,
       "maxDataPoints": 500,
@@ -3820,7 +3904,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 57
+        "y": 63
       },
       "id": 41,
       "options": {
@@ -3913,7 +3997,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 63
+        "y": 69
       },
       "id": 42,
       "maxDataPoints": 500,
@@ -4015,7 +4099,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 63
+        "y": 69
       },
       "id": 43,
       "maxDataPoints": 500,
@@ -4117,7 +4201,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 63
+        "y": 69
       },
       "id": 44,
       "options": {
@@ -4210,7 +4294,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 63
+        "y": 69
       },
       "id": 45,
       "options": {
@@ -4302,7 +4386,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 69
+        "y": 75
       },
       "id": 46,
       "options": {
@@ -4347,5 +4431,5 @@
   "timezone": "browser",
   "title": "Icegate",
   "uid": "g78tk2",
-  "version": 13
+  "version": 14
 }

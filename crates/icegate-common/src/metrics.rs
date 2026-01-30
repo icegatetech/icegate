@@ -138,7 +138,10 @@ fn histogram_view(inst: &Instrument) -> Option<Stream> {
     }
 
     let boundaries: &[f64] = if inst.unit() == "s" || inst.name().contains("duration") {
-        &[0.01, 0.25, 0.75, 0.1, 0.2, 0.3, 0.4, 0.7, 1.0, 1.3, 1.6, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 100.0]
+        &[
+            0.01, 0.25, 0.75, 0.1, 0.2, 0.3, 0.4, 0.7, 1.0, 1.3, 1.6, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0,
+            100.0,
+        ]
     } else if inst.unit() == "By" || inst.name().contains("bytes") {
         &[
             512.0,
