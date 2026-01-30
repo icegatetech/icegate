@@ -28,6 +28,23 @@ storage:
   # Storage properties (optional)
   properties: {}
 
+# Queue Configuration (WAL)
+queue:
+  # Base path for queue segments (e.g. s3://bucket/queue or file:///var/data/queue)
+  base_path: s3://queue
+  # Capacity of the write channel (bounded for backpressure)
+  channel_capacity: 1024
+  # Number of retry attempts for write operations
+  write_retries: 3
+  # Parquet compression codec: none, snappy, gzip, lzo, brotli, lz4, zstd
+  compression: zstd
+  # Maximum number of records to accumulate before flush
+  max_records_per_flush: 10000
+  # Maximum bytes to accumulate before flush
+  max_bytes_per_flush: 67108864
+  # Maximum time to wait before flush (milliseconds)
+  flush_interval_ms: 1000
+
 # Shift Configuration
 shift:
   read:

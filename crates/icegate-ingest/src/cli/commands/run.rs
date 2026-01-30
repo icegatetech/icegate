@@ -56,14 +56,16 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Initialize WAL queue based on queue config's base_path
     tracing::info!("Initializing WAL queue");
-    let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
+    let mut queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
+    if queue_config.base_path.is_empty() {
+        queue_config.base_path = "wal".to_string();
+    }
     let (write_tx, write_rx) = channel(queue_config.channel_capacity);
 
     // Create object store based on queue base_path
     let (store, normalized_path) = create_object_store(&queue_config.base_path, Some(&config.storage.backend))?;
 
     // Update queue config with normalized base path
-    let mut queue_config = queue_config;
     queue_config.base_path = normalized_path;
 
     let metrics_runtime = if config.metrics.enabled {

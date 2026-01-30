@@ -49,6 +49,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
+  "id": 3,
   "links": [],
   "panels": [
     {
@@ -63,99 +64,6 @@
       "panels": [],
       "title": "Ingest",
       "type": "row"
-    },
-    {
-      "id": 47,
-      "type": "timeseries",
-      "title": "Request: received amount of data [1m]",
-      "gridPos": {
-        "x": 6,
-        "y": 1,
-        "h": 6,
-        "w": 6
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "spanNulls": false,
-            "insertNulls": false,
-            "showPoints": "auto",
-            "showValues": false,
-            "pointSize": 5,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto",
-            "axisLabel": "",
-            "axisColorMode": "text",
-            "axisBorderShow": false,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "axisCenteredZero": false,
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "binBps"
-        },
-        "overrides": []
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "sum (rate(icegate_ingest_otlp_request_size_bytes_bytes_sum[1m]))",
-          "legendFormat": "bytes/sec",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "datasource": "Prometheus",
-      "options": {
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none",
-          "hideZeros": false
-        },
-        "legend": {
-          "showLegend": true,
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": []
-        }
-      }
     },
     {
       "datasource": "Prometheus",
@@ -261,7 +169,6 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -276,7 +183,7 @@
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
-            "fillOpacity": 9,
+            "fillOpacity": 0,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
@@ -315,7 +222,7 @@
               }
             ]
           },
-          "unit": "s"
+          "unit": "binBps"
         },
         "overrides": []
       },
@@ -325,8 +232,7 @@
         "x": 6,
         "y": 1
       },
-      "id": 22,
-      "maxDataPoints": 500,
+      "id": 47,
       "options": {
         "legend": {
           "calcs": [],
@@ -337,40 +243,21 @@
         "tooltip": {
           "hideZeros": false,
           "mode": "multi",
-          "sort": "desc"
+          "sort": "none"
         }
       },
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))\n",
-          "fromExploreMetrics": false,
-          "legendFormat": "p50",
+          "expr": "sum (rate(icegate_ingest_otlp_request_size_bytes_bytes_sum[1m]))",
+          "legendFormat": "bytes/sec",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
-        },
-        {
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))\n",
-          "fromExploreMetrics": false,
-          "legendFormat": "p95",
-          "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p90-histogram_quantile",
-          "datasource": "Prometheus"
-        },
-        {
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))",
-          "fromExploreMetrics": false,
-          "legendFormat": "p99",
-          "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p50-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "A"
         }
       ],
-      "title": "Request: latency",
+      "title": "Request: received amount of data [1m]",
       "type": "timeseries"
     },
     {
@@ -457,22 +344,22 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bytes_bucket[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p50",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bytes_bucket[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p90-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p90-histogram_quantile"
         }
       ],
       "title": "Request: size",
@@ -561,22 +448,22 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p50",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket[1m])))\n",
           "fromExploreMetrics": false,
           "legendFormat": "p99",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p50-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p50-histogram_quantile"
         }
       ],
       "title": "Request: records per request [1m]",
@@ -665,13 +552,13 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_seconds_bucket[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
@@ -689,7 +576,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "Wait time for write acknowledgment.",
+      "description": "",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -753,7 +640,7 @@
         "x": 6,
         "y": 7
       },
-      "id": 26,
+      "id": 22,
       "maxDataPoints": 500,
       "options": {
         "legend": {
@@ -771,26 +658,34 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "p50",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))\n",
           "fromExploreMetrics": false,
-          "hide": false,
-          "legendFormat": "p50",
+          "legendFormat": "p95",
           "range": true,
-          "refId": "A"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p90-histogram_quantile"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_seconds_bucket[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p50-histogram_quantile"
         }
       ],
-      "title": "WAL: ack latency [1m]",
+      "title": "Request: latency",
       "type": "timeseries"
     },
     {
@@ -1073,7 +968,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "Estimated bytes in the accumulator",
+      "description": "Wait time for write acknowledgment.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1088,7 +983,7 @@
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
-            "fillOpacity": 0,
+            "fillOpacity": 9,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
@@ -1127,7 +1022,7 @@
               }
             ]
           },
-          "unit": "bytes"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -1137,7 +1032,8 @@
         "x": 6,
         "y": 13
       },
-      "id": 30,
+      "id": 26,
+      "maxDataPoints": 500,
       "options": {
         "legend": {
           "calcs": [],
@@ -1148,7 +1044,7 @@
         "tooltip": {
           "hideZeros": false,
           "mode": "multi",
-          "sort": "none"
+          "sort": "desc"
         }
       },
       "pluginVersion": "12.3.1",
@@ -1156,13 +1052,24 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "icegate_ingest_wal_pending_bytes_bytes",
-          "legendFormat": "{{topic}}",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_seconds_bucket[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_seconds_bucket[1m])))",
+          "fromExploreMetrics": false,
+          "hide": false,
+          "legendFormat": "p50",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "WAL: pending bytes to flush",
+      "title": "WAL: ack latency [1m]",
       "type": "timeseries"
     },
     {
@@ -1249,13 +1156,13 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "\nhistogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_seconds_bucket[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
@@ -1327,7 +1234,7 @@
               }
             ]
           },
-          "unit": "bytes"
+          "unit": "cps"
         },
         "overrides": []
       },
@@ -1337,7 +1244,7 @@
         "x": 18,
         "y": 13
       },
-      "id": 32,
+      "id": 48,
       "maxDataPoints": 500,
       "options": {
         "legend": {
@@ -1355,26 +1262,26 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bytes_bucket[1m])))\n",
+          "expr": "sum by (topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_seconds_count[1m]))",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{topic}} - {{status}}",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bytes_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_seconds_bucket[1m])))",
           "fromExploreMetrics": false,
-          "hide": false,
+          "hide": true,
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "WAL: segment size [1m]",
+      "title": "WAL: flush finished count [1m]",
       "type": "timeseries"
     },
     {
@@ -1460,13 +1367,13 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_records_per_segment_bucket[1m])))\n",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
@@ -1480,6 +1387,206 @@
         }
       ],
       "title": "WAL: records per segment [1m]",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "Estimated bytes in the accumulator",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 19
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "icegate_ingest_wal_pending_bytes_bytes",
+          "legendFormat": "{{topic}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "WAL: pending bytes to flush",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 9,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 19
+      },
+      "id": 32,
+      "maxDataPoints": 500,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bytes_bucket[1m])))\n",
+          "fromExploreMetrics": false,
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bytes_bucket[1m])))",
+          "fromExploreMetrics": false,
+          "hide": false,
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "WAL: segment size [1m]",
       "type": "timeseries"
     },
     {
@@ -1544,7 +1651,7 @@
       "gridPos": {
         "h": 6,
         "w": 6,
-        "x": 6,
+        "x": 18,
         "y": 19
       },
       "id": 34,
@@ -1565,111 +1672,16 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "sum by (topic, reason) (rate(icegate_ingest_wal_write_retries_total_total[1m]))",
           "fromExploreMetrics": false,
           "legendFormat": "{{topic}} - {{reason}}",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         }
       ],
       "title": "WAL: number of write retries [1m]",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "description": "",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 9,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 12,
-        "y": 19
-      },
-      "id": 35,
-      "maxDataPoints": 500,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "sum by (topic, reason) (rate(icegate_ingest_wal_write_errors_total_total[1m]))",
-          "fromExploreMetrics": false,
-          "legendFormat": "{{topic}} - {{reason}}",
-          "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
-        }
-      ],
-      "title": "WAL: number of write errors [1m]",
       "type": "timeseries"
     },
     {
@@ -1926,7 +1938,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "cpm"
         },
         "overrides": []
       },
@@ -1955,7 +1968,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (\n  rate(icegate_ingest_shift_planned_tasks_total_total[1m])\n)",
+          "expr": "sum by (topic) (\n  increase(icegate_ingest_shift_planned_tasks_total_total[1m])\n)",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -2141,31 +2154,31 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.99,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_seconds_bucket{ }[$__rate_interval])))",
           "fromExploreMetrics": false,
           "legendFormat": "p99",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p99-histogram_quantile"
         },
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.9,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_seconds_bucket{ }[$__rate_interval])))",
           "fromExploreMetrics": false,
           "legendFormat": "p90",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p90-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p90-histogram_quantile"
         },
         {
+          "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.5,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_seconds_bucket{ }[$__rate_interval])))",
           "fromExploreMetrics": false,
           "legendFormat": "p50",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p50-histogram_quantile",
-          "datasource": "Prometheus"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_seconds_bucket-p50-histogram_quantile"
         }
       ],
       "title": "Plan task: latency of segment planing and reading",
@@ -2260,6 +2273,15 @@
           "legendFormat": "{{topic}} - p95",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_seconds_bucket[1m])))",
+          "hide": false,
+          "legendFormat": "{{topic}} - p50",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "WAL: segment reading [1m]",
@@ -2652,6 +2674,15 @@
           "legendFormat": "{{topic}} - {{status}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_parquet_write_duration_seconds_seconds_bucket[1m])))",
+          "hide": false,
+          "legendFormat": "{{topic}} - {{status}}",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Shift task: parquet write latency [1m]",
@@ -2712,7 +2743,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "cpm"
         },
         "overrides": []
       },
@@ -2741,7 +2773,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (rate(icegate_ingest_shift_parquet_files_total_total[1m]))",
+          "expr": "sum by (topic) (increase(icegate_ingest_shift_parquet_files_total_total[1m]))",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -2933,6 +2965,15 @@
           "legendFormat": "{{topic}} - p95",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_get_data_files_duration_seconds_seconds_bucket[1m])))",
+          "hide": false,
+          "legendFormat": "{{topic}} - p50",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Commit task: get parquet files latency [1m]",
@@ -3027,6 +3068,15 @@
           "legendFormat": "{{topic}} - p95",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_commit_duration_seconds_seconds_bucket[1m])))",
+          "hide": false,
+          "legendFormat": "{{topic}} - p50",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Commit task: iceberg commit latency [1m]",
@@ -3180,7 +3230,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "cpm"
         },
         "overrides": []
       },
@@ -3191,6 +3242,7 @@
         "y": 44
       },
       "id": 19,
+      "interval": "1m",
       "options": {
         "legend": {
           "calcs": [],
@@ -3209,13 +3261,13 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum (rate(icegate_ingest_shift_task_success_total_total[1m]))",
+          "expr": "sum by (topic, task)  (increase(icegate_ingest_shift_task_success_total_total[1m]))",
           "legendFormat": "{{topic}}-{{task}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Tasks: all tasks rate [1m]",
+      "title": "Tasks: success tasks count [1m]",
       "type": "timeseries"
     },
     {
@@ -3472,7 +3524,7 @@
               }
             ]
           },
-          "unit": "reqps"
+          "unit": "cpm"
         },
         "overrides": []
       },
@@ -3501,13 +3553,13 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (status) (rate(icegate_jobmanager_job_duration_seconds_count[1m]))\n",
+          "expr": "sum by (status) (increase(icegate_jobmanager_job_duration_seconds_count[1m]))\n",
           "legendFormat": "{{status}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Jobmanager: job iterations rate [1m]",
+      "title": "Jobmanager: job iterations count [1m]",
       "type": "timeseries"
     },
     {
@@ -4189,53 +4241,45 @@
       "type": "timeseries"
     },
     {
-      "id": 46,
-      "type": "timeseries",
-      "title": "Jobmanager: S3 requests [1m]",
-      "gridPos": {
-        "x": 0,
-        "y": 69,
-        "h": 6,
-        "w": 6
-      },
+      "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
             "barAlignment": 0,
             "barWidthFactor": 0.6,
-            "lineWidth": 1,
+            "drawStyle": "line",
             "fillOpacity": 0,
             "gradientMode": "none",
-            "spanNulls": false,
-            "insertNulls": false,
-            "showPoints": "auto",
-            "showValues": false,
-            "pointSize": 5,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
             },
-            "axisPlacement": "auto",
-            "axisLabel": "",
-            "axisColorMode": "text",
-            "axisBorderShow": false,
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
             },
-            "axisCenteredZero": false,
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
             },
             "thresholdsStyle": {
               "mode": "off"
             }
-          },
-          "color": {
-            "mode": "palette-classic"
           },
           "mappings": [],
           "thresholds": {
@@ -4243,7 +4287,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               },
               {
                 "color": "red",
@@ -4253,6 +4297,26 @@
           }
         },
         "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 69
+      },
+      "id": 46,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
       },
       "pluginVersion": "12.3.1",
       "targets": [
@@ -4265,20 +4329,8 @@
           "refId": "A"
         }
       ],
-      "datasource": "Prometheus",
-      "options": {
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none",
-          "hideZeros": false
-        },
-        "legend": {
-          "showLegend": true,
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": []
-        }
-      }
+      "title": "Jobmanager: S3 requests [1m]",
+      "type": "timeseries"
     }
   ],
   "preload": false,
@@ -4295,7 +4347,5 @@
   "timezone": "browser",
   "title": "Icegate",
   "uid": "g78tk2",
-  "version": 69,
-  "weekStart": "",
-  "id": null
+  "version": 13
 }

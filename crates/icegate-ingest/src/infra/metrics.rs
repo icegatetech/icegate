@@ -758,6 +758,7 @@ pub struct WalWriterMetrics {
     pending_records: Gauge<u64>,
     pending_bytes: Gauge<u64>,
     flush_duration: Histogram<f64>,
+    segments_total: Counter<u64>,
     segment_bytes: Histogram<f64>,
     row_groups_per_segment: Histogram<f64>,
     records_per_segment: Histogram<f64>,
@@ -778,6 +779,7 @@ impl WalWriterMetrics {
             pending_records: meter.u64_gauge("icegate_ingest_wal_pending_records").build(),
             pending_bytes: meter.u64_gauge("icegate_ingest_wal_pending_bytes").build(),
             flush_duration: meter.f64_histogram("icegate_ingest_wal_flush_duration_seconds").build(),
+            segments_total: meter.u64_counter("icegate_ingest_wal_segments_total").build(),
             segment_bytes: meter.f64_histogram("icegate_ingest_wal_segment_bytes").build(),
             row_groups_per_segment: meter.f64_histogram("icegate_ingest_wal_row_groups_per_segment").build(),
             records_per_segment: meter.f64_histogram("icegate_ingest_wal_records_per_segment").build(),
@@ -805,6 +807,10 @@ impl WalWriterMetrics {
             .f64_histogram("icegate_ingest_wal_flush_duration_seconds")
             .with_description("Flush duration (concat + write)")
             .with_unit("s")
+            .build();
+        let segments_total = meter
+            .u64_counter("icegate_ingest_wal_segments_total")
+            .with_description("WAL segments written")
             .build();
         let segment_bytes = meter
             .f64_histogram("icegate_ingest_wal_segment_bytes")
@@ -835,6 +841,7 @@ impl WalWriterMetrics {
             pending_records,
             pending_bytes,
             flush_duration,
+            segments_total,
             segment_bytes,
             row_groups_per_segment,
             records_per_segment,
@@ -878,6 +885,7 @@ impl QueueWriterEvents for WalWriterMetrics {
             return;
         }
         let labels = &[KeyValue::new("topic", topic.to_string())];
+        self.segments_total.add(1, labels);
         self.segment_bytes.record(outcome.size_bytes as f64, labels);
         self.row_groups_per_segment.record(outcome.row_groups as f64, labels);
         self.records_per_segment.record(outcome.records as f64, labels);
