@@ -87,6 +87,9 @@ impl QueueWriter {
         let check_flush_interval = Duration::from_millis(writer.config.flush_interval_ms / 4);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(check_flush_interval);
+            // Use Delay mode: wait for full interval AFTER each flush completes
+            // This prevents tick accumulation when flush_due_topics takes longer than interval
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
