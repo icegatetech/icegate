@@ -75,28 +75,6 @@ services:
       retries: 10
       start_period: 10s
 
-  trino:
-    image: trinodb/trino:479
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./trino/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
-    environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      AWS_REGION: us-east-1
-    depends_on:
-      minio:
-        condition: service_healthy
-      nessie:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "/usr/lib/trino/bin/health-check"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
   migrate:
     build:
       context: ../..
@@ -134,8 +112,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      jaeger:
-        condition: service_healthy
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -163,8 +139,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      jaeger:
-        condition: service_healthy
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -182,39 +156,6 @@ services:
         - action: rebuild
           path: ../../crates
 
-  prometheus:
-    image: prom/prometheus:v3.9.1
-    ports:
-      - "9092:9090"
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    depends_on:
-      ingest:
-        condition: service_started
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.76.0
-    ports:
-      - "16686:16686"
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-      SPAN_STORAGE_TYPE: "badger"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  otelgen:
-    image: ghcr.io/krzko/otelgen:v0.5.2
-    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]
-    depends_on:
-      ingest:
-        condition: service_healthy
-    restart: unless-stopped
-
   grafana:
     image: grafana/grafana:12.3
     ports:
@@ -230,6 +171,109 @@ services:
     depends_on:
       query:
         condition: service_started
+
+  otelgen:
+    image: ghcr.io/krzko/otelgen:v0.5.2
+    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]
+    depends_on:
+      ingest:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - load
+
+  prometheus:
+    image: prom/prometheus:v3.9.1
+    ports:
+      - "9092:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      ingest:
+        condition: service_started
+      node-exporter:
+        condition: service_started
+      cadvisor:
+        condition: service_started
+    profiles:
+      - monitoring
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    ports:
+      - "16686:16686"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: "badger"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - monitoring
+
+  node-exporter:
+    image: prom/node-exporter:v1.10.2
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(proc|sys|dev|etc|host|run)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+      - /var/run:/var/run:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+      - /etc/machine-id:/etc/machine-id:ro
+    command:
+      - --docker_only=true
+      - --store_container_labels=false
+      - --storage_duration=2m
+      - --housekeeping_interval=10s
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  trino:
+    image: trinodb/trino:479
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./trino/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    depends_on:
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    profiles:
+      - analytics
 
 volumes:
   minio-data:
