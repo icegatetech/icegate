@@ -1,7 +1,16 @@
 .PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench
 
-load:
+run-core-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml up --build
+
+run-load-release:
+	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile load up
+
+run-monitoring-release:
+	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile monitoring up
+
+run-analytics-release:
+	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile analytics up
 
 dev:
 	PROFILE=debug docker build --build-arg PROFILE=debug -f config/docker/Dockerfile .

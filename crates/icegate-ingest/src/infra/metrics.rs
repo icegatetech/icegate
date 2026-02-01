@@ -45,63 +45,57 @@ impl ShiftMetrics {
 
         Self {
             enabled: false,
-            plan_duration: meter.f64_histogram("icegate_ingest_shift_plan_duration_seconds").build(),
-            queue_plan_duration: meter.f64_histogram("icegate_ingest_shift_queue_plan_duration_seconds").build(),
+            plan_duration: meter.f64_histogram("icegate_ingest_shift_plan_duration").build(),
+            queue_plan_duration: meter.f64_histogram("icegate_ingest_shift_queue_plan_duration").build(),
             queue_read_segment_duration: meter
-                .f64_histogram("icegate_ingest_shift_queue_read_segment_duration_seconds")
+                .f64_histogram("icegate_ingest_shift_queue_read_segment_duration")
                 .build(),
-            planned_segments_total: meter.u64_counter("icegate_ingest_shift_planned_segments_total").build(),
-            planned_record_batches_total: meter
-                .u64_counter("icegate_ingest_shift_planned_record_batches_total")
-                .build(),
-            planned_tasks_total: meter.u64_counter("icegate_ingest_shift_planned_tasks_total").build(),
+            planned_segments_total: meter.u64_counter("icegate_ingest_shift_planned_segments").build(),
+            planned_record_batches_total: meter.u64_counter("icegate_ingest_shift_planned_record_batches").build(),
+            planned_tasks_total: meter.u64_counter("icegate_ingest_shift_planned_tasks").build(),
             backlog_segments: meter.u64_gauge("icegate_ingest_shift_backlog_segments").build(),
             segment_record_batches_per_task: meter
                 .f64_histogram("icegate_ingest_shift_segment_record_batches_per_task")
                 .build(),
             segment_rows_per_task: meter.f64_histogram("icegate_ingest_shift_segment_rows_per_task").build(),
-            parquet_write_duration: meter
-                .f64_histogram("icegate_ingest_shift_parquet_write_duration_seconds")
-                .build(),
-            parquet_files_total: meter.u64_counter("icegate_ingest_shift_parquet_files_total").build(),
-            bytes_written_total: meter.u64_counter("icegate_ingest_shift_bytes_written_total").build(),
-            get_data_files_duration: meter
-                .f64_histogram("icegate_ingest_shift_get_data_files_duration_seconds")
-                .build(),
-            commit_duration: meter.f64_histogram("icegate_ingest_shift_commit_duration_seconds").build(),
-            already_committed_total: meter.u64_counter("icegate_ingest_shift_already_committed_total").build(),
-            task_failures_total: meter.u64_counter("icegate_ingest_shift_task_failures_total").build(),
-            task_success_total: meter.u64_counter("icegate_ingest_shift_task_success_total").build(),
+            parquet_write_duration: meter.f64_histogram("icegate_ingest_shift_parquet_write_duration").build(),
+            parquet_files_total: meter.u64_counter("icegate_ingest_shift_parquet_files").build(),
+            bytes_written_total: meter.u64_counter("icegate_ingest_shift_bytes_written").build(),
+            get_data_files_duration: meter.f64_histogram("icegate_ingest_shift_get_data_files_duration").build(),
+            commit_duration: meter.f64_histogram("icegate_ingest_shift_commit_duration").build(),
+            already_committed_total: meter.u64_counter("icegate_ingest_shift_already_committed").build(),
+            task_failures_total: meter.u64_counter("icegate_ingest_shift_task_failures").build(),
+            task_success_total: meter.u64_counter("icegate_ingest_shift_task_success").build(),
         }
     }
 
     /// Build a metrics recorder using the provided meter.
     pub fn new(meter: &Meter) -> Self {
         let plan_duration = meter
-            .f64_histogram("icegate_ingest_shift_plan_duration_seconds")
+            .f64_histogram("icegate_ingest_shift_plan_duration")
             .with_description("Duration of shift plan task execution")
             .with_unit("s")
             .build();
         let queue_plan_duration = meter
-            .f64_histogram("icegate_ingest_shift_queue_plan_duration_seconds")
+            .f64_histogram("icegate_ingest_shift_queue_plan_duration")
             .with_description("Duration of queue_reader.plan_segments execution")
             .with_unit("s")
             .build();
         let queue_read_segment_duration = meter
-            .f64_histogram("icegate_ingest_shift_queue_read_segment_duration_seconds")
+            .f64_histogram("icegate_ingest_shift_queue_read_segment_duration")
             .with_description("Duration of queue_reader.read_segment execution")
             .with_unit("s")
             .build();
         let planned_segments_total = meter
-            .u64_counter("icegate_ingest_shift_planned_segments_total")
+            .u64_counter("icegate_ingest_shift_planned_segments")
             .with_description("Number of planned segments")
             .build();
         let planned_record_batches_total = meter
-            .u64_counter("icegate_ingest_shift_planned_record_batches_total")
+            .u64_counter("icegate_ingest_shift_planned_record_batches")
             .with_description("Number of planned record batches")
             .build();
         let planned_tasks_total = meter
-            .u64_counter("icegate_ingest_shift_planned_tasks_total")
+            .u64_counter("icegate_ingest_shift_planned_tasks")
             .with_description("Number of planned shift tasks")
             .build();
         let backlog_segments = meter
@@ -117,39 +111,39 @@ impl ShiftMetrics {
             .with_description("Rows per shift task")
             .build();
         let parquet_write_duration = meter
-            .f64_histogram("icegate_ingest_shift_parquet_write_duration_seconds")
+            .f64_histogram("icegate_ingest_shift_parquet_write_duration")
             .with_description("Duration of storage.write_record_batches execution")
             .with_unit("s")
             .build();
         let parquet_files_total = meter
-            .u64_counter("icegate_ingest_shift_parquet_files_total")
+            .u64_counter("icegate_ingest_shift_parquet_files")
             .with_description("Number of parquet files written by shift tasks")
             .build();
         let bytes_written_total = meter
-            .u64_counter("icegate_ingest_shift_bytes_written_total")
+            .u64_counter("icegate_ingest_shift_bytes_written")
             .with_description("Bytes written by shift tasks")
             .with_unit("By")
             .build();
         let get_data_files_duration = meter
-            .f64_histogram("icegate_ingest_shift_get_data_files_duration_seconds")
+            .f64_histogram("icegate_ingest_shift_get_data_files_duration")
             .with_description("Duration of storage.get_data_files execution")
             .with_unit("s")
             .build();
         let commit_duration = meter
-            .f64_histogram("icegate_ingest_shift_commit_duration_seconds")
+            .f64_histogram("icegate_ingest_shift_commit_duration")
             .with_description("Duration of storage.commit execution")
             .with_unit("s")
             .build();
         let already_committed_total = meter
-            .u64_counter("icegate_ingest_shift_already_committed_total")
+            .u64_counter("icegate_ingest_shift_already_committed")
             .with_description("Number of commit tasks resolved as already committed")
             .build();
         let task_failures_total = meter
-            .u64_counter("icegate_ingest_shift_task_failures_total")
+            .u64_counter("icegate_ingest_shift_task_failures")
             .with_description("Number of shift task failures")
             .build();
         let task_success_total = meter
-            .u64_counter("icegate_ingest_shift_task_success_total")
+            .u64_counter("icegate_ingest_shift_task_success")
             .with_description("Number of shift task successes")
             .build();
 
@@ -396,46 +390,46 @@ impl OtlpMetrics {
 
         Self {
             enabled: false,
-            requests_total: meter.u64_counter("icegate_ingest_otlp_requests_total").build(),
-            request_duration: meter.f64_histogram("icegate_ingest_otlp_request_duration_seconds").build(),
-            request_size_bytes: meter.f64_histogram("icegate_ingest_otlp_request_size_bytes").build(),
-            decode_duration: meter.f64_histogram("icegate_ingest_otlp_decode_duration_seconds").build(),
-            decode_errors_total: meter.u64_counter("icegate_ingest_otlp_decode_errors_total").build(),
-            transform_duration: meter.f64_histogram("icegate_ingest_otlp_transform_duration_seconds").build(),
+            requests_total: meter.u64_counter("icegate_ingest_otlp_requests").build(),
+            request_duration: meter.f64_histogram("icegate_ingest_otlp_request_duration").build(),
+            request_size_bytes: meter.f64_histogram("icegate_ingest_otlp_request_size").build(),
+            decode_duration: meter.f64_histogram("icegate_ingest_otlp_decode_duration").build(),
+            decode_errors_total: meter.u64_counter("icegate_ingest_otlp_decode_errors").build(),
+            transform_duration: meter.f64_histogram("icegate_ingest_otlp_transform_duration").build(),
             records_per_request: meter.f64_histogram("icegate_ingest_otlp_records_per_request").build(),
-            wal_enqueue_duration: meter.f64_histogram("icegate_ingest_wal_enqueue_duration_seconds").build(),
-            wal_ack_duration: meter.f64_histogram("icegate_ingest_wal_ack_duration_seconds").build(),
-            wal_queue_unavailable_total: meter.u64_counter("icegate_ingest_wal_queue_unavailable_total").build(),
+            wal_enqueue_duration: meter.f64_histogram("icegate_ingest_wal_enqueue_duration").build(),
+            wal_ack_duration: meter.f64_histogram("icegate_ingest_wal_ack_duration").build(),
+            wal_queue_unavailable_total: meter.u64_counter("icegate_ingest_wal_queue_unavailable").build(),
         }
     }
 
     /// Build a metrics recorder using the provided meter.
     pub fn new(meter: &Meter) -> Self {
         let requests_total = meter
-            .u64_counter("icegate_ingest_otlp_requests_total")
+            .u64_counter("icegate_ingest_otlp_requests")
             .with_description("Total number of OTLP intake requests")
             .build();
         let request_duration = meter
-            .f64_histogram("icegate_ingest_otlp_request_duration_seconds")
+            .f64_histogram("icegate_ingest_otlp_request_duration")
             .with_description("End-to-end OTLP request duration")
             .with_unit("s")
             .build();
         let request_size_bytes = meter
-            .f64_histogram("icegate_ingest_otlp_request_size_bytes")
+            .f64_histogram("icegate_ingest_otlp_request_size")
             .with_description("OTLP request body size")
             .with_unit("By")
             .build();
         let decode_duration = meter
-            .f64_histogram("icegate_ingest_otlp_decode_duration_seconds")
+            .f64_histogram("icegate_ingest_otlp_decode_duration")
             .with_description("OTLP decode duration")
             .with_unit("s")
             .build();
         let decode_errors_total = meter
-            .u64_counter("icegate_ingest_otlp_decode_errors_total")
+            .u64_counter("icegate_ingest_otlp_decode_errors")
             .with_description("OTLP decode/validation errors")
             .build();
         let transform_duration = meter
-            .f64_histogram("icegate_ingest_otlp_transform_duration_seconds")
+            .f64_histogram("icegate_ingest_otlp_transform_duration")
             .with_description("OTLP transform duration")
             .with_unit("s")
             .build();
@@ -444,17 +438,17 @@ impl OtlpMetrics {
             .with_description("Records per OTLP request")
             .build();
         let wal_enqueue_duration = meter
-            .f64_histogram("icegate_ingest_wal_enqueue_duration_seconds")
+            .f64_histogram("icegate_ingest_wal_enqueue_duration")
             .with_description("Time to enqueue WAL write request")
             .with_unit("s")
             .build();
         let wal_ack_duration = meter
-            .f64_histogram("icegate_ingest_wal_ack_duration_seconds")
+            .f64_histogram("icegate_ingest_wal_ack_duration")
             .with_description("Time to wait for WAL write acknowledgment")
             .with_unit("s")
             .build();
         let wal_queue_unavailable_total = meter
-            .u64_counter("icegate_ingest_wal_queue_unavailable_total")
+            .u64_counter("icegate_ingest_wal_queue_unavailable")
             .with_description("Failed WAL enqueue attempts")
             .build();
 
@@ -777,14 +771,14 @@ impl WalWriterMetrics {
             inner,
             pending_batches: meter.u64_gauge("icegate_ingest_wal_pending_batches").build(),
             pending_records: meter.u64_gauge("icegate_ingest_wal_pending_records").build(),
-            pending_bytes: meter.u64_gauge("icegate_ingest_wal_pending_bytes").build(),
-            flush_duration: meter.f64_histogram("icegate_ingest_wal_flush_duration_seconds").build(),
-            segments_total: meter.u64_counter("icegate_ingest_wal_segments_total").build(),
-            segment_bytes: meter.f64_histogram("icegate_ingest_wal_segment_bytes").build(),
+            pending_bytes: meter.u64_gauge("icegate_ingest_wal_pending").build(),
+            flush_duration: meter.f64_histogram("icegate_ingest_wal_flush_duration").build(),
+            segments_total: meter.u64_counter("icegate_ingest_wal_segments").build(),
+            segment_bytes: meter.f64_histogram("icegate_ingest_wal_segment").build(),
             row_groups_per_segment: meter.f64_histogram("icegate_ingest_wal_row_groups_per_segment").build(),
             records_per_segment: meter.f64_histogram("icegate_ingest_wal_records_per_segment").build(),
-            write_retries_total: meter.u64_counter("icegate_ingest_wal_write_retries_total").build(),
-            write_errors_total: meter.u64_counter("icegate_ingest_wal_write_errors_total").build(),
+            write_retries_total: meter.u64_counter("icegate_ingest_wal_write_retries").build(),
+            write_errors_total: meter.u64_counter("icegate_ingest_wal_write_errors").build(),
         }
     }
 
@@ -799,21 +793,21 @@ impl WalWriterMetrics {
             .with_description("Number of records in WAL accumulator")
             .build();
         let pending_bytes = meter
-            .u64_gauge("icegate_ingest_wal_pending_bytes")
+            .u64_gauge("icegate_ingest_wal_pending")
             .with_description("Estimated bytes in WAL accumulator")
             .with_unit("By")
             .build();
         let flush_duration = meter
-            .f64_histogram("icegate_ingest_wal_flush_duration_seconds")
+            .f64_histogram("icegate_ingest_wal_flush_duration")
             .with_description("Flush duration (concat + write)")
             .with_unit("s")
             .build();
         let segments_total = meter
-            .u64_counter("icegate_ingest_wal_segments_total")
+            .u64_counter("icegate_ingest_wal_segments")
             .with_description("WAL segments written")
             .build();
         let segment_bytes = meter
-            .f64_histogram("icegate_ingest_wal_segment_bytes")
+            .f64_histogram("icegate_ingest_wal_segment")
             .with_description("WAL segment size in bytes")
             .with_unit("By")
             .build();
@@ -826,11 +820,11 @@ impl WalWriterMetrics {
             .with_description("Records per WAL segment")
             .build();
         let write_retries_total = meter
-            .u64_counter("icegate_ingest_wal_write_retries_total")
+            .u64_counter("icegate_ingest_wal_write_retries")
             .with_description("WAL write retries")
             .build();
         let write_errors_total = meter
-            .u64_counter("icegate_ingest_wal_write_errors_total")
+            .u64_counter("icegate_ingest_wal_write_errors")
             .with_description("WAL write errors")
             .build();
 
