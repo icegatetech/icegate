@@ -158,7 +158,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2024m
+          memory: 2048m
           cpus: 1
 
   grafana:
