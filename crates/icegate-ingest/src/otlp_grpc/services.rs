@@ -53,6 +53,10 @@ impl LogsService for OtlpGrpcService {
     /// queue. Returns partial success response with count of rejected
     /// records.
     #[allow(clippy::cast_possible_wrap)]
+    #[tracing::instrument(
+        skip(self, request),
+        fields(method = "/opentelemetry.proto.collector.logs.v1.LogsService/Export")
+    )]
     async fn export(
         &self,
         request: Request<ExportLogsServiceRequest>,
@@ -90,6 +94,7 @@ impl LogsService for OtlpGrpcService {
             batch,
             group_by_column: Some("tenant_id".to_string()),
             response_tx,
+            trace_context: icegate_common::extract_current_trace_context(),
         };
 
         // Send to WAL queue
@@ -110,14 +115,19 @@ impl LogsService for OtlpGrpcService {
             Status::internal(format!("Failed to receive write result: {e}"))
         })?;
 
+        // Add link to flush operation if trace context is available
+        if let Some(tc) = result.trace_context() {
+            icegate_common::add_span_link(tc);
+        }
+
         match result {
-            icegate_queue::WriteResult::Success { offset, records } => {
+            icegate_queue::WriteResult::Success { offset, records, .. } => {
                 debug!(offset, records, "OTLP GRPC request ended successfully");
                 request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_OK);
                 request_metrics.finish_ok();
                 Ok(Response::new(ExportLogsServiceResponse { partial_success: None }))
             }
-            icegate_queue::WriteResult::Failed { reason } => {
+            icegate_queue::WriteResult::Failed { reason, .. } => {
                 // Return partial success with all records rejected
                 request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
                 request_metrics.finish_partial();
@@ -144,6 +154,10 @@ impl TraceService for OtlpGrpcService {
     /// - Write spans to Iceberg spans table via catalog
     /// - Handle batching and backpressure
     /// - Return partial success for rejected spans
+    #[tracing::instrument(
+        skip(self, _request),
+        fields(method = "/opentelemetry.proto.collector.trace.v1.TraceService/Export")
+    )]
     async fn export(
         &self,
         _request: Request<ExportTraceServiceRequest>,
@@ -165,6 +179,10 @@ impl MetricsService for OtlpGrpcService {
     /// - Write metrics to Iceberg metrics table via catalog
     /// - Handle batching and backpressure
     /// - Return partial success for rejected metrics
+    #[tracing::instrument(
+        skip(self, _request),
+        fields(method = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export")
+    )]
     async fn export(
         &self,
         _request: Request<ExportMetricsServiceRequest>,

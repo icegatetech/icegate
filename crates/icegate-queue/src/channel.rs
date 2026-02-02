@@ -30,6 +30,12 @@ pub struct WriteRequest {
 
     /// Channel to send the write result back to the caller.
     pub response_tx: oneshot::Sender<WriteResult>,
+
+    /// W3C trace context for distributed tracing (traceparent header format).
+    ///
+    /// Format: `{version}-{trace-id}-{parent-id}-{trace-flags}`
+    /// Example: `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`
+    pub trace_context: Option<String>,
 }
 
 /// Result of a write operation.
@@ -41,25 +47,36 @@ pub enum WriteResult {
         offset: u64,
         /// Number of records written.
         records: usize,
+        /// W3C trace context for distributed tracing (traceparent header format).
+        trace_context: Option<String>,
     },
     /// Write failed.
     Failed {
         /// Reason for failure.
         reason: String,
+        /// W3C trace context for distributed tracing (traceparent header format).
+        trace_context: Option<String>,
     },
 }
 
 impl WriteResult {
     /// Creates a success result.
     #[must_use]
-    pub const fn success(offset: u64, records: usize) -> Self {
-        Self::Success { offset, records }
+    pub const fn success(offset: u64, records: usize, trace_context: Option<String>) -> Self {
+        Self::Success {
+            offset,
+            records,
+            trace_context,
+        }
     }
 
     /// Creates a failure result.
     #[must_use]
-    pub fn failed(reason: impl Into<String>) -> Self {
-        Self::Failed { reason: reason.into() }
+    pub fn failed(reason: impl Into<String>, trace_context: Option<String>) -> Self {
+        Self::Failed {
+            reason: reason.into(),
+            trace_context,
+        }
     }
 
     /// Returns true if the write succeeded.
@@ -97,7 +114,15 @@ impl WriteResult {
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Success { .. } => None,
-            Self::Failed { reason } => Some(reason),
+            Self::Failed { reason, .. } => Some(reason),
+        }
+    }
+
+    /// Returns the trace context if present.
+    #[must_use]
+    pub const fn trace_context(&self) -> &Option<String> {
+        match self {
+            Self::Success { trace_context, .. } | Self::Failed { trace_context, .. } => trace_context,
         }
     }
 }
@@ -114,21 +139,39 @@ mod tests {
 
     #[test]
     fn test_write_result_success() {
-        let result = WriteResult::success(42, 100);
+        let result = WriteResult::success(42, 100, None);
         assert!(result.is_success());
         assert!(!result.is_failed());
         assert_eq!(result.offset(), Some(42));
         assert_eq!(result.records(), Some(100));
         assert_eq!(result.reason(), None);
+        assert_eq!(result.trace_context(), &None);
+    }
+
+    #[test]
+    fn test_write_result_success_with_trace() {
+        let trace_ctx = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
+        let result = WriteResult::success(42, 100, trace_ctx.clone());
+        assert!(result.is_success());
+        assert_eq!(result.trace_context(), &trace_ctx);
     }
 
     #[test]
     fn test_write_result_failed() {
-        let result = WriteResult::failed("connection timeout");
+        let result = WriteResult::failed("connection timeout", None);
         assert!(!result.is_success());
         assert!(result.is_failed());
         assert_eq!(result.offset(), None);
         assert_eq!(result.records(), None);
         assert_eq!(result.reason(), Some("connection timeout"));
+        assert_eq!(result.trace_context(), &None);
+    }
+
+    #[test]
+    fn test_write_result_failed_with_trace() {
+        let trace_ctx = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
+        let result = WriteResult::failed("connection timeout", trace_ctx.clone());
+        assert!(result.is_failed());
+        assert_eq!(result.trace_context(), &trace_ctx);
     }
 }

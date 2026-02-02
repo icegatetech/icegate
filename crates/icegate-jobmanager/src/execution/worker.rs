@@ -113,10 +113,7 @@ impl Worker {
         }
     }
 
-    #[tracing::instrument(
-        skip(self, cancel_token),
-        fields(worker_id = %self.id)
-    )]
+    // Do not add trace instrumentation here, it will cause an infinite trace.
     pub async fn start(&self, cancel_token: CancellationToken) -> Result<(), InternalError> {
         info!("Starting worker {}", self.id);
 

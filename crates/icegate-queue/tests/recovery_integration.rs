@@ -23,6 +23,7 @@ async fn test_recovery_empty_store() -> Result<(), Box<dyn std::error::Error>> {
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -59,6 +60,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
                 batch: batch.clone(),
                 group_by_column: None,
                 response_tx,
+                trace_context: None,
             })
             .await
             .unwrap();
@@ -81,6 +83,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -118,6 +121,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
                 batch: batch.clone(),
                 group_by_column: None,
                 response_tx,
+                trace_context: None,
             })
             .await
             .unwrap();
@@ -132,6 +136,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
                 batch: batch.clone(),
                 group_by_column: None,
                 response_tx,
+                trace_context: None,
             })
             .await
             .unwrap();
@@ -145,6 +150,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
             batch: batch.clone(),
             group_by_column: None,
             response_tx,
+            trace_context: None,
         })
         .await
         .unwrap();
@@ -167,6 +173,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -184,6 +191,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -201,6 +209,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -235,6 +244,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
                 batch: batch.clone(),
                 group_by_column: None,
                 response_tx,
+                trace_context: None,
             })
             .await
             .unwrap();
@@ -257,6 +267,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -285,6 +296,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
             batch: batch.clone(),
             group_by_column: None,
             response_tx,
+            trace_context: None,
         })
         .await
         .unwrap();

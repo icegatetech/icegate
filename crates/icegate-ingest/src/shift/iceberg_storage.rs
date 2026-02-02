@@ -143,6 +143,7 @@ impl IcebergStorage {
         .await
     }
 
+    #[tracing::instrument(skip(self, batches, cancel_token))]
     async fn write_parquet_files_once(
         &self,
         batches: Vec<RecordBatch>,

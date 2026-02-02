@@ -29,9 +29,6 @@ parquet = { workspace = true }
 # Iceberg
 iceberg = { workspace = true }
 
-# Object Store
-object_store = { workspace = true }
-
 # Error handling
 thiserror = { workspace = true }
 
@@ -60,7 +57,6 @@ opentelemetry_sdk = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 # CLI
 clap = { workspace = true }

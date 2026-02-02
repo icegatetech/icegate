@@ -3,11 +3,17 @@
 //! Provides shared tracing configuration and initialization for IceGate services.
 //! Uses OTLP exporter with tonic to send traces to Jaeger or other OTLP-compatible backends.
 
+use std::collections::HashMap;
+
 use opentelemetry::global;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, SdkTracerProvider};
 use serde::{Deserialize, Serialize};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::error::{CommonError, Result};
@@ -218,4 +224,145 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
     Ok(TracingGuard {
         provider: Some(tracer_provider),
     })
+}
+
+/// Extracts W3C traceparent from the current tracing span.
+///
+/// Returns a traceparent header value (format: `{version}-{trace-id}-{parent-id}-{trace-flags}`)
+/// that can be used to propagate trace context across async boundaries.
+///
+/// # Returns
+///
+/// Returns `Some(String)` with the traceparent header value if a valid trace context exists,
+/// or `None` if no valid trace context is available.
+///
+/// # Examples
+///
+/// ```no_run
+/// use icegate_common::extract_current_trace_context;
+///
+/// # async fn example() {
+/// let trace_context = extract_current_trace_context();
+/// if let Some(tc) = trace_context {
+///     // Store or propagate trace context
+///     println!("Trace context: {}", tc);
+/// }
+/// # }
+/// ```
+#[must_use]
+pub fn extract_current_trace_context() -> Option<String> {
+    let cx = tracing::Span::current().context();
+    let mut headers = HashMap::new();
+    let propagator = TraceContextPropagator::new();
+    propagator.inject_context(&cx, &mut headers);
+    headers.get("traceparent").map(ToString::to_string)
+}
+
+/// Converts a W3C traceparent string back to an `OpenTelemetry` `Context`.
+///
+/// This is the inverse of `extract_current_trace_context()`. Falls back to
+/// current context if parsing fails.
+///
+/// # Arguments
+///
+/// * `traceparent` - W3C traceparent header value in format `{version}-{trace-id}-{parent-id}-{trace-flags}`
+///
+/// # Returns
+///
+/// Returns an `OpenTelemetry` `Context` with the parsed trace context.
+/// If parsing fails, returns the current context.
+///
+/// # Examples
+///
+/// ```no_run
+/// use icegate_common::traceparent_to_context;
+///
+/// # async fn example() {
+/// let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+/// let context = traceparent_to_context(traceparent);
+/// // Use context as parent for new spans
+/// # }
+/// ```
+#[must_use]
+pub fn traceparent_to_context(traceparent: &str) -> opentelemetry::Context {
+    let mut headers = HashMap::new();
+    headers.insert("traceparent".to_string(), traceparent.to_string());
+    let propagator = TraceContextPropagator::new();
+    propagator.extract(&headers)
+}
+
+/// Adds a span link to the current span from a W3C traceparent string.
+///
+/// Returns `true` if the link was added successfully, `false` if the
+/// traceparent was invalid.
+///
+/// # Arguments
+///
+/// * `traceparent` - W3C traceparent header value
+///
+/// # Returns
+///
+/// Returns `true` if the span link was successfully added (traceparent is valid),
+/// or `false` if the traceparent was invalid.
+///
+/// # Examples
+///
+/// ```no_run
+/// use icegate_common::add_span_link;
+///
+/// # async fn example() {
+/// let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+/// if add_span_link(traceparent) {
+///     println!("Span link added successfully");
+/// }
+/// # }
+/// ```
+pub fn add_span_link(traceparent: &str) -> bool {
+    let parent_cx = traceparent_to_context(traceparent);
+    let flush_span_context = parent_cx.span().span_context().clone();
+    if flush_span_context.is_valid() {
+        tracing::Span::current().add_link(flush_span_context);
+        true
+    } else {
+        false
+    }
+}
+
+/// Adds multiple span links to the current span from W3C traceparent strings.
+///
+/// Returns the number of links successfully added.
+///
+/// # Arguments
+///
+/// * `traceparents` - Iterator of W3C traceparent header values
+///
+/// # Returns
+///
+/// Returns the count of successfully added span links.
+///
+/// # Examples
+///
+/// ```no_run
+/// use icegate_common::add_span_links;
+///
+/// # async fn example() {
+/// let traceparents = vec![
+///     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+///     "00-5cf92f3577b34da6a3ce929d0e0e4737-00f067aa0ba902b8-01",
+/// ];
+/// let count = add_span_links(traceparents);
+/// println!("Added {} span links", count);
+/// # }
+/// ```
+pub fn add_span_links<'a, I>(traceparents: I) -> usize
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut count = 0;
+    for traceparent in traceparents {
+        if add_span_link(traceparent) {
+            count += 1;
+        }
+    }
+    count
 }

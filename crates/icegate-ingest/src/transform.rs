@@ -56,6 +56,7 @@ pub fn logs_arrow_schema() -> Schema {
 #[allow(clippy::cast_possible_wrap)]
 #[allow(clippy::cast_possible_truncation)] // Timestamp fits in i64 for practical purposes
 #[allow(clippy::expect_used)] // Byte lengths are validated before append
+#[tracing::instrument(skip(request))]
 pub fn logs_to_record_batch(
     request: &ExportLogsServiceRequest,
     tenant_id: Option<&str>,

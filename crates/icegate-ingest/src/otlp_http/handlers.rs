@@ -46,6 +46,7 @@ const STATUS_ERROR: &str = "error";
 /// Transforms OTLP log records to Arrow `RecordBatch` and writes to the WAL
 /// queue.
 #[allow(clippy::cast_possible_wrap)]
+#[tracing::instrument(skip(state, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_LOGS))]
 pub async fn ingest_logs(
     State(state): State<OtlpHttpState>,
     headers: HeaderMap,
@@ -88,6 +89,7 @@ pub async fn ingest_logs(
         batch,
         group_by_column: Some("tenant_id".to_string()),
         response_tx,
+        trace_context: icegate_common::extract_current_trace_context(),
     };
 
     // Send to WAL queue
@@ -112,14 +114,19 @@ pub async fn ingest_logs(
         ))))
     })?;
 
+    // Add link to flush operation if trace context is available
+    if let Some(tc) = result.trace_context() {
+        icegate_common::add_span_link(tc);
+    }
+
     match result {
-        WriteResult::Success { offset, records } => {
+        WriteResult::Success { offset, records, .. } => {
             debug!(offset, records, "Logs written to WAL");
             request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_OK);
             request_metrics.finish_ok();
             Ok(Json(ExportLogsResponse::default()))
         }
-        WriteResult::Failed { reason } => {
+        WriteResult::Failed { reason, .. } => {
             // Return partial success with all records rejected
             request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
             request_metrics.finish_partial();

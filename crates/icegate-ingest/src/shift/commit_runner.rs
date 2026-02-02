@@ -105,6 +105,7 @@ impl<S> CommitTaskRunner for CommitTaskRunnerImpl<S>
 where
     S: Storage + 'static,
 {
+    #[tracing::instrument(name="commit_run", skip(self, task, manager, cancel_token), fields(task_id = %task.id()))]
     async fn run(
         &self,
         task: Arc<dyn ImmutableTask>,

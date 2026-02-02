@@ -24,6 +24,7 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
             batch: batch.clone(),
             group_by_column: None,
             response_tx,
+            trace_context: None,
         })
         .await
         .unwrap();
@@ -64,6 +65,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
             batch: batch.clone(),
             group_by_column: None,
             response_tx,
+            trace_context: None,
         })
         .await
         .unwrap();
@@ -114,6 +116,7 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
         batch: original_batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -153,6 +156,7 @@ async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -193,6 +197,7 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
             batch,
             group_by_column: None,
             response_tx,
+            trace_context: None,
         })
         .await
         .unwrap();
@@ -243,6 +248,7 @@ async fn test_plan_max_row_groups_limit() -> Result<(), Box<dyn std::error::Erro
             batch,
             group_by_column: None,
             response_tx,
+            trace_context: None,
         })
         .await
         .unwrap();

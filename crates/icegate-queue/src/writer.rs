@@ -17,6 +17,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
     Topic,
@@ -84,7 +85,7 @@ impl QueueWriter {
 
         // Spawn flush ticker task
         // To make a flush interval is more precise make the check interval is smaller than the one
-        let check_flush_interval = Duration::from_millis(writer.config.flush_interval_ms / 4);
+        let check_flush_interval = Duration::from_millis(writer.config.flush_interval_ms);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(check_flush_interval);
             // Use Delay mode: wait for full interval AFTER each flush completes
@@ -112,6 +113,19 @@ impl QueueWriter {
             info!("Queue writer started");
 
             while let Some(request) = receiver.recv().await {
+                // Extract remote parent context from W3C trace context
+                let parent_cx = request
+                    .trace_context
+                    .as_ref()
+                    .map_or_else(opentelemetry::Context::current, |tc| {
+                        icegate_common::traceparent_to_context(tc)
+                    });
+
+                // Create a span with the remote parent context
+                let span = tracing::info_span!("process_request");
+                let _ = span.set_parent(parent_cx);
+                let _guard = span.enter();
+
                 let writer = Arc::clone(&writer);
                 let result = writer.handle_request(request).await;
                 if let Err(e) = result {
@@ -140,15 +154,15 @@ impl QueueWriter {
     async fn handle_request(&self, request: WriteRequest) -> Result<()> {
         debug!("Start handle request to WAL");
         let topic = request.topic.clone();
-        let (pending_batches, pending_records, pending_bytes, should_flush) = {
+        let trace_context = request.trace_context.clone();
+        let (pending_batches, pending_records, pending_bytes) = {
             let mut accumulators = self.accumulators.write().await;
             let accumulator = accumulators.entry(topic.clone()).or_insert_with(TopicAccumulator::new);
-            accumulator.add(request.batch, request.response_tx);
+            accumulator.add(request.batch, request.response_tx, trace_context);
             (
                 accumulator.pending_batches(),
                 accumulator.pending_records(),
                 accumulator.pending_bytes(),
-                accumulator.should_flush(&self.config),
             )
         };
 
@@ -158,10 +172,6 @@ impl QueueWriter {
             saturating_u64(pending_records),
             saturating_u64(pending_bytes),
         );
-
-        if should_flush {
-            self.flush_topic(&topic).await?;
-        }
 
         Ok(())
     }
@@ -197,7 +207,7 @@ impl QueueWriter {
     #[tracing::instrument(skip(self), fields(topic = %topic))]
     async fn flush_topic(&self, topic: &Topic) -> Result<()> {
         let flush_start = Instant::now();
-        let (batches, responses) = {
+        let pending = {
             let mut accumulators = self.accumulators.write().await;
             if let Some(accumulator) = accumulators.get_mut(topic) {
                 accumulator.take()
@@ -206,14 +216,23 @@ impl QueueWriter {
             }
         };
 
-        debug!(batches = batches.len(), "Flushing topic batches");
+        debug!(batches = pending.len(), "Flushing topic batches");
         self.events.on_accumulator_state_update(topic.as_str(), 0, 0, 0);
 
-        if batches.is_empty() {
+        if pending.is_empty() {
             debug!("No batches to flush");
             return Ok(());
         }
 
+        // Add span links for all trace contexts from batched requests
+        let trace_contexts: Vec<&str> = pending.iter().filter_map(|p| p.trace_context.as_deref()).collect();
+        icegate_common::add_span_links(trace_contexts);
+
+        // Extract trace context from current flush_topic span
+        let flush_trace_context = icegate_common::extract_current_trace_context();
+
+        // Extract batches for concatenation
+        let batches: Vec<RecordBatch> = pending.iter().map(|p| p.batch.clone()).collect();
         let total_records: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
         // Concatenate all batches into one
@@ -222,7 +241,7 @@ impl QueueWriter {
             Err(e) => {
                 self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
                 self.events.on_write_error(topic.as_str(), write_error_reason(&e));
-                TopicAccumulator::send_failure(responses, &e.to_string());
+                TopicAccumulator::send_failure(pending, &e.to_string(), flush_trace_context.as_ref());
                 return Err(e);
             }
         };
@@ -232,13 +251,13 @@ impl QueueWriter {
             Ok(offset) => {
                 self.events.on_flush_finish(topic.as_str(), "ok", flush_start.elapsed());
                 debug!(offset, "Flush completed");
-                TopicAccumulator::send_success(responses, offset, total_records);
+                TopicAccumulator::send_success(pending, offset, total_records, flush_trace_context.as_ref());
                 Ok(())
             }
             Err(e) => {
                 self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
                 self.events.on_write_error(topic.as_str(), write_error_reason(&e));
-                TopicAccumulator::send_failure(responses, &e.to_string());
+                TopicAccumulator::send_failure(pending, &e.to_string(), flush_trace_context.as_ref());
                 Err(e)
             }
         }
@@ -751,6 +770,7 @@ mod tests {
             batch,
             group_by_column: None,
             response_tx,
+            trace_context: None,
         })
         .await
         .unwrap();
