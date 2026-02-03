@@ -120,9 +120,9 @@ impl WriteResult {
 
     /// Returns the trace context if present.
     #[must_use]
-    pub const fn trace_context(&self) -> &Option<String> {
+    pub fn trace_context(&self) -> Option<&str> {
         match self {
-            Self::Success { trace_context, .. } | Self::Failed { trace_context, .. } => trace_context,
+            Self::Success { trace_context, .. } | Self::Failed { trace_context, .. } => trace_context.as_deref(),
         }
     }
 }
@@ -145,15 +145,18 @@ mod tests {
         assert_eq!(result.offset(), Some(42));
         assert_eq!(result.records(), Some(100));
         assert_eq!(result.reason(), None);
-        assert_eq!(result.trace_context(), &None);
+        assert_eq!(result.trace_context(), None);
     }
 
     #[test]
     fn test_write_result_success_with_trace() {
         let trace_ctx = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
-        let result = WriteResult::success(42, 100, trace_ctx.clone());
+        let result = WriteResult::success(42, 100, trace_ctx);
         assert!(result.is_success());
-        assert_eq!(result.trace_context(), &trace_ctx);
+        assert_eq!(
+            result.trace_context(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
     }
 
     #[test]
@@ -164,14 +167,17 @@ mod tests {
         assert_eq!(result.offset(), None);
         assert_eq!(result.records(), None);
         assert_eq!(result.reason(), Some("connection timeout"));
-        assert_eq!(result.trace_context(), &None);
+        assert_eq!(result.trace_context(), None);
     }
 
     #[test]
     fn test_write_result_failed_with_trace() {
         let trace_ctx = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
-        let result = WriteResult::failed("connection timeout", trace_ctx.clone());
+        let result = WriteResult::failed("connection timeout", trace_ctx);
         assert!(result.is_failed());
-        assert_eq!(result.trace_context(), &trace_ctx);
+        assert_eq!(
+            result.trace_context(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
     }
 }

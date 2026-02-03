@@ -318,10 +318,16 @@ mod tests {
         assert!(result1.is_success());
         assert_eq!(result1.offset(), Some(42));
         assert_eq!(result1.records(), Some(100));
-        assert_eq!(result1.trace_context(), &trace_ctx);
+        assert_eq!(
+            result1.trace_context(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
 
         assert!(result2.is_success());
-        assert_eq!(result2.trace_context(), &trace_ctx);
+        assert_eq!(
+            result2.trace_context(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
     }
 
     #[tokio::test]
@@ -340,6 +346,9 @@ mod tests {
         let result = rx.await.expect("recv");
         assert!(result.is_failed());
         assert_eq!(result.reason(), Some("test error"));
-        assert_eq!(result.trace_context(), &trace_ctx);
+        assert_eq!(
+            result.trace_context(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
     }
 }
