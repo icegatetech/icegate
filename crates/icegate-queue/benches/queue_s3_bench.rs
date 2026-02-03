@@ -54,6 +54,7 @@ async fn write_batch(
         batch,
         group_by_column,
         response_tx,
+        trace_context: None,
     })
     .await
     .expect("Failed to send write request");

@@ -36,8 +36,10 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Logging
+# Logging and tracing
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

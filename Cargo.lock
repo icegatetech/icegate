@@ -3603,7 +3603,6 @@ dependencies = [
  "icegate-common",
  "icegate-jobmanager",
  "icegate-queue",
- "object_store",
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
@@ -3616,7 +3615,6 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -3709,6 +3707,7 @@ dependencies = [
  "futures",
  "icegate-common",
  "object_store",
+ "opentelemetry",
  "parquet",
  "rand 0.9.2",
  "serde",
@@ -3717,6 +3716,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-opentelemetry",
  "uuid",
 ]
 

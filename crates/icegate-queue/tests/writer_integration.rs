@@ -24,6 +24,7 @@ async fn test_write_single_batch_to_s3() -> Result<(), Box<dyn std::error::Error
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -65,6 +66,7 @@ async fn test_sequential_writes_monotonic_offsets() -> Result<(), Box<dyn std::e
             batch: batch.clone(),
             group_by_column: None,
             response_tx,
+            trace_context: None,
         })
         .await
         .unwrap();
@@ -105,6 +107,7 @@ async fn test_write_with_grouping() -> Result<(), Box<dyn std::error::Error>> {
         batch: batch.clone(),
         group_by_column: Some("tenant_id".to_string()),
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -140,6 +143,7 @@ async fn test_write_empty_batch() -> Result<(), Box<dyn std::error::Error>> {
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -177,6 +181,7 @@ async fn test_write_with_base_path() -> Result<(), Box<dyn std::error::Error>> {
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -211,6 +216,7 @@ async fn test_channel_write_response() -> Result<(), Box<dyn std::error::Error>>
         batch: batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -245,6 +251,7 @@ async fn test_write_then_read_roundtrip() -> Result<(), Box<dyn std::error::Erro
         batch: original_batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -294,6 +301,7 @@ async fn test_write_read_schema_preservation() -> Result<(), Box<dyn std::error:
         batch: original_batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();
@@ -341,6 +349,7 @@ async fn test_write_read_with_compression() -> Result<(), Box<dyn std::error::Er
         batch: original_batch.clone(),
         group_by_column: None,
         response_tx,
+        trace_context: None,
     })
     .await
     .unwrap();

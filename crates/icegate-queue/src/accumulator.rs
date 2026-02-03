@@ -10,23 +10,31 @@ use tokio::sync::oneshot;
 
 use crate::{channel::WriteResult, config::QueueConfig, error::Result};
 
+/// A pending batch with its response channel and optional trace context.
+#[derive(Debug)]
+pub struct PendingBatch {
+    /// The record batch to be written.
+    pub(crate) batch: RecordBatch,
+    /// Response channel for this batch.
+    pub(crate) response_tx: oneshot::Sender<WriteResult>,
+    /// Optional W3C trace context (traceparent format).
+    pub(crate) trace_context: Option<String>,
+}
+
 /// Accumulator for a single topic.
 ///
 /// Collects `RecordBatches` and their response channels until a flush
 /// threshold is reached.
 #[derive(Debug)]
 pub struct TopicAccumulator {
-    /// Accumulated batches waiting to be flushed.
-    batches: Vec<RecordBatch>,
+    /// Pending batches with their response channels and trace contexts.
+    pending: Vec<PendingBatch>,
 
     /// Total record count across all batches.
     total_records: usize,
 
     /// Estimated total bytes across all batches.
     total_bytes: usize,
-
-    /// Response channels for pending batches.
-    pending_responses: Vec<oneshot::Sender<WriteResult>>,
 
     /// Time when accumulator was created or last flushed.
     last_flush: Instant,
@@ -43,26 +51,33 @@ impl TopicAccumulator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            batches: Vec::new(),
+            pending: Vec::new(),
             total_records: 0,
             total_bytes: 0,
-            pending_responses: Vec::new(),
             last_flush: Instant::now(),
         }
     }
 
     /// Adds a batch and its response channel to the accumulator.
-    pub fn add(&mut self, batch: RecordBatch, response_tx: oneshot::Sender<WriteResult>) {
+    pub fn add(
+        &mut self,
+        batch: RecordBatch,
+        response_tx: oneshot::Sender<WriteResult>,
+        trace_context: Option<String>,
+    ) {
         self.total_records += batch.num_rows();
         self.total_bytes += Self::estimate_batch_size(&batch);
-        self.batches.push(batch);
-        self.pending_responses.push(response_tx);
+        self.pending.push(PendingBatch {
+            batch,
+            response_tx,
+            trace_context,
+        });
     }
 
     /// Checks if the accumulator should be flushed based on config thresholds.
     #[must_use]
     pub fn should_flush(&self, config: &QueueConfig) -> bool {
-        if self.batches.is_empty() {
+        if self.pending.is_empty() {
             return false;
         }
 
@@ -90,20 +105,20 @@ impl TopicAccumulator {
     #[cfg(test)]
     #[must_use]
     pub fn has_pending(&self) -> bool {
-        !self.batches.is_empty()
+        !self.pending.is_empty()
     }
 
     /// Returns the number of pending batches.
     #[cfg(test)]
     #[must_use]
     pub fn batch_count(&self) -> usize {
-        self.batches.len()
+        self.pending.len()
     }
 
     /// Returns the number of pending batches.
     #[must_use]
     pub fn pending_batches(&self) -> usize {
-        self.batches.len()
+        self.pending.len()
     }
 
     /// Returns the total record count.
@@ -127,15 +142,12 @@ impl TopicAccumulator {
 
     /// Takes all accumulated batches and responses, resetting the accumulator.
     ///
-    /// Returns the batches and their corresponding response channels.
-    pub fn take(&mut self) -> (Vec<RecordBatch>, Vec<oneshot::Sender<WriteResult>>) {
+    /// Returns all pending batches with their response channels and trace contexts.
+    pub fn take(&mut self) -> Vec<PendingBatch> {
         self.total_records = 0;
         self.total_bytes = 0;
         self.last_flush = Instant::now();
-        (
-            std::mem::take(&mut self.batches),
-            std::mem::take(&mut self.pending_responses),
-        )
+        std::mem::take(&mut self.pending)
     }
 
     /// Concatenates multiple `RecordBatches` into a single batch.
@@ -161,16 +173,24 @@ impl TopicAccumulator {
     }
 
     /// Sends success results to all pending response channels.
-    pub fn send_success(responses: Vec<oneshot::Sender<WriteResult>>, offset: u64, total_records: usize) {
-        for response_tx in responses {
-            let _ = response_tx.send(WriteResult::success(offset, total_records));
+    ///
+    /// All responses share the same `trace_context`, which should be extracted
+    /// from the flush operation span that performed the actual write.
+    pub fn send_success(pending: Vec<PendingBatch>, offset: u64, total_records: usize, trace_context: Option<&String>) {
+        for p in pending {
+            let _ = p
+                .response_tx
+                .send(WriteResult::success(offset, total_records, trace_context.cloned()));
         }
     }
 
     /// Sends failure results to all pending response channels.
-    pub fn send_failure(responses: Vec<oneshot::Sender<WriteResult>>, reason: &str) {
-        for response_tx in responses {
-            let _ = response_tx.send(WriteResult::failed(reason));
+    ///
+    /// All responses share the same `trace_context`, which should be extracted
+    /// from the flush operation span that encountered the error.
+    pub fn send_failure(pending: Vec<PendingBatch>, reason: &str, trace_context: Option<&String>) {
+        for p in pending {
+            let _ = p.response_tx.send(WriteResult::failed(reason, trace_context.cloned()));
         }
     }
 }
@@ -213,7 +233,7 @@ mod tests {
         let mut acc = TopicAccumulator::new();
         let (tx, _rx) = oneshot::channel();
 
-        acc.add(test_batch(100), tx);
+        acc.add(test_batch(100), tx, None);
 
         assert_eq!(acc.batch_count(), 1);
         assert_eq!(acc.total_records(), 100);
@@ -226,15 +246,14 @@ mod tests {
         let (tx1, _rx1) = oneshot::channel();
         let (tx2, _rx2) = oneshot::channel();
 
-        acc.add(test_batch(100), tx1);
-        acc.add(test_batch(50), tx2);
+        acc.add(test_batch(100), tx1, None);
+        acc.add(test_batch(50), tx2, None);
 
         assert_eq!(acc.total_records(), 150);
 
-        let (batches, responses) = acc.take();
+        let pending = acc.take();
 
-        assert_eq!(batches.len(), 2);
-        assert_eq!(responses.len(), 2);
+        assert_eq!(pending.len(), 2);
         assert_eq!(acc.batch_count(), 0);
         assert_eq!(acc.total_records(), 0);
         assert!(!acc.has_pending());
@@ -246,11 +265,11 @@ mod tests {
         let config = QueueConfig::new("test").with_max_records_per_flush(100);
 
         let (tx, _rx) = oneshot::channel();
-        acc.add(test_batch(50), tx);
+        acc.add(test_batch(50), tx, None);
         assert!(!acc.should_flush(&config));
 
         let (tx, _rx) = oneshot::channel();
-        acc.add(test_batch(60), tx);
+        acc.add(test_batch(60), tx, None);
         assert!(acc.should_flush(&config)); // 110 >= 100
     }
 
@@ -277,7 +296,21 @@ mod tests {
         let (tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
 
-        TopicAccumulator::send_success(vec![tx1, tx2], 42, 100);
+        let pending = vec![
+            PendingBatch {
+                batch: test_batch(10),
+                response_tx: tx1,
+                trace_context: None,
+            },
+            PendingBatch {
+                batch: test_batch(10),
+                response_tx: tx2,
+                trace_context: None,
+            },
+        ];
+
+        let trace_ctx = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
+        TopicAccumulator::send_success(pending, 42, 100, trace_ctx.as_ref());
 
         let result1 = rx1.await.expect("recv");
         let result2 = rx2.await.expect("recv");
@@ -285,18 +318,37 @@ mod tests {
         assert!(result1.is_success());
         assert_eq!(result1.offset(), Some(42));
         assert_eq!(result1.records(), Some(100));
+        assert_eq!(
+            result1.trace_context(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
 
         assert!(result2.is_success());
+        assert_eq!(
+            result2.trace_context(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
     }
 
     #[tokio::test]
     async fn test_send_failure() {
         let (tx, rx) = oneshot::channel();
 
-        TopicAccumulator::send_failure(vec![tx], "test error");
+        let pending = vec![PendingBatch {
+            batch: test_batch(10),
+            response_tx: tx,
+            trace_context: None,
+        }];
+
+        let trace_ctx = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
+        TopicAccumulator::send_failure(pending, "test error", trace_ctx.as_ref());
 
         let result = rx.await.expect("recv");
         assert!(result.is_failed());
         assert_eq!(result.reason(), Some("test error"));
+        assert_eq!(
+            result.trace_context(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
     }
 }

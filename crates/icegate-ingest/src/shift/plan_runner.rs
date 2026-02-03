@@ -78,6 +78,7 @@ where
     Q: QueueReader + 'static,
     S: Storage + 'static,
 {
+    #[tracing::instrument(name="plan_run", skip(self, manager, cancel_token), fields(task_id = %task_id))]
     async fn run(
         &self,
         task_id: Uuid,
