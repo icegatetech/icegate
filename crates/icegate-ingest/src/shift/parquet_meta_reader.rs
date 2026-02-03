@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::error::{IngestError, Result};
 
 /// Builds Iceberg data files from parquet file paths by reading parquet metadata.
-#[tracing::instrument]
+#[tracing::instrument(skip(table), fields(path_count = parquet_paths.len()), err)]
 pub async fn data_files_from_parquet_paths(table: &Table, parquet_paths: &[String]) -> Result<Vec<DataFile>> {
     // TODO(med): We have at least 3 S3 API calls (HEAD, GET footer size, GET footer range).
     if parquet_paths.is_empty() {
@@ -68,7 +68,7 @@ pub async fn data_files_from_parquet_paths(table: &Table, parquet_paths: &[Strin
     Ok(data_files)
 }
 
-#[tracing::instrument]
+#[tracing::instrument(level = "debug", skip(partition_spec, partition_type))]
 fn partition_from_path(
     file_path: &str,
     partition_spec: &iceberg::spec::PartitionSpec,
