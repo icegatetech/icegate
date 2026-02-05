@@ -91,6 +91,15 @@ impl ServerConfig for MetricsConfig {
 pub struct MetricsRuntime {
     registry: Registry,
     meter: Meter,
+    meter_provider: SdkMeterProvider,
+}
+
+impl Drop for MetricsRuntime {
+    fn drop(&mut self) {
+        if let Err(err) = self.meter_provider.shutdown() {
+            tracing::error!("Failed to shutdown meter provider: {err}");
+        }
+    }
 }
 
 impl MetricsRuntime {
@@ -111,10 +120,14 @@ impl MetricsRuntime {
             .build();
         let meter = meter_provider.meter(service_name);
 
-        opentelemetry::global::set_meter_provider(meter_provider);
+        opentelemetry::global::set_meter_provider(meter_provider.clone());
         opentelemetry_instrumentation_tokio::observe_current_runtime();
 
-        Ok(Self { registry, meter })
+        Ok(Self {
+            registry,
+            meter,
+            meter_provider,
+        })
     }
 
     /// Return a clone of the service meter.
