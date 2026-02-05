@@ -4,13 +4,13 @@ run-core-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml up --build
 
 run-load-release:
-	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile load up
+	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile load up --build
 
 run-monitoring-release:
-	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile monitoring up
+	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile monitoring up --build
 
 run-analytics-release:
-	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile analytics up
+	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile analytics up --build
 
 dev:
 	PROFILE=debug docker build --build-arg PROFILE=debug -f config/docker/Dockerfile .

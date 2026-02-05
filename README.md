@@ -64,63 +64,75 @@ The system consists of five core components for handling observability data (met
 
 ### Prerequisites
 
-#### Required Tools
-- **Rust** >= 1.92.0 (for Rust 2024 edition support)
-- **Cargo** (Rust's package manager and build tool, included with Rust)
-- **Git**
+- **Docker** and **Docker Compose** - for running the application
+- **Git** - for cloning the repository
 
-#### Optional Tools
-- **rustfmt** - for code formatting (included with Rust)
-- **clippy** - for linting and static analysis (included with Rust)
-- **rust-analyzer** - for IDE support
+### Quick Start
 
-### Validating Prerequisites
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/icegatetech/icegate.git
+   cd icegate
+   ```
 
-Check if Rust is installed with the correct version:
+2. Start the core services:
+   ```bash
+   make run-monitoing-release
+   ```
+
+   This command builds and runs all core services in Docker containers. The first run will take a few minutes to build the images and start all services.
+
+### Available Services
+
+Once running, the following services are available:
+
+#### Data Ingestion
+- **OTLP gRPC**: `http://localhost:4317` - Ingest observability data using OpenTelemetry gRPC protocol
+- **OTLP HTTP**: `http://localhost:4318` - Ingest observability data using OpenTelemetry HTTP protocol
+- **Ingest Metrics**: `http://localhost:9091/metrics` - Prometheus metrics for ingest service
+
+#### Query APIs
+- **Loki API**: `http://localhost:3100` - Query logs using Loki-compatible API ✅ **Currently Supported**
+- **Prometheus API**: `http://localhost:9090` - Query metrics (planned)
+- **Tempo API**: `http://localhost:3200` - Query traces (planned)
+
+#### Visualization
+- **Grafana**: `http://localhost:3000` - Dashboard and visualization (no login required)
+
+#### Infrastructure
+- **MinIO Console**: `http://localhost:9001` - Object storage web interface (login: minioadmin/minioadmin)
+- **MinIO API**: `http://localhost:9000` - S3-compatible object storage API
+- **Nessie API**: `http://localhost:19120` - Iceberg catalog REST API
+
+### Additional Profiles
+
+Run with additional services for testing and monitoring:
 
 ```bash
-# Check Rust version
-rustc --version
+# Include load generator for testing
+make run-load-release
 
-# Check Cargo version
-cargo --version
+# Pure runtime services
+make run-core-release
 
-# Check rustfmt (optional)
-rustfmt --version
-
-# Check clippy (optional)
-cargo clippy --version
+# Include analytics tools (Trino SQL query engine at http://localhost:8082)
+make run-analytics-release
 ```
 
-You should have Rust 1.92.0 or later installed.
+### Next Steps
 
-### Installing Rust
-
-If you don't have Rust installed, use rustup (the recommended Rust toolchain installer):
-
-```bash
-# Install Rust via rustup
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Follow the prompts to complete installation
-# Then reload your shell or run:
-source $HOME/.cargo/env
-
-# Verify installation
-rustc --version
-cargo --version
-```
-
-### Installation
-
-Dependencies are managed via Cargo and specified in `Cargo.toml`. They will be automatically downloaded and compiled when you build the project.
+- Send telemetry data to `localhost:4317` (gRPC) or `localhost:4318` (HTTP) using any OpenTelemetry SDK
+- View data in Grafana at `http://localhost:3000`
+- Query data using Loki, Prometheus, or Tempo APIs
 
 ## Development
+
+For developers who want to build from source and contribute:
 
 ```bash
 cargo build            # Build the project
 cargo test             # Run tests
-make dev               # Start full development stack with Docker
+make dev               # Start development stack with hot-reload
 ```
 
 For detailed development setup, build commands, and code quality guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
