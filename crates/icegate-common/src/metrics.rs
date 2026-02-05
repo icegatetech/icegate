@@ -89,7 +89,6 @@ impl ServerConfig for MetricsConfig {
 
 /// Metrics runtime state.
 pub struct MetricsRuntime {
-    _meter_provider: SdkMeterProvider,
     registry: Registry,
     meter: Meter,
 }
@@ -112,11 +111,10 @@ impl MetricsRuntime {
             .build();
         let meter = meter_provider.meter(service_name);
 
-        Ok(Self {
-            _meter_provider: meter_provider,
-            registry,
-            meter,
-        })
+        opentelemetry::global::set_meter_provider(meter_provider);
+        opentelemetry_instrumentation_tokio::observe_current_runtime();
+
+        Ok(Self { registry, meter })
     }
 
     /// Return a clone of the service meter.

@@ -40,6 +40,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }
 opentelemetry = { workspace = true }
+opentelemetry-instrumentation-tokio = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-prometheus = { workspace = true }
 prometheus = { workspace = true }

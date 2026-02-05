@@ -7,6 +7,7 @@ use std::{
 
 use arrow::{compute::SortOptions, record_batch::RecordBatch};
 use async_trait::async_trait;
+use iceberg::spec::TableMetadata;
 use iceberg::{
     Catalog, NamespaceIdent, TableIdent,
     arrow::RecordBatchPartitionSplitter,
@@ -163,10 +164,13 @@ impl IcebergStorage {
         let queue_schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
         let table = self.load_table(cancel_token).await?;
-        let sorted_batch = sort_by_table_order(&table, combined_batch)?;
+        let table_metadata = table.metadata().clone();
+        let table_file_io = table.file_io().clone();
+        let sorted_batch =
+            tokio::task::spawn_blocking(move || sort_by_table_order(table.metadata(), combined_batch)).await??;
         tracing::debug!("Sorted batch has {} rows", sorted_batch.num_rows());
 
-        let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+        let location_generator = DefaultLocationGenerator::new(table_metadata.clone())
             .map_err(|e| IngestError::Shift(format!("failed to create location generator: {e}")))?;
 
         // Generate unique file prefix with UUID to avoid conflicts
@@ -180,12 +184,12 @@ impl IcebergStorage {
             .set_max_row_group_size(self.row_group_size)
             .build();
 
-        let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table.metadata().current_schema().clone());
+        let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table_metadata.current_schema().clone());
 
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
             self.max_file_size_mb * 1024 * 1024,
-            table.file_io().clone(),
+            table_file_io,
             location_generator,
             file_name_generator,
         );
@@ -197,8 +201,8 @@ impl IcebergStorage {
 
         // Create partition splitter to compute partition keys from source columns
         let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
-            table.metadata().current_schema().clone(),
-            table.metadata().default_partition_spec().clone(),
+            table_metadata.current_schema().clone(),
+            table_metadata.default_partition_spec().clone(),
         )
         .map_err(|e| IngestError::Shift(format!("failed to create partition splitter: {e}")))?;
 
@@ -388,15 +392,15 @@ impl Storage for IcebergStorage {
 }
 
 /// Sorts a record batch by the table's sort order.
-fn sort_by_table_order(table: &Table, batch: RecordBatch) -> Result<RecordBatch> {
-    let sort_order = table.metadata().default_sort_order();
+fn sort_by_table_order(table_metadata: &TableMetadata, batch: RecordBatch) -> Result<RecordBatch> {
+    let sort_order = table_metadata.default_sort_order();
 
     if sort_order.fields.is_empty() {
         // No sort order defined, return as-is
         return Ok(batch);
     }
 
-    let schema = table.metadata().current_schema();
+    let schema = table_metadata.current_schema();
     let batch_schema = batch.schema();
 
     // Build sort columns from Iceberg sort order

@@ -149,7 +149,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (protocol, signal, status) (\n  rate(icegate_ingest_otlp_requests_total[1m])\n)\n",
+          "expr": "sum by (protocol, signal, status) (\n  rate(icegate_ingest_otlp_requests_total{job=\"ingest\"}[1m])\n)\n",
           "legendFormat": "{{protocol}} - {{signal}} - {{status}}",
           "range": true,
           "refId": "A"
@@ -157,7 +157,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum(rate(icegate_ingest_otlp_requests_total[1m]))\n",
+          "expr": "sum(rate(icegate_ingest_otlp_requests_total{job=\"ingest\"}[1m]))\n",
           "hide": false,
           "legendFormat": "overall",
           "range": true,
@@ -251,7 +251,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum (rate(icegate_ingest_otlp_request_size_bytes_sum[1m]))",
+          "expr": "sum (rate(icegate_ingest_otlp_request_size_bytes_sum{job=\"ingest\"}[1m]))",
           "legendFormat": "bytes/sec",
           "range": true,
           "refId": "A"
@@ -346,7 +346,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p50",
           "range": true,
@@ -355,7 +355,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
@@ -450,7 +450,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p50",
           "range": true,
@@ -459,7 +459,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket[1m])))\n",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
           "legendFormat": "p99",
           "range": true,
@@ -554,7 +554,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
@@ -563,7 +563,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
           "legendFormat": "p50",
@@ -660,7 +660,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket[1m])))\n",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
           "legendFormat": "{{signal}} - {{status}} - p50",
           "range": true,
@@ -669,7 +669,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket[1m])))\n",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
           "legendFormat": "{{signal}} - {{status}} - p95",
           "range": true,
@@ -678,7 +678,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "{{signal}} - {{status}} - p99",
           "range": true,
@@ -771,7 +771,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (protocol, signal) (rate(icegate_ingest_wal_queue_unavailable_total[1m]))",
+          "expr": "sum by (protocol, signal) (rate(icegate_ingest_wal_queue_unavailable_total{job=\"ingest\"}[1m]))",
           "legendFormat": "{{protocol}} - {{signal}} - {{status}}",
           "range": true,
           "refId": "A"
@@ -864,7 +864,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "icegate_ingest_wal_pending_batches",
+          "expr": "icegate_ingest_wal_pending_batches{job=\"ingest\"}",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -957,7 +957,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "icegate_ingest_wal_pending_records",
+          "expr": "icegate_ingest_wal_pending_records{job=\"ingest\"}",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -1052,7 +1052,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
@@ -1061,7 +1061,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
           "legendFormat": "p50",
@@ -1158,7 +1158,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "\nhistogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_bucket[1m])))",
+          "expr": "\nhistogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "legendFormat": "{{topic}} - {{status}} - p95",
           "range": true,
@@ -1167,7 +1167,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
           "legendFormat": "{{topic}} - {{status}} - p50",
@@ -1262,7 +1262,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "icegate_ingest_wal_pending_batches",
+          "expr": "icegate_ingest_wal_pending_batches{job=\"ingest\"}",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -1356,7 +1356,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_records_per_segment_bucket[1m])))\n",
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_records_per_segment_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
@@ -1365,7 +1365,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_wal_records_per_segment_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_wal_records_per_segment_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
           "legendFormat": "p50",
@@ -1461,7 +1461,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "icegate_ingest_wal_pending_bytes",
+          "expr": "icegate_ingest_wal_pending_bytes{job=\"ingest\"}",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -1556,7 +1556,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket[1m])))\n",
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
           "legendFormat": "p95",
           "range": true,
@@ -1565,7 +1565,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
           "legendFormat": "p50",
@@ -1662,7 +1662,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_count[1m]))",
+          "expr": "sum by (topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_count{job=\"ingest\"}[1m]))",
           "fromExploreMetrics": false,
           "legendFormat": "{{topic}} - {{status}}",
           "range": true,
@@ -1758,7 +1758,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (rate(icegate_ingest_wal_segments_total[1m]))",
+          "expr": "sum by (topic) (rate(icegate_ingest_wal_segments_total{job=\"ingest\"}[1m]))",
           "fromExploreMetrics": false,
           "legendFormat": "{{topic}}",
           "range": true,
@@ -1775,6 +1775,204 @@
         "w": 24,
         "x": 0,
         "y": 31
+      },
+      "id": 50,
+      "panels": [],
+      "title": "Tokio",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 51,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "builder",
+          "expr": "sum by(instance) (rate(tokio_worker_busy_duration_milliseconds_total{job=\"ingest\"}[1m]) / 1000)",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Worker load [1m]",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 52,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "builder",
+          "expr": "tokio_alive_tasks{job=\"ingest\"}",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Alive Tasks",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
       },
       "id": 5,
       "panels": [],
@@ -1844,7 +2042,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 32
+        "y": 41
       },
       "id": 1,
       "options": {
@@ -1865,7 +2063,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "rate(icegate_ingest_shift_backlog_segments[1m])",
+          "expr": "rate(icegate_ingest_shift_backlog_segments{job=\"ingest\"}[1m])",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -1937,7 +2135,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 32
+        "y": 41
       },
       "id": 2,
       "options": {
@@ -1958,7 +2156,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (\n  rate(icegate_ingest_shift_planned_segments_total[1m])\n)",
+          "expr": "sum by (topic) (\n  rate(icegate_ingest_shift_planned_segments_total{job=\"ingest\"}[1m])\n)",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -2031,7 +2229,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 32
+        "y": 41
       },
       "id": 3,
       "options": {
@@ -2052,7 +2250,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (\n  increase(icegate_ingest_shift_planned_tasks_total[1m])\n)",
+          "expr": "sum by (topic) (\n  increase(icegate_ingest_shift_planned_tasks_total{job=\"ingest\"}[1m])\n)",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -2124,7 +2322,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 32
+        "y": 41
       },
       "id": 4,
       "options": {
@@ -2145,7 +2343,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (rate(icegate_ingest_shift_planned_segments_total[1m]))\n/\nsum by (topic) (rate(icegate_ingest_shift_planned_tasks_total[1m]))",
+          "expr": "sum by (topic) (rate(icegate_ingest_shift_planned_segments_total{job=\"ingest\"}[1m]))\n/\nsum by (topic) (rate(icegate_ingest_shift_planned_tasks_total{job=\"ingest\"}[1m]))",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -2218,7 +2416,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 38
+        "y": 47
       },
       "id": 6,
       "maxDataPoints": 500,
@@ -2240,7 +2438,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_bucket{ }[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_bucket{job=\"ingest\"}[$__rate_interval])))",
           "fromExploreMetrics": false,
           "legendFormat": "p99",
           "range": true,
@@ -2249,7 +2447,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_bucket{ }[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_bucket{job=\"ingest\"}[$__rate_interval])))",
           "fromExploreMetrics": false,
           "legendFormat": "p90",
           "range": true,
@@ -2258,7 +2456,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_bucket{ }[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5,sum by (le) (rate(icegate_ingest_shift_plan_duration_seconds_bucket{job=\"ingest\", }[$__rate_interval])))",
           "fromExploreMetrics": false,
           "legendFormat": "p50",
           "range": true,
@@ -2332,7 +2530,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 38
+        "y": 47
       },
       "id": 7,
       "options": {
@@ -2353,7 +2551,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{topic}} - p95",
           "range": true,
           "refId": "A"
@@ -2361,7 +2559,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "hide": false,
           "legendFormat": "{{topic}} - p50",
           "range": true,
@@ -2435,7 +2633,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 38
+        "y": 47
       },
       "id": 8,
       "options": {
@@ -2456,7 +2654,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_sum[1m]))\n/\nsum by (topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_count[1m]))\n",
+          "expr": "sum by (topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_sum{job=\"ingest\"}[1m]))\n/\nsum by (topic, status) (rate(icegate_ingest_shift_queue_read_segment_duration_seconds_count{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{topic}}-{{status}}",
           "range": true,
           "refId": "A"
@@ -2528,7 +2726,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 38
+        "y": 47
       },
       "id": 9,
       "options": {
@@ -2549,7 +2747,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_shift_segment_record_batches_per_task_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_shift_segment_record_batches_per_task_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{topic}} - p50",
           "range": true,
           "refId": "A"
@@ -2557,7 +2755,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_shift_segment_record_batches_per_task_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_shift_segment_record_batches_per_task_bucket{job=\"ingest\"}[1m])))",
           "hide": false,
           "legendFormat": "{{topic}} - p95",
           "range": true,
@@ -2630,7 +2828,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 44
+        "y": 53
       },
       "id": 10,
       "options": {
@@ -2651,7 +2849,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_shift_segment_rows_per_task_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_shift_segment_rows_per_task_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{topic}} - p50",
           "range": true,
           "refId": "A"
@@ -2659,7 +2857,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_shift_segment_rows_per_task_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_shift_segment_rows_per_task_bucket{job=\"ingest\"}[1m])))",
           "hide": false,
           "legendFormat": "{{topic}} - p95",
           "range": true,
@@ -2733,7 +2931,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 44
+        "y": 53
       },
       "id": 11,
       "options": {
@@ -2754,17 +2952,17 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_parquet_write_duration_seconds_bucket[1m])))",
-          "legendFormat": "{{topic}} - {{status}}",
+          "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_parquet_write_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "legendFormat": "{{topic}} - {{status}} - p95",
           "range": true,
           "refId": "A"
         },
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_parquet_write_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_parquet_write_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "hide": false,
-          "legendFormat": "{{topic}} - {{status}}",
+          "legendFormat": "{{topic}} - {{status}} - p50",
           "range": true,
           "refId": "B"
         }
@@ -2836,7 +3034,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 44
+        "y": 53
       },
       "id": 12,
       "options": {
@@ -2857,7 +3055,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (increase(icegate_ingest_shift_parquet_files_total[1m]))",
+          "expr": "sum by (topic) (increase(icegate_ingest_shift_parquet_files_total{job=\"ingest\"}[1m]))",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -2930,7 +3128,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 44
+        "y": 53
       },
       "id": 13,
       "options": {
@@ -2951,7 +3149,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (rate(icegate_ingest_shift_bytes_written_bytes_total[1m]))",
+          "expr": "sum by (topic) (rate(icegate_ingest_shift_bytes_written_bytes_total{job=\"ingest\"}[1m]))",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -3024,7 +3222,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 50
+        "y": 59
       },
       "id": 14,
       "options": {
@@ -3045,7 +3243,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_get_data_files_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_get_data_files_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{topic}} - p95",
           "range": true,
           "refId": "A"
@@ -3053,7 +3251,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_get_data_files_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_get_data_files_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "hide": false,
           "legendFormat": "{{topic}} - p50",
           "range": true,
@@ -3127,7 +3325,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 50
+        "y": 59
       },
       "id": 15,
       "options": {
@@ -3148,7 +3346,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_commit_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_commit_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{topic}} - p95",
           "range": true,
           "refId": "A"
@@ -3156,7 +3354,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_commit_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_commit_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "hide": false,
           "legendFormat": "{{topic}} - p50",
           "range": true,
@@ -3229,7 +3427,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 50
+        "y": 59
       },
       "id": 16,
       "options": {
@@ -3250,7 +3448,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (rate(icegate_ingest_shift_already_committed_total[1m]))\n",
+          "expr": "sum by (topic) (rate(icegate_ingest_shift_already_committed_total{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -3323,7 +3521,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 50
+        "y": 59
       },
       "id": 19,
       "interval": "1m",
@@ -3345,7 +3543,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic, task)  (increase(icegate_ingest_shift_task_success_total[1m]))",
+          "expr": "sum by (topic, task)  (increase(icegate_ingest_shift_task_success_total{job=\"ingest\"}[1m]))",
           "legendFormat": "{{topic}}-{{task}}",
           "range": true,
           "refId": "A"
@@ -3417,7 +3615,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 56
+        "y": 65
       },
       "id": 17,
       "options": {
@@ -3438,7 +3636,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic, task, reason) (rate(icegate_ingest_shift_task_failures_total[1m]))\n",
+          "expr": "sum by (topic, task, reason) (rate(icegate_ingest_shift_task_failures_total{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{topic}}-{{task}}-{{reason}}",
           "range": true,
           "refId": "A"
@@ -3510,7 +3708,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 56
+        "y": 65
       },
       "id": 18,
       "options": {
@@ -3531,7 +3729,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "(\n  sum by (topic, task) (rate(icegate_ingest_shift_task_success_total[1m]))\n)\n/\nclamp_min(\n  (\n    sum by (topic, task) (rate(icegate_ingest_shift_task_success_total[1m]))\n  ) +\n  (\n    sum by (topic, task) (rate(icegate_ingest_shift_task_failures_total[1m]))\n    or\n    sum by (topic, task) (rate(icegate_ingest_shift_task_success_total[1m])) * 0\n  ),\n  1e-12\n)\n",
+          "expr": "(\n  sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"ingest\"}[1m]))\n)\n/\nclamp_min(\n  (\n    sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"ingest\"}[1m]))\n  ) +\n  (\n    sum by (topic, task) (rate(icegate_ingest_shift_task_failures_total{job=\"ingest\"}[1m]))\n    or\n    sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"ingest\"}[1m])) * 0\n  ),\n  1e-12\n)\n",
           "legendFormat": "{{topic}}-{{task}}",
           "range": true,
           "refId": "A"
@@ -3546,7 +3744,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 62
+        "y": 71
       },
       "id": 37,
       "panels": [],
@@ -3616,7 +3814,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 63
+        "y": 72
       },
       "id": 38,
       "options": {
@@ -3637,7 +3835,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (status) (increase(icegate_jobmanager_job_duration_seconds_count[1m]))\n",
+          "expr": "sum by (status) (increase(icegate_jobmanager_job_duration_seconds_count{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{status}}",
           "range": true,
           "refId": "A"
@@ -3709,7 +3907,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 63
+        "y": 72
       },
       "id": 39,
       "options": {
@@ -3730,7 +3928,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "(\n  sum(rate(icegate_jobmanager_job_duration_seconds_count{status=\"Completed\"}[1m]))\n)\n/\nclamp_min(\n  (\n    sum(rate(icegate_jobmanager_job_duration_seconds_count[1m]))\n  ),\n  1e-12\n)\n",
+          "expr": "(\n  sum(rate(icegate_jobmanager_job_duration_seconds_count{job=\"ingest\", status=\"Completed\"}[1m]))\n)\n/\nclamp_min(\n  (\n    sum(rate(icegate_jobmanager_job_duration_seconds_count{job=\"ingest\"}[1m]))\n  ),\n  1e-12\n)\n",
           "legendFormat": "overall",
           "range": true,
           "refId": "A"
@@ -3802,7 +4000,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 63
+        "y": 72
       },
       "id": 40,
       "maxDataPoints": 500,
@@ -3824,7 +4022,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, code) (rate(icegate_jobmanager_job_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, code) (rate(icegate_jobmanager_job_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{code}} p95",
           "range": true,
           "refId": "A"
@@ -3832,7 +4030,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, code) (rate(icegate_jobmanager_job_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, code) (rate(icegate_jobmanager_job_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{code}} p50",
           "range": true,
           "refId": "B"
@@ -3904,7 +4102,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 63
+        "y": 72
       },
       "id": 41,
       "options": {
@@ -3925,7 +4123,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_count{status=\"Failed\"}[1m]))\n",
+          "expr": "sum by (job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_count{job=\"ingest\", status=\"Failed\"}[1m]))\n",
           "legendFormat": "{{job_code}}-{{task_code}}",
           "range": true,
           "refId": "A"
@@ -3997,7 +4195,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 69
+        "y": 78
       },
       "id": 42,
       "maxDataPoints": 500,
@@ -4019,7 +4217,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{job_code}}-{{task_code}} p95",
           "range": true,
           "refId": "A"
@@ -4027,7 +4225,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{job_code}}-{{task_code}} p50",
           "range": true,
           "refId": "B"
@@ -4099,7 +4297,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 69
+        "y": 78
       },
       "id": 43,
       "maxDataPoints": 500,
@@ -4121,7 +4319,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(icegate_jobmanager_storage_s3_latency_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(icegate_jobmanager_storage_s3_latency_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{operation}} p95",
           "range": true,
           "refId": "A"
@@ -4129,7 +4327,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, operation) (rate(icegate_jobmanager_storage_s3_latency_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, operation) (rate(icegate_jobmanager_storage_s3_latency_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{operation}} p50",
           "range": true,
           "refId": "B"
@@ -4201,7 +4399,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 69
+        "y": 78
       },
       "id": 44,
       "options": {
@@ -4222,7 +4420,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (operation, http_status) (rate(icegate_jobmanager_storage_s3_latency_seconds_count{http_status!=\"OK\"}[1m]))\n",
+          "expr": "sum by (operation, http_status) (rate(icegate_jobmanager_storage_s3_latency_seconds_count{http_status!=\"OK\", job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{operation}}-{{http_status}}",
           "range": true,
           "refId": "A"
@@ -4294,7 +4492,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 69
+        "y": 78
       },
       "id": 45,
       "options": {
@@ -4315,7 +4513,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "(\n  sum by (method) (rate(icegate_jobmanager_storage_cache_hits_ratio_total[1m]))\n)\n/\nclamp_min(\n  (\n    sum by (method) (rate(icegate_jobmanager_storage_cache_hits_ratio_total[1m])) +\n    sum by (method) (rate(icegate_jobmanager_storage_cache_misses_ratio_total[1m]))\n  ),\n  1e-12\n)\n",
+          "expr": "(\n  sum by (method) (rate(icegate_jobmanager_storage_cache_hits_ratio_total{job=\"ingest\"}[1m]))\n)\n/\nclamp_min(\n  (\n    sum by (method) (rate(icegate_jobmanager_storage_cache_hits_ratio_total{job=\"ingest\"}[1m])) +\n    sum by (method) (rate(icegate_jobmanager_storage_cache_misses_ratio_total{job=\"ingest\"}[1m]))\n  ),\n  1e-12\n)\n",
           "legendFormat": "{{method}}",
           "range": true,
           "refId": "A"
@@ -4386,7 +4584,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 75
+        "y": 84
       },
       "id": 46,
       "options": {
@@ -4407,7 +4605,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (operation) (irate(icegate_jobmanager_storage_s3_latency_seconds_count[1m]))\n",
+          "expr": "sum by (operation) (irate(icegate_jobmanager_storage_s3_latency_seconds_count{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{operation}}",
           "range": true,
           "refId": "A"
@@ -4429,7 +4627,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Icegate",
+  "title": "Ingest",
   "uid": "g78tk2",
   "version": 14
 }

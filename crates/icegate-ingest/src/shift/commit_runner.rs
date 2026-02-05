@@ -125,6 +125,12 @@ where
 
         let input: CommitInput = super::executor::parse_task_input(task.as_ref())
             .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Serialization, err))?;
+
+        // Link to parent plan span
+        if let Some(ref tc) = input.trace_context {
+            icegate_common::add_span_link(tc);
+        }
+
         let committed_offset = self.storage.get_last_offset(cancel_token).await.map_err(|err| {
             CommitTaskFailure::new(CommitFailureReason::Commit, Error::TaskExecution(err.to_string()))
         })?;
@@ -151,6 +157,8 @@ where
         }
 
         let mut parquet_files = Vec::new();
+        let mut shift_trace_contexts = Vec::new();
+
         for dep_task_id in task.depends_on() {
             let dep_task = manager
                 .get_task(dep_task_id)
@@ -169,7 +177,15 @@ where
                 )
             })?;
             parquet_files.extend(output.parquet_files);
+
+            // Collect shift trace contexts
+            if let Some(tc) = output.trace_context {
+                shift_trace_contexts.push(tc);
+            }
         }
+
+        // Link all parent shift spans
+        icegate_common::add_span_links(shift_trace_contexts.iter().map(String::as_str));
 
         if parquet_files.is_empty() {
             return Err(CommitTaskFailure::new(
