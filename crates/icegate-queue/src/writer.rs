@@ -301,8 +301,10 @@ impl QueueWriter {
         };
 
         // Convert to Parquet bytes
-        let parquet_bytes = self.batches_to_parquet(&batches)?;
         let row_group_count = batches.len();
+        let writer_properties = self.writer_properties();
+        let parquet_bytes =
+            tokio::task::spawn_blocking(move || Self::batches_to_parquet(writer_properties, &batches)).await??;
         let size_bytes = parquet_bytes.len() as u64;
         debug!(
             records = record_count,
@@ -397,14 +399,12 @@ impl QueueWriter {
     }
 
     /// Converts record batches to Parquet bytes.
-    fn batches_to_parquet(&self, batches: &[RecordBatch]) -> Result<Bytes> {
+    fn batches_to_parquet(props: WriterProperties, batches: &[RecordBatch]) -> Result<Bytes> {
         if batches.is_empty() {
             return Err(QueueError::Config("No batches to write".to_string()));
         }
 
         let schema = batches[0].schema();
-        let props = self.writer_properties();
-
         let mut buffer = Vec::new();
         {
             let mut writer = ArrowWriter::try_new(&mut buffer, schema, Some(props))?;
@@ -481,7 +481,7 @@ impl QueueWriter {
     /// Uses `If-None-Match: *` for atomic write (fails if file exists).
     #[tracing::instrument(
         skip(self, data),
-        fields(topic = %segment_id.topic, offset = segment_id.offset)
+        fields(topic = %segment_id.topic, offset = segment_id.offset, pending_bytes = data.len())
     )]
     async fn try_write(&self, segment_id: &SegmentId, data: Bytes) -> Result<()> {
         debug!("Try to save segments in store");

@@ -10,6 +10,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 ARG PROFILE=release
 COPY --from=planner /app/recipe.json recipe.json
+ENV RUSTFLAGS="--cfg tokio_unstable"
 RUN cargo chef cook $([ "$PROFILE" = "release" ] && echo "--release") --recipe-path recipe.json
 COPY ./crates ./crates
 COPY Cargo.toml Cargo.lock ./

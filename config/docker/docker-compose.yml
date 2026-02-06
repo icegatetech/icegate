@@ -28,6 +28,7 @@ services:
         mc alias set minio http://minio:9000 minioadmin minioadmin &&
         mc mb --ignore-existing minio/warehouse &&
         mc mb --ignore-existing minio/queue &&
+        mc ilm rule add --expire-days 1 minio/queue &&
         mc mb --ignore-existing minio/jobs
       "
 
@@ -158,7 +159,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2048m
+          memory: 3g
           cpus: 1
 
   grafana:

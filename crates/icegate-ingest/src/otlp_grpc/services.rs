@@ -71,11 +71,11 @@ impl LogsService for OtlpGrpcService {
         // Extract tenant_id from metadata (TODO: implement proper tenant extraction)
         let tenant_id = None; // Will use default
 
-        // Transform OTLP logs to Arrow RecordBatch
-        let batch = request_metrics.record_transform(|| {
-            transform::logs_to_record_batch(&export_request, tenant_id)
-                .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))
-        })?;
+        // Transform OTLP logs to Arrow RecordBatch (offload to blocking thread)
+        let batch = tokio::task::spawn_blocking(move || transform::logs_to_record_batch(&export_request, tenant_id))
+            .await
+            .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
+            .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))?;
         let Some(batch) = batch else {
             // No records to process - return success with 0 rejected
             request_metrics.record_records_per_request(0);
