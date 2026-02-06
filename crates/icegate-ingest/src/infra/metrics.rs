@@ -25,6 +25,7 @@ pub struct ShiftMetrics {
     planned_record_batches_total: Counter<u64>,
     planned_tasks_total: Counter<u64>,
     backlog_segments: Gauge<u64>,
+    planned_input_bytes_per_task: Histogram<f64>,
     segment_record_batches_per_task: Histogram<f64>,
     segment_rows_per_task: Histogram<f64>,
     parquet_write_duration: Histogram<f64>,
@@ -54,6 +55,9 @@ impl ShiftMetrics {
             planned_record_batches_total: meter.u64_counter("icegate_ingest_shift_planned_record_batches").build(),
             planned_tasks_total: meter.u64_counter("icegate_ingest_shift_planned_tasks").build(),
             backlog_segments: meter.u64_gauge("icegate_ingest_shift_backlog_segments").build(),
+            planned_input_bytes_per_task: meter
+                .f64_histogram("icegate_ingest_shift_planned_input_bytes_per_task")
+                .build(),
             segment_record_batches_per_task: meter
                 .f64_histogram("icegate_ingest_shift_segment_record_batches_per_task")
                 .build(),
@@ -101,6 +105,11 @@ impl ShiftMetrics {
         let backlog_segments = meter
             .u64_gauge("icegate_ingest_shift_backlog_segments")
             .with_description("Number of segments waiting to be processed")
+            .build();
+        let planned_input_bytes_per_task = meter
+            .f64_histogram("icegate_ingest_shift_planned_input_bytes_per_task")
+            .with_description("Planned input bytes per shift task")
+            .with_unit("By")
             .build();
         let segment_record_batches_per_task = meter
             .f64_histogram("icegate_ingest_shift_segment_record_batches_per_task")
@@ -156,6 +165,7 @@ impl ShiftMetrics {
             planned_record_batches_total,
             planned_tasks_total,
             backlog_segments,
+            planned_input_bytes_per_task,
             segment_record_batches_per_task,
             segment_rows_per_task,
             parquet_write_duration,
@@ -236,6 +246,16 @@ impl ShiftMetrics {
         }
         self.planned_tasks_total
             .add(count as u64, &[KeyValue::new("topic", topic.to_string())]);
+    }
+
+    /// Record planned input bytes per shift task.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn record_planned_input_bytes_per_task(&self, count: u64, topic: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.planned_input_bytes_per_task
+            .record(count as f64, &[KeyValue::new("topic", topic.to_string())]);
     }
 
     /// Record backlog segments count.

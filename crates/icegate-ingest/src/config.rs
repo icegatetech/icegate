@@ -69,6 +69,9 @@ impl IngestConfig {
         self.shift.validate()?;
         self.metrics.validate()?;
         self.tracing.validate()?;
+        if let Some(queue) = &self.queue {
+            queue.validate()?;
+        }
 
         // Check for port conflicts among enabled servers
         check_port_conflicts(&[&self.otlp_http, &self.otlp_grpc, &self.metrics])?;

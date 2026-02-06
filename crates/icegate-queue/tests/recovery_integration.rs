@@ -11,7 +11,7 @@ async fn test_recovery_empty_store() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create writer and recover on empty store
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -49,7 +49,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
     // First writer: write 3 segments (offsets 0, 1, 2)
     {
         let config = QueueConfig::new("queue");
-        let (tx, rx) = channel(config.channel_capacity);
+        let (tx, rx) = channel(config.common.channel_capacity);
         let writer = QueueWriter::new(config, store.clone());
         let handle = writer.start(rx);
 
@@ -73,7 +73,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
 
     // Second writer: should recover and continue from offset 3
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -109,7 +109,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
     // First writer: write to multiple topics
     {
         let config = QueueConfig::new("queue");
-        let (tx, rx) = channel(config.channel_capacity);
+        let (tx, rx) = channel(config.common.channel_capacity);
         let writer = QueueWriter::new(config, store.clone());
         let handle = writer.start(rx);
 
@@ -162,7 +162,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
 
     // Second writer: should recover independent offsets for each topic
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -233,7 +233,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
     // First writer: write with custom base_path
     {
         let config = QueueConfig::new("my-queue");
-        let (tx, rx) = channel(config.channel_capacity);
+        let (tx, rx) = channel(config.common.channel_capacity);
         let writer = QueueWriter::new(config, store.clone());
         let handle = writer.start(rx);
 
@@ -257,7 +257,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
 
     // Second writer: recover with same base_path
     let config = QueueConfig::new("my-queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -285,7 +285,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
 
     // Verify no cross-contamination with different base_path
     let config_different = QueueConfig::new("different-queue");
-    let (tx_diff, rx_diff) = channel(config_different.channel_capacity);
+    let (tx_diff, rx_diff) = channel(config_different.common.channel_capacity);
     let writer_diff = QueueWriter::new(config_different, store.clone());
     let handle_diff = writer_diff.start(rx_diff);
 

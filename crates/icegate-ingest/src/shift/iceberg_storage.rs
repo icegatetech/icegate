@@ -159,6 +159,7 @@ impl IcebergStorage {
             });
         }
 
+        // TODO(crit): тут мы еще и склеиваем все батчи в один?
         tracing::info!("Start writing parquet file. Batches: {}", batches.len());
         let queue_schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
@@ -173,6 +174,7 @@ impl IcebergStorage {
         let write_id = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(write_id.to_string(), None, DataFileFormat::Parquet);
 
+        // TODO(crit): проверить параметры
         let writer_props = WriterProperties::builder()
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_data_page_row_count_limit(self.row_group_size / 10)

@@ -87,6 +87,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - **MUST** use `thiserror` for defining error types and `anyhow` for application-level errors
 - **MUST** propagate errors with `?` operator where appropriate
 - Provide meaningful error messages with context using `.context()` from `anyhow`
+- NEVER use panic, MUST to give error to the top.
 
 ## Function Design
 

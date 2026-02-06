@@ -2,15 +2,15 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icegate_common::{MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
-use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
+use icegate_common::{catalog::CatalogBuilder, create_object_store, run_metrics_server, MetricsRuntime};
+use icegate_queue::{channel, NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    IngestConfig,
     error::Result,
     infra::metrics::{OtlpMetrics, ShiftMetrics, WalWriterMetrics},
     shift::Shifter,
+    IngestConfig,
 };
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
@@ -57,14 +57,14 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     // Initialize WAL queue based on queue config's base_path
     tracing::info!("Initializing WAL queue");
     let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
-    let (write_tx, write_rx) = channel(queue_config.channel_capacity);
+    let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
 
     // Create object store based on queue base_path
-    let (store, normalized_path) = create_object_store(&queue_config.base_path, Some(&config.storage.backend))?;
+    let (store, normalized_path) = create_object_store(&queue_config.common.base_path, Some(&config.storage.backend))?;
 
     // Update queue config with normalized base path
     let mut queue_config = queue_config;
-    queue_config.base_path = normalized_path;
+    queue_config.common.base_path = normalized_path;
 
     let metrics_runtime = if config.metrics.enabled {
         Some(Arc::new(MetricsRuntime::new("ingest")?))
@@ -86,9 +86,10 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
     let queue_reader = Arc::new(ParquetQueueReader::new(
-        queue_config.base_path.clone(),
+        queue_config.common.base_path.clone(),
         Arc::clone(&store),
-    ));
+        queue_config.common.max_row_group_size,
+    )?);
     let shift_metrics = metrics_runtime.as_ref().map_or_else(ShiftMetrics::new_disabled, |runtime| {
         ShiftMetrics::new(&runtime.meter())
     });

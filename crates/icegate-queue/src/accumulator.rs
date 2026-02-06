@@ -82,19 +82,20 @@ impl TopicAccumulator {
         }
 
         // Check record count threshold
-        if self.total_records >= config.max_records_per_flush {
+        let row_flush_limit = config.flush_record_limit();
+        if self.total_records >= row_flush_limit {
             return true;
         }
 
         // Check byte size threshold
-        if self.total_bytes >= config.max_bytes_per_flush {
+        if self.total_bytes >= config.write.max_bytes_per_flush {
             return true;
         }
 
         // Check time threshold
         #[allow(clippy::cast_possible_truncation)] // Duration will not exceed u64 in practice
         let elapsed_ms = self.last_flush.elapsed().as_millis() as u64;
-        if elapsed_ms >= config.flush_interval_ms {
+        if elapsed_ms >= config.write.flush_interval_ms {
             return true;
         }
 
@@ -262,7 +263,9 @@ mod tests {
     #[test]
     fn test_should_flush_records() {
         let mut acc = TopicAccumulator::new();
-        let config = QueueConfig::new("test").with_max_records_per_flush(100);
+        let config = QueueConfig::new("test")
+            .with_max_row_group_size(50)
+            .with_records_per_flush_multiplier(2);
 
         let (tx, _rx) = oneshot::channel();
         acc.add(test_batch(50), tx, None);
@@ -270,7 +273,7 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel();
         acc.add(test_batch(60), tx, None);
-        assert!(acc.should_flush(&config)); // 110 >= 100
+        assert!(acc.should_flush(&config)); // 110 >= (50 * 2)
     }
 
     #[test]

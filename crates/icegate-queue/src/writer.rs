@@ -8,24 +8,24 @@ use std::{
 
 use arrow::{
     array::ArrayRef,
-    compute::{SortColumn, SortOptions, lexsort_to_indices, take},
+    compute::{lexsort_to_indices, take, SortColumn, SortOptions},
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use futures::{TryStreamExt, future::join_all};
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
+use futures::{future::join_all, TryStreamExt};
+use object_store::{path::Path, ObjectStore, PutMode, PutOptions, PutPayload};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
-    Topic,
     accumulator::TopicAccumulator,
     channel::{WriteReceiver, WriteRequest},
     config::QueueConfig,
     error::{QueueError, Result},
     segment::SegmentId,
+    Topic,
 };
 
 /// Queue writer that persists Arrow `RecordBatches` to Parquet on object
@@ -85,7 +85,7 @@ impl QueueWriter {
 
         // Spawn flush ticker task
         // To make a flush interval is more precise make the check interval is smaller than the one
-        let check_flush_interval = Duration::from_millis(writer.config.flush_interval_ms);
+        let check_flush_interval = Duration::from_millis(writer.config.write.flush_interval_ms);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(check_flush_interval);
             // Use Delay mode: wait for full interval AFTER each flush completes
@@ -282,7 +282,7 @@ impl QueueWriter {
     /// Writes a batch to object storage, returning the offset.
     ///
     /// This is the core write method used internally. For normal usage, prefer using the channel-based approach via `start()`.
-    /// Now we always have one row group for each parquet file, because `group_by_column` is always optional.
+    /// We flush after each prepared batch, but large batches can still be split by parquet max row group size.
     #[tracing::instrument(
         skip(self, batch),
         fields(topic = %topic)
@@ -423,16 +423,19 @@ impl QueueWriter {
 
     /// Creates Parquet writer properties from config.
     fn writer_properties(&self) -> WriterProperties {
-        let compression = self.config.compression.to_parquet_compression();
+        let compression = self.config.write.compression.to_parquet_compression();
 
-        WriterProperties::builder().set_compression(compression).build()
+        WriterProperties::builder()
+            .set_compression(compression)
+            .set_max_row_group_size(self.config.common.max_row_group_size)
+            .build()
     }
 
     /// Writes Parquet bytes to object storage with retry on conflict.
     #[tracing::instrument(skip(self, data), fields(topic = %topic))]
     async fn write_with_retry(&self, topic: &Topic, data: Bytes) -> Result<u64> {
         let mut attempts = 0;
-        let max_attempts = self.config.write_retries;
+        let max_attempts = self.config.write.write_retries;
 
         loop {
             let offset = self.next_offset(topic).await;
@@ -460,14 +463,14 @@ impl QueueWriter {
                     );
                     // Increment offset and retry (loop continues)
                     // SAFETY: check the interval is within the range of u64
-                    if self.config.flush_interval_ms >= i64::MAX as u64 {
+                    if self.config.write.flush_interval_ms >= i64::MAX as u64 {
                         return Err(QueueError::Config("flush_interval_ms too large".to_string()));
                     }
                     #[allow(clippy::cast_possible_wrap)]
-                    let interval = self.config.flush_interval_ms as i64 / 4; // 25% delta
+                    let interval = self.config.write.flush_interval_ms as i64 / 4; // 25% delta
                     #[allow(clippy::cast_sign_loss)]
                     // SAFETY: the `interval` can't be negative
-                    let delay = self.config.flush_interval_ms + rand::random_range(-interval..=interval) as u64;
+                    let delay = self.config.write.flush_interval_ms + rand::random_range(-interval..=interval) as u64;
                     debug!(offset, attempt = attempts, delay_ms = delay, "Retrying segment write");
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
@@ -485,10 +488,14 @@ impl QueueWriter {
     )]
     async fn try_write(&self, segment_id: &SegmentId, data: Bytes) -> Result<()> {
         debug!("Try to save segments in store");
-        let full_path = if self.config.base_path.is_empty() {
+        let full_path = if self.config.common.base_path.is_empty() {
             segment_id.to_relative_path()
         } else {
-            Path::from(format!("{}/{}", self.config.base_path, segment_id.to_relative_path()))
+            Path::from(format!(
+                "{}/{}",
+                self.config.common.base_path,
+                segment_id.to_relative_path()
+            ))
         };
 
         let opts = PutOptions {
@@ -543,19 +550,19 @@ impl QueueWriter {
     /// Scans the object store for existing parquet segments and sets
     /// the next offset for each topic to continue from where we left off.
     async fn recover(&self) -> Result<()> {
-        let base_path = if self.config.base_path.is_empty() {
+        let base_path = if self.config.common.base_path.is_empty() {
             None
         } else {
-            Some(Path::from(self.config.base_path.as_str()))
+            Some(Path::from(self.config.common.base_path.as_str()))
         };
         let list_stream = self.store.list(base_path.as_ref());
         let items: Vec<_> = list_stream.try_collect().await?;
 
         // Build prefix for stripping - empty string means no prefix to strip
-        let base_prefix = if self.config.base_path.is_empty() {
+        let base_prefix = if self.config.common.base_path.is_empty() {
             String::new()
         } else {
-            format!("{}/", self.config.base_path)
+            format!("{}/", self.config.common.base_path)
         };
 
         // Map: topic -> next offset (max found + 1)
@@ -679,9 +686,10 @@ mod tests {
     };
     use object_store::memory::InMemory;
     use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::channel::channel;
+    use crate::{channel::channel, ParquetQueueReader};
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -796,6 +804,23 @@ mod tests {
         // Each group should have 2 records
         assert_eq!(grouped[0].num_rows(), 2);
         assert_eq!(grouped[1].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_max_row_group_size_limits_row_group_size() {
+        let store = Arc::new(InMemory::new());
+        let config = QueueConfig::new("queue").with_max_row_group_size(2);
+        let writer = QueueWriter::new(config, store.clone());
+
+        writer.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+
+        let reader = ParquetQueueReader::new("queue", store, 2).unwrap();
+        let cancel = CancellationToken::new();
+        let batches = reader.read_segment(&"logs".to_string(), 0, &[0, 1], &cancel).await.unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[1].num_rows(), 2);
     }
 
     #[tokio::test]

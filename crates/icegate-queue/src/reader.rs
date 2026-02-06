@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use icegate_common::retrier::{Retrier, RetrierConfig};
-use object_store::{ObjectStore, path::Path};
+use object_store::{path::Path, ObjectStore};
 use parquet::{
     arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     errors::ParquetError,
@@ -20,9 +20,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{
-    Topic,
     error::{QueueError, Result},
     segment::SegmentId,
+    Topic,
 };
 
 // Reference to record batches (row groups) inside a WAL segment.
@@ -46,6 +46,8 @@ pub struct SegmentsPlan {
     pub segments_count: usize,
     /// Total number of row groups across all planned segments.
     pub record_batches_total: usize,
+    /// Total planned input size (compressed bytes) across all grouped segments.
+    pub input_bytes_total: u64,
 }
 
 /// Grouped record batches in segments keyed by a column value.
@@ -59,6 +61,8 @@ pub struct GroupedSegmentsPlan {
     pub segments_count: usize,
     /// Total number of row groups in the grouped segments.
     pub record_batches_total: usize,
+    /// Total planned input size (compressed bytes) for this grouped segments.
+    pub input_bytes_total: u64,
 }
 
 /// Record batches indexes (row group) in segment (WAL file).
@@ -73,6 +77,7 @@ pub struct SegmentRecordBatchIdxs {
 struct RowGroupsInSegments {
     segments: BTreeMap<u64, Vec<usize>>,
     row_group_count: usize,
+    input_bytes: u64,
 }
 
 impl RowGroupsInSegments {
@@ -80,24 +85,28 @@ impl RowGroupsInSegments {
         Self {
             segments: BTreeMap::new(),
             row_group_count: 0,
+            input_bytes: 0,
         }
     }
 
-    fn push(&mut self, offset: u64, row_groups: Vec<usize>) -> Result<()> {
-        if row_groups.is_empty() {
-            return Ok(());
-        }
+    fn push(&mut self, offset: u64, row_group_idx: usize, row_group_bytes: u64) -> Result<()> {
         self.row_group_count = self
             .row_group_count
-            .checked_add(row_groups.len())
+            .checked_add(1)
             .ok_or_else(|| QueueError::Metadata("row group count overflow".to_string()))?;
-        self.segments.entry(offset).or_default().extend(row_groups);
+        self.input_bytes = self
+            .input_bytes
+            .checked_add(row_group_bytes)
+            .ok_or_else(|| QueueError::Metadata("row group bytes overflow".to_string()))?;
+        self.segments.entry(offset).or_default().push(row_group_idx);
         Ok(())
     }
 
-    fn take(&mut self) -> (Vec<SegmentRecordBatchIdxs>, usize) {
+    fn take(&mut self) -> (Vec<SegmentRecordBatchIdxs>, usize, u64) {
         let row_group_count = self.row_group_count;
+        let input_bytes = self.input_bytes;
         self.row_group_count = 0;
+        self.input_bytes = 0;
         let segments = std::mem::take(&mut self.segments);
         let segments = segments
             .into_iter()
@@ -106,7 +115,7 @@ impl RowGroupsInSegments {
                 record_batch_idxs: row_groups,
             })
             .collect();
-        (segments, row_group_count)
+        (segments, row_group_count, input_bytes)
     }
 }
 
@@ -120,6 +129,7 @@ pub trait QueueReader: Send + Sync {
         start_offset: u64,
         group_by_column_name: &str,
         max_record_batches_per_task: usize,
+        max_input_bytes_per_task: u64,
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan>;
 
@@ -143,17 +153,34 @@ pub struct ParquetQueueReader {
     /// Object store backend.
     store: Arc<dyn ObjectStore>,
 
+    /// Maximum number of rows per emitted [`RecordBatch`] when reading a segment.
+    record_batch_size_rows: usize,
+
     retrier: Retrier,
 }
 
 impl ParquetQueueReader {
     /// Creates a new queue reader.
-    pub fn new(base_path: impl Into<String>, store: Arc<dyn ObjectStore>) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `record_batch_size_rows` is zero.
+    pub fn new(
+        base_path: impl Into<String>,
+        store: Arc<dyn ObjectStore>,
+        record_batch_size_rows: usize,
+    ) -> Result<Self> {
+        if record_batch_size_rows == 0 {
+            return Err(QueueError::Config(
+                "record_batch_size_rows must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self {
             base_path: base_path.into(),
             store,
+            record_batch_size_rows,
             retrier: Retrier::new(RetrierConfig::default()),
-        }
+        })
     }
 
     /// Lists segments for a topic starting from a given offset.
@@ -165,7 +192,7 @@ impl ParquetQueueReader {
         start_offset: u64,
         cancel_token: &CancellationToken,
     ) -> Result<Vec<SegmentId>> {
-        // TODO(high): if a lot of files have accumulated, we need to somehow batch them.
+        // TODO(crit): if a lot of files have accumulated, we need to somehow batch them.
         // Build prefix path - handle empty base_path
         let prefix = if self.base_path.is_empty() {
             Path::from(topic.as_str())
@@ -267,7 +294,8 @@ impl ParquetQueueReader {
         topic: &Topic,
         start_offset: u64,
         group_by_column_name: &str,
-        max_row_groups_per_group: usize,
+        max_row_groups_per_grouped_batch: usize,
+        max_input_bytes_per_grouped_batch: u64,
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan> {
         let segments = self.list_segments(topic, start_offset, cancel_token).await?;
@@ -277,15 +305,17 @@ impl ParquetQueueReader {
                 last_segment_offset: None,
                 segments_count: 0,
                 record_batches_total: 0,
+                input_bytes_total: 0,
             });
         }
 
         let last_offset = segments.last().map(|segment| segment.offset);
-        let (groups, row_groups_total) = self
+        let (groups, row_groups_total, input_bytes_total) = self
             .plan_record_batches(
                 segments.as_slice(),
                 group_by_column_name,
-                max_row_groups_per_group,
+                max_row_groups_per_grouped_batch,
+                max_input_bytes_per_grouped_batch,
                 cancel_token,
             )
             .await?;
@@ -295,6 +325,7 @@ impl ParquetQueueReader {
             last_segment_offset: last_offset,
             segments_count: segments.len(),
             record_batches_total: row_groups_total,
+            input_bytes_total,
         })
     }
 
@@ -325,7 +356,7 @@ impl ParquetQueueReader {
         let reader = ParquetObjectReader::new(Arc::clone(&self.store), path).with_file_size(object_meta.size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let stream = builder
-            .with_batch_size(8192)
+            .with_batch_size(self.record_batch_size_rows)
             .with_row_groups(record_batch_idxs.to_vec())
             .build()?;
 
@@ -338,18 +369,26 @@ impl ParquetQueueReader {
         &self,
         segments: &[SegmentId],
         group_by_column_name: &str,
-        max_row_groups_per_group: usize,
+        max_row_groups_per_grouped_batch: usize,
+        max_input_bytes_per_grouped_batch: u64,
         cancel_token: &CancellationToken,
-    ) -> Result<(Vec<GroupedSegmentsPlan>, usize)> {
-        if max_row_groups_per_group == 0 {
+    ) -> Result<(Vec<GroupedSegmentsPlan>, usize, u64)> {
+        if max_row_groups_per_grouped_batch == 0 {
             return Err(QueueError::Config(
                 "max_row_groups_per_group must be greater than zero".to_string(),
             ));
         }
+        if max_input_bytes_per_grouped_batch == 0 {
+            return Err(QueueError::Config(
+                "max_input_bytes_per_group must be greater than zero".to_string(),
+            ));
+        }
 
+        // grouped row group chunks by group key for all segments
         let mut grouped_chunks: HashMap<String, RowGroupsInSegments> = HashMap::new();
-        let mut grouped = Vec::new();
+        let mut plan = Vec::new();
         let mut row_groups_total = 0usize;
+        let mut input_bytes_total = 0u64;
 
         for segment in segments {
             let wal_offset = segment.offset;
@@ -370,21 +409,54 @@ impl ParquetQueueReader {
                 let group_key =
                     Self::group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
                 saw_row_groups = true;
+                let row_group_bytes = Self::row_group_compressed_bytes(row_group, row_group_idx)?;
 
                 let chunk = grouped_chunks.entry(group_key.clone()).or_insert_with(RowGroupsInSegments::new);
-                let row_groups = vec![row_group_idx];
-                row_groups_total = row_groups_total
-                    .checked_add(row_groups.len())
-                    .ok_or_else(|| QueueError::Metadata("row group total overflow".to_string()))?;
-                chunk.push(wal_offset, row_groups)?;
-                if chunk.row_group_count == max_row_groups_per_group {
-                    let (segments, row_groups_total) = chunk.take();
+                let next_row_group_count = chunk
+                    .row_group_count
+                    .checked_add(1)
+                    .ok_or_else(|| QueueError::Metadata("row group count overflow".to_string()))?;
+                let next_input_bytes = chunk
+                    .input_bytes
+                    .checked_add(row_group_bytes)
+                    .ok_or_else(|| QueueError::Metadata("row group bytes overflow".to_string()))?;
+                if chunk.row_group_count > 0
+                    && (next_row_group_count > max_row_groups_per_grouped_batch
+                        || next_input_bytes > max_input_bytes_per_grouped_batch)
+                {
+                    let (segments, row_groups_total, input_bytes) = chunk.take();
                     let segments_count = segments.len();
-                    grouped.push(GroupedSegmentsPlan {
+                    input_bytes_total = input_bytes_total
+                        .checked_add(input_bytes)
+                        .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
+                    plan.push(GroupedSegmentsPlan {
+                        group_col_val: group_key.clone(),
+                        segments,
+                        segments_count,
+                        record_batches_total: row_groups_total,
+                        input_bytes_total: input_bytes,
+                    });
+                }
+
+                row_groups_total = row_groups_total
+                    .checked_add(1)
+                    .ok_or_else(|| QueueError::Metadata("row group total overflow".to_string()))?;
+                chunk.push(wal_offset, row_group_idx, row_group_bytes)?;
+                // We've reached the row group limit, so we're dropping the chunk.
+                if chunk.row_group_count >= max_row_groups_per_grouped_batch
+                    || chunk.input_bytes >= max_input_bytes_per_grouped_batch
+                {
+                    let (segments, row_groups_total, input_bytes) = chunk.take();
+                    let segments_count = segments.len();
+                    input_bytes_total = input_bytes_total
+                        .checked_add(input_bytes)
+                        .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
+                    plan.push(GroupedSegmentsPlan {
                         group_col_val: group_key,
                         segments,
                         segments_count,
                         record_batches_total: row_groups_total,
+                        input_bytes_total: input_bytes,
                     });
                 }
             }
@@ -396,21 +468,45 @@ impl ParquetQueueReader {
             }
         }
 
+        // Collecting the remaining records
         for (group_key, mut chunk) in grouped_chunks {
-            let (segments, row_groups_total) = chunk.take();
+            let (segments, row_groups_total, input_bytes) = chunk.take();
             if segments.is_empty() {
                 continue;
             }
             let segments_count = segments.len();
-            grouped.push(GroupedSegmentsPlan {
+            input_bytes_total = input_bytes_total
+                .checked_add(input_bytes)
+                .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
+            plan.push(GroupedSegmentsPlan {
                 group_col_val: group_key,
                 segments,
                 segments_count,
                 record_batches_total: row_groups_total,
+                input_bytes_total: input_bytes,
             });
         }
 
-        Ok((grouped, row_groups_total))
+        Ok((plan, row_groups_total, input_bytes_total))
+    }
+
+    fn row_group_compressed_bytes(
+        row_group: &parquet::file::metadata::RowGroupMetaData,
+        row_group_idx: usize,
+    ) -> Result<u64> {
+        let mut total_bytes: u64 = 0;
+        for column in row_group.columns() {
+            let compressed_size = column.compressed_size();
+            let compressed_size = u64::try_from(compressed_size).map_err(|_| {
+                QueueError::Metadata(format!(
+                    "negative compressed size in row group {row_group_idx}: {compressed_size}"
+                ))
+            })?;
+            total_bytes = total_bytes
+                .checked_add(compressed_size)
+                .ok_or_else(|| QueueError::Metadata("row group compressed bytes overflow".to_string()))?;
+        }
+        Ok(total_bytes)
     }
 
     /// Reads Parquet footer metadata using range requests (no full file download).
@@ -443,6 +539,9 @@ impl ParquetQueueReader {
             .map_err(|_| QueueError::Metadata(format!("file size {file_size} exceeds addressable size")))?;
         let mut tail_len = std::cmp::min(file_size_usize, 64 * 1024);
 
+        // The footer size is taken from the end of the parquet file: the last 8 bytes are footer_len (4 bytes LE) + "PAR1".
+        // Therefore, the code first reads the tail to 64 KB (or less if the file is small) in the hope that it will be enough right away.
+        // If there is not enough, try_parse_sized returns NeedMoreData(need), and the code reads the larger tail.
         loop {
             let start = file_size - tail_len as u64;
             let store = Arc::clone(&self.store);
@@ -486,12 +585,13 @@ impl ParquetQueueReader {
     async fn retry<T, Fut, F>(&self, cancel_token: &CancellationToken, mut op: F) -> Result<T>
     where
         F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
+        Fut: Future<Output = Result<T>>,
     {
         let result = self
             .retrier
             .retry::<_, _, Result<T>, QueueError>(
                 || {
+                    // TODO(crit): add metric
                     let fut = op();
                     async move {
                         match fut.await {
@@ -571,6 +671,7 @@ impl QueueReader for ParquetQueueReader {
         start_offset: u64,
         group_by_column_name: &str,
         max_record_batches_per_task: usize,
+        max_input_bytes_per_task: u64,
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan> {
         Self::plan_segments(
@@ -579,6 +680,7 @@ impl QueueReader for ParquetQueueReader {
             start_offset,
             group_by_column_name,
             max_record_batches_per_task,
+            max_input_bytes_per_task,
             cancel_token,
         )
         .await

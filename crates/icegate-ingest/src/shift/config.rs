@@ -1,5 +1,6 @@
 //! Shift configuration.
 
+use std::ops::Div;
 use std::time::Duration;
 
 use icegate_jobmanager::s3_storage::{JobStateCodecKind, S3StorageConfig};
@@ -164,6 +165,8 @@ impl JobsStorageConfig {
 pub struct ShiftReadConfig {
     /// Maximum number of row groups to process per shift task.
     pub max_record_batches_per_task: usize,
+    /// Maximum input size in bytes to process per shift task.
+    pub max_input_bytes_per_task: u64,
 }
 
 /// Iceberg write settings for shift.
@@ -178,22 +181,11 @@ pub struct ShiftWriteConfig {
     pub table_cache_ttl_secs: u64,
 }
 
-/// Jobs manager settings for shift.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ShiftJobsManagerConfig {
-    /// Polling interval in milliseconds for job manager workers.
-    pub poll_interval_ms: u64,
-    /// Interval between job iterations, in milliseconds.
-    pub iteration_interval_millisecs: u64,
-    /// Job storage configuration.
-    pub storage: JobsStorageConfig,
-}
-
 impl Default for ShiftReadConfig {
     fn default() -> Self {
         Self {
             max_record_batches_per_task: 128,
+            max_input_bytes_per_task: 64 * 1024 * 1024, // 64MB
         }
     }
 }
@@ -221,15 +213,38 @@ impl Default for ShiftTimeoutsConfig {
     }
 }
 
+/// Jobs manager settings for shift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShiftJobsManagerConfig {
+    /// Number of job manager workers.
+    pub worker_count: usize,
+    /// Polling interval in milliseconds for job manager workers.
+    pub poll_interval_ms: u64,
+    /// Interval between job iterations, in milliseconds.
+    pub iteration_interval_millisecs: u64,
+    /// Job storage configuration.
+    pub storage: JobsStorageConfig,
+}
+
 impl Default for ShiftJobsManagerConfig {
     fn default() -> Self {
         Self {
+            worker_count: default_jobs_manager_worker_count(),
             poll_interval_ms: 1_000,              // 1 sec
             iteration_interval_millisecs: 30_000, // 30 sec
             storage: JobsStorageConfig::default(),
         }
     }
 }
+
+fn default_jobs_manager_worker_count() -> usize {
+    match std::thread::available_parallelism() {
+        Ok(parallelism) => parallelism.get().div_ceil(2),
+        Err(_) => 1,
+    }
+}
+
 
 /// Configuration for the shift process.
 ///
@@ -265,6 +280,11 @@ impl ShiftConfig {
                 "max_record_batches_per_task must be greater than zero".to_string(),
             ));
         }
+        if self.read.max_input_bytes_per_task == 0 {
+            return Err(IngestError::Config(
+                "max_input_bytes_per_task must be greater than zero".to_string(),
+            ));
+        }
         if self.write.table_cache_ttl_secs == 0 {
             return Err(IngestError::Config(
                 "table_cache_ttl_secs must be greater than zero".to_string(),
@@ -273,6 +293,11 @@ impl ShiftConfig {
         if self.jobsmanager.poll_interval_ms == 0 {
             return Err(IngestError::Config(
                 "jobsmanager.poll_interval_ms must be greater than zero".to_string(),
+            ));
+        }
+        if self.jobsmanager.worker_count == 0 {
+            return Err(IngestError::Config(
+                "jobsmanager.worker_count must be greater than zero".to_string(),
             ));
         }
         if self.jobsmanager.iteration_interval_millisecs == 0 {
@@ -339,5 +364,37 @@ impl ShiftTimeoutsConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_jobs_manager_worker_count, ShiftConfig, ShiftJobsManagerConfig};
+
+    #[test]
+    fn shift_read_default_max_input_bytes_per_task() {
+        let config = ShiftConfig::default();
+        assert_eq!(config.read.max_input_bytes_per_task, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn shift_validate_rejects_zero_max_input_bytes_per_task() {
+        let mut config = ShiftConfig::default();
+        config.read.max_input_bytes_per_task = 0;
+        let err = config.validate().expect_err("config must be invalid");
+        assert!(
+            err.to_string().contains("max_input_bytes_per_task must be greater than zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn shift_jobsmanager_default_worker_count_uses_available_parallelism() {
+        let config = ShiftJobsManagerConfig::default();
+        assert_eq!(
+            config.worker_count,
+            default_jobs_manager_worker_count(),
+            "worker_count must follow available CPU parallelism"
+        );
     }
 }
