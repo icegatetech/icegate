@@ -126,6 +126,7 @@ where
         let input: CommitInput = super::executor::parse_task_input(task.as_ref())
             .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Serialization, err))?;
 
+        // TODO(low): Move to CommitTaskRunnerWithMetrics aka instrumentation.
         // Link to parent plan span
         if let Some(ref tc) = input.trace_context {
             icegate_common::add_span_link(tc);
