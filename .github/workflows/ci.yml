@@ -245,7 +245,7 @@ jobs:
           name: IceGate Benchmarks
           tool: 'cargo'
           output-file-path: output.txt
-          gh-repository: 'icegatetech/benchmark-results'
+          gh-repository: 'github.com/icegatetech/benchmark-results'
           gh-pages-branch: main
           benchmark-data-dir-path: dev/bench
           github-token: ${{ secrets.BENCHMARK_TOKEN }}
