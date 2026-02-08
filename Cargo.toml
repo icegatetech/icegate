@@ -138,4 +138,4 @@ testcontainers = { version = "0.26", features = ["http_wait"] }
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 aws-config = "1.8.13"
 aws-sdk-s3 = "1.122.0"
-criterion = "0.5"
+criterion = "0.8.2"

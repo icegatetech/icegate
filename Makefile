@@ -44,6 +44,6 @@ install:
 	cargo install cargo-audit
 
 bench:
-	cargo bench --package icegate-query
+	cargo bench --bench queue_s3_bench --bench loki_queries -- --output-format bencher | tee output.txt
 
 ci: check fmt clippy test audit

@@ -210,7 +210,7 @@ jobs:
             benchmark-baseline-
 
       - name: Run benchmarks
-        run: cargo bench -p icegate-queue -p icegate-query -- --output-format bencher | tee output.txt
+        run: cargo bench --bench queue_s3_bench --bench loki_queries -- --output-format bencher | tee output.txt
 
       - name: Compare benchmarks (PR)
         if: github.event_name == 'pull_request'
