@@ -212,6 +212,13 @@ jobs:
       - name: Run benchmarks
         run: cargo bench --bench queue_s3_bench --bench loki_queries -- --output-format bencher | tee output.txt
 
+      - name: Upload Criterion reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-reports
+          path: target/criterion/
+          retention-days: 30
+
       - name: Compare benchmarks (PR)
         if: github.event_name == 'pull_request'
         uses: benchmark-action/github-action-benchmark@v1
