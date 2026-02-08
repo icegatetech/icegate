@@ -65,7 +65,7 @@ async fn write_batch(
 fn write_performance(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_performance");
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(20));
+    group.measurement_time(Duration::from_secs(40));
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -182,7 +182,7 @@ fn write_grouping(c: &mut Criterion) {
 fn read_performance(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_performance");
     group.sample_size(10);
-    group.measurement_time(Duration::from_secs(20));
+    group.measurement_time(Duration::from_secs(45));
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
