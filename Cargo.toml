@@ -136,6 +136,6 @@ reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
 testcontainers = { version = "0.26", features = ["http_wait"] }
 testcontainers-modules = { version = "0.14", features = ["minio"] }
-aws-config = "1.1"
-aws-sdk-s3 = "1.11"
+aws-config = "1.8.13"
+aws-sdk-s3 = "1.122.0"
 criterion = "0.5"

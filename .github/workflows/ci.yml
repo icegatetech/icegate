@@ -167,6 +167,9 @@ jobs:
   benchmark:
     name: Benchmark
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -198,15 +201,56 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-stable-cargo-build-target-bench-
 
-      - name: Run benchmarks
-        run: cargo bench --workspace
-
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+      - name: Restore benchmark baseline cache
+        uses: actions/cache@v4
         with:
-          name: benchmark-results
-          path: target/criterion/
-          retention-days: 30
+          path: ./bench-cache
+          key: benchmark-baseline-${{ runner.os }}
+          restore-keys: |
+            benchmark-baseline-
+
+      - name: Run benchmarks
+        run: cargo bench --workspace -- --output-format bencher | tee output.txt
+
+      - name: Compare benchmarks (PR)
+        if: github.event_name == 'pull_request'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: IceGate Benchmarks
+          tool: 'cargo'
+          output-file-path: output.txt
+          external-data-json-path: ./bench-cache/benchmark-data.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: true
+          save-data-file: false
+
+      - name: Update cached baseline (main)
+        if: github.event_name == 'push'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: IceGate Benchmarks
+          tool: 'cargo'
+          output-file-path: output.txt
+          external-data-json-path: ./bench-cache/benchmark-data.json
+          alert-threshold: '150%'
+          fail-on-alert: true
+          save-data-file: true
+
+      - name: Push results to dashboard (main)
+        if: github.event_name == 'push'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: IceGate Benchmarks
+          tool: 'cargo'
+          output-file-path: output.txt
+          gh-repository: 'icegatetech/benchmark-results'
+          gh-pages-branch: main
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ secrets.BENCHMARK_TOKEN }}
+          auto-push: true
+          save-data-file: true
 
   security-audit:
     name: Security Audit
