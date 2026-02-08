@@ -1,49 +1,16 @@
 //! Queue configuration.
 
-use crate::{QueueError, Result};
 use serde::{Deserialize, Serialize};
 
-/// Common queue settings shared by read and write paths.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct QueueCommonConfig {
-    /// Base path for queue segments (e.g., "<s3://bucket/queue>" or "<file:///var/data>").
-    pub base_path: String,
-
-    /// Capacity of the write channel (bounded for backpressure).
-    pub channel_capacity: usize,
-
-    /// Maximum number of rows in a single parquet row group for WAL segments.
-    pub max_row_group_size: usize,
-}
-
-/// Queue write settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct QueueWriteConfig {
-    /// Number of retry attempts for write operations.
-    pub write_retries: usize,
-
-    /// Compression codec for Parquet files.
-    pub compression: CompressionCodec,
-
-    /// Multiplier that controls how many row groups worth of rows can be accumulated before flush.
-    pub records_per_flush_multiplier: usize,
-
-    /// Maximum bytes to accumulate before flush.
-    pub max_bytes_per_flush: usize,
-
-    /// Maximum time to wait before flush (in milliseconds).
-    pub flush_interval_ms: u64,
-}
+use crate::{QueueError, Result};
 
 /// Queue read settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueueReadConfig {}
 
 /// Configuration for the queue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueueConfig {
     /// Common queue settings.
@@ -75,14 +42,51 @@ pub enum CompressionCodec {
     Zstd,
 }
 
+/// Common queue settings shared by read and write paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QueueCommonConfig {
+    /// Base path for queue segments (e.g., "<s3://bucket/queue>" or "<file:///var/data>").
+    pub base_path: String,
+
+    /// Capacity of the write channel (bounded for backpressure).
+    pub channel_capacity: usize,
+
+    /// Maximum number of rows in a single parquet row group for WAL segments.
+    /// It is better to synchronize with `ShiftWriteConfig::row_group_size`.
+    pub max_row_group_size: usize,
+}
+
 impl Default for QueueCommonConfig {
     fn default() -> Self {
         Self {
             base_path: String::new(),
-            channel_capacity: 1024,
-            max_row_group_size: 8192,
+            channel_capacity: 1_024,
+            max_row_group_size: 8_192,
         }
     }
+}
+
+/// Queue write settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QueueWriteConfig {
+    /// Number of retry attempts for write operations.
+    pub write_retries: usize,
+
+    /// Compression codec for Parquet files.
+    pub compression: CompressionCodec,
+
+    /// Multiplier that controls how many row groups worth of rows can be accumulated before flush.
+    /// Depends on `QueueCommonConfig::max_row_group_size`
+    pub records_per_flush_multiplier: usize,
+
+    /// Maximum bytes to accumulate before flush.
+    /// It is better to synchronize with `ShiftReadConfig::max_input_bytes_per_task`.
+    pub max_bytes_per_flush: usize,
+
+    /// Maximum time to wait before flush (in milliseconds).
+    pub flush_interval_ms: u64,
 }
 
 impl Default for QueueWriteConfig {
@@ -93,22 +97,6 @@ impl Default for QueueWriteConfig {
             records_per_flush_multiplier: 1,
             max_bytes_per_flush: 64 * 1024 * 1024, // 64 MB
             flush_interval_ms: 200,
-        }
-    }
-}
-
-impl Default for QueueReadConfig {
-    fn default() -> Self {
-        Self {}
-    }
-}
-
-impl Default for QueueConfig {
-    fn default() -> Self {
-        Self {
-            common: QueueCommonConfig::default(),
-            write: QueueWriteConfig::default(),
-            read: QueueReadConfig::default(),
         }
     }
 }
@@ -178,9 +166,7 @@ impl QueueConfig {
     /// Returns an error if a numeric limit is zero.
     pub fn validate(&self) -> Result<()> {
         if self.common.base_path.trim().is_empty() {
-            return Err(QueueError::Config(
-                "common.base_path must not be empty".to_string(),
-            ));
+            return Err(QueueError::Config("common.base_path must not be empty".to_string()));
         }
         if self.common.max_row_group_size == 0 {
             return Err(QueueError::Config(
@@ -207,10 +193,10 @@ impl QueueConfig {
             .max_row_group_size
             .checked_mul(self.write.records_per_flush_multiplier)
             .ok_or_else(|| {
-            QueueError::Config(
-                "common.max_row_group_size * write.records_per_flush_multiplier overflows usize".to_string(),
-            )
-        })?;
+                QueueError::Config(
+                    "common.max_row_group_size * write.records_per_flush_multiplier overflows usize".to_string(),
+                )
+            })?;
 
         Ok(())
     }
@@ -222,11 +208,14 @@ impl QueueConfig {
     /// Panics if the config is invalid and multiplication overflows.
     /// Call [`Self::validate`] before using this value.
     #[must_use]
-    pub const fn flush_record_limit(&self) -> usize {
+    pub fn flush_record_limit(&self) -> usize {
         self.common
             .max_row_group_size
             .checked_mul(self.write.records_per_flush_multiplier)
-            .expect("validated queue config must not overflow flush_record_limit")
+            .map_or_else(
+                || panic!("validated queue config must not overflow flush_record_limit"),
+                std::convert::identity,
+            )
     }
 }
 
@@ -249,8 +238,9 @@ impl CompressionCodec {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde::Deserialize;
+
+    use super::*;
 
     #[test]
     fn test_default_config() {

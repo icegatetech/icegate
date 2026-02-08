@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use icegate_common::retrier::{Retrier, RetrierConfig};
-use object_store::{path::Path, ObjectStore};
+use object_store::{ObjectStore, path::Path};
 use parquet::{
     arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     errors::ParquetError,
@@ -17,13 +17,15 @@ use parquet::{
     file::statistics::Statistics,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{Instrument, debug};
 
 use crate::{
+    Topic,
     error::{QueueError, Result},
     segment::SegmentId,
-    Topic,
 };
+
+const PLAN_BLOCKING_MIN_ROW_GROUPS: usize = 64;
 
 // Reference to record batches (row groups) inside a WAL segment.
 //
@@ -78,6 +80,18 @@ struct RowGroupsInSegments {
     segments: BTreeMap<u64, Vec<usize>>,
     row_group_count: usize,
     input_bytes: u64,
+}
+
+struct SegmentRowGroup {
+    group_key: String,
+    row_group_idx: usize,
+    row_group_bytes: u64,
+}
+
+/// Used as buffer in separate spawn
+struct SegmentRowGroups {
+    wal_offset: u64,
+    entries: Vec<SegmentRowGroup>,
 }
 
 impl RowGroupsInSegments {
@@ -192,7 +206,7 @@ impl ParquetQueueReader {
         start_offset: u64,
         cancel_token: &CancellationToken,
     ) -> Result<Vec<SegmentId>> {
-        // TODO(crit): if a lot of files have accumulated, we need to somehow batch them.
+        // TODO(high): if a lot of files have accumulated, we need to somehow batch them.
         // Build prefix path - handle empty base_path
         let prefix = if self.base_path.is_empty() {
             Path::from(topic.as_str())
@@ -389,105 +403,183 @@ impl ParquetQueueReader {
         let mut plan = Vec::new();
         let mut row_groups_total = 0usize;
         let mut input_bytes_total = 0u64;
+        let mut inline_segments = 0usize;
+        let mut blocking_segments = 0usize;
 
         for segment in segments {
             let wal_offset = segment.offset;
             let parquet_meta = self.read_parquet_metadata(&segment.topic, wal_offset, cancel_token).await?;
-            let schema = parquet_meta.file_metadata().schema_descr();
-            let column_idx = schema
-                .columns()
-                .iter()
-                .position(|col| col.name() == group_by_column_name)
-                .ok_or_else(|| {
-                    QueueError::Metadata(format!(
-                        "column '{group_by_column_name}' not found in parquet schema for segment {wal_offset}"
-                    ))
-                })?;
-
-            let mut saw_row_groups = false;
-            for (row_group_idx, row_group) in parquet_meta.row_groups().iter().enumerate() {
-                let group_key =
-                    Self::group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
-                saw_row_groups = true;
-                let row_group_bytes = Self::row_group_compressed_bytes(row_group, row_group_idx)?;
-
-                let chunk = grouped_chunks.entry(group_key.clone()).or_insert_with(RowGroupsInSegments::new);
-                let next_row_group_count = chunk
-                    .row_group_count
+            let row_groups = parquet_meta.row_groups().len();
+            let segment_entries = if Self::should_process_in_blocking(row_groups) {
+                let group_by_column_name = group_by_column_name.to_string();
+                blocking_segments = blocking_segments
                     .checked_add(1)
-                    .ok_or_else(|| QueueError::Metadata("row group count overflow".to_string()))?;
-                let next_input_bytes = chunk
-                    .input_bytes
-                    .checked_add(row_group_bytes)
-                    .ok_or_else(|| QueueError::Metadata("row group bytes overflow".to_string()))?;
-                if chunk.row_group_count > 0
-                    && (next_row_group_count > max_row_groups_per_grouped_batch
-                        || next_input_bytes > max_input_bytes_per_grouped_batch)
-                {
-                    let (segments, row_groups_total, input_bytes) = chunk.take();
-                    let segments_count = segments.len();
-                    input_bytes_total = input_bytes_total
-                        .checked_add(input_bytes)
-                        .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
-                    plan.push(GroupedSegmentsPlan {
-                        group_col_val: group_key.clone(),
-                        segments,
-                        segments_count,
-                        record_batches_total: row_groups_total,
-                        input_bytes_total: input_bytes,
-                    });
-                }
-
-                row_groups_total = row_groups_total
+                    .ok_or_else(|| QueueError::Metadata("blocking segment count overflow".to_string()))?;
+                tokio::task::spawn_blocking(move || {
+                    Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &group_by_column_name)
+                })
+                .in_current_span()
+                .await??
+            } else {
+                inline_segments = inline_segments
                     .checked_add(1)
-                    .ok_or_else(|| QueueError::Metadata("row group total overflow".to_string()))?;
-                chunk.push(wal_offset, row_group_idx, row_group_bytes)?;
-                // We've reached the row group limit, so we're dropping the chunk.
-                if chunk.row_group_count >= max_row_groups_per_grouped_batch
-                    || chunk.input_bytes >= max_input_bytes_per_grouped_batch
-                {
-                    let (segments, row_groups_total, input_bytes) = chunk.take();
-                    let segments_count = segments.len();
-                    input_bytes_total = input_bytes_total
-                        .checked_add(input_bytes)
-                        .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
-                    plan.push(GroupedSegmentsPlan {
-                        group_col_val: group_key,
-                        segments,
-                        segments_count,
-                        record_batches_total: row_groups_total,
-                        input_bytes_total: input_bytes,
-                    });
-                }
-            }
+                    .ok_or_else(|| QueueError::Metadata("inline segment count overflow".to_string()))?;
+                Self::collect_segment_plan_entries(&parquet_meta, wal_offset, group_by_column_name)?
+            };
 
-            if !saw_row_groups {
-                return Err(QueueError::Metadata(format!(
-                    "no row groups found in WAL segment {wal_offset}"
-                )));
+            for entry in segment_entries.entries {
+                Self::apply_segment_plan_entry(
+                    &mut grouped_chunks,
+                    &mut plan,
+                    segment_entries.wal_offset,
+                    entry,
+                    max_row_groups_per_grouped_batch,
+                    max_input_bytes_per_grouped_batch,
+                    &mut row_groups_total,
+                    &mut input_bytes_total,
+                )?;
             }
         }
 
-        // Collecting the remaining records
-        for (group_key, mut chunk) in grouped_chunks {
-            let (segments, row_groups_total, input_bytes) = chunk.take();
-            if segments.is_empty() {
-                continue;
-            }
-            let segments_count = segments.len();
-            input_bytes_total = input_bytes_total
-                .checked_add(input_bytes)
-                .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
-            plan.push(GroupedSegmentsPlan {
-                group_col_val: group_key,
-                segments,
-                segments_count,
-                record_batches_total: row_groups_total,
-                input_bytes_total: input_bytes,
+        debug!(
+            "plan_record_batches: segments={} inline={} blocking={}",
+            segments.len(),
+            inline_segments,
+            blocking_segments
+        );
+
+        Self::flush_remaining_chunks(grouped_chunks, &mut plan, &mut input_bytes_total)?;
+
+        Ok((plan, row_groups_total, input_bytes_total))
+    }
+
+    const fn should_process_in_blocking(row_group_count: usize) -> bool {
+        row_group_count >= PLAN_BLOCKING_MIN_ROW_GROUPS
+    }
+
+    #[tracing::instrument(
+        level = "debug",
+        skip(parquet_meta, group_by_column_name),
+        fields(wal_offset, group_by_column_name = %group_by_column_name)
+    )]
+    fn collect_segment_plan_entries(
+        parquet_meta: &ParquetMetaData,
+        wal_offset: u64,
+        group_by_column_name: &str,
+    ) -> Result<SegmentRowGroups> {
+        // it is necessary to return the temp buffer (SegmentRowGroups), because the function is used in spawn
+
+        let schema = parquet_meta.file_metadata().schema_descr();
+        let column_idx = schema
+            .columns()
+            .iter()
+            .position(|col| col.name() == group_by_column_name)
+            .ok_or_else(|| {
+                QueueError::Metadata(format!(
+                    "column '{group_by_column_name}' not found in parquet schema for segment {wal_offset}"
+                ))
+            })?;
+
+        let mut entries = Vec::with_capacity(parquet_meta.row_groups().len());
+        for (row_group_idx, row_group) in parquet_meta.row_groups().iter().enumerate() {
+            let group_key = Self::group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
+            let row_group_bytes = Self::row_group_compressed_bytes(row_group, row_group_idx)?;
+            entries.push(SegmentRowGroup {
+                group_key,
+                row_group_idx,
+                row_group_bytes,
             });
         }
 
-        Ok((plan, row_groups_total, input_bytes_total))
+        if entries.is_empty() {
+            return Err(QueueError::Metadata(format!(
+                "no row groups found in WAL segment {wal_offset}"
+            )));
+        }
+
+        Ok(SegmentRowGroups { wal_offset, entries })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_segment_plan_entry(
+        grouped_chunks: &mut HashMap<String, RowGroupsInSegments>,
+        plan: &mut Vec<GroupedSegmentsPlan>,
+        wal_offset: u64,
+        entry: SegmentRowGroup,
+        max_row_groups_per_grouped_batch: usize,
+        max_input_bytes_per_grouped_batch: u64,
+        row_groups_total: &mut usize,
+        input_bytes_total: &mut u64,
+    ) -> Result<()> {
+        let SegmentRowGroup {
+            group_key,
+            row_group_idx,
+            row_group_bytes,
+        } = entry;
+        let chunk = grouped_chunks.entry(group_key.clone()).or_insert_with(RowGroupsInSegments::new);
+        let next_row_group_count = chunk
+            .row_group_count
+            .checked_add(1)
+            .ok_or_else(|| QueueError::Metadata("row group count overflow".to_string()))?;
+        let next_input_bytes = chunk
+            .input_bytes
+            .checked_add(row_group_bytes)
+            .ok_or_else(|| QueueError::Metadata("row group bytes overflow".to_string()))?;
+        if chunk.row_group_count > 0
+            && (next_row_group_count > max_row_groups_per_grouped_batch
+                || next_input_bytes > max_input_bytes_per_grouped_batch)
+        {
+            Self::flush_group_chunk(&group_key, chunk, plan, input_bytes_total)?;
+        }
+
+        *row_groups_total = row_groups_total
+            .checked_add(1)
+            .ok_or_else(|| QueueError::Metadata("row group total overflow".to_string()))?;
+        chunk.push(wal_offset, row_group_idx, row_group_bytes)?;
+        // We've reached the row group or input bytes limit, so we flush the chunk.
+        if chunk.row_group_count >= max_row_groups_per_grouped_batch
+            || chunk.input_bytes >= max_input_bytes_per_grouped_batch
+        {
+            Self::flush_group_chunk(&group_key, chunk, plan, input_bytes_total)?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_group_chunk(
+        group_key: &str,
+        chunk: &mut RowGroupsInSegments,
+        plan: &mut Vec<GroupedSegmentsPlan>,
+        input_bytes_total: &mut u64,
+    ) -> Result<()> {
+        let (segments, row_groups_total, input_bytes) = chunk.take();
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let segments_count = segments.len();
+        *input_bytes_total = input_bytes_total
+            .checked_add(input_bytes)
+            .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
+        plan.push(GroupedSegmentsPlan {
+            group_col_val: group_key.to_string(),
+            segments,
+            segments_count,
+            record_batches_total: row_groups_total,
+            input_bytes_total: input_bytes,
+        });
+        Ok(())
+    }
+
+    fn flush_remaining_chunks(
+        grouped_chunks: HashMap<String, RowGroupsInSegments>,
+        plan: &mut Vec<GroupedSegmentsPlan>,
+        input_bytes_total: &mut u64,
+    ) -> Result<()> {
+        // Collecting the remaining records.
+        for (group_key, mut chunk) in grouped_chunks {
+            Self::flush_group_chunk(&group_key, &mut chunk, plan, input_bytes_total)?;
+        }
+        Ok(())
     }
 
     fn row_group_compressed_bytes(
@@ -591,7 +683,7 @@ impl ParquetQueueReader {
             .retrier
             .retry::<_, _, Result<T>, QueueError>(
                 || {
-                    // TODO(crit): add metric
+                    // TODO(high): add metric
                     let fut = op();
                     async move {
                         match fut.await {

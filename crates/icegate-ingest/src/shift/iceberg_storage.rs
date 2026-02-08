@@ -150,9 +150,6 @@ impl IcebergStorage {
         batches: Vec<RecordBatch>,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        // TODO(high): We have problem. If the number of batches in the WAL file is large, then we will create a large number of small parquet files for Iceberg (for each batch).
-        // We either need to process several WAL files in one task, or compact Iceberg parquet files separately, or pre-partition records into a WAL Writer.
-
         if batches.is_empty() {
             return Ok(WrittenDataFiles {
                 data_files: Vec::new(),
@@ -160,7 +157,6 @@ impl IcebergStorage {
             });
         }
 
-        // TODO(crit): тут мы еще и склеиваем все батчи в один?
         tracing::info!("Start writing parquet file. Batches: {}", batches.len());
         let queue_schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
@@ -179,7 +175,6 @@ impl IcebergStorage {
         let write_id = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(write_id.to_string(), None, DataFileFormat::Parquet);
 
-        // TODO(crit): проверить параметры
         let writer_props = WriterProperties::builder()
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_data_page_row_count_limit(self.row_group_size / 10)

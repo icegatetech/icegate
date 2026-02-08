@@ -2,15 +2,15 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icegate_common::{catalog::CatalogBuilder, create_object_store, run_metrics_server, MetricsRuntime};
-use icegate_queue::{channel, NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter};
+use icegate_common::{MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
+use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    IngestConfig,
     error::Result,
     infra::metrics::{OtlpMetrics, ShiftMetrics, WalWriterMetrics},
     shift::Shifter,
-    IngestConfig,
 };
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)

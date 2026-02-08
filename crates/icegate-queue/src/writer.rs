@@ -8,24 +8,24 @@ use std::{
 
 use arrow::{
     array::ArrayRef,
-    compute::{lexsort_to_indices, take, SortColumn, SortOptions},
+    compute::{SortColumn, SortOptions, lexsort_to_indices, take},
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use futures::{future::join_all, TryStreamExt};
-use object_store::{path::Path, ObjectStore, PutMode, PutOptions, PutPayload};
+use futures::{TryStreamExt, future::join_all};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
+    Topic,
     accumulator::TopicAccumulator,
     channel::{WriteReceiver, WriteRequest},
     config::QueueConfig,
     error::{QueueError, Result},
     segment::SegmentId,
-    Topic,
 };
 
 /// Queue writer that persists Arrow `RecordBatches` to Parquet on object
@@ -699,7 +699,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::{channel::channel, ParquetQueueReader};
+    use crate::{ParquetQueueReader, channel::channel};
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![

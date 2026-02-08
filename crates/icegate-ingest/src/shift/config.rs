@@ -1,6 +1,5 @@
 //! Shift configuration.
 
-use std::ops::Div;
 use std::time::Duration;
 
 use icegate_jobmanager::s3_storage::{JobStateCodecKind, S3StorageConfig};
@@ -166,19 +165,8 @@ pub struct ShiftReadConfig {
     /// Maximum number of row groups to process per shift task.
     pub max_record_batches_per_task: usize,
     /// Maximum input size in bytes to process per shift task.
+    /// It is better to synchronize with `QueueWriteConfig::max_bytes_per_flush`.
     pub max_input_bytes_per_task: u64,
-}
-
-/// Iceberg write settings for shift.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ShiftWriteConfig {
-    /// Parquet row group size (number of rows per row group).
-    pub row_group_size: usize,
-    /// Maximum file size in MB before rolling to a new file.
-    pub max_file_size_mb: usize,
-    /// Time-to-live for cached Iceberg table metadata, in seconds.
-    pub table_cache_ttl_secs: u64,
 }
 
 impl Default for ShiftReadConfig {
@@ -190,11 +178,25 @@ impl Default for ShiftReadConfig {
     }
 }
 
+/// Iceberg write settings for shift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShiftWriteConfig {
+    /// Parquet row group size (number of rows per row group).
+    /// It is better to synchronize with `QueueCommonConfig::max_row_group_size`.
+    pub row_group_size: usize,
+    /// Maximum file size in MB before rolling to a new file.
+    /// It is better to synchronize with `ShiftReadConfig::max_input_bytes_per_task`.
+    pub max_file_size_mb: usize,
+    /// Time-to-live for cached Iceberg table metadata, in seconds.
+    pub table_cache_ttl_secs: u64,
+}
+
 impl Default for ShiftWriteConfig {
     fn default() -> Self {
         Self {
-            row_group_size: 10_000,
-            max_file_size_mb: 100,
+            row_group_size: 8_192,
+            max_file_size_mb: 64,
             table_cache_ttl_secs: 60,
         }
     }
@@ -239,12 +241,9 @@ impl Default for ShiftJobsManagerConfig {
 }
 
 fn default_jobs_manager_worker_count() -> usize {
-    match std::thread::available_parallelism() {
-        Ok(parallelism) => parallelism.get().div_ceil(2),
-        Err(_) => 1,
-    }
+    // we'll leave half of threads for processing API requests
+    std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get().div_ceil(2))
 }
-
 
 /// Configuration for the shift process.
 ///
@@ -369,7 +368,7 @@ impl ShiftTimeoutsConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_jobs_manager_worker_count, ShiftConfig, ShiftJobsManagerConfig};
+    use super::{ShiftConfig, ShiftJobsManagerConfig, default_jobs_manager_worker_count};
 
     #[test]
     fn shift_read_default_max_input_bytes_per_task() {
