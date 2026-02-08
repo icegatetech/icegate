@@ -104,6 +104,7 @@ tonic = "0.14"
 prost = "0.14"
 
 # OpenTelemetry proto (with tonic service generation)
+opentelemetry-instrumentation-tokio = "0.1"
 opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic", "logs", "trace", "metrics"] }
 opentelemetry = { version = "0.31.0", features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.31.0", features = ["metrics", "trace", "rt-tokio", "spec_unstable_metrics_views"] }
@@ -126,7 +127,7 @@ regex = "1.12"
 
 # Utilities
 itoa = "1"
-bytes = "1"
+bytes = "1.11.1"
 hex = "0.4"
 rand = "0.9.2"
 
@@ -135,6 +136,6 @@ reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
 testcontainers = { version = "0.26", features = ["http_wait"] }
 testcontainers-modules = { version = "0.14", features = ["minio"] }
-aws-config = "1.1"
-aws-sdk-s3 = "1.11"
-criterion = "0.5"
+aws-config = "1.8.13"
+aws-sdk-s3 = "1.122.0"
+criterion = "0.8.2"

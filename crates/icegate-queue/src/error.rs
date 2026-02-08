@@ -100,6 +100,10 @@ pub enum QueueError {
     /// Multiple errors occurred.
     #[error("multiple errors occurred: {0:?}")]
     Multiple(Vec<Self>),
+
+    /// Join error
+    #[error("join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
 }
 
 impl icegate_common::RetryError for QueueError {
@@ -130,7 +134,8 @@ impl QueueError {
             | Self::Json(_)
             | Self::ChannelClosed
             | Self::Config(_)
-            | Self::Metadata(_) => false,
+            | Self::Metadata(_)
+            | Self::Join(_) => false,
         }
     }
 }

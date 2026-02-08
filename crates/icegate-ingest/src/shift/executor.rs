@@ -60,6 +60,9 @@ pub struct ShiftInput {
     pub tenant_id: String,
     /// segments to read and shift.
     pub segments: Vec<SegmentToRead>,
+    /// W3C trace context from parent plan span
+    #[serde(default)]
+    pub trace_context: Option<String>,
 }
 
 /// Output of the shift task.
@@ -67,6 +70,9 @@ pub struct ShiftInput {
 pub struct ShiftOutput {
     /// Parquet files produced by the shift task.
     pub parquet_files: Vec<String>,
+    /// W3C trace context from shift span
+    #[serde(default)]
+    pub trace_context: Option<String>,
 }
 
 /// Input for the commit task.
@@ -74,6 +80,9 @@ pub struct ShiftOutput {
 pub struct CommitInput {
     /// Highest segments offset to commit in snapshot summary.
     pub last_offset: u64,
+    /// W3C trace context from parent plan span
+    #[serde(default)]
+    pub trace_context: Option<String>,
 }
 
 /// Shared executor dependencies for shift tasks.

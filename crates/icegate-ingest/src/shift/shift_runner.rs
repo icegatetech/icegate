@@ -211,7 +211,10 @@ where
             .map(iceberg::spec::DataFile::file_size_in_bytes)
             .sum();
 
-        let output = ShiftOutput { parquet_files };
+        let output = ShiftOutput {
+            parquet_files,
+            trace_context: icegate_common::extract_current_trace_context(),
+        };
         let output_payload = serde_json::to_vec(&output).map_err(|err| {
             ShiftTaskFailure::new(
                 ShiftTaskFailureReason::Serialization,

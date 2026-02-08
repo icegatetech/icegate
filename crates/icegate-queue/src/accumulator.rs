@@ -173,25 +173,32 @@ impl TopicAccumulator {
         batch.columns().iter().map(|col| col.get_array_memory_size()).sum()
     }
 
-    /// Sends success results to all pending response channels.
+    /// Sends success results to all response channels.
     ///
     /// All responses share the same `trace_context`, which should be extracted
     /// from the flush operation span that performed the actual write.
-    pub fn send_success(pending: Vec<PendingBatch>, offset: u64, total_records: usize, trace_context: Option<&String>) {
-        for p in pending {
-            let _ = p
-                .response_tx
-                .send(WriteResult::success(offset, total_records, trace_context.cloned()));
+    pub fn send_success(
+        response_channels: Vec<oneshot::Sender<WriteResult>>,
+        offset: u64,
+        total_records: usize,
+        trace_context: Option<&String>,
+    ) {
+        for response_tx in response_channels {
+            let _ = response_tx.send(WriteResult::success(offset, total_records, trace_context.cloned()));
         }
     }
 
-    /// Sends failure results to all pending response channels.
+    /// Sends failure results to all response channels.
     ///
     /// All responses share the same `trace_context`, which should be extracted
     /// from the flush operation span that encountered the error.
-    pub fn send_failure(pending: Vec<PendingBatch>, reason: &str, trace_context: Option<&String>) {
-        for p in pending {
-            let _ = p.response_tx.send(WriteResult::failed(reason, trace_context.cloned()));
+    pub fn send_failure(
+        response_channels: Vec<oneshot::Sender<WriteResult>>,
+        reason: &str,
+        trace_context: Option<&String>,
+    ) {
+        for response_tx in response_channels {
+            let _ = response_tx.send(WriteResult::failed(reason, trace_context.cloned()));
         }
     }
 }
@@ -299,21 +306,10 @@ mod tests {
         let (tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
 
-        let pending = vec![
-            PendingBatch {
-                batch: test_batch(10),
-                response_tx: tx1,
-                trace_context: None,
-            },
-            PendingBatch {
-                batch: test_batch(10),
-                response_tx: tx2,
-                trace_context: None,
-            },
-        ];
+        let response_channels = vec![tx1, tx2];
 
         let trace_ctx = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
-        TopicAccumulator::send_success(pending, 42, 100, trace_ctx.as_ref());
+        TopicAccumulator::send_success(response_channels, 42, 100, trace_ctx.as_ref());
 
         let result1 = rx1.await.expect("recv");
         let result2 = rx2.await.expect("recv");
@@ -337,14 +333,10 @@ mod tests {
     async fn test_send_failure() {
         let (tx, rx) = oneshot::channel();
 
-        let pending = vec![PendingBatch {
-            batch: test_batch(10),
-            response_tx: tx,
-            trace_context: None,
-        }];
+        let response_channels = vec![tx];
 
         let trace_ctx = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
-        TopicAccumulator::send_failure(pending, "test error", trace_ctx.as_ref());
+        TopicAccumulator::send_failure(response_channels, "test error", trace_ctx.as_ref());
 
         let result = rx.await.expect("recv");
         assert!(result.is_failed());

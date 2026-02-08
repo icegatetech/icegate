@@ -149,6 +149,7 @@ where
 
         let commit_input = super::CommitInput {
             last_offset: last_offset_value,
+            trace_context: icegate_common::extract_current_trace_context(),
         };
         let commit_timeout = self
             .timeouts
@@ -222,9 +223,12 @@ fn create_shift_task(
     record_batches_total: usize,
     timeouts: &TimeoutEstimator,
 ) -> Result<uuid::Uuid, Error> {
+    let trace_context = icegate_common::extract_current_trace_context();
+
     let shift_input = ShiftInput {
         tenant_id: tenant_id.to_string(),
         segments,
+        trace_context,
     };
 
     let shift_timeout = timeouts

@@ -27,6 +27,12 @@ impl From<IngestError> for OtlpError {
     }
 }
 
+impl From<tokio::task::JoinError> for OtlpError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        Self(IngestError::from(err))
+    }
+}
+
 impl IntoResponse for OtlpError {
     fn into_response(self) -> Response {
         let (status, error_type) = match &self.0 {

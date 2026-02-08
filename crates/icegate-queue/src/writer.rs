@@ -224,15 +224,25 @@ impl QueueWriter {
             return Ok(());
         }
 
+        // Decompose pending into separate vectors to avoid cloning batches
+        let capacity = pending.len();
+        let mut batches = Vec::with_capacity(capacity);
+        let mut response_channels = Vec::with_capacity(capacity);
+        let mut trace_contexts = Vec::with_capacity(capacity);
+
+        for p in pending {
+            batches.push(p.batch);
+            response_channels.push(p.response_tx);
+            trace_contexts.push(p.trace_context);
+        }
+
         // Add span links for all trace contexts from batched requests
-        let trace_contexts: Vec<&str> = pending.iter().filter_map(|p| p.trace_context.as_deref()).collect();
-        icegate_common::add_span_links(trace_contexts);
+        let trace_context_refs: Vec<&str> = trace_contexts.iter().filter_map(Option::as_deref).collect();
+        icegate_common::add_span_links(trace_context_refs);
 
         // Extract trace context from current flush_topic span
         let flush_trace_context = icegate_common::extract_current_trace_context();
 
-        // Extract batches for concatenation
-        let batches: Vec<RecordBatch> = pending.iter().map(|p| p.batch.clone()).collect();
         let total_records: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
         // Concatenate all batches into one
@@ -241,7 +251,7 @@ impl QueueWriter {
             Err(e) => {
                 self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
                 self.events.on_write_error(topic.as_str(), write_error_reason(&e));
-                TopicAccumulator::send_failure(pending, &e.to_string(), flush_trace_context.as_ref());
+                TopicAccumulator::send_failure(response_channels, &e.to_string(), flush_trace_context.as_ref());
                 return Err(e);
             }
         };
@@ -251,13 +261,13 @@ impl QueueWriter {
             Ok(offset) => {
                 self.events.on_flush_finish(topic.as_str(), "ok", flush_start.elapsed());
                 debug!(offset, "Flush completed");
-                TopicAccumulator::send_success(pending, offset, total_records, flush_trace_context.as_ref());
+                TopicAccumulator::send_success(response_channels, offset, total_records, flush_trace_context.as_ref());
                 Ok(())
             }
             Err(e) => {
                 self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
                 self.events.on_write_error(topic.as_str(), write_error_reason(&e));
-                TopicAccumulator::send_failure(pending, &e.to_string(), flush_trace_context.as_ref());
+                TopicAccumulator::send_failure(response_channels, &e.to_string(), flush_trace_context.as_ref());
                 Err(e)
             }
         }
@@ -301,8 +311,10 @@ impl QueueWriter {
         };
 
         // Convert to Parquet bytes
-        let parquet_bytes = self.batches_to_parquet(&batches)?;
         let row_group_count = batches.len();
+        let writer_properties = self.writer_properties();
+        let parquet_bytes =
+            tokio::task::spawn_blocking(move || Self::batches_to_parquet(writer_properties, &batches)).await??;
         let size_bytes = parquet_bytes.len() as u64;
         debug!(
             records = record_count,
@@ -397,14 +409,12 @@ impl QueueWriter {
     }
 
     /// Converts record batches to Parquet bytes.
-    fn batches_to_parquet(&self, batches: &[RecordBatch]) -> Result<Bytes> {
+    fn batches_to_parquet(props: WriterProperties, batches: &[RecordBatch]) -> Result<Bytes> {
         if batches.is_empty() {
             return Err(QueueError::Config("No batches to write".to_string()));
         }
 
         let schema = batches[0].schema();
-        let props = self.writer_properties();
-
         let mut buffer = Vec::new();
         {
             let mut writer = ArrowWriter::try_new(&mut buffer, schema, Some(props))?;
@@ -484,7 +494,7 @@ impl QueueWriter {
     /// Uses `If-None-Match: *` for atomic write (fails if file exists).
     #[tracing::instrument(
         skip(self, data),
-        fields(topic = %segment_id.topic, offset = segment_id.offset)
+        fields(topic = %segment_id.topic, offset = segment_id.offset, pending_bytes = data.len())
     )]
     async fn try_write(&self, segment_id: &SegmentId, data: Bytes) -> Result<()> {
         debug!("Try to save segments in store");
