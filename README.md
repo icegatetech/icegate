@@ -2,6 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-prototype-red.svg)]()
+[![Benchmarks](https://img.shields.io/badge/charts-benchmarks-blue)](https://icegatetech.github.io/benchmark-results/dev/bench/plot.html)
 
 An Observability Data Lake engine designed to be fast, easy-to-use, cost-effective, scalable, and fault-tolerant.
 
