@@ -389,12 +389,12 @@ impl ParquetQueueReader {
     ) -> Result<(Vec<GroupedSegmentsPlan>, usize, u64)> {
         if max_row_groups_per_grouped_batch == 0 {
             return Err(QueueError::Config(
-                "max_row_groups_per_group must be greater than zero".to_string(),
+                "max_row_groups_per_grouped_batch must be greater than zero".to_string(),
             ));
         }
         if max_input_bytes_per_grouped_batch == 0 {
             return Err(QueueError::Config(
-                "max_input_bytes_per_group must be greater than zero".to_string(),
+                "max_input_bytes_per_grouped_batch must be greater than zero".to_string(),
             ));
         }
 
