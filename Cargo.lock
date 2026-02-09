@@ -3526,7 +3526,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=6946f3197bc3958d38af275933c188b957920a88#6946f3197bc3958d38af275933c188b957920a88"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=8d3338aa9130996f6de0b5106458fb263d7e2b3e#8d3338aa9130996f6de0b5106458fb263d7e2b3e"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -3581,7 +3581,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=6946f3197bc3958d38af275933c188b957920a88#6946f3197bc3958d38af275933c188b957920a88"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=8d3338aa9130996f6de0b5106458fb263d7e2b3e#8d3338aa9130996f6de0b5106458fb263d7e2b3e"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3601,7 +3601,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=6946f3197bc3958d38af275933c188b957920a88#6946f3197bc3958d38af275933c188b957920a88"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=8d3338aa9130996f6de0b5106458fb263d7e2b3e#8d3338aa9130996f6de0b5106458fb263d7e2b3e"
 dependencies = [
  "anyhow",
  "async-trait",
