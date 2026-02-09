@@ -115,6 +115,7 @@ where
                 start_offset,
                 "tenant_id",
                 self.shift_config.read.max_record_batches_per_task,
+                self.shift_config.read.max_input_bytes_per_task,
                 cancel_token,
             )
             .await

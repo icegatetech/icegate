@@ -141,7 +141,7 @@ impl Shifter {
         let cached_storage = Arc::new(CachedStorage::new(s3_storage, jobs_manager_metrics.clone()));
 
         let manager_config = JobsManagerConfig {
-            worker_count: 1,
+            worker_count: shift_config.jobsmanager.worker_count,
             worker_config: WorkerConfig {
                 poll_interval: Duration::from_millis(shift_config.jobsmanager.poll_interval_ms),
                 ..Default::default()

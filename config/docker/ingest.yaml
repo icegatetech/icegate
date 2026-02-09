@@ -12,8 +12,10 @@ storage:
     endpoint: http://minio:9000
 
 queue:
-  base_path: s3://queue/
-  flush_interval_ms: 200
+  common:
+    base_path: s3://queue/
+  write:
+    flush_interval_ms: 200
 
 shift:
   jobsmanager:

@@ -12,7 +12,7 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write 5 segments
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -35,7 +35,7 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
     handle.await.unwrap().unwrap();
 
     // List all segments
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let segments = reader.list_segments(&"logs".to_string(), 0, &cancel).await.unwrap();
 
@@ -53,7 +53,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
 
     // Write 5 segments (offsets 0-4)
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -76,7 +76,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
     handle.await.unwrap().unwrap();
 
     // List segments starting from offset 2
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let segments = reader.list_segments(&"logs".to_string(), 2, &cancel).await.unwrap();
 
@@ -91,7 +91,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
 async fn test_list_empty_topic() -> Result<(), Box<dyn std::error::Error>> {
     let (_minio, store, _bucket) = common::setup_queue_test().await?;
 
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let segments = reader.list_segments(&"nonexistent".to_string(), 0, &cancel).await.unwrap();
 
@@ -105,7 +105,7 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write phase
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -128,7 +128,7 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
     handle.await.unwrap().unwrap();
 
     // Read phase
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let batches = reader.read_segment(&"logs".to_string(), offset, &[0], &cancel).await.unwrap();
 
@@ -140,12 +140,51 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn test_read_segment_uses_configured_record_batch_size() -> Result<(), Box<dyn std::error::Error>> {
+    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+
+    // Write phase: one WAL segment with one row group of 25 rows.
+    let config = QueueConfig::new("queue");
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, store.clone());
+    let handle = writer.start(rx);
+
+    let original_batch = common::test_batch(25, 1)?;
+    let (response_tx, response_rx) = oneshot::channel();
+    tx.send(WriteRequest {
+        topic: "logs".to_string(),
+        batch: original_batch,
+        group_by_column: None,
+        response_tx,
+        trace_context: None,
+    })
+    .await
+    .unwrap();
+    let write_result = response_rx.await.unwrap();
+    let offset = write_result.offset().unwrap();
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    // Read with smaller batch size to force 25 rows => 10 + 10 + 5.
+    let reader = ParquetQueueReader::new("queue", store, 10)?;
+    let cancel = CancellationToken::new();
+    let batches = reader.read_segment(&"logs".to_string(), offset, &[0], &cancel).await.unwrap();
+
+    assert_eq!(batches.len(), 3);
+    assert_eq!(batches[0].num_rows(), 10);
+    assert_eq!(batches[1].num_rows(), 10);
+    assert_eq!(batches[2].num_rows(), 5);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error>> {
     let (_minio, store, _bucket) = common::setup_queue_test().await?;
 
     // Write a single segment (will have 1 row group)
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -168,7 +207,7 @@ async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error
     handle.await.unwrap().unwrap();
 
     // Read the single row group
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let batches = reader.read_segment(&"logs".to_string(), offset, &[0], &cancel).await.unwrap();
 
@@ -183,7 +222,7 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
 
     // Write multiple batches - each batch will have 1 row group
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -209,10 +248,10 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
 
     // Plan segments grouped by tenant_id
     // Note: Since each segment has rows for only tenant-0, planning will group them
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let plan = reader
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 100, &cancel)
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 100, 64 * 1024 * 1024, &cancel)
         .await
         .unwrap();
 
@@ -236,7 +275,7 @@ async fn test_plan_max_row_groups_limit() -> Result<(), Box<dyn std::error::Erro
 
     // Write 5 segments with single tenant per batch
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -259,10 +298,10 @@ async fn test_plan_max_row_groups_limit() -> Result<(), Box<dyn std::error::Erro
     handle.await.unwrap().unwrap();
 
     // Plan with small max_row_groups limit
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let plan = reader
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 2, &cancel)
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 2, 64 * 1024 * 1024, &cancel)
         .await
         .unwrap();
 
@@ -274,5 +313,49 @@ async fn test_plan_max_row_groups_limit() -> Result<(), Box<dyn std::error::Erro
             group.record_batches_total
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_segments_with_small_input_bytes_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+
+    let config = QueueConfig::new("queue");
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, store.clone());
+    let handle = writer.start(rx);
+
+    for _ in 0..3 {
+        let batch = common::test_batch(20, 1)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: "logs".to_string(),
+            batch,
+            group_by_column: None,
+            response_tx,
+            trace_context: None,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+    }
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let cancel = CancellationToken::new();
+    let plan = reader
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 100, 1, &cancel)
+        .await
+        .unwrap();
+
+    for group in &plan.groups {
+        assert_eq!(
+            group.record_batches_total, 1,
+            "Each task should contain exactly one row group when byte limit is tiny"
+        );
+    }
+
     Ok(())
 }

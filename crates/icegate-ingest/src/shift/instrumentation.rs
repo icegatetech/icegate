@@ -248,6 +248,7 @@ where
         start_offset: u64,
         group_by_column_name: &str,
         max_record_batches_per_task: usize,
+        max_input_bytes_per_task: u64,
         cancel_token: &CancellationToken,
     ) -> icegate_queue::Result<SegmentsPlan> {
         let start = Instant::now();
@@ -258,13 +259,19 @@ where
                 start_offset,
                 group_by_column_name,
                 max_record_batches_per_task,
+                max_input_bytes_per_task,
                 cancel_token,
             )
             .await;
         match &result {
-            Ok(_) => self
-                .metrics
-                .record_queue_plan_duration(start.elapsed(), topic.as_str(), TaskStatus::Ok.as_str()),
+            Ok(plan) => {
+                self.metrics
+                    .record_queue_plan_duration(start.elapsed(), topic.as_str(), TaskStatus::Ok.as_str());
+                for group in &plan.groups {
+                    self.metrics
+                        .record_planned_input_bytes_per_task(group.input_bytes_total, topic.as_str());
+                }
+            }
             Err(_) => {
                 self.metrics
                     .record_queue_plan_duration(start.elapsed(), topic.as_str(), TaskStatus::Error.as_str());

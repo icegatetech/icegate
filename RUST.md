@@ -87,6 +87,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - **MUST** use `thiserror` for defining error types and `anyhow` for application-level errors
 - **MUST** propagate errors with `?` operator where appropriate
 - Provide meaningful error messages with context using `.context()` from `anyhow`
+- **NEVER** use `panic!`; **MUST** propagate errors to the caller via `Result`
 
 ## Function Design
 
@@ -115,6 +116,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - Do not commit commented-out tests
 - Use `#[cfg(test)]` modules for test code
 - Never check the error text in tests, only the error types.
+- Never test private methods and functions, the tests will be fragile.
 
 ## Imports and Dependencies
 

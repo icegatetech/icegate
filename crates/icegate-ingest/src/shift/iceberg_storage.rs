@@ -150,9 +150,6 @@ impl IcebergStorage {
         batches: Vec<RecordBatch>,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        // TODO(high): We have problem. If the number of batches in the WAL file is large, then we will create a large number of small parquet files for Iceberg (for each batch).
-        // We either need to process several WAL files in one task, or compact Iceberg parquet files separately, or pre-partition records into a WAL Writer.
-
         if batches.is_empty() {
             return Ok(WrittenDataFiles {
                 data_files: Vec::new(),

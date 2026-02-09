@@ -30,25 +30,29 @@ storage:
 
 # Queue Configuration (WAL)
 queue:
-  # Base path for queue segments (e.g. s3://bucket/queue or file:///var/data/queue)
-  base_path: s3://queue
-  # Capacity of the write channel (bounded for backpressure)
-  channel_capacity: 1024
-  # Number of retry attempts for write operations
-  write_retries: 3
-  # Parquet compression codec: none, snappy, gzip, lzo, brotli, lz4, zstd
-  compression: zstd
-  # Maximum number of records to accumulate before flush
-  max_records_per_flush: 10000
-  # Maximum bytes to accumulate before flush
-  max_bytes_per_flush: 67108864
-  # Maximum time to wait before flush (milliseconds)
-  flush_interval_ms: 1000
-
+  common:
+    # Base path for queue segments (e.g. s3://bucket/queue or file:///var/data/queue)
+    base_path: s3://queue
+    # Capacity of the write channel (bounded for backpressure)
+    channel_capacity: 1024
+    # Maximum number of rows in one WAL parquet row group
+    max_row_group_size: 10000
+  write:
+    # Number of retry attempts for write operations
+    write_retries: 3
+    # Parquet compression codec: none, snappy, gzip, lzo, brotli, lz4, zstd
+    compression: zstd
+    # Flush by rows after this many row-groups-worth of accumulated rows
+    records_per_flush_multiplier: 1
+    # Maximum bytes to accumulate before flush
+    max_bytes_per_flush: 67108864
+    # Maximum time to wait before flush (milliseconds)
+    flush_interval_ms: 1000
 # Shift Configuration
 shift:
   read:
     # max_record_batches_per_task: 128
+    # max_input_bytes_per_task: 67108864
   write:
     # row_group_size: 10000
     # max_file_size_mb: 100
@@ -61,6 +65,7 @@ shift:
     # commit_base_ms: 30000
     # commit_per_parquet_file_ms: 100
   jobsmanager:
+    # worker_count: 1
     # poll_interval_ms: 1000
     # iteration_interval_millisecs: 300
     storage:

@@ -35,7 +35,7 @@ fn start_writer(
     base_path: &str,
 ) -> (JoinHandle<icegate_queue::Result<()>>, icegate_queue::WriteChannel) {
     let config = QueueConfig::new(base_path);
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store).with_events(Arc::new(NoopQueueWriterEvents));
     let handle = writer.start(rx);
     (handle, tx)
@@ -202,7 +202,7 @@ fn read_performance(c: &mut Criterion) {
         (minio, store)
     });
 
-    let reader = ParquetQueueReader::new("queue".to_string(), Arc::clone(&store));
+    let reader = ParquetQueueReader::new("queue".to_string(), Arc::clone(&store), 8192).unwrap();
     let topic = "reads".to_string();
 
     // Benchmark 6: List segments - list 10 pre-written segments
@@ -270,7 +270,7 @@ fn end_to_end(c: &mut Criterion) {
                 writer_handle.await.unwrap().unwrap();
 
                 // Read phase
-                let reader = ParquetQueueReader::new("queue".to_string(), Arc::clone(&store));
+                let reader = ParquetQueueReader::new("queue".to_string(), Arc::clone(&store), 8192).unwrap();
                 let cancel = CancellationToken::new();
                 let topic_e2e = "e2e".to_string();
 

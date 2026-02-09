@@ -12,7 +12,7 @@ async fn test_write_single_batch_to_s3() -> Result<(), Box<dyn std::error::Error
 
     // Setup writer
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -51,7 +51,7 @@ async fn test_sequential_writes_monotonic_offsets() -> Result<(), Box<dyn std::e
     let (_minio, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -95,7 +95,7 @@ async fn test_write_with_grouping() -> Result<(), Box<dyn std::error::Error>> {
     let (_minio, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -131,7 +131,7 @@ async fn test_write_empty_batch() -> Result<(), Box<dyn std::error::Error>> {
     let (_minio, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -170,7 +170,7 @@ async fn test_write_with_base_path() -> Result<(), Box<dyn std::error::Error>> {
     let (_minio, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("my-custom-path");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -205,7 +205,7 @@ async fn test_channel_write_response() -> Result<(), Box<dyn std::error::Error>>
     let (_minio, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store);
     let handle = writer.start(rx);
 
@@ -240,7 +240,7 @@ async fn test_write_then_read_roundtrip() -> Result<(), Box<dyn std::error::Erro
 
     // Write phase
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -264,7 +264,7 @@ async fn test_write_then_read_roundtrip() -> Result<(), Box<dyn std::error::Erro
     handle.await.unwrap().unwrap();
 
     // Read phase
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let batches = reader.read_segment(&"logs".to_string(), offset, &[0], &cancel).await.unwrap();
 
@@ -288,7 +288,7 @@ async fn test_write_read_schema_preservation() -> Result<(), Box<dyn std::error:
 
     // Write phase
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -313,7 +313,7 @@ async fn test_write_read_schema_preservation() -> Result<(), Box<dyn std::error:
     handle.await.unwrap().unwrap();
 
     // Read phase
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let batches = reader.read_segment(&"events".to_string(), 0, &[0], &cancel).await.unwrap();
 
@@ -338,7 +338,7 @@ async fn test_write_read_with_compression() -> Result<(), Box<dyn std::error::Er
 
     // Write phase - default config uses ZSTD compression
     let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.channel_capacity);
+    let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
@@ -361,7 +361,7 @@ async fn test_write_read_with_compression() -> Result<(), Box<dyn std::error::Er
     handle.await.unwrap().unwrap();
 
     // Read phase - should decompress automatically
-    let reader = ParquetQueueReader::new("queue", store);
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let batches = reader.read_segment(&"logs".to_string(), 0, &[0], &cancel).await.unwrap();
 
