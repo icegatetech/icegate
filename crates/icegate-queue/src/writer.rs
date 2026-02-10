@@ -12,7 +12,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use futures::{TryStreamExt, future::join_all};
+use futures::future::join_all;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
@@ -489,6 +489,19 @@ impl QueueWriter {
         }
     }
 
+    /// Builds the full object store path for a segment.
+    fn segment_full_path(&self, segment_id: &SegmentId) -> Path {
+        if self.config.common.base_path.is_empty() {
+            segment_id.to_relative_path()
+        } else {
+            Path::from(format!(
+                "{}/{}",
+                self.config.common.base_path,
+                segment_id.to_relative_path()
+            ))
+        }
+    }
+
     /// Attempts to write a segment to object storage.
     ///
     /// Uses `If-None-Match: *` for atomic write (fails if file exists).
@@ -498,15 +511,7 @@ impl QueueWriter {
     )]
     async fn try_write(&self, segment_id: &SegmentId, data: Bytes) -> Result<()> {
         debug!("Try to save segments in store");
-        let full_path = if self.config.common.base_path.is_empty() {
-            segment_id.to_relative_path()
-        } else {
-            Path::from(format!(
-                "{}/{}",
-                self.config.common.base_path,
-                segment_id.to_relative_path()
-            ))
-        };
+        let full_path = self.segment_full_path(segment_id);
 
         let opts = PutOptions {
             mode: PutMode::Create, // If-None-Match: *
@@ -515,7 +520,7 @@ impl QueueWriter {
 
         let payload = PutPayload::from_bytes(data);
 
-        self.store.put_opts(&full_path, payload, opts).await.map_err(|e| {
+        let result = self.store.put_opts(&full_path, payload, opts).await.map_err(|e| {
             if matches!(e, object_store::Error::AlreadyExists { .. }) {
                 QueueError::AlreadyExists {
                     topic: segment_id.topic.clone(),
@@ -529,6 +534,12 @@ impl QueueWriter {
                 }
             }
         })?;
+
+        debug!(
+            e_tag = result.e_tag.as_deref().unwrap_or("none"),
+            version = result.version.as_deref().unwrap_or("none"),
+            "Segment written"
+        );
 
         Ok(())
     }
@@ -555,61 +566,107 @@ impl QueueWriter {
         offsets.insert(topic.clone(), offset);
     }
 
-    /// Recovers offset state from existing segments on startup.
+    /// Checks whether a segment exists in object storage via HEAD request.
+    async fn segment_exists(&self, segment_id: &SegmentId) -> Result<bool> {
+        let path = self.segment_full_path(segment_id);
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(QueueError::ObjectStore(e)),
+        }
+    }
+
+    /// Discovers topic directories in object storage.
     ///
-    /// Scans the object store for existing parquet segments and sets
-    /// the next offset for each topic to continue from where we left off.
-    async fn recover(&self) -> Result<()> {
+    /// Uses `list_with_delimiter` to find topic-level prefixes without
+    /// listing individual segments.
+    async fn discover_topics(&self) -> Result<Vec<Topic>> {
         let base_path = if self.config.common.base_path.is_empty() {
             None
         } else {
             Some(Path::from(self.config.common.base_path.as_str()))
         };
-        let list_stream = self.store.list(base_path.as_ref());
-        let items: Vec<_> = list_stream.try_collect().await?;
+        let result = self.store.list_with_delimiter(base_path.as_ref()).await?;
 
-        // Build prefix for stripping - empty string means no prefix to strip
         let base_prefix = if self.config.common.base_path.is_empty() {
             String::new()
         } else {
             format!("{}/", self.config.common.base_path)
         };
 
-        // Map: topic -> next offset (max found + 1)
-        let mut topic_offsets: HashMap<Topic, u64> = HashMap::new();
-
-        for item in items {
-            let path_str = item.location.as_ref();
-            if path_str.ends_with(".parquet") {
-                // Get relative path by stripping base prefix (if any)
+        Ok(result
+            .common_prefixes
+            .iter()
+            .filter_map(|prefix| {
+                let prefix_str = prefix.as_ref();
                 let relative = if base_prefix.is_empty() {
-                    path_str
+                    prefix_str
                 } else {
-                    match path_str.strip_prefix(&base_prefix) {
-                        Some(r) => r,
-                        None => continue,
-                    }
+                    prefix_str.strip_prefix(&base_prefix)?
                 };
-
-                // Parse topic and offset from path: "topic/00000000000000000000.parquet"
-                if let Ok(segment_id) = SegmentId::from_relative_path(&Path::from(relative)) {
-                    let entry = topic_offsets.entry(segment_id.topic.clone()).or_insert(0);
-                    let next = segment_id.offset + 1;
-                    if next > *entry {
-                        *entry = next;
-                    }
+                if relative.is_empty() {
+                    None
+                } else {
+                    Some(relative.to_string())
                 }
+            })
+            .collect())
+    }
+
+    /// Finds the maximum segment offset for a topic using binary search.
+    ///
+    /// Uses exponential search to find an upper bound, then binary search
+    /// to narrow down to the exact maximum offset. This runs in O(log N)
+    /// HEAD requests, avoiding the need to list all segments.
+    async fn find_max_offset(&self, topic: &Topic) -> Result<Option<u64>> {
+        // Check if topic has any segments at all
+        if !self.segment_exists(&SegmentId::new(topic, 0)).await? {
+            return Ok(None);
+        }
+
+        // Phase 1: Exponential search to find upper bound
+        let mut bound: u64 = 1;
+        while self.segment_exists(&SegmentId::new(topic, bound)).await? {
+            bound = bound.saturating_mul(2);
+            if bound == u64::MAX {
+                break;
             }
         }
 
-        // Set recovered offsets
-        for (topic, next_offset) in &topic_offsets {
-            self.set_offset(topic, *next_offset).await;
-            info!("Recovered topic '{}': next offset = {}", topic, next_offset);
+        // Phase 2: Binary search between bound/2 and bound
+        let mut lo = bound / 2;
+        let mut hi = bound;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if self.segment_exists(&SegmentId::new(topic, mid)).await? {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
 
-        if !topic_offsets.is_empty() {
-            info!("Recovery complete: {} topics", topic_offsets.len());
+        Ok(Some(lo))
+    }
+
+    /// Recovers offset state from existing segments on startup.
+    ///
+    /// Discovers topics via directory listing, then uses exponential +
+    /// binary search to find the maximum offset per topic in O(log N)
+    /// HEAD requests. This avoids listing all segments, which breaks
+    /// at ~1000 segments on S3-compatible stores.
+    async fn recover(&self) -> Result<()> {
+        let topics = self.discover_topics().await?;
+
+        for topic in &topics {
+            if let Some(max_offset) = self.find_max_offset(topic).await? {
+                let next_offset = max_offset + 1;
+                self.set_offset(topic, next_offset).await;
+                info!("Recovered topic '{}': next offset = {}", topic, next_offset);
+            }
+        }
+
+        if !topics.is_empty() {
+            info!("Recovery complete: {} topics", topics.len());
         }
 
         Ok(())
@@ -891,5 +948,26 @@ mod tests {
 
         assert_eq!(logs_offset, 2);
         assert_eq!(events_offset, 1);
+    }
+
+    #[tokio::test]
+    async fn test_recover_with_many_segments() {
+        let store = Arc::new(InMemory::new());
+        let config = QueueConfig::new("queue");
+        let writer = QueueWriter::new(config, store.clone());
+
+        // Write enough segments to validate exponential + binary search
+        let segment_count = 2000;
+        for _ in 0..segment_count {
+            writer.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        }
+
+        // Simulate restart
+        let config2 = QueueConfig::new("queue");
+        let writer2 = QueueWriter::new(config2, store);
+        writer2.recover().await.unwrap();
+
+        let offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        assert_eq!(offset, segment_count);
     }
 }
