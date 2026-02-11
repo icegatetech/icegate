@@ -1,4 +1,4 @@
-.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench
+.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench down
 
 run-core-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml up --build
@@ -44,7 +44,7 @@ install:
 	cargo install cargo-audit
 
 bench:
-	cargo bench --bench queue_s3_bench --bench loki_queries -- --output-format bencher | tee output.txt
+	cargo bench --bench queue_s3_bench -- --output-format bencher | tee output.txt
 
 down:
 	docker compose -f config/docker/docker-compose.yml down

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use arrow::{compute::concat_batches, record_batch::RecordBatch};
 use tokio::sync::oneshot;
+use tracing::trace;
 
 use crate::{channel::WriteResult, config::QueueConfig, error::Result};
 
@@ -78,26 +79,38 @@ impl TopicAccumulator {
     #[must_use]
     pub fn should_flush(&self, config: &QueueConfig) -> bool {
         if self.pending.is_empty() {
+            trace!("Accumulator is empty, no flush needed");
             return false;
         }
 
         // Check record count threshold
         let row_flush_limit = config.flush_record_limit();
         if self.total_records >= row_flush_limit {
+            trace!("Record count threshold reached, flushing accumulator");
             return true;
         }
 
         // Check byte size threshold
         if self.total_bytes >= config.write.max_bytes_per_flush {
+            trace!("Byte size threshold reached, flushing accumulator");
             return true;
         }
+        trace!(
+            "Byte size threshold not reached, skipping flush, current: {} bytes, threshold: {} bytes",
+            self.total_bytes, config.write.max_bytes_per_flush
+        );
 
         // Check time threshold
         #[allow(clippy::cast_possible_truncation)] // Duration will not exceed u64 in practice
         let elapsed_ms = self.last_flush.elapsed().as_millis() as u64;
         if elapsed_ms >= config.write.flush_interval_ms {
+            trace!("Time threshold reached, flushing accumulator");
             return true;
         }
+        trace!(
+            "Time threshold not reached, skipping flush, elapsed: {}ms, threshold: {}ms",
+            elapsed_ms, config.write.flush_interval_ms
+        );
 
         false
     }

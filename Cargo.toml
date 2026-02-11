@@ -81,7 +81,7 @@ iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev 
 datafusion = "51.0"
 
 # Async runtime
-tokio = { version = "1.48.0", features = ["full"] }
+tokio = { version = "1.48.0", features = ["full", "tracing"] }
 tokio-util = "0.7"
 futures = "0.3.31"
 

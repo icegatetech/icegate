@@ -16,7 +16,7 @@ use futures::future::join_all;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
@@ -85,7 +85,7 @@ impl QueueWriter {
 
         // Spawn flush ticker task
         // To make a flush interval is more precise make the check interval is smaller than the one
-        let check_flush_interval = Duration::from_millis(writer.config.write.flush_interval_ms);
+        let check_flush_interval = Duration::from_millis(writer.config.write.flush_interval_ms / 4);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(check_flush_interval);
             // Use Delay mode: wait for full interval AFTER each flush completes
@@ -93,7 +93,8 @@ impl QueueWriter {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
-                    _ = interval.tick() => {
+                    tick = interval.tick() => {
+                        trace!("Flush ticker ticked {}ms", tick.elapsed().as_millis());
                         if let Err(e) = flush_writer.flush_due_topics().await {
                             warn!("Flush ticker error: {}", e);
                         }
@@ -156,8 +157,10 @@ impl QueueWriter {
         let topic = request.topic.clone();
         let trace_context = request.trace_context.clone();
         let (pending_batches, pending_records, pending_bytes) = {
+            trace!("Start accumulator acquisition");
             let mut accumulators = self.accumulators.write().await;
-            let accumulator = accumulators.entry(topic.clone()).or_insert_with(TopicAccumulator::new);
+            trace!("Accumulator acquisition complete");
+            let accumulator = accumulators.entry(topic).or_insert_with(TopicAccumulator::new);
             accumulator.add(request.batch, request.response_tx, trace_context);
             (
                 accumulator.pending_batches(),
@@ -165,9 +168,10 @@ impl QueueWriter {
                 accumulator.pending_bytes(),
             )
         };
+        trace!("Accumulator block finished");
 
         self.events.on_accumulator_state_update(
-            topic.as_str(),
+            request.topic.as_str(),
             saturating_u64(pending_batches),
             saturating_u64(pending_records),
             saturating_u64(pending_bytes),

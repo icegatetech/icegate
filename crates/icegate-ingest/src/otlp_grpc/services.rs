@@ -53,10 +53,7 @@ impl LogsService for OtlpGrpcService {
     /// queue. Returns partial success response with count of rejected
     /// records.
     #[allow(clippy::cast_possible_wrap)]
-    #[tracing::instrument(
-        skip(self, request),
-        fields(method = "/opentelemetry.proto.collector.logs.v1.LogsService/Export")
-    )]
+    #[tracing::instrument(name = "export_logs", skip(self, request))]
     async fn export(
         &self,
         request: Request<ExportLogsServiceRequest>,

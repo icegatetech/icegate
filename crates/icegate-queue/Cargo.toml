@@ -27,7 +27,7 @@ object_store = { workspace = true }
 icegate-common = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true, features = ["sync", "rt", "fs"] }
+tokio = { workspace = true, features = ["sync", "rt", "fs", "tracing"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
