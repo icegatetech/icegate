@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::Query as QueryExtra;
-use icegate_common::{DEFAULT_TENANT_ID, TENANT_ID_HEADER};
+use icegate_common::{DEFAULT_TENANT_ID, TENANT_ID_HEADER, is_valid_tenant_id};
 
 use super::{
     error::{LokiError, LokiResult},
@@ -25,11 +25,16 @@ use crate::error::QueryError;
 // ============================================================================
 
 /// Extract tenant ID from HTTP headers.
+///
+/// Returns the header value if present and valid (ASCII alphanumeric, hyphens,
+/// underscores). Falls back to `DEFAULT_TENANT_ID` otherwise — matching the
+/// ingest-path behaviour so that data is always queryable under the same
+/// tenant that was used during ingestion.
 fn extract_tenant_id(headers: &HeaderMap) -> String {
     headers
         .get(TENANT_ID_HEADER)
         .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
+        .filter(|s| is_valid_tenant_id(s))
         .map_or_else(|| DEFAULT_TENANT_ID.to_string(), String::from)
 }
 
