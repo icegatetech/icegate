@@ -489,18 +489,21 @@ impl Job {
             return false;
         }
 
-        if let Some(interval) = self.iteration_interval {
-            if Utc::now() < self.started_at + interval {
-                return false;
-            }
+        if let Some(next_start) = self.next_start_at {
+            return Utc::now() > next_start;
         }
 
-        self.next_start_at.map_or(true, |next_start| Utc::now() > next_start)
+        self.iteration_interval
+            .map_or(true, |interval| Utc::now() >= self.started_at + interval)
     }
 
     // State mutations
     pub(crate) fn update_version(&mut self, version: String) {
         self.version = version;
+    }
+
+    pub(crate) fn set_next_start_at(&mut self, next_start_at: DateTime<Utc>) {
+        self.next_start_at = Some(next_start_at);
     }
 
     fn validate_task_input(input: &[u8], task_limits: TaskLimits) -> Result<(), JobError> {
@@ -597,6 +600,9 @@ impl Job {
         }
         if let Some(running) = worker_job.running_at {
             self.running_at = Some(running);
+        }
+        if let Some(next_start_at) = worker_job.next_start_at {
+            self.next_start_at = Some(next_start_at);
         }
 
         Ok(())
@@ -1081,6 +1087,73 @@ mod tests {
     }
 
     #[test]
+    fn test_set_next_start_at_blocks_next_iteration_when_future() {
+        let task = make_task(Uuid::from_u128(360), "done", TaskStatus::Completed, Vec::new());
+        let mut job = restore_job(
+            Uuid::from_u128(361),
+            JobStatus::Completed,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(362),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        job.set_next_start_at(Utc::now() + Duration::seconds(60));
+        assert!(!job.is_ready_to_next_iteration());
+    }
+
+    #[test]
+    fn test_set_next_start_at_with_past_keeps_next_iteration_ready() {
+        let task = make_task(Uuid::from_u128(363), "done", TaskStatus::Completed, Vec::new());
+        let mut job = restore_job(
+            Uuid::from_u128(364),
+            JobStatus::Completed,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(365),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        job.set_next_start_at(Utc::now() - Duration::seconds(1));
+        assert!(job.is_ready_to_next_iteration());
+    }
+
+    #[test]
+    fn test_set_next_start_at_overrides_iteration_interval_floor() {
+        let task = make_task(Uuid::from_u128(366), "done", TaskStatus::Completed, Vec::new());
+        let mut job = Job::restore(
+            Uuid::from_u128(367),
+            JobCode::new("job"),
+            String::new(),
+            1,
+            JobStatus::Completed,
+            vec![task],
+            Uuid::from_u128(368),
+            Utc::now(),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+            None,
+            Some(Duration::seconds(60)),
+            TaskLimits::default(),
+        );
+
+        job.set_next_start_at(Utc::now() - Duration::seconds(1));
+        assert!(job.is_ready_to_next_iteration());
+    }
+
+    #[test]
     fn test_next_iteration_resets_timestamps_and_next_start() {
         let old_task_id = Uuid::from_u128(36);
         let old_task = make_task(old_task_id, "old", TaskStatus::Completed, Vec::new());
@@ -1097,9 +1170,10 @@ mod tests {
             Uuid::from_u128(300),
             Some(Utc::now() - Duration::seconds(5)),
             Some(Utc::now() - Duration::seconds(1)),
-            Some(Utc::now() - Duration::seconds(1)),
+            None,
             HashMap::new(),
         );
+        job.set_next_start_at(Utc::now() - Duration::seconds(1));
 
         let new_task = TaskDefinition::new(TaskCode::new("new"), Vec::new(), Duration::seconds(5)).unwrap();
         job.next_iteration(vec![new_task], worker_id).unwrap();
@@ -1713,6 +1787,110 @@ mod tests {
         assert!(job.tasks_by_id.contains_key(&created_task_id));
         assert!(job.tasks_by_id.contains_key(&processed_task_id));
         assert!(!job.tasks_by_id.contains_key(&other_task_id));
+    }
+
+    #[test]
+    fn test_merge_with_processed_task_copies_next_start_at_from_worker() {
+        let task_id = Uuid::from_u128(1340);
+        let worker_id = Uuid::from_u128(1341);
+        let mut job = restore_job(
+            Uuid::from_u128(1342),
+            JobStatus::Running,
+            vec![make_task(task_id, "base", TaskStatus::Started, Vec::new())],
+            1,
+            None,
+            None,
+            worker_id,
+            Some(Utc::now()),
+            None,
+            Some(Utc::now() - Duration::seconds(10)),
+            HashMap::new(),
+        );
+
+        let next_start_at = Utc::now() + Duration::seconds(60);
+        let worker_job = restore_job(
+            *job.id(),
+            JobStatus::Completed,
+            vec![Task::restore(
+                task_id,
+                TaskCode::new("base"),
+                TaskStatus::Started,
+                Some(worker_id),
+                Uuid::from_u128(1343),
+                Duration::seconds(5),
+                Some(Utc::now()),
+                None,
+                Some(Utc::now() + Duration::seconds(60)),
+                1,
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+                Vec::new(),
+            )],
+            1,
+            None,
+            None,
+            worker_id,
+            Some(Utc::now()),
+            Some(Utc::now()),
+            Some(next_start_at),
+            HashMap::new(),
+        );
+
+        job.merge_with_processed_task(&worker_job, &worker_id, &task_id).unwrap();
+        assert_eq!(job.next_start_at(), Some(next_start_at));
+    }
+
+    #[test]
+    fn test_merge_with_processed_task_keeps_saved_next_start_at_when_worker_missing() {
+        let task_id = Uuid::from_u128(1350);
+        let worker_id = Uuid::from_u128(1351);
+        let saved_next_start_at = Utc::now() + Duration::seconds(30);
+        let mut job = restore_job(
+            Uuid::from_u128(1352),
+            JobStatus::Running,
+            vec![make_task(task_id, "base", TaskStatus::Started, Vec::new())],
+            1,
+            None,
+            None,
+            worker_id,
+            Some(Utc::now()),
+            None,
+            Some(saved_next_start_at),
+            HashMap::new(),
+        );
+
+        let worker_job = restore_job(
+            *job.id(),
+            JobStatus::Completed,
+            vec![Task::restore(
+                task_id,
+                TaskCode::new("base"),
+                TaskStatus::Started,
+                Some(worker_id),
+                Uuid::from_u128(1353),
+                Duration::seconds(5),
+                Some(Utc::now()),
+                None,
+                Some(Utc::now() + Duration::seconds(60)),
+                1,
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+                Vec::new(),
+            )],
+            1,
+            None,
+            None,
+            worker_id,
+            Some(Utc::now()),
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        job.merge_with_processed_task(&worker_job, &worker_id, &task_id).unwrap();
+        assert_eq!(job.next_start_at(), Some(saved_next_start_at));
     }
 
     #[test]
