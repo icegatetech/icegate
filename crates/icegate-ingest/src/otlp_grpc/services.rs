@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use icegate_common::LOGS_TOPIC;
+use icegate_common::{LOGS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
 use icegate_queue::WriteChannel;
 use opentelemetry_proto::tonic::collector::{
     logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService},
@@ -25,6 +25,20 @@ const ENCODING_PROTOBUF: &str = "protobuf";
 const STATUS_OK: &str = "ok";
 const STATUS_ERROR: &str = "error";
 const WAL_REASON_CHANNEL_CLOSED: &str = "channel_closed";
+
+/// Extract tenant ID from gRPC request metadata.
+///
+/// Returns `Some(tenant_id)` if the `x-scope-orgid` metadata key is present and
+/// contains a valid value (non-empty, ASCII alphanumeric/hyphens/underscores).
+/// Returns `None` otherwise, which falls back to `DEFAULT_TENANT_ID` downstream.
+fn extract_tenant_id<T>(request: &Request<T>) -> Option<String> {
+    request
+        .metadata()
+        .get(TENANT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| is_valid_tenant_id(s))
+        .map(String::from)
+}
 
 /// OTLP gRPC service implementation.
 ///
@@ -62,17 +76,18 @@ impl LogsService for OtlpGrpcService {
         let request_size = request.get_ref().encoded_len();
         let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_LOGS, ENCODING_PROTOBUF);
         request_metrics.record_request_size(request_size);
+
+        let tenant_id = extract_tenant_id(&request);
+
         // TODO(med): instrument gRPC decoding time by wrapping tonic/prost codec; handler receives decoded payload.
         let export_request = request.into_inner();
 
-        // Extract tenant_id from metadata (TODO: implement proper tenant extraction)
-        let tenant_id = None; // Will use default
-
         // Transform OTLP logs to Arrow RecordBatch (offload to blocking thread)
-        let batch = tokio::task::spawn_blocking(move || transform::logs_to_record_batch(&export_request, tenant_id))
-            .await
-            .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
-            .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))?;
+        let batch =
+            tokio::task::spawn_blocking(move || transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
+                .await
+                .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
+                .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))?;
         let Some(batch) = batch else {
             // No records to process - return success with 0 rejected
             request_metrics.record_records_per_request(0);

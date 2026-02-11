@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::Query as QueryExtra;
-use icegate_common::DEFAULT_TENANT_ID;
+use icegate_common::{DEFAULT_TENANT_ID, TENANT_ID_HEADER};
 
 use super::{
     error::{LokiError, LokiResult},
@@ -21,20 +21,13 @@ use super::{
 use crate::error::QueryError;
 
 // ============================================================================
-// Constants
-// ============================================================================
-
-/// HTTP header for tenant identification (Grafana/Loki standard).
-const TENANT_HEADER: &str = "x-scope-orgid";
-
-// ============================================================================
 // Helpers
 // ============================================================================
 
 /// Extract tenant ID from HTTP headers.
 fn extract_tenant_id(headers: &HeaderMap) -> String {
     headers
-        .get(TENANT_HEADER)
+        .get(TENANT_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map_or_else(|| DEFAULT_TENANT_ID.to_string(), String::from)
