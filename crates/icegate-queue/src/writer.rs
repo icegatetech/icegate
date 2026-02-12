@@ -12,7 +12,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all};
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
@@ -617,29 +617,62 @@ impl QueueWriter {
             .collect())
     }
 
+    /// Finds the offset of the first existing segment for a topic.
+    ///
+    /// Lists one item from the topic prefix via `store.list()` to find the
+    /// lowest-offset segment. This handles cases where early segments have
+    /// been cleared by TTL, so segment 0 may no longer exist.
+    ///
+    /// Returns `None` if no segments exist for the topic.
+    async fn find_first_segment_offset(&self, topic: &Topic) -> Result<Option<u64>> {
+        let prefix = if self.config.common.base_path.is_empty() {
+            Path::from(format!("{topic}/"))
+        } else {
+            Path::from(format!("{}/{topic}/", self.config.common.base_path))
+        };
+
+        let mut stream = self.store.list(Some(&prefix));
+        let Some(meta) = stream.next().await else {
+            return Ok(None);
+        };
+        let meta = meta?;
+
+        // Strip base_path prefix to get the relative path for SegmentId parsing
+        let location_str = meta.location.as_ref();
+        let relative_str = if self.config.common.base_path.is_empty() {
+            location_str
+        } else {
+            let prefix_to_strip = format!("{}/", self.config.common.base_path);
+            location_str.strip_prefix(&prefix_to_strip).unwrap_or(location_str)
+        };
+
+        let segment_id = SegmentId::from_relative_path(&Path::from(relative_str))?;
+        Ok(Some(segment_id.offset))
+    }
+
     /// Finds the maximum segment offset for a topic using binary search.
     ///
     /// Uses exponential search to find an upper bound, then binary search
     /// to narrow down to the exact maximum offset. This runs in O(log N)
     /// HEAD requests, avoiding the need to list all segments.
     async fn find_max_offset(&self, topic: &Topic) -> Result<Option<u64>> {
-        // Check if topic has any segments at all
-        if !self.segment_exists(&SegmentId::new(topic, 0)).await? {
+        // Find the first existing segment (handles TTL-cleared early segments)
+        let Some(seed) = self.find_first_segment_offset(topic).await? else {
             return Ok(None);
-        }
+        };
 
-        // Phase 1: Exponential search to find upper bound
-        let mut bound: u64 = 1;
-        while self.segment_exists(&SegmentId::new(topic, bound)).await? {
-            bound = bound.saturating_mul(2);
-            if bound == u64::MAX {
+        // Phase 1: Exponential search upward from seed to find upper bound
+        let mut step: u64 = 1;
+        while self.segment_exists(&SegmentId::new(topic, seed.saturating_add(step))).await? {
+            step = step.saturating_mul(2);
+            if seed.saturating_add(step) == u64::MAX {
                 break;
             }
         }
 
-        // Phase 2: Binary search between bound/2 and bound
-        let mut lo = bound / 2;
-        let mut hi = bound;
+        // Phase 2: Binary search between seed + step/2 and seed + step
+        let mut lo = seed.saturating_add(step / 2);
+        let mut hi = seed.saturating_add(step);
         while lo < hi {
             let mid = lo + (hi - lo).div_ceil(2);
             if self.segment_exists(&SegmentId::new(topic, mid)).await? {
@@ -973,5 +1006,33 @@ mod tests {
 
         let offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
         assert_eq!(offset, segment_count);
+    }
+
+    #[tokio::test]
+    async fn test_recover_with_ttl_cleared_segments() {
+        let store = Arc::new(InMemory::new());
+
+        // Write 10 segments (offsets 0-9)
+        let config1 = QueueConfig::new("queue");
+        let writer1 = QueueWriter::new(config1, store.clone());
+        for _ in 0..10 {
+            writer1.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        }
+
+        // Delete segments 0-4 (simulating TTL clearing early segments)
+        for offset in 0..5 {
+            let segment_id = SegmentId::new("logs", offset);
+            let path = Path::from(format!("queue/{}", segment_id.to_relative_path()));
+            store.delete(&path).await.unwrap();
+        }
+
+        // Create new writer (simulating restart) and recover
+        let config2 = QueueConfig::new("queue");
+        let writer2 = QueueWriter::new(config2, store);
+        writer2.recover().await.unwrap();
+
+        // New write should continue from offset 10 (after the last existing segment 9)
+        let offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        assert_eq!(offset, 10);
     }
 }
