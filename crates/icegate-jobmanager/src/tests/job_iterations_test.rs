@@ -135,8 +135,8 @@ async fn test_job_iterations_honors_next_start_at() -> Result<(), Box<dyn std::e
             let current = count.fetch_add(1, Ordering::SeqCst) + 1;
 
             if current == 1 {
-                manager.set_next_start_at(Utc::now() + ChronoDuration::milliseconds(delay_ms))?;
                 first_at.store(Utc::now().timestamp_millis(), Ordering::SeqCst);
+                manager.set_next_start_at(Utc::now() + ChronoDuration::milliseconds(delay_ms))?;
             }
             if current == 2 {
                 second_at.store(Utc::now().timestamp_millis(), Ordering::SeqCst);
