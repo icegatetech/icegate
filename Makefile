@@ -44,7 +44,7 @@ install:
 	cargo install cargo-audit
 
 bench:
-	cargo bench --bench queue_s3_bench -- --output-format bencher | tee output.txt
+	cargo bench --bench queue_s3_bench --bench loki_queries -- --output-format bencher | tee output.txt
 
 down:
 	docker compose -f config/docker/docker-compose.yml down

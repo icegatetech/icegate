@@ -9,7 +9,7 @@ use axum::{
     http::{HeaderMap, header::CONTENT_TYPE},
     response::IntoResponse,
 };
-use icegate_common::LOGS_TOPIC;
+use icegate_common::{LOGS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
 use icegate_queue::{WriteRequest, WriteResult};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
@@ -36,6 +36,19 @@ const PROTOCOL_HTTP: &str = "http";
 const WAL_REASON_CHANNEL_CLOSED: &str = "channel_closed";
 const STATUS_OK: &str = "ok";
 const STATUS_ERROR: &str = "error";
+
+/// Extract tenant ID from HTTP headers.
+///
+/// Returns `Some(tenant_id)` if the `x-scope-orgid` header is present and
+/// contains a valid value (non-empty, ASCII alphanumeric/hyphens/underscores).
+/// Returns `None` otherwise, which falls back to `DEFAULT_TENANT_ID` downstream.
+fn extract_tenant_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(TENANT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| is_valid_tenant_id(s))
+        .map(String::from)
+}
 
 /// Handle OTLP logs ingestion.
 ///
@@ -66,12 +79,12 @@ pub async fn ingest_logs(
         .record_decode(content_type, || parse_logs_request(content_type, &body))
         .map_err(OtlpError::from)?;
 
-    // TODO: Extract tenant_id from authentication
-    let tenant_id = None;
+    let tenant_id = extract_tenant_id(&headers);
 
     // Transform OTLP logs to Arrow RecordBatch (offload to blocking thread)
     let batch =
-        tokio::task::spawn_blocking(move || transform::logs_to_record_batch(&export_request, tenant_id)).await??;
+        tokio::task::spawn_blocking(move || transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
+            .await??;
     let Some(batch) = batch else {
         // No records to process - return success with 0 rejected
         request_metrics.record_records_per_request(0);
@@ -277,5 +290,32 @@ mod tests {
     fn test_unsupported_content_type() {
         let result = parse_logs_request("text/plain", &Bytes::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_tenant_id_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_ID_HEADER, "my-tenant".parse().unwrap());
+        assert_eq!(extract_tenant_id(&headers), Some("my-tenant".to_string()));
+    }
+
+    #[test]
+    fn test_extract_tenant_id_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_tenant_id(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_tenant_id_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_ID_HEADER, "".parse().unwrap());
+        assert_eq!(extract_tenant_id(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_tenant_id_invalid_chars() {
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_ID_HEADER, "bad/tenant".parse().unwrap());
+        assert_eq!(extract_tenant_id(&headers), None);
     }
 }
