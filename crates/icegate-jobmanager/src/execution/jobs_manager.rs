@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -72,6 +73,8 @@ impl Drop for JobsManagerHandle {
 }
 
 impl JobsManager {
+    const WORKER_START_STAGGER_MS: u64 = 50;
+
     // TODO(med): we need to allocate an asynchronous API for managing and configuring jobs. So the
     // client will be able to change job settings without restarting. TODO(low): consider reducing
     // the number of parameters for manager startup
@@ -113,8 +116,16 @@ impl JobsManager {
 
             let token = cancel_token.clone();
             let worker_id = i;
+            let worker_start_delay = worker_start_delay(i, Self::WORKER_START_STAGGER_MS);
 
             join_set.spawn(async move {
+                if !worker_start_delay.is_zero() {
+                    tokio::select! {
+                        () = token.cancelled() => return Ok(()),
+                        () = sleep(worker_start_delay) => {}
+                    }
+                }
+
                 // TODO(high): decide what to do with the panic, now the worker is dying.
                 if let Err(e) = worker.start(token).await {
                     tracing::error!("Worker {} stopped with error: {}", worker_id, e);
@@ -127,4 +138,9 @@ impl JobsManager {
 
         Ok(JobsManagerHandle { cancel_token, join_set })
     }
+}
+
+fn worker_start_delay(worker_index: usize, stagger_ms: u64) -> std::time::Duration {
+    let worker_index_u64 = u64::try_from(worker_index).unwrap_or(u64::MAX);
+    std::time::Duration::from_millis(worker_index_u64.saturating_mul(stagger_ms))
 }
