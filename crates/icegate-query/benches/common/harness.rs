@@ -92,7 +92,7 @@ impl TestServer {
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let server_handle = tokio::spawn(async move {
-            let disabled_metrics = std::sync::Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
+            let disabled_metrics = Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
             icegate_query::loki::run_with_port_tx(
                 server_engine,
                 loki_config,

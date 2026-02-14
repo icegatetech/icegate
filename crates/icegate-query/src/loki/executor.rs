@@ -287,27 +287,41 @@ impl QueryExecutor {
         let plan_start = Instant::now();
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let df = planner.plan_labels(selector).await?;
-        self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "labels");
+        let df = match planner.plan_labels(selector).await {
+            Ok(df) => {
+                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "labels");
+                df
+            }
+            Err(e) => {
+                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "labels");
+                self.metrics.add_error("loki", "plan");
+                return Err(e.into());
+            }
+        };
 
         let execute_start = Instant::now();
-        let batches = df.collect().await.map_err(QueryError::from)?;
-        self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "labels");
+        let batches = match df.collect().await {
+            Ok(batches) => {
+                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "labels");
+                batches
+            }
+            Err(e) => {
+                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "labels");
+                self.metrics.add_error("loki", "execute");
+                return Err(QueryError::from(e).into());
+            }
+        };
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         self.metrics.record_result_rows(total_rows, "loki", "labels");
 
-        // Dedup + sort labels (CPU-bound, offloaded to blocking thread)
+        // Dedup and sort labels via BTreeSet (CPU-bound, offloaded to blocking thread)
         let span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
-                let mut labels: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for value in extract_string_column(&batches, 0) {
-                    labels.insert(value);
-                }
-                let mut sorted: Vec<String> = labels.into_iter().collect();
-                sorted.sort();
-                sorted
+                let labels: std::collections::BTreeSet<String> =
+                    extract_string_column(&batches, 0).into_iter().collect();
+                labels.into_iter().collect()
             })
         })
         .await
@@ -347,13 +361,32 @@ impl QueryExecutor {
         let plan_start = Instant::now();
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let df = planner.plan_label_values(selector, label_name).await?;
-        self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "label_values");
+        let df = match planner.plan_label_values(selector, label_name).await {
+            Ok(df) => {
+                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "label_values");
+                df
+            }
+            Err(e) => {
+                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "label_values");
+                self.metrics.add_error("loki", "plan");
+                return Err(e.into());
+            }
+        };
 
         let execute_start = Instant::now();
-        let batches = df.collect().await.map_err(QueryError::from)?;
-        self.metrics
-            .record_execute_duration(execute_start.elapsed(), "loki", "label_values");
+        let batches = match df.collect().await {
+            Ok(batches) => {
+                self.metrics
+                    .record_execute_duration(execute_start.elapsed(), "loki", "label_values");
+                batches
+            }
+            Err(e) => {
+                self.metrics
+                    .record_execute_duration(execute_start.elapsed(), "loki", "label_values");
+                self.metrics.add_error("loki", "execute");
+                return Err(QueryError::from(e).into());
+            }
+        };
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         self.metrics.record_result_rows(total_rows, "loki", "label_values");
@@ -391,12 +424,30 @@ impl QueryExecutor {
         let plan_start = Instant::now();
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let df = planner.plan_series(&selectors).await?;
-        self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "series");
+        let df = match planner.plan_series(&selectors).await {
+            Ok(df) => {
+                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "series");
+                df
+            }
+            Err(e) => {
+                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "series");
+                self.metrics.add_error("loki", "plan");
+                return Err(e.into());
+            }
+        };
 
         let execute_start = Instant::now();
-        let batches = df.collect().await.map_err(QueryError::from)?;
-        self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "series");
+        let batches = match df.collect().await {
+            Ok(batches) => {
+                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "series");
+                batches
+            }
+            Err(e) => {
+                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "series");
+                self.metrics.add_error("loki", "execute");
+                return Err(QueryError::from(e).into());
+            }
+        };
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         self.metrics.record_result_rows(total_rows, "loki", "series");

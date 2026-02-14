@@ -416,7 +416,7 @@ impl QueueWriter {
     }
 
     /// Converts record batches to Parquet bytes.
-    #[instrument(skip(batches), fields(batches.len = batches.len()))]
+    #[instrument(skip_all, fields(batches.len = batches.len()))]
     fn batches_to_parquet(props: WriterProperties, batches: &[RecordBatch]) -> Result<Bytes> {
         if batches.is_empty() {
             return Err(QueueError::Config("No batches to write".to_string()));

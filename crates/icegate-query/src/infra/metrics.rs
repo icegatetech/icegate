@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use opentelemetry::{
     KeyValue,
-    metrics::{Counter, Gauge, Histogram, Meter, MeterProvider as _},
+    metrics::{Counter, Histogram, Meter, MeterProvider as _, UpDownCounter},
 };
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 
@@ -32,7 +32,7 @@ pub struct QueryMetrics {
     provider_refresh_duration: Histogram<f64>,
     provider_refresh_errors_total: Counter<u64>,
     errors_total: Counter<u64>,
-    active_queries: Gauge<i64>,
+    active_queries: UpDownCounter<i64>,
 }
 
 impl QueryMetrics {
@@ -58,7 +58,7 @@ impl QueryMetrics {
             provider_refresh_duration: meter.f64_histogram("icegate_query_provider_refresh_duration").build(),
             provider_refresh_errors_total: meter.u64_counter("icegate_query_provider_refresh_errors_total").build(),
             errors_total: meter.u64_counter("icegate_query_errors_total").build(),
-            active_queries: meter.i64_gauge("icegate_query_active_queries").build(),
+            active_queries: meter.i64_up_down_counter("icegate_query_active_queries").build(),
         }
     }
 
@@ -121,7 +121,7 @@ impl QueryMetrics {
             .with_description("Query errors by phase")
             .build();
         let active_queries = meter
-            .i64_gauge("icegate_query_active_queries")
+            .i64_up_down_counter("icegate_query_active_queries")
             .with_description("Currently executing queries")
             .build();
 
@@ -176,12 +176,12 @@ impl QueryMetrics {
         );
     }
 
-    /// Record active queries gauge value.
-    pub fn record_active_queries(&self, count: i64, api: &str) {
+    /// Adjust the active queries counter by `delta` (+1 to increment, -1 to decrement).
+    pub fn add_active_queries(&self, delta: i64, api: &str) {
         if !self.enabled {
             return;
         }
-        self.active_queries.record(count, &[KeyValue::new("api", api.to_string())]);
+        self.active_queries.add(delta, &[KeyValue::new("api", api.to_string())]);
     }
 
     // ========================================================================
@@ -329,7 +329,7 @@ impl<'a> QueryRequestRecorder<'a> {
     ///
     /// Increments the active-queries gauge immediately.
     pub fn new(metrics: &'a QueryMetrics, api: &'a str, endpoint: &'a str) -> Self {
-        metrics.record_active_queries(1, api);
+        metrics.add_active_queries(1, api);
         Self {
             metrics,
             api,
@@ -349,7 +349,7 @@ impl<'a> QueryRequestRecorder<'a> {
         self.metrics.add_request(self.api, self.endpoint, status);
         self.metrics
             .record_request_duration(self.request_start.elapsed(), self.api, self.endpoint);
-        self.metrics.record_active_queries(-1, self.api);
+        self.metrics.add_active_queries(-1, self.api);
     }
 }
 

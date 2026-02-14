@@ -67,7 +67,7 @@ impl DataFusionPlanner {
 impl Planner for DataFusionPlanner {
     type Plan = DataFrame;
 
-    #[tracing::instrument(skip(self, expr), fields(plan_type))]
+    #[tracing::instrument(skip_all)]
     async fn plan(&self, expr: LogQLExpr) -> Result<Self::Plan> {
         let df = match expr {
             LogQLExpr::Log(log_expr) => {
