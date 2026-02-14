@@ -6,13 +6,15 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::LokiConfig;
-use crate::engine::QueryEngine;
+use crate::{engine::QueryEngine, infra::metrics::QueryMetrics};
 
 /// Shared application state for Loki server
 #[derive(Clone)]
 pub struct LokiState {
     /// Query engine for creating `DataFusion` sessions
     pub engine: Arc<QueryEngine>,
+    /// Query metrics recorder
+    pub metrics: Arc<QueryMetrics>,
 }
 
 /// Run the Loki HTTP server
@@ -24,8 +26,9 @@ pub async fn run(
     engine: Arc<QueryEngine>,
     config: LokiConfig,
     cancel_token: CancellationToken,
+    metrics: Arc<QueryMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(engine, config, cancel_token, None).await
+    run_with_port_tx(engine, config, cancel_token, None, metrics).await
 }
 
 /// Run the Loki HTTP server with optional port notification
@@ -41,10 +44,11 @@ pub async fn run_with_port_tx(
     config: LokiConfig,
     cancel_token: CancellationToken,
     port_tx: Option<oneshot::Sender<u16>>,
+    metrics: Arc<QueryMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = LokiState { engine };
+    let state = LokiState { engine, metrics };
 
     let app = super::routes::routes(state);
 

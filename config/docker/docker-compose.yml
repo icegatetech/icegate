@@ -117,7 +117,7 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
-      RUST_LOG: info
+      RUST_LOG: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     develop:
       watch:
@@ -134,7 +134,6 @@ services:
     ports:
       - "4317:4317"
       - "4318:4318"
-      - "9091:9091"
     volumes:
       - ./ingest.yaml:/etc/icegate/ingest.yaml:ro
     depends_on:

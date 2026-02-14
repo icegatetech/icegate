@@ -164,8 +164,11 @@ impl IcebergStorage {
         let table_metadata = table.metadata().clone();
         let table_file_io = table.file_io().clone();
         let metadata_for_sort = table_metadata.clone();
-        let sorted_batch =
-            tokio::task::spawn_blocking(move || sort_by_table_order(&metadata_for_sort, combined_batch)).await??;
+        let span = tracing::Span::current();
+        let sorted_batch = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| sort_by_table_order(&metadata_for_sort, combined_batch))
+        })
+        .await??;
         tracing::debug!("Sorted batch has {} rows", sorted_batch.num_rows());
 
         let location_generator = DefaultLocationGenerator::new(table_metadata.clone())

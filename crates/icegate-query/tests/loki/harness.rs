@@ -108,9 +108,16 @@ impl TestServer {
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let server_handle = tokio::spawn(async move {
-            icegate_query::loki::run_with_port_tx(server_engine, loki_config, cancel_token_clone, Some(port_tx))
-                .await
-                .unwrap();
+            let disabled_metrics = std::sync::Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
+            icegate_query::loki::run_with_port_tx(
+                server_engine,
+                loki_config,
+                cancel_token_clone,
+                Some(port_tx),
+                disabled_metrics,
+            )
+            .await
+            .unwrap();
         });
 
         // Wait for the server to bind and receive the actual port
