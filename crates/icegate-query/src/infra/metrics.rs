@@ -12,6 +12,16 @@ use opentelemetry::{
 };
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 
+/// Histogram bucket boundaries (in seconds) for fast sub-phases like parse,
+/// plan, and format, which typically complete in low milliseconds.
+const FAST_DURATION_BOUNDARIES: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+
+/// Histogram bucket boundaries (in seconds) for end-to-end and I/O-bound
+/// durations like request, execute, session creation, and provider refresh.
+const DURATION_BOUNDARIES: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
 /// Metrics recorded throughout the query request lifecycle.
 ///
 /// Follows the same `new(&Meter)` / `new_disabled()` pattern used by
@@ -72,26 +82,31 @@ impl QueryMetrics {
             .f64_histogram("icegate_query_request_duration")
             .with_description("End-to-end request duration")
             .with_unit("s")
+            .with_boundaries(DURATION_BOUNDARIES.to_vec())
             .build();
         let parse_duration = meter
             .f64_histogram("icegate_query_parse_duration")
             .with_description("LogQL/PromQL parse duration")
             .with_unit("s")
+            .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
             .build();
         let plan_duration = meter
             .f64_histogram("icegate_query_plan_duration")
             .with_description("Query planning duration")
             .with_unit("s")
+            .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
             .build();
         let execute_duration = meter
             .f64_histogram("icegate_query_execute_duration")
             .with_description("DataFusion execute (df.collect) duration")
             .with_unit("s")
+            .with_boundaries(DURATION_BOUNDARIES.to_vec())
             .build();
         let format_duration = meter
             .f64_histogram("icegate_query_format_duration")
             .with_description("Result formatting duration")
             .with_unit("s")
+            .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
             .build();
         let result_rows = meter
             .f64_histogram("icegate_query_result_rows")
@@ -106,11 +121,13 @@ impl QueryMetrics {
             .f64_histogram("icegate_query_session_create_duration")
             .with_description("SessionContext creation duration")
             .with_unit("s")
+            .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
             .build();
         let provider_refresh_duration = meter
             .f64_histogram("icegate_query_provider_refresh_duration")
             .with_description("IcebergCatalogProvider refresh duration")
             .with_unit("s")
+            .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
             .build();
         let provider_refresh_errors_total = meter
             .u64_counter("icegate_query_provider_refresh_errors_total")

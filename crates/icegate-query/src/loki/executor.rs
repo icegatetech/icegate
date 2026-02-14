@@ -6,7 +6,10 @@
 use std::{sync::Arc, time::Instant};
 
 use chrono::{DateTime, Duration, Utc};
-use datafusion::{arrow::array::RecordBatch, prelude::SessionContext};
+use datafusion::{
+    arrow::array::RecordBatch,
+    prelude::{DataFrame, SessionContext},
+};
 
 use super::{
     error::{LokiError, LokiResult},
@@ -142,6 +145,63 @@ impl QueryExecutor {
         Ok(session)
     }
 
+    /// Plan a query and execute it, recording metrics for both phases.
+    ///
+    /// Times the plan future and `df.collect()` execution, recording durations,
+    /// errors, and result row counts via [`QueryMetrics`].
+    async fn plan_and_execute<F>(&self, plan_type: &str, plan_future: F) -> LokiResult<Vec<RecordBatch>>
+    where
+        F: std::future::Future<Output = crate::error::Result<DataFrame>>,
+    {
+        let plan_start = Instant::now();
+        let df = match plan_future.await {
+            Ok(df) => {
+                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", plan_type);
+                df
+            }
+            Err(e) => {
+                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", plan_type);
+                self.metrics.add_error("loki", "plan");
+                return Err(e.into());
+            }
+        };
+
+        let execute_start = Instant::now();
+        let batches = match df.collect().await {
+            Ok(batches) => {
+                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", plan_type);
+                batches
+            }
+            Err(e) => {
+                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", plan_type);
+                self.metrics.add_error("loki", "execute");
+                return Err(QueryError::from(e).into());
+            }
+        };
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        self.metrics.record_result_rows(total_rows, "loki", plan_type);
+
+        Ok(batches)
+    }
+
+    /// Parse an optional selector string on a blocking thread.
+    ///
+    /// Returns [`Selector::empty()`] when `query` is `None`.
+    async fn parse_selector_opt(&self, query: Option<String>) -> LokiResult<Selector> {
+        match query {
+            Some(q) => {
+                let span = tracing::Span::current();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(|| parse_selector(&q).map_err(|e| LokiError(make_query_error_send(e.0))))
+                })
+                .await
+                .map_err(join_error)?
+            }
+            None => Ok(Selector::empty()),
+        }
+    }
+
     /// Execute a range query and return formatted results.
     #[tracing::instrument(skip(self, params), fields(tenant_id, query = %params.query))]
     pub async fn execute_range_query(
@@ -196,39 +256,10 @@ impl QueryExecutor {
         let is_metric_query = expr.is_metric();
         let plan_type = if is_metric_query { "metric" } else { "log" };
 
-        // Create session and plan
-        let plan_start = Instant::now();
+        // Create session, plan, and execute
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let df = match planner.plan(expr).await {
-            Ok(df) => {
-                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", plan_type);
-                df
-            }
-            Err(e) => {
-                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", plan_type);
-                self.metrics.add_error("loki", "plan");
-                return Err(e.into());
-            }
-        };
-
-        // Execute
-        let execute_start = Instant::now();
-        let batches = match df.collect().await {
-            Ok(batches) => {
-                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", plan_type);
-                batches
-            }
-            Err(e) => {
-                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", plan_type);
-                self.metrics.add_error("loki", "execute");
-                return Err(QueryError::from(e).into());
-            }
-        };
-
-        // Record result stats
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        self.metrics.record_result_rows(total_rows, "loki", plan_type);
+        let batches = self.plan_and_execute(plan_type, planner.plan(expr)).await?;
 
         let exec_time = exec_start.elapsed().as_secs_f64();
 
@@ -276,48 +307,11 @@ impl QueryExecutor {
         );
 
         // Parse optional selector (CPU-bound, offloaded to blocking thread)
-        let selector = match params.query.clone() {
-            Some(q) => {
-                let span = tracing::Span::current();
-                tokio::task::spawn_blocking(move || {
-                    span.in_scope(|| parse_selector(&q).map_err(|e| LokiError(make_query_error_send(e.0))))
-                })
-                .await
-                .map_err(join_error)??
-            }
-            None => Selector::empty(),
-        };
+        let selector = self.parse_selector_opt(params.query.clone()).await?;
 
-        let plan_start = Instant::now();
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let df = match planner.plan_labels(selector).await {
-            Ok(df) => {
-                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "labels");
-                df
-            }
-            Err(e) => {
-                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "labels");
-                self.metrics.add_error("loki", "plan");
-                return Err(e.into());
-            }
-        };
-
-        let execute_start = Instant::now();
-        let batches = match df.collect().await {
-            Ok(batches) => {
-                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "labels");
-                batches
-            }
-            Err(e) => {
-                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "labels");
-                self.metrics.add_error("loki", "execute");
-                return Err(QueryError::from(e).into());
-            }
-        };
-
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        self.metrics.record_result_rows(total_rows, "loki", "labels");
+        let batches = self.plan_and_execute("labels", planner.plan_labels(selector)).await?;
 
         // Dedup and sort labels via BTreeSet (CPU-bound, offloaded to blocking thread)
         let span = tracing::Span::current();
@@ -350,52 +344,21 @@ impl QueryExecutor {
         );
 
         // Parse optional selector (CPU-bound, offloaded to blocking thread)
-        let selector = match params.query.clone() {
-            Some(q) => {
-                let span = tracing::Span::current();
-                tokio::task::spawn_blocking(move || {
-                    span.in_scope(|| parse_selector(&q).map_err(|e| LokiError(make_query_error_send(e.0))))
-                })
-                .await
-                .map_err(join_error)??
-            }
-            None => Selector::empty(),
-        };
+        let selector = self.parse_selector_opt(params.query.clone()).await?;
 
-        let plan_start = Instant::now();
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let df = match planner.plan_label_values(selector, label_name).await {
-            Ok(df) => {
-                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "label_values");
-                df
-            }
-            Err(e) => {
-                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "label_values");
-                self.metrics.add_error("loki", "plan");
-                return Err(e.into());
-            }
-        };
+        let batches = self
+            .plan_and_execute("label_values", planner.plan_label_values(selector, label_name))
+            .await?;
 
-        let execute_start = Instant::now();
-        let batches = match df.collect().await {
-            Ok(batches) => {
-                self.metrics
-                    .record_execute_duration(execute_start.elapsed(), "loki", "label_values");
-                batches
-            }
-            Err(e) => {
-                self.metrics
-                    .record_execute_duration(execute_start.elapsed(), "loki", "label_values");
-                self.metrics.add_error("loki", "execute");
-                return Err(QueryError::from(e).into());
-            }
-        };
+        // CPU-bound column extraction offloaded to blocking thread
+        let span = tracing::Span::current();
+        let result = tokio::task::spawn_blocking(move || span.in_scope(|| extract_string_column(&batches, 0)))
+            .await
+            .map_err(join_error)?;
 
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        self.metrics.record_result_rows(total_rows, "loki", "label_values");
-
-        Ok(extract_string_column(&batches, 0))
+        Ok(result)
     }
 
     /// Execute a series metadata query.
@@ -425,36 +388,9 @@ impl QueryExecutor {
         .await
         .map_err(join_error)??;
 
-        let plan_start = Instant::now();
         let session_ctx = self.create_session().await?;
         let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let df = match planner.plan_series(&selectors).await {
-            Ok(df) => {
-                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "series");
-                df
-            }
-            Err(e) => {
-                self.metrics.record_plan_duration(plan_start.elapsed(), "loki", "series");
-                self.metrics.add_error("loki", "plan");
-                return Err(e.into());
-            }
-        };
-
-        let execute_start = Instant::now();
-        let batches = match df.collect().await {
-            Ok(batches) => {
-                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "series");
-                batches
-            }
-            Err(e) => {
-                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", "series");
-                self.metrics.add_error("loki", "execute");
-                return Err(QueryError::from(e).into());
-            }
-        };
-
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        self.metrics.record_result_rows(total_rows, "loki", "series");
+        let batches = self.plan_and_execute("series", planner.plan_series(&selectors)).await?;
 
         // Format series (CPU-bound, offloaded to blocking thread)
         let format_start = Instant::now();
