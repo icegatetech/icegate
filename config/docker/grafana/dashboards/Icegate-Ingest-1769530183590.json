@@ -360,6 +360,15 @@
           "legendFormat": "p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p90-histogram_quantile"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "A"
         }
       ],
       "title": "Request: size",
@@ -461,9 +470,18 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p50-histogram_quantile"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "A"
         }
       ],
       "title": "Request: records per request [1m]",
@@ -569,6 +587,15 @@
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "WAL: write to WAL latency [1m]",
@@ -1067,6 +1094,15 @@
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "WAL: ack latency [1m]",
@@ -1173,6 +1209,15 @@
           "legendFormat": "{{topic}} - {{status}} - p50",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, topic, status) (rate(icegate_ingest_wal_flush_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "{{topic}} - {{status}} - p99",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "WAL: flush latency [1m]",
@@ -1371,6 +1416,15 @@
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, topic) (rate(icegate_ingest_wal_records_per_segment_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "WAL: records per segment [1m]",
@@ -1571,6 +1625,15 @@
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "WAL: segment size [1m]",
