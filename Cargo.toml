@@ -73,12 +73,13 @@ antlr4rust = "0.5"
 # Patches: DataFusion 51 + Arrow 57 compat (upstream PR #1830 closed), memory catalog enhancements
 # Upstream plan: Switch back when DataFusion 51 officially supported upstream
 # Maintenance: develop branch rebased on upstream main; run `make ci` after each sync
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "8d3338aa9130996f6de0b5106458fb263d7e2b3e" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "8d3338aa9130996f6de0b5106458fb263d7e2b3e" }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "8d3338aa9130996f6de0b5106458fb263d7e2b3e" }
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
 
 # DataFusion
 datafusion = "51.0"
+datafusion-tracing = "51.0"
 
 # Async runtime
 tokio = { version = "1.48.0", features = ["full", "tracing"] }

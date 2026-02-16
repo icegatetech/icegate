@@ -30,6 +30,7 @@ iceberg-datafusion = { workspace = true }
 
 # DataFusion
 datafusion = { workspace = true }
+datafusion-tracing = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -57,6 +58,12 @@ tower-http = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Metrics
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-prometheus = { workspace = true }
+prometheus = { workspace = true }
 
 # Date and time
 chrono = { workspace = true }

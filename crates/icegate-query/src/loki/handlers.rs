@@ -1,7 +1,8 @@
 //! Loki API request handlers.
 //!
 //! Thin route handlers that delegate to executor for query execution
-//! and use typed models for responses.
+//! and use typed models for responses. Each handler records request
+//! metrics via [`QueryRequestRecorder`].
 
 use axum::{
     Json,
@@ -18,7 +19,7 @@ use super::{
     models::{LabelValuesQueryParams, LabelsQueryParams, LokiResponse, RangeQueryParams, SeriesQueryParams},
     server::LokiState,
 };
-use crate::error::QueryError;
+use crate::{error::QueryError, infra::metrics::QueryRequestRecorder};
 
 // ============================================================================
 // Helpers
@@ -46,27 +47,45 @@ fn extract_tenant_id(headers: &HeaderMap) -> String {
 ///
 /// Per Loki API spec, instant queries (`/query`) use `time` parameter (not
 /// start/end) and only support metric queries (returns 400 for log queries).
+#[tracing::instrument(skip_all, fields(tenant_id))]
 pub async fn query(
-    State(_loki_state): State<LokiState>,
-    _headers: HeaderMap,
+    State(loki_state): State<LokiState>,
+    headers: HeaderMap,
     Query(_params): Query<RangeQueryParams>,
 ) -> Result<StatusCode, LokiError> {
-    Err(LokiError(QueryError::NotImplemented(
+    let tenant_id = extract_tenant_id(&headers);
+    tracing::Span::current().record("tenant_id", &tenant_id);
+    let mut recorder = QueryRequestRecorder::new(&loki_state.metrics, "loki", "query");
+    let err = LokiError(QueryError::NotImplemented(
         "Instant query endpoint not yet implemented. Use /loki/api/v1/query_range instead.".to_string(),
-    )))
+    ));
+    recorder.finish("error");
+    Err(err)
 }
 
 /// Handle range query requests.
+#[tracing::instrument(skip_all, fields(tenant_id, query = %params.query))]
 pub async fn query_range(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
     Query(params): Query<RangeQueryParams>,
 ) -> LokiResult<impl IntoResponse> {
     let tenant_id = extract_tenant_id(&headers);
-    let executor = QueryExecutor::new(loki_state.engine);
-    let data = executor.execute_range_query(tenant_id, &params).await?;
-
-    Ok((StatusCode::OK, Json(LokiResponse::success(data))))
+    tracing::Span::current().record("tenant_id", &tenant_id);
+    let engine = loki_state.engine;
+    let metrics = loki_state.metrics;
+    let mut recorder = QueryRequestRecorder::new(&metrics, "loki", "query_range");
+    let executor = QueryExecutor::new(engine, std::sync::Arc::clone(&metrics));
+    match executor.execute_range_query(tenant_id, &params).await {
+        Ok(data) => {
+            recorder.finish("ok");
+            Ok((StatusCode::OK, Json(LokiResponse::success(data))))
+        }
+        Err(e) => {
+            recorder.finish("error");
+            Err(e)
+        }
+    }
 }
 
 // ============================================================================
@@ -76,46 +95,83 @@ pub async fn query_range(
 /// Handle label names request.
 ///
 /// Loki API: `GET /loki/api/v1/labels`
+#[tracing::instrument(skip_all, fields(tenant_id))]
 pub async fn labels(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
     Query(params): Query<LabelsQueryParams>,
 ) -> LokiResult<impl IntoResponse> {
-    let executor = QueryExecutor::new(loki_state.engine);
-    let data = executor.execute_labels(extract_tenant_id(&headers), &params).await?;
-
-    Ok((StatusCode::OK, Json(LokiResponse::success(data))))
+    let tenant_id = extract_tenant_id(&headers);
+    tracing::Span::current().record("tenant_id", &tenant_id);
+    let engine = loki_state.engine;
+    let metrics = loki_state.metrics;
+    let mut recorder = QueryRequestRecorder::new(&metrics, "loki", "labels");
+    let executor = QueryExecutor::new(engine, std::sync::Arc::clone(&metrics));
+    match executor.execute_labels(tenant_id, &params).await {
+        Ok(data) => {
+            recorder.finish("ok");
+            Ok((StatusCode::OK, Json(LokiResponse::success(data))))
+        }
+        Err(e) => {
+            recorder.finish("error");
+            Err(e)
+        }
+    }
 }
 
 /// Handle label values request.
 ///
 /// Loki API: `GET /loki/api/v1/label/:name/values`
+#[tracing::instrument(skip_all, fields(tenant_id, label_name = %label_name))]
 pub async fn label_values(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
     Path(label_name): Path<String>,
     Query(params): Query<LabelValuesQueryParams>,
 ) -> LokiResult<impl IntoResponse> {
-    let executor = QueryExecutor::new(loki_state.engine);
-    let data = executor
-        .execute_label_values(extract_tenant_id(&headers), &label_name, &params)
-        .await?;
-
-    Ok((StatusCode::OK, Json(LokiResponse::success(data))))
+    let tenant_id = extract_tenant_id(&headers);
+    tracing::Span::current().record("tenant_id", &tenant_id);
+    let engine = loki_state.engine;
+    let metrics = loki_state.metrics;
+    let mut recorder = QueryRequestRecorder::new(&metrics, "loki", "label_values");
+    let executor = QueryExecutor::new(engine, std::sync::Arc::clone(&metrics));
+    match executor.execute_label_values(tenant_id, &label_name, &params).await {
+        Ok(data) => {
+            recorder.finish("ok");
+            Ok((StatusCode::OK, Json(LokiResponse::success(data))))
+        }
+        Err(e) => {
+            recorder.finish("error");
+            Err(e)
+        }
+    }
 }
 
 /// Handle series request.
 ///
 /// Loki API: `GET /loki/api/v1/series`
+#[tracing::instrument(skip_all, fields(tenant_id))]
 pub async fn series(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
     QueryExtra(params): QueryExtra<SeriesQueryParams>,
 ) -> LokiResult<impl IntoResponse> {
-    let executor = QueryExecutor::new(loki_state.engine);
-    let data = executor.execute_series(extract_tenant_id(&headers), &params).await?;
-
-    Ok((StatusCode::OK, Json(LokiResponse::success(data))))
+    let tenant_id = extract_tenant_id(&headers);
+    tracing::Span::current().record("tenant_id", &tenant_id);
+    let engine = loki_state.engine;
+    let metrics = loki_state.metrics;
+    let mut recorder = QueryRequestRecorder::new(&metrics, "loki", "series");
+    let executor = QueryExecutor::new(engine, std::sync::Arc::clone(&metrics));
+    match executor.execute_series(tenant_id, &params).await {
+        Ok(data) => {
+            recorder.finish("ok");
+            Ok((StatusCode::OK, Json(LokiResponse::success(data))))
+        }
+        Err(e) => {
+            recorder.finish("error");
+            Err(e)
+        }
+    }
 }
 
 // ============================================================================

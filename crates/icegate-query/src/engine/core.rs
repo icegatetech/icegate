@@ -12,6 +12,7 @@ use datafusion::{
     execution::SessionStateBuilder,
     prelude::{SessionConfig, SessionContext},
 };
+use datafusion_tracing::{InstrumentationOptions, instrument_with_debug_spans};
 use iceberg::Catalog;
 use iceberg_datafusion::IcebergCatalogProvider;
 use tokio::sync::RwLock;
@@ -61,6 +62,7 @@ impl QueryEngine {
     /// # Errors
     ///
     /// Returns an error if the initial catalog provider cannot be created
+    #[tracing::instrument(skip(catalog))]
     pub async fn new(catalog: Arc<dyn Catalog>, config: QueryEngineConfig) -> Result<Self> {
         let engine = Self {
             catalog,
@@ -83,16 +85,24 @@ impl QueryEngine {
     /// # Errors
     ///
     /// Returns an error if the cached provider is not available
+    #[tracing::instrument(skip(self))]
     pub async fn create_session(&self) -> Result<SessionContext> {
         // Build session config from engine config
         let session_config = SessionConfig::new()
             .with_batch_size(self.config.batch_size)
             .with_target_partitions(self.config.target_partitions);
 
-        // Build session state
+        // Instrument DataFusion execution plans with tracing spans.
+        // Each physical plan node (scan, filter, sort, aggregate, etc.) gets
+        // its own debug-level span with optional metrics recording.
+        let options = InstrumentationOptions::builder().record_metrics(true).build();
+        let instrument_rule = instrument_with_debug_spans!(options: options);
+
+        // Build session state with the instrumentation rule
         let session_state = SessionStateBuilder::new()
             .with_config(session_config)
             .with_default_features()
+            .with_physical_optimizer_rule(instrument_rule)
             .build();
 
         // Create SessionContext
@@ -101,8 +111,10 @@ impl QueryEngine {
         // Get cached provider and register catalog
         let guard = self.cached_provider.read().await;
         let Some(cached) = guard.as_ref() else {
+            tracing::debug!("Provider cache miss: not initialized");
             return Err(QueryError::Config("Catalog provider not initialized".to_string()));
         };
+        tracing::debug!("Provider cache hit");
         let provider = Arc::clone(&cached.provider);
         drop(guard);
 
@@ -119,6 +131,7 @@ impl QueryEngine {
     /// # Errors
     ///
     /// Returns an error if the catalog provider cannot be created
+    #[tracing::instrument(skip(self))]
     pub async fn refresh_provider(&self) -> Result<()> {
         let provider = IcebergCatalogProvider::try_new(Arc::clone(&self.catalog))
             .await

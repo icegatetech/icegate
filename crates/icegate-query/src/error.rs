@@ -38,6 +38,10 @@ pub enum QueryError {
     /// Underlying Iceberg error (from catalog operations).
     #[error("iceberg error: {0}")]
     Iceberg(#[from] iceberg::Error),
+
+    /// Internal execution error (e.g., blocking task panicked).
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 impl From<icegate_common::error::CommonError> for QueryError {

@@ -2,10 +2,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icegate_common::CatalogBuilder;
+use icegate_common::{CatalogBuilder, MetricsRuntime, run_metrics_server};
 use tokio_util::sync::CancellationToken;
 
-use crate::{QueryConfig, engine::QueryEngine, error::QueryError};
+use crate::{QueryConfig, engine::QueryEngine, error::QueryError, infra::metrics::QueryMetrics};
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors
@@ -67,15 +67,41 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     tracing::info!("Query engine initialized successfully");
 
+    // Initialize metrics
+    let metrics_runtime = if config.metrics.enabled {
+        Some(Arc::new(MetricsRuntime::new("query")?))
+    } else {
+        None
+    };
+    let query_metrics = Arc::new(
+        metrics_runtime.as_ref().map_or_else(QueryMetrics::new_disabled, |runtime| {
+            QueryMetrics::new(&runtime.meter())
+        }),
+    );
+
     // Spawn server tasks
     let mut handles = Vec::new();
+
+    // Metrics server
+    if let Some(ref runtime) = metrics_runtime {
+        let metrics_config = config.metrics.clone();
+        let token = cancel_token.clone();
+        let registry = runtime.registry();
+        let handle = tokio::spawn(async move {
+            run_metrics_server(metrics_config, registry, token)
+                .await
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+        });
+        handles.push(handle);
+    }
 
     // Query servers
     if config.loki.enabled {
         let engine = Arc::clone(&query_engine);
         let loki_config = config.loki.clone();
         let token = cancel_token.clone();
-        let handle = tokio::spawn(async move { crate::loki::run(engine, loki_config, token).await });
+        let m = Arc::clone(&query_metrics);
+        let handle = tokio::spawn(async move { crate::loki::run(engine, loki_config, token, m).await });
         handles.push(handle);
     }
 

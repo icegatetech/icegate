@@ -101,6 +101,7 @@ impl AntlrParser {
 }
 
 impl Parser for AntlrParser {
+    #[tracing::instrument(skip(self), fields(query))]
     fn parse(&self, query: &str) -> Result<LogQLExpr> {
         let input = InputStream::new(query);
         let mut lexer = LogQLLexer::new(input);
