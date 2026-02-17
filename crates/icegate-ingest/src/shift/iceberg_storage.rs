@@ -32,6 +32,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use super::{config::ShiftConfig, parquet_meta_reader::data_files_from_parquet_paths};
@@ -211,13 +212,20 @@ impl IcebergStorage {
         let partitioned_batches_len = partitioned_batches.len();
 
         for (partition_key, partition_batch) in partitioned_batches {
+            let partition_path = partition_key.to_path();
             tracing::debug!(
                 "Writing partition with {} rows: {}",
                 partition_batch.num_rows(),
-                partition_key.to_path()
+                partition_path
+            );
+            let write_span = tracing::info_span!(
+                "write parquet throught fanout",
+                partition_key = %partition_path,
+                rows = partition_batch.num_rows()
             );
             fanout_writer
                 .write(partition_key, partition_batch)
+                .instrument(write_span)
                 .await
                 .map_err(|e| IngestError::Shift(format!("failed to write partition batch: {e}")))?;
         }

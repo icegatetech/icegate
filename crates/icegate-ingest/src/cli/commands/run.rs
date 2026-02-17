@@ -1,17 +1,110 @@
 //! Run command implementation
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    any::Any,
+    path::PathBuf,
+    sync::{Arc, mpsc},
+    thread,
+};
 
 use icegate_common::{MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
+use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     IngestConfig,
-    error::Result,
+    error::{IngestError, Result},
     infra::metrics::{OtlpMetrics, ShiftMetrics, WalWriterMetrics},
+    runtime_threads::compute_runtime_threads,
     shift::Shifter,
 };
+
+struct ShiftRuntimeHandle {
+    shutdown_tx: mpsc::Sender<()>,
+    join_handle: thread::JoinHandle<Result<()>>,
+}
+
+impl ShiftRuntimeHandle {
+    fn shutdown(self) -> Result<()> {
+        if self.shutdown_tx.send(()).is_err() {
+            tracing::warn!("shift runtime shutdown channel is closed");
+        }
+
+        match self.join_handle.join() {
+            Ok(result) => result,
+            Err(panic) => Err(IngestError::Shift(format!(
+                "shift runtime thread panicked: {}",
+                panic_payload_to_string(&*panic)
+            ))),
+        }
+    }
+}
+
+fn panic_payload_to_string(panic: &(dyn Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn spawn_shift_runtime(shifter: Shifter, shift_threads: usize) -> Result<ShiftRuntimeHandle> {
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<()>>(1);
+
+    let join_handle = thread::Builder::new()
+        .name("icegate-shift-runtime".to_string())
+        .spawn(move || -> Result<()> {
+            let runtime = Builder::new_multi_thread()
+                .worker_threads(shift_threads)
+                .enable_all()
+                .build()
+                .map_err(IngestError::Io)?;
+
+            let shifter_handle = {
+                let _guard = runtime.enter();
+                match shifter.start() {
+                    Ok(handle) => {
+                        let _ = startup_tx.send(Ok(()));
+                        handle
+                    }
+                    Err(err) => {
+                        let error = IngestError::Shift(err.to_string());
+                        let _ = startup_tx.send(Err(IngestError::Shift(err.to_string())));
+                        return Err(error);
+                    }
+                }
+            };
+
+            if shutdown_rx.recv().is_err() {
+                tracing::debug!("shift runtime shutdown sender dropped, stopping");
+            }
+
+            runtime.block_on(async { shifter_handle.shutdown().await })?;
+            Ok(())
+        })
+        .map_err(IngestError::Io)?;
+
+    match startup_rx.recv() {
+        Ok(Ok(())) => Ok(ShiftRuntimeHandle {
+            shutdown_tx,
+            join_handle,
+        }),
+        Ok(Err(err)) => {
+            let _ = join_handle.join();
+            Err(err)
+        }
+        Err(_) => {
+            let _ = join_handle.join();
+            Err(IngestError::Shift(
+                "shift runtime failed to report startup status".to_string(),
+            ))
+        }
+    }
+}
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors
@@ -110,9 +203,15 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         jobsmanager_metrics,
     )
     .await?;
-    let shifter_handle = shifter.start()?;
-
-    tracing::info!("Shifter started successfully");
+    let runtime_plan = compute_runtime_threads();
+    tracing::info!(
+        available_parallelism = runtime_plan.total,
+        main_runtime_threads = runtime_plan.main_threads,
+        shift_runtime_threads = runtime_plan.shift_threads,
+        "Runtime thread allocation resolved"
+    );
+    let shift_runtime = spawn_shift_runtime(shifter, runtime_plan.shift_threads)?;
+    tracing::info!("Shifter started successfully on dedicated runtime");
 
     // Create a cancellation token for coordinated shutdown
     let cancel_token = CancellationToken::new();
@@ -154,46 +253,59 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         handles.push(handle);
     }
 
+    let mut server_result = Ok(());
     if handles.is_empty() {
         tracing::warn!("No OTLP servers are enabled in configuration");
-        tracing::info!("Stopping shifter...");
-        shifter_handle.shutdown().await?;
-        tracing::info!("Shifter stopped gracefully");
-        // Orderly shutdown: close channel so writer loop can exit, then await it
-        drop(write_tx);
-        return Ok(writer_handle.await??);
+    } else {
+        tracing::info!("All enabled OTLP servers started");
+        tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
+
+        // Wait for shutdown signal (SIGINT or SIGTERM)
+        shutdown_signal().await;
+
+        tracing::info!("Shutdown signal received, stopping all servers...");
+
+        // Cancel all servers
+        cancel_token.cancel();
+
+        // Wait for all servers to stop
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    server_result = Err(IngestError::Other(err));
+                    break;
+                }
+                Err(err) => {
+                    server_result = Err(IngestError::Join(err));
+                    break;
+                }
+            }
+        }
+
+        if server_result.is_ok() {
+            tracing::info!("All OTLP servers stopped gracefully");
+        }
     }
-
-    tracing::info!("All enabled OTLP servers started");
-    tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
-
-    // Wait for shutdown signal (SIGINT or SIGTERM)
-    shutdown_signal().await;
-
-    tracing::info!("Shutdown signal received, stopping all servers...");
-
-    // Cancel all servers
-    cancel_token.cancel();
-
-    // Wait for all servers to stop
-    for handle in handles {
-        handle.await??;
-    }
-
-    tracing::info!("All OTLP servers stopped gracefully");
 
     tracing::info!("Stopping shifter...");
-    shifter_handle.shutdown().await?;
-    tracing::info!("Shifter stopped gracefully");
+    let shift_result = shift_runtime.shutdown();
+    if shift_result.is_ok() {
+        tracing::info!("Shifter stopped gracefully");
+    }
 
     // Close the write channel so the writer loop can exit
     drop(write_tx);
 
     // Wait for the writer task to finish
-    writer_handle.await??;
+    let writer_result = writer_handle.await;
 
     // Keep tracing guard alive until the very end
     drop(tracing_guard);
+
+    server_result?;
+    shift_result?;
+    writer_result??;
 
     Ok(())
 }
