@@ -26,7 +26,6 @@ use object_store::ObjectStore;
 use tokio_util::sync::CancellationToken;
 
 use super::scan::IcegateIcebergScan;
-use super::strip_parquet_metadata;
 
 /// Table provider that merges Iceberg (cold) and WAL (hot) data.
 ///
@@ -38,7 +37,7 @@ pub(super) struct IcegateTableProvider {
     catalog: Arc<dyn Catalog>,
     /// Table identifier in the catalog (namespace + name).
     table_ident: TableIdent,
-    /// Clean Arrow schema without `PARQUET:field_id` metadata.
+    /// Arrow schema for the table.
     schema: ArrowSchemaRef,
     /// Object store URL registered with the DataFusion runtime for WAL access.
     wal_store_url: ObjectStoreUrl,
@@ -46,6 +45,8 @@ pub(super) struct IcegateTableProvider {
     wal_store: Arc<dyn ObjectStore>,
     /// WAL base path prefix (e.g., `s3://queue/`).
     wal_base_path: String,
+    /// Batch size (rows) for WAL segment reading.
+    batch_size: usize,
 }
 
 impl std::fmt::Debug for IcegateTableProvider {
@@ -60,8 +61,8 @@ impl std::fmt::Debug for IcegateTableProvider {
 impl IcegateTableProvider {
     /// Creates a new merged table provider.
     ///
-    /// Loads the table once to capture the Arrow schema (with PARQUET metadata
-    /// stripped) and stores references for per-scan metadata refresh.
+    /// Loads the table once to capture the Arrow schema and stores references
+    /// for per-scan metadata refresh.
     ///
     /// # Errors
     ///
@@ -74,6 +75,7 @@ impl IcegateTableProvider {
         wal_store_url: ObjectStoreUrl,
         wal_store: Arc<dyn ObjectStore>,
         wal_base_path: String,
+        batch_size: usize,
     ) -> Result<Self, iceberg::Error> {
         // Load table once to capture schema
         let table = catalog.load_table(&table_ident).await?;
@@ -81,8 +83,7 @@ impl IcegateTableProvider {
             table.metadata().current_schema(),
         )?);
 
-        // Strip PARQUET:field_id metadata for clean schema
-        let schema = strip_parquet_metadata(&arrow_schema);
+        let schema = arrow_schema;
 
         Ok(Self {
             catalog,
@@ -91,6 +92,7 @@ impl IcegateTableProvider {
             wal_store_url,
             wal_store,
             wal_base_path,
+            batch_size,
         })
     }
 }
@@ -154,8 +156,11 @@ impl TableProvider for IcegateTableProvider {
 
         // 4. Build WAL scan plan
         // Start from offset + 1 (or 0 if no offset found = fresh system)
-        let wal_start = wal_offset.map_or(0, |o| o + 1);
-        let wal_plan = match self.build_wal_plan(state, projection, filters, wal_start).await {
+        let wal_start = wal_offset.map_or(0, |o| o.saturating_add(1));
+        let wal_plan = match self
+            .build_wal_plan(state, projection, filters, wal_start, self.batch_size)
+            .await
+        {
             Ok(Some(plan)) => {
                 tracing::debug!("WAL scan plan created");
                 Some(plan)
@@ -213,9 +218,10 @@ impl IcegateTableProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         start_offset: u64,
+        batch_size: usize,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         // List WAL segments
-        let files = list_wal_files(&self.wal_store, &self.wal_base_path, start_offset).await?;
+        let files = list_wal_files(&self.wal_store, &self.wal_base_path, start_offset, batch_size).await?;
         if files.is_empty() {
             return Ok(None);
         }
@@ -279,6 +285,10 @@ impl IcegateTableProvider {
 /// WAL segments).
 #[tracing::instrument(level = "debug", skip(table))]
 fn extract_wal_offset(table: &Table) -> Option<u64> {
+    /// Safety cap to prevent unbounded snapshot chain walks (e.g. a cycle or
+    /// an unexpectedly deep history).
+    const MAX_SNAPSHOT_WALK: u32 = 1000;
+
     let metadata = table.metadata();
     let mut snapshot = metadata.current_snapshot()?;
     let mut walked = 0u32;
@@ -297,6 +307,13 @@ fn extract_wal_offset(table: &Table) -> Option<u64> {
             return Some(offset);
         }
         walked += 1;
+        if walked >= MAX_SNAPSHOT_WALK {
+            tracing::warn!(
+                limit = MAX_SNAPSHOT_WALK,
+                "Snapshot walk limit reached without finding WAL offset"
+            );
+            return None;
+        }
         // Walk to parent snapshot
         let parent_id = snapshot.parent_snapshot_id()?;
         snapshot = metadata.snapshot_by_id(parent_id)?;
@@ -313,12 +330,15 @@ async fn list_wal_files(
     store: &Arc<dyn ObjectStore>,
     wal_base_path: &str,
     start_offset: u64,
+    batch_size: usize,
 ) -> DFResult<Vec<datafusion::datasource::listing::PartitionedFile>> {
     use icegate_queue::ParquetQueueReader;
 
-    let reader = ParquetQueueReader::new(wal_base_path, Arc::clone(store), 8192)
+    let reader = ParquetQueueReader::new(wal_base_path, Arc::clone(store), batch_size)
         .map_err(|e| DataFusionError::External(e.into()))?;
 
+    // Intentionally uncancellable: WAL segment listing is a short metadata
+    // operation during query planning that must run to completion.
     let cancel = CancellationToken::new();
     let topic: String = icegate_common::LOGS_TOPIC.to_string();
     let segments = reader
@@ -331,20 +351,33 @@ async fn list_wal_files(
         "WAL segment listing complete"
     );
 
-    let mut files = Vec::with_capacity(segments.len());
-    for seg in &segments {
+    // Issue HEAD requests concurrently to avoid sequential round-trip latency.
+    // Each request is independent, so we use buffer_unordered for maximum
+    // throughput while bounding the number of in-flight requests.
+    use futures::stream::{self, StreamExt, TryStreamExt};
+
+    const MAX_CONCURRENT_HEAD_REQUESTS: usize = 32;
+
+    let files: Vec<datafusion::datasource::listing::PartitionedFile> = stream::iter(segments.into_iter().map(|seg| {
         let relative = seg.to_relative_path();
         let path = if wal_base_path.is_empty() {
             relative
         } else {
             object_store::path::Path::from(format!("{wal_base_path}/{relative}"))
         };
-        let meta = store.head(&path).await.map_err(|e| DataFusionError::External(e.into()))?;
-        files.push(datafusion::datasource::listing::PartitionedFile::new(
-            path.to_string(),
-            meta.size as u64,
-        ));
-    }
+
+        async move {
+            let store = Arc::clone(store);
+            let meta = store.head(&path).await.map_err(|e| DataFusionError::External(e.into()))?;
+            Ok::<_, DataFusionError>(datafusion::datasource::listing::PartitionedFile::new(
+                path.to_string(),
+                meta.size,
+            ))
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_HEAD_REQUESTS)
+    .try_collect()
+    .await?;
 
     tracing::debug!(segments_resolved = files.len(), start_offset, "WAL resolving complete");
     Ok(files)

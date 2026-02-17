@@ -57,7 +57,6 @@ pub struct QueryEngineConfig {
     /// When set to a non-empty string, the query engine will merge WAL
     /// (Write-Ahead Log) segments with Iceberg data for near-real-time queries.
     /// An empty string disables WAL reading (pure Iceberg mode).
-    #[serde(default)]
     pub wal_base_path: String,
 }
 

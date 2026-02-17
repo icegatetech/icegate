@@ -46,6 +46,7 @@ impl IcegateCatalogProvider {
         wal_store_url: ObjectStoreUrl,
         wal_store: Arc<dyn ObjectStore>,
         wal_base_path: String,
+        batch_size: usize,
     ) -> Result<Self, iceberg::Error> {
         let namespace_idents = catalog.list_namespaces(None).await?;
 
@@ -66,6 +67,7 @@ impl IcegateCatalogProvider {
                     wal_store_url.clone(),
                     Arc::clone(&wal_store),
                     wal_base_path.clone(),
+                    batch_size,
                 )
                 .await?;
                 schemas.insert(name.clone(), Arc::new(provider));

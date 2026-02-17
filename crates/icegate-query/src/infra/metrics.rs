@@ -22,6 +22,32 @@ const DURATION_BOUNDARIES: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
+/// Histogram bucket boundaries (in bytes) for byte-level scan metrics.
+/// Covers from 512 B up to ~100 MB in roughly exponential steps.
+const BYTES_BOUNDARIES: &[f64] = &[
+    0.0,
+    512.0,
+    1_024.0,
+    10_240.0,
+    102_400.0,
+    1_024_000.0,
+    10_240_000.0,
+    102_400_000.0,
+];
+
+/// Histogram bucket boundaries for row-count scan metrics.
+/// Covers from 0 up to 10 M rows in roughly exponential steps.
+const ROWS_BOUNDARIES: &[f64] = &[
+    0.0,
+    10.0,
+    100.0,
+    1_000.0,
+    10_000.0,
+    100_000.0,
+    1_000_000.0,
+    10_000_000.0,
+];
+
 /// Metrics recorded throughout the query request lifecycle.
 ///
 /// Follows the same `new(&Meter)` / `new_disabled()` pattern used by
@@ -159,30 +185,36 @@ impl QueryMetrics {
         let wal_scan_rows = meter
             .f64_histogram("icegate_query_wal_scan_rows")
             .with_description("Rows read from WAL per query")
+            .with_boundaries(ROWS_BOUNDARIES.to_vec())
             .build();
         let wal_scan_bytes = meter
             .f64_histogram("icegate_query_wal_scan_bytes")
             .with_description("Decompressed bytes from WAL per query")
             .with_unit("By")
+            .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
         let wal_scan_compressed_bytes = meter
             .f64_histogram("icegate_query_wal_scan_compressed_bytes")
             .with_description("Compressed bytes scanned from WAL Parquet files per query")
             .with_unit("By")
+            .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
         let iceberg_scan_rows = meter
             .f64_histogram("icegate_query_iceberg_scan_rows")
             .with_description("Rows read from Iceberg per query")
+            .with_boundaries(ROWS_BOUNDARIES.to_vec())
             .build();
         let iceberg_scan_bytes = meter
             .f64_histogram("icegate_query_iceberg_scan_bytes")
             .with_description("Decompressed bytes from Iceberg per query")
             .with_unit("By")
+            .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
         let iceberg_scan_compressed_bytes = meter
             .f64_histogram("icegate_query_iceberg_scan_compressed_bytes")
             .with_description("Compressed file sizes from Iceberg manifest per query")
             .with_unit("By")
+            .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
 
         Self {

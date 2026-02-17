@@ -124,8 +124,11 @@ impl QueryEngine {
         // Create SessionContext
         let session_ctx = SessionContext::new_with_state(session_state);
 
-        // Register WAL object store with the runtime so DataFusion's
-        // ParquetSource can read WAL Parquet files via the registered URL.
+        // Register the WAL object store with this session's RuntimeEnv.
+        // Each SessionContext built via SessionStateBuilder::new()...build()
+        // owns its own RuntimeEnv, so register_object_store must be called
+        // per-session (not once globally) for DataFusion's ParquetSource to
+        // resolve WAL Parquet files through the registered URL.
         if let Some((ref store, ref url)) = self.wal_store {
             session_ctx.runtime_env().register_object_store(url.as_ref(), Arc::clone(store));
         }
@@ -162,6 +165,7 @@ impl QueryEngine {
                 url.clone(),
                 Arc::clone(store),
                 self.config.wal_base_path.clone(),
+                self.config.batch_size,
             )
             .await
             .map_err(|e| QueryError::Config(format!("Failed to create IcegateCatalogProvider: {e}")))?;

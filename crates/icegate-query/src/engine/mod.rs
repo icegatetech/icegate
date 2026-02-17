@@ -12,4 +12,4 @@ pub(crate) mod provider;
 pub use core::QueryEngine;
 
 pub use config::QueryEngineConfig;
-pub use provider::{SourceMetrics, extract_source_metrics};
+pub(crate) use provider::{SourceMetrics, extract_source_metrics};

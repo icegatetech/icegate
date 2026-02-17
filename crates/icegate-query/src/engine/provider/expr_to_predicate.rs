@@ -251,6 +251,10 @@ fn to_iceberg_binary_predicate(
     TransformedResult::Predicate(Predicate::Binary(BinaryExpression::new(op, r, d)))
 }
 
+/// Reverses a comparison operator for `literal op column → column reversed_op literal`.
+///
+/// # Panics
+/// Panics if `op` is not a comparison operator (`Eq`, `NotEq`, `Lt`, `LtEq`, `Gt`, `GtEq`).
 fn reverse_predicate_operator(op: PredicateOperator) -> PredicateOperator {
     match op {
         PredicateOperator::Eq => PredicateOperator::Eq,

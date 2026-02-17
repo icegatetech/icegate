@@ -7,7 +7,7 @@
 //! with the following additions:
 //! - `ExecutionPlanMetricsSet` with `BaselineMetrics`
 //! - `metrics()` override that returns actual metrics (upstream returns `None`)
-//! - Schema stripping of `PARQUET:field_id` metadata in the output stream
+//! - Metrics tracking via `ExecutionPlanMetricsSet`
 
 use std::any::Any;
 use std::pin::Pin;
@@ -29,7 +29,6 @@ use iceberg::table::Table;
 use tracing::instrument;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
-use super::strip_parquet_metadata;
 
 /// Convert an Iceberg error into a DataFusion error.
 fn to_datafusion_error(error: iceberg::Error) -> datafusion::error::DataFusionError {
@@ -41,7 +40,7 @@ fn to_datafusion_error(error: iceberg::Error) -> datafusion::error::DataFusionEr
 /// Reimplements the upstream `IcebergTableScan` to add:
 /// - Per-partition `BaselineMetrics` (`output_rows`, `output_bytes`,
 ///   `elapsed_compute`)
-/// - Schema stripping (removes `PARQUET:field_id` metadata from output batches)
+/// - Metrics tracking via `ExecutionPlanMetricsSet`
 #[derive(Debug)]
 pub(super) struct IcegateIcebergScan {
     /// Iceberg table instance.
@@ -65,7 +64,7 @@ impl IcegateIcebergScan {
     ///
     /// * `table` - The Iceberg table to scan
     /// * `snapshot_id` - Optional snapshot ID (None = current snapshot)
-    /// * `schema` - The clean Arrow schema (without PARQUET metadata)
+    /// * `schema` - The Arrow schema for this table
     /// * `projection` - Optional column indices to project
     /// * `filters` - DataFusion filter expressions to push down
     pub(super) fn new(
@@ -75,11 +74,15 @@ impl IcegateIcebergScan {
         projection: Option<&Vec<usize>>,
         filters: &[datafusion::prelude::Expr],
     ) -> Self {
-        let clean_schema = strip_parquet_metadata(schema);
-
         let output_schema = projection.map_or_else(
-            || clean_schema.clone(),
-            |proj| Arc::new(clean_schema.project(proj).unwrap_or_else(|_| clean_schema.as_ref().clone())),
+            || schema.clone(),
+            |proj| match schema.project(proj) {
+                Ok(projected) => Arc::new(projected),
+                Err(err) => {
+                    tracing::warn!(?err, ?proj, "schema projection failed, falling back to full schema");
+                    schema.clone()
+                }
+            },
         );
         let plan_properties = Self::compute_properties(output_schema);
         let projection_names =
@@ -132,8 +135,7 @@ impl ExecutionPlan for IcegateIcebergScan {
         Some(self.metrics.clone_inner())
     }
 
-    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        let _ = context; // Consumed by tracing instrumentation
+    fn execute(&self, partition: usize, _context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let baseline = BaselineMetrics::new(&self.metrics, partition);
 
         let fut = get_batch_stream(
@@ -170,7 +172,7 @@ impl DisplayAs for IcegateIcebergScan {
 /// 1. Build one scan with projection + predicates
 /// 2. `plan_files()` — collect file tasks
 /// 3. Feed collected tasks to `ArrowReaderBuilder.build().read()` for data
-/// 4. Remap each output batch to `output_schema` (strip PARQUET metadata)
+/// 4. Track output metrics per batch
 ///
 /// Note: `compressed_bytes` is not tracked because `FileScanTask.length` is the
 /// full Parquet file size, not the compressed bytes actually read. With column

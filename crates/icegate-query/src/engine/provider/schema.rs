@@ -49,6 +49,7 @@ impl IcegateSchemaProvider {
         wal_store_url: ObjectStoreUrl,
         wal_store: Arc<dyn ObjectStore>,
         wal_base_path: String,
+        batch_size: usize,
     ) -> Result<Self, iceberg::Error> {
         let table_idents = catalog.list_tables(&namespace).await?;
 
@@ -65,6 +66,7 @@ impl IcegateSchemaProvider {
                     wal_store_url.clone(),
                     Arc::clone(&wal_store),
                     wal_base_path.clone(),
+                    batch_size,
                 )
                 .await?;
                 Arc::new(provider)
