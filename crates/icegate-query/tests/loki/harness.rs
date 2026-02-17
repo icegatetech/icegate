@@ -95,7 +95,7 @@ impl TestServer {
 
         // Start server with port notification channel
         let query_engine = Arc::new(
-            QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
+            QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default(), None)
                 .await
                 .expect("Failed to create QueryEngine"),
         );

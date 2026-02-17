@@ -119,6 +119,7 @@ services:
       AWS_REGION: us-east-1
       RUST_LOG: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: query
     develop:
       watch:
         - action: rebuild
@@ -145,6 +146,7 @@ services:
       AWS_REGION: us-east-1
       RUST_LOG: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: ingest
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/4317' || exit 1"]
       interval: 5s
@@ -158,7 +160,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 3g
+          memory: 2g
           cpus: 1
 
   grafana:

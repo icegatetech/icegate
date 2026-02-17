@@ -16,6 +16,7 @@ use super::{
     formatters::{batches_to_loki_matrix, batches_to_loki_streams, batches_to_series_list, extract_string_column},
     models::{QueryResultData, RangeQueryParams},
 };
+use crate::engine::{SourceMetrics, extract_source_metrics};
 use crate::{
     engine::QueryEngine,
     error::{ParseError, QueryError},
@@ -147,9 +148,15 @@ impl QueryExecutor {
 
     /// Plan a query and execute it, recording metrics for both phases.
     ///
-    /// Times the plan future and `df.collect()` execution, recording durations,
-    /// errors, and result row counts via [`QueryMetrics`].
-    async fn plan_and_execute<F>(&self, plan_type: &str, plan_future: F) -> LokiResult<Vec<RecordBatch>>
+    /// Times the plan future and execution, recording durations, errors, and
+    /// result row counts via [`QueryMetrics`]. Retains the physical plan to
+    /// extract per-source metrics (Iceberg vs WAL) after execution.
+    async fn plan_and_execute<F>(
+        &self,
+        session_ctx: &SessionContext,
+        plan_type: &str,
+        plan_future: F,
+    ) -> LokiResult<(Vec<RecordBatch>, SourceMetrics)>
     where
         F: std::future::Future<Output = crate::error::Result<DataFrame>>,
     {
@@ -166,8 +173,21 @@ impl QueryExecutor {
             }
         };
 
+        // Retain the physical plan for per-source metrics extraction.
+        // We call create_physical_plan() + manual collect() instead of
+        // df.collect() so the plan is available after execution.
         let execute_start = Instant::now();
-        let batches = match df.collect().await {
+        let physical_plan = match df.create_physical_plan().await {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.metrics.record_execute_duration(execute_start.elapsed(), "loki", plan_type);
+                self.metrics.add_error("loki", "execute");
+                return Err(QueryError::from(e).into());
+            }
+        };
+
+        let task_ctx = session_ctx.task_ctx();
+        let batches = match datafusion::physical_plan::collect(physical_plan.clone(), task_ctx).await {
             Ok(batches) => {
                 self.metrics.record_execute_duration(execute_start.elapsed(), "loki", plan_type);
                 batches
@@ -179,10 +199,14 @@ impl QueryExecutor {
             }
         };
 
+        // Extract per-source metrics from the retained physical plan tree
+        let source_metrics = extract_source_metrics(physical_plan.as_ref());
+        self.metrics.record_source_metrics(&source_metrics, "loki");
+
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         self.metrics.record_result_rows(total_rows, "loki", plan_type);
 
-        Ok(batches)
+        Ok((batches, source_metrics))
     }
 
     /// Parse an optional selector string on a blocking thread.
@@ -258,8 +282,8 @@ impl QueryExecutor {
 
         // Create session, plan, and execute
         let session_ctx = self.create_session().await?;
-        let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let batches = self.plan_and_execute(plan_type, planner.plan(expr)).await?;
+        let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
+        let (batches, source_metrics) = self.plan_and_execute(&session_ctx, plan_type, planner.plan(expr)).await?;
 
         let exec_time = exec_start.elapsed().as_secs_f64();
 
@@ -282,7 +306,7 @@ impl QueryExecutor {
             .record_format_duration(format_start.elapsed(), "loki", result_type_str);
         self.metrics.record_result_bytes(formatted.total_bytes, "loki", plan_type);
 
-        let stats = formatted.to_stats(exec_time);
+        let stats = formatted.to_stats(exec_time, Some(&source_metrics));
         let result_data = QueryResultData {
             result_type: formatted.result_type,
             result: formatted.result,
@@ -310,8 +334,10 @@ impl QueryExecutor {
         let selector = self.parse_selector_opt(params.query.clone()).await?;
 
         let session_ctx = self.create_session().await?;
-        let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let batches = self.plan_and_execute("labels", planner.plan_labels(selector)).await?;
+        let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
+        let (batches, _source_metrics) = self
+            .plan_and_execute(&session_ctx, "labels", planner.plan_labels(selector))
+            .await?;
 
         // Dedup and sort labels via BTreeSet (CPU-bound, offloaded to blocking thread)
         let span = tracing::Span::current();
@@ -347,9 +373,13 @@ impl QueryExecutor {
         let selector = self.parse_selector_opt(params.query.clone()).await?;
 
         let session_ctx = self.create_session().await?;
-        let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let batches = self
-            .plan_and_execute("label_values", planner.plan_label_values(selector, label_name))
+        let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
+        let (batches, _source_metrics) = self
+            .plan_and_execute(
+                &session_ctx,
+                "label_values",
+                planner.plan_label_values(selector, label_name),
+            )
             .await?;
 
         // CPU-bound column extraction offloaded to blocking thread
@@ -389,8 +419,10 @@ impl QueryExecutor {
         .map_err(join_error)??;
 
         let session_ctx = self.create_session().await?;
-        let planner = DataFusionPlanner::new(session_ctx, query_ctx);
-        let batches = self.plan_and_execute("series", planner.plan_series(&selectors)).await?;
+        let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
+        let (batches, _source_metrics) = self
+            .plan_and_execute(&session_ctx, "series", planner.plan_series(&selectors))
+            .await?;
 
         // Format series (CPU-bound, offloaded to blocking thread)
         let format_start = Instant::now();

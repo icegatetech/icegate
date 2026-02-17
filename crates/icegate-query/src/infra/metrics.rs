@@ -43,6 +43,14 @@ pub struct QueryMetrics {
     provider_refresh_errors_total: Counter<u64>,
     errors_total: Counter<u64>,
     active_queries: UpDownCounter<i64>,
+
+    // Per-source scan metrics
+    wal_scan_rows: Histogram<f64>,
+    wal_scan_bytes: Histogram<f64>,
+    wal_scan_compressed_bytes: Histogram<f64>,
+    iceberg_scan_rows: Histogram<f64>,
+    iceberg_scan_bytes: Histogram<f64>,
+    iceberg_scan_compressed_bytes: Histogram<f64>,
 }
 
 impl QueryMetrics {
@@ -69,6 +77,12 @@ impl QueryMetrics {
             provider_refresh_errors_total: meter.u64_counter("icegate_query_provider_refresh_errors_total").build(),
             errors_total: meter.u64_counter("icegate_query_errors_total").build(),
             active_queries: meter.i64_up_down_counter("icegate_query_active_queries").build(),
+            wal_scan_rows: meter.f64_histogram("icegate_query_wal_scan_rows").build(),
+            wal_scan_bytes: meter.f64_histogram("icegate_query_wal_scan_bytes").build(),
+            wal_scan_compressed_bytes: meter.f64_histogram("icegate_query_wal_scan_compressed_bytes").build(),
+            iceberg_scan_rows: meter.f64_histogram("icegate_query_iceberg_scan_rows").build(),
+            iceberg_scan_bytes: meter.f64_histogram("icegate_query_iceberg_scan_bytes").build(),
+            iceberg_scan_compressed_bytes: meter.f64_histogram("icegate_query_iceberg_scan_compressed_bytes").build(),
         }
     }
 
@@ -142,6 +156,35 @@ impl QueryMetrics {
             .with_description("Currently executing queries")
             .build();
 
+        let wal_scan_rows = meter
+            .f64_histogram("icegate_query_wal_scan_rows")
+            .with_description("Rows read from WAL per query")
+            .build();
+        let wal_scan_bytes = meter
+            .f64_histogram("icegate_query_wal_scan_bytes")
+            .with_description("Decompressed bytes from WAL per query")
+            .with_unit("By")
+            .build();
+        let wal_scan_compressed_bytes = meter
+            .f64_histogram("icegate_query_wal_scan_compressed_bytes")
+            .with_description("Compressed bytes scanned from WAL Parquet files per query")
+            .with_unit("By")
+            .build();
+        let iceberg_scan_rows = meter
+            .f64_histogram("icegate_query_iceberg_scan_rows")
+            .with_description("Rows read from Iceberg per query")
+            .build();
+        let iceberg_scan_bytes = meter
+            .f64_histogram("icegate_query_iceberg_scan_bytes")
+            .with_description("Decompressed bytes from Iceberg per query")
+            .with_unit("By")
+            .build();
+        let iceberg_scan_compressed_bytes = meter
+            .f64_histogram("icegate_query_iceberg_scan_compressed_bytes")
+            .with_description("Compressed file sizes from Iceberg manifest per query")
+            .with_unit("By")
+            .build();
+
         Self {
             enabled: true,
             requests_total,
@@ -157,6 +200,12 @@ impl QueryMetrics {
             provider_refresh_errors_total,
             errors_total,
             active_queries,
+            wal_scan_rows,
+            wal_scan_bytes,
+            wal_scan_compressed_bytes,
+            iceberg_scan_rows,
+            iceberg_scan_bytes,
+            iceberg_scan_compressed_bytes,
         }
     }
 
@@ -312,6 +361,22 @@ impl QueryMetrics {
             return;
         }
         self.provider_refresh_errors_total.add(1, &[]);
+    }
+
+    /// Record per-source scan metrics extracted from the physical plan tree.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn record_source_metrics(&self, source: &crate::engine::SourceMetrics, api: &str) {
+        if !self.enabled {
+            return;
+        }
+        let attrs = &[KeyValue::new("api", api.to_string())];
+        self.wal_scan_rows.record(source.wal_rows as f64, attrs);
+        self.wal_scan_bytes.record(source.wal_bytes as f64, attrs);
+        self.wal_scan_compressed_bytes.record(source.wal_compressed_bytes as f64, attrs);
+        self.iceberg_scan_rows.record(source.iceberg_rows as f64, attrs);
+        self.iceberg_scan_bytes.record(source.iceberg_bytes as f64, attrs);
+        self.iceberg_scan_compressed_bytes
+            .record(source.iceberg_compressed_bytes as f64, attrs);
     }
 
     /// Record an error by phase.

@@ -5,6 +5,9 @@ catalog:
   properties:
     prefix: main
 
+engine:
+  wal_base_path: s3://queue/
+
 storage:
   backend: !s3
     bucket: warehouse

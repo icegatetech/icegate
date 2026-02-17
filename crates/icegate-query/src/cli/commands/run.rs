@@ -2,7 +2,8 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icegate_common::{CatalogBuilder, MetricsRuntime, run_metrics_server};
+use datafusion::execution::object_store::ObjectStoreUrl;
+use icegate_common::{CatalogBuilder, MetricsRuntime, create_object_store, run_metrics_server};
 use tokio_util::sync::CancellationToken;
 
 use crate::{QueryConfig, engine::QueryEngine, error::QueryError, infra::metrics::QueryMetrics};
@@ -41,7 +42,7 @@ async fn shutdown_signal() {
 #[allow(clippy::cognitive_complexity)]
 pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Load configuration
-    let config = QueryConfig::from_file(&config_path)?;
+    let mut config = QueryConfig::from_file(&config_path)?;
 
     // Initialize tracing with OpenTelemetry
     let tracing_guard = icegate_common::init_tracing(&config.tracing)?;
@@ -55,9 +56,24 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     tracing::info!("Catalog initialized successfully");
 
+    // Initialize WAL object store (if configured)
+    let wal_store = if config.engine.wal_base_path.is_empty() {
+        tracing::info!("WAL reading disabled (wal_base_path is empty)");
+        None
+    } else {
+        tracing::info!(wal_base_path = %config.engine.wal_base_path, "Initializing WAL object store");
+        let url = ObjectStoreUrl::parse(&config.engine.wal_base_path)
+            .map_err(|e| QueryError::Config(format!("Invalid WAL base path: {e}")))?;
+        let (store, prefix) = create_object_store(&config.engine.wal_base_path, Some(&config.storage.backend))?;
+        // Override wal_base_path with the normalized prefix within the object store
+        // (e.g., "s3://bucket/prefix/" → "prefix", "s3://bucket/" → "")
+        config.engine.wal_base_path = prefix;
+        Some((store, url))
+    };
+
     // Initialize query engine with cached IcebergCatalogProvider
     tracing::info!("Initializing query engine");
-    let query_engine = Arc::new(QueryEngine::new(catalog, config.engine.clone()).await?);
+    let query_engine = Arc::new(QueryEngine::new(catalog, config.engine.clone(), wal_store).await?);
 
     // Create cancellation token for coordinated shutdown
     let cancel_token = CancellationToken::new();

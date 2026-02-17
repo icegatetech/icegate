@@ -80,7 +80,7 @@ impl TestServer {
         let _ = catalog.create_table(&namespace_ident, table_creation).await?;
 
         let query_engine = Arc::new(
-            QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
+            QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default(), None)
                 .await
                 .expect("Failed to create QueryEngine"),
         );

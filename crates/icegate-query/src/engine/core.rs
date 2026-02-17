@@ -9,16 +9,18 @@ use std::{sync::Arc, time::Duration};
 
 use datafusion::{
     catalog::CatalogProvider,
-    execution::SessionStateBuilder,
+    execution::{SessionStateBuilder, object_store::ObjectStoreUrl},
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_tracing::{InstrumentationOptions, instrument_with_debug_spans};
 use iceberg::Catalog;
 use iceberg_datafusion::IcebergCatalogProvider;
+use object_store::ObjectStore;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::QueryEngineConfig;
+use super::provider::IcegateCatalogProvider;
 use crate::error::{QueryError, Result};
 
 /// Cached `IcebergCatalogProvider` with thread-safe access
@@ -37,7 +39,7 @@ struct CachedProvider {
 ///
 /// ```ignore
 /// let catalog = CatalogBuilder::from_config(&config.catalog).await?;
-/// let engine = Arc::new(QueryEngine::new(catalog, config).await?);
+/// let engine = Arc::new(QueryEngine::new(catalog, config, None).await?);
 /// engine.start_refresh_task(cancel_token);
 ///
 /// // In handlers:
@@ -51,6 +53,8 @@ pub struct QueryEngine {
     cached_provider: RwLock<Option<CachedProvider>>,
     /// Engine configuration
     config: QueryEngineConfig,
+    /// WAL object store and URL (None when WAL is disabled)
+    wal_store: Option<(Arc<dyn ObjectStore>, ObjectStoreUrl)>,
 }
 
 impl QueryEngine {
@@ -59,15 +63,27 @@ impl QueryEngine {
     /// Initializes the catalog provider cache. The provider is created
     /// immediately to ensure the engine is ready to serve queries.
     ///
+    /// # Arguments
+    ///
+    /// * `catalog` - Iceberg catalog for accessing tables
+    /// * `config` - Engine configuration
+    /// * `wal_store` - Optional WAL object store and URL for hot data reading.
+    ///   Pass `None` to disable WAL merging (pure Iceberg mode).
+    ///
     /// # Errors
     ///
     /// Returns an error if the initial catalog provider cannot be created
-    #[tracing::instrument(skip(catalog))]
-    pub async fn new(catalog: Arc<dyn Catalog>, config: QueryEngineConfig) -> Result<Self> {
+    #[tracing::instrument(skip(catalog, wal_store))]
+    pub async fn new(
+        catalog: Arc<dyn Catalog>,
+        config: QueryEngineConfig,
+        wal_store: Option<(Arc<dyn ObjectStore>, ObjectStoreUrl)>,
+    ) -> Result<Self> {
         let engine = Self {
             catalog,
             cached_provider: RwLock::new(None),
             config,
+            wal_store,
         };
 
         // Initialize the provider cache
@@ -108,6 +124,12 @@ impl QueryEngine {
         // Create SessionContext
         let session_ctx = SessionContext::new_with_state(session_state);
 
+        // Register WAL object store with the runtime so DataFusion's
+        // ParquetSource can read WAL Parquet files via the registered URL.
+        if let Some((ref store, ref url)) = self.wal_store {
+            session_ctx.runtime_env().register_object_store(url.as_ref(), Arc::clone(store));
+        }
+
         // Get cached provider and register catalog
         let guard = self.cached_provider.read().await;
         let Some(cached) = guard.as_ref() else {
@@ -133,18 +155,31 @@ impl QueryEngine {
     /// Returns an error if the catalog provider cannot be created
     #[tracing::instrument(skip(self))]
     pub async fn refresh_provider(&self) -> Result<()> {
-        let provider = IcebergCatalogProvider::try_new(Arc::clone(&self.catalog))
+        let provider: Arc<dyn CatalogProvider> = if let Some((ref store, ref url)) = self.wal_store {
+            // WAL-enabled: use our custom merged provider
+            let p = IcegateCatalogProvider::try_new(
+                Arc::clone(&self.catalog),
+                url.clone(),
+                Arc::clone(store),
+                self.config.wal_base_path.clone(),
+            )
             .await
-            .map_err(|e| QueryError::Config(format!("Failed to create IcebergCatalogProvider: {e}")))?;
+            .map_err(|e| QueryError::Config(format!("Failed to create IcegateCatalogProvider: {e}")))?;
+            tracing::debug!("IcegateCatalogProvider cache refreshed (WAL-merged)");
+            Arc::new(p)
+        } else {
+            // Pure Iceberg mode: use standard provider
+            let p = IcebergCatalogProvider::try_new(Arc::clone(&self.catalog))
+                .await
+                .map_err(|e| QueryError::Config(format!("Failed to create IcebergCatalogProvider: {e}")))?;
+            tracing::debug!("IcebergCatalogProvider cache refreshed");
+            Arc::new(p)
+        };
 
         {
             let mut guard = self.cached_provider.write().await;
-            *guard = Some(CachedProvider {
-                provider: Arc::new(provider) as Arc<dyn CatalogProvider>,
-            });
+            *guard = Some(CachedProvider { provider });
         }
-
-        tracing::debug!("IcebergCatalogProvider cache refreshed");
 
         Ok(())
     }
@@ -212,6 +247,7 @@ impl std::fmt::Debug for QueryEngine {
         f.debug_struct("QueryEngine")
             .field("catalog", &"Arc<dyn Catalog>")
             .field("config", &self.config)
+            .field("wal_enabled", &self.wal_store.is_some())
             .finish_non_exhaustive()
     }
 }

@@ -43,6 +43,12 @@ pub fn is_valid_tenant_id(value: &str) -> bool {
 /// Topic name for logs in the WAL queue.
 pub const LOGS_TOPIC: &str = "logs";
 
+/// Iceberg snapshot summary key for the last committed WAL queue offset.
+///
+/// Written by the Shifter after each WAL-to-Iceberg commit and read by the
+/// query engine to determine the WAL/Iceberg boundary.
+pub const WAL_OFFSET_PROPERTY: &str = "icegate.queue.offset";
+
 /// Catalog management for Iceberg catalogs.
 pub mod catalog;
 /// Common configuration utilities.

@@ -31,7 +31,7 @@ impl SegmentId {
     ///
     /// Format: `{topic}/{offset}.parquet`
     #[must_use]
-    pub(crate) fn to_relative_path(&self) -> Path {
+    pub fn to_relative_path(&self) -> Path {
         Path::from(format!(
             "{}/{:0>width$}.parquet",
             self.topic,

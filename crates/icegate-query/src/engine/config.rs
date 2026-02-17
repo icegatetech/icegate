@@ -51,6 +51,14 @@ pub struct QueryEngineConfig {
     /// Set to 0 to disable periodic refresh (provider only created at startup).
     /// The cache is refreshed in a background task to avoid blocking queries.
     pub provider_refresh_seconds: u64,
+
+    /// WAL base path for reading hot data (e.g., `s3://queue/`).
+    ///
+    /// When set to a non-empty string, the query engine will merge WAL
+    /// (Write-Ahead Log) segments with Iceberg data for near-real-time queries.
+    /// An empty string disables WAL reading (pure Iceberg mode).
+    #[serde(default)]
+    pub wal_base_path: String,
 }
 
 impl Default for QueryEngineConfig {
@@ -60,6 +68,7 @@ impl Default for QueryEngineConfig {
             target_partitions: DEFAULT_TARGET_PARTITIONS,
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
             provider_refresh_seconds: DEFAULT_PROVIDER_REFRESH_SECONDS,
+            wal_base_path: String::new(),
         }
     }
 }

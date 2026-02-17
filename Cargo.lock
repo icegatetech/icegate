@@ -3542,7 +3542,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#6c197fe8b02e24dc020ca327926d74ed77c13743"
+source = "git+https://github.com/apache/iceberg-rust?rev=6c197fe8b02e24dc020ca327926d74ed77c13743#6c197fe8b02e24dc020ca327926d74ed77c13743"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -3597,7 +3597,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#6c197fe8b02e24dc020ca327926d74ed77c13743"
+source = "git+https://github.com/apache/iceberg-rust?rev=6c197fe8b02e24dc020ca327926d74ed77c13743#6c197fe8b02e24dc020ca327926d74ed77c13743"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3617,7 +3617,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#6c197fe8b02e24dc020ca327926d74ed77c13743"
+source = "git+https://github.com/apache/iceberg-rust?rev=6c197fe8b02e24dc020ca327926d74ed77c13743#6c197fe8b02e24dc020ca327926d74ed77c13743"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3644,6 +3644,7 @@ dependencies = [
  "opentelemetry-instrumentation-tokio",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
+ "opentelemetry-resource-detectors",
  "opentelemetry_sdk",
  "prometheus",
  "rand 0.9.2",
@@ -3739,6 +3740,7 @@ name = "icegate-query"
 version = "0.1.0"
 dependencies = [
  "antlr4rust",
+ "async-trait",
  "axum 0.7.9",
  "axum-extra",
  "chrono",
@@ -3746,29 +3748,27 @@ dependencies = [
  "criterion",
  "datafusion",
  "datafusion-tracing",
+ "futures",
  "iceberg",
- "iceberg-catalog-rest",
  "iceberg-datafusion",
  "icegate-common",
+ "icegate-queue",
  "itoa",
+ "object_store",
  "opentelemetry",
- "opentelemetry-prometheus",
  "opentelemetry_sdk",
- "prometheus",
+ "parquet",
  "rand 0.9.2",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
- "serde_yaml",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "toml",
  "tower-http 0.5.2",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4658,6 +4658,23 @@ dependencies = [
  "tonic",
  "tonic-prost",
 ]
+
+[[package]]
+name = "opentelemetry-resource-detectors"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e82845106cf72d47c141cee7f0d95e0650d8f28c6222a1f1ae727a8883899c19"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+]
+
+[[package]]
+name = "opentelemetry-semantic-conventions"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e62e29dfe041afb8ed2a6c9737ab57db4907285d999ef8ad3a59092a36bdc846"
 
 [[package]]
 name = "opentelemetry_sdk"

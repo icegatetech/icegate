@@ -19,18 +19,26 @@ path = "src/main.rs"
 
 [dependencies]
 icegate-common = { workspace = true }
+icegate-queue = { workspace = true }
+parquet = { workspace = true }
 
 # ANTLR parser
 antlr4rust = { workspace = true }
 
 # Iceberg
 iceberg = { workspace = true }
-iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
 
 # DataFusion
 datafusion = { workspace = true }
 datafusion-tracing = { workspace = true }
+
+# Object storage
+object_store = { workspace = true }
+
+# Async utilities
+futures = { workspace = true }
+async-trait = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -47,8 +55,6 @@ regex = { workspace = true }
 # Configuration
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-toml = { workspace = true }
 
 # HTTP server
 axum = { workspace = true }
@@ -57,13 +63,10 @@ tower-http = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 # Metrics
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
-opentelemetry-prometheus = { workspace = true }
-prometheus = { workspace = true }
 
 # Date and time
 chrono = { workspace = true }
