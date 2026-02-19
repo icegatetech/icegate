@@ -214,28 +214,23 @@ impl IcebergStorage {
 
         for (partition_key, partition_batch) in partitioned_batches {
             let partition_path = partition_key.to_path();
-            tracing::debug!(
-                "Writing partition with {} rows: {}",
-                partition_batch.num_rows(),
-                partition_path
-            );
-            let write_span = tracing::info_span!(
+            let span = tracing::info_span!(
                 "iceberg_partition_write",
                 partition_key = %partition_path,
                 rows = partition_batch.num_rows()
             );
-            let span = tracing::info_span!("iceberg_partition_write", partition = %partition_key.to_path());
             fanout_writer
                 .write(partition_key, partition_batch)
-                .instrument(write_span)
+                .instrument(span)
                 .await
                 .map_err(|e| IngestError::Shift(format!("failed to write partition batch: {e}")))?;
         }
-        tracing::debug!("Closing writer");
 
         // Close writer and get data files
+        let span = tracing::info_span!("iceberg_write_close");
         let data_files: Vec<DataFile> = fanout_writer
             .close()
+            .instrument(span)
             .await
             .map_err(|e| IngestError::Shift(format!("failed to close fanout writer: {e}")))?;
 
