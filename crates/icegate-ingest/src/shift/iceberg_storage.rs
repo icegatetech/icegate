@@ -158,13 +158,14 @@ impl IcebergStorage {
             });
         }
 
-        tracing::info!("Start writing parquet file. Batches: {}", batches.len());
+        tracing::info!("Start preparing parquet file. Batches: {}", batches.len());
         let queue_schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
         let table = self.load_table(cancel_token).await?;
         let table_metadata = table.metadata().clone();
         let table_file_io = table.file_io().clone();
         let metadata_for_sort = table_metadata.clone();
+        tracing::debug!("Sorting batch");
         let sorted_batch =
             tokio::task::spawn_blocking(move || sort_by_table_order(&metadata_for_sort, combined_batch)).await??;
         tracing::debug!("Sorted batch has {} rows", sorted_batch.num_rows());
@@ -219,16 +220,18 @@ impl IcebergStorage {
                 partition_path
             );
             let write_span = tracing::info_span!(
-                "write parquet throught fanout",
+                "iceberg_partition_write",
                 partition_key = %partition_path,
                 rows = partition_batch.num_rows()
             );
+            let span = tracing::info_span!("iceberg_partition_write", partition = %partition_key.to_path());
             fanout_writer
                 .write(partition_key, partition_batch)
                 .instrument(write_span)
                 .await
                 .map_err(|e| IngestError::Shift(format!("failed to write partition batch: {e}")))?;
         }
+        tracing::debug!("Closing writer");
 
         // Close writer and get data files
         let data_files: Vec<DataFile> = fanout_writer

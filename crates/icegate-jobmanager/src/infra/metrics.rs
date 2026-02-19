@@ -16,6 +16,8 @@ pub struct Metrics {
     s3_latency: Histogram<f64>,
     cache_hits: Counter<u64>,
     cache_misses: Counter<u64>,
+    task_stolen: Counter<u64>,
+    save_conflict_retries: Counter<u64>,
 }
 
 impl Metrics {
@@ -30,6 +32,8 @@ impl Metrics {
             s3_latency: meter.f64_histogram("icegate_jobmanager_storage_s3_latency").build(),
             cache_hits: meter.u64_counter("icegate_jobmanager_storage_cache_hits").build(),
             cache_misses: meter.u64_counter("icegate_jobmanager_storage_cache_misses").build(),
+            task_stolen: meter.u64_counter("icegate_jobmanager_task_stolen").build(),
+            save_conflict_retries: meter.u64_counter("icegate_jobmanager_save_conflict_retry").build(),
         }
     }
 
@@ -64,6 +68,18 @@ impl Metrics {
             .with_unit("1")
             .build();
 
+        let task_stolen = meter
+            .u64_counter("icegate_jobmanager_task_stolen")
+            .with_description("Total number of task steal events due to worker mismatch")
+            .with_unit("1")
+            .build();
+
+        let save_conflict_retries = meter
+            .u64_counter("icegate_jobmanager_save_conflict_retry")
+            .with_description("Total number of save retries caused by optimistic concurrency conflicts")
+            .with_unit("1")
+            .build();
+
         Self {
             enabled: true,
             job_duration,
@@ -71,6 +87,8 @@ impl Metrics {
             s3_latency,
             cache_hits,
             cache_misses,
+            task_stolen,
+            save_conflict_retries,
         }
     }
 
@@ -132,5 +150,32 @@ impl Metrics {
             return;
         }
         self.cache_misses.add(1, &[KeyValue::new("method", method.to_string())]);
+    }
+
+    pub fn record_task_stolen(&self, job_code: &JobCode, task_code: &TaskCode, phase: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        self.task_stolen.add(
+            1,
+            &[
+                KeyValue::new("job_code", job_code.to_string()),
+                KeyValue::new("task_code", task_code.to_string()),
+                KeyValue::new("phase", phase),
+            ],
+        );
+    }
+
+    pub fn record_save_conflict_retry(&self, job_code: &JobCode, phase: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        self.save_conflict_retries.add(
+            1,
+            &[
+                KeyValue::new("job_code", job_code.to_string()),
+                KeyValue::new("phase", phase),
+            ],
+        );
     }
 }
