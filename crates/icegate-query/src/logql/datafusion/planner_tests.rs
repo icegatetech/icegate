@@ -167,9 +167,10 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
         backend: CatalogBackend::Memory,
         warehouse: warehouse_str,
         properties: std::collections::HashMap::new(),
+        cache: None,
     };
 
-    let iceberg_catalog = CatalogBuilder::from_config(&config)
+    let (iceberg_catalog, _) = CatalogBuilder::from_config(&config)
         .await
         .expect("Failed to create test catalog");
 

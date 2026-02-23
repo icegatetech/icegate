@@ -29,12 +29,12 @@ use super::scan::IcegateIcebergScan;
 
 /// Table provider that merges Iceberg (cold) and WAL (hot) data.
 ///
-/// On every `scan()`, loads fresh Iceberg metadata, determines the WAL
-/// boundary offset from snapshot history, and builds a `UnionExec` plan
-/// that reads both sources with matching schemas.
+/// On every `scan()`, reads Iceberg metadata, determines the WAL boundary
+/// offset from snapshot history, and builds a `UnionExec` plan that reads
+/// both sources with matching schemas. The provider is rebuilt per session
+/// by `QueryEngine::create_session()`, so the table metadata reflects the
+/// latest committed state.
 pub(super) struct IcegateTableProvider {
-    /// Iceberg catalog for loading fresh table metadata on each scan.
-    catalog: Arc<dyn Catalog>,
     /// Table identifier in the catalog (namespace + name).
     table_ident: TableIdent,
     /// Arrow schema for the table.
@@ -47,6 +47,8 @@ pub(super) struct IcegateTableProvider {
     wal_base_path: String,
     /// Batch size (rows) for WAL segment reading.
     batch_size: usize,
+    /// Iceberg table loaded at provider construction time.
+    table: Table,
 }
 
 impl std::fmt::Debug for IcegateTableProvider {
@@ -61,8 +63,9 @@ impl std::fmt::Debug for IcegateTableProvider {
 impl IcegateTableProvider {
     /// Creates a new merged table provider.
     ///
-    /// Loads the table once to capture the Arrow schema and stores references
-    /// for per-scan metadata refresh.
+    /// Loads the table from the catalog to capture the Arrow schema. The
+    /// provider is rebuilt per session, so the table reflects the latest
+    /// committed Iceberg state.
     ///
     /// # Errors
     ///
@@ -77,22 +80,19 @@ impl IcegateTableProvider {
         wal_base_path: String,
         batch_size: usize,
     ) -> Result<Self, iceberg::Error> {
-        // Load table once to capture schema
         let table = catalog.load_table(&table_ident).await?;
-        let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
+        let schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
             table.metadata().current_schema(),
         )?);
 
-        let schema = arrow_schema;
-
         Ok(Self {
-            catalog,
             table_ident,
             schema,
             wal_store_url,
             wal_store,
             wal_base_path,
             batch_size,
+            table,
         })
     }
 }
@@ -126,15 +126,11 @@ impl TableProvider for IcegateTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // 1. Load fresh table metadata from catalog
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(|e| DataFusionError::External(e.into()))?;
+        // 1. Clone table (cheap: inner data is Arc-wrapped)
+        let table = self.table.clone();
 
         // 2. Extract WAL offset from snapshot history
-        let wal_offset = extract_wal_offset(&table);
+        let wal_offset = extract_wal_offset(&table)?;
         tracing::debug!(wal_offset = ?wal_offset, "Resolved WAL boundary offset");
 
         // 3. Build Iceberg scan plan (our reimplemented scan with metrics)
@@ -157,24 +153,14 @@ impl TableProvider for IcegateTableProvider {
         // 4. Build WAL scan plan
         // Start from offset + 1 (or 0 if no offset found = fresh system)
         let wal_start = wal_offset.map_or(0, |o| o.saturating_add(1));
-        let wal_plan = match self
+        let wal_plan = self
             .build_wal_plan(state, projection, filters, wal_start, self.batch_size)
-            .await
-        {
-            Ok(Some(plan)) => {
-                tracing::debug!("WAL scan plan created");
-                Some(plan)
-            }
-            Ok(None) => {
-                tracing::debug!("No WAL segments found");
-                None
-            }
-            Err(e) => {
-                // WAL failure is non-fatal: fall back to Iceberg-only
-                tracing::warn!(error = %e, "WAL reading failed, falling back to Iceberg-only");
-                None
-            }
-        };
+            .await?;
+        if wal_plan.is_some() {
+            tracing::debug!("WAL scan plan created");
+        } else {
+            tracing::debug!("No WAL segments found");
+        }
 
         // 5. Combine plans
         match (iceberg_plan, wal_plan) {
@@ -281,16 +267,25 @@ impl IcegateTableProvider {
 /// property. The property may be absent from the current snapshot because
 /// compaction creates snapshots without it.
 ///
-/// Returns `None` if no snapshot has the property (fresh system: read all
-/// WAL segments).
+/// # Returns
+///
+/// * `Ok(Some(offset))` — found the WAL boundary offset
+/// * `Ok(None)` — no snapshots exist (fresh system: read all WAL segments)
+///
+/// # Errors
+///
+/// Returns `DataFusionError` if the snapshot walk limit is reached without
+/// finding the offset, which would cause offset=0 and data duplication.
 #[tracing::instrument(level = "debug", skip(table))]
-fn extract_wal_offset(table: &Table) -> Option<u64> {
+fn extract_wal_offset(table: &Table) -> DFResult<Option<u64>> {
     /// Safety cap to prevent unbounded snapshot chain walks (e.g. a cycle or
     /// an unexpectedly deep history).
     const MAX_SNAPSHOT_WALK: u32 = 1000;
 
     let metadata = table.metadata();
-    let mut snapshot = metadata.current_snapshot()?;
+    let Some(mut snapshot) = metadata.current_snapshot() else {
+        return Ok(None);
+    };
     let mut walked = 0u32;
     loop {
         if let Some(offset) = snapshot
@@ -304,19 +299,23 @@ fn extract_wal_offset(table: &Table) -> Option<u64> {
                 offset,
                 "Found WAL offset in snapshot history"
             );
-            return Some(offset);
+            return Ok(Some(offset));
         }
         walked += 1;
         if walked >= MAX_SNAPSHOT_WALK {
-            tracing::warn!(
-                limit = MAX_SNAPSHOT_WALK,
-                "Snapshot walk limit reached without finding WAL offset"
-            );
-            return None;
+            return Err(DataFusionError::Execution(format!(
+                "Snapshot walk limit ({MAX_SNAPSHOT_WALK}) reached without finding WAL offset; \
+                 cannot determine safe boundary — aborting to prevent data duplication"
+            )));
         }
-        // Walk to parent snapshot
-        let parent_id = snapshot.parent_snapshot_id()?;
-        snapshot = metadata.snapshot_by_id(parent_id)?;
+        // Walk to parent snapshot; None means the chain ended without the property
+        let Some(parent_id) = snapshot.parent_snapshot_id() else {
+            return Ok(None);
+        };
+        let Some(parent) = metadata.snapshot_by_id(parent_id) else {
+            return Ok(None);
+        };
+        snapshot = parent;
     }
 }
 

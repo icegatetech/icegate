@@ -18,11 +18,14 @@ testing = ["testcontainers", "aws-config", "aws-sdk-s3"]
 
 [dependencies]
 # Iceberg
-iceberg = { workspace = true }
+iceberg = { workspace = true, features = ["io-cache"] }
 iceberg-catalog-rest = { workspace = true }
+foyer = { workspace = true, features = ["tracing"] }
 
 # Storage
 object_store = { workspace = true }
+opendal = { workspace = true }
+object_store_opendal = { workspace = true }
 
 # Configuration
 serde = { workspace = true }

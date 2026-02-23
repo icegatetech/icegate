@@ -26,7 +26,7 @@ parquet = { workspace = true }
 antlr4rust = { workspace = true }
 
 # Iceberg
-iceberg = { workspace = true }
+iceberg = { workspace = true, features = ["io-metrics", "io-tracing", "io-cache"] }
 iceberg-datafusion = { workspace = true }
 
 # DataFusion

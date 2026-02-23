@@ -52,34 +52,37 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     // Initialize catalog
     tracing::info!("Initializing catalog");
-    let catalog = CatalogBuilder::from_config(&config.catalog).await?;
+    let (catalog, io_cache_handle) = CatalogBuilder::from_config(&config.catalog).await?;
 
     tracing::info!("Catalog initialized successfully");
 
-    // Initialize WAL object store (if configured)
-    let wal_store = if config.engine.wal_base_path.is_empty() {
-        tracing::info!("WAL reading disabled (wal_base_path is empty)");
-        None
-    } else {
-        tracing::info!(wal_base_path = %config.engine.wal_base_path, "Initializing WAL object store");
-        let url = ObjectStoreUrl::parse(&config.engine.wal_base_path)
-            .map_err(|e| QueryError::Config(format!("Invalid WAL base path: {e}")))?;
-        let (store, prefix) = create_object_store(&config.engine.wal_base_path, Some(&config.storage.backend))?;
-        // Override wal_base_path with the normalized prefix within the object store
-        // (e.g., "s3://bucket/prefix/" → "prefix", "s3://bucket/" → "")
-        config.engine.wal_base_path = prefix;
-        Some((store, url))
-    };
+    // Validate engine config (ensures wal_base_path is set)
+    config.engine.validate()?;
 
-    // Initialize query engine with cached IcebergCatalogProvider
+    // Extract the shared foyer cache from the IO cache handle so the WAL
+    // object store can share the same hybrid cache as the Iceberg catalog.
+    let foyer_cache = io_cache_handle.as_ref().map(|h| h.cache().clone());
+
+    // Initialize WAL object store
+    tracing::info!(wal_base_path = %config.engine.wal_base_path, "Initializing WAL object store");
+    let url = ObjectStoreUrl::parse(&config.engine.wal_base_path)
+        .map_err(|e| QueryError::Config(format!("Invalid WAL base path: {e}")))?;
+    let (store, prefix) = create_object_store(
+        &config.engine.wal_base_path,
+        Some(&config.storage.backend),
+        foyer_cache.as_ref(),
+    )?;
+    // Override wal_base_path with the normalized prefix within the object store
+    // (e.g., "s3://bucket/prefix/" → "prefix", "s3://bucket/" → "")
+    config.engine.wal_base_path = prefix;
+    let wal_store = (store, url);
+
+    // Initialize query engine with cached catalog provider
     tracing::info!("Initializing query engine");
-    let query_engine = Arc::new(QueryEngine::new(catalog, config.engine.clone(), wal_store).await?);
+    let query_engine = Arc::new(QueryEngine::new(catalog, config.engine.clone(), wal_store));
 
     // Create cancellation token for coordinated shutdown
     let cancel_token = CancellationToken::new();
-
-    // Start background provider refresh task
-    query_engine.start_refresh_task(cancel_token.clone());
 
     tracing::info!("Query engine initialized successfully");
 
@@ -161,6 +164,12 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     }
 
     tracing::info!("All query servers stopped gracefully");
+
+    // Gracefully close the IO cache to drain foyer's background flusher tasks.
+    // This prevents "sending on a closed channel" errors during runtime teardown.
+    if let Some(handle) = io_cache_handle {
+        handle.close().await;
+    }
 
     // Keep tracing guard alive until the very end
     drop(tracing_guard);

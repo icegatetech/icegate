@@ -17,7 +17,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 const FAST_DURATION_BOUNDARIES: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
 
 /// Histogram bucket boundaries (in seconds) for end-to-end and I/O-bound
-/// durations like request, execute, session creation, and provider refresh.
+/// durations like request, execute, and session creation.
 const DURATION_BOUNDARIES: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
@@ -65,8 +65,6 @@ pub struct QueryMetrics {
     result_rows: Histogram<f64>,
     result_bytes: Histogram<f64>,
     session_create_duration: Histogram<f64>,
-    provider_refresh_duration: Histogram<f64>,
-    provider_refresh_errors_total: Counter<u64>,
     errors_total: Counter<u64>,
     active_queries: UpDownCounter<i64>,
 
@@ -99,8 +97,6 @@ impl QueryMetrics {
             result_rows: meter.f64_histogram("icegate_query_result_rows").build(),
             result_bytes: meter.f64_histogram("icegate_query_result_bytes").build(),
             session_create_duration: meter.f64_histogram("icegate_query_session_create_duration").build(),
-            provider_refresh_duration: meter.f64_histogram("icegate_query_provider_refresh_duration").build(),
-            provider_refresh_errors_total: meter.u64_counter("icegate_query_provider_refresh_errors_total").build(),
             errors_total: meter.u64_counter("icegate_query_errors_total").build(),
             active_queries: meter.i64_up_down_counter("icegate_query_active_queries").build(),
             wal_scan_rows: meter.f64_histogram("icegate_query_wal_scan_rows").build(),
@@ -163,16 +159,6 @@ impl QueryMetrics {
             .with_unit("s")
             .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
             .build();
-        let provider_refresh_duration = meter
-            .f64_histogram("icegate_query_provider_refresh_duration")
-            .with_description("IcebergCatalogProvider refresh duration")
-            .with_unit("s")
-            .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
-            .build();
-        let provider_refresh_errors_total = meter
-            .u64_counter("icegate_query_provider_refresh_errors_total")
-            .with_description("Provider refresh failures")
-            .build();
         let errors_total = meter
             .u64_counter("icegate_query_errors_total")
             .with_description("Query errors by phase")
@@ -228,8 +214,6 @@ impl QueryMetrics {
             result_rows,
             result_bytes,
             session_create_duration,
-            provider_refresh_duration,
-            provider_refresh_errors_total,
             errors_total,
             active_queries,
             wal_scan_rows,
@@ -377,22 +361,6 @@ impl QueryMetrics {
             return;
         }
         self.session_create_duration.record(duration.as_secs_f64(), &[]);
-    }
-
-    /// Record provider refresh duration.
-    pub fn record_provider_refresh_duration(&self, duration: Duration) {
-        if !self.enabled {
-            return;
-        }
-        self.provider_refresh_duration.record(duration.as_secs_f64(), &[]);
-    }
-
-    /// Record a provider refresh failure.
-    pub fn add_provider_refresh_error(&self) {
-        if !self.enabled {
-            return;
-        }
-        self.provider_refresh_errors_total.add(1, &[]);
     }
 
     /// Record per-source scan metrics extracted from the physical plan tree.

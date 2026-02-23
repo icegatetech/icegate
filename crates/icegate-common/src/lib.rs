@@ -71,7 +71,7 @@ pub mod tracing;
 pub mod testing;
 
 // Re-export commonly used types
-pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig};
+pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoCacheHandle};
 pub use config::{ServerConfig, check_port_conflicts, load_config_file};
 pub use error::Result;
 pub use metrics::{MetricsConfig, MetricsRuntime, run_metrics_server};

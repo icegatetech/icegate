@@ -138,6 +138,7 @@ async fn setup_containers() -> (ContainerAsync<MinIO>, ContainerAsync<GenericIma
         backend: CatalogBackend::Rest { uri: iceberg_base },
         warehouse: format!("s3://{BUCKET_NAME}/"),
         properties,
+        cache: None,
     };
 
     (minio, iceberg, config)
@@ -171,7 +172,7 @@ async fn test_migrate_create_tables() {
 
     println!("Creating catalog with config: {:?}", config);
 
-    let catalog = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
+    let (catalog, _) = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
 
     println!("Catalog created, calling create_tables...");
 
@@ -209,7 +210,7 @@ async fn test_migrate_create_tables() {
 async fn test_migrate_create_tables_dry_run() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
+    let (catalog, _) = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
 
     // First call with dry_run=true
     let ops = create_tables(&catalog, true).await.expect("Failed to dry-run create tables");
@@ -235,7 +236,7 @@ async fn test_migrate_create_tables_dry_run() {
 async fn test_migrate_create_tables_idempotent() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
+    let (catalog, _) = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
 
     // First call - creates tables
     let ops_first = create_tables(&catalog, false)
@@ -259,7 +260,7 @@ async fn test_migrate_create_tables_idempotent() {
 async fn test_migrate_upgrade_schemas() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
+    let (catalog, _) = CatalogBuilder::from_config(&config).await.expect("Failed to create catalog");
 
     // First create the tables
     let create_ops = create_tables(&catalog, false).await.expect("Failed to create tables");

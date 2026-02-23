@@ -18,6 +18,26 @@ pub struct CatalogConfig {
     /// Additional catalog-specific properties
     #[serde(default)]
     pub properties: HashMap<String, String>,
+    /// Optional IO cache for `FileIO` reads.
+    ///
+    /// When set, wraps the Iceberg `FileIO` with a foyer hybrid cache
+    /// (memory + disk) to reduce S3 round-trips for repeated reads.
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
+}
+
+/// IO cache configuration for the `FileIO` layer.
+///
+/// When enabled, wraps the Iceberg `FileIO` with a foyer hybrid cache
+/// (memory + disk) to reduce S3 round-trips for repeated reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Memory cache capacity in mebibytes (e.g., 64).
+    pub memory_size_mb: usize,
+    /// Directory for disk cache storage.
+    pub disk_dir: String,
+    /// Disk cache capacity in mebibytes (e.g., 256).
+    pub disk_size_mb: usize,
 }
 
 /// Types of catalogs supported
@@ -63,6 +83,21 @@ impl CatalogConfig {
             }
         }
 
+        // Validate cache config if present
+        if let Some(ref cache) = self.cache {
+            if cache.memory_size_mb == 0 {
+                return Err(CommonError::Config(
+                    "Cache memory_size_mb must be greater than 0".into(),
+                ));
+            }
+            if cache.disk_dir.trim().is_empty() {
+                return Err(CommonError::Config("Cache disk_dir cannot be empty".into()));
+            }
+            if cache.disk_size_mb == 0 {
+                return Err(CommonError::Config("Cache disk_size_mb must be greater than 0".into()));
+            }
+        }
+
         Ok(())
     }
 }
@@ -73,6 +108,7 @@ impl Default for CatalogConfig {
             backend: CatalogBackend::Memory,
             warehouse: "/tmp/icegate/warehouse".to_string(),
             properties: HashMap::new(),
+            cache: None,
         }
     }
 }

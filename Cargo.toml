@@ -53,6 +53,9 @@ icegate-queue = { path = "crates/icegate-queue" }
 arrow = { version = "57.0", default-features = false, features = ["prettyprint"] }
 parquet = { version = "57.0", default-features = false, features = ["arrow", "object_store", "zstd"] }
 object_store = { version = "0.12", features = ["aws"] }
+opendal = { version = "0.55", features = ["services-s3", "layers-otel-trace", "layers-otel-metrics"] }
+object_store_opendal = "0.55"
+foyer = { version = "0.18", features = ["serde"] }
 
 # Error handling
 thiserror = "2"
@@ -65,9 +68,9 @@ async-trait = "0.1"
 antlr4rust = "0.5"
 
 # Iceberg (apache/iceberg-rust pinned to a specific revision for DataFusion 51 + Arrow 57 compat)
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "6c197fe8b02e24dc020ca327926d74ed77c13743" }
-iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "6c197fe8b02e24dc020ca327926d74ed77c13743" }
-iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "6c197fe8b02e24dc020ca327926d74ed77c13743" }
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "422251ea0c6189a86d434438a06b240c035a399a" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "422251ea0c6189a86d434438a06b240c035a399a" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "422251ea0c6189a86d434438a06b240c035a399a" }
 
 # DataFusion
 datafusion = "51.0"

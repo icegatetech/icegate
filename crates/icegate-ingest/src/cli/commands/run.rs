@@ -60,7 +60,9 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
 
     // Create object store based on queue base_path
-    let (store, normalized_path) = create_object_store(&queue_config.common.base_path, Some(&config.storage.backend))?;
+    // Ingest writes data — no read cache needed, pass None.
+    let (store, normalized_path) =
+        create_object_store(&queue_config.common.base_path, Some(&config.storage.backend), None)?;
 
     // Update queue config with normalized base path
     let mut queue_config = queue_config;
@@ -82,7 +84,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
-    let catalog = CatalogBuilder::from_config(&config.catalog).await?;
+    let (catalog, io_cache_handle) = CatalogBuilder::from_config(&config.catalog).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
     let queue_reader = Arc::new(ParquetQueueReader::new(
@@ -191,6 +193,11 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Wait for the writer task to finish
     writer_handle.await??;
+
+    // Gracefully close the IO cache to drain foyer's background flusher tasks.
+    if let Some(handle) = io_cache_handle {
+        handle.close().await;
+    }
 
     // Keep tracing guard alive until the very end
     drop(tracing_guard);

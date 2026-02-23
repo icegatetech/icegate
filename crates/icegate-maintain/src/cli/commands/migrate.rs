@@ -29,7 +29,7 @@ async fn create(config_path: PathBuf, dry_run: bool) -> Result<(), MaintainError
     let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
     tracing::info!("Initializing catalog");
-    let catalog = CatalogBuilder::from_config(&config.catalog).await?;
+    let (catalog, _) = CatalogBuilder::from_config(&config.catalog).await?;
 
     if dry_run {
         tracing::info!("Running in dry-run mode - no changes will be made");
@@ -47,7 +47,7 @@ async fn upgrade(config_path: PathBuf, dry_run: bool) -> Result<(), MaintainErro
     let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
     tracing::info!("Initializing catalog");
-    let catalog = CatalogBuilder::from_config(&config.catalog).await?;
+    let (catalog, _) = CatalogBuilder::from_config(&config.catalog).await?;
 
     if dry_run {
         tracing::info!("Running in dry-run mode - no changes will be made");

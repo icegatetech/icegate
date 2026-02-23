@@ -19,7 +19,6 @@ queue:
 
 shift:
   jobsmanager:
-    iteration_interval_millisecs: 60000
     storage:
       endpoint: http://minio:9000
       bucket: jobs
