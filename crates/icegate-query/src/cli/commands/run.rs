@@ -63,12 +63,35 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // so the WAL object store can share the same hybrid cache as the Iceberg
     // catalog.
     let foyer_cache = io_cache_handle.as_ref().map(|h| h.cache().clone());
-    let cache_object_size_limit = config.catalog.cache.as_ref().map(|c| c.object_size_limit_mb * 1024 * 1024);
+    let cache_object_size_limit = config
+        .catalog
+        .cache
+        .as_ref()
+        .map(|c| {
+            c.object_size_limit_mb
+                .checked_mul(1024)
+                .and_then(|v| v.checked_mul(1024))
+                .ok_or_else(|| {
+                    QueryError::Config(format!(
+                        "object_size_limit_mb ({}) is too large to convert to bytes",
+                        c.object_size_limit_mb,
+                    ))
+                })
+        })
+        .transpose()?;
 
     // Initialize WAL object store
     tracing::info!(wal_base_path = %config.engine.wal_base_path, "Initializing WAL object store");
-    let url = ObjectStoreUrl::parse(&config.engine.wal_base_path)
-        .map_err(|e| QueryError::Config(format!("Invalid WAL base path: {e}")))?;
+    // Normalize bare local paths (e.g., "/tmp/wal") to URLs with file:// scheme
+    // so ObjectStoreUrl::parse succeeds.
+    let wal_url_str = if config.engine.wal_base_path.starts_with('/') && !config.engine.wal_base_path.starts_with("//")
+    {
+        format!("file://{}", config.engine.wal_base_path)
+    } else {
+        config.engine.wal_base_path.clone()
+    };
+    let url =
+        ObjectStoreUrl::parse(&wal_url_str).map_err(|e| QueryError::Config(format!("Invalid WAL base path: {e}")))?;
     let (store, prefix) = create_object_store(
         &config.engine.wal_base_path,
         Some(&config.storage.backend),

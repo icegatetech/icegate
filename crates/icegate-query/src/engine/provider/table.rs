@@ -221,10 +221,17 @@ impl IcegateTableProvider {
         } else {
             let df_schema = datafusion::common::DFSchema::try_from(self.schema.as_ref().clone())
                 .map_err(|e| DataFusionError::Plan(format!("Failed to create DFSchema: {e}")))?;
-            let physical_exprs: Vec<_> = filters
-                .iter()
-                .filter_map(|f| state.create_physical_expr(f.clone(), &df_schema).ok())
-                .collect();
+            let mut physical_exprs = Vec::with_capacity(filters.len());
+            for f in filters {
+                match state.create_physical_expr(f.clone(), &df_schema) {
+                    Ok(expr) => physical_exprs.push(expr),
+                    Err(e) => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Failed to convert filter to physical expression: {e}"
+                        )));
+                    }
+                }
+            }
             if physical_exprs.is_empty() {
                 None
             } else {
@@ -288,12 +295,13 @@ fn extract_wal_offset(table: &Table) -> DFResult<Option<u64>> {
     };
     let mut walked = 0u32;
     loop {
-        if let Some(offset) = snapshot
-            .summary()
-            .additional_properties
-            .get(WAL_OFFSET_PROPERTY)
-            .and_then(|v| v.parse::<u64>().ok())
-        {
+        if let Some(raw_value) = snapshot.summary().additional_properties.get(WAL_OFFSET_PROPERTY) {
+            let offset: u64 = raw_value.parse().map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Malformed {WAL_OFFSET_PROPERTY} value {raw_value:?} in snapshot {}: {e}",
+                    snapshot.snapshot_id(),
+                ))
+            })?;
             tracing::debug!(
                 snapshots_walked = walked,
                 offset,
@@ -313,7 +321,11 @@ fn extract_wal_offset(table: &Table) -> DFResult<Option<u64>> {
             return Ok(None);
         };
         let Some(parent) = metadata.snapshot_by_id(parent_id) else {
-            return Ok(None);
+            return Err(DataFusionError::Execution(format!(
+                "Iceberg metadata inconsistency: snapshot {} references parent snapshot {parent_id} \
+                 which does not exist in table metadata",
+                snapshot.snapshot_id(),
+            )));
         };
         snapshot = parent;
     }

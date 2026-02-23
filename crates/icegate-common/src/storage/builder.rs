@@ -67,15 +67,23 @@ pub fn create_s3_store(
     };
 
     // Read AWS credentials from environment (optional for IAM role/instance-profile auth).
-    // Both must be set or neither — partial configuration is an error.
+    // Both access_key and secret_key must be set or neither — partial configuration
+    // is an error. session_token is optional but requires both access_key and secret_key.
     let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|v| !v.is_empty());
     let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok().filter(|v| !v.is_empty());
+    let session_token = std::env::var("AWS_SESSION_TOKEN").ok().filter(|v| !v.is_empty());
 
     if access_key.is_some() != secret_key.is_some() {
         return Err(CommonError::Config(
             "AWS credentials partially configured; set both AWS_ACCESS_KEY_ID and \
              AWS_SECRET_ACCESS_KEY, or neither"
                 .to_string(),
+        ));
+    }
+
+    if session_token.is_some() && access_key.is_none() {
+        return Err(CommonError::Config(
+            "AWS_SESSION_TOKEN requires both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY".to_string(),
         ));
     }
 
@@ -86,6 +94,9 @@ pub fn create_s3_store(
     }
     if let Some(ref secret) = secret_key {
         s3 = s3.secret_access_key(secret);
+    }
+    if let Some(ref token) = session_token {
+        s3 = s3.session_token(token);
     }
 
     if let Some(ep) = &endpoint {
