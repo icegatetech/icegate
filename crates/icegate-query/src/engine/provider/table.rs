@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
+use datafusion::catalog::memory::DataSourceExec;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -136,13 +137,13 @@ impl TableProvider for IcegateTableProvider {
         // 3. Build Iceberg scan plan (our reimplemented scan with metrics)
         let has_snapshot = table.metadata().current_snapshot().is_some();
         let iceberg_plan: Option<Arc<dyn ExecutionPlan>> = if has_snapshot {
-            let scan = IcegateIcebergScan::new(
+            let scan = IcegateIcebergScan::try_new(
                 table.clone(),
                 None, // Current snapshot
                 &self.schema,
                 projection,
                 filters,
-            );
+            )?;
             tracing::debug!("Iceberg scan plan created");
             Some(Arc::new(scan))
         } else {
@@ -179,7 +180,7 @@ impl TableProvider for IcegateTableProvider {
             (None, None) => {
                 // Return an empty scan -- no data available from either source
                 tracing::debug!("Empty plan: no Iceberg snapshot and no WAL segments");
-                let scan = IcegateIcebergScan::new(table, None, &self.schema, projection, filters);
+                let scan = IcegateIcebergScan::try_new(table, None, &self.schema, projection, filters)?;
                 Ok(Arc::new(scan))
             }
         }
@@ -256,7 +257,6 @@ impl IcegateTableProvider {
         }
         let config = builder.build();
 
-        use datafusion::catalog::memory::DataSourceExec;
         Ok(Some(DataSourceExec::from_data_source(config)))
     }
 }
@@ -338,10 +338,10 @@ async fn list_wal_files(
 
     // Intentionally uncancellable: WAL segment listing is a short metadata
     // operation during query planning that must run to completion.
-    let cancel = CancellationToken::new();
+    let uncancellable_token = CancellationToken::new();
     let topic: String = icegate_common::LOGS_TOPIC.to_string();
     let segments = reader
-        .list_segments(&topic, start_offset, &cancel)
+        .list_segments(&topic, start_offset, &uncancellable_token)
         .await
         .map_err(|e| DataFusionError::External(e.into()))?;
     tracing::debug!(
@@ -362,7 +362,7 @@ async fn list_wal_files(
         let path = if wal_base_path.is_empty() {
             relative
         } else {
-            object_store::path::Path::from(format!("{wal_base_path}/{relative}"))
+            object_store::path::Path::from(format!("{}/{relative}", wal_base_path.trim_end_matches('/')))
         };
 
         async move {

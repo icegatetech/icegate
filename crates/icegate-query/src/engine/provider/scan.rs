@@ -67,36 +67,36 @@ impl IcegateIcebergScan {
     /// * `schema` - The Arrow schema for this table
     /// * `projection` - Optional column indices to project
     /// * `filters` - DataFusion filter expressions to push down
-    pub(super) fn new(
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataFusionError` if the projection indices are out of bounds.
+    pub(super) fn try_new(
         table: Table,
         snapshot_id: Option<i64>,
         schema: &ArrowSchemaRef,
         projection: Option<&Vec<usize>>,
         filters: &[datafusion::prelude::Expr],
-    ) -> Self {
-        let output_schema = projection.map_or_else(
-            || schema.clone(),
-            |proj| match schema.project(proj) {
-                Ok(projected) => Arc::new(projected),
-                Err(err) => {
-                    tracing::warn!(?err, ?proj, "schema projection failed, falling back to full schema");
-                    schema.clone()
-                }
-            },
-        );
+    ) -> DFResult<Self> {
+        let (output_schema, projection_names) = match projection {
+            None => (schema.clone(), None),
+            Some(proj) => {
+                let projected = Arc::new(schema.project(proj)?);
+                let names = projected.fields().iter().map(|f| f.name().clone()).collect::<Vec<String>>();
+                (projected, Some(names))
+            }
+        };
         let plan_properties = Self::compute_properties(output_schema);
-        let projection_names =
-            projection.map(|v| v.iter().map(|p| schema.field(*p).name().clone()).collect::<Vec<String>>());
         let predicates = convert_filters_to_predicate(filters);
 
-        Self {
+        Ok(Self {
             table,
             snapshot_id,
             plan_properties,
             projection: projection_names,
             predicates,
             metrics: ExecutionPlanMetricsSet::new(),
-        }
+        })
     }
 
     /// Compute plan properties for the DataFusion optimizer.

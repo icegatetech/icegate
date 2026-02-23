@@ -14,12 +14,10 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
+use icegate_common::ICEGATE_NAMESPACE;
 use object_store::ObjectStore;
 
 use super::schema::IcegateSchemaProvider;
-
-/// The namespace that contains IceGate tables (logs, spans, events, metrics).
-const ICEGATE_NAMESPACE: &str = "icegate";
 
 /// Catalog provider that substitutes our custom schema provider for the
 /// IceGate namespace while using standard Iceberg providers for all others.

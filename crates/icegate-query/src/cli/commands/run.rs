@@ -59,9 +59,11 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Validate engine config (ensures wal_base_path is set)
     config.engine.validate()?;
 
-    // Extract the shared foyer cache from the IO cache handle so the WAL
-    // object store can share the same hybrid cache as the Iceberg catalog.
+    // Extract the shared foyer cache and size limit from the IO cache handle
+    // so the WAL object store can share the same hybrid cache as the Iceberg
+    // catalog.
     let foyer_cache = io_cache_handle.as_ref().map(|h| h.cache().clone());
+    let cache_object_size_limit = config.catalog.cache.as_ref().map(|c| c.object_size_limit_mb * 1024 * 1024);
 
     // Initialize WAL object store
     tracing::info!(wal_base_path = %config.engine.wal_base_path, "Initializing WAL object store");
@@ -71,6 +73,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         &config.engine.wal_base_path,
         Some(&config.storage.backend),
         foyer_cache.as_ref(),
+        cache_object_size_limit,
     )?;
     // Override wal_base_path with the normalized prefix within the object store
     // (e.g., "s3://bucket/prefix/" → "prefix", "s3://bucket/" → "")
@@ -142,6 +145,9 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     if handles.is_empty() {
         tracing::warn!("No query servers are enabled in configuration");
+        if let Some(handle) = io_cache_handle {
+            handle.close().await;
+        }
         return Ok(());
     }
 

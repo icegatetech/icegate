@@ -61,8 +61,12 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Create object store based on queue base_path
     // Ingest writes data — no read cache needed, pass None.
-    let (store, normalized_path) =
-        create_object_store(&queue_config.common.base_path, Some(&config.storage.backend), None)?;
+    let (store, normalized_path) = create_object_store(
+        &queue_config.common.base_path,
+        Some(&config.storage.backend),
+        None,
+        None,
+    )?;
 
     // Update queue config with normalized base path
     let mut queue_config = queue_config;
@@ -163,7 +167,11 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         tracing::info!("Shifter stopped gracefully");
         // Orderly shutdown: close channel so writer loop can exit, then await it
         drop(write_tx);
-        return Ok(writer_handle.await??);
+        writer_handle.await??;
+        if let Some(handle) = io_cache_handle {
+            handle.close().await;
+        }
+        return Ok(());
     }
 
     tracing::info!("All enabled OTLP servers started");

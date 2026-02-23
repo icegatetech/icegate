@@ -145,8 +145,18 @@ impl CatalogBuilder {
     /// Returns the `IoCacheConfig` for the Iceberg catalog and an
     /// [`IoCacheHandle`] for graceful shutdown.
     async fn build_io_cache(config: &CacheConfig) -> Result<(iceberg::io::IoCacheConfig, IoCacheHandle)> {
-        let memory_bytes = config.memory_size_mb * 1024 * 1024;
-        let disk_bytes = config.disk_size_mb * 1024 * 1024;
+        let memory_bytes = config.memory_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+            CommonError::Config(format!(
+                "memory_size_mb ({}) overflows when converted to bytes",
+                config.memory_size_mb
+            ))
+        })?;
+        let disk_bytes = config.disk_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+            CommonError::Config(format!(
+                "disk_size_mb ({}) overflows when converted to bytes",
+                config.disk_size_mb
+            ))
+        })?;
 
         let cache: iceberg::io::FoyerCache = foyer::HybridCacheBuilder::new()
             .memory(memory_bytes)

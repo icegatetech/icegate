@@ -26,6 +26,13 @@ pub struct CatalogConfig {
     pub cache: Option<CacheConfig>,
 }
 
+/// Default maximum object size eligible for caching (16 `MiB`).
+///
+/// Large enough for Iceberg metadata files (manifests, manifest lists,
+/// `metadata.json`) but small enough to prevent pulling entire Parquet
+/// data files into memory on cache miss.
+const DEFAULT_CACHE_OBJECT_SIZE_LIMIT_MB: usize = 16;
+
 /// IO cache configuration for the `FileIO` layer.
 ///
 /// When enabled, wraps the Iceberg `FileIO` with a foyer hybrid cache
@@ -38,6 +45,21 @@ pub struct CacheConfig {
     pub disk_dir: String,
     /// Disk cache capacity in mebibytes (e.g., 256).
     pub disk_size_mb: usize,
+    /// Maximum size of a single object eligible for caching, in mebibytes.
+    ///
+    /// Objects larger than this limit bypass the cache entirely and are
+    /// read directly from the backend. This prevents the `FoyerLayer`
+    /// from pulling very large Parquet files into memory on cache miss.
+    ///
+    /// Defaults to 16 `MiB` when not specified, which is large enough for
+    /// Iceberg metadata files but avoids caching full data files.
+    #[serde(default = "default_object_size_limit_mb")]
+    pub object_size_limit_mb: usize,
+}
+
+/// Returns the default object size limit for serde deserialization.
+const fn default_object_size_limit_mb() -> usize {
+    DEFAULT_CACHE_OBJECT_SIZE_LIMIT_MB
 }
 
 /// Types of catalogs supported
@@ -95,6 +117,11 @@ impl CatalogConfig {
             }
             if cache.disk_size_mb == 0 {
                 return Err(CommonError::Config("Cache disk_size_mb must be greater than 0".into()));
+            }
+            if cache.object_size_limit_mb == 0 {
+                return Err(CommonError::Config(
+                    "Cache object_size_limit_mb must be greater than 0".into(),
+                ));
             }
         }
 

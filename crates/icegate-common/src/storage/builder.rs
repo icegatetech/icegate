@@ -39,6 +39,9 @@ pub type ObjectStoreWithPath = (Arc<dyn ObjectStore>, String);
 /// * `base_path` - S3 URL in the format `s3://bucket/prefix`
 /// * `backend` - Optional storage backend configuration for endpoint/region settings
 /// * `cache` - Optional foyer cache shared with the Iceberg catalog's IO layer
+/// * `cache_object_size_limit` - Maximum object size (bytes) eligible for caching.
+///   Objects larger than this bypass the cache. `None` uses the `FoyerLayer` default
+///   (no limit).
 ///
 /// # Returns
 ///
@@ -48,6 +51,7 @@ pub fn create_s3_store(
     base_path: &str,
     backend: Option<&StorageBackend>,
     cache: Option<&iceberg::io::FoyerCache>,
+    cache_object_size_limit: Option<usize>,
 ) -> Result<ObjectStoreWithPath> {
     // Parse S3 URL: s3://bucket/prefix
     let path_without_scheme = base_path.strip_prefix("s3://").unwrap_or(base_path);
@@ -62,29 +66,27 @@ pub fn create_s3_store(
         _ => (None, "us-east-1".to_string()),
     };
 
-    // Read and validate AWS credentials from environment
-    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-        .map_err(|_| CommonError::Config("AWS_ACCESS_KEY_ID environment variable is not set".to_string()))?;
-    if access_key_id.is_empty() {
-        return Err(CommonError::Config(
-            "AWS_ACCESS_KEY_ID environment variable is empty".to_string(),
-        ));
-    }
+    // Read AWS credentials from environment (optional for IAM role/instance-profile auth).
+    // Both must be set or neither — partial configuration is an error.
+    let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|v| !v.is_empty());
+    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok().filter(|v| !v.is_empty());
 
-    let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .map_err(|_| CommonError::Config("AWS_SECRET_ACCESS_KEY environment variable is not set".to_string()))?;
-    if secret_access_key.is_empty() {
+    if access_key.is_some() != secret_key.is_some() {
         return Err(CommonError::Config(
-            "AWS_SECRET_ACCESS_KEY environment variable is empty".to_string(),
+            "AWS credentials partially configured; set both AWS_ACCESS_KEY_ID and \
+             AWS_SECRET_ACCESS_KEY, or neither"
+                .to_string(),
         ));
     }
 
     // Build OpenDAL S3 service
-    let mut s3 = S3::default()
-        .bucket(&bucket)
-        .region(&region)
-        .access_key_id(&access_key_id)
-        .secret_access_key(&secret_access_key);
+    let mut s3 = S3::default().bucket(&bucket).region(&region);
+    if let Some(ref key_id) = access_key {
+        s3 = s3.access_key_id(key_id);
+    }
+    if let Some(ref secret) = secret_key {
+        s3 = s3.secret_access_key(secret);
+    }
 
     if let Some(ep) = &endpoint {
         s3 = s3.endpoint(ep);
@@ -107,7 +109,11 @@ pub fn create_s3_store(
         .layer(OtelTraceLayer);
 
     let operator = if let Some(foyer_cache) = cache {
-        base.layer(iceberg::io::FoyerLayer::new(foyer_cache.clone()))
+        let mut foyer_layer = iceberg::io::FoyerLayer::new(foyer_cache.clone());
+        if let Some(limit) = cache_object_size_limit {
+            foyer_layer = foyer_layer.with_size_limit(..limit);
+        }
+        base.layer(foyer_layer)
             .layer(OtelMetricsLayer::builder().register(&meter))
             .finish()
     } else {
@@ -162,6 +168,8 @@ pub fn create_memory_store(base_path: &str) -> ObjectStoreWithPath {
 /// * `base_path` - The storage path with optional scheme prefix
 /// * `backend` - Optional storage backend configuration (used for S3 endpoint/region)
 /// * `cache` - Optional foyer cache for S3 read caching (ignored for non-S3 backends)
+/// * `cache_object_size_limit` - Maximum object size (bytes) eligible for caching
+///   (ignored for non-S3 backends). See [`create_s3_store`].
 ///
 /// # Returns
 ///
@@ -170,9 +178,10 @@ pub fn create_object_store(
     base_path: &str,
     backend: Option<&StorageBackend>,
     cache: Option<&iceberg::io::FoyerCache>,
+    cache_object_size_limit: Option<usize>,
 ) -> Result<ObjectStoreWithPath> {
     if base_path.starts_with("s3://") {
-        create_s3_store(base_path, backend, cache)
+        create_s3_store(base_path, backend, cache, cache_object_size_limit)
     } else if base_path.starts_with("file://") || base_path.starts_with('/') {
         create_local_store(base_path)
     } else {
