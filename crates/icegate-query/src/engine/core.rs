@@ -1,90 +1,85 @@
-//! Query execution engine with cached catalog provider
+//! Query execution engine with per-session catalog provider.
 //!
-//! The `QueryEngine` provides pre-configured `SessionContext` instances with
-//! the Iceberg catalog already registered. It caches the
-//! `IcebergCatalogProvider` to avoid the 50-500ms network round-trip on every
-//! query.
+//! The `QueryEngine` builds a fresh catalog provider on each
+//! `create_session()` call, ensuring every query sees the latest committed
+//! Iceberg data. The Iceberg `io-cache` feature (foyer hybrid cache) handles
+//! caching expensive S3/FileIO reads, so the per-session rebuild only costs
+//! catalog REST API calls.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use datafusion::{
     catalog::CatalogProvider,
-    execution::SessionStateBuilder,
+    execution::{SessionStateBuilder, object_store::ObjectStoreUrl},
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_tracing::{InstrumentationOptions, instrument_with_debug_spans};
 use iceberg::Catalog;
-use iceberg_datafusion::IcebergCatalogProvider;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
+use object_store::ObjectStore;
 
 use super::QueryEngineConfig;
-use crate::error::{QueryError, Result};
+use super::provider::IcegateCatalogProvider;
+use crate::error::Result;
 
-/// Cached `IcebergCatalogProvider` with thread-safe access
-struct CachedProvider {
-    provider: Arc<dyn CatalogProvider>,
-}
-
-/// Query execution engine with cached catalog provider
+/// Query execution engine with per-session catalog provider.
 ///
-/// `QueryEngine` provides pre-configured `SessionContext` instances with
-/// the Iceberg catalog already registered. It caches the
-/// `IcebergCatalogProvider` to avoid the 50-500ms network round-trip on every
-/// query.
+/// `QueryEngine` builds a fresh catalog provider on each `create_session()`
+/// call, so every query sees the latest committed Iceberg metadata. The
+/// Iceberg `io-cache` (foyer hybrid cache) handles caching expensive
+/// S3/FileIO reads underneath.
 ///
 /// # Usage
 ///
 /// ```ignore
-/// let catalog = CatalogBuilder::from_config(&config.catalog).await?;
-/// let engine = Arc::new(QueryEngine::new(catalog, config).await?);
-/// engine.start_refresh_task(cancel_token);
+/// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
+/// let engine = Arc::new(QueryEngine::new(catalog, config, (wal_store, wal_url)));
 ///
 /// // In handlers:
 /// let session_ctx = engine.create_session().await?;
 /// // Use session_ctx for query execution...
 /// ```
 pub struct QueryEngine {
-    /// Iceberg catalog for accessing tables
+    /// Iceberg catalog for accessing tables.
     catalog: Arc<dyn Catalog>,
-    /// Cached catalog provider (refreshed periodically)
-    cached_provider: RwLock<Option<CachedProvider>>,
-    /// Engine configuration
+    /// Engine configuration.
     config: QueryEngineConfig,
+    /// WAL object store and registered URL for hot data reading.
+    wal_store: (Arc<dyn ObjectStore>, ObjectStoreUrl),
 }
 
 impl QueryEngine {
-    /// Create a new `QueryEngine`
+    /// Create a new `QueryEngine`.
     ///
-    /// Initializes the catalog provider cache. The provider is created
-    /// immediately to ensure the engine is ready to serve queries.
+    /// Stores the catalog and configuration for later use by
+    /// `create_session()`. No provider is built at construction time.
     ///
-    /// # Errors
+    /// # Arguments
     ///
-    /// Returns an error if the initial catalog provider cannot be created
-    #[tracing::instrument(skip(catalog))]
-    pub async fn new(catalog: Arc<dyn Catalog>, config: QueryEngineConfig) -> Result<Self> {
-        let engine = Self {
+    /// * `catalog` - Iceberg catalog for accessing tables
+    /// * `config` - Engine configuration
+    /// * `wal_store` - WAL object store and URL for hot data reading
+    #[must_use]
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        config: QueryEngineConfig,
+        wal_store: (Arc<dyn ObjectStore>, ObjectStoreUrl),
+    ) -> Self {
+        Self {
             catalog,
-            cached_provider: RwLock::new(None),
             config,
-        };
-
-        // Initialize the provider cache
-        engine.refresh_provider().await?;
-
-        Ok(engine)
+            wal_store,
+        }
     }
 
-    /// Create a new `SessionContext` with the Iceberg catalog registered
+    /// Create a new `SessionContext` with the Iceberg catalog registered.
     ///
-    /// This is the primary method handlers should use. Each call creates
-    /// a fresh `SessionContext` (required by `DataFusion` for concurrent
-    /// queries) but reuses the cached `IcebergCatalogProvider`.
+    /// Builds a fresh catalog provider from the Iceberg catalog, ensuring the
+    /// session sees the latest committed table metadata. Each call creates a
+    /// fresh `SessionContext` (required by `DataFusion` for concurrent queries).
     ///
     /// # Errors
     ///
-    /// Returns an error if the cached provider is not available
+    /// Returns an error if the catalog provider cannot be created
     #[tracing::instrument(skip(self))]
     pub async fn create_session(&self) -> Result<SessionContext> {
         // Build session config from engine config
@@ -108,102 +103,44 @@ impl QueryEngine {
         // Create SessionContext
         let session_ctx = SessionContext::new_with_state(session_state);
 
-        // Get cached provider and register catalog
-        let guard = self.cached_provider.read().await;
-        let Some(cached) = guard.as_ref() else {
-            tracing::debug!("Provider cache miss: not initialized");
-            return Err(QueryError::Config("Catalog provider not initialized".to_string()));
+        // Register the WAL object store with this session's RuntimeEnv.
+        // Each SessionContext built via SessionStateBuilder::new()...build()
+        // owns its own RuntimeEnv, so register_object_store must be called
+        // per-session (not once globally) for DataFusion's ParquetSource to
+        // resolve WAL Parquet files through the registered URL.
+        let (ref store, ref url) = self.wal_store;
+        session_ctx.runtime_env().register_object_store(url.as_ref(), Arc::clone(store));
+
+        // Build a fresh provider from the catalog
+        let provider: Arc<dyn CatalogProvider> = {
+            let p = IcegateCatalogProvider::try_new(
+                Arc::clone(&self.catalog),
+                url.clone(),
+                Arc::clone(store),
+                self.config.wal_base_path.clone(),
+                self.config.batch_size,
+            )
+            .await?;
+            Arc::new(p)
         };
-        tracing::debug!("Provider cache hit");
-        let provider = Arc::clone(&cached.provider);
-        drop(guard);
 
         session_ctx.register_catalog(&self.config.catalog_name, provider);
 
         Ok(session_ctx)
     }
 
-    /// Refresh the cached `IcebergCatalogProvider`
+    /// Get reference to the underlying Iceberg catalog.
     ///
-    /// This fetches fresh catalog metadata from the Iceberg catalog.
-    /// Called periodically by the background refresh task.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the catalog provider cannot be created
-    #[tracing::instrument(skip(self))]
-    pub async fn refresh_provider(&self) -> Result<()> {
-        let provider = IcebergCatalogProvider::try_new(Arc::clone(&self.catalog))
-            .await
-            .map_err(|e| QueryError::Config(format!("Failed to create IcebergCatalogProvider: {e}")))?;
-
-        {
-            let mut guard = self.cached_provider.write().await;
-            *guard = Some(CachedProvider {
-                provider: Arc::new(provider) as Arc<dyn CatalogProvider>,
-            });
-        }
-
-        tracing::debug!("IcebergCatalogProvider cache refreshed");
-
-        Ok(())
-    }
-
-    /// Get reference to the underlying Iceberg catalog
-    ///
-    /// Useful for handlers that need direct catalog access
+    /// Useful for handlers that need direct catalog access.
     #[must_use]
     pub fn catalog(&self) -> Arc<dyn Catalog> {
         Arc::clone(&self.catalog)
     }
 
-    /// Get reference to the engine configuration
+    /// Get reference to the engine configuration.
     #[must_use]
     pub const fn config(&self) -> &QueryEngineConfig {
         &self.config
-    }
-
-    /// Start the background provider refresh task
-    ///
-    /// Spawns a background task that periodically refreshes the cached
-    /// `IcebergCatalogProvider`. The task runs until the cancellation token
-    /// is triggered.
-    ///
-    /// If `provider_refresh_seconds` is 0 in the config, this method returns
-    /// immediately without spawning a task.
-    pub fn start_refresh_task(self: &Arc<Self>, cancel_token: CancellationToken) {
-        if self.config.provider_refresh_seconds == 0 {
-            tracing::info!("Periodic provider refresh disabled");
-            return;
-        }
-
-        let engine = Arc::clone(self);
-        let interval = Duration::from_secs(self.config.provider_refresh_seconds);
-
-        tokio::spawn(async move {
-            let mut interval_timer = tokio::time::interval(interval);
-            // Skip the first tick (provider was just initialized)
-            interval_timer.tick().await;
-
-            loop {
-                tokio::select! {
-                    () = cancel_token.cancelled() => {
-                        tracing::info!("Provider refresh task shutting down");
-                        break;
-                    }
-                    _ = interval_timer.tick() => {
-                        if let Err(e) = engine.refresh_provider().await {
-                            tracing::warn!("Failed to refresh catalog provider: {}", e);
-                        }
-                    }
-                }
-            }
-        });
-
-        tracing::info!(
-            interval_seconds = self.config.provider_refresh_seconds,
-            "Started periodic provider refresh task"
-        );
     }
 }
 

@@ -17,9 +17,35 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 const FAST_DURATION_BOUNDARIES: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
 
 /// Histogram bucket boundaries (in seconds) for end-to-end and I/O-bound
-/// durations like request, execute, session creation, and provider refresh.
+/// durations like request, execute, and session creation.
 const DURATION_BOUNDARIES: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Histogram bucket boundaries (in bytes) for byte-level scan metrics.
+/// Covers from 512 B up to ~100 MB in roughly exponential steps.
+const BYTES_BOUNDARIES: &[f64] = &[
+    0.0,
+    512.0,
+    1_024.0,
+    10_240.0,
+    102_400.0,
+    1_024_000.0,
+    10_240_000.0,
+    102_400_000.0,
+];
+
+/// Histogram bucket boundaries for row-count scan metrics.
+/// Covers from 0 up to 10 M rows in roughly exponential steps.
+const ROWS_BOUNDARIES: &[f64] = &[
+    0.0,
+    10.0,
+    100.0,
+    1_000.0,
+    10_000.0,
+    100_000.0,
+    1_000_000.0,
+    10_000_000.0,
 ];
 
 /// Metrics recorded throughout the query request lifecycle.
@@ -39,10 +65,16 @@ pub struct QueryMetrics {
     result_rows: Histogram<f64>,
     result_bytes: Histogram<f64>,
     session_create_duration: Histogram<f64>,
-    provider_refresh_duration: Histogram<f64>,
-    provider_refresh_errors_total: Counter<u64>,
     errors_total: Counter<u64>,
     active_queries: UpDownCounter<i64>,
+
+    // Per-source scan metrics
+    wal_scan_rows: Histogram<f64>,
+    wal_scan_bytes: Histogram<f64>,
+    wal_scan_compressed_bytes: Histogram<f64>,
+    iceberg_scan_rows: Histogram<f64>,
+    iceberg_scan_bytes: Histogram<f64>,
+    iceberg_scan_compressed_bytes: Histogram<f64>,
 }
 
 impl QueryMetrics {
@@ -65,10 +97,14 @@ impl QueryMetrics {
             result_rows: meter.f64_histogram("icegate_query_result_rows").build(),
             result_bytes: meter.f64_histogram("icegate_query_result_bytes").build(),
             session_create_duration: meter.f64_histogram("icegate_query_session_create_duration").build(),
-            provider_refresh_duration: meter.f64_histogram("icegate_query_provider_refresh_duration").build(),
-            provider_refresh_errors_total: meter.u64_counter("icegate_query_provider_refresh_errors_total").build(),
             errors_total: meter.u64_counter("icegate_query_errors_total").build(),
             active_queries: meter.i64_up_down_counter("icegate_query_active_queries").build(),
+            wal_scan_rows: meter.f64_histogram("icegate_query_wal_scan_rows").build(),
+            wal_scan_bytes: meter.f64_histogram("icegate_query_wal_scan_bytes").build(),
+            wal_scan_compressed_bytes: meter.f64_histogram("icegate_query_wal_scan_compressed_bytes").build(),
+            iceberg_scan_rows: meter.f64_histogram("icegate_query_iceberg_scan_rows").build(),
+            iceberg_scan_bytes: meter.f64_histogram("icegate_query_iceberg_scan_bytes").build(),
+            iceberg_scan_compressed_bytes: meter.f64_histogram("icegate_query_iceberg_scan_compressed_bytes").build(),
         }
     }
 
@@ -123,16 +159,6 @@ impl QueryMetrics {
             .with_unit("s")
             .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
             .build();
-        let provider_refresh_duration = meter
-            .f64_histogram("icegate_query_provider_refresh_duration")
-            .with_description("IcebergCatalogProvider refresh duration")
-            .with_unit("s")
-            .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
-            .build();
-        let provider_refresh_errors_total = meter
-            .u64_counter("icegate_query_provider_refresh_errors_total")
-            .with_description("Provider refresh failures")
-            .build();
         let errors_total = meter
             .u64_counter("icegate_query_errors_total")
             .with_description("Query errors by phase")
@@ -140,6 +166,41 @@ impl QueryMetrics {
         let active_queries = meter
             .i64_up_down_counter("icegate_query_active_queries")
             .with_description("Currently executing queries")
+            .build();
+
+        let wal_scan_rows = meter
+            .f64_histogram("icegate_query_wal_scan_rows")
+            .with_description("Rows read from WAL per query")
+            .with_boundaries(ROWS_BOUNDARIES.to_vec())
+            .build();
+        let wal_scan_bytes = meter
+            .f64_histogram("icegate_query_wal_scan_bytes")
+            .with_description("Decompressed bytes from WAL per query")
+            .with_unit("By")
+            .with_boundaries(BYTES_BOUNDARIES.to_vec())
+            .build();
+        let wal_scan_compressed_bytes = meter
+            .f64_histogram("icegate_query_wal_scan_compressed_bytes")
+            .with_description("Compressed bytes scanned from WAL Parquet files per query")
+            .with_unit("By")
+            .with_boundaries(BYTES_BOUNDARIES.to_vec())
+            .build();
+        let iceberg_scan_rows = meter
+            .f64_histogram("icegate_query_iceberg_scan_rows")
+            .with_description("Rows read from Iceberg per query")
+            .with_boundaries(ROWS_BOUNDARIES.to_vec())
+            .build();
+        let iceberg_scan_bytes = meter
+            .f64_histogram("icegate_query_iceberg_scan_bytes")
+            .with_description("Decompressed bytes from Iceberg per query")
+            .with_unit("By")
+            .with_boundaries(BYTES_BOUNDARIES.to_vec())
+            .build();
+        let iceberg_scan_compressed_bytes = meter
+            .f64_histogram("icegate_query_iceberg_scan_compressed_bytes")
+            .with_description("Compressed file sizes from Iceberg manifest per query")
+            .with_unit("By")
+            .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
 
         Self {
@@ -153,10 +214,14 @@ impl QueryMetrics {
             result_rows,
             result_bytes,
             session_create_duration,
-            provider_refresh_duration,
-            provider_refresh_errors_total,
             errors_total,
             active_queries,
+            wal_scan_rows,
+            wal_scan_bytes,
+            wal_scan_compressed_bytes,
+            iceberg_scan_rows,
+            iceberg_scan_bytes,
+            iceberg_scan_compressed_bytes,
         }
     }
 
@@ -298,20 +363,20 @@ impl QueryMetrics {
         self.session_create_duration.record(duration.as_secs_f64(), &[]);
     }
 
-    /// Record provider refresh duration.
-    pub fn record_provider_refresh_duration(&self, duration: Duration) {
+    /// Record per-source scan metrics extracted from the physical plan tree.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn record_source_metrics(&self, source: &crate::engine::SourceMetrics, api: &str) {
         if !self.enabled {
             return;
         }
-        self.provider_refresh_duration.record(duration.as_secs_f64(), &[]);
-    }
-
-    /// Record a provider refresh failure.
-    pub fn add_provider_refresh_error(&self) {
-        if !self.enabled {
-            return;
-        }
-        self.provider_refresh_errors_total.add(1, &[]);
+        let attrs = &[KeyValue::new("api", api.to_string())];
+        self.wal_scan_rows.record(source.wal_rows as f64, attrs);
+        self.wal_scan_bytes.record(source.wal_bytes as f64, attrs);
+        self.wal_scan_compressed_bytes.record(source.wal_compressed_bytes as f64, attrs);
+        self.iceberg_scan_rows.record(source.iceberg_rows as f64, attrs);
+        self.iceberg_scan_bytes.record(source.iceberg_bytes as f64, attrs);
+        self.iceberg_scan_compressed_bytes
+            .record(source.iceberg_compressed_bytes as f64, attrs);
     }
 
     /// Record an error by phase.

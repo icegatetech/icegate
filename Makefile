@@ -7,7 +7,7 @@ run-load-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile load up --build
 
 run-monitoring-release:
-	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile monitoring up --build
+	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile monitoring up --build --force-recreate
 
 run-analytics-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile analytics up --build

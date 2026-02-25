@@ -103,7 +103,10 @@ services:
         PROFILE: ${PROFILE:-release}
     command: ["/usr/local/bin/query", "run", "--config", "/etc/icegate/query.yaml"]
     deploy:
-      replicas: ${QUERY_REPLICAS:-1}
+      resources:
+        limits:
+          memory: 4g
+          cpus: 4
     ports:
       - "3100:3100"
       - "9090:9090"
@@ -117,8 +120,9 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
-      RUST_LOG: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+      RUST_LOG: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: query
     develop:
       watch:
         - action: rebuild
@@ -145,6 +149,7 @@ services:
       AWS_REGION: us-east-1
       RUST_LOG: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: ingest
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/4317' || exit 1"]
       interval: 5s
@@ -158,8 +163,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 3g
-          cpus: 1
+          memory: 2g
+          cpus: 2
 
   grafana:
     image: grafana/grafana:12.3

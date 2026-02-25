@@ -15,6 +15,7 @@ use datafusion::arrow::array::{
     ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::DataType;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::parquet::file::properties::WriterProperties;
 use iceberg::Catalog;
 use iceberg::spec::DataFileFormat;
@@ -25,7 +26,9 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use icegate_common::{CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE, catalog::CatalogBuilder, schema};
+use icegate_common::{
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoCacheHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
+};
 use icegate_query::engine::{QueryEngine, QueryEngineConfig};
 use icegate_query::loki::LokiConfig;
 use rand::Rng;
@@ -52,6 +55,7 @@ impl TestServer {
             backend: CatalogBackend::Memory,
             warehouse: warehouse_str.clone(),
             properties: std::collections::HashMap::default(),
+            cache: None,
         };
 
         let loki_config = LokiConfig {
@@ -60,7 +64,7 @@ impl TestServer {
             port: 0,
         };
 
-        let catalog = CatalogBuilder::from_config(&catalog_config).await?;
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoCacheHandle::noop()).await?;
 
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
 
@@ -79,11 +83,20 @@ impl TestServer {
 
         let _ = catalog.create_table(&namespace_ident, table_creation).await?;
 
-        let query_engine = Arc::new(
-            QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
-                .await
-                .expect("Failed to create QueryEngine"),
-        );
+        // Provide an in-memory WAL store — WAL scan finds 0 segments,
+        // which is correct for benchmarks that only write to Iceberg.
+        let wal_base_path = "wal://bench";
+        let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let wal_url = ObjectStoreUrl::parse(wal_base_path).unwrap();
+        let engine_config = QueryEngineConfig {
+            wal_base_path: wal_base_path.to_string(),
+            ..QueryEngineConfig::default()
+        };
+        let query_engine = Arc::new(QueryEngine::new(
+            Arc::clone(&catalog),
+            engine_config,
+            (wal_store, wal_url),
+        ));
 
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();

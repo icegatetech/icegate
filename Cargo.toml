@@ -53,6 +53,9 @@ icegate-queue = { path = "crates/icegate-queue" }
 arrow = { version = "57.0", default-features = false, features = ["prettyprint"] }
 parquet = { version = "57.0", default-features = false, features = ["arrow", "object_store", "zstd"] }
 object_store = { version = "0.12", features = ["aws"] }
+opendal = { version = "0.55", features = ["services-s3", "layers-otel-trace", "layers-otel-metrics"] }
+object_store_opendal = "0.55"
+foyer = { version = "0.18", features = ["serde"] }
 
 # Error handling
 thiserror = "2"
@@ -64,18 +67,12 @@ async-trait = "0.1"
 # ANTLR parser
 antlr4rust = "0.5"
 
-# Iceberg
-#iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
-#iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
-#iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "d78f6567cabe917d75ae9884144a5a0f70e08ace" }
-
-# Fork: icegatetech/iceberg-rust (tracking #25)
-# Patches: DataFusion 51 + Arrow 57 compat (upstream PR #1830 closed), memory catalog enhancements
-# Upstream plan: Switch back when DataFusion 51 officially supported upstream
-# Maintenance: develop branch rebased on upstream main; run `make ci` after each sync
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
+# Iceberg — fork of apache/iceberg-rust `develop` branch.
+# Pinned to a specific revision for DataFusion 51 + Arrow 57 compat.
+# Fork adds WAL-aware table scan support; track upstream merge progress in GH-71.
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
 
 # DataFusion
 datafusion = "51.0"
@@ -107,6 +104,7 @@ prost = "0.14"
 # OpenTelemetry proto (with tonic service generation)
 opentelemetry-instrumentation-tokio = "0.1"
 opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic", "logs", "trace", "metrics"] }
+opentelemetry-resource-detectors = "0.10"
 opentelemetry = { version = "0.31.0", features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.31.0", features = ["metrics", "trace", "rt-tokio", "spec_unstable_metrics_views"] }
 opentelemetry-prometheus = "0.31.0"

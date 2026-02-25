@@ -36,8 +36,14 @@ pub struct FormattedResult {
 
 impl FormattedResult {
     /// Create query stats from formatting result.
-    pub fn to_stats(&self, exec_time: f64) -> QueryStats {
-        QueryStats::from_metrics(self.total_bytes, self.total_lines, self.num_batches, exec_time)
+    ///
+    /// When `source` is provided, the stats include a per-source breakdown
+    /// (Iceberg vs WAL). Otherwise, falls back to the aggregate-only format.
+    pub fn to_stats(&self, exec_time: f64, source: Option<&crate::engine::SourceMetrics>) -> QueryStats {
+        source.map_or_else(
+            || QueryStats::from_metrics(self.total_bytes, self.total_lines, self.num_batches, exec_time),
+            |s| QueryStats::from_source_metrics(s, self.total_bytes, self.total_lines, self.num_batches, exec_time),
+        )
     }
 }
 

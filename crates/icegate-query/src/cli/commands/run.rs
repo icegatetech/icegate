@@ -2,7 +2,8 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icegate_common::{CatalogBuilder, MetricsRuntime, run_metrics_server};
+use datafusion::execution::object_store::ObjectStoreUrl;
+use icegate_common::{CatalogBuilder, IoCacheHandle, MetricsRuntime, create_object_store, run_metrics_server};
 use tokio_util::sync::CancellationToken;
 
 use crate::{QueryConfig, engine::QueryEngine, error::QueryError, infra::metrics::QueryMetrics};
@@ -41,7 +42,7 @@ async fn shutdown_signal() {
 #[allow(clippy::cognitive_complexity)]
 pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Load configuration
-    let config = QueryConfig::from_file(&config_path)?;
+    let mut config = QueryConfig::from_file(&config_path)?;
 
     // Initialize tracing with OpenTelemetry
     let tracing_guard = icegate_common::init_tracing(&config.tracing)?;
@@ -51,19 +52,64 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     // Initialize catalog
     tracing::info!("Initializing catalog");
-    let catalog = CatalogBuilder::from_config(&config.catalog).await?;
+    let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 
     tracing::info!("Catalog initialized successfully");
 
-    // Initialize query engine with cached IcebergCatalogProvider
+    // Validate engine config (ensures wal_base_path is set)
+    config.engine.validate()?;
+
+    // Extract the shared foyer cache and size limit from the IO cache handle
+    // so the WAL object store can share the same hybrid cache as the Iceberg
+    // catalog.
+    let foyer_cache = io_cache.cache().cloned();
+    let cache_object_size_limit = config
+        .catalog
+        .cache
+        .as_ref()
+        .map(|c| {
+            c.object_size_limit_mb
+                .checked_mul(1024)
+                .and_then(|v| v.checked_mul(1024))
+                .ok_or_else(|| {
+                    QueryError::Config(format!(
+                        "object_size_limit_mb ({}) is too large to convert to bytes",
+                        c.object_size_limit_mb,
+                    ))
+                })
+        })
+        .transpose()?;
+
+    // Initialize WAL object store
+    tracing::info!(wal_base_path = %config.engine.wal_base_path, "Initializing WAL object store");
+    // Normalize bare local paths (e.g., "/tmp/wal") to URLs with file:// scheme
+    // so ObjectStoreUrl::parse succeeds.
+    let wal_url_str = if config.engine.wal_base_path.starts_with('/') && !config.engine.wal_base_path.starts_with("//")
+    {
+        format!("file://{}", config.engine.wal_base_path)
+    } else {
+        config.engine.wal_base_path.clone()
+    };
+    let url =
+        ObjectStoreUrl::parse(&wal_url_str).map_err(|e| QueryError::Config(format!("Invalid WAL base path: {e}")))?;
+    let (store, prefix) = create_object_store(
+        &config.engine.wal_base_path,
+        Some(&config.storage.backend),
+        foyer_cache.as_ref(),
+        cache_object_size_limit,
+    )?;
+    // Override wal_base_path with the normalized prefix within the object store
+    // (e.g., "s3://bucket/prefix/" → "prefix", "s3://bucket/" → "")
+    config.engine.wal_base_path = prefix;
+    let wal_store = (store, url);
+
+    // Initialize query engine with cached catalog provider
     tracing::info!("Initializing query engine");
-    let query_engine = Arc::new(QueryEngine::new(catalog, config.engine.clone()).await?);
+    let query_engine = Arc::new(QueryEngine::new(catalog, config.engine.clone(), wal_store));
 
     // Create cancellation token for coordinated shutdown
     let cancel_token = CancellationToken::new();
-
-    // Start background provider refresh task
-    query_engine.start_refresh_task(cancel_token.clone());
 
     tracing::info!("Query engine initialized successfully");
 
@@ -123,6 +169,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     if handles.is_empty() {
         tracing::warn!("No query servers are enabled in configuration");
+        io_cache.close().await;
         return Ok(());
     }
 
@@ -145,6 +192,10 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     }
 
     tracing::info!("All query servers stopped gracefully");
+
+    // Gracefully close the IO cache to drain foyer's background flusher tasks.
+    // This prevents "sending on a closed channel" errors during runtime teardown.
+    io_cache.close().await;
 
     // Keep tracing guard alive until the very end
     drop(tracing_guard);

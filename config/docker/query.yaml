@@ -4,6 +4,13 @@ catalog:
   warehouse: s3://warehouse/
   properties:
     prefix: main
+  cache:
+    memory_size_mb: 1024
+    disk_dir: /tmp/icegate/cache
+    disk_size_mb: 4096
+
+engine:
+  wal_base_path: s3://queue/
 
 storage:
   backend: !s3

@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::{
     arrow::{
         array::{
@@ -33,7 +34,9 @@ use iceberg::{
         },
     },
 };
-use icegate_common::{CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE, catalog::CatalogBuilder, schema};
+use icegate_common::{
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoCacheHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
+};
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
     loki::LokiConfig,
@@ -64,6 +67,7 @@ impl TestServer {
             backend: CatalogBackend::Memory,
             warehouse: warehouse_str.clone(),
             properties: std::collections::HashMap::default(),
+            cache: None,
         };
 
         // Use port 0 for ephemeral port assignment
@@ -73,7 +77,7 @@ impl TestServer {
             port: 0,
         };
 
-        let catalog = CatalogBuilder::from_config(&catalog_config).await?;
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoCacheHandle::noop()).await?;
 
         // Create namespace and table
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
@@ -93,12 +97,20 @@ impl TestServer {
 
         let _ = catalog.create_table(&namespace_ident, table_creation).await?;
 
-        // Start server with port notification channel
-        let query_engine = Arc::new(
-            QueryEngine::new(Arc::clone(&catalog), QueryEngineConfig::default())
-                .await
-                .expect("Failed to create QueryEngine"),
-        );
+        // Start server with port notification channel.
+        // Provide an in-memory WAL store — WAL scan finds 0 segments,
+        // which is correct for tests that only write to Iceberg.
+        let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let wal_url = ObjectStoreUrl::parse("wal://test").unwrap();
+        let engine_config = QueryEngineConfig {
+            wal_base_path: "wal://test".to_string(),
+            ..QueryEngineConfig::default()
+        };
+        let query_engine = Arc::new(QueryEngine::new(
+            Arc::clone(&catalog),
+            engine_config,
+            (wal_store, wal_url),
+        ));
 
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();

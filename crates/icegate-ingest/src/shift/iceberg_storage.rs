@@ -25,7 +25,7 @@ use iceberg::{
     },
 };
 use icegate_common::{
-    ICEGATE_NAMESPACE,
+    ICEGATE_NAMESPACE, WAL_OFFSET_PROPERTY,
     retrier::{Retrier, RetrierConfig},
 };
 use parquet::basic::{Compression, ZstdLevel};
@@ -36,9 +36,6 @@ use uuid::Uuid;
 
 use super::{config::ShiftConfig, parquet_meta_reader::data_files_from_parquet_paths};
 use crate::error::{IngestError, Result};
-
-/// Key for storing the queue offset in snapshot summary.
-const OFFSET_SUMMARY_KEY: &str = "icegate.queue.offset";
 
 /// Result of writing batches into parquet data files.
 pub struct WrittenDataFiles {
@@ -110,7 +107,7 @@ impl IcebergStorage {
             snapshot
                 .summary()
                 .additional_properties
-                .get(OFFSET_SUMMARY_KEY)
+                .get(WAL_OFFSET_PROPERTY)
                 .and_then(|v| v.parse::<u64>().ok())
         }))
     }
@@ -291,8 +288,8 @@ impl IcebergStorage {
 
         // Store offset in snapshot summary properties
         let mut snapshot_props = HashMap::new();
-        snapshot_props.insert(OFFSET_SUMMARY_KEY.to_string(), last_offset.to_string());
-        tracing::debug!("Setting snapshot property: {}={}", OFFSET_SUMMARY_KEY, last_offset);
+        snapshot_props.insert(WAL_OFFSET_PROPERTY.to_string(), last_offset.to_string());
+        tracing::debug!("Setting snapshot property: {}={}", WAL_OFFSET_PROPERTY, last_offset);
 
         let append_action = tx
             .fast_append()

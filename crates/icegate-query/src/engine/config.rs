@@ -1,8 +1,7 @@
-//! Query engine configuration
+//! Query engine configuration.
 //!
-//! Configuration for the shared `QueryEngine` that manages `DataFusion` session
-//! creation and caches the `IcebergCatalogProvider` to avoid per-query metadata
-//! fetches.
+//! Configuration for the `QueryEngine` that manages `DataFusion` session
+//! creation with fresh catalog providers built per session.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,14 +16,9 @@ const DEFAULT_TARGET_PARTITIONS: usize = 4;
 /// Default catalog name to register with `DataFusion`.
 const DEFAULT_CATALOG_NAME: &str = "iceberg";
 
-/// Default interval in seconds for refreshing the `IcebergCatalogProvider`
-/// cache.
-const DEFAULT_PROVIDER_REFRESH_SECONDS: u64 = 60;
-
 /// Configuration for the `QueryEngine`
 ///
-/// Controls `DataFusion` session parameters and catalog provider caching
-/// behavior.
+/// Controls `DataFusion` session parameters and catalog provider behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueryEngineConfig {
@@ -46,11 +40,12 @@ pub struct QueryEngineConfig {
     /// (e.g., `SELECT * FROM iceberg.icegate.logs`).
     pub catalog_name: String,
 
-    /// Interval in seconds for refreshing the `IcebergCatalogProvider` cache
+    /// WAL base path for reading hot data (e.g., `s3://queue/`).
     ///
-    /// Set to 0 to disable periodic refresh (provider only created at startup).
-    /// The cache is refreshed in a background task to avoid blocking queries.
-    pub provider_refresh_seconds: u64,
+    /// The query engine merges WAL (Write-Ahead Log) segments with Iceberg
+    /// data for near-real-time queries. This field is **required** — the
+    /// query service will refuse to start if it is empty.
+    pub wal_base_path: String,
 }
 
 impl Default for QueryEngineConfig {
@@ -59,7 +54,7 @@ impl Default for QueryEngineConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             target_partitions: DEFAULT_TARGET_PARTITIONS,
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
-            provider_refresh_seconds: DEFAULT_PROVIDER_REFRESH_SECONDS,
+            wal_base_path: String::new(),
         }
     }
 }
@@ -79,6 +74,9 @@ impl QueryEngineConfig {
         }
         if self.catalog_name.trim().is_empty() {
             return Err(QueryError::Config("catalog_name cannot be empty".into()));
+        }
+        if self.wal_base_path.trim().is_empty() {
+            return Err(QueryError::Config("wal_base_path must be configured".into()));
         }
         Ok(())
     }
