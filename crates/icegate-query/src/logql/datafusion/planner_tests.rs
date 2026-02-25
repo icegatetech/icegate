@@ -20,7 +20,7 @@ fn get_logical_plan(df: &DataFrame) -> &LogicalPlan {
     df.logical_plan()
 }
 use icegate_common::{
-    CatalogBackend, CatalogBuilder, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE, schema::logs_schema,
+    CatalogBackend, CatalogBuilder, CatalogConfig, ICEGATE_NAMESPACE, IoCacheHandle, LOGS_TABLE, schema::logs_schema,
 };
 
 use crate::logql::{
@@ -170,7 +170,7 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
         cache: None,
     };
 
-    let (iceberg_catalog, _) = CatalogBuilder::from_config(&config)
+    let iceberg_catalog = CatalogBuilder::from_config(&config, &IoCacheHandle::noop())
         .await
         .expect("Failed to create test catalog");
 

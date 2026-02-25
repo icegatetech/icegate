@@ -19,39 +19,102 @@ use crate::error::{CommonError, Result};
 /// runtime teardown. Calling [`close()`](Self::close) drains the flushers
 /// cleanly before the cache is dropped.
 ///
+/// The cache is created **outside** the catalog builder via
+/// [`from_config()`](Self::from_config) so that the same cache can be shared
+/// with other components (e.g., the WAL object store) without coupling its
+/// lifecycle to catalog construction.
+///
 /// # Usage
 ///
-/// Store this handle alongside the catalog and close it during shutdown:
-///
 /// ```ignore
-/// let (catalog, cache_handle) = CatalogBuilder::from_config(&config).await?;
+/// let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
+/// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 /// // ... run servers ...
 /// // On shutdown:
-/// if let Some(handle) = cache_handle {
-///     handle.close().await;
-/// }
+/// io_cache.close().await;
 /// ```
 pub struct IoCacheHandle {
-    cache: iceberg::io::FoyerCache,
+    cache: Option<iceberg::io::FoyerCache>,
 }
 
 impl IoCacheHandle {
-    /// Returns a reference to the underlying foyer cache.
+    /// Create a no-op handle (no cache configured).
+    ///
+    /// Useful in tests and tools that don't need IO caching.
+    #[must_use]
+    pub const fn noop() -> Self {
+        Self { cache: None }
+    }
+
+    /// Create a handle from optional cache configuration.
+    ///
+    /// When `config` is `None`, creates a no-op handle whose
+    /// [`close()`](Self::close) is a no-op and whose [`cache()`](Self::cache)
+    /// returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the foyer cache cannot be built (e.g., memory/disk
+    /// size overflow or filesystem error).
+    pub async fn from_config(config: Option<&CacheConfig>) -> Result<Self> {
+        let cache = match config {
+            Some(cache_config) => Some(Self::build_foyer_cache(cache_config).await?),
+            None => None,
+        };
+        Ok(Self { cache })
+    }
+
+    /// Returns a reference to the underlying foyer cache, if configured.
     ///
     /// Clone the returned cache to share it with other components (e.g., WAL
     /// object store). `FoyerCache` is `Arc`-based, so clones share the same
     /// cache instance.
-    pub const fn cache(&self) -> &iceberg::io::FoyerCache {
-        &self.cache
+    pub const fn cache(&self) -> Option<&iceberg::io::FoyerCache> {
+        self.cache.as_ref()
+    }
+
+    /// Create an Iceberg IO cache extension from the underlying cache.
+    ///
+    /// Returns `None` when no cache was configured.
+    fn io_cache_extension(&self) -> Option<iceberg::io::IoCacheExtension> {
+        self.cache.as_ref().map(|c| iceberg::io::IoCacheExtension::new(c.clone()))
     }
 
     /// Gracefully close the IO cache, draining background flusher tasks.
+    ///
+    /// No-op when no cache was configured.
     pub async fn close(self) {
-        tracing::info!("Closing IO cache...");
-        if let Err(e) = self.cache.close().await {
-            tracing::warn!("IO cache close returned error: {e}");
+        if let Some(cache) = self.cache {
+            tracing::info!("Closing IO cache...");
+            if let Err(e) = cache.close().await {
+                tracing::warn!("IO cache close returned error: {e}");
+            }
+            tracing::info!("IO cache closed");
         }
-        tracing::info!("IO cache closed");
+    }
+
+    /// Build the foyer hybrid cache from [`CacheConfig`].
+    async fn build_foyer_cache(config: &CacheConfig) -> Result<iceberg::io::FoyerCache> {
+        let memory_bytes = config.memory_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+            CommonError::Config(format!(
+                "memory_size_mb ({}) overflows when converted to bytes",
+                config.memory_size_mb
+            ))
+        })?;
+        let disk_bytes = config.disk_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+            CommonError::Config(format!(
+                "disk_size_mb ({}) overflows when converted to bytes",
+                config.disk_size_mb
+            ))
+        })?;
+
+        foyer::HybridCacheBuilder::new()
+            .memory(memory_bytes)
+            .storage(foyer::Engine::mixed())
+            .with_device_options(foyer::DirectFsDeviceOptions::new(&config.disk_dir).with_capacity(disk_bytes))
+            .build()
+            .await
+            .map_err(|e| CommonError::Config(format!("Failed to build IO cache: {e}")))
     }
 }
 
@@ -61,20 +124,18 @@ pub struct CatalogBuilder;
 impl CatalogBuilder {
     /// Create a catalog from configuration.
     ///
-    /// Returns the catalog and an optional [`IoCacheHandle`]. When a cache is
-    /// configured, the handle **must** be closed during shutdown to avoid
-    /// foyer flusher errors. See [`IoCacheHandle::close`].
+    /// The `io_cache` handle is created **before** calling this method (via
+    /// [`IoCacheHandle::from_config`]) so the same cache can be shared with
+    /// other components (e.g., WAL object store) without coupling its
+    /// lifecycle to catalog construction.
     ///
     /// # Errors
     ///
     /// Returns an error if the catalog cannot be created
-    pub async fn from_config(config: &CatalogConfig) -> Result<(Arc<dyn Catalog>, Option<IoCacheHandle>)> {
+    pub async fn from_config(config: &CatalogConfig, io_cache: &IoCacheHandle) -> Result<Arc<dyn Catalog>> {
         match &config.backend {
-            CatalogBackend::Memory => {
-                let catalog = Self::create_memory_catalog(config).await?;
-                Ok((catalog, None))
-            }
-            CatalogBackend::Rest { uri } => Self::create_rest_catalog(config, uri).await,
+            CatalogBackend::Memory => Self::create_memory_catalog(config).await,
+            CatalogBackend::Rest { uri } => Self::create_rest_catalog(config, uri, io_cache).await,
         }
     }
 
@@ -102,7 +163,8 @@ impl CatalogBuilder {
     async fn create_rest_catalog(
         config: &CatalogConfig,
         uri: &str,
-    ) -> Result<(Arc<dyn Catalog>, Option<IoCacheHandle>)> {
+        io_cache: &IoCacheHandle,
+    ) -> Result<Arc<dyn Catalog>> {
         // Build REST catalog properties
         let mut properties = HashMap::new();
         properties.insert("uri".to_string(), uri.to_string());
@@ -117,19 +179,17 @@ impl CatalogBuilder {
         let mut catalog = RestCatalogBuilder::default().load("rest", properties).await?;
 
         // Apply IO cache extension if configured
-        let cache_handle = if let Some(ref cache_config) = config.cache {
-            let (io_cache, handle) = Self::build_io_cache(cache_config).await?;
-            catalog = catalog.with_file_io_extension(io_cache);
-            tracing::info!(
-                memory_mb = cache_config.memory_size_mb,
-                disk_mb = cache_config.disk_size_mb,
-                disk_dir = %cache_config.disk_dir,
-                "IO cache enabled for REST catalog"
-            );
-            Some(handle)
-        } else {
-            None
-        };
+        if let Some(ext) = io_cache.io_cache_extension() {
+            catalog = catalog.with_file_io_extension(ext);
+            if let Some(ref cache_config) = config.cache {
+                tracing::info!(
+                    memory_mb = cache_config.memory_size_mb,
+                    disk_mb = cache_config.disk_size_mb,
+                    disk_dir = %cache_config.disk_dir,
+                    "IO cache enabled for REST catalog"
+                );
+            }
+        }
 
         tracing::info!(
             uri = %uri,
@@ -137,40 +197,6 @@ impl CatalogBuilder {
             "Created REST catalog"
         );
 
-        Ok((Arc::new(catalog), cache_handle))
-    }
-
-    /// Build a foyer hybrid cache from [`CacheConfig`].
-    ///
-    /// Returns the `IoCacheConfig` for the Iceberg catalog and an
-    /// [`IoCacheHandle`] for graceful shutdown.
-    async fn build_io_cache(config: &CacheConfig) -> Result<(iceberg::io::IoCacheConfig, IoCacheHandle)> {
-        let memory_bytes = config.memory_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
-            CommonError::Config(format!(
-                "memory_size_mb ({}) overflows when converted to bytes",
-                config.memory_size_mb
-            ))
-        })?;
-        let disk_bytes = config.disk_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
-            CommonError::Config(format!(
-                "disk_size_mb ({}) overflows when converted to bytes",
-                config.disk_size_mb
-            ))
-        })?;
-
-        let cache: iceberg::io::FoyerCache = foyer::HybridCacheBuilder::new()
-            .memory(memory_bytes)
-            .storage(foyer::Engine::mixed())
-            .with_device_options(foyer::DirectFsDeviceOptions::new(&config.disk_dir).with_capacity(disk_bytes))
-            .build()
-            .await
-            .map_err(|e| CommonError::Config(format!("Failed to build IO cache: {e}")))?;
-
-        // Clone the cache handle before wrapping it — HybridCache is Arc-based,
-        // so both the IoCacheConfig and IoCacheHandle share the same underlying
-        // cache. Closing either handle drains the shared flusher tasks.
-        let handle = IoCacheHandle { cache: cache.clone() };
-
-        Ok((iceberg::io::IoCacheConfig::new(cache), handle))
+        Ok(Arc::new(catalog))
     }
 }

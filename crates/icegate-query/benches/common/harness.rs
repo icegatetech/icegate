@@ -26,7 +26,9 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use icegate_common::{CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE, catalog::CatalogBuilder, schema};
+use icegate_common::{
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoCacheHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
+};
 use icegate_query::engine::{QueryEngine, QueryEngineConfig};
 use icegate_query::loki::LokiConfig;
 use rand::Rng;
@@ -62,7 +64,7 @@ impl TestServer {
             port: 0,
         };
 
-        let (catalog, _) = CatalogBuilder::from_config(&catalog_config).await?;
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoCacheHandle::noop()).await?;
 
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
 

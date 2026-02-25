@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icegate_common::{MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
+use icegate_common::{IoCacheHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use tokio_util::sync::CancellationToken;
 
@@ -88,7 +88,8 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
-    let (catalog, io_cache_handle) = CatalogBuilder::from_config(&config.catalog).await?;
+    let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
     let queue_reader = Arc::new(ParquetQueueReader::new(
@@ -168,9 +169,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         // Orderly shutdown: close channel so writer loop can exit, then await it
         drop(write_tx);
         writer_handle.await??;
-        if let Some(handle) = io_cache_handle {
-            handle.close().await;
-        }
+        io_cache.close().await;
         return Ok(());
     }
 
@@ -203,9 +202,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     writer_handle.await??;
 
     // Gracefully close the IO cache to drain foyer's background flusher tasks.
-    if let Some(handle) = io_cache_handle {
-        handle.close().await;
-    }
+    io_cache.close().await;
 
     // Keep tracing guard alive until the very end
     drop(tracing_guard);

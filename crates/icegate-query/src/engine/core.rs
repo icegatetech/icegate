@@ -31,7 +31,7 @@ use crate::error::{QueryError, Result};
 /// # Usage
 ///
 /// ```ignore
-/// let (catalog, _) = CatalogBuilder::from_config(&config.catalog).await?;
+/// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 /// let engine = Arc::new(QueryEngine::new(catalog, config, (wal_store, wal_url)));
 ///
 /// // In handlers:

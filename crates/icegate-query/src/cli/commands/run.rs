@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use datafusion::execution::object_store::ObjectStoreUrl;
-use icegate_common::{CatalogBuilder, MetricsRuntime, create_object_store, run_metrics_server};
+use icegate_common::{CatalogBuilder, IoCacheHandle, MetricsRuntime, create_object_store, run_metrics_server};
 use tokio_util::sync::CancellationToken;
 
 use crate::{QueryConfig, engine::QueryEngine, error::QueryError, infra::metrics::QueryMetrics};
@@ -52,7 +52,8 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     // Initialize catalog
     tracing::info!("Initializing catalog");
-    let (catalog, io_cache_handle) = CatalogBuilder::from_config(&config.catalog).await?;
+    let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 
     tracing::info!("Catalog initialized successfully");
 
@@ -62,7 +63,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Extract the shared foyer cache and size limit from the IO cache handle
     // so the WAL object store can share the same hybrid cache as the Iceberg
     // catalog.
-    let foyer_cache = io_cache_handle.as_ref().map(|h| h.cache().clone());
+    let foyer_cache = io_cache.cache().cloned();
     let cache_object_size_limit = config
         .catalog
         .cache
@@ -168,9 +169,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     if handles.is_empty() {
         tracing::warn!("No query servers are enabled in configuration");
-        if let Some(handle) = io_cache_handle {
-            handle.close().await;
-        }
+        io_cache.close().await;
         return Ok(());
     }
 
@@ -196,9 +195,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     // Gracefully close the IO cache to drain foyer's background flusher tasks.
     // This prevents "sending on a closed channel" errors during runtime teardown.
-    if let Some(handle) = io_cache_handle {
-        handle.close().await;
-    }
+    io_cache.close().await;
 
     // Keep tracing guard alive until the very end
     drop(tracing_guard);

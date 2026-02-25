@@ -34,7 +34,9 @@ use iceberg::{
         },
     },
 };
-use icegate_common::{CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, LOGS_TABLE, catalog::CatalogBuilder, schema};
+use icegate_common::{
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoCacheHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
+};
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
     loki::LokiConfig,
@@ -75,7 +77,7 @@ impl TestServer {
             port: 0,
         };
 
-        let (catalog, _) = CatalogBuilder::from_config(&catalog_config).await?;
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoCacheHandle::noop()).await?;
 
         // Create namespace and table
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
