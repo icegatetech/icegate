@@ -85,10 +85,11 @@ impl TestServer {
 
         // Provide an in-memory WAL store — WAL scan finds 0 segments,
         // which is correct for benchmarks that only write to Iceberg.
+        let wal_base_path = "wal://bench";
         let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let wal_url = ObjectStoreUrl::parse("wal://bench").unwrap();
+        let wal_url = ObjectStoreUrl::parse(wal_base_path).unwrap();
         let engine_config = QueryEngineConfig {
-            wal_base_path: "wal://bench".to_string(),
+            wal_base_path: wal_base_path.to_string(),
             ..QueryEngineConfig::default()
         };
         let query_engine = Arc::new(QueryEngine::new(

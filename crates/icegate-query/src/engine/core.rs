@@ -19,7 +19,7 @@ use object_store::ObjectStore;
 
 use super::QueryEngineConfig;
 use super::provider::IcegateCatalogProvider;
-use crate::error::{QueryError, Result};
+use crate::error::Result;
 
 /// Query execution engine with per-session catalog provider.
 ///
@@ -120,8 +120,7 @@ impl QueryEngine {
                 self.config.wal_base_path.clone(),
                 self.config.batch_size,
             )
-            .await
-            .map_err(|e| QueryError::Config(format!("Failed to create IcegateCatalogProvider: {e}")))?;
+            .await?;
             Arc::new(p)
         };
 
