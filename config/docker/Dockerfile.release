@@ -20,6 +20,7 @@ RUN cargo build --release --workspace --bins
 FROM debian:bookworm-slim AS runtime
 
 ARG BINARY
+RUN test -n "$BINARY" || { echo "ERROR: BINARY build-arg is required"; exit 1; }
 ARG VERSION
 ARG REVISION
 ARG BUILD_DATE

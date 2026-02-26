@@ -23,7 +23,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Free Disk Space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: true
           android: true
@@ -44,17 +44,6 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Validate tag matches Cargo.toml
-        run: |
-          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          TAG="${GITHUB_REF_NAME}"
-          TAG_VERSION="${TAG#v}"
-          TAG_BASE="${TAG_VERSION%%-*}"
-          if [ "$CARGO_VERSION" != "$TAG_BASE" ]; then
-            echo "::error::Tag version (${TAG_BASE}) does not match Cargo.toml (${CARGO_VERSION})"
-            exit 1
-          fi
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -64,6 +53,17 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
+
+      - name: Validate tag matches Cargo.toml
+        run: |
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')
+          TAG="${GITHUB_REF_NAME}"
+          TAG_VERSION="${TAG#v}"
+          TAG_BASE="${TAG_VERSION%%-*}"
+          if [ "$CARGO_VERSION" != "$TAG_BASE" ]; then
+            echo "::error::Tag version (${TAG_BASE}) does not match Cargo.toml (${CARGO_VERSION})"
+            exit 1
+          fi
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -95,7 +95,7 @@ jobs:
         binary: [query, ingest, maintain]
     steps:
       - name: Free Disk Space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: true
           android: true
@@ -121,6 +121,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Generate build timestamp
+        id: timestamp
+        run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -129,7 +133,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -144,7 +148,7 @@ jobs:
             BINARY=${{ matrix.binary }}
             VERSION=${{ needs.ci-gate.outputs.version }}
             REVISION=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            BUILD_DATE=${{ steps.timestamp.outputs.value }}
           cache-from: type=gha,scope=release-builder
           cache-to: type=gha,mode=max,scope=release-builder
 
