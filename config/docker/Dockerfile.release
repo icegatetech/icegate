@@ -1,0 +1,41 @@
+# ── Builder stages (shared across all binary images) ────────────────────────
+FROM rust:bookworm AS chef
+RUN cargo install cargo-chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY ./crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+ENV RUSTFLAGS="--cfg tokio_unstable"
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY ./crates ./crates
+COPY Cargo.toml Cargo.lock ./
+RUN cargo build --release --workspace --bins
+
+# ── Runtime (one binary per image) ──────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+ARG BINARY
+ARG VERSION
+ARG REVISION
+ARG BUILD_DATE
+
+LABEL org.opencontainers.image.title="icegate-${BINARY}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.source="https://github.com/icegatetech/icegate" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/${BINARY} /usr/local/bin/${BINARY}
+RUN ln -s /usr/local/bin/${BINARY} /usr/local/bin/entrypoint
+
+USER nobody
+ENTRYPOINT ["/usr/local/bin/entrypoint"]
