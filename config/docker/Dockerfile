@@ -19,6 +19,8 @@ RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") --workspace --
 FROM debian:bookworm-slim
 ARG PROFILE=release
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/${PROFILE}/ /usr/local/bin/
+COPY --from=builder /app/target/${PROFILE}/query    /usr/local/bin/query
+COPY --from=builder /app/target/${PROFILE}/ingest   /usr/local/bin/ingest
+COPY --from=builder /app/target/${PROFILE}/maintain  /usr/local/bin/maintain
 USER nobody
 ENTRYPOINT ["/bin/sh", "-c", "exec \"$@\"", "--"]

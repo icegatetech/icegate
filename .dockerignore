@@ -1,4 +1,14 @@
-config
-docs
-target
+target/
+config/
+docs/
+.git/
+.github/
+.idea/
+.vscode/
+.claude/
+.DS_Store
 Makefile
+output.txt
+LICENSE
+*.md
+!crates/**/*.md
