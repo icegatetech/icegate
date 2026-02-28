@@ -131,9 +131,9 @@ impl CatalogConfig {
             }
             CatalogBackend::Glue { catalog_id } => {
                 if let Some(id) = catalog_id {
-                    if id.trim().is_empty() {
+                    if id.len() != 12 || !id.bytes().all(|b| b.is_ascii_digit()) {
                         return Err(CommonError::Config(
-                            "Glue catalog_id, when specified, cannot be empty".into(),
+                            "Glue catalog_id must be a 12-digit AWS account ID".into(),
                         ));
                     }
                 }
