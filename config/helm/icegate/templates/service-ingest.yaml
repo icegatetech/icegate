@@ -1,4 +1,4 @@
-{{- if .Values.ingest.enabled -}}
+{{- if and .Values.ingest.enabled (or .Values.ingest.otlpGrpc.enabled .Values.ingest.otlpHttp.enabled .Values.ingest.metrics.enabled) -}}
 apiVersion: v1
 kind: Service
 metadata:

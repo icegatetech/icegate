@@ -150,7 +150,7 @@ query:
   livenessProbe:
     httpGet:
       path: /ready
-      port: loki
+      port: 3100
     initialDelaySeconds: 15
     periodSeconds: 20
     timeoutSeconds: 5
@@ -158,7 +158,7 @@ query:
   readinessProbe:
     httpGet:
       path: /ready
-      port: loki
+      port: 3100
     initialDelaySeconds: 5
     periodSeconds: 10
     timeoutSeconds: 5
@@ -288,14 +288,14 @@ ingest:
   ## Liveness and readiness probe overrides
   livenessProbe:
     tcpSocket:
-      port: otlp-grpc
+      port: 4317
     initialDelaySeconds: 15
     periodSeconds: 20
     timeoutSeconds: 5
     failureThreshold: 3
   readinessProbe:
     tcpSocket:
-      port: otlp-grpc
+      port: 4317
     initialDelaySeconds: 5
     periodSeconds: 10
     timeoutSeconds: 5

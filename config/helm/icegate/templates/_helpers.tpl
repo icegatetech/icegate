@@ -114,9 +114,11 @@ properties:
 {{- end }}
 {{- end }}
 {{- else if eq .Values.catalog.backend "glue" -}}
-backend: !glue
 {{- if .Values.catalog.glue.catalogId }}
+backend: !glue
   catalog_id: {{ .Values.catalog.glue.catalogId }}
+{{- else }}
+backend: !glue {}
 {{- end }}
 warehouse: {{ .Values.catalog.warehouse }}
 {{- if .Values.catalog.properties }}
