@@ -85,14 +85,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-  # ── Docker images (3 binaries x multi-arch) ──────────────────────────────
+  # ── Docker images (3 binaries x multi-arch via buildx bake) ──────────────
   docker:
-    name: Docker ${{ matrix.binary }}
+    name: Docker Images
     needs: ci-gate
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        binary: [query, ingest, maintain]
     steps:
       - name: Free Disk Space
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -125,32 +122,59 @@ jobs:
         id: timestamp
         run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
-      - name: Docker metadata
-        id: meta
+      - name: Docker metadata (query)
+        id: meta-query
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_PREFIX }}-${{ matrix.binary }}
+          images: ${{ env.IMAGE_PREFIX }}-query
+          bake-target: query
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Docker metadata (ingest)
+        id: meta-ingest
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-ingest
+          bake-target: ingest
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Docker metadata (maintain)
+        id: meta-maintain
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-maintain
+          bake-target: maintain
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/bake-action@v6
         with:
-          context: .
-          file: config/docker/Dockerfile.release
-          platforms: linux/amd64,linux/arm64
+          source: .
+          files: |
+            config/docker/docker-bake.hcl
+            ${{ steps.meta-query.outputs.bake-file-tags }}
+            ${{ steps.meta-query.outputs.bake-file-labels }}
+            ${{ steps.meta-ingest.outputs.bake-file-tags }}
+            ${{ steps.meta-ingest.outputs.bake-file-labels }}
+            ${{ steps.meta-maintain.outputs.bake-file-tags }}
+            ${{ steps.meta-maintain.outputs.bake-file-labels }}
+          targets: default
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            BINARY=${{ matrix.binary }}
-            VERSION=${{ needs.ci-gate.outputs.version }}
-            REVISION=${{ github.sha }}
-            BUILD_DATE=${{ steps.timestamp.outputs.value }}
-          cache-from: type=gha,scope=release-builder
-          cache-to: type=gha,mode=max,scope=release-builder
+          set: |
+            *.args.VERSION=${{ needs.ci-gate.outputs.version }}
+            *.args.REVISION=${{ github.sha }}
+            *.args.BUILD_DATE=${{ steps.timestamp.outputs.value }}
+            *.cache-from=type=gha,scope=release-builder
+            *.cache-to=type=gha,mode=max,scope=release-builder
 
   # ── Helm chart (OCI artifact → GHCR) ─────────────────────────────────────
   helm-chart:
