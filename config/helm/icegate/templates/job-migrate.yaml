@@ -1,0 +1,57 @@
+{{- if .Values.migrate.enabled -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "migrate") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": {{ .Values.migrate.hookDeletePolicy }}
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrate.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "icegate.componentLabels" (dict "context" . "component" "migrate") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icegate.serviceAccountName" . }}
+      securityContext:
+        {{- include "icegate.podSecurityContext" . | nindent 8 }}
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: {{ include "icegate.image" (dict "image" .Values.migrate.image "tag" .Chart.AppVersion) }}
+          imagePullPolicy: {{ .Values.migrate.image.pullPolicy }}
+          command:
+            - /usr/local/bin/entrypoint
+            - migrate
+            - create
+            - --config
+            - /etc/icegate/maintain.yaml
+          securityContext:
+            {{- include "icegate.containerSecurityContext" . | nindent 12 }}
+          env:
+            {{- include "icegate.awsEnv" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/icegate
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "icegate.componentName" (dict "context" . "component" "maintain") }}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

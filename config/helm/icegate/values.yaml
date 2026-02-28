@@ -1,0 +1,334 @@
+## Global settings
+global:
+  nameOverride: ""
+  fullnameOverride: ""
+  imagePullSecrets: []
+
+## ServiceAccount
+serviceAccount:
+  create: true
+  ## Annotations for the ServiceAccount (e.g. for AWS IRSA)
+  ## eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/icegate
+  annotations: {}
+  name: ""
+
+## Iceberg catalog configuration (shared by all components)
+catalog:
+  ## Backend type: "rest", "s3tables", or "glue"
+  backend: rest
+  ## REST catalog settings (used when backend=rest)
+  rest:
+    uri: http://nessie:19120/iceberg
+  ## S3 Tables settings (used when backend=s3tables)
+  s3tables:
+    tableBucketArn: ""
+  ## AWS Glue settings (used when backend=glue)
+  glue:
+    ## AWS Glue catalog ID (optional; omit or leave empty for default account catalog)
+    catalogId: ""
+  ## Iceberg warehouse location
+  warehouse: "s3://warehouse/"
+  ## Additional catalog properties
+  properties:
+    prefix: main
+
+## Storage configuration (shared by all components)
+storage:
+  s3:
+    bucket: warehouse
+    region: us-east-1
+    ## Optional S3-compatible endpoint (e.g. MinIO). Omit for real AWS S3.
+    endpoint: ""
+
+## AWS credentials
+aws:
+  ## Name of an existing Secret containing aws-access-key-id and aws-secret-access-key keys.
+  ## Leave empty when using IRSA/Workload Identity.
+  existingSecret: ""
+  region: us-east-1
+
+## ---------------------------------------------------------------------------
+## Query component
+## ---------------------------------------------------------------------------
+query:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/icegatetech/icegate-query
+    tag: ""  # defaults to Chart.appVersion
+    pullPolicy: IfNotPresent
+
+  ## Query engine settings
+  engine:
+    walBasePath: "s3://queue/"
+    batchSize: 8192
+    targetPartitions: 4
+    catalogName: iceberg
+
+  ## FileIO cache configuration (optional)
+  cache:
+    enabled: true
+    memorySizeMb: 1024
+    diskDir: /tmp/icegate/cache
+    diskSizeMb: 4096
+    objectSizeLimitMb: 16
+    ## emptyDir sizeLimit for the disk cache volume
+    volumeSizeLimit: 5Gi
+
+  ## Loki API
+  loki:
+    enabled: true
+    port: 3100
+
+  ## Prometheus API
+  prometheus:
+    enabled: true
+    port: 9090
+
+  ## Tempo API
+  tempo:
+    enabled: true
+    port: 3200
+
+  ## Prometheus metrics endpoint
+  metrics:
+    enabled: true
+    port: 9091
+    path: /metrics
+
+  ## OpenTelemetry tracing
+  tracing:
+    enabled: true
+    otlpEndpoint: ""
+    sampleRatio: 1.0
+
+  ## RUST_LOG level
+  rustLog: "info"
+
+  ## Extra environment variables
+  extraEnv: []
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 4Gi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+  ## Service
+  service:
+    type: ClusterIP
+    annotations: {}
+
+  ## Ingress
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    #  - host: loki.example.com
+    #    paths:
+    #      - path: /
+    #        pathType: Prefix
+    #        port: 3100
+    tls: []
+
+  ## PodDisruptionBudget
+  pdb:
+    enabled: false
+    minAvailable: 1
+    # maxUnavailable: 1
+
+  ## Liveness and readiness probe overrides
+  livenessProbe:
+    httpGet:
+      path: /ready
+      port: 3100
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: 3100
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+## ---------------------------------------------------------------------------
+## Ingest component
+## ---------------------------------------------------------------------------
+ingest:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/icegatetech/icegate-ingest
+    tag: ""  # defaults to Chart.appVersion
+    pullPolicy: IfNotPresent
+
+  ## Queue (WAL) configuration
+  queue:
+    enabled: true
+    common:
+      basePath: "s3://queue/"
+      channelCapacity: 1024
+      maxRowGroupSize: 8192
+    write:
+      writeRetries: 3
+      compression: zstd
+      recordsPerFlushMultiplier: 1
+      maxBytesPerFlush: 67108864
+      flushIntervalMs: 200
+
+  ## Shift configuration (WAL -> Iceberg)
+  shift:
+    read:
+      maxRecordBatchesPerTask: 128
+      maxInputBytesPerTask: 67108864
+    write:
+      rowGroupSize: 8192
+      maxFileSizeMb: 64
+      tableCacheTtlSecs: 60
+    timeouts:
+      planBaseMs: 10000
+      shiftBaseMs: 10000
+      shiftPerRecordBatchMs: 50
+      shiftPerSegmentMs: 300
+      commitBaseMs: 30000
+      commitPerParquetFileMs: 100
+    jobsmanager:
+      workerCount: 2
+      pollIntervalMs: 1000
+      iterationIntervalMillisecs: 30000
+      storage:
+        ## Defaults to storage.s3.endpoint when empty
+        endpoint: ""
+        bucket: jobs
+        prefix: shifter
+        region: ""  # defaults to aws.region
+        useSsl: false
+        jobStateCodec: json
+        requestTimeoutSecs: 5
+
+  ## OTLP HTTP receiver
+  otlpHttp:
+    enabled: true
+    port: 4318
+
+  ## OTLP gRPC receiver
+  otlpGrpc:
+    enabled: true
+    port: 4317
+
+  ## Prometheus metrics endpoint
+  metrics:
+    enabled: true
+    port: 9091
+    path: /metrics
+
+  ## OpenTelemetry tracing
+  tracing:
+    enabled: true
+    otlpEndpoint: ""
+    sampleRatio: 1.0
+
+  ## RUST_LOG level
+  rustLog: "info"
+
+  ## Extra environment variables
+  extraEnv: []
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+  ## Service
+  service:
+    type: ClusterIP
+    annotations: {}
+
+  ## Ingress
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    #  - host: otlp.example.com
+    #    paths:
+    #      - path: /
+    #        pathType: Prefix
+    #        port: 4318
+    tls: []
+
+  ## PodDisruptionBudget
+  pdb:
+    enabled: false
+    minAvailable: 1
+    # maxUnavailable: 1
+
+  ## Liveness and readiness probe overrides
+  livenessProbe:
+    tcpSocket:
+      port: 4317
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    tcpSocket:
+      port: 4317
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+## ---------------------------------------------------------------------------
+## Migrate (Helm hook)
+## ---------------------------------------------------------------------------
+migrate:
+  enabled: true
+
+  image:
+    repository: ghcr.io/icegatetech/icegate-maintain
+    tag: ""  # defaults to Chart.appVersion
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  hookDeletePolicy: before-hook-creation
+
+## ---------------------------------------------------------------------------
+## ServiceMonitor (Prometheus Operator)
+## ---------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}

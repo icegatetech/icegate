@@ -1,0 +1,75 @@
+{{- if .Values.ingest.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "ingest") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 4 }}
+data:
+  ingest.yaml: |
+    catalog:
+      {{- include "icegate.catalogYaml" . | nindent 6 }}
+    storage:
+      {{- include "icegate.storageYaml" . | nindent 6 }}
+    {{- if .Values.ingest.queue.enabled }}
+    queue:
+      common:
+        base_path: {{ .Values.ingest.queue.common.basePath | quote }}
+        channel_capacity: {{ .Values.ingest.queue.common.channelCapacity }}
+        max_row_group_size: {{ .Values.ingest.queue.common.maxRowGroupSize }}
+      write:
+        write_retries: {{ .Values.ingest.queue.write.writeRetries }}
+        compression: {{ .Values.ingest.queue.write.compression }}
+        records_per_flush_multiplier: {{ .Values.ingest.queue.write.recordsPerFlushMultiplier }}
+        max_bytes_per_flush: {{ .Values.ingest.queue.write.maxBytesPerFlush | int }}
+        flush_interval_ms: {{ .Values.ingest.queue.write.flushIntervalMs }}
+      read: {}
+    {{- end }}
+    shift:
+      read:
+        max_record_batches_per_task: {{ .Values.ingest.shift.read.maxRecordBatchesPerTask }}
+        max_input_bytes_per_task: {{ .Values.ingest.shift.read.maxInputBytesPerTask | int }}
+      write:
+        row_group_size: {{ .Values.ingest.shift.write.rowGroupSize }}
+        max_file_size_mb: {{ .Values.ingest.shift.write.maxFileSizeMb }}
+        table_cache_ttl_secs: {{ .Values.ingest.shift.write.tableCacheTtlSecs }}
+      timeouts:
+        plan_base_ms: {{ .Values.ingest.shift.timeouts.planBaseMs }}
+        shift_base_ms: {{ .Values.ingest.shift.timeouts.shiftBaseMs }}
+        shift_per_record_batch_ms: {{ .Values.ingest.shift.timeouts.shiftPerRecordBatchMs }}
+        shift_per_segment_ms: {{ .Values.ingest.shift.timeouts.shiftPerSegmentMs }}
+        commit_base_ms: {{ .Values.ingest.shift.timeouts.commitBaseMs }}
+        commit_per_parquet_file_ms: {{ .Values.ingest.shift.timeouts.commitPerParquetFileMs }}
+      jobsmanager:
+        worker_count: {{ .Values.ingest.shift.jobsmanager.workerCount }}
+        poll_interval_ms: {{ .Values.ingest.shift.jobsmanager.pollIntervalMs }}
+        iteration_interval_millisecs: {{ .Values.ingest.shift.jobsmanager.iterationIntervalMillisecs }}
+        storage:
+          endpoint: {{ .Values.ingest.shift.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          bucket: {{ .Values.ingest.shift.jobsmanager.storage.bucket | quote }}
+          prefix: {{ .Values.ingest.shift.jobsmanager.storage.prefix | quote }}
+          region: {{ .Values.ingest.shift.jobsmanager.storage.region | default .Values.aws.region | quote }}
+          use_ssl: {{ .Values.ingest.shift.jobsmanager.storage.useSsl }}
+          job_state_codec: {{ .Values.ingest.shift.jobsmanager.storage.jobStateCodec }}
+          request_timeout_secs: {{ .Values.ingest.shift.jobsmanager.storage.requestTimeoutSecs }}
+    otlp_http:
+      enabled: {{ .Values.ingest.otlpHttp.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.ingest.otlpHttp.port }}
+    otlp_grpc:
+      enabled: {{ .Values.ingest.otlpGrpc.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.ingest.otlpGrpc.port }}
+    metrics:
+      enabled: {{ .Values.ingest.metrics.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.ingest.metrics.port }}
+      path: {{ .Values.ingest.metrics.path | quote }}
+    tracing:
+      enabled: {{ .Values.ingest.tracing.enabled }}
+      {{- if .Values.ingest.tracing.otlpEndpoint }}
+      otlp_endpoint: {{ .Values.ingest.tracing.otlpEndpoint | quote }}
+      {{- end }}
+      sample_ratio: {{ .Values.ingest.tracing.sampleRatio }}
+{{- end }}

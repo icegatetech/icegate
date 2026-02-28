@@ -1,0 +1,38 @@
+IceGate has been deployed to namespace {{ .Release.Namespace }}.
+
+{{- if .Values.query.enabled }}
+
+=== Query Service ===
+
+{{- if .Values.query.loki.enabled }}
+Loki API (port {{ .Values.query.loki.port }}):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "query") }} {{ .Values.query.loki.port }}:{{ .Values.query.loki.port }}
+{{- end }}
+
+{{- if .Values.query.prometheus.enabled }}
+Prometheus API (port {{ .Values.query.prometheus.port }}):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "query") }} {{ .Values.query.prometheus.port }}:{{ .Values.query.prometheus.port }}
+{{- end }}
+
+{{- if .Values.query.tempo.enabled }}
+Tempo API (port {{ .Values.query.tempo.port }}):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "query") }} {{ .Values.query.tempo.port }}:{{ .Values.query.tempo.port }}
+{{- end }}
+
+{{- end }}
+
+{{- if .Values.ingest.enabled }}
+
+=== Ingest Service ===
+
+{{- if .Values.ingest.otlpGrpc.enabled }}
+OTLP gRPC (port {{ .Values.ingest.otlpGrpc.port }}):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "ingest") }} {{ .Values.ingest.otlpGrpc.port }}:{{ .Values.ingest.otlpGrpc.port }}
+{{- end }}
+
+{{- if .Values.ingest.otlpHttp.enabled }}
+OTLP HTTP (port {{ .Values.ingest.otlpHttp.port }}):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "ingest") }} {{ .Values.ingest.otlpHttp.port }}:{{ .Values.ingest.otlpHttp.port }}
+{{- end }}
+
+{{- end }}
