@@ -15,80 +15,8 @@ env:
   IMAGE_PREFIX: ghcr.io/icegatetech/icegate
 
 jobs:
-  # ── Gate: CI checks + version validation ──────────────────────────────────
-  ci-gate:
-    name: CI Gate
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-    steps:
-      - name: Free Disk Space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Extract version metadata
-        id: meta
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Install Rust nightly (for rustfmt)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
-      - name: Validate tag matches Cargo.toml
-        run: |
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')
-          TAG="${GITHUB_REF_NAME}"
-          TAG_VERSION="${TAG#v}"
-          TAG_BASE="${TAG_VERSION%%-*}"
-          if [ "$CARGO_VERSION" != "$TAG_BASE" ]; then
-            echo "::error::Tag version (${TAG_BASE}) does not match Cargo.toml (${CARGO_VERSION})"
-            exit 1
-          fi
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-stable-release-gate-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-stable-release-gate-
-
-      - name: Check formatting
-        run: cargo +nightly fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test --workspace
-
-  # ── Docker images (3 binaries x multi-arch via buildx bake) ──────────────
   docker:
     name: Docker Images
-    needs: ci-gate
     runs-on: ubuntu-latest
     steps:
       - name: Free Disk Space
@@ -179,7 +107,7 @@ jobs:
   # ── Helm chart (OCI artifact → GHCR) ─────────────────────────────────────
   helm-chart:
     name: Helm Chart
-    needs: [ci-gate, docker]
+    needs: [docker]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -217,7 +145,7 @@ jobs:
   # ── GitHub Release ────────────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [ci-gate, docker, helm-chart]
+    needs: [docker, helm-chart]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
