@@ -1,0 +1,36 @@
+{{- if .Values.ingest.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "ingest") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 4 }}
+  {{- with .Values.ingest.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.ingest.service.type }}
+  selector:
+    {{- include "icegate.selectorLabels" (dict "context" . "component" "ingest") | nindent 4 }}
+  ports:
+    {{- if .Values.ingest.otlpGrpc.enabled }}
+    - name: otlp-grpc
+      port: {{ .Values.ingest.otlpGrpc.port }}
+      targetPort: otlp-grpc
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.ingest.otlpHttp.enabled }}
+    - name: otlp-http
+      port: {{ .Values.ingest.otlpHttp.port }}
+      targetPort: otlp-http
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.ingest.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.ingest.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}
+{{- end }}

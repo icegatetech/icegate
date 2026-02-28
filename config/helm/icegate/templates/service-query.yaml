@@ -1,0 +1,42 @@
+{{- if .Values.query.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "query") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "query") | nindent 4 }}
+  {{- with .Values.query.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.query.service.type }}
+  selector:
+    {{- include "icegate.selectorLabels" (dict "context" . "component" "query") | nindent 4 }}
+  ports:
+    {{- if .Values.query.loki.enabled }}
+    - name: loki
+      port: {{ .Values.query.loki.port }}
+      targetPort: loki
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.query.prometheus.enabled }}
+    - name: prometheus
+      port: {{ .Values.query.prometheus.port }}
+      targetPort: prometheus
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.query.tempo.enabled }}
+    - name: tempo
+      port: {{ .Values.query.tempo.port }}
+      targetPort: tempo
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.query.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.query.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}
+{{- end }}

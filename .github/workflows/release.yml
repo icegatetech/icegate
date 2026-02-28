@@ -152,10 +152,48 @@ jobs:
           cache-from: type=gha,scope=release-builder
           cache-to: type=gha,mode=max,scope=release-builder
 
+  # ── Helm chart (OCI artifact → GHCR) ─────────────────────────────────────
+  helm-chart:
+    name: Helm Chart
+    needs: [ci-gate, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Log in to GHCR
+        env:
+          HELM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HELM_USER: ${{ github.actor }}
+        run: echo "${HELM_TOKEN}" | helm registry login ghcr.io --username "${HELM_USER}" --password-stdin
+
+      - name: Stamp chart version
+        env:
+          VERSION: ${{ needs.ci-gate.outputs.version }}
+        run: |
+          sed -i "s/^version:.*/version: ${VERSION}/" config/helm/icegate/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" config/helm/icegate/Chart.yaml
+
+      - name: Lint chart
+        run: helm lint config/helm/icegate
+
+      - name: Package chart
+        run: helm package config/helm/icegate
+
+      - name: Push chart to GHCR
+        env:
+          VERSION: ${{ needs.ci-gate.outputs.version }}
+        run: helm push "icegate-${VERSION}.tgz" oci://ghcr.io/icegatetech/icegate/charts
+
   # ── GitHub Release ────────────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [ci-gate, docker]
+    needs: [ci-gate, docker, helm-chart]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -173,6 +211,12 @@ jobs:
           PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${TAG}$" | head -n1)
 
           cat <<EOF > notes.md
+          ## Helm Chart
+
+          \`\`\`bash
+          helm install icegate oci://ghcr.io/icegatetech/icegate/charts/icegate --version ${VERSION}
+          \`\`\`
+
           ## Docker Images
 
           \`\`\`bash

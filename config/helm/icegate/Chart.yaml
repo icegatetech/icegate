@@ -1,0 +1,27 @@
+apiVersion: v2
+name: icegate
+description: >-
+  IceGate is an observability data lake engine that stores logs, traces,
+  metrics, and events in Apache Iceberg tables with DataFusion as the query
+  engine. Data is ingested via OpenTelemetry protocol and queried via
+  Loki/Prometheus/Tempo-compatible APIs.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/icegatetech/icegate
+sources:
+  - https://github.com/icegatetech/icegate
+maintainers:
+  - name: icegatetech
+    url: https://github.com/icegatetech
+keywords:
+  - observability
+  - iceberg
+  - datafusion
+  - opentelemetry
+  - logs
+  - traces
+  - metrics
+  - loki
+  - prometheus
+  - tempo

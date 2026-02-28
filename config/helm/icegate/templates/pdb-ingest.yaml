@@ -1,0 +1,19 @@
+{{- if and .Values.ingest.enabled .Values.ingest.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "ingest") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 4 }}
+spec:
+  {{- if .Values.ingest.pdb.minAvailable }}
+  minAvailable: {{ .Values.ingest.pdb.minAvailable }}
+  {{- end }}
+  {{- if .Values.ingest.pdb.maxUnavailable }}
+  maxUnavailable: {{ .Values.ingest.pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "icegate.selectorLabels" (dict "context" . "component" "ingest") | nindent 6 }}
+{{- end }}

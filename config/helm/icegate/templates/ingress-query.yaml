@@ -1,0 +1,36 @@
+{{- if and .Values.query.enabled .Values.query.ingress.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "query") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "query") | nindent 4 }}
+  {{- with .Values.query.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.query.ingress.className }}
+  ingressClassName: {{ .Values.query.ingress.className }}
+  {{- end }}
+  {{- if .Values.query.ingress.tls }}
+  tls:
+    {{- toYaml .Values.query.ingress.tls | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.query.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "icegate.componentName" (dict "context" $ "component" "query") }}
+                port:
+                  number: {{ .port }}
+          {{- end }}
+    {{- end }}
+{{- end }}

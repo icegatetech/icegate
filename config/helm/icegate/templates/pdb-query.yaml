@@ -1,0 +1,19 @@
+{{- if and .Values.query.enabled .Values.query.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "query") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "query") | nindent 4 }}
+spec:
+  {{- if .Values.query.pdb.minAvailable }}
+  minAvailable: {{ .Values.query.pdb.minAvailable }}
+  {{- end }}
+  {{- if .Values.query.pdb.maxUnavailable }}
+  maxUnavailable: {{ .Values.query.pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "icegate.selectorLabels" (dict "context" . "component" "query") | nindent 6 }}
+{{- end }}
