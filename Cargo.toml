@@ -72,6 +72,8 @@ antlr4rust = "0.5"
 # Fork adds WAL-aware table scan support; track upstream merge progress in GH-71.
 iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
 iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
+iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
+iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
 iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
 
 # DataFusion

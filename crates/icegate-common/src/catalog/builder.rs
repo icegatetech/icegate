@@ -6,7 +6,9 @@ use iceberg::{
     Catalog, CatalogBuilder as IcebergCatalogBuilder,
     memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
 };
+use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_catalog_rest::RestCatalogBuilder;
+use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
 
 use super::{CacheConfig, CatalogBackend, CatalogConfig};
 use crate::error::{CommonError, Result};
@@ -136,6 +138,10 @@ impl CatalogBuilder {
         match &config.backend {
             CatalogBackend::Memory => Self::create_memory_catalog(config).await,
             CatalogBackend::Rest { uri } => Self::create_rest_catalog(config, uri, io_cache).await,
+            CatalogBackend::S3Tables { table_bucket_arn } => {
+                Self::create_s3tables_catalog(config, table_bucket_arn).await
+            }
+            CatalogBackend::Glue { catalog_id } => Self::create_glue_catalog(config, catalog_id.as_deref()).await,
         }
     }
 
@@ -154,6 +160,58 @@ impl CatalogBuilder {
         tracing::info!(
             warehouse = %config.warehouse,
             "Created Memory catalog"
+        );
+
+        Ok(Arc::new(catalog))
+    }
+
+    /// Create an S3 Tables catalog
+    ///
+    /// Note: S3 Tables catalog does not currently support IO cache extensions.
+    /// AWS credentials are resolved from the environment by the AWS SDK.
+    async fn create_s3tables_catalog(config: &CatalogConfig, table_bucket_arn: &str) -> Result<Arc<dyn Catalog>> {
+        let mut properties = HashMap::new();
+        properties.insert("table_bucket_arn".to_string(), table_bucket_arn.to_string());
+        properties.insert("warehouse".to_string(), config.warehouse.clone());
+
+        // Add any additional properties from config
+        for (key, value) in &config.properties {
+            properties.insert(key.clone(), value.clone());
+        }
+
+        let catalog = S3TablesCatalogBuilder::default().load("s3tables", properties).await?;
+
+        tracing::info!(
+            table_bucket_arn = %table_bucket_arn,
+            warehouse = %config.warehouse,
+            "Created S3 Tables catalog"
+        );
+
+        Ok(Arc::new(catalog))
+    }
+
+    /// Create an AWS Glue catalog.
+    ///
+    /// Note: Glue catalog does not currently support IO cache extensions.
+    /// AWS credentials are resolved from the environment by the AWS SDK.
+    async fn create_glue_catalog(config: &CatalogConfig, catalog_id: Option<&str>) -> Result<Arc<dyn Catalog>> {
+        let mut properties = HashMap::new();
+        properties.insert("warehouse".to_string(), config.warehouse.clone());
+
+        if let Some(id) = catalog_id {
+            properties.insert("catalog_id".to_string(), id.to_string());
+        }
+
+        for (key, value) in &config.properties {
+            properties.insert(key.clone(), value.clone());
+        }
+
+        let catalog = GlueCatalogBuilder::default().load("glue", properties).await?;
+
+        tracing::info!(
+            catalog_id = ?catalog_id,
+            warehouse = %config.warehouse,
+            "Created Glue catalog"
         );
 
         Ok(Arc::new(catalog))

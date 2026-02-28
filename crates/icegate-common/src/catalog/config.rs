@@ -68,10 +68,26 @@ const fn default_object_size_limit_mb() -> usize {
 pub enum CatalogBackend {
     /// In-memory catalog (for testing)
     Memory,
-    /// REST catalog (production)
+    /// REST catalog (production, e.g. Nessie)
     Rest {
         /// REST endpoint URI
         uri: String,
+    },
+    /// AWS S3 Tables catalog (production, AWS-managed Iceberg)
+    S3Tables {
+        /// S3 Tables table bucket ARN
+        ///
+        /// Format: `arn:aws:s3tables:<region>:<account>:bucket/<name>`
+        table_bucket_arn: String,
+    },
+    /// AWS Glue catalog (production, AWS-managed Iceberg)
+    Glue {
+        /// AWS Glue catalog identifier (optional).
+        ///
+        /// When omitted, the default AWS account catalog is used.
+        /// Format: 12-digit AWS account ID (e.g., `123456789012`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catalog_id: Option<String>,
     },
 }
 
@@ -102,6 +118,25 @@ impl CatalogConfig {
             }
             CatalogBackend::Memory => {
                 // No specific validation needed for memory catalog
+            }
+            CatalogBackend::S3Tables { table_bucket_arn } => {
+                if table_bucket_arn.trim().is_empty() {
+                    return Err(CommonError::Config("S3 Tables table_bucket_arn cannot be empty".into()));
+                }
+                if !table_bucket_arn.starts_with("arn:aws:s3tables:") {
+                    return Err(CommonError::Config(
+                        "S3 Tables table_bucket_arn must start with arn:aws:s3tables:".into(),
+                    ));
+                }
+            }
+            CatalogBackend::Glue { catalog_id } => {
+                if let Some(id) = catalog_id {
+                    if id.trim().is_empty() {
+                        return Err(CommonError::Config(
+                            "Glue catalog_id, when specified, cannot be empty".into(),
+                        ));
+                    }
+                }
             }
         }
 

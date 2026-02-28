@@ -659,6 +659,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-glue"
+version = "1.137.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "034b1d0fa165c64bf825b8ba5e5567b115f7439be1f13e51c5c754de98b896d9"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.122.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -691,6 +715,30 @@ dependencies = [
  "sha2",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "aws-sdk-s3tables"
+version = "1.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3939542b583da4db85c30868e32718633d6f7b0566d7cb978a9afd15545dcbd9"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]
@@ -3883,6 +3931,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-catalog-glue"
+version = "0.8.0"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=0885fd8a5bd5352bd95a8a121a1607cbd3db4b20#0885fd8a5bd5352bd95a8a121a1607cbd3db4b20"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-glue",
+ "iceberg",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iceberg-catalog-rest"
 version = "0.8.0"
 source = "git+https://github.com/icegatetech/iceberg-rust?rev=0885fd8a5bd5352bd95a8a121a1607cbd3db4b20#0885fd8a5bd5352bd95a8a121a1607cbd3db4b20"
@@ -3900,6 +3963,18 @@ dependencies = [
  "tracing",
  "typed-builder",
  "uuid",
+]
+
+[[package]]
+name = "iceberg-catalog-s3tables"
+version = "0.8.0"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=0885fd8a5bd5352bd95a8a121a1607cbd3db4b20#0885fd8a5bd5352bd95a8a121a1607cbd3db4b20"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3tables",
+ "iceberg",
 ]
 
 [[package]]
@@ -3927,7 +4002,9 @@ dependencies = [
  "axum 0.7.9",
  "foyer",
  "iceberg",
+ "iceberg-catalog-glue",
  "iceberg-catalog-rest",
+ "iceberg-catalog-s3tables",
  "object_store",
  "object_store_opendal",
  "opendal",
