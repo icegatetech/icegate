@@ -88,12 +88,12 @@ jobs:
         with:
           files: |
             config/docker/docker-bake.hcl
-            ${{ steps.meta-query.outputs.bake-file-tags }}
-            ${{ steps.meta-query.outputs.bake-file-labels }}
-            ${{ steps.meta-ingest.outputs.bake-file-tags }}
-            ${{ steps.meta-ingest.outputs.bake-file-labels }}
-            ${{ steps.meta-maintain.outputs.bake-file-tags }}
-            ${{ steps.meta-maintain.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-query.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-query.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-ingest.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-ingest.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-maintain.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-maintain.outputs.bake-file-labels }}
           targets: default
           push: true
           set: |
