@@ -86,7 +86,6 @@ jobs:
       - name: Build and push
         uses: docker/bake-action@v6
         with:
-          source: .
           files: |
             config/docker/docker-bake.hcl
             ${{ steps.meta-query.outputs.bake-file-tags }}
@@ -102,7 +101,7 @@ jobs:
             *.args.REVISION=${{ github.sha }}
             *.args.BUILD_DATE=${{ steps.timestamp.outputs.value }}
             *.cache-from=type=gha,scope=release-builder
-            *.cache-to=type=gha,mode=max,scope=release-builder
+            builder.cache-to=type=gha,mode=max,scope=release-builder
 
   # ── Helm chart (OCI artifact → GHCR) ─────────────────────────────────────
   helm-chart:

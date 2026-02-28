@@ -20,8 +20,27 @@ target "_common" {
   platforms  = ["linux/amd64", "linux/arm64"]
 }
 
-target "query" {
+// Builds chef → planner → builder once. Not in the default group,
+// but bake resolves it automatically via the "target:builder" context
+// reference in _runtime.
+target "builder" {
   inherits = ["_common"]
+  target   = "builder"
+}
+
+// Runtime targets override the "builder" named stage with the single
+// builder target output, so COPY --from=builder resolves to it without
+// rebuilding chef/planner/builder per binary.
+target "_runtime" {
+  inherits = ["_common"]
+  contexts = {
+    builder = "target:builder"
+  }
+  target = "runtime"
+}
+
+target "query" {
+  inherits = ["_runtime"]
   args = {
     BINARY     = "query"
     VERSION    = VERSION
@@ -31,7 +50,7 @@ target "query" {
 }
 
 target "ingest" {
-  inherits = ["_common"]
+  inherits = ["_runtime"]
   args = {
     BINARY     = "ingest"
     VERSION    = VERSION
@@ -41,7 +60,7 @@ target "ingest" {
 }
 
 target "maintain" {
-  inherits = ["_common"]
+  inherits = ["_runtime"]
   args = {
     BINARY     = "maintain"
     VERSION    = VERSION
