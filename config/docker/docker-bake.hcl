@@ -42,29 +42,32 @@ target "_runtime" {
 target "query" {
   inherits = ["_runtime"]
   args = {
-    BINARY     = "query"
-    VERSION    = VERSION
-    REVISION   = REVISION
-    BUILD_DATE = BUILD_DATE
+    BINARY      = "query"
+    DESCRIPTION = "Query APIs for IceGate (Loki, Prometheus, Tempo)"
+    VERSION     = VERSION
+    REVISION    = REVISION
+    BUILD_DATE  = BUILD_DATE
   }
 }
 
 target "ingest" {
   inherits = ["_runtime"]
   args = {
-    BINARY     = "ingest"
-    VERSION    = VERSION
-    REVISION   = REVISION
-    BUILD_DATE = BUILD_DATE
+    BINARY      = "ingest"
+    DESCRIPTION = "OTLP data ingestion for IceGate"
+    VERSION     = VERSION
+    REVISION    = REVISION
+    BUILD_DATE  = BUILD_DATE
   }
 }
 
 target "maintain" {
   inherits = ["_runtime"]
   args = {
-    BINARY     = "maintain"
-    VERSION    = VERSION
-    REVISION   = REVISION
-    BUILD_DATE = BUILD_DATE
+    BINARY      = "maintain"
+    DESCRIPTION = "Maintenance operations for IceGate"
+    VERSION     = VERSION
+    REVISION    = REVISION
+    BUILD_DATE  = BUILD_DATE
   }
 }

@@ -24,8 +24,10 @@ RUN test -n "$BINARY" || { echo "ERROR: BINARY build-arg is required"; exit 1; }
 ARG VERSION
 ARG REVISION
 ARG BUILD_DATE
+ARG DESCRIPTION
 
 LABEL org.opencontainers.image.title="icegate-${BINARY}" \
+      org.opencontainers.image.description="${DESCRIPTION}" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${BUILD_DATE}" \

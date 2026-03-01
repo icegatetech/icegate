@@ -56,6 +56,8 @@ jobs:
         with:
           images: ${{ env.IMAGE_PREFIX }}-query
           bake-target: query
+          labels: |
+            org.opencontainers.image.description=Query APIs for IceGate (Loki, Prometheus, Tempo)
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -67,6 +69,8 @@ jobs:
         with:
           images: ${{ env.IMAGE_PREFIX }}-ingest
           bake-target: ingest
+          labels: |
+            org.opencontainers.image.description=OTLP data ingestion for IceGate
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -78,6 +82,8 @@ jobs:
         with:
           images: ${{ env.IMAGE_PREFIX }}-maintain
           bake-target: maintain
+          labels: |
+            org.opencontainers.image.description=Maintenance operations for IceGate
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -136,7 +142,7 @@ jobs:
         run: helm package config/helm/icegate
 
       - name: Push chart to GHCR
-        run: helm push "icegate-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/icegatetech/icegate/charts
+        run: helm push "icegate-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/icegatetech/charts
 
   # ── GitHub Release ────────────────────────────────────────────────────────
   github-release:
@@ -163,7 +169,7 @@ jobs:
           ## Helm Chart
 
           \`\`\`bash
-          helm install icegate oci://ghcr.io/icegatetech/icegate/charts/icegate --version ${VERSION}
+          helm install icegate oci://ghcr.io/icegatetech/charts/icegate --version ${VERSION}
           \`\`\`
 
           ## Docker Images
@@ -174,7 +180,7 @@ jobs:
           docker pull ${IMAGE_PREFIX}-maintain:${VERSION}
           \`\`\`
 
-          Platforms: \`linux/amd64\`, \`linux/arm64\`
+          Platforms: \`linux/amd64\`
 
           ## Changelog
           EOF
