@@ -97,7 +97,7 @@ jobs:
           targets: default
           push: true
           set: |
-            *.args.VERSION=${{ needs.ci-gate.outputs.version }}
+            *.args.VERSION=${{ steps.meta-query.outputs.version }}
             *.args.REVISION=${{ github.sha }}
             *.args.BUILD_DATE=${{ steps.timestamp.outputs.value }}
             *.cache-from=type=gha,scope=release-builder
@@ -124,9 +124,8 @@ jobs:
         run: echo "${HELM_TOKEN}" | helm registry login ghcr.io --username "${HELM_USER}" --password-stdin
 
       - name: Stamp chart version
-        env:
-          VERSION: ${{ needs.ci-gate.outputs.version }}
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           sed -i "s/^version:.*/version: ${VERSION}/" config/helm/icegate/Chart.yaml
           sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" config/helm/icegate/Chart.yaml
 
@@ -137,9 +136,7 @@ jobs:
         run: helm package config/helm/icegate
 
       - name: Push chart to GHCR
-        env:
-          VERSION: ${{ needs.ci-gate.outputs.version }}
-        run: helm push "icegate-${VERSION}.tgz" oci://ghcr.io/icegatetech/icegate/charts
+        run: helm push "icegate-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/icegatetech/icegate/charts
 
   # ── GitHub Release ────────────────────────────────────────────────────────
   github-release:
@@ -155,9 +152,10 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.ci-gate.outputs.version }}
           TAG: ${{ github.ref_name }}
         run: |
+          VERSION="${TAG#v}"
+
           # Find previous full release tag (no hyphen = no prerelease suffix)
           PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${TAG}$" | head -n1)
 
