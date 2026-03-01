@@ -17,7 +17,7 @@ group "default" {
 target "_common" {
   context    = "."
   dockerfile = "config/docker/Dockerfile.release"
-  platforms  = ["linux/amd64", "linux/arm64"]
+  platforms  = ["linux/amd64"]  # TODO(medium): Investigate a slow ARM compilation
 }
 
 // Builds chef → planner → builder once. Not in the default group,
