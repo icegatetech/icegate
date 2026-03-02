@@ -1,4 +1,11 @@
 {{/*
+Namespace name. Uses namespace.name override, falling back to .Release.Namespace.
+*/}}
+{{- define "icegate.namespace" -}}
+{{- default .Release.Namespace .Values.namespace.name }}
+{{- end }}
+
+{{/*
 Expand the name of the chart.
 */}}
 {{- define "icegate.name" -}}
