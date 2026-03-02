@@ -106,8 +106,8 @@ jobs:
             *.args.VERSION=${{ steps.meta-query.outputs.version }}
             *.args.REVISION=${{ github.sha }}
             *.args.BUILD_DATE=${{ steps.timestamp.outputs.value }}
-            *.cache-from=type=gha,scope=release-builder
-            builder.cache-to=type=gha,mode=max,scope=release-builder
+            *.cache-from=type=gha,scope=release
+            *.cache-to=type=gha,mode=max,scope=release
 
   # ── Helm chart (OCI artifact → GHCR) ─────────────────────────────────────
   helm-chart:

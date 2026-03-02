@@ -18,29 +18,16 @@ target "_common" {
   context    = "."
   dockerfile = "config/docker/Dockerfile.release"
   platforms  = ["linux/amd64", "linux/arm64"]
-}
-
-// Builds chef → planner → builder once. Not in the default group,
-// but bake resolves it automatically via the "target:builder" context
-// reference in _runtime.
-target "builder" {
-  inherits = ["_common"]
-  target   = "builder"
-}
-
-// Runtime targets override the "builder" named stage with the single
-// builder target output, so COPY --from=builder resolves to it without
-// rebuilding chef/planner/builder per binary.
-target "_runtime" {
-  inherits = ["_common"]
-  contexts = {
-    builder = "target:builder"
-  }
+  // Each binary target builds the full Dockerfile independently.
+  // BuildKit deduplicates the builder stage layers across targets
+  // within the same bake invocation. A separate "builder" bake target
+  // with target:builder context sharing is NOT used because it breaks
+  // per-platform tracking when the builder is pinned to $BUILDPLATFORM.
   target = "runtime"
 }
 
 target "query" {
-  inherits = ["_runtime"]
+  inherits = ["_common"]
   args = {
     BINARY      = "query"
     DESCRIPTION = "Query APIs for IceGate (Loki, Prometheus, Tempo)"
@@ -51,7 +38,7 @@ target "query" {
 }
 
 target "ingest" {
-  inherits = ["_runtime"]
+  inherits = ["_common"]
   args = {
     BINARY      = "ingest"
     DESCRIPTION = "OTLP data ingestion for IceGate"
@@ -62,7 +49,7 @@ target "ingest" {
 }
 
 target "maintain" {
-  inherits = ["_runtime"]
+  inherits = ["_common"]
   args = {
     BINARY      = "maintain"
     DESCRIPTION = "Maintenance operations for IceGate"

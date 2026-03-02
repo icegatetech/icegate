@@ -18,7 +18,8 @@ ARG TARGETARCH
 # Install both cross-compilation toolchains unconditionally.
 # The unused one adds ~60MB but keeps the logic simple and allows
 # building for any target from any host (amd64 CI or arm64 Mac).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && apt-get install -y --no-install-recommends \
       gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
       gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/*
