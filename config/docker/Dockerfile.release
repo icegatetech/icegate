@@ -15,17 +15,19 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM --platform=$BUILDPLATFORM chef AS builder
 ARG TARGETARCH
 
-# Install cross-compilation toolchain for non-native targets
+# Install both cross-compilation toolchains unconditionally.
+# The unused one adds ~60MB but keeps the logic simple and allows
+# building for any target from any host (amd64 CI or arm64 Mac).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
+      gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN <<EOF
 set -eu
 case "${TARGETARCH}" in
   amd64) RUST_TARGET="x86_64-unknown-linux-gnu" ;;
-  arm64)
-    RUST_TARGET="aarch64-unknown-linux-gnu"
-    apt-get update && apt-get install -y --no-install-recommends \
-      gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
-    && rm -rf /var/lib/apt/lists/*
-    ;;
+  arm64) RUST_TARGET="aarch64-unknown-linux-gnu" ;;
   *) echo "ERROR: Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
 esac
 rustup target add "${RUST_TARGET}"
@@ -34,10 +36,10 @@ EOF
 
 COPY --from=planner /app/recipe.json recipe.json
 ENV RUSTFLAGS="--cfg tokio_unstable"
-# The cc crate and cargo use these to find the cross-linker/compiler.
-# Setting them unconditionally is harmless — they are ignored for native builds.
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
 
 # Cook dependencies with cross-compilation target
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
