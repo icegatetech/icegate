@@ -180,7 +180,7 @@ jobs:
           docker pull ${IMAGE_PREFIX}-maintain:${VERSION}
           \`\`\`
 
-          Platforms: \`linux/amd64\`
+          Platforms: \`linux/amd64\`, \`linux/arm64\`
 
           ## Changelog
           EOF

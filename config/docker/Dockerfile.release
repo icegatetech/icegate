@@ -1,22 +1,65 @@
+# syntax=docker/dockerfile:1
+
 # ── Builder stages (shared across all binary images) ────────────────────────
-FROM rust:bookworm AS chef
+# Pin build stages to the host platform so Rust compiles natively,
+# then cross-compile for the target architecture.
+FROM --platform=$BUILDPLATFORM rust:bookworm AS chef
 RUN cargo install cargo-chef
 WORKDIR /app
 
-FROM chef AS planner
+FROM --platform=$BUILDPLATFORM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY ./crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS builder
+FROM --platform=$BUILDPLATFORM chef AS builder
+ARG TARGETARCH
+
+# Install cross-compilation toolchain for non-native targets
+RUN <<EOF
+set -eu
+case "${TARGETARCH}" in
+  amd64) RUST_TARGET="x86_64-unknown-linux-gnu" ;;
+  arm64)
+    RUST_TARGET="aarch64-unknown-linux-gnu"
+    apt-get update && apt-get install -y --no-install-recommends \
+      gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+    && rm -rf /var/lib/apt/lists/*
+    ;;
+  *) echo "ERROR: Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;;
+esac
+rustup target add "${RUST_TARGET}"
+echo "${RUST_TARGET}" > /tmp/rust-target
+EOF
+
 COPY --from=planner /app/recipe.json recipe.json
 ENV RUSTFLAGS="--cfg tokio_unstable"
-RUN cargo chef cook --release --recipe-path recipe.json
+# The cc crate and cargo use these to find the cross-linker/compiler.
+# Setting them unconditionally is harmless — they are ignored for native builds.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+
+# Cook dependencies with cross-compilation target
+RUN RUST_TARGET=$(cat /tmp/rust-target) && \
+    cargo chef cook --release --target "${RUST_TARGET}" --recipe-path recipe.json
+
 COPY ./crates ./crates
 COPY Cargo.toml Cargo.lock ./
-RUN cargo build --release --workspace --bins
+
+# Build workspace binaries and copy to a fixed output path so the runtime
+# stage doesn't need to know the target triple.
+RUN <<EOF
+set -eu
+RUST_TARGET=$(cat /tmp/rust-target)
+cargo build --release --target "${RUST_TARGET}" --workspace --bins
+mkdir -p /app/output
+cp /app/target/${RUST_TARGET}/release/query    /app/output/
+cp /app/target/${RUST_TARGET}/release/ingest   /app/output/
+cp /app/target/${RUST_TARGET}/release/maintain /app/output/
+EOF
 
 # ── Runtime (one binary per image) ──────────────────────────────────────────
+# No platform pin — inherits the target platform from Buildx.
 FROM debian:bookworm-slim AS runtime
 
 ARG BINARY
@@ -37,7 +80,7 @@ LABEL org.opencontainers.image.title="icegate-${BINARY}" \
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/${BINARY} /usr/local/bin/${BINARY}
+COPY --from=builder /app/output/${BINARY} /usr/local/bin/${BINARY}
 RUN ln -s /usr/local/bin/${BINARY} /usr/local/bin/entrypoint
 
 USER nobody
