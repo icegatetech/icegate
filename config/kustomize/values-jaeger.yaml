@@ -1,0 +1,20 @@
+# Jaeger tracing - mapped from Docker Compose jaeger all-in-one service
+
+allInOne:
+  enabled: true
+  extraEnv:
+    - name: COLLECTOR_OTLP_ENABLED
+      value: "true"
+    - name: SPAN_STORAGE_TYPE
+      value: badger
+
+# Disable individual components (all-in-one bundles them)
+collector:
+  enabled: false
+query:
+  enabled: false
+agent:
+  enabled: false
+
+storage:
+  type: badger

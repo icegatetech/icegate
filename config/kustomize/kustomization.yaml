@@ -1,0 +1,141 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace-infra.yaml
+  - namespace-observability.yaml
+  - secret-aws.yaml
+  - secret-aws-infra.yaml
+
+helmCharts:
+  - name: minio
+    repo: https://charts.min.io
+    version: 5.4.0
+    releaseName: minio
+    namespace: infra
+    valuesFile: values-minio.yaml
+
+  - name: nessie
+    repo: https://charts.projectnessie.org
+    version: 0.107.3
+    releaseName: nessie
+    namespace: infra
+    valuesFile: values-nessie.yaml
+
+  - name: kube-prometheus-stack
+    repo: https://prometheus-community.github.io/helm-charts
+    version: 72.6.2
+    releaseName: prometheus
+    includeCRDs: true
+    namespace: observability
+    valuesFile: values-prometheus.yaml
+
+  - name: icegate
+    repo: oci://ghcr.io/icegatetech/charts
+    version: 0.1.0-rc5
+    releaseName: icegate
+    namespace: icegate
+    valuesFile: values-icegate.yaml
+
+  - name: grafana
+    repo: https://grafana.github.io/helm-charts
+    releaseName: grafana
+    namespace: observability
+    valuesFile: values-grafana.yaml
+
+  - name: jaeger
+    repo: https://jaegertracing.github.io/helm-charts
+    releaseName: jaeger
+    namespace: observability
+    valuesFile: values-jaeger.yaml
+
+# Force namespace on resources from charts that omit metadata.namespace.
+# Kustomize's namespace transformer doesn't inject it for Helm-inflated
+# resources it cannot classify.
+patches:
+  # MinIO → infra
+  - target:
+      name: minio-sa
+      kind: ServiceAccount
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  - target:
+      name: minio
+      kind: ConfigMap
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  - target:
+      name: minio
+      kind: Secret
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  - target:
+      name: minio
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  - target:
+      name: minio-console
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  - target:
+      name: minio
+      kind: PersistentVolumeClaim
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  - target:
+      name: minio
+      kind: Deployment
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  - target:
+      name: minio-post-job
+      kind: Job
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  - target:
+      name: minio-cluster
+      kind: Probe
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: infra
+  # Jaeger → observability
+  - target:
+      name: jaeger
+      kind: ServiceAccount
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: observability
+  - target:
+      name: jaeger
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: observability
+  - target:
+      name: jaeger
+      kind: Deployment
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: observability

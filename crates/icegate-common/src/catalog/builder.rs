@@ -112,6 +112,9 @@ impl IoCacheHandle {
 
         foyer::HybridCacheBuilder::new()
             .memory(memory_bytes)
+            .with_weighter(|key: &iceberg::io::FoyerKey, value: &iceberg::io::FoyerValue| {
+                key.path.len() + key.version.as_ref().map_or_else(|| 0, String::len) + value.len()
+            })
             .storage(foyer::Engine::mixed())
             .with_device_options(foyer::DirectFsDeviceOptions::new(&config.disk_dir).with_capacity(disk_bytes))
             .build()

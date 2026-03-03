@@ -3876,7 +3876,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=0885fd8a5bd5352bd95a8a121a1607cbd3db4b20#0885fd8a5bd5352bd95a8a121a1607cbd3db4b20"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e#5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -3933,7 +3933,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=0885fd8a5bd5352bd95a8a121a1607cbd3db4b20#0885fd8a5bd5352bd95a8a121a1607cbd3db4b20"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e#5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3948,7 +3948,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=0885fd8a5bd5352bd95a8a121a1607cbd3db4b20#0885fd8a5bd5352bd95a8a121a1607cbd3db4b20"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e#5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3968,7 +3968,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-s3tables"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=0885fd8a5bd5352bd95a8a121a1607cbd3db4b20#0885fd8a5bd5352bd95a8a121a1607cbd3db4b20"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e#5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3980,7 +3980,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.8.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=0885fd8a5bd5352bd95a8a121a1607cbd3db4b20#0885fd8a5bd5352bd95a8a121a1607cbd3db4b20"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e#5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e"
 dependencies = [
  "anyhow",
  "async-trait",
