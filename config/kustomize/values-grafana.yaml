@@ -28,13 +28,13 @@ datasources:
       - name: Jaeger
         type: jaeger
         access: proxy
-        url: http://jaeger-query:16686
+        url: http://jaeger-query.observability:16686
         isDefault: false
         editable: false
       - name: Prometheus
         type: prometheus
         access: proxy
-        url: http://prometheus-kube-prometheus-prometheus:9090
+        url: http://prometheus-kube-prometheus-prometheus.observability:9090
         isDefault: false
         editable: false
 

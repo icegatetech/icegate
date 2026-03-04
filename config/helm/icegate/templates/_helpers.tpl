@@ -1,8 +1,8 @@
 {{/*
-Namespace name. Uses namespace.name override, falling back to .Release.Namespace.
+Namespace name. Always uses .Release.Namespace for consistency with all templates.
 */}}
 {{- define "icegate.namespace" -}}
-{{- default .Release.Namespace .Values.namespace.name }}
+{{- .Release.Namespace }}
 {{- end }}
 
 {{/*

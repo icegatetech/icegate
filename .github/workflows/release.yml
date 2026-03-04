@@ -33,6 +33,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate SemVer tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Tag '${TAG}' is not a valid SemVer tag (expected v<MAJOR>.<MINOR>.<PATCH>[-prerelease])"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Prerelease if tag contains a hyphen after stripping v
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -61,7 +78,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
 
       - name: Docker metadata (ingest)
         id: meta-ingest
@@ -74,7 +91,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
 
       - name: Docker metadata (maintain)
         id: meta-maintain
@@ -87,7 +104,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
 
       - name: Build and push
         uses: docker/bake-action@v6
@@ -103,7 +120,7 @@ jobs:
           targets: default
           push: true
           set: |
-            *.args.VERSION=${{ steps.meta-query.outputs.version }}
+            *.args.VERSION=${{ steps.version.outputs.version }}
             *.args.REVISION=${{ github.sha }}
             *.args.BUILD_DATE=${{ steps.timestamp.outputs.value }}
             *.cache-from=type=gha,scope=release

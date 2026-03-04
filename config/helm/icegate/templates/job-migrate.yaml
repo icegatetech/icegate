@@ -38,7 +38,7 @@ spec:
             - |
               {{- range .Values.migrate.waitForDependencies.endpoints }}
               echo "Waiting for {{ . }} ..."
-              until wget -qO- --timeout=2 {{ . }} >/dev/null 2>&1; do
+              until wget -qO- --timeout=2 "{{ . }}" >/dev/null 2>&1; do
                 sleep 3
               done
               echo "{{ . }} is ready"

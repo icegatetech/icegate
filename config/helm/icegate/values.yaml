@@ -2,8 +2,6 @@
 namespace:
   ## Create the namespace as part of this chart release
   create: false
-  ## Override the namespace name. Defaults to .Release.Namespace.
-  name: ""
 
 ## Global settings
 global:
