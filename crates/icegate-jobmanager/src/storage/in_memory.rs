@@ -51,7 +51,7 @@ impl Storage for InMemoryStorage {
         let job_guard = self.job.read().await;
         match job_guard.as_ref() {
             Some(job) if job.code() == job_code => Ok(job.clone()),
-            _ => Err(StorageError::NotFound),
+            _ => Err(StorageError::NotFound("Job is absent in in-memory storage".to_string())),
         }
     }
 
@@ -63,8 +63,10 @@ impl Storage for InMemoryStorage {
         let job_guard = self.job.read().await;
         match job_guard.as_ref() {
             Some(job) if job.code() == &job_meta.code && job.version() == job_meta.version => Ok(job.clone()),
-            Some(_) => Err(StorageError::ConcurrentModification),
-            None => Err(StorageError::NotFound),
+            Some(_) => Err(StorageError::ConcurrentModification(
+                "Version mismatch in in-memory storage".to_string(),
+            )),
+            None => Err(StorageError::NotFound("Job is absent in in-memory storage".to_string())),
         }
     }
 
@@ -80,7 +82,7 @@ impl Storage for InMemoryStorage {
                 iter_num: job.iter_num(),
                 version: job.version().to_string(),
             }),
-            _ => Err(StorageError::NotFound),
+            _ => Err(StorageError::NotFound("Job is absent in in-memory storage".to_string())),
         }
     }
 
