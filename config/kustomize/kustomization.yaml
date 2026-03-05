@@ -49,7 +49,7 @@ helmCharts:
 
   - name: jaeger
     repo: https://jaegertracing.github.io/helm-charts
-    version: 0.74.1
+    version: 3.4.1
     releaseName: jaeger
     namespace: observability
     valuesFile: values-jaeger.yaml
@@ -131,7 +131,21 @@ patches:
         path: /metadata/namespace
         value: observability
   - target:
-      name: jaeger
+      name: jaeger-collector
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: observability
+  - target:
+      name: jaeger-query
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/namespace
+        value: observability
+  - target:
+      name: jaeger-agent
       kind: Service
     patch: |
       - op: add

@@ -2,11 +2,6 @@
 
 allInOne:
   enabled: true
-  extraEnv:
-    - name: COLLECTOR_OTLP_ENABLED
-      value: "true"
-    - name: SPAN_STORAGE_TYPE
-      value: badger
 
 # Disable individual components (all-in-one bundles them)
 collector:
@@ -15,6 +10,8 @@ query:
   enabled: false
 agent:
   enabled: false
+provisionDataStore:
+  cassandra: false
 
 storage:
   type: badger
