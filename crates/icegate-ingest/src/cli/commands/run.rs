@@ -53,6 +53,21 @@ fn panic_payload_to_string(panic: &(dyn Any + Send)) -> String {
     )
 }
 
+fn resolve_shift_startup_failure(
+    join_result: thread::Result<Result<()>>,
+    fallback_error: Option<IngestError>,
+) -> IngestError {
+    match join_result {
+        Ok(Err(err)) => err,
+        Ok(Ok(())) => fallback_error
+            .unwrap_or_else(|| IngestError::Shift("shift runtime exited before reporting startup status".to_string())),
+        Err(panic) => IngestError::Shift(format!(
+            "shift runtime thread panicked: {}",
+            panic_payload_to_string(&*panic)
+        )),
+    }
+}
+
 fn spawn_shift_runtime(shifter: Shifter, shift_threads: usize) -> Result<ShiftRuntimeHandle> {
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
     let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<()>>(1);
@@ -95,16 +110,8 @@ fn spawn_shift_runtime(shifter: Shifter, shift_threads: usize) -> Result<ShiftRu
             shutdown_tx,
             join_handle,
         }),
-        Ok(Err(err)) => {
-            let _ = join_handle.join();
-            Err(err)
-        }
-        Err(_) => {
-            let _ = join_handle.join();
-            Err(IngestError::Shift(
-                "shift runtime failed to report startup status".to_string(),
-            ))
-        }
+        Ok(Err(err)) => Err(resolve_shift_startup_failure(join_handle.join(), Some(err))),
+        Err(_) => Err(resolve_shift_startup_failure(join_handle.join(), None)),
     }
 }
 
@@ -297,17 +304,17 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         }
     }
 
-    tracing::info!("Stopping shifter...");
-    let shift_result = shift_runtime.shutdown();
-    if shift_result.is_ok() {
-        tracing::info!("Shifter stopped gracefully");
-    }
-
     // Close the write channel so the writer loop can exit
     drop(write_tx);
 
     // Wait for the writer task to finish
     let writer_result = writer_handle.await;
+
+    tracing::info!("Stopping shifter...");
+    let shift_result = shift_runtime.shutdown();
+    if shift_result.is_ok() {
+        tracing::info!("Shifter stopped gracefully");
+    }
 
     // Gracefully close the IO cache to drain foyer's background flusher tasks.
     io_cache.close().await;
@@ -320,4 +327,35 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     writer_result??;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::{IngestError, resolve_shift_startup_failure};
+
+    #[test]
+    fn startup_failure_prefers_join_error() {
+        let error =
+            resolve_shift_startup_failure(Ok(Err(IngestError::Io(io::Error::other("runtime build failed")))), None);
+        assert!(matches!(error, IngestError::Io(_)));
+        assert!(error.to_string().contains("runtime build failed"));
+    }
+
+    #[test]
+    fn startup_failure_uses_fallback_when_join_is_ok() {
+        let fallback = IngestError::Shift("reported startup error".to_string());
+        let error = resolve_shift_startup_failure(Ok(Ok(())), Some(fallback));
+        assert!(matches!(error, IngestError::Shift(_)));
+        assert!(error.to_string().contains("reported startup error"));
+    }
+
+    #[test]
+    fn startup_failure_reports_panic_payload() {
+        let panic_payload: Box<dyn std::any::Any + Send> = Box::new("panic at startup");
+        let error = resolve_shift_startup_failure(Err(panic_payload), None);
+        assert!(matches!(error, IngestError::Shift(_)));
+        assert!(error.to_string().contains("panic at startup"));
+    }
 }
