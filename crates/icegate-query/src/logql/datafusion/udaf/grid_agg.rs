@@ -1214,7 +1214,9 @@ impl Accumulator for LastGridAccumulator {
             let (start_idx, end_idx) =
                 find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
             for j in start_idx..end_idx {
-                if ts > self.timestamps[j] {
+                // Use >= so equal timestamps prefer the later-arriving value,
+                // which is correct for last_over_time semantics.
+                if ts >= self.timestamps[j] {
                     self.timestamps[j] = ts;
                     self.values[j] = val;
                 }
@@ -1280,7 +1282,9 @@ impl Accumulator for LastGridAccumulator {
             let other_ts = extract_i64_list(ts_list, row)?;
             for (i, (v, t)) in other_vals.into_iter().zip(other_ts).enumerate() {
                 if let (Some(v), Some(t)) = (v, t) {
-                    if i < self.timestamps.len() && (t > self.timestamps[i] || !self.has_value[i]) {
+                    // Use >= for consistency with update_batch: equal timestamps
+                    // prefer the incoming value during merge.
+                    if i < self.timestamps.len() && (t >= self.timestamps[i] || !self.has_value[i]) {
                         self.timestamps[i] = t;
                         self.values[i] = v;
                         self.has_value[i] = true;
@@ -1490,7 +1494,9 @@ impl RateCounterGridAccumulator {
             return 0.0;
         }
 
-        entries.sort_unstable_by_key(|&(ts, _)| ts);
+        // Use stable sort so equal-timestamp samples preserve insertion order,
+        // ensuring deterministic reset/delta detection.
+        entries.sort_by_key(|&(ts, _)| ts);
 
         let mut total_delta = 0.0;
         for i in 1..entries.len() {
