@@ -1,3 +1,8 @@
+## Namespace
+namespace:
+  ## Create the namespace as part of this chart release
+  create: false
+
 ## Global settings
 global:
   nameOverride: ""
@@ -323,6 +328,16 @@ migrate:
   backoffLimit: 3
   activeDeadlineSeconds: 300
   hookDeletePolicy: before-hook-creation
+
+  ## Wait for catalog and storage to be ready before migrating.
+  ## Uses a busybox init container to poll the endpoints.
+  waitForDependencies:
+    enabled: true
+    image: busybox:1.37
+    ## Endpoints to poll (HTTP GET). Migrate starts only when all return 2xx.
+    endpoints: []
+    #  - http://nessie:19120/api/v2/config
+    #  - http://rustfs-svc:9000/health/ready
 
 ## ---------------------------------------------------------------------------
 ## ServiceMonitor (Prometheus Operator)

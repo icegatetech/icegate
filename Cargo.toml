@@ -70,11 +70,11 @@ antlr4rust = "0.5"
 # Iceberg — fork of apache/iceberg-rust `develop` branch.
 # Pinned to a specific revision for DataFusion 51 + Arrow 57 compat.
 # Fork adds WAL-aware table scan support; track upstream merge progress in GH-71.
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
-iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
-iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0885fd8a5bd5352bd95a8a121a1607cbd3db4b20" }
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
+iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
+iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
 
 # DataFusion
 datafusion = "51.0"

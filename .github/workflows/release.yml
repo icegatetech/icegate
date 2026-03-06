@@ -15,12 +15,9 @@ env:
   IMAGE_PREFIX: ghcr.io/icegatetech/icegate
 
 jobs:
-  # ── Gate: CI checks + version validation ──────────────────────────────────
-  ci-gate:
-    name: CI Gate
+  docker:
+    name: Docker Images
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Free Disk Space
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -36,77 +33,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract version metadata
-        id: meta
+      - name: Validate SemVer tag
+        id: version
         run: |
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Install Rust nightly (for rustfmt)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
-      - name: Validate tag matches Cargo.toml
-        run: |
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')
-          TAG="${GITHUB_REF_NAME}"
-          TAG_VERSION="${TAG#v}"
-          TAG_BASE="${TAG_VERSION%%-*}"
-          if [ "$CARGO_VERSION" != "$TAG_BASE" ]; then
-            echo "::error::Tag version (${TAG_BASE}) does not match Cargo.toml (${CARGO_VERSION})"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Tag '${TAG}' is not a valid SemVer tag (expected v<MAJOR>.<MINOR>.<PATCH>[-prerelease])"
             exit 1
           fi
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-stable-release-gate-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-stable-release-gate-
-
-      - name: Check formatting
-        run: cargo +nightly fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test --workspace
-
-  # ── Docker images (3 binaries x multi-arch) ──────────────────────────────
-  docker:
-    name: Docker ${{ matrix.binary }}
-    needs: ci-gate
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        binary: [query, ingest, maintain]
-    steps:
-      - name: Free Disk Space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Checkout
-        uses: actions/checkout@v4
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Prerelease if tag contains a hyphen after stripping v
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -125,37 +67,69 @@ jobs:
         id: timestamp
         run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
-      - name: Docker metadata
-        id: meta
+      - name: Docker metadata (query)
+        id: meta-query
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_PREFIX }}-${{ matrix.binary }}
+          images: ${{ env.IMAGE_PREFIX }}-query
+          bake-target: query
+          labels: |
+            org.opencontainers.image.description=Query APIs for IceGate (Loki, Prometheus, Tempo)
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
+
+      - name: Docker metadata (ingest)
+        id: meta-ingest
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-ingest
+          bake-target: ingest
+          labels: |
+            org.opencontainers.image.description=OTLP data ingestion for IceGate
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
+
+      - name: Docker metadata (maintain)
+        id: meta-maintain
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-maintain
+          bake-target: maintain
+          labels: |
+            org.opencontainers.image.description=Maintenance operations for IceGate
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/bake-action@v6
         with:
-          context: .
-          file: config/docker/Dockerfile.release
-          platforms: linux/amd64,linux/arm64
+          files: |
+            config/docker/docker-bake.hcl
+            cwd://${{ steps.meta-query.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-query.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-ingest.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-ingest.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-maintain.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-maintain.outputs.bake-file-labels }}
+          targets: default
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            BINARY=${{ matrix.binary }}
-            VERSION=${{ needs.ci-gate.outputs.version }}
-            REVISION=${{ github.sha }}
-            BUILD_DATE=${{ steps.timestamp.outputs.value }}
-          cache-from: type=gha,scope=release-builder
-          cache-to: type=gha,mode=max,scope=release-builder
+          set: |
+            *.args.VERSION=${{ steps.version.outputs.version }}
+            *.args.REVISION=${{ github.sha }}
+            *.args.BUILD_DATE=${{ steps.timestamp.outputs.value }}
+            *.cache-from=type=gha,scope=release
+            *.cache-to=type=gha,mode=max,scope=release
 
   # ── Helm chart (OCI artifact → GHCR) ─────────────────────────────────────
   helm-chart:
     name: Helm Chart
-    needs: [ci-gate, docker]
+    needs: [docker]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -173,9 +147,8 @@ jobs:
         run: echo "${HELM_TOKEN}" | helm registry login ghcr.io --username "${HELM_USER}" --password-stdin
 
       - name: Stamp chart version
-        env:
-          VERSION: ${{ needs.ci-gate.outputs.version }}
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           sed -i "s/^version:.*/version: ${VERSION}/" config/helm/icegate/Chart.yaml
           sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" config/helm/icegate/Chart.yaml
 
@@ -186,14 +159,12 @@ jobs:
         run: helm package config/helm/icegate
 
       - name: Push chart to GHCR
-        env:
-          VERSION: ${{ needs.ci-gate.outputs.version }}
-        run: helm push "icegate-${VERSION}.tgz" oci://ghcr.io/icegatetech/icegate/charts
+        run: helm push "icegate-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/icegatetech/charts
 
   # ── GitHub Release ────────────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [ci-gate, docker, helm-chart]
+    needs: [docker, helm-chart]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -204,9 +175,10 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.ci-gate.outputs.version }}
           TAG: ${{ github.ref_name }}
         run: |
+          VERSION="${TAG#v}"
+
           # Find previous full release tag (no hyphen = no prerelease suffix)
           PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${TAG}$" | head -n1)
 
@@ -214,7 +186,7 @@ jobs:
           ## Helm Chart
 
           \`\`\`bash
-          helm install icegate oci://ghcr.io/icegatetech/icegate/charts/icegate --version ${VERSION}
+          helm install icegate oci://ghcr.io/icegatetech/charts/icegate --version ${VERSION}
           \`\`\`
 
           ## Docker Images

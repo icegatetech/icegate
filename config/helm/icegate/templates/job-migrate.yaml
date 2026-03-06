@@ -26,6 +26,24 @@ spec:
       securityContext:
         {{- include "icegate.podSecurityContext" . | nindent 8 }}
       restartPolicy: OnFailure
+      {{- if and .Values.migrate.waitForDependencies.enabled .Values.migrate.waitForDependencies.endpoints }}
+      initContainers:
+        - name: wait-for-deps
+          image: {{ .Values.migrate.waitForDependencies.image }}
+          securityContext:
+            {{- include "icegate.containerSecurityContext" . | nindent 12 }}
+          command:
+            - sh
+            - -c
+            - |
+              {{- range .Values.migrate.waitForDependencies.endpoints }}
+              echo "Waiting for {{ . }} ..."
+              until wget -qO- --timeout=2 "{{ . }}" >/dev/null 2>&1; do
+                sleep 3
+              done
+              echo "{{ . }} is ready"
+              {{- end }}
+      {{- end }}
       containers:
         - name: migrate
           image: {{ include "icegate.image" (dict "image" .Values.migrate.image "tag" .Chart.AppVersion) }}

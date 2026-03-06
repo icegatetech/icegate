@@ -1,4 +1,11 @@
 {{/*
+Namespace name. Always uses .Release.Namespace for consistency with all templates.
+*/}}
+{{- define "icegate.namespace" -}}
+{{- .Release.Namespace }}
+{{- end }}
+
+{{/*
 Expand the name of the chart.
 */}}
 {{- define "icegate.name" -}}
