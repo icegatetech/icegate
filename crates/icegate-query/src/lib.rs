@@ -11,6 +11,9 @@ pub mod cli;
 /// Query execution engine with cached catalog provider
 pub mod engine;
 
+/// Infrastructure: metrics, observability helpers.
+pub mod infra;
+
 /// Loki API server (LogQL)
 pub mod loki;
 

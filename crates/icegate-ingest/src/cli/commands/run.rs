@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 
-use icegate_common::{MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
+use icegate_common::{IoCacheHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
@@ -153,7 +153,13 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
 
     // Create object store based on queue base_path
-    let (store, normalized_path) = create_object_store(&queue_config.common.base_path, Some(&config.storage.backend))?;
+    // Ingest writes data — no read cache needed, pass None.
+    let (store, normalized_path) = create_object_store(
+        &queue_config.common.base_path,
+        Some(&config.storage.backend),
+        None,
+        None,
+    )?;
 
     // Update queue config with normalized base path
     let mut queue_config = queue_config;
@@ -175,7 +181,8 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
-    let catalog = CatalogBuilder::from_config(&config.catalog).await?;
+    let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
     let queue_reader = Arc::new(ParquetQueueReader::new(
@@ -256,9 +263,18 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let mut server_result = Ok(());
     if handles.is_empty() {
         tracing::warn!("No OTLP servers are enabled in configuration");
-    } else {
-        tracing::info!("All enabled OTLP servers started");
-        tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
+        tracing::info!("Stopping shifter...");
+        shifter_handle.shutdown().await?;
+        tracing::info!("Shifter stopped gracefully");
+        // Orderly shutdown: close channel so writer loop can exit, then await it
+        drop(write_tx);
+        writer_handle.await??;
+        io_cache.close().await;
+        return Ok(());
+    }
+
+    tracing::info!("All enabled OTLP servers started");
+    tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
 
         // Wait for shutdown signal (SIGINT or SIGTERM)
         shutdown_signal().await;
@@ -299,6 +315,9 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Wait for the writer task to finish
     let writer_result = writer_handle.await;
+
+    // Gracefully close the IO cache to drain foyer's background flusher tasks.
+    io_cache.close().await;
 
     // Keep tracing guard alive until the very end
     drop(tracing_guard);

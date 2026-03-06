@@ -17,7 +17,7 @@ use parquet::{
     file::statistics::Statistics,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug};
+use tracing::debug;
 
 use crate::{
     Topic,
@@ -415,10 +415,12 @@ impl ParquetQueueReader {
                 blocking_segments = blocking_segments
                     .checked_add(1)
                     .ok_or_else(|| QueueError::Metadata("blocking segment count overflow".to_string()))?;
+                let span = tracing::Span::current();
                 tokio::task::spawn_blocking(move || {
-                    Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &group_by_column_name)
+                    span.in_scope(|| {
+                        Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &group_by_column_name)
+                    })
                 })
-                .in_current_span()
                 .await??
             } else {
                 inline_segments = inline_segments

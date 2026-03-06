@@ -242,7 +242,8 @@ pub struct IngesterStats {
 }
 
 impl IngesterStats {
-    /// Create ingester stats from query metrics.
+    /// Create ingester stats from query metrics (aggregate mode, no per-source
+    /// breakdown).
     pub const fn from_metrics(bytes: usize, lines: usize, batches: usize) -> Self {
         #[allow(clippy::cast_possible_truncation)]
         Self {
@@ -256,6 +257,23 @@ impl IngesterStats {
             total_duplicates: 0,
             total_lines_sent: lines as u64,
             total_reached: 1,
+        }
+    }
+
+    /// Create ingester stats from WAL per-source metrics.
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn from_wal(compressed_bytes: usize, decompressed_bytes: usize, lines: usize) -> Self {
+        Self {
+            compressed_bytes: compressed_bytes as u64,
+            decompressed_bytes: decompressed_bytes as u64,
+            decompressed_lines: lines as u64,
+            head_chunk_bytes: 0,
+            head_chunk_lines: 0,
+            total_batches: 0,
+            total_chunks_matched: 0,
+            total_duplicates: 0,
+            total_lines_sent: lines as u64,
+            total_reached: if lines > 0 { 1 } else { 0 },
         }
     }
 }
@@ -293,6 +311,20 @@ impl StoreStats {
         Self {
             compressed_bytes: 0,
             decompressed_bytes: bytes as u64,
+            decompressed_lines: lines as u64,
+            chunks_download_time: 0,
+            total_chunks_ref: 0,
+            total_chunks_downloaded: 0,
+            total_duplicates: 0,
+        }
+    }
+
+    /// Create store stats from Iceberg per-source metrics.
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn from_iceberg(compressed_bytes: usize, decompressed_bytes: usize, lines: usize) -> Self {
+        Self {
+            compressed_bytes: compressed_bytes as u64,
+            decompressed_bytes: decompressed_bytes as u64,
             decompressed_lines: lines as u64,
             chunks_download_time: 0,
             total_chunks_ref: 0,
@@ -362,6 +394,54 @@ impl QueryStats {
             ingester: IngesterStats::from_metrics(bytes, lines, batches),
             store: StoreStats::from_metrics(bytes, lines),
             summary: SummaryStats::from_metrics(bytes, lines, exec_time),
+        }
+    }
+
+    /// Create query stats with separate Ingester (WAL) and Store (Iceberg)
+    /// breakdown from per-source execution metrics.
+    ///
+    /// Summary totals use scan-level bytes/rows from source metrics when
+    /// available, falling back to formatter output counts when the custom
+    /// provider is not active (e.g., standard `IcebergCatalogProvider`).
+    ///
+    /// For WAL, `DataSourceExec` emits `bytes_scanned` (compressed Parquet
+    /// bytes) but not decompressed `output_bytes`. When decompressed bytes
+    /// are unavailable, the summary uses `max(wal_bytes, wal_compressed_bytes)`
+    /// as the best available WAL byte estimate.
+    pub fn from_source_metrics(
+        source: &crate::engine::SourceMetrics,
+        total_bytes_fallback: usize,
+        total_lines_fallback: usize,
+        _batches: usize,
+        exec_time: f64,
+    ) -> Self {
+        // Best available WAL bytes: prefer decompressed, fall back to
+        // compressed (from ParquetSource `bytes_scanned`).
+        let wal_best_bytes = source.wal_bytes.max(source.wal_compressed_bytes);
+        let scanned_bytes = source.iceberg_bytes + wal_best_bytes;
+        let scanned_rows = source.iceberg_rows + source.wal_rows;
+
+        // Use scan-level metrics when available, otherwise fall back to
+        // formatter output counts (standard Iceberg provider mode).
+        let total_bytes = if scanned_bytes > 0 {
+            scanned_bytes
+        } else {
+            total_bytes_fallback
+        };
+        let total_lines = if scanned_rows > 0 {
+            scanned_rows
+        } else {
+            total_lines_fallback
+        };
+
+        Self {
+            ingester: IngesterStats::from_wal(source.wal_compressed_bytes, source.wal_bytes, source.wal_rows),
+            store: StoreStats::from_iceberg(
+                source.iceberg_compressed_bytes,
+                source.iceberg_bytes,
+                source.iceberg_rows,
+            ),
+            summary: SummaryStats::from_metrics(total_bytes, total_lines, exec_time),
         }
     }
 }

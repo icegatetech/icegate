@@ -36,8 +36,14 @@ pub struct FormattedResult {
 
 impl FormattedResult {
     /// Create query stats from formatting result.
-    pub fn to_stats(&self, exec_time: f64) -> QueryStats {
-        QueryStats::from_metrics(self.total_bytes, self.total_lines, self.num_batches, exec_time)
+    ///
+    /// When `source` is provided, the stats include a per-source breakdown
+    /// (Iceberg vs WAL). Otherwise, falls back to the aggregate-only format.
+    pub fn to_stats(&self, exec_time: f64, source: Option<&crate::engine::SourceMetrics>) -> QueryStats {
+        source.map_or_else(
+            || QueryStats::from_metrics(self.total_bytes, self.total_lines, self.num_batches, exec_time),
+            |s| QueryStats::from_source_metrics(s, self.total_bytes, self.total_lines, self.num_batches, exec_time),
+        )
     }
 }
 
@@ -294,6 +300,7 @@ fn make_stream_key_into(labels: &HashMap<Arc<str>, Arc<str>>, buffer: &mut Strin
 /// Converts `DataFusion` `RecordBatches` to Loki streams format.
 ///
 /// Groups log entries by their labels and returns formatted streams.
+#[tracing::instrument(level = "debug", fields(batches = batches.len()))]
 pub fn batches_to_loki_streams(batches: &[RecordBatch]) -> FormattedResult {
     let mut streams: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(String, String)>)> = HashMap::with_capacity(64);
     let mut interner = StringInterner::new();
@@ -427,6 +434,7 @@ fn extract_metric_labels(
 /// Converts `DataFusion` `RecordBatches` to Loki matrix format.
 ///
 /// Groups metric samples by their labels and returns formatted matrix.
+#[tracing::instrument(level = "debug", fields(batches = batches.len()))]
 pub fn batches_to_loki_matrix(batches: &[RecordBatch]) -> FormattedResult {
     let mut series: HashMap<String, (HashMap<Arc<str>, Arc<str>>, Vec<(i64, String)>)> = HashMap::with_capacity(64);
     let mut interner = StringInterner::new();

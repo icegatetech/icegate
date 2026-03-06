@@ -41,7 +41,9 @@ impl IntoResponse for LokiError {
             QueryError::DataFusion(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::ExecutionError),
 
             // 500 Internal Server Error - infrastructure failures
-            QueryError::Iceberg(_) | QueryError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::Internal),
+            QueryError::Iceberg(_) | QueryError::Config(_) | QueryError::Internal(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::Internal)
+            }
         };
 
         (status, Json(LokiResponse::<()>::error(error_type, self.0.to_string()))).into_response()

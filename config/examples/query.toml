@@ -51,9 +51,10 @@ enabled = true
 host = "127.0.0.1"
 port = 3200
 
-# Query Engine Configuration (optional, uses defaults if not specified)
-# [engine]
-# batch_size = 8192                   # DataFusion batch size
-# target_partitions = 4              # Parallelism degree
-# catalog_name = "iceberg"           # Catalog name in SQL queries
-# provider_refresh_seconds = 60      # Cache refresh interval (0 to disable)
+# Query Engine Configuration
+[engine]
+# WAL base path for near-real-time queries (required)
+wal_base_path = "s3://queue/"
+# batch_size = 8192                   # DataFusion batch size (optional)
+# target_partitions = 4              # Parallelism degree (optional)
+# catalog_name = "iceberg"           # Catalog name in SQL queries (optional)

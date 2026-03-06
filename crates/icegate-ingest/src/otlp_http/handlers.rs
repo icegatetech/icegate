@@ -82,9 +82,11 @@ pub async fn ingest_logs(
     let tenant_id = extract_tenant_id(&headers);
 
     // Transform OTLP logs to Arrow RecordBatch (offload to blocking thread)
-    let batch =
-        tokio::task::spawn_blocking(move || transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
-            .await??;
+    let span = tracing::Span::current();
+    let batch = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
+    })
+    .await??;
     let Some(batch) = batch else {
         // No records to process - return success with 0 rejected
         request_metrics.record_records_per_request(0);

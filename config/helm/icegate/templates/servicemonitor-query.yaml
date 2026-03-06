@@ -1,0 +1,21 @@
+{{- if and .Values.query.enabled .Values.query.metrics.enabled .Values.serviceMonitor.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "query") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "query") | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "icegate.selectorLabels" (dict "context" . "component" "query") | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: {{ .Values.query.metrics.path }}
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+{{- end }}

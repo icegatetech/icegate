@@ -259,6 +259,24 @@ jobs:
           auto-push: true
           save-data-file: true
 
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v4.1.0
+
+      - name: Lint chart
+        run: helm lint config/helm/icegate
+
+      - name: Template chart
+        run: helm template icegate config/helm/icegate > /dev/null
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest

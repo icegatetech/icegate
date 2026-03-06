@@ -1,0 +1,219 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/icegatetech/icegate
+
+jobs:
+  docker:
+    name: Docker Images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate SemVer tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Tag '${TAG}' is not a valid SemVer tag (expected v<MAJOR>.<MINOR>.<PATCH>[-prerelease])"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Prerelease if tag contains a hyphen after stripping v
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate build timestamp
+        id: timestamp
+        run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata (query)
+        id: meta-query
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-query
+          bake-target: query
+          labels: |
+            org.opencontainers.image.description=Query APIs for IceGate (Loki, Prometheus, Tempo)
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
+
+      - name: Docker metadata (ingest)
+        id: meta-ingest
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-ingest
+          bake-target: ingest
+          labels: |
+            org.opencontainers.image.description=OTLP data ingestion for IceGate
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
+
+      - name: Docker metadata (maintain)
+        id: meta-maintain
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-maintain
+          bake-target: maintain
+          labels: |
+            org.opencontainers.image.description=Maintenance operations for IceGate
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
+
+      - name: Build and push
+        uses: docker/bake-action@v6
+        with:
+          files: |
+            config/docker/docker-bake.hcl
+            cwd://${{ steps.meta-query.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-query.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-ingest.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-ingest.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-maintain.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-maintain.outputs.bake-file-labels }}
+          targets: default
+          push: true
+          set: |
+            *.args.VERSION=${{ steps.version.outputs.version }}
+            *.args.REVISION=${{ github.sha }}
+            *.args.BUILD_DATE=${{ steps.timestamp.outputs.value }}
+            *.cache-from=type=gha,scope=release
+            *.cache-to=type=gha,mode=max,scope=release
+
+  # ── Helm chart (OCI artifact → GHCR) ─────────────────────────────────────
+  helm-chart:
+    name: Helm Chart
+    needs: [docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v4.1.0
+
+      - name: Log in to GHCR
+        env:
+          HELM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HELM_USER: ${{ github.actor }}
+        run: echo "${HELM_TOKEN}" | helm registry login ghcr.io --username "${HELM_USER}" --password-stdin
+
+      - name: Stamp chart version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version:.*/version: ${VERSION}/" config/helm/icegate/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" config/helm/icegate/Chart.yaml
+
+      - name: Lint chart
+        run: helm lint config/helm/icegate
+
+      - name: Package chart
+        run: helm package config/helm/icegate
+
+      - name: Push chart to GHCR
+        run: helm push "icegate-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/icegatetech/charts
+
+  # ── GitHub Release ────────────────────────────────────────────────────────
+  github-release:
+    name: GitHub Release
+    needs: [docker, helm-chart]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+
+          # Find previous full release tag (no hyphen = no prerelease suffix)
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${TAG}$" | head -n1)
+
+          cat <<EOF > notes.md
+          ## Helm Chart
+
+          \`\`\`bash
+          helm install icegate oci://ghcr.io/icegatetech/charts/icegate --version ${VERSION}
+          \`\`\`
+
+          ## Docker Images
+
+          \`\`\`bash
+          docker pull ${IMAGE_PREFIX}-query:${VERSION}
+          docker pull ${IMAGE_PREFIX}-ingest:${VERSION}
+          docker pull ${IMAGE_PREFIX}-maintain:${VERSION}
+          \`\`\`
+
+          Platforms: \`linux/amd64\`, \`linux/arm64\`
+
+          ## Changelog
+          EOF
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "" >> notes.md
+            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..${TAG}" >> notes.md
+            echo "" >> notes.md
+          else
+            echo "Initial release." >> notes.md
+          fi
+
+          PRERELEASE_FLAG=""
+          case "${TAG}" in *-*) PRERELEASE_FLAG="--prerelease" ;; esac
+
+          gh release create "${TAG}" \
+            --title "IceGate ${TAG}" \
+            --notes-file notes.md \
+            ${PRERELEASE_FLAG}

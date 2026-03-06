@@ -7,6 +7,9 @@ catalog:
   # Catalog backend options:
   # - !memory (for testing)
   # - !rest { uri: "http://127.0.0.1:19120/iceberg" }
+  # - !s3tables { table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket" }
+  # - !glue {}
+  # - !glue { catalog_id: "123456789012" }
   backend: !rest
     uri: http://127.0.0.1:19120/iceberg
   # Warehouse location (root path for data storage)

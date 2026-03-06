@@ -1,0 +1,19 @@
+{{- if .Values.migrate.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "maintain") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "maintain") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": {{ .Values.migrate.hookDeletePolicy }}
+data:
+  maintain.yaml: |
+    catalog:
+      {{- include "icegate.catalogYaml" . | nindent 6 }}
+    storage:
+      {{- include "icegate.storageYaml" . | nindent 6 }}
+{{- end }}

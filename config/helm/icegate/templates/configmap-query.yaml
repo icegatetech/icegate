@@ -1,0 +1,50 @@
+{{- if .Values.query.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "query") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "query") | nindent 4 }}
+data:
+  query.yaml: |
+    catalog:
+      {{- include "icegate.catalogYaml" . | nindent 6 }}
+      {{- if .Values.query.cache.enabled }}
+      cache:
+        memory_size_mb: {{ .Values.query.cache.memorySizeMb }}
+        disk_dir: {{ .Values.query.cache.diskDir }}
+        disk_size_mb: {{ .Values.query.cache.diskSizeMb }}
+        object_size_limit_mb: {{ .Values.query.cache.objectSizeLimitMb }}
+      {{- end }}
+    engine:
+      wal_base_path: {{ .Values.query.engine.walBasePath | quote }}
+      batch_size: {{ .Values.query.engine.batchSize }}
+      target_partitions: {{ .Values.query.engine.targetPartitions }}
+      catalog_name: {{ .Values.query.engine.catalogName | quote }}
+    storage:
+      {{- include "icegate.storageYaml" . | nindent 6 }}
+    loki:
+      enabled: {{ .Values.query.loki.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.query.loki.port }}
+    prometheus:
+      enabled: {{ .Values.query.prometheus.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.query.prometheus.port }}
+    tempo:
+      enabled: {{ .Values.query.tempo.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.query.tempo.port }}
+    metrics:
+      enabled: {{ .Values.query.metrics.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.query.metrics.port }}
+      path: {{ .Values.query.metrics.path | quote }}
+    tracing:
+      enabled: {{ .Values.query.tracing.enabled }}
+      {{- if .Values.query.tracing.otlpEndpoint }}
+      otlp_endpoint: {{ .Values.query.tracing.otlpEndpoint | quote }}
+      {{- end }}
+      sample_ratio: {{ .Values.query.tracing.sampleRatio }}
+{{- end }}

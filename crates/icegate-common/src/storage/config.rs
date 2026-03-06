@@ -2,8 +2,6 @@
 //!
 //! Defines configuration structures for storage backends.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CommonError, Result};
@@ -13,9 +11,6 @@ use crate::error::{CommonError, Result};
 pub struct StorageConfig {
     /// Storage backend type
     pub backend: StorageBackend,
-    /// Additional storage-specific properties
-    #[serde(default)]
-    pub properties: HashMap<String, String>,
 }
 
 /// Storage backend types
@@ -79,7 +74,6 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: StorageBackend::Memory,
-            properties: HashMap::new(),
         }
     }
 }

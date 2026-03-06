@@ -9,8 +9,12 @@ use opentelemetry::global;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_resource_detectors::{
+    HostResourceDetector, K8sResourceDetector, OsResourceDetector, ProcessResourceDetector,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::resource::{EnvResourceDetector, SdkProvidedResourceDetector, TelemetryResourceDetector};
 use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, SdkTracerProvider};
 use serde::{Deserialize, Serialize};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -24,10 +28,6 @@ pub struct TracingConfig {
     /// Whether tracing is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-
-    /// Service name for trace identification
-    #[serde(default = "default_service_name")]
-    pub service_name: String,
 
     /// OTLP endpoint for trace export (e.g., `http://jaeger:4317`)
     /// Falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable
@@ -46,7 +46,6 @@ impl Default for TracingConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
-            service_name: default_service_name(),
             otlp_endpoint: None,
             sample_ratio: default_sample_ratio(),
         }
@@ -55,10 +54,6 @@ impl Default for TracingConfig {
 
 const fn default_enabled() -> bool {
     true
-}
-
-fn default_service_name() -> String {
-    "icegate".to_string()
 }
 
 const fn default_sample_ratio() -> f64 {
@@ -147,7 +142,6 @@ impl Drop for TracingGuard {
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = TracingConfig {
 ///     enabled: true,
-///     service_name: "icegate-ingest".to_string(),
 ///     otlp_endpoint: Some("http://jaeger:4317".to_string()),
 ///     sample_ratio: 1.0,
 /// };
@@ -198,17 +192,28 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
         .map_err(|e| CommonError::Config(format!("Failed to create OTLP exporter: {e}")))?;
 
     // Build tracer provider with batch exporter
-    let service_name = config.service_name.clone();
     let tracer_provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .with_sampler(sampler)
         .with_id_generator(RandomIdGenerator::default())
-        .with_resource(Resource::builder_empty().with_service_name(service_name).build())
+        .with_resource(
+            Resource::builder_empty()
+                .with_detectors(&[
+                    Box::new(OsResourceDetector),
+                    Box::new(K8sResourceDetector),
+                    Box::new(HostResourceDetector::default()),
+                    Box::new(ProcessResourceDetector),
+                    Box::new(SdkProvidedResourceDetector),
+                    Box::new(TelemetryResourceDetector),
+                    Box::new(EnvResourceDetector::new()),
+                ])
+                .build(),
+        )
         .build();
 
     // Set global tracer provider
     global::set_tracer_provider(tracer_provider.clone());
-    let tracer = global::tracer(config.service_name.clone());
+    let tracer = global::tracer("main");
 
     // Initialize tracing subscriber with OpenTelemetry layer
     tracing_subscriber::registry()

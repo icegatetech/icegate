@@ -83,11 +83,13 @@ impl LogsService for OtlpGrpcService {
         let export_request = request.into_inner();
 
         // Transform OTLP logs to Arrow RecordBatch (offload to blocking thread)
-        let batch =
-            tokio::task::spawn_blocking(move || transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
-                .await
-                .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
-                .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))?;
+        let span = tracing::Span::current();
+        let batch = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))?;
         let Some(batch) = batch else {
             // No records to process - return success with 0 rejected
             request_metrics.record_records_per_request(0);

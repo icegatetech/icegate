@@ -1,4 +1,5 @@
-.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench down
+.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench down \
+       helm-lint helm-template
 
 run-core-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml up --build
@@ -7,7 +8,7 @@ run-load-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile load up --build
 
 run-monitoring-release:
-	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile monitoring up --build
+	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile monitoring up --build --force-recreate
 
 run-analytics-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile analytics up --build
@@ -49,4 +50,10 @@ bench:
 down:
 	docker compose -f config/docker/docker-compose.yml down
 
-ci: check fmt clippy test audit
+helm-lint:
+	helm lint config/helm/icegate
+
+helm-template:
+	helm template icegate config/helm/icegate > /dev/null
+
+ci: check fmt clippy test audit helm-lint helm-template

@@ -16,7 +16,7 @@ use futures::{StreamExt, future::join_all};
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
-use tracing::{Instrument, debug, error, info, trace, warn};
+use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
@@ -317,8 +317,11 @@ impl QueueWriter {
         // Convert to Parquet bytes
         let row_group_count = batches.len();
         let writer_properties = self.writer_properties();
-        let parquet_bytes =
-            tokio::task::spawn_blocking(move || Self::batches_to_parquet(writer_properties, &batches)).await??;
+        let span = tracing::Span::current();
+        let parquet_bytes = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| Self::batches_to_parquet(writer_properties, &batches))
+        })
+        .await??;
         let size_bytes = parquet_bytes.len() as u64;
         debug!(
             records = record_count,
@@ -413,6 +416,7 @@ impl QueueWriter {
     }
 
     /// Converts record batches to Parquet bytes.
+    #[instrument(skip_all, fields(batches.len = batches.len()))]
     fn batches_to_parquet(props: WriterProperties, batches: &[RecordBatch]) -> Result<Bytes> {
         if batches.is_empty() {
             return Err(QueueError::Config("No batches to write".to_string()));
@@ -544,6 +548,7 @@ impl QueueWriter {
                 "store.put_opts failed"
             );
             if matches!(e, object_store::Error::AlreadyExists { .. }) {
+                debug!("Segment already exists, skipping write (offset {})", segment_id.offset);
                 QueueError::AlreadyExists {
                     topic: segment_id.topic.clone(),
                     offset: segment_id.offset,

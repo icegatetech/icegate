@@ -67,6 +67,7 @@ impl DataFusionPlanner {
 impl Planner for DataFusionPlanner {
     type Plan = DataFrame;
 
+    #[tracing::instrument(skip_all)]
     async fn plan(&self, expr: LogQLExpr) -> Result<Self::Plan> {
         let df = match expr {
             LogQLExpr::Log(log_expr) => {
@@ -89,6 +90,7 @@ impl Planner for DataFusionPlanner {
 }
 
 impl DataFusionPlanner {
+    #[tracing::instrument(skip(self, expr))]
     async fn plan_log(&self, expr: LogExpr, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<DataFrame> {
         // 1. Scan the logs table from iceberg.icegate namespace
         let df = self.session_ctx.table(LOGS_TABLE_FQN).await?;
@@ -130,6 +132,7 @@ impl DataFusionPlanner {
     /// - `level` alias (if `severity_text` has non-null values)
     ///
     /// Labels with only NULL values are excluded from the result.
+    #[tracing::instrument(skip(self, selector))]
     pub async fn plan_labels(&self, selector: Selector) -> Result<DataFrame> {
         // Build base query with tenant + time + selector filters
         let log_expr = LogExpr::new(selector);
@@ -172,6 +175,7 @@ impl DataFusionPlanner {
     /// Returns a `DataFrame` with a single column `value` containing all
     /// distinct values for the specified label from logs matching the
     /// selector and time range.
+    #[tracing::instrument(skip(self, selector), fields(label_name))]
     pub async fn plan_label_values(&self, selector: Selector, label_name: &str) -> Result<DataFrame> {
         // Build base query with tenant + time + selector filters
         let log_expr = LogExpr::new(selector);
@@ -204,6 +208,7 @@ impl DataFusionPlanner {
     /// 2. Convert binary columns (`trace_id`, `span_id`) to hex strings
     /// 3. Group by indexed columns + serialized attributes
     /// 4. Keep one representative attributes MAP using `first_value()`
+    #[tracing::instrument(skip(self, selectors))]
     #[allow(clippy::items_after_statements)]
     pub async fn plan_series(&self, selectors: &[Selector]) -> Result<DataFrame> {
         use datafusion::{
@@ -258,6 +263,8 @@ impl DataFusionPlanner {
         Ok(df)
     }
 
+    // Note: #[tracing::instrument] cannot be applied to methods returning Pin<Box<dyn Future>>
+    // directly. The outer plan() span covers this call.
     fn plan_metric<'a>(&'a self, expr: MetricExpr) -> Pin<Box<dyn Future<Output = Result<DataFrame>> + Send + 'a>> {
         Box::pin(async move {
             match expr {
@@ -304,6 +311,7 @@ impl DataFusionPlanner {
         })
     }
 
+    #[tracing::instrument(skip(self, agg))]
     async fn plan_range_aggregation(&self, agg: crate::logql::metric::RangeAggregation) -> Result<DataFrame> {
         if agg.range_expr.unwrap.is_some() {
             self.plan_unwrap_range_aggregation(agg).await
@@ -1092,6 +1100,7 @@ impl DataFusionPlanner {
         }
     }
 
+    #[tracing::instrument(skip(self, agg))]
     async fn plan_vector_aggregation(&self, agg: crate::logql::metric::VectorAggregation) -> Result<DataFrame> {
         // Push grouping down to inner RangeAggregation if present
         let inner_expr = Self::push_grouping_to_inner_expr(*agg.expr, agg.grouping.as_ref());

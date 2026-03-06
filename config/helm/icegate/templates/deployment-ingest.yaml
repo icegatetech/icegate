@@ -1,0 +1,102 @@
+{{- if .Values.ingest.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "ingest") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 4 }}
+spec:
+  replicas: {{ .Values.ingest.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "icegate.selectorLabels" (dict "context" . "component" "ingest") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-ingest.yaml") . | sha256sum }}
+      labels:
+        {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icegate.serviceAccountName" . }}
+      securityContext:
+        {{- include "icegate.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: ingest
+          image: {{ include "icegate.image" (dict "image" .Values.ingest.image "tag" .Chart.AppVersion) }}
+          imagePullPolicy: {{ .Values.ingest.image.pullPolicy }}
+          command:
+            - /usr/local/bin/entrypoint
+            - run
+            - --config
+            - /etc/icegate/ingest.yaml
+          securityContext:
+            {{- include "icegate.containerSecurityContext" . | nindent 12 }}
+          ports:
+            {{- if .Values.ingest.otlpGrpc.enabled }}
+            - name: otlp-grpc
+              containerPort: {{ .Values.ingest.otlpGrpc.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.ingest.otlpHttp.enabled }}
+            - name: otlp-http
+              containerPort: {{ .Values.ingest.otlpHttp.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.ingest.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.ingest.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- include "icegate.awsEnv" . | nindent 12 }}
+            - name: RUST_LOG
+              value: {{ .Values.ingest.rustLog | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: icegate-ingest
+            {{- with .Values.ingest.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.ingest.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.ingest.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.ingest.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/icegate
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "icegate.componentName" (dict "context" . "component" "ingest") }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.ingest.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingest.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingest.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingest.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
