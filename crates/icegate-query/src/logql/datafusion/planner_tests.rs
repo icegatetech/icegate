@@ -205,6 +205,7 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
         limit: None,
         step: Some(TimeDelta::seconds(15)), // 15-second step for metric queries
         direction: SortDirection::default(),
+        max_grid_points: QueryContext::DEFAULT_MAX_GRID_POINTS,
     };
 
     (session_ctx, query_ctx)

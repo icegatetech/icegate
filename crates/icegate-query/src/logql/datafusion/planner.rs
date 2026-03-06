@@ -703,6 +703,7 @@ impl DataFusionPlanner {
             step_micros,
             range_micros,
             offset_micros,
+            self.query_ctx.max_grid_points,
         )?;
         let grid_points = grid_agg.grid_points().to_vec();
         let grid_agg_udaf = AggregateUDF::from(grid_agg);
@@ -814,7 +815,9 @@ impl DataFusionPlanner {
             Self::build_date_grid_args(&self.query_ctx, agg.range_expr.range, agg.range_expr.offset)?;
 
         // 5. Apply date_grid UDF with inverse=true
-        let date_grid_udf = ScalarUDF::from(super::udf::DateGrid::new());
+        let date_grid_udf = ScalarUDF::from(super::udf::DateGrid::with_max_grid_points(
+            self.query_ctx.max_grid_points,
+        ));
         let date_grid_args = vec![
             col("timestamp"),
             start_arg,
@@ -915,6 +918,7 @@ impl DataFusionPlanner {
             step_micros,
             range_micros,
             offset_micros,
+            self.query_ctx.max_grid_points,
         )?;
         let grid_points = grid_agg.grid_points().to_vec();
         let grid_agg_udaf = AggregateUDF::from(grid_agg);
@@ -981,8 +985,7 @@ impl DataFusionPlanner {
 
         df = df.select(select_exprs)?;
 
-        // 13. Filter for sparse output (keep only value > 0)
-        Ok(df.filter(col("value").gt(lit(0.0)))?)
+        Ok(df)
     }
 
     fn build_default_label_columns(with: &[&str], without: &[&str]) -> Vec<String> {

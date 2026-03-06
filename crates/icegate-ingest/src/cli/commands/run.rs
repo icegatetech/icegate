@@ -61,11 +61,8 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Create object store based on queue base_path
     // Ingest writes data — no read cache needed, pass None.
-    let (store, normalized_path) = create_object_store(
-        &queue_config.common.base_path,
-        Some(&config.storage.backend),
-        None,
-    )?;
+    let (store, normalized_path) =
+        create_object_store(&queue_config.common.base_path, Some(&config.storage.backend), None)?;
 
     // Update queue config with normalized base path
     let mut queue_config = queue_config;

@@ -113,6 +113,7 @@ impl GridAgg {
     /// * `step_micros` - Step interval in microseconds
     /// * `range_micros` - Range window size in microseconds
     /// * `offset_micros` - Offset for the range window in microseconds
+    /// * `max_grid_points` - Maximum allowed grid points to prevent excessive memory allocation
     ///
     /// # Errors
     /// Returns error if grid computation fails (invalid parameters).
@@ -123,8 +124,9 @@ impl GridAgg {
         step_micros: i64,
         range_micros: i64,
         offset_micros: i64,
+        max_grid_points: i64,
     ) -> Result<Self> {
-        let grid = compute_grid_points(start_micros, end_micros, step_micros)?;
+        let grid = compute_grid_points(start_micros, end_micros, step_micros, max_grid_points)?;
 
         // Count only needs timestamp; all others need (timestamp, value)
         let num_args = if matches!(op, GridAggOp::Count) { 1 } else { 2 };
@@ -948,11 +950,11 @@ impl Accumulator for WelfordGridAccumulator {
             .zip(self.m2s.iter())
             .map(|(&c, &m2)| {
                 // Population stddev/stdvar: need at least 1 sample (Prometheus uses n, not n-1)
-                if c < 2 {
+                if c == 0 {
                     None
                 } else {
                     #[allow(clippy::cast_precision_loss)]
-                    let variance = m2 / (c - 1) as f64;
+                    let variance = m2 / c as f64;
                     if self.is_variance {
                         Some(variance)
                     } else {
@@ -1634,7 +1636,7 @@ mod tests {
     /// Helper to create a `GridContext` for testing.
     fn test_ctx(start: i64, end: i64, step: i64, range: i64, offset: i64) -> GridContext {
         GridContext {
-            grid: Arc::new(compute_grid_points(start, end, step).unwrap()),
+            grid: Arc::new(compute_grid_points(start, end, step, 11_000).unwrap()),
             range_micros: range,
             offset_micros: offset,
         }

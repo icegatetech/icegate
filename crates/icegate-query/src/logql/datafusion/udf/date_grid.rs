@@ -12,9 +12,6 @@ use datafusion::{
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
 
-/// Maximum number of grid points to prevent excessive memory allocation.
-const MAX_GRID_POINTS: i64 = 10_000;
-
 /// Precompute grid points as microsecond timestamps.
 ///
 /// Generates evenly-spaced timestamps from `start_micros` to `end_micros`
@@ -24,11 +21,12 @@ const MAX_GRID_POINTS: i64 = 10_000;
 /// * `start_micros` - Grid start timestamp in microseconds
 /// * `end_micros` - Grid end timestamp in microseconds
 /// * `step_micros` - Step interval in microseconds (must be positive)
+/// * `max_points` - Maximum allowed grid points to prevent excessive memory allocation
 ///
 /// # Errors
 /// Returns error if step is non-positive, time range is invalid, or grid exceeds
-/// `MAX_GRID_POINTS` limit.
-pub fn compute_grid_points(start_micros: i64, end_micros: i64, step_micros: i64) -> Result<Vec<i64>> {
+/// `max_points` limit.
+pub fn compute_grid_points(start_micros: i64, end_micros: i64, step_micros: i64, max_points: i64) -> Result<Vec<i64>> {
     if step_micros <= 0 {
         return plan_err!("step must be positive");
     }
@@ -46,11 +44,11 @@ pub fn compute_grid_points(start_micros: i64, end_micros: i64, step_micros: i64)
         .checked_add(1)
         .ok_or_else(|| DataFusionError::Plan("Grid size calculation overflow".to_string()))?;
 
-    if num_points_i64 > MAX_GRID_POINTS {
+    if num_points_i64 > max_points {
         return plan_err!(
             "Grid size too large: {} points exceeds maximum of {}",
             num_points_i64,
-            MAX_GRID_POINTS
+            max_points
         );
     }
 
@@ -151,19 +149,27 @@ pub fn find_matching_grid_indices(
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DateGrid {
     signature: Signature,
+    max_grid_points: i64,
 }
 
 impl Default for DateGrid {
     fn default() -> Self {
-        Self::new()
+        use crate::logql::planner::QueryContext;
+        Self::with_max_grid_points(QueryContext::DEFAULT_MAX_GRID_POINTS)
     }
 }
 
 impl DateGrid {
-    /// Creates a new `DateGrid` UDF.
+    /// Creates a new `DateGrid` UDF with the default grid point limit.
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new `DateGrid` UDF with a custom grid point limit.
+    pub fn with_max_grid_points(max_grid_points: i64) -> Self {
         Self {
             signature: Signature::any(7, Volatility::Immutable),
+            max_grid_points,
         }
     }
 
@@ -266,7 +272,7 @@ impl ScalarUDFImpl for DateGrid {
         };
 
         // Compute grid points using shared utility
-        let grid = compute_grid_points(start_micros, end_micros, step_micros)?;
+        let grid = compute_grid_points(start_micros, end_micros, step_micros, self.max_grid_points)?;
 
         // Process each timestamp and collect matching grid points
         let mut list_builder: Vec<Vec<i64>> = Vec::with_capacity(timestamp_array.len());
@@ -364,24 +370,24 @@ mod tests {
     #[test]
     fn test_compute_grid_points_basic() {
         // 0, 100, 200, 300, 400, 500
-        let grid = compute_grid_points(0, 500, 100).unwrap();
+        let grid = compute_grid_points(0, 500, 100, 11_000).unwrap();
         assert_eq!(grid, vec![0, 100, 200, 300, 400, 500]);
     }
 
     #[test]
     fn test_compute_grid_points_single_point() {
-        let grid = compute_grid_points(100, 100, 50).unwrap();
+        let grid = compute_grid_points(100, 100, 50, 11_000).unwrap();
         assert_eq!(grid, vec![100]);
     }
 
     #[test]
     fn test_compute_grid_points_rejects_negative_step() {
-        assert!(compute_grid_points(0, 100, -1).is_err());
+        assert!(compute_grid_points(0, 100, -1, 11_000).is_err());
     }
 
     #[test]
     fn test_compute_grid_points_rejects_inverted_range() {
-        assert!(compute_grid_points(100, 0, 10).is_err());
+        assert!(compute_grid_points(100, 0, 10, 11_000).is_err());
     }
 
     #[test]
