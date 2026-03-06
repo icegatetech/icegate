@@ -353,7 +353,7 @@ impl Accumulator for CountGridAccumulator {
             }
             let ts = timestamps.value(i);
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for bucket in &mut self.counts[start_idx..end_idx] {
                 *bucket += 1;
             }
@@ -457,7 +457,7 @@ impl Accumulator for SumGridAccumulator {
             let ts = timestamps.value(i);
             let val = vals.value(i);
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for j in start_idx..end_idx {
                 self.sums[j] += val;
                 self.counts[j] += 1;
@@ -566,7 +566,7 @@ impl Accumulator for AvgGridAccumulator {
             let ts = timestamps.value(i);
             let val = vals.value(i);
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for j in start_idx..end_idx {
                 self.sums[j] += val;
                 self.counts[j] += 1;
@@ -681,8 +681,13 @@ impl Accumulator for MinGridAccumulator {
             }
             let ts = timestamps.value(i);
             let val = vals.value(i);
+            // Skip NaN: IEEE 754 NaN comparisons are always false, which would
+            // leave the bucket at f64::INFINITY while marking has_value = true.
+            if val.is_nan() {
+                continue;
+            }
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for j in start_idx..end_idx {
                 if val < self.mins[j] {
                     self.mins[j] = val;
@@ -743,7 +748,8 @@ impl Accumulator for MinGridAccumulator {
             let other_has = extract_i64_list(has_list, row)?;
             for (i, (m, h)) in other_mins.into_iter().zip(other_has).enumerate() {
                 if let (Some(m), Some(h)) = (m, h) {
-                    if i < self.mins.len() && h != 0 {
+                    // Skip NaN values from other partitions during merge.
+                    if i < self.mins.len() && h != 0 && !m.is_nan() {
                         if m < self.mins[i] || !self.has_value[i] {
                             self.mins[i] = m;
                         }
@@ -799,8 +805,13 @@ impl Accumulator for MaxGridAccumulator {
             }
             let ts = timestamps.value(i);
             let val = vals.value(i);
+            // Skip NaN: IEEE 754 NaN comparisons are always false, which would
+            // leave the bucket at f64::NEG_INFINITY while marking has_value = true.
+            if val.is_nan() {
+                continue;
+            }
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for j in start_idx..end_idx {
                 if val > self.maxs[j] {
                     self.maxs[j] = val;
@@ -861,7 +872,8 @@ impl Accumulator for MaxGridAccumulator {
             let other_has = extract_i64_list(has_list, row)?;
             for (i, (m, h)) in other_maxs.into_iter().zip(other_has).enumerate() {
                 if let (Some(m), Some(h)) = (m, h) {
-                    if i < self.maxs.len() && h != 0 {
+                    // Skip NaN values from other partitions during merge.
+                    if i < self.maxs.len() && h != 0 && !m.is_nan() {
                         if m > self.maxs[i] || !self.has_value[i] {
                             self.maxs[i] = m;
                         }
@@ -927,7 +939,7 @@ impl Accumulator for WelfordGridAccumulator {
             let ts = timestamps.value(i);
             let val = vals.value(i);
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             // Welford's online algorithm for each matching bucket
             for j in start_idx..end_idx {
                 self.counts[j] += 1;
@@ -1086,7 +1098,7 @@ impl Accumulator for FirstGridAccumulator {
             let ts = timestamps.value(i);
             let val = vals.value(i);
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for j in start_idx..end_idx {
                 if ts < self.timestamps[j] {
                     self.timestamps[j] = ts;
@@ -1212,7 +1224,7 @@ impl Accumulator for LastGridAccumulator {
             let ts = timestamps.value(i);
             let val = vals.value(i);
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for j in start_idx..end_idx {
                 // Use >= so equal timestamps prefer the later-arriving value,
                 // which is correct for last_over_time semantics.
@@ -1368,8 +1380,11 @@ impl Accumulator for QuantileGridAccumulator {
             let ts = timestamps.value(i);
             let val = vals.value(i);
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for j in start_idx..end_idx {
+                // TODO: With large volumes, this may cause OOM since we store all raw values
+                // per bucket. Consider t-digest or similar approximate quantile algorithm
+                // to bound memory usage.
                 self.buckets[j].push(val);
             }
         }
@@ -1443,6 +1458,8 @@ impl Accumulator for QuantileGridAccumulator {
                         )));
                     }
                     if i < self.buckets.len() {
+                        // TODO: Merging can accumulate unbounded values across partitions.
+                        // Consider implementing a memory budget or approximate algorithm.
                         for &v in &flat_vals[offset..offset + len] {
                             if let Some(v) = v {
                                 self.buckets[i].push(v);
@@ -1527,7 +1544,7 @@ impl Accumulator for RateCounterGridAccumulator {
             let ts = timestamps.value(i);
             let val = vals.value(i);
             let (start_idx, end_idx) =
-                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros);
+                find_matching_grid_indices(ts, &self.ctx.grid, self.ctx.range_micros, self.ctx.offset_micros)?;
             for j in start_idx..end_idx {
                 self.buckets[j].push((ts, val));
             }

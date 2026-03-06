@@ -87,23 +87,25 @@ pub fn find_matching_grid_indices(
     grid: &[i64],
     range_micros: i64,
     offset_micros: i64,
-) -> (usize, usize) {
+) -> Result<(usize, usize)> {
     // Grid point g matches if: t + offset <= g <= t + offset + range
-    let Some(lower_grid) = timestamp.checked_add(offset_micros) else {
-        return (0, 0);
-    };
-    let Some(upper_grid) = lower_grid.checked_add(range_micros) else {
-        return (0, 0);
-    };
+    let lower_grid = timestamp.checked_add(offset_micros).ok_or_else(|| {
+        DataFusionError::Execution(format!("timestamp ({timestamp}) + offset ({offset_micros}) overflow"))
+    })?;
+    let upper_grid = lower_grid.checked_add(range_micros).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "timestamp + offset ({lower_grid}) + range ({range_micros}) overflow"
+        ))
+    })?;
 
     // Negative range would produce an inverted interval — return empty.
     if upper_grid < lower_grid {
-        return (0, 0);
+        return Ok((0, 0));
     }
 
     let start_idx = grid.partition_point(|&g| g < lower_grid);
     let end_idx = grid.partition_point(|&g| g <= upper_grid);
-    (start_idx, end_idx)
+    Ok((start_idx, end_idx))
 }
 
 /// UDF: `date_grid(timestamp, start, end, step, range, offset, inverse)` - calculate step timestamps of
@@ -290,7 +292,7 @@ impl ScalarUDFImpl for DateGrid {
             } else {
                 let t = timestamp_array.value(i);
 
-                let (start_idx, end_idx) = find_matching_grid_indices(t, &grid, range_micros, offset_micros);
+                let (start_idx, end_idx) = find_matching_grid_indices(t, &grid, range_micros, offset_micros)?;
                 let matches: Vec<i64> = if inverse {
                     // Inverse mode: return grid points NOT in the coverage window
                     grid[..start_idx].iter().chain(grid[end_idx..].iter()).copied().collect()
@@ -402,7 +404,7 @@ mod tests {
         // Grid: [0, 100, 200, 300, 400, 500]
         // Timestamp=50, range=200, offset=0 → matches g where 50 <= g <= 250 → [100, 200]
         let grid = vec![0, 100, 200, 300, 400, 500];
-        let (start, end) = find_matching_grid_indices(50, &grid, 200, 0);
+        let (start, end) = find_matching_grid_indices(50, &grid, 200, 0).unwrap();
         assert_eq!(&grid[start..end], &[100, 200]);
     }
 
@@ -411,14 +413,21 @@ mod tests {
         // Grid: [0, 100, 200, 300, 400, 500]
         // Timestamp=50, range=100, offset=50 → matches g where 100 <= g <= 200 → [100, 200]
         let grid = vec![0, 100, 200, 300, 400, 500];
-        let (start, end) = find_matching_grid_indices(50, &grid, 100, 50);
+        let (start, end) = find_matching_grid_indices(50, &grid, 100, 50).unwrap();
         assert_eq!(&grid[start..end], &[100, 200]);
     }
 
     #[test]
     fn test_find_matching_grid_indices_no_match() {
         let grid = vec![0, 100, 200, 300];
-        let (start, end) = find_matching_grid_indices(500, &grid, 100, 0);
+        let (start, end) = find_matching_grid_indices(500, &grid, 100, 0).unwrap();
         assert_eq!(start, end); // empty range
+    }
+
+    #[test]
+    fn test_find_matching_grid_indices_overflow_returns_error() {
+        let grid = vec![0, 100, 200];
+        let result = find_matching_grid_indices(i64::MAX, &grid, 100, 1);
+        assert!(result.is_err());
     }
 }
