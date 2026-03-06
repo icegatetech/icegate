@@ -39,9 +39,6 @@ pub type ObjectStoreWithPath = (Arc<dyn ObjectStore>, String);
 /// * `base_path` - S3 URL in the format `s3://bucket/prefix`
 /// * `backend` - Optional storage backend configuration for endpoint/region settings
 /// * `cache` - Optional foyer cache shared with the Iceberg catalog's IO layer
-/// * `cache_object_size_limit` - Maximum object size (bytes) eligible for caching.
-///   Objects larger than this bypass the cache. `None` uses the `FoyerLayer` default
-///   (no limit).
 ///
 /// # Returns
 ///
@@ -51,7 +48,6 @@ pub fn create_s3_store(
     base_path: &str,
     backend: Option<&StorageBackend>,
     cache: Option<&iceberg::io::FoyerCache>,
-    cache_object_size_limit: Option<usize>,
 ) -> Result<ObjectStoreWithPath> {
     // Parse S3 URL: s3://bucket/prefix
     let path_without_scheme = base_path.strip_prefix("s3://").unwrap_or(base_path);
@@ -120,10 +116,7 @@ pub fn create_s3_store(
         .layer(OtelTraceLayer);
 
     let operator = if let Some(foyer_cache) = cache {
-        let mut foyer_layer = iceberg::io::FoyerLayer::new(foyer_cache.clone());
-        if let Some(limit) = cache_object_size_limit {
-            foyer_layer = foyer_layer.with_size_limit(..limit);
-        }
+        let foyer_layer = iceberg::io::FoyerLayer::new(foyer_cache.clone());
         base.layer(foyer_layer)
             .layer(OtelMetricsLayer::builder().register(&meter))
             .finish()
@@ -179,8 +172,6 @@ pub fn create_memory_store(base_path: &str) -> ObjectStoreWithPath {
 /// * `base_path` - The storage path with optional scheme prefix
 /// * `backend` - Optional storage backend configuration (used for S3 endpoint/region)
 /// * `cache` - Optional foyer cache for S3 read caching (ignored for non-S3 backends)
-/// * `cache_object_size_limit` - Maximum object size (bytes) eligible for caching
-///   (ignored for non-S3 backends). See [`create_s3_store`].
 ///
 /// # Returns
 ///
@@ -189,10 +180,9 @@ pub fn create_object_store(
     base_path: &str,
     backend: Option<&StorageBackend>,
     cache: Option<&iceberg::io::FoyerCache>,
-    cache_object_size_limit: Option<usize>,
 ) -> Result<ObjectStoreWithPath> {
     if base_path.starts_with("s3://") {
-        create_s3_store(base_path, backend, cache, cache_object_size_limit)
+        create_s3_store(base_path, backend, cache)
     } else if base_path.starts_with("file://") || base_path.starts_with('/') {
         create_local_store(base_path)
     } else {

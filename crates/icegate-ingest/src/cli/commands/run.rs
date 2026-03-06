@@ -65,7 +65,6 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         &queue_config.common.base_path,
         Some(&config.storage.backend),
         None,
-        None,
     )?;
 
     // Update queue config with normalized base path

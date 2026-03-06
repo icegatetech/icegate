@@ -667,11 +667,11 @@ async fn test_step_based_bucketing() {
         "Plan should contain aggregate for count_over_time"
     );
 
-    // Check the step (60 seconds = 60_000_000 microseconds) appears in plan
-    let plan_str = format!("{plan:?}");
+    // GridAgg UDAF encodes the step in its grid points
+    let plan_str = format!("{plan:?}").to_lowercase();
     assert!(
-        plan_str.contains("60000000000") || plan_str.contains("IntervalMonthDayNano"),
-        "Plan should reference step interval parameter"
+        plan_str.contains("gridagg"),
+        "Plan should contain gridagg UDAF with step encoded in grid points"
     );
 }
 
@@ -746,24 +746,23 @@ async fn test_time_grid_gap_filling() {
     let df = planner.plan(expr).await.expect("Planning failed");
     let plan = get_logical_plan(&df);
 
-    // UDF-based implementation: date_grid UDF generates matching grid points,
-    // then we unnest and aggregate with standard count function.
-    // Gap filling happens naturally because non-matching grid points aren't
-    // in the result (sparse representation).
+    // UDAF-based implementation: gridagg UDAF generates per-bucket values,
+    // then we unnest and select. Gap filling happens naturally because
+    // non-matching grid points produce NULL values (sparse representation).
     assert!(
         plan_contains_aggregate(plan),
         "Plan should contain aggregate for counting"
     );
 
-    // Check plan contains date_grid UDF and count aggregation
+    // Check plan contains gridagg UDAF with count operation
     let plan_str = format!("{plan:?}").to_lowercase();
     assert!(
-        plan_str.contains("date_grid") || plan_str.contains("dategrid"),
-        "Plan should reference date_grid UDF: {plan_str}"
+        plan_str.contains("gridagg"),
+        "Plan should reference gridagg UDAF: {plan_str}"
     );
     assert!(
-        plan_str.contains("count"),
-        "Plan should reference count aggregation: {plan_str}"
+        plan_str.contains("op: count"),
+        "Plan should use count operation in gridagg: {plan_str}"
     );
 }
 
@@ -796,11 +795,11 @@ async fn test_sum_over_time_with_numeric_unwrap() {
         plan_str.contains("parse_numeric") || plan_str.contains("parsenumeric"),
         "Plan should use parse_numeric UDF for default conversion"
     );
-    assert!(plan_str.contains("sum"), "Plan should contain sum aggregation");
     assert!(
-        plan_str.contains("date_grid") || plan_str.contains("dategrid"),
-        "Plan should use date_grid for time bucketing"
+        plan_str.contains("gridagg"),
+        "Plan should contain gridagg UDAF for time bucketing"
     );
+    assert!(plan_str.contains("op: sum"), "Plan should use sum operation in gridagg");
 }
 
 #[tokio::test]
@@ -886,13 +885,10 @@ async fn test_first_last_over_time() {
     let plan = get_logical_plan(&df);
     let plan_str = format!("{plan:?}").to_lowercase();
     assert!(
-        plan_str.contains("first_value") || plan_str.contains("firstvalue"),
-        "Plan should contain first_value aggregation"
+        plan_str.contains("gridagg") && plan_str.contains("op: first"),
+        "Plan should contain gridagg UDAF with first operation"
     );
-    assert!(
-        plan_str.contains("timestamp"),
-        "Plan should order by timestamp for first_value"
-    );
+    assert!(plan_str.contains("timestamp"), "Plan should reference timestamp column");
 
     // Test last_over_time
     let range_expr = RangeExpr::new(log_expr, TimeDelta::hours(1)).with_unwrap(UnwrapExpr::new("request_size"));
@@ -903,8 +899,8 @@ async fn test_first_last_over_time() {
     let plan = get_logical_plan(&df);
     let plan_str = format!("{plan:?}").to_lowercase();
     assert!(
-        plan_str.contains("last_value") || plan_str.contains("lastvalue"),
-        "Plan should contain last_value aggregation"
+        plan_str.contains("gridagg") && plan_str.contains("op: last"),
+        "Plan should contain gridagg UDAF with last operation"
     );
 }
 
@@ -931,13 +927,10 @@ async fn test_quantile_over_time() {
 
     let plan_str = format!("{plan:?}").to_lowercase();
     assert!(
-        plan_str.contains("approx_percentile_cont") || plan_str.contains("percentile"),
-        "Plan should use approx_percentile_cont for quantile"
+        plan_str.contains("gridagg") && plan_str.contains("quantile"),
+        "Plan should contain gridagg UDAF with quantile operation"
     );
-    assert!(
-        plan_str.contains("0.95") || plan_str.contains("95"),
-        "Plan should contain the quantile parameter"
-    );
+    assert!(plan_str.contains("0.95"), "Plan should contain the quantile parameter");
 }
 
 #[tokio::test]
@@ -1036,7 +1029,10 @@ async fn test_stddev_stdvar_over_time() {
     let df = planner.plan(expr).await.expect("stddev_over_time planning failed");
     let plan = get_logical_plan(&df);
     let plan_str = format!("{plan:?}").to_lowercase();
-    assert!(plan_str.contains("stddev"), "Plan should contain stddev aggregation");
+    assert!(
+        plan_str.contains("gridagg") && plan_str.contains("op: stddev"),
+        "Plan should contain gridagg UDAF with stddev operation"
+    );
 
     // Test stdvar_over_time
     let range_expr = RangeExpr::new(log_expr, TimeDelta::minutes(30)).with_unwrap(UnwrapExpr::new("reading"));
@@ -1047,8 +1043,8 @@ async fn test_stddev_stdvar_over_time() {
     let plan = get_logical_plan(&df);
     let plan_str = format!("{plan:?}").to_lowercase();
     assert!(
-        plan_str.contains("var_sample") || plan_str.contains("variance"),
-        "Plan should contain variance aggregation"
+        plan_str.contains("gridagg") && plan_str.contains("op: stdvar"),
+        "Plan should contain gridagg UDAF with stdvar operation"
     );
 }
 
@@ -1072,9 +1068,11 @@ async fn test_rate_counter() {
     let plan = get_logical_plan(&df);
 
     let plan_str = format!("{plan:?}").to_lowercase();
-    // rate_counter sums the values first
-    assert!(plan_str.contains("sum"), "Plan should sum values for rate_counter");
-    // Then divides by range duration (not easily visible in plan string, but should be in the final projection)
+    // rate_counter is handled by gridagg UDAF with RateCounter op
+    assert!(
+        plan_str.contains("gridagg") && plan_str.contains("ratecounter"),
+        "Plan should contain gridagg UDAF with ratecounter operation"
+    );
 }
 
 #[tokio::test]
@@ -1097,15 +1095,11 @@ async fn test_rate_counter_with_single_reset() {
     let plan = get_logical_plan(&df);
 
     let plan_str = format!("{plan:?}").to_lowercase();
-    // Should use LAG window function for counter reset detection
-    assert!(plan_str.contains("lag"), "Plan should contain LAG window function");
-    // Should calculate delta column
+    // Counter reset detection is handled inside gridagg UDAF with RateCounter op
     assert!(
-        plan_str.contains("delta"),
-        "Plan should create delta column for reset detection"
+        plan_str.contains("gridagg") && plan_str.contains("ratecounter"),
+        "Plan should contain gridagg UDAF with ratecounter operation for reset detection"
     );
-    // Should sum deltas instead of raw values
-    assert!(plan_str.contains("sum"), "Plan should sum delta values");
 }
 
 #[tokio::test]
@@ -1128,13 +1122,11 @@ async fn test_rate_counter_multiple_resets() {
     let plan = get_logical_plan(&df);
 
     let plan_str = format!("{plan:?}").to_lowercase();
-    // Verify LAG window function for tracking previous values
+    // Counter reset detection for multiple resets is handled inside gridagg UDAF
     assert!(
-        plan_str.contains("lag"),
-        "Plan should contain LAG window function for multiple resets"
+        plan_str.contains("gridagg") && plan_str.contains("ratecounter"),
+        "Plan should contain gridagg UDAF with ratecounter operation for multiple resets"
     );
-    // Verify delta calculation logic
-    assert!(plan_str.contains("delta"), "Plan should calculate delta for each point");
 }
 
 #[tokio::test]
@@ -1157,15 +1149,10 @@ async fn test_rate_counter_no_reset() {
     let plan = get_logical_plan(&df);
 
     let plan_str = format!("{plan:?}").to_lowercase();
-    // Normal monotonic increase should still use LAG for consistency
+    // Monotonic counter handling is inside gridagg UDAF with RateCounter op
     assert!(
-        plan_str.contains("lag"),
-        "Plan should use LAG even for monotonic counters"
-    );
-    // Delta calculation should handle normal increases (current - previous)
-    assert!(
-        plan_str.contains("delta"),
-        "Plan should calculate delta for monotonic values"
+        plan_str.contains("gridagg") && plan_str.contains("ratecounter"),
+        "Plan should contain gridagg UDAF with ratecounter operation for monotonic counters"
     );
 }
 
@@ -1189,15 +1176,10 @@ async fn test_rate_counter_single_value() {
     let plan = get_logical_plan(&df);
 
     let plan_str = format!("{plan:?}").to_lowercase();
-    // Single value case: prev_value IS NULL, should use LAG but delta=0
+    // Single value and NULL handling is inside gridagg UDAF with RateCounter op
     assert!(
-        plan_str.contains("lag"),
-        "Plan should contain LAG for single value case"
-    );
-    // Delta calculation should handle NULL previous value (first sample)
-    assert!(
-        plan_str.contains("delta"),
-        "Plan should handle first sample with delta=0"
+        plan_str.contains("gridagg") && plan_str.contains("ratecounter"),
+        "Plan should contain gridagg UDAF with ratecounter operation for single value case"
     );
 }
 
@@ -1228,12 +1210,15 @@ async fn test_rate_counter_label_grouping() {
     let plan = get_logical_plan(&df);
 
     let plan_str = format!("{plan:?}").to_lowercase();
-    // LAG window function should partition by labels (including service_name)
-    assert!(plan_str.contains("lag"), "Plan should contain LAG window function");
-    // Verify partitioning includes label columns for per-series tracking
+    // Counter reset detection per label group is handled inside gridagg UDAF
     assert!(
-        plan_str.contains("partition") || plan_str.contains("over"),
-        "Plan should partition LAG window by labels"
+        plan_str.contains("gridagg") && plan_str.contains("ratecounter"),
+        "Plan should contain gridagg UDAF with ratecounter operation"
+    );
+    // Verify service_name appears in the plan for grouping
+    assert!(
+        plan_str.contains("service_name"),
+        "Plan should reference service_name for label grouping"
     );
 }
 
@@ -1354,12 +1339,8 @@ async fn test_unwrap_with_offset() {
     // Offset shifts the time window but shouldn't change the core aggregation logic
     let plan_str = format!("{plan:?}").to_lowercase();
     assert!(
-        plan_str.contains("avg"),
-        "Plan should contain avg aggregation even with offset"
-    );
-    assert!(
-        plan_str.contains("date_grid") || plan_str.contains("dategrid"),
-        "Plan should use date_grid for time bucketing even with offset"
+        plan_str.contains("gridagg") && plan_str.contains("op: avg"),
+        "Plan should contain gridagg UDAF with avg operation even with offset"
     );
 }
 
