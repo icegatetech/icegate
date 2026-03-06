@@ -32,6 +32,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use super::{config::ShiftConfig, parquet_meta_reader::data_files_from_parquet_paths};
@@ -154,13 +155,14 @@ impl IcebergStorage {
             });
         }
 
-        tracing::info!("Start writing parquet file. Batches: {}", batches.len());
+        tracing::info!("Start preparing parquet file. Batches: {}", batches.len());
         let queue_schema = batches[0].schema();
         let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
         let table = self.load_table(cancel_token).await?;
         let table_metadata = table.metadata().clone();
         let table_file_io = table.file_io().clone();
         let metadata_for_sort = table_metadata.clone();
+        tracing::debug!("Sorting batch");
         let span = tracing::Span::current();
         let sorted_batch = tokio::task::spawn_blocking(move || {
             span.in_scope(|| sort_by_table_order(&metadata_for_sort, combined_batch))
@@ -211,20 +213,24 @@ impl IcebergStorage {
         let partitioned_batches_len = partitioned_batches.len();
 
         for (partition_key, partition_batch) in partitioned_batches {
-            tracing::debug!(
-                "Writing partition with {} rows: {}",
-                partition_batch.num_rows(),
-                partition_key.to_path()
+            let partition_path = partition_key.to_path();
+            let span = tracing::info_span!(
+                "iceberg_partition_write",
+                partition_key = %partition_path,
+                rows = partition_batch.num_rows()
             );
             fanout_writer
                 .write(partition_key, partition_batch)
+                .instrument(span)
                 .await
                 .map_err(|e| IngestError::Shift(format!("failed to write partition batch: {e}")))?;
         }
 
         // Close writer and get data files
+        let span = tracing::info_span!("iceberg_write_close");
         let data_files: Vec<DataFile> = fanout_writer
             .close()
+            .instrument(span)
             .await
             .map_err(|e| IngestError::Shift(format!("failed to close fanout writer: {e}")))?;
 

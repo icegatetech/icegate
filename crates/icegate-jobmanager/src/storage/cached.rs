@@ -105,7 +105,9 @@ impl Storage for CachedStorage {
             }
         }
 
-        let job = job.ok_or(StorageError::ConcurrentModification)?;
+        let job = job.ok_or_else(|| {
+            StorageError::ConcurrentModification("Failed to read consistent job state after retries".to_string())
+        })?;
 
         cached_job.job = Some(job.clone());
         Ok(job)

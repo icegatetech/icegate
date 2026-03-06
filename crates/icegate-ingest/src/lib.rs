@@ -23,4 +23,7 @@ pub mod transform;
 /// Shift operations: moving data from WAL to Iceberg
 pub mod shift;
 
+/// Runtime thread planning helpers.
+pub mod runtime_threads;
+
 pub use config::IngestConfig;

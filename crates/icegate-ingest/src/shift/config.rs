@@ -162,7 +162,7 @@ impl JobsStorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShiftReadConfig {
-    /// Maximum number of row groups to process per shift task.
+    /// Maximum number of row groups to process per shift task. The restriction is necessary because very small row groups can be stored in the WAL, which can reduce performance.
     pub max_record_batches_per_task: usize,
     /// Maximum input size in bytes to process per shift task.
     /// It is better to synchronize with `QueueWriteConfig::max_bytes_per_flush`.
@@ -172,7 +172,7 @@ pub struct ShiftReadConfig {
 impl Default for ShiftReadConfig {
     fn default() -> Self {
         Self {
-            max_record_batches_per_task: 128,
+            max_record_batches_per_task: 1024,
             max_input_bytes_per_task: 64 * 1024 * 1024, // 64MB
         }
     }

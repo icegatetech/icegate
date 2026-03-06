@@ -16,7 +16,7 @@ use futures::{StreamExt, future::join_all};
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
@@ -458,8 +458,9 @@ impl QueueWriter {
         loop {
             let offset = self.next_offset(topic).await;
             let segment_id = SegmentId::new(topic, offset);
+            let attempt = attempts + 1;
 
-            match self.try_write(&segment_id, data.clone()).await {
+            match self.try_write(&segment_id, data.clone(), attempt).await {
                 Ok(()) => {
                     debug!("Wrote segment {}/{}", topic, offset);
 
@@ -515,11 +516,12 @@ impl QueueWriter {
     /// Uses `If-None-Match: *` for atomic write (fails if file exists).
     #[tracing::instrument(
         skip(self, data),
-        fields(topic = %segment_id.topic, offset = segment_id.offset, pending_bytes = data.len())
+        fields(topic = %segment_id.topic, offset = segment_id.offset, attempt, pending_bytes = data.len())
     )]
-    async fn try_write(&self, segment_id: &SegmentId, data: Bytes) -> Result<()> {
+    async fn try_write(&self, segment_id: &SegmentId, data: Bytes, attempt: usize) -> Result<()> {
         debug!("Try to save segments in store");
         let full_path = self.segment_full_path(segment_id);
+        let pending_bytes = data.len();
 
         let opts = PutOptions {
             mode: PutMode::Create, // If-None-Match: *
@@ -527,8 +529,24 @@ impl QueueWriter {
         };
 
         let payload = PutPayload::from_bytes(data);
+        let put_started = Instant::now();
+        let put_span = tracing::info_span!(
+            "store.put_opts",
+            topic = %segment_id.topic,
+            offset = segment_id.offset,
+            attempt,
+            pending_bytes
+        );
+        let put_result = self.store.put_opts(&full_path, payload, opts).instrument(put_span).await;
+        let elapsed_ms = u64::try_from(put_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        let result = self.store.put_opts(&full_path, payload, opts).await.map_err(|e| {
+        let result = put_result.map_err(|e| {
+            warn!(
+                reason = object_store_error_reason(&e),
+                elapsed_ms,
+                error = %e,
+                "store.put_opts failed"
+            );
             if matches!(e, object_store::Error::AlreadyExists { .. }) {
                 debug!("Segment already exists, skipping write (offset {})", segment_id.offset);
                 QueueError::AlreadyExists {
@@ -545,6 +563,7 @@ impl QueueWriter {
         })?;
 
         debug!(
+            elapsed_ms,
             e_tag = result.e_tag.as_deref().unwrap_or("none"),
             version = result.version.as_deref().unwrap_or("none"),
             "Segment written"
@@ -779,6 +798,19 @@ fn write_error_reason(error: &QueueError) -> &'static str {
                 "other"
             }
         }
+        _ => "other",
+    }
+}
+
+const fn object_store_error_reason(error: &object_store::Error) -> &'static str {
+    match error {
+        object_store::Error::AlreadyExists { .. } => "already_exists",
+        object_store::Error::Precondition { .. } => "precondition",
+        object_store::Error::NotModified { .. } => "not_modified",
+        object_store::Error::NotFound { .. } => "not_found",
+        object_store::Error::PermissionDenied { .. } => "permission_denied",
+        object_store::Error::Unauthenticated { .. } => "unauthenticated",
+        object_store::Error::NotImplemented => "not_implemented",
         _ => "other",
     }
 }

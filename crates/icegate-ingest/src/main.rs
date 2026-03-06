@@ -2,13 +2,20 @@
 //!
 //! Server app for ingesting OTLP data into `IceGate` observability data lake.
 
-#![allow(clippy::print_stderr)]
-
 use clap::Parser;
 use icegate_ingest::{cli::Cli, error::Result};
+use tokio::runtime::Builder;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    cli.execute().await
+
+    let plan = icegate_ingest::runtime_threads::compute_runtime_threads();
+
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(plan.main_threads)
+        .enable_all()
+        .build()
+        .map_err(icegate_ingest::error::IngestError::Io)?;
+
+    runtime.block_on(cli.execute())
 }

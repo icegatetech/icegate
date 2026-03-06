@@ -12,11 +12,11 @@ use crate::{Error, Job, JobCode, JobDefinition};
 // StorageError - storage-specific errors
 #[derive(ThisError, Debug, Clone)]
 pub(crate) enum StorageError {
-    #[error("job not found")]
-    NotFound,
+    #[error("job not found: {0}")]
+    NotFound(String),
 
-    #[error("concurrent modification detected")]
-    ConcurrentModification,
+    #[error("concurrent modification detected: {0}")]
+    ConcurrentModification(String),
 
     #[error("job not modified")]
     NotModified,
@@ -39,8 +39,8 @@ pub(crate) enum StorageError {
     #[error("service unavailable")]
     ServiceUnavailable,
 
-    #[error("auth error")]
-    Auth,
+    #[error("auth error: {0}")]
+    Auth(String),
 
     #[error("{0}")]
     Other(String),
@@ -52,7 +52,7 @@ impl StorageError {
     }
 
     pub const fn is_conflict(&self) -> bool {
-        matches!(self, Self::ConcurrentModification)
+        matches!(self, Self::ConcurrentModification(_))
     }
 
     pub const fn is_cancelled(&self) -> bool {

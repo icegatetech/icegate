@@ -175,7 +175,7 @@ impl Worker {
 
         let job = match self.storage.get_job(job_code, cancel_token).await {
             Ok(job) => job,
-            Err(StorageError::NotFound) => match self.create_new_job(job_code, cancel_token).await {
+            Err(StorageError::NotFound(_)) => match self.create_new_job(job_code, cancel_token).await {
                 Ok(job) => job,
                 Err(InternalError::Cancelled) => {
                     debug!("Job creation cancelled");
@@ -353,10 +353,15 @@ impl Worker {
             debug!("Tasks for job {} not found", job.code());
             return Ok(false);
         };
+        let task_code = job.get_task(&task_id)?.code().clone();
+        let job_code = job.code().clone();
 
         match job.start_task(&task_id, self.id) {
             Ok(()) => {}
-            Err(JobError::TaskWorkerMismatch) => return Ok(true),
+            Err(JobError::TaskWorkerMismatch) => {
+                self.metrics.record_task_stolen(&job_code, &task_code, "pick_start_local");
+                return Ok(true);
+            }
             Err(e) => return Err(InternalError::from(e)),
         }
 
@@ -364,15 +369,24 @@ impl Worker {
 
         let task_id_clone = task_id;
         let worker_id = self.id;
+        let metrics = self.metrics.clone();
+        let task_code_for_metrics = task_code.clone();
+        let job_code_for_metrics = job_code.clone();
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
                 let JobMergeContext { mut saved_job, .. } = ctx;
                 match saved_job.start_task(&task_id_clone, worker_id) {
                     Ok(()) => {
+                        metrics.record_save_conflict_retry(&job_code_for_metrics, "pick_start_conflict");
                         debug!("Job has concurrent modification when picking task - retry");
                         Ok(MergeDecision::Retry(saved_job))
                     }
                     Err(JobError::TaskWorkerMismatch) => {
+                        metrics.record_task_stolen(
+                            &job_code_for_metrics,
+                            &task_code_for_metrics,
+                            "pick_start_conflict",
+                        );
                         debug!("Job has concurrent modification when picking task - skip");
                         Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
                     }
@@ -418,6 +432,8 @@ impl Worker {
     ) -> Result<(), InternalError> {
         let task_id = *task_id;
         let task = job.get_task(&task_id)?;
+        let task_code = task.code().clone();
+        let job_code = job.code().clone();
 
         let executor = self.job_registry.get_task_executor(job.code(), &task.code().clone())?;
 
@@ -462,6 +478,9 @@ impl Worker {
 
                 let worker_id = self.id;
                 let task_id_clone = task_id;
+                let metrics = self.metrics.clone();
+                let task_code_for_metrics = task_code.clone();
+                let job_code_for_metrics = job_code.clone();
                 _ = self
                     .save_processed_task(job, &task_id, &cancel_token, move |ctx| {
                         let JobMergeContext {
@@ -470,10 +489,16 @@ impl Worker {
                         } = ctx;
                         match saved_job.merge_with_processed_task(current_job, &worker_id, &task_id_clone) {
                             Ok(()) => {
+                                metrics.record_save_conflict_retry(&job_code_for_metrics, "save_failed_task");
                                 debug!("Retry to save failed task");
                                 Ok(MergeDecision::Retry(saved_job))
                             }
                             Err(JobError::TaskWorkerMismatch) => {
+                                metrics.record_task_stolen(
+                                    &job_code_for_metrics,
+                                    &task_code_for_metrics,
+                                    "save_failed_task",
+                                );
                                 debug!("Task has stolen when try to save failed task - skip");
                                 Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
                             }
@@ -487,6 +512,9 @@ impl Worker {
 
                 let worker_id = self.id;
                 let task_id_clone = task_id;
+                let metrics = self.metrics.clone();
+                let task_code_for_metrics = task_code.clone();
+                let job_code_for_metrics = job_code.clone();
 
                 job.try_to_complete(&worker_id)?;
 
@@ -498,12 +526,18 @@ impl Worker {
                         } = ctx;
                         match saved_job.merge_with_processed_task(current_job, &worker_id, &task_id_clone) {
                             Ok(()) => {
+                                metrics.record_save_conflict_retry(&job_code_for_metrics, "save_completed_task");
                                 // conditions for job completion might have been met (another worker completed task)
                                 saved_job.try_to_complete(&worker_id)?;
                                 debug!("Retry to save completed task");
                                 Ok(MergeDecision::Retry(saved_job))
                             }
                             Err(JobError::TaskWorkerMismatch) => {
+                                metrics.record_task_stolen(
+                                    &job_code_for_metrics,
+                                    &task_code_for_metrics,
+                                    "save_completed_task",
+                                );
                                 debug!("Task has stolen when try to save completed task - skip");
                                 Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
                             }
