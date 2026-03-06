@@ -1331,7 +1331,7 @@ impl QuantileGridAccumulator {
         if sorted.is_empty() {
             return f64::NAN;
         }
-        sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+        sorted.sort_unstable_by(f64::total_cmp);
 
         if sorted.len() == 1 {
             return sorted[0];

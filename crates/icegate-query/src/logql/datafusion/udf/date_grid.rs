@@ -59,9 +59,11 @@ pub fn compute_grid_points(start_micros: i64, end_micros: i64, step_micros: i64,
         .map(|i| {
             #[allow(clippy::cast_possible_wrap)]
             let idx = i as i64;
-            start_micros + idx * step_micros
+            idx.checked_mul(step_micros)
+                .and_then(|offset| start_micros.checked_add(offset))
+                .ok_or_else(|| DataFusionError::Plan(format!("Grid point calculation overflow at index {idx}")))
         })
-        .collect();
+        .collect::<Result<Vec<i64>>>()?;
 
     Ok(grid)
 }
