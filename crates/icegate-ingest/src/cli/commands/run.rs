@@ -42,13 +42,15 @@ impl ShiftRuntimeHandle {
 }
 
 fn panic_payload_to_string(panic: &(dyn Any + Send)) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic".to_string()
-    }
+    panic.downcast_ref::<&str>().map_or_else(
+        || {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "unknown panic".to_string())
+        },
+        |message| (*message).to_string(),
+    )
 }
 
 fn spawn_shift_runtime(shifter: Shifter, shift_threads: usize) -> Result<ShiftRuntimeHandle> {

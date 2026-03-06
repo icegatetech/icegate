@@ -802,7 +802,7 @@ fn write_error_reason(error: &QueueError) -> &'static str {
     }
 }
 
-fn object_store_error_reason(error: &object_store::Error) -> &'static str {
+const fn object_store_error_reason(error: &object_store::Error) -> &'static str {
     match error {
         object_store::Error::AlreadyExists { .. } => "already_exists",
         object_store::Error::Precondition { .. } => "precondition",
