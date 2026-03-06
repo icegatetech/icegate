@@ -15,7 +15,6 @@ data:
         memory_size_mb: {{ .Values.query.cache.memorySizeMb }}
         disk_dir: {{ .Values.query.cache.diskDir }}
         disk_size_mb: {{ .Values.query.cache.diskSizeMb }}
-        object_size_limit_mb: {{ .Values.query.cache.objectSizeLimitMb }}
       {{- end }}
     engine:
       wal_base_path: {{ .Values.query.engine.walBasePath | quote }}

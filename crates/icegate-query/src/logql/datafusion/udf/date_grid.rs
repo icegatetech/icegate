@@ -12,6 +12,102 @@ use datafusion::{
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
 
+/// Precompute grid points as microsecond timestamps.
+///
+/// Generates evenly-spaced timestamps from `start_micros` to `end_micros`
+/// at `step_micros` intervals. Used by both the `DateGrid` UDF and `GridAgg` UDAF.
+///
+/// # Arguments
+/// * `start_micros` - Grid start timestamp in microseconds
+/// * `end_micros` - Grid end timestamp in microseconds
+/// * `step_micros` - Step interval in microseconds (must be positive)
+/// * `max_points` - Maximum allowed grid points to prevent excessive memory allocation
+///
+/// # Errors
+/// Returns error if step is non-positive, time range is invalid, or grid exceeds
+/// `max_points` limit.
+pub fn compute_grid_points(start_micros: i64, end_micros: i64, step_micros: i64, max_points: i64) -> Result<Vec<i64>> {
+    if step_micros <= 0 {
+        return plan_err!("step must be positive");
+    }
+    if end_micros < start_micros {
+        return plan_err!("end timestamp must be greater than or equal to start timestamp");
+    }
+
+    let time_range = end_micros
+        .checked_sub(start_micros)
+        .ok_or_else(|| DataFusionError::Plan("Time range calculation overflow".to_string()))?;
+
+    let num_points_i64 = time_range
+        .checked_div(step_micros)
+        .ok_or_else(|| DataFusionError::Plan("Grid calculation overflow".to_string()))?
+        .checked_add(1)
+        .ok_or_else(|| DataFusionError::Plan("Grid size calculation overflow".to_string()))?;
+
+    if num_points_i64 > max_points {
+        return plan_err!(
+            "Grid size too large: {} points exceeds maximum of {}",
+            num_points_i64,
+            max_points
+        );
+    }
+
+    let num_points = usize::try_from(num_points_i64)
+        .map_err(|_| DataFusionError::Plan("Grid size exceeds usize capacity".to_string()))?;
+
+    let grid: Vec<i64> = (0..num_points)
+        .map(|i| {
+            #[allow(clippy::cast_possible_wrap)]
+            let idx = i as i64;
+            idx.checked_mul(step_micros)
+                .and_then(|offset| start_micros.checked_add(offset))
+                .ok_or_else(|| DataFusionError::Plan(format!("Grid point calculation overflow at index {idx}")))
+        })
+        .collect::<Result<Vec<i64>>>()?;
+
+    Ok(grid)
+}
+
+/// Find the range of grid indices a timestamp maps to using binary search.
+///
+/// A timestamp `t` maps to grid point `g` if: `t + offset <= g <= t + offset + range`.
+/// Returns `(start_idx, end_idx)` as a half-open range `[start_idx, end_idx)`.
+///
+/// # Arguments
+/// * `timestamp` - The timestamp in microseconds
+/// * `grid` - Sorted slice of grid point timestamps in microseconds
+/// * `range_micros` - Range window size in microseconds
+/// * `offset_micros` - Offset for the range window in microseconds
+///
+/// # Returns
+/// `(start_idx, end_idx)` — indices into `grid` where matching points lie.
+/// If no grid points match, `start_idx == end_idx`.
+pub fn find_matching_grid_indices(
+    timestamp: i64,
+    grid: &[i64],
+    range_micros: i64,
+    offset_micros: i64,
+) -> Result<(usize, usize)> {
+    // Grid point g matches if: t + offset <= g <= t + offset + range
+    let lower_grid = timestamp.checked_add(offset_micros).ok_or_else(|| {
+        DataFusionError::Execution(format!("timestamp ({timestamp}) + offset ({offset_micros}) overflow"))
+    })?;
+    let upper_grid = lower_grid.checked_add(range_micros).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "timestamp + offset ({lower_grid}) + range ({range_micros}) overflow"
+        ))
+    })?;
+
+    // Negative range would produce an inverted interval — return empty.
+    if upper_grid < lower_grid {
+        return Ok((0, 0));
+    }
+
+    let start_idx = grid.partition_point(|&g| g < lower_grid);
+    let end_idx = grid.partition_point(|&g| g <= upper_grid);
+    Ok((start_idx, end_idx))
+}
+
 /// UDF: `date_grid(timestamp, start, end, step, range, offset, inverse)` - calculate step timestamps of
 /// aligning grid
 ///
@@ -62,19 +158,27 @@ use datafusion::{
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DateGrid {
     signature: Signature,
+    max_grid_points: i64,
 }
 
 impl Default for DateGrid {
     fn default() -> Self {
-        Self::new()
+        use crate::logql::planner::QueryContext;
+        Self::with_max_grid_points(QueryContext::DEFAULT_MAX_GRID_POINTS)
     }
 }
 
 impl DateGrid {
-    /// Creates a new `DateGrid` UDF.
+    /// Creates a new `DateGrid` UDF with the default grid point limit.
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new `DateGrid` UDF with a custom grid point limit.
+    pub fn with_max_grid_points(max_grid_points: i64) -> Self {
         Self {
             signature: Signature::any(7, Volatility::Immutable),
+            max_grid_points,
         }
     }
 
@@ -139,9 +243,6 @@ impl ScalarUDFImpl for DateGrid {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         use datafusion::common::ScalarValue;
 
-        // Define a reasonable maximum grid size to prevent excessive memory allocation
-        const MAX_GRID_POINTS: i64 = 10_000; // 10K points max
-
         // Validate argument count
         if args.args.len() != 7 {
             return plan_err!("date_grid requires 7 arguments");
@@ -179,51 +280,8 @@ impl ScalarUDFImpl for DateGrid {
             _ => return plan_err!("Seventh argument (inverse) must be a Boolean scalar"),
         };
 
-        // Validate step is positive
-        if step_micros <= 0 {
-            return plan_err!("step must be positive");
-        }
-
-        // Validate time range
-        if end_micros < start_micros {
-            return plan_err!("end timestamp must be greater than or equal to start timestamp");
-        }
-
-        // Calculate grid size safely to prevent overflow/excessive allocation
-        let time_range = end_micros
-            .checked_sub(start_micros)
-            .ok_or_else(|| DataFusionError::Plan("Time range calculation overflow".to_string()))?;
-
-        let num_points_i64 = time_range
-            .checked_div(step_micros)
-            .ok_or_else(|| DataFusionError::Plan("Grid calculation overflow".to_string()))?
-            .checked_add(1)
-            .ok_or_else(|| DataFusionError::Plan("Grid size calculation overflow".to_string()))?;
-
-        if num_points_i64 > MAX_GRID_POINTS {
-            return plan_err!(
-                "Grid size too large: {} points exceeds maximum of {}",
-                num_points_i64,
-                MAX_GRID_POINTS
-            );
-        }
-
-        // Safe to cast after bounds check; on 32-bit systems this is validated by MAX_GRID_POINTS limit
-        let num_points = usize::try_from(num_points_i64)
-            .map_err(|_| DataFusionError::Plan("Grid size exceeds usize capacity".to_string()))?;
-
-        // Generate grid timestamps
-        let grid: Vec<i64> = (0..num_points)
-            .map(|i| {
-                #[allow(clippy::cast_possible_wrap)]
-                let idx = i as i64;
-                start_micros + idx * step_micros
-            })
-            .collect();
-
-        let upper_bound_micros = range_micros
-            .checked_add(offset_micros)
-            .ok_or_else(|| DataFusionError::Execution("Overflow when computing range + offset bounds".to_string()))?;
+        // Compute grid points using shared utility
+        let grid = compute_grid_points(start_micros, end_micros, step_micros, self.max_grid_points)?;
 
         // Process each timestamp and collect matching grid points
         let mut list_builder: Vec<Vec<i64>> = Vec::with_capacity(timestamp_array.len());
@@ -234,28 +292,13 @@ impl ScalarUDFImpl for DateGrid {
             } else {
                 let t = timestamp_array.value(i);
 
-                // Grid point g matches if: t + offset <= g <= t + upper_bound
-                let lower_grid = t.checked_add(offset_micros).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Overflow when computing lower grid bound: timestamp {t} + offset {offset_micros}"
-                    ))
-                })?;
-                let upper_grid = t.checked_add(upper_bound_micros).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Overflow when computing upper grid bound: timestamp {t} + upper_bound {upper_bound_micros}"
-                    ))
-                })?;
-
-                // Collect matching grid points based on inverse parameter
+                let (start_idx, end_idx) = find_matching_grid_indices(t, &grid, range_micros, offset_micros)?;
                 let matches: Vec<i64> = if inverse {
                     // Inverse mode: return grid points NOT in the coverage window
-                    grid.iter().copied().filter(|&g| g < lower_grid || g > upper_grid).collect()
+                    grid[..start_idx].iter().chain(grid[end_idx..].iter()).copied().collect()
                 } else {
                     // Normal mode: return grid points in the coverage window
-                    // Binary search for first grid point >= lower_grid
-                    let start_idx = grid.partition_point(|&g| g < lower_grid);
-                    // Collect all matching grid points within the range
-                    grid[start_idx..].iter().take_while(|&&g| g <= upper_grid).copied().collect()
+                    grid[start_idx..end_idx].to_vec()
                 };
 
                 list_builder.push(matches);
@@ -331,5 +374,60 @@ mod tests {
         let result = DateGrid::extract_interval_micros(&arg, "test");
         assert!(result.is_err());
         assert!(result.unwrap_err().message().contains("Month intervals are not supported"));
+    }
+
+    #[test]
+    fn test_compute_grid_points_basic() {
+        // 0, 100, 200, 300, 400, 500
+        let grid = compute_grid_points(0, 500, 100, 11_000).unwrap();
+        assert_eq!(grid, vec![0, 100, 200, 300, 400, 500]);
+    }
+
+    #[test]
+    fn test_compute_grid_points_single_point() {
+        let grid = compute_grid_points(100, 100, 50, 11_000).unwrap();
+        assert_eq!(grid, vec![100]);
+    }
+
+    #[test]
+    fn test_compute_grid_points_rejects_negative_step() {
+        assert!(compute_grid_points(0, 100, -1, 11_000).is_err());
+    }
+
+    #[test]
+    fn test_compute_grid_points_rejects_inverted_range() {
+        assert!(compute_grid_points(100, 0, 10, 11_000).is_err());
+    }
+
+    #[test]
+    fn test_find_matching_grid_indices_basic() {
+        // Grid: [0, 100, 200, 300, 400, 500]
+        // Timestamp=50, range=200, offset=0 → matches g where 50 <= g <= 250 → [100, 200]
+        let grid = vec![0, 100, 200, 300, 400, 500];
+        let (start, end) = find_matching_grid_indices(50, &grid, 200, 0).unwrap();
+        assert_eq!(&grid[start..end], &[100, 200]);
+    }
+
+    #[test]
+    fn test_find_matching_grid_indices_with_offset() {
+        // Grid: [0, 100, 200, 300, 400, 500]
+        // Timestamp=50, range=100, offset=50 → matches g where 100 <= g <= 200 → [100, 200]
+        let grid = vec![0, 100, 200, 300, 400, 500];
+        let (start, end) = find_matching_grid_indices(50, &grid, 100, 50).unwrap();
+        assert_eq!(&grid[start..end], &[100, 200]);
+    }
+
+    #[test]
+    fn test_find_matching_grid_indices_no_match() {
+        let grid = vec![0, 100, 200, 300];
+        let (start, end) = find_matching_grid_indices(500, &grid, 100, 0).unwrap();
+        assert_eq!(start, end); // empty range
+    }
+
+    #[test]
+    fn test_find_matching_grid_indices_overflow_returns_error() {
+        let grid = vec![0, 100, 200];
+        let result = find_matching_grid_indices(i64::MAX, &grid, 100, 1);
+        assert!(result.is_err());
     }
 }

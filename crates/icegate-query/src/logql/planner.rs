@@ -42,6 +42,7 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 ///     limit: None,
 ///     step: None,
 ///     direction: SortDirection::default(),
+///     max_grid_points: QueryContext::DEFAULT_MAX_GRID_POINTS,
 /// };
 /// let planner = DataFusionPlanner::new(session_context, query_context);
 /// let _plan = planner.plan(LogQLExpr::Log(LogExpr::new(Selector::empty()))).await;
@@ -74,6 +75,16 @@ pub struct QueryContext {
     pub step: Option<TimeDelta>,
     /// Sort direction for log queries (default: backward/newest first).
     pub direction: SortDirection,
+    /// Maximum number of grid points allowed per query (default: `11_000`).
+    pub max_grid_points: i64,
+}
+
+impl QueryContext {
+    /// Default maximum number of grid points per query.
+    ///
+    /// Grafana typically requests up to ~11,000 data points (maxDataPoints).
+    /// This default accommodates that while preventing excessive memory allocation.
+    pub const DEFAULT_MAX_GRID_POINTS: i64 = 11_000;
 }
 
 /// A trait for planning `LogQL` expressions into execution plans.

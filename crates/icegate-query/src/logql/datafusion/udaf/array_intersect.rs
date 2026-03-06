@@ -1,7 +1,4 @@
-//! User-defined aggregate functions for LogQL operations in DataFusion.
-//!
-//! This module provides UDAFs for LogQL-specific aggregation operations,
-//! specifically array intersection for label matcher operations.
+//! Array intersection UDAF for LogQL `absent_over_time` operations.
 
 use std::{any::Any, sync::Arc};
 

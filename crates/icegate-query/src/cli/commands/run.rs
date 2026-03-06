@@ -60,26 +60,9 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Validate engine config (ensures wal_base_path is set)
     config.engine.validate()?;
 
-    // Extract the shared foyer cache and size limit from the IO cache handle
-    // so the WAL object store can share the same hybrid cache as the Iceberg
-    // catalog.
+    // Extract the shared foyer cache from the IO cache handle so the WAL
+    // object store can share the same hybrid cache as the Iceberg catalog.
     let foyer_cache = io_cache.cache().cloned();
-    let cache_object_size_limit = config
-        .catalog
-        .cache
-        .as_ref()
-        .map(|c| {
-            c.object_size_limit_mb
-                .checked_mul(1024)
-                .and_then(|v| v.checked_mul(1024))
-                .ok_or_else(|| {
-                    QueryError::Config(format!(
-                        "object_size_limit_mb ({}) is too large to convert to bytes",
-                        c.object_size_limit_mb,
-                    ))
-                })
-        })
-        .transpose()?;
 
     // Initialize WAL object store
     tracing::info!(wal_base_path = %config.engine.wal_base_path, "Initializing WAL object store");
@@ -97,7 +80,6 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         &config.engine.wal_base_path,
         Some(&config.storage.backend),
         foyer_cache.as_ref(),
-        cache_object_size_limit,
     )?;
     // Override wal_base_path with the normalized prefix within the object store
     // (e.g., "s3://bucket/prefix/" → "prefix", "s3://bucket/" → "")

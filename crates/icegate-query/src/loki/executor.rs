@@ -73,6 +73,7 @@ pub fn build_query_context(
         limit: None,
         step: None,
         direction: SortDirection::default(),
+        max_grid_points: QueryContext::DEFAULT_MAX_GRID_POINTS,
     }
 }
 
@@ -249,6 +250,7 @@ impl QueryExecutor {
                 Some("forward") => SortDirection::Forward,
                 _ => SortDirection::Backward, // Default per Loki spec
             },
+            max_grid_points: QueryContext::DEFAULT_MAX_GRID_POINTS,
         };
 
         // Parse LogQL (CPU-bound ANTLR parse offloaded to blocking thread)

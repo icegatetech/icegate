@@ -6,7 +6,7 @@ pub mod map_insert;
 pub mod parse;
 
 // Re-export all UDFs for backward compatibility
-pub use date_grid::DateGrid;
+pub use date_grid::{DateGrid, compute_grid_points, find_matching_grid_indices};
 pub use map_filter::{MapDropKeys, MapKeepKeys};
 pub use map_insert::MapInsert;
 pub use parse::{ParseBytes, ParseDuration, ParseNumeric};
