@@ -1346,7 +1346,7 @@ async fn test_unwrap_with_offset() {
 }
 
 #[tokio::test]
-async fn test_unwrap_coalesce_null_to_zero() {
+async fn test_unwrap_null_passthrough_to_udaf() {
     use crate::logql::{
         log::UnwrapExpr,
         metric::{MetricExpr, RangeAggregation, RangeAggregationOp, RangeExpr},
@@ -1366,11 +1366,18 @@ async fn test_unwrap_coalesce_null_to_zero() {
 
     let plan_str = format!("{plan:?}").to_lowercase();
 
-    // Verify that NULL values are replaced with 0.0 for aggregation
-    // (while still tracking errors separately)
+    // NULL unwrapped values must NOT be coalesced to 0.0 — GridAgg accumulators
+    // skip NULL rows natively. Coalescing would inject synthetic zeros that
+    // distort sum, avg, min, stddev, and quantile aggregates.
     assert!(
-        plan_str.contains("coalesce"),
-        "Plan should use coalesce to replace NULL with 0.0 for aggregation"
+        !plan_str.contains("coalesce"),
+        "Plan must not coalesce NULL unwrapped values — accumulators skip NULLs natively"
+    );
+
+    // Error tracking via _has_unwrap_error should still be present
+    assert!(
+        plan_str.contains("_has_unwrap_error"),
+        "Plan should still track unwrap errors via _has_unwrap_error column"
     );
 }
 

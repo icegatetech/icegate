@@ -94,6 +94,11 @@ pub fn find_matching_grid_indices(
         return (0, 0);
     };
 
+    // Negative range would produce an inverted interval — return empty.
+    if upper_grid < lower_grid {
+        return (0, 0);
+    }
+
     let start_idx = grid.partition_point(|&g| g < lower_grid);
     let end_idx = grid.partition_point(|&g| g <= upper_grid);
     (start_idx, end_idx)

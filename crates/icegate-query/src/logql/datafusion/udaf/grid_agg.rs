@@ -26,7 +26,7 @@ use datafusion::{
 use super::super::udf::date_grid::{compute_grid_points, find_matching_grid_indices};
 
 /// Aggregation operation to perform within each grid bucket.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GridAggOp {
     /// `count_over_time`, `rate` — count of log entries per bucket.
     Count,
@@ -227,7 +227,7 @@ impl Eq for GridAgg {}
 
 impl std::hash::Hash for GridAgg {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(&self.op).hash(state);
+        self.op.hash(state);
         self.grid.hash(state);
         self.range_micros.hash(state);
         self.offset_micros.hash(state);
@@ -1331,7 +1331,7 @@ impl QuantileGridAccumulator {
         if sorted.is_empty() {
             return f64::NAN;
         }
-        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
         if sorted.len() == 1 {
             return sorted[0];
@@ -1432,6 +1432,12 @@ impl Accumulator for QuantileGridAccumulator {
             for (i, len) in lengths.into_iter().enumerate() {
                 if let Some(len) = len {
                     let len = len as usize;
+                    if offset + len > flat_vals.len() {
+                        return Err(DataFusionError::Execution(format!(
+                            "QuantileGridAccumulator: state offset {offset} + length {len} exceeds flat values size {}",
+                            flat_vals.len()
+                        )));
+                    }
                     if i < self.buckets.len() {
                         for &v in &flat_vals[offset..offset + len] {
                             if let Some(v) = v {

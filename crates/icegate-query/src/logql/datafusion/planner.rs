@@ -655,17 +655,11 @@ impl DataFusionPlanner {
         // 5. Mark rows with conversion errors (unwrapped_value IS NULL)
         df = df.with_column("_has_unwrap_error", col("unwrapped_value").is_null())?;
 
-        // 6. Replace NULL with 0.0 for aggregation (errors still tracked by _has_unwrap_error)
-        df = df.with_column(
-            "unwrapped_value",
-            datafusion::functions::core::coalesce().call(vec![col("unwrapped_value"), lit(0.0)]),
-        )?;
-
-        // 7. Compute grid parameters
+        // 6. Compute grid parameters (NULL unwrapped_value rows are skipped by GridAgg accumulators)
         let (start_micros, end_micros, step_micros, range_micros, offset_micros) =
             Self::extract_grid_params(&self.query_ctx, agg.range_expr.range, agg.range_expr.offset)?;
 
-        // 8. Map RangeAggregationOp to GridAggOp
+        // 7. Map RangeAggregationOp to GridAggOp
         let grid_agg_op = match agg.op {
             RangeAggregationOp::SumOverTime => GridAggOp::Sum,
             RangeAggregationOp::AvgOverTime => GridAggOp::Avg,
@@ -695,7 +689,7 @@ impl DataFusionPlanner {
             }
         };
 
-        // 9. Create GridAgg UDAF
+        // 8. Create GridAgg UDAF
         let grid_agg = GridAgg::new(
             grid_agg_op,
             start_micros,
@@ -708,7 +702,7 @@ impl DataFusionPlanner {
         let grid_points = grid_agg.grid_points().to_vec();
         let grid_agg_udaf = AggregateUDF::from(grid_agg);
 
-        // 10. Build label grouping with pushdown support (no grid_timestamp — UDAF handles it)
+        // 9. Build label grouping with pushdown support (no grid_timestamp — UDAF handles it)
         let grouping_exprs = if let Some(ref grouping) = agg.grouping {
             let (grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
             df = df.with_column("attributes", filtered_attrs_expr)?;
@@ -717,7 +711,7 @@ impl DataFusionPlanner {
             Self::build_label_grouping_exprs(false) // false = no grid_timestamp (UDAF handles it)
         };
 
-        // 11. Aggregate: GROUP BY labels only, UDAF accumulates into grid buckets
+        // 10. Aggregate: GROUP BY labels only, UDAF accumulates into grid buckets
         df = df.aggregate(
             grouping_exprs,
             vec![
@@ -730,7 +724,7 @@ impl DataFusionPlanner {
             ],
         )?;
 
-        // 12. Add __error__ label for groups with conversion errors
+        // 11. Add __error__ label for groups with conversion errors
         let map_insert_udf = ScalarUDF::from(super::udf::MapInsert::new());
         df = df.with_column(
             "attributes",
@@ -741,7 +735,7 @@ impl DataFusionPlanner {
             .otherwise(col("attributes"))?,
         )?;
 
-        // 13. Add literal _grid_timestamps column, unnest both, filter NULLs
+        // 12. Add literal _grid_timestamps column, unnest both, filter NULLs
         let ts_type = DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None);
         let grid_ts_list = ScalarValue::List(ScalarValue::new_list_from_iter(
             grid_points.iter().map(|&ts| ScalarValue::TimestampMicrosecond(Some(ts), None)),
@@ -752,12 +746,15 @@ impl DataFusionPlanner {
         df = df.unnest_columns(&["_grid_timestamps", "_grid_values"])?;
         df = df.filter(col("_grid_values").is_not_null())?;
 
-        // 14. Apply rate division for RateCounter
+        // 13. Apply rate division for RateCounter
         let range_nanos = agg
             .range_expr
             .range
             .num_nanoseconds()
             .ok_or(QueryError::Config("Range duration too large".to_string()))?;
+        if range_nanos <= 0 {
+            return Err(QueryError::Config("Range duration must be positive".to_string()));
+        }
         #[allow(clippy::cast_precision_loss)]
         let range_secs = range_nanos as f64 / 1_000_000_000.0;
 
@@ -766,7 +763,7 @@ impl DataFusionPlanner {
             _ => col("_grid_values").alias("value"),
         };
 
-        // 15. Select output columns (respect grouping to avoid referencing missing columns)
+        // 14. Select output columns (respect grouping to avoid referencing missing columns)
         let mut select_exprs = vec![col("_grid_timestamps").alias("timestamp"), value_expr];
         select_exprs.extend(Self::build_grouped_label_exprs(agg.grouping.as_ref()));
 
@@ -969,6 +966,9 @@ impl DataFusionPlanner {
             .range
             .num_nanoseconds()
             .ok_or(QueryError::Config("Range duration too large".to_string()))?;
+        if range_nanos <= 0 {
+            return Err(QueryError::Config("Range duration must be positive".to_string()));
+        }
         #[allow(clippy::cast_precision_loss)]
         let range_secs = range_nanos as f64 / 1_000_000_000.0;
 
