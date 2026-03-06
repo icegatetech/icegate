@@ -263,18 +263,9 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let mut server_result = Ok(());
     if handles.is_empty() {
         tracing::warn!("No OTLP servers are enabled in configuration");
-        tracing::info!("Stopping shifter...");
-        shifter_handle.shutdown().await?;
-        tracing::info!("Shifter stopped gracefully");
-        // Orderly shutdown: close channel so writer loop can exit, then await it
-        drop(write_tx);
-        writer_handle.await??;
-        io_cache.close().await;
-        return Ok(());
-    }
-
-    tracing::info!("All enabled OTLP servers started");
-    tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
+    } else {
+        tracing::info!("All enabled OTLP servers started");
+        tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
 
         // Wait for shutdown signal (SIGINT or SIGTERM)
         shutdown_signal().await;

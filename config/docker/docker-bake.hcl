@@ -16,7 +16,7 @@ group "default" {
 
 target "_common" {
   context    = "."
-  dockerfile = "config/docker/Dockerfile.release"
+  dockerfile = "config/docker/release.Dockerfile"
   platforms  = ["linux/amd64", "linux/arm64"]
   // Each binary target builds the full Dockerfile independently.
   // BuildKit deduplicates the builder stage layers across targets

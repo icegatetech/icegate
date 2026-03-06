@@ -290,11 +290,12 @@ impl S3Storage {
         match err {
             aws_sdk_s3::error::SdkError::ServiceError(service_err) => {
                 let status = service_err.raw().status().as_u16();
+                let details = err.to_string();
                 match status {
-                    401 | 403 => StorageError::Auth,
-                    404 => StorageError::NotFound,
+                    401 | 403 => StorageError::Auth(details),
+                    404 => StorageError::NotFound(details),
                     408 => StorageError::Timeout,
-                    412 => StorageError::ConcurrentModification,
+                    412 => StorageError::ConcurrentModification(details),
                     429 => StorageError::RateLimited,
                     500 | 502 | 503 | 504 => StorageError::ServiceUnavailable,
                     _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
@@ -632,7 +633,9 @@ impl Storage for S3Storage {
             }
         }
 
-        Err(StorageError::NotFound)
+        Err(StorageError::NotFound(
+            "No job state objects found for requested job".to_string(),
+        ))
     }
 
     // SaveJob saves job atomically with Version check

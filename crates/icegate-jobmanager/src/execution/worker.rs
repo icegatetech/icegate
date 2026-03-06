@@ -175,7 +175,7 @@ impl Worker {
 
         let job = match self.storage.get_job(job_code, cancel_token).await {
             Ok(job) => job,
-            Err(StorageError::NotFound) => match self.create_new_job(job_code, cancel_token).await {
+            Err(StorageError::NotFound(_)) => match self.create_new_job(job_code, cancel_token).await {
                 Ok(job) => job,
                 Err(InternalError::Cancelled) => {
                     debug!("Job creation cancelled");
