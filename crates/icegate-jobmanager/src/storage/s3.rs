@@ -478,7 +478,7 @@ impl S3Storage {
         match result {
             Ok(output) => {
                 self.record_s3_ok("PUT", start);
-                Ok(output.e_tag().map(std::string::ToString::to_string))
+                Ok(output.e_tag().map(Self::normalize_etag))
             }
             Err(e) => {
                 self.record_s3_err("PUT", &e, start);
@@ -510,13 +510,18 @@ impl S3Storage {
         match result {
             Ok(output) => {
                 self.record_s3_ok("PUT", start);
-                Ok(output.e_tag().map(std::string::ToString::to_string))
+                Ok(output.e_tag().map(Self::normalize_etag))
             }
             Err(e) => {
                 self.record_s3_err("PUT", &e, start);
                 Err(Self::map_s3_error(&e))
             }
         }
+    }
+
+    fn normalize_etag(etag: &str) -> String {
+        // Some S3 implementation (Ceph) return ETag with quotes.
+        etag.trim().trim_matches('"').to_string()
     }
 }
 
@@ -628,7 +633,7 @@ impl Storage for S3Storage {
                 return Ok(JobMeta {
                     code: job_code.clone(),
                     iter_num,
-                    version: etag.to_string(),
+                    version: Self::normalize_etag(etag),
                 });
             }
         }
@@ -644,12 +649,12 @@ impl Storage for S3Storage {
         if cancel_token.is_cancelled() {
             return Err(StorageError::Cancelled);
         }
-        let is_new_iter = job.is_started();
+        let is_new_iter = job.version().is_empty();
         let version = job.version().to_string();
         let data = Arc::new(self.serialize_job(job)?);
         let key = self.build_state_path(job.code(), job.iter_num());
 
-        if job.is_started() {
+        if is_new_iter {
             debug!(
                 "Saving next job iteration (id: {}, code: {}, iter: {}, status: {:?})",
                 job.id().to_string(),

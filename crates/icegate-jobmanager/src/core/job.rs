@@ -296,13 +296,13 @@ impl Job {
             return Err(JobError::Other("job is not ready to next iteration".into()));
         }
 
-        self.status.transition_to(JobStatus::Started)?;
+        self.status.can_transition_to(&JobStatus::Started)?;
 
         let old_id = self.id;
         let old_iter_num = self.iter_num;
         let old_metadata = self.metadata.clone();
 
-        *self = Self::new(
+        let mut new_job = Self::new(
             self.code.clone(),
             task_defs,
             old_metadata,
@@ -311,11 +311,12 @@ impl Job {
             self.iteration_interval,
             self.task_limits,
         )?;
-        self.id = old_id;
+        new_job.id = old_id;
         // TODO(low): in the future, a mechanism for restarting the sequence is needed (currently the maximum sequence is 10^20).
         // Sequential uuid will not work, as there may be a race when creating a new job by different workers.
-        self.iter_num = old_iter_num + 1;
-        self.started_at = Utc::now();
+        new_job.iter_num = old_iter_num + 1;
+        new_job.started_at = Utc::now();
+        *self = new_job;
 
         Ok(())
     }
@@ -555,6 +556,46 @@ impl Job {
         Ok(())
     }
 
+    // Merging. Call this method when worker picked and started a task but failed to save due to conflict.
+    pub(crate) fn merge_with_picked_task(
+        &mut self,
+        worker_job: &Self,
+        worker_id: &Uuid,
+        task_id: &Uuid,
+    ) -> Result<(), JobError> {
+        if self.id != worker_job.id {
+            return Err(JobError::Other(format!(
+                "merge picked task for job '{}' failed - IDs are different",
+                self.code
+            )));
+        }
+
+        self.check_task_stolen(task_id, worker_id)?;
+
+        let worker_task = worker_job.get_task_arc(task_id)?;
+        if !worker_task.is_started() {
+            return Err(JobError::Other(format!(
+                "merge picked task for job '{}' failed - worker task is not started by worker '{}'",
+                self.code, worker_id
+            )));
+        }
+
+        self.status.transition_to(worker_job.status.clone()).map_err(|e| {
+            JobError::Other(format!(
+                "merge picked task for job '{}' status failed: {}",
+                self.code, e
+            ))
+        })?;
+
+        self.tasks_by_id.insert(*task_id, Arc::clone(worker_task));
+        self.updated_by_worker_id = *worker_id;
+        if self.running_at.is_none() {
+            self.running_at = worker_job.running_at;
+        }
+
+        Ok(())
+    }
+
     // Merging. Call this method after worker handled a task.
     pub(crate) fn merge_with_processed_task(
         &mut self,
@@ -569,11 +610,7 @@ impl Job {
             )));
         }
 
-        let exist_task = self.get_task_arc(task_id)?;
-        if exist_task.processing_by_worker().is_some() && exist_task.processing_by_worker() != Some(*worker_id) {
-            // This can happen when the current worker has lost a task due to a timeout.
-            return Err(JobError::TaskWorkerMismatch);
-        }
+        self.check_task_stolen(task_id, worker_id)?;
 
         self.status.transition_to(worker_job.status.clone()).map_err(|e| {
             // TODO(low): its may be ok when job was already saved as completed, but current worker is late with
@@ -688,6 +725,17 @@ impl Job {
 
     fn get_task_arc_mut(&mut self, task_id: &Uuid) -> Result<&mut Arc<Task>, JobError> {
         self.tasks_by_id.get_mut(task_id).ok_or(JobError::TaskNotFound)
+    }
+
+    fn check_task_stolen(&self, task_id: &Uuid, worker_id: &Uuid) -> Result<(), JobError> {
+        // This validates the job fetched from storage.
+        // If another worker already owns this task there, current worker must stop merging.
+        let exist_task = self.get_task_arc(task_id)?;
+        if exist_task.processing_by_worker().is_some() && exist_task.processing_by_worker() != Some(*worker_id) {
+            return Err(JobError::TaskWorkerMismatch);
+        }
+
+        Ok(())
     }
 }
 
@@ -962,6 +1010,50 @@ mod tests {
     }
 
     #[test]
+    fn test_pick_task_to_execute_completed_job_invalid_transition() {
+        let completed = make_task(Uuid::from_u128(12), "done", TaskStatus::Completed, Vec::new());
+        let worker_id = Uuid::from_u128(101);
+        let mut job = restore_job(
+            Uuid::from_u128(109),
+            JobStatus::Completed,
+            vec![completed],
+            1,
+            Some(1),
+            None,
+            worker_id,
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        let err = job.pick_task_to_execute(&worker_id).unwrap_err();
+        assert!(matches!(err, JobError::InvalidStatusTransition { .. }));
+    }
+
+    #[test]
+    fn test_pick_task_to_execute_failed_job_invalid_transition() {
+        let failed = make_task(Uuid::from_u128(13), "failed", TaskStatus::Failed, Vec::new());
+        let worker_id = Uuid::from_u128(102);
+        let mut job = restore_job(
+            Uuid::from_u128(110),
+            JobStatus::Failed,
+            vec![failed],
+            1,
+            Some(1),
+            None,
+            worker_id,
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        let err = job.pick_task_to_execute(&worker_id).unwrap_err();
+        assert!(matches!(err, JobError::InvalidStatusTransition { .. }));
+    }
+
+    #[test]
     fn test_next_iteration_success() {
         let old_task_id = Uuid::from_u128(20);
         let old_task = make_task(old_task_id, "old", TaskStatus::Completed, Vec::new());
@@ -1108,27 +1200,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_next_start_at_with_past_keeps_next_iteration_ready() {
-        let task = make_task(Uuid::from_u128(363), "done", TaskStatus::Completed, Vec::new());
-        let mut job = restore_job(
-            Uuid::from_u128(364),
-            JobStatus::Completed,
-            vec![task],
-            1,
-            None,
-            None,
-            Uuid::from_u128(365),
-            None,
-            Some(Utc::now()),
-            None,
-            HashMap::new(),
-        );
-
-        job.set_next_start_at(Utc::now() - Duration::seconds(1));
-        assert!(job.is_ready_to_next_iteration());
-    }
-
-    #[test]
     fn test_set_next_start_at_overrides_iteration_interval_floor() {
         let task = make_task(Uuid::from_u128(366), "done", TaskStatus::Completed, Vec::new());
         let mut job = Job::restore(
@@ -1149,6 +1220,7 @@ mod tests {
             TaskLimits::default(),
         );
 
+        assert!(!job.is_ready_to_next_iteration());
         job.set_next_start_at(Utc::now() - Duration::seconds(1));
         assert!(job.is_ready_to_next_iteration());
     }
@@ -1212,6 +1284,62 @@ mod tests {
         assert_eq!(job.id, job_id);
         assert_eq!(job.updated_by_worker_id, worker_id);
         assert!(matches!(job.status, JobStatus::Started));
+    }
+
+    #[test]
+    fn test_next_iteration_error_keeps_state_unchanged() {
+        let old_task_id = Uuid::from_u128(43);
+        let old_task = make_task(old_task_id, "old", TaskStatus::Completed, Vec::new());
+        let next_start_at = Utc::now() - Duration::seconds(1);
+        let metadata_key = "k".to_string();
+        let metadata_value = serde_json::Value::String("v".to_string());
+        let mut metadata = HashMap::new();
+        metadata.insert(metadata_key.clone(), metadata_value.clone());
+
+        let mut job = Job::restore(
+            Uuid::from_u128(44),
+            JobCode::new("job"),
+            String::new(),
+            7,
+            JobStatus::Completed,
+            vec![old_task],
+            Uuid::from_u128(311),
+            Utc::now() - Duration::seconds(5),
+            Some(Utc::now() - Duration::seconds(4)),
+            Some(Utc::now() - Duration::seconds(3)),
+            Some(next_start_at),
+            metadata.clone(),
+            Some(9),
+            Some(Duration::seconds(2)),
+            TaskLimits {
+                max_input_bytes: 4,
+                max_output_bytes: 8,
+            },
+        );
+
+        let old_started_at = job.started_at();
+        let old_running_at = job.running_at();
+        let old_completed_at = job.completed_at();
+        let old_next_start_at = job.next_start_at();
+        let old_updated_by_worker_id = job.updated_by_worker_id();
+        let old_task_ids: Vec<Uuid> = job.tasks_as_iter().map(|task| *task.id()).collect();
+
+        let too_big = TaskDefinition::new(TaskCode::new("too_big"), vec![1, 2, 3, 4, 5], Duration::seconds(5)).unwrap();
+        let err = job.next_iteration(vec![too_big], Uuid::from_u128(312)).unwrap_err();
+        assert!(matches!(err, JobError::Other(_)));
+
+        assert!(matches!(job.status(), JobStatus::Completed));
+        assert_eq!(job.iter_num(), 7);
+        assert_eq!(job.started_at(), old_started_at);
+        assert_eq!(job.running_at(), old_running_at);
+        assert_eq!(job.completed_at(), old_completed_at);
+        assert_eq!(job.next_start_at(), old_next_start_at);
+        assert_eq!(job.updated_by_worker_id(), old_updated_by_worker_id);
+        assert_eq!(job.metadata().get(&metadata_key), Some(&metadata_value));
+        assert_eq!(
+            job.tasks_as_iter().map(|task| *task.id()).collect::<Vec<_>>(),
+            old_task_ids
+        );
     }
 
     #[test]
@@ -1617,6 +1745,211 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_with_picked_task_ok() {
+        let task_id = Uuid::from_u128(1050);
+        let worker_id = Uuid::from_u128(1051);
+        let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
+        let mut saved_job = restore_job(
+            Uuid::from_u128(1052),
+            JobStatus::Started,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1053),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let mut worker_job = saved_job.clone();
+        let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, Some(task_id));
+        worker_job.start_task(&task_id, worker_id).unwrap();
+
+        saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap();
+
+        let merged_task = saved_job.get_task_arc(&task_id).unwrap();
+        assert!(matches!(saved_job.status(), JobStatus::Running));
+        assert!(saved_job.running_at().is_some());
+        assert!(matches!(merged_task.status(), TaskStatus::Started));
+        assert_eq!(merged_task.processing_by_worker(), Some(worker_id));
+        assert_eq!(merged_task.attempt(), 1);
+    }
+
+    #[test]
+    fn test_merge_with_picked_task_worker_mismatch() {
+        let task_id = Uuid::from_u128(1060);
+        let worker_id = Uuid::from_u128(1061);
+        let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
+        let mut worker_job = restore_job(
+            Uuid::from_u128(1062),
+            JobStatus::Started,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1063),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+        let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, Some(task_id));
+        worker_job.start_task(&task_id, worker_id).unwrap();
+
+        let started_by_other = Task::restore(
+            task_id,
+            TaskCode::new("todo"),
+            TaskStatus::Started,
+            Some(Uuid::from_u128(1069)),
+            Uuid::from_u128(1064),
+            Duration::seconds(5),
+            Some(Utc::now()),
+            None,
+            Some(Utc::now() + Duration::seconds(60)),
+            1,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+        let mut saved_job = restore_job(
+            *worker_job.id(),
+            JobStatus::Running,
+            vec![started_by_other],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1065),
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let err = saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap_err();
+        assert!(matches!(err, JobError::TaskWorkerMismatch));
+    }
+
+    #[test]
+    fn test_merge_with_picked_task_idempotent() {
+        let task_id = Uuid::from_u128(1070);
+        let worker_id = Uuid::from_u128(1071);
+        let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
+        let mut saved_job = restore_job(
+            Uuid::from_u128(1072),
+            JobStatus::Started,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1073),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+        let mut worker_job = saved_job.clone();
+        let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, Some(task_id));
+        worker_job.start_task(&task_id, worker_id).unwrap();
+
+        saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap();
+        let first_task = saved_job.get_task_arc(&task_id).unwrap();
+        let first_attempt = first_task.attempt();
+        let first_deadline = first_task.deadline_at();
+
+        saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap();
+        let second_task = saved_job.get_task_arc(&task_id).unwrap();
+
+        assert_eq!(first_attempt, second_task.attempt());
+        assert_eq!(first_deadline, second_task.deadline_at());
+        assert_eq!(second_task.attempt(), 1);
+    }
+
+    #[test]
+    fn test_merge_with_picked_task_different_job_id() {
+        let task_id = Uuid::from_u128(1080);
+        let worker_id = Uuid::from_u128(1081);
+        let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
+        let mut saved_job = restore_job(
+            Uuid::from_u128(1082),
+            JobStatus::Started,
+            vec![task.clone()],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1083),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+        let mut worker_job = restore_job(
+            Uuid::from_u128(1084),
+            JobStatus::Started,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1085),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, Some(task_id));
+        worker_job.start_task(&task_id, worker_id).unwrap();
+
+        let err = saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap_err();
+        assert!(matches!(err, JobError::Other(_)));
+    }
+
+    #[test]
+    fn test_merge_with_picked_task_worker_task_not_started() {
+        let task_id = Uuid::from_u128(1086);
+        let worker_id = Uuid::from_u128(1087);
+        let task = make_task(task_id, "todo", TaskStatus::Todo, Vec::new());
+        let mut saved_job = restore_job(
+            Uuid::from_u128(1088),
+            JobStatus::Started,
+            vec![task.clone()],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1089),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+        let mut worker_job = restore_job(
+            *saved_job.id(),
+            JobStatus::Started,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1090),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, Some(task_id));
+
+        let err = saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap_err();
+        assert!(matches!(err, JobError::Other(_)));
+    }
+
+    #[test]
     fn test_merge_with_processed_task_different_id() {
         let task = make_task(Uuid::from_u128(110), "todo", TaskStatus::Todo, Vec::new());
         let mut job = restore_job(
@@ -1931,51 +2264,126 @@ mod tests {
     }
 
     #[test]
-    fn test_update_version() {
-        let task = make_task(Uuid::from_u128(150), "todo", TaskStatus::Todo, Vec::new());
-        let worker_id = Uuid::from_u128(1500);
-        let mut job = restore_job(
-            Uuid::from_u128(1501),
-            JobStatus::Started,
-            vec![task],
-            1,
-            Some(1),
-            None,
-            worker_id,
-            None,
-            None,
-            None,
-            HashMap::new(),
-        );
-
-        job.update_version("v1".to_string());
-        assert_eq!(job.version(), "v1");
-    }
-
-    #[test]
-    fn test_task_limits_default() {
-        let limits = TaskLimits::default();
-        assert!(limits.max_input_bytes > 100);
-        assert!(limits.max_output_bytes > 100);
-    }
-
-    #[test]
-    fn test_job_definition_with_task_limits() {
+    fn test_job_definition_new_success_with_defaults_and_builders() {
         let mut executors = HashMap::new();
         let executor: crate::registry::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("noop"), executor);
-        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
-        let limits = TaskLimits {
+        executors.insert(TaskCode::new("task_a"), Arc::clone(&executor));
+        executors.insert(TaskCode::new("task_b"), executor);
+        let task_a = TaskDefinition::new(TaskCode::new("task_a"), Vec::new(), Duration::seconds(5)).unwrap();
+        let task_b = TaskDefinition::new(TaskCode::new("task_b"), Vec::new(), Duration::seconds(5)).unwrap();
+        let task_limits = TaskLimits {
             max_input_bytes: 1,
             max_output_bytes: 2,
         };
 
-        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors)
+        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_a, task_b], executors)
             .unwrap()
-            .with_task_limits(limits);
+            .with_max_iterations(3)
+            .unwrap()
+            .with_iteration_interval(Duration::seconds(7))
+            .unwrap()
+            .with_task_limits(task_limits);
 
+        assert_eq!(job_def.max_iterations(), Some(3));
+        assert_eq!(job_def.iteration_interval(), Some(Duration::seconds(7)));
         assert_eq!(job_def.task_limits().max_input_bytes, 1);
         assert_eq!(job_def.task_limits().max_output_bytes, 2);
+    }
+
+    #[test]
+    fn test_job_definition_new_defaults_without_builders() {
+        let mut executors = HashMap::new();
+        let executor: crate::registry::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        executors.insert(TaskCode::new("noop"), executor);
+        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
+        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors).unwrap();
+
+        assert_eq!(job_def.max_iterations(), None);
+        assert_eq!(job_def.iteration_interval(), None);
+        assert_eq!(
+            job_def.task_limits().max_input_bytes,
+            TaskLimits::default().max_input_bytes
+        );
+        assert_eq!(
+            job_def.task_limits().max_output_bytes,
+            TaskLimits::default().max_output_bytes
+        );
+    }
+
+    #[test]
+    fn test_job_definition_new_rejects_empty_initial_tasks() {
+        let mut executors = HashMap::new();
+        let executor: crate::registry::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        executors.insert(TaskCode::new("noop"), executor);
+
+        let result = JobDefinition::new(JobCode::new("job"), Vec::new(), executors);
+        assert!(matches!(result, Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn test_job_definition_new_rejects_empty_executors() {
+        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
+        let result = JobDefinition::new(JobCode::new("job"), vec![task_def], HashMap::new());
+        assert!(matches!(result, Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn test_job_definition_new_rejects_missing_executor_for_initial_task() {
+        let mut executors = HashMap::new();
+        let executor: crate::registry::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        executors.insert(TaskCode::new("present"), executor);
+        let task_def = TaskDefinition::new(TaskCode::new("missing"), Vec::new(), Duration::seconds(5)).unwrap();
+
+        let result = JobDefinition::new(JobCode::new("job"), vec![task_def], executors);
+        assert!(matches!(result, Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn test_job_definition_with_max_iterations_rejects_zero() {
+        let mut executors = HashMap::new();
+        let executor: crate::registry::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        executors.insert(TaskCode::new("noop"), executor);
+        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
+        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors).unwrap();
+
+        let result = job_def.with_max_iterations(0);
+        assert!(matches!(result, Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn test_job_definition_with_iteration_interval_rejects_zero_and_negative() {
+        let mut executors = HashMap::new();
+        let executor: crate::registry::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        executors.insert(TaskCode::new("noop"), executor);
+        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
+        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors).unwrap();
+
+        let zero = job_def.clone().with_iteration_interval(Duration::zero());
+        assert!(matches!(zero, Err(Error::Other(_))));
+        let negative = job_def.with_iteration_interval(Duration::seconds(-1));
+        assert!(matches!(negative, Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn test_job_new_accepts_input_at_limit() {
+        let task_def = TaskDefinition::new(TaskCode::new("fit"), vec![0; 4], Duration::seconds(5)).unwrap();
+        let limits = TaskLimits {
+            max_input_bytes: 4,
+            max_output_bytes: 10,
+        };
+
+        let job = Job::new(
+            JobCode::new("job"),
+            vec![task_def],
+            HashMap::new(),
+            Uuid::from_u128(1599),
+            None,
+            None,
+            limits,
+        )
+        .unwrap();
+
+        assert_eq!(job.tasks_as_iter().count(), 1);
     }
 
     #[test]
@@ -2025,6 +2433,30 @@ mod tests {
     }
 
     #[test]
+    fn test_add_task_accepts_input_at_limit() {
+        let limits = TaskLimits {
+            max_input_bytes: 4,
+            max_output_bytes: 10,
+        };
+        let init_def = TaskDefinition::new(TaskCode::new("init"), vec![0; 1], Duration::seconds(5)).unwrap();
+        let mut job = Job::new(
+            JobCode::new("job"),
+            vec![init_def],
+            HashMap::new(),
+            Uuid::from_u128(1750),
+            None,
+            None,
+            limits,
+        )
+        .unwrap();
+
+        let task_def = TaskDefinition::new(TaskCode::new("child"), vec![0; 4], Duration::seconds(5)).unwrap();
+        let task_id = job.add_task(&task_def, Uuid::from_u128(1751)).unwrap();
+        let task = job.get_task_arc(&task_id).unwrap();
+        assert_eq!(task.input().len(), 4);
+    }
+
+    #[test]
     fn test_complete_task_rejects_oversized_output() {
         let limits = TaskLimits {
             max_input_bytes: 4,
@@ -2047,5 +2479,32 @@ mod tests {
 
         let err = job.complete_task(&task_id, vec![0; 5]).err().unwrap();
         assert!(matches!(err, JobError::Other(_)));
+    }
+
+    #[test]
+    fn test_complete_task_accepts_output_at_limit() {
+        let limits = TaskLimits {
+            max_input_bytes: 4,
+            max_output_bytes: 4,
+        };
+        let init_def = TaskDefinition::new(TaskCode::new("init"), vec![0; 1], Duration::seconds(5)).unwrap();
+        let mut job = Job::new(
+            JobCode::new("job"),
+            vec![init_def],
+            HashMap::new(),
+            Uuid::from_u128(1850),
+            None,
+            None,
+            limits,
+        )
+        .unwrap();
+
+        let task_id = *job.tasks_as_iter().next().unwrap().id();
+        job.start_task(&task_id, Uuid::from_u128(1851)).unwrap();
+        job.complete_task(&task_id, vec![0; 4]).unwrap();
+
+        let task = job.get_task_arc(&task_id).unwrap();
+        assert!(matches!(task.status(), TaskStatus::Completed));
+        assert_eq!(task.output().len(), 4);
     }
 }
