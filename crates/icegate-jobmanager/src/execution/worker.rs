@@ -374,8 +374,11 @@ impl Worker {
         let job_code_for_metrics = job_code.clone();
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
-                let JobMergeContext { mut saved_job, .. } = ctx;
-                match saved_job.start_task(&task_id_clone, worker_id) {
+                let JobMergeContext {
+                    current_job,
+                    mut saved_job,
+                } = ctx;
+                match saved_job.merge_with_picked_task(current_job, &worker_id, &task_id_clone) {
                     Ok(()) => {
                         metrics.record_save_conflict_retry(&job_code_for_metrics, "pick_start_conflict");
                         debug!("Job has concurrent modification when picking task - retry");
