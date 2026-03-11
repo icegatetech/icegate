@@ -2,9 +2,340 @@
 
 mod common;
 
-use icegate_queue::{ParquetQueueReader, QueueConfig, QueueWriter, WriteRequest, channel};
-use tokio::sync::oneshot;
+use std::{
+    collections::HashMap,
+    fmt, io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use icegate_queue::{ParquetQueueReader, QueueConfig, QueueWriter, SegmentsPlan, WriteRequest, channel};
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
+};
+use tokio::{
+    sync::{Notify, oneshot},
+    time::{Instant, sleep, timeout},
+};
 use tokio_util::sync::CancellationToken;
+
+fn normalize_plan(plan: &SegmentsPlan) -> Vec<(String, Vec<(u64, Vec<usize>)>, usize, u64)> {
+    let mut normalized = plan
+        .groups
+        .iter()
+        .map(|group| {
+            let mut segments = group
+                .segments
+                .iter()
+                .map(|segment| (segment.segment_offset, segment.record_batch_idxs.clone()))
+                .collect::<Vec<_>>();
+            segments.sort_by_key(|(offset, _)| *offset);
+            (
+                group.group_col_val.clone(),
+                segments,
+                group.record_batches_total,
+                group.input_bytes_total,
+            )
+        })
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized
+}
+
+fn assert_is_forced_metadata_failure(err: &icegate_queue::QueueError) {
+    match err {
+        icegate_queue::QueueError::ObjectStore(object_store::Error::Generic { source, .. }) => {
+            assert!(
+                source.downcast_ref::<io::Error>().is_some(),
+                "expected io::Error source in object_store generic error, got: {source}"
+            );
+        }
+        other => panic!("expected QueueError::ObjectStore(Generic), got: {other}"),
+    }
+}
+
+#[derive(Debug)]
+struct DelayedObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    delays: HashMap<u64, Duration>,
+    active_metadata_reads: Option<Arc<AtomicUsize>>,
+    max_active_metadata_reads: Option<Arc<AtomicUsize>>,
+    metadata_concurrency_gate: Option<Arc<MetadataConcurrencyGate>>,
+}
+
+impl DelayedObjectStore {
+    fn new(inner: Arc<dyn ObjectStore>, delays_ms: HashMap<u64, u64>) -> Self {
+        let delays = delays_ms
+            .into_iter()
+            .map(|(offset, ms)| (offset, Duration::from_millis(ms)))
+            .collect();
+        Self {
+            inner,
+            delays,
+            active_metadata_reads: None,
+            max_active_metadata_reads: None,
+            metadata_concurrency_gate: None,
+        }
+    }
+
+    fn with_metadata_read_probe(
+        mut self,
+        active_metadata_reads: Arc<AtomicUsize>,
+        max_active_metadata_reads: Arc<AtomicUsize>,
+    ) -> Self {
+        self.active_metadata_reads = Some(active_metadata_reads);
+        self.max_active_metadata_reads = Some(max_active_metadata_reads);
+        self
+    }
+
+    fn with_metadata_concurrency_gate(mut self, metadata_concurrency_gate: Arc<MetadataConcurrencyGate>) -> Self {
+        self.metadata_concurrency_gate = Some(metadata_concurrency_gate);
+        self
+    }
+
+    fn delay_for_location(&self, location: &Path) -> Option<Duration> {
+        let file_name = location.as_ref().rsplit('/').next()?;
+        let offset = file_name.strip_suffix(".parquet")?.parse::<u64>().ok()?;
+        self.delays.get(&offset).copied()
+    }
+}
+
+fn update_max_seen(max: &AtomicUsize, value: usize) {
+    let mut observed = max.load(Ordering::SeqCst);
+    while value > observed {
+        match max.compare_exchange(observed, value, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(new_observed) => observed = new_observed,
+        }
+    }
+}
+
+struct ActiveMetadataReadGuard {
+    counter: Option<Arc<AtomicUsize>>,
+}
+
+impl ActiveMetadataReadGuard {
+    const fn new(counter: Option<Arc<AtomicUsize>>) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for ActiveMetadataReadGuard {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.counter {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MetadataConcurrencyGate {
+    required_parallel_reads: usize,
+    entered_reads: AtomicUsize,
+    is_open: AtomicBool,
+    notify: Notify,
+    wait_timeout: Duration,
+}
+
+impl MetadataConcurrencyGate {
+    fn new(required_parallel_reads: usize, wait_timeout: Duration) -> Self {
+        Self {
+            required_parallel_reads,
+            entered_reads: AtomicUsize::new(0),
+            is_open: AtomicBool::new(false),
+            notify: Notify::new(),
+            wait_timeout,
+        }
+    }
+
+    async fn wait_until_open(&self) -> ObjectStoreResult<()> {
+        if self.is_open.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let entered = self.entered_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        if entered >= self.required_parallel_reads {
+            self.is_open.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+            return Ok(());
+        }
+
+        timeout(self.wait_timeout, self.notify.notified())
+            .await
+            .map_err(|_| object_store::Error::Generic {
+                store: "DelayedObjectStore",
+                source: Box::new(io::Error::other(
+                    "metadata concurrency gate timed out: metadata reads did not overlap",
+                )),
+            })?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailingMetadataObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    fail_offset: u64,
+    delays: HashMap<u64, Duration>,
+}
+
+impl FailingMetadataObjectStore {
+    fn new(inner: Arc<dyn ObjectStore>, fail_offset: u64, delays_ms: HashMap<u64, u64>) -> Self {
+        let delays = delays_ms
+            .into_iter()
+            .map(|(offset, ms)| (offset, Duration::from_millis(ms)))
+            .collect();
+        Self {
+            inner,
+            fail_offset,
+            delays,
+        }
+    }
+
+    fn offset_for_location(location: &Path) -> Option<u64> {
+        let file_name = location.as_ref().rsplit('/').next()?;
+        file_name.strip_suffix(".parquet")?.parse::<u64>().ok()
+    }
+
+    fn delay_for_location(&self, location: &Path) -> Option<Duration> {
+        let offset = Self::offset_for_location(location)?;
+        self.delays.get(&offset).copied()
+    }
+}
+
+impl fmt::Display for FailingMetadataObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FailingMetadataObjectStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailingMetadataObjectStore {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        if options.head && Self::offset_for_location(location) == Some(self.fail_offset) {
+            return Err(object_store::Error::Generic {
+                store: "FailingMetadataObjectStore",
+                source: Box::new(io::Error::other(format!(
+                    "forced metadata read failure for offset {}",
+                    self.fail_offset
+                ))),
+            });
+        }
+        if let Some(delay) = self.delay_for_location(location) {
+            if options.head || options.range.is_some() {
+                sleep(delay).await;
+            }
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+impl fmt::Display for DelayedObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DelayedObjectStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for DelayedObjectStore {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        let is_metadata_read = options.head || options.range.is_some();
+        let _active_guard = if is_metadata_read {
+            self.active_metadata_reads.as_ref().map_or_else(
+                || ActiveMetadataReadGuard::new(None),
+                |active_counter| {
+                    let current = active_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some(max_counter) = &self.max_active_metadata_reads {
+                        update_max_seen(max_counter, current);
+                    }
+                    ActiveMetadataReadGuard::new(Some(Arc::clone(active_counter)))
+                },
+            )
+        } else {
+            ActiveMetadataReadGuard::new(None)
+        };
+        if is_metadata_read {
+            if let Some(gate) = &self.metadata_concurrency_gate {
+                gate.wait_until_open().await?;
+            }
+        }
+        if let Some(delay) = self.delay_for_location(location) {
+            if options.head || options.range.is_some() {
+                sleep(delay).await;
+            }
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
 
 #[tokio::test]
 async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
@@ -356,6 +687,395 @@ async fn test_plan_segments_with_small_input_bytes_limit() -> Result<(), Box<dyn
             "Each task should contain exactly one row group when byte limit is tiny"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_segments_parallelism_preserves_plan_result() -> Result<(), Box<dyn std::error::Error>> {
+    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+
+    let config = QueueConfig::new("queue");
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, base_store.clone());
+    let handle = writer.start(rx);
+
+    for _ in 0..8 {
+        let batch = common::test_batch(200, 1)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: "logs".to_string(),
+            batch,
+            group_by_column: None,
+            response_tx,
+            trace_context: None,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+    }
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let serial_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let serial_max_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let parallel_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let parallel_max_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+
+    let serial_store: Arc<dyn ObjectStore> = Arc::new(
+        DelayedObjectStore::new(
+            base_store.clone(),
+            HashMap::from([(0_u64, 25_u64), (1_u64, 25_u64), (2_u64, 25_u64)]),
+        )
+        .with_metadata_read_probe(
+            Arc::clone(&serial_active_metadata_reads),
+            Arc::clone(&serial_max_active_metadata_reads),
+        ),
+    );
+    let parallel_store: Arc<dyn ObjectStore> = Arc::new(
+        DelayedObjectStore::new(
+            base_store,
+            HashMap::from([
+                (0_u64, 25_u64),
+                (1_u64, 25_u64),
+                (2_u64, 25_u64),
+                (3_u64, 25_u64),
+                (4_u64, 25_u64),
+                (5_u64, 25_u64),
+                (6_u64, 25_u64),
+                (7_u64, 25_u64),
+            ]),
+        )
+        .with_metadata_read_probe(
+            Arc::clone(&parallel_active_metadata_reads),
+            Arc::clone(&parallel_max_active_metadata_reads),
+        )
+        .with_metadata_concurrency_gate(Arc::new(MetadataConcurrencyGate::new(2, Duration::from_secs(2)))),
+    );
+
+    let reader_serial = ParquetQueueReader::new("queue", serial_store, 8192)?.with_plan_segment_read_parallelism(1)?;
+    let reader_parallel =
+        ParquetQueueReader::new("queue", parallel_store, 8192)?.with_plan_segment_read_parallelism(8)?;
+    let cancel = CancellationToken::new();
+
+    let serial_plan = reader_serial
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .await
+        .unwrap();
+    let parallel_plan = reader_parallel
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(serial_plan.last_segment_offset, parallel_plan.last_segment_offset);
+    assert_eq!(serial_plan.segments_count, parallel_plan.segments_count);
+    assert_eq!(serial_plan.record_batches_total, parallel_plan.record_batches_total);
+    assert_eq!(serial_plan.input_bytes_total, parallel_plan.input_bytes_total);
+    assert_eq!(normalize_plan(&serial_plan), normalize_plan(&parallel_plan));
+    assert_eq!(
+        serial_max_active_metadata_reads.load(Ordering::SeqCst),
+        1,
+        "serial planning must keep exactly one in-flight metadata read"
+    );
+    assert!(
+        parallel_max_active_metadata_reads.load(Ordering::SeqCst) >= 2,
+        "parallel planning must overlap metadata reads"
+    );
+    assert_eq!(serial_active_metadata_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(parallel_active_metadata_reads.load(Ordering::SeqCst), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_segments_parallelism_preserves_plan_result_with_skewed_metadata_delays()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+
+    let config = QueueConfig::new("queue");
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, base_store.clone());
+    let handle = writer.start(rx);
+
+    for _ in 0..8 {
+        let batch = common::test_batch(200, 1)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: "logs".to_string(),
+            batch,
+            group_by_column: None,
+            response_tx,
+            trace_context: None,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+    }
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let delays = HashMap::from([
+        (0_u64, 250_u64),
+        (1_u64, 20_u64),
+        (2_u64, 180_u64),
+        (3_u64, 10_u64),
+        (4_u64, 140_u64),
+        (5_u64, 5_u64),
+        (6_u64, 90_u64),
+        (7_u64, 1_u64),
+    ]);
+    let serial_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let serial_max_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let parallel_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let parallel_max_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+
+    let delayed_store_serial: Arc<dyn ObjectStore> = Arc::new(
+        DelayedObjectStore::new(base_store.clone(), delays.clone()).with_metadata_read_probe(
+            Arc::clone(&serial_active_metadata_reads),
+            Arc::clone(&serial_max_active_metadata_reads),
+        ),
+    );
+    let delayed_store_parallel: Arc<dyn ObjectStore> = Arc::new(
+        DelayedObjectStore::new(base_store, delays)
+            .with_metadata_read_probe(
+                Arc::clone(&parallel_active_metadata_reads),
+                Arc::clone(&parallel_max_active_metadata_reads),
+            )
+            .with_metadata_concurrency_gate(Arc::new(MetadataConcurrencyGate::new(2, Duration::from_secs(2)))),
+    );
+
+    let reader_serial =
+        ParquetQueueReader::new("queue", delayed_store_serial, 8192)?.with_plan_segment_read_parallelism(1)?;
+    let reader_parallel =
+        ParquetQueueReader::new("queue", delayed_store_parallel, 8192)?.with_plan_segment_read_parallelism(8)?;
+    let cancel = CancellationToken::new();
+
+    let serial_plan = reader_serial
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .await
+        .unwrap();
+    let parallel_plan = reader_parallel
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(serial_plan.last_segment_offset, parallel_plan.last_segment_offset);
+    assert_eq!(serial_plan.segments_count, parallel_plan.segments_count);
+    assert_eq!(serial_plan.record_batches_total, parallel_plan.record_batches_total);
+    assert_eq!(serial_plan.input_bytes_total, parallel_plan.input_bytes_total);
+    assert_eq!(normalize_plan(&serial_plan), normalize_plan(&parallel_plan));
+    assert_eq!(
+        serial_max_active_metadata_reads.load(Ordering::SeqCst),
+        1,
+        "serial planning must keep exactly one in-flight metadata read"
+    );
+    assert!(
+        parallel_max_active_metadata_reads.load(Ordering::SeqCst) >= 2,
+        "parallel planning must overlap metadata reads"
+    );
+    assert_eq!(serial_active_metadata_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(parallel_active_metadata_reads.load(Ordering::SeqCst), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metadata_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+
+    let config = QueueConfig::new("queue").with_max_row_group_size(2);
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, base_store.clone());
+    let handle = writer.start(rx);
+
+    for _ in 0..4 {
+        // 128 rows with row_group_size=2 => >=64 row groups per segment (spawn_blocking path).
+        let batch = common::test_batch(128, 1)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: "logs".to_string(),
+            batch,
+            group_by_column: None,
+            response_tx,
+            trace_context: None,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+    }
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let serial_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let serial_max_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let parallel_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+    let parallel_max_active_metadata_reads = Arc::new(AtomicUsize::new(0));
+
+    let serial_store: Arc<dyn ObjectStore> = Arc::new(
+        DelayedObjectStore::new(base_store.clone(), HashMap::from([(0_u64, 20_u64), (1_u64, 20_u64)]))
+            .with_metadata_read_probe(
+                Arc::clone(&serial_active_metadata_reads),
+                Arc::clone(&serial_max_active_metadata_reads),
+            ),
+    );
+    let parallel_store: Arc<dyn ObjectStore> = Arc::new(
+        DelayedObjectStore::new(
+            base_store,
+            HashMap::from([(0_u64, 20_u64), (1_u64, 20_u64), (2_u64, 20_u64)]),
+        )
+        .with_metadata_read_probe(
+            Arc::clone(&parallel_active_metadata_reads),
+            Arc::clone(&parallel_max_active_metadata_reads),
+        )
+        .with_metadata_concurrency_gate(Arc::new(MetadataConcurrencyGate::new(2, Duration::from_secs(2)))),
+    );
+
+    let reader_serial = ParquetQueueReader::new("queue", serial_store, 8192)?.with_plan_segment_read_parallelism(1)?;
+    let reader_parallel =
+        ParquetQueueReader::new("queue", parallel_store, 8192)?.with_plan_segment_read_parallelism(8)?;
+    let cancel = CancellationToken::new();
+
+    let serial_plan = reader_serial
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 1024, 64 * 1024 * 1024, &cancel)
+        .await
+        .unwrap();
+    let parallel_plan = reader_parallel
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 1024, 64 * 1024 * 1024, &cancel)
+        .await
+        .unwrap();
+
+    assert!(
+        serial_plan.record_batches_total >= 64 * 4,
+        "expected >=64 row groups per segment to force spawn_blocking path"
+    );
+    assert_eq!(serial_plan.last_segment_offset, parallel_plan.last_segment_offset);
+    assert_eq!(serial_plan.segments_count, parallel_plan.segments_count);
+    assert_eq!(serial_plan.record_batches_total, parallel_plan.record_batches_total);
+    assert_eq!(serial_plan.input_bytes_total, parallel_plan.input_bytes_total);
+    assert_eq!(normalize_plan(&serial_plan), normalize_plan(&parallel_plan));
+    assert_eq!(
+        serial_max_active_metadata_reads.load(Ordering::SeqCst),
+        1,
+        "serial planning must keep exactly one in-flight metadata read"
+    );
+    assert!(
+        parallel_max_active_metadata_reads.load(Ordering::SeqCst) >= 2,
+        "parallel planning must overlap metadata reads"
+    );
+    assert_eq!(serial_active_metadata_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(parallel_active_metadata_reads.load(Ordering::SeqCst), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_segments_parallel_fails_fast_on_metadata_error_without_partial_plan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+
+    let config = QueueConfig::new("queue");
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, base_store.clone());
+    let handle = writer.start(rx);
+
+    for _ in 0..4 {
+        let batch = common::test_batch(100, 1)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: "logs".to_string(),
+            batch,
+            group_by_column: None,
+            response_tx,
+            trace_context: None,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+    }
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let failing_store: Arc<dyn ObjectStore> = Arc::new(FailingMetadataObjectStore::new(
+        base_store,
+        0,
+        HashMap::from([(1_u64, 1_500_u64), (2_u64, 1_500_u64), (3_u64, 1_500_u64)]),
+    ));
+    let reader = ParquetQueueReader::new("queue", failing_store, 8192)?.with_plan_segment_read_parallelism(8)?;
+    let cancel = CancellationToken::new();
+    let start = Instant::now();
+
+    let Err(err) = reader
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .await
+    else {
+        panic!("planning must fail when metadata read fails for one segment");
+    };
+
+    let elapsed = start.elapsed();
+    assert_is_forced_metadata_failure(&err);
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "planning must fail-fast without returning partial plan, elapsed={elapsed:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_without_waiting_for_first()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+
+    let config = QueueConfig::new("queue");
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, base_store.clone());
+    let handle = writer.start(rx);
+
+    for _ in 0..4 {
+        let batch = common::test_batch(100, 1)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: "logs".to_string(),
+            batch,
+            group_by_column: None,
+            response_tx,
+            trace_context: None,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+    }
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let failing_store: Arc<dyn ObjectStore> = Arc::new(FailingMetadataObjectStore::new(
+        base_store,
+        1,
+        HashMap::from([(0_u64, 1_500_u64), (2_u64, 1_500_u64), (3_u64, 1_500_u64)]),
+    ));
+    let reader = ParquetQueueReader::new("queue", failing_store, 8192)?.with_plan_segment_read_parallelism(8)?;
+    let cancel = CancellationToken::new();
+    let start = Instant::now();
+
+    let Err(err) = reader
+        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .await
+    else {
+        panic!("planning must fail when metadata read fails for one segment");
+    };
+
+    let elapsed = start.elapsed();
+    assert_is_forced_metadata_failure(&err);
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "planning must fail-fast on non-first segment error without waiting for offset 0, elapsed={elapsed:?}"
+    );
 
     Ok(())
 }

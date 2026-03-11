@@ -4037,6 +4037,7 @@ dependencies = [
  "axum 0.7.9",
  "chrono",
  "clap",
+ "futures",
  "hex",
  "iceberg",
  "icegate-common",

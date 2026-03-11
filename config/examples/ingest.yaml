@@ -56,6 +56,8 @@ shift:
   read:
     # max_record_batches_per_task: 128
     # max_input_bytes_per_task: 67108864
+    # plan_segment_read_parallelism: 8
+    # shift_segment_read_parallelism: 8
   write:
     # row_group_size: 10000
     # max_file_size_mb: 100

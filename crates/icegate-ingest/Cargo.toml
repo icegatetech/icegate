@@ -63,3 +63,4 @@ clap = { workspace = true }
 
 # Async utils
 async-trait = { workspace = true }
+futures = { workspace = true }
