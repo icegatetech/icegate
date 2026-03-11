@@ -58,8 +58,11 @@ tempo:
 
 # Query Engine Configuration
 engine:
-  # WAL base path for near-real-time queries (required)
-  wal_base_path: s3://queue/
   # batch_size: 8192                   # DataFusion batch size (optional)
   # target_partitions: 4               # Parallelism degree (optional)
   # catalog_name: iceberg              # Catalog name in SQL queries (optional)
+
+# Queue Configuration (WAL segment reading for near-real-time queries)
+queue:
+  common:
+    base_path: s3://queue/

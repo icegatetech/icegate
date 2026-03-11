@@ -1,0 +1,65 @@
+# kube-prometheus-stack - Prometheus Operator, Prometheus, kube-state-metrics, node-exporter
+
+# Grafana is deployed separately via its own Helm chart
+grafana:
+  enabled: false
+
+# AlertManager not needed for dev
+alertmanager:
+  enabled: false
+
+# Prometheus server configuration
+prometheus:
+  prometheusSpec:
+    # Scrape ServiceMonitors in any namespace (namespace set at apply time)
+    serviceMonitorNamespaceSelector: {}
+    serviceMonitorSelector: {}
+
+    retention: 7d
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+
+# Prometheus Operator
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# kube-state-metrics
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# node-exporter
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 64Mi

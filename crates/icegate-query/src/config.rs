@@ -8,6 +8,7 @@ use std::path::Path;
 use icegate_common::{
     CatalogConfig, MetricsConfig, StorageConfig, TracingConfig, check_port_conflicts, load_config_file,
 };
+use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 
 use super::{engine::QueryEngineConfig, loki::LokiConfig, prometheus::PrometheusConfig, tempo::TempoConfig};
@@ -27,6 +28,9 @@ pub struct QueryConfig {
     /// Query engine configuration (shared across all APIs)
     #[serde(default)]
     pub engine: QueryEngineConfig,
+    /// Queue configuration for WAL segment reading
+    #[serde(default)]
+    pub queue: QueueConfig,
     /// Loki API server
     pub loki: LokiConfig,
     /// Prometheus API server
@@ -62,6 +66,9 @@ impl QueryConfig {
         self.catalog.validate()?;
         self.storage.validate()?;
         self.engine.validate()?;
+        self.queue
+            .validate()
+            .map_err(|e| crate::error::QueryError::Config(e.to_string()))?;
         self.loki.validate()?;
         self.prometheus.validate()?;
         self.tempo.validate()?;

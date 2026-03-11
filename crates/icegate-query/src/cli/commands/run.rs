@@ -2,8 +2,8 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use datafusion::execution::object_store::ObjectStoreUrl;
 use icegate_common::{CatalogBuilder, IoCacheHandle, MetricsRuntime, create_object_store, run_metrics_server};
+use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
 use crate::{QueryConfig, engine::QueryEngine, error::QueryError, infra::metrics::QueryMetrics};
@@ -42,7 +42,7 @@ async fn shutdown_signal() {
 #[allow(clippy::cognitive_complexity)]
 pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Load configuration
-    let mut config = QueryConfig::from_file(&config_path)?;
+    let config = QueryConfig::from_file(&config_path)?;
 
     // Initialize tracing with OpenTelemetry
     let tracing_guard = icegate_common::init_tracing(&config.tracing)?;
@@ -57,38 +57,33 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     tracing::info!("Catalog initialized successfully");
 
-    // Validate engine config (ensures wal_base_path is set)
+    // Validate engine config
     config.engine.validate()?;
 
     // Extract the shared foyer cache from the IO cache handle so the WAL
     // object store can share the same hybrid cache as the Iceberg catalog.
     let foyer_cache = io_cache.cache().cloned();
 
-    // Initialize WAL object store
-    tracing::info!(wal_base_path = %config.engine.wal_base_path, "Initializing WAL object store");
-    // Normalize bare local paths (e.g., "/tmp/wal") to URLs with file:// scheme
-    // so ObjectStoreUrl::parse succeeds.
-    let wal_url_str = if config.engine.wal_base_path.starts_with('/') && !config.engine.wal_base_path.starts_with("//")
-    {
-        format!("file://{}", config.engine.wal_base_path)
-    } else {
-        config.engine.wal_base_path.clone()
-    };
-    let url =
-        ObjectStoreUrl::parse(&wal_url_str).map_err(|e| QueryError::Config(format!("Invalid WAL base path: {e}")))?;
+    // Initialize WAL object store from queue config
+    tracing::info!(queue_base_path = %config.queue.common.base_path, "Initializing WAL object store");
     let (store, prefix) = create_object_store(
-        &config.engine.wal_base_path,
+        &config.queue.common.base_path,
         Some(&config.storage.backend),
         foyer_cache.as_ref(),
     )?;
-    // Override wal_base_path with the normalized prefix within the object store
-    // (e.g., "s3://bucket/prefix/" → "prefix", "s3://bucket/" → "")
-    config.engine.wal_base_path = prefix;
-    let wal_store = (store, url);
+
+    // Build the shared WAL queue reader
+    let wal_reader = ParquetQueueReader::new(prefix, Arc::clone(&store), config.engine.batch_size)
+        .map_err(|e| QueryError::Config(format!("Failed to create WAL reader: {e}")))?;
 
     // Initialize query engine with cached catalog provider
     tracing::info!("Initializing query engine");
-    let query_engine = Arc::new(QueryEngine::new(catalog, config.engine.clone(), wal_store));
+    let query_engine = Arc::new(QueryEngine::new(
+        catalog,
+        config.engine.clone(),
+        store,
+        Arc::new(wal_reader),
+    ));
 
     // Create cancellation token for coordinated shutdown
     let cancel_token = CancellationToken::new();

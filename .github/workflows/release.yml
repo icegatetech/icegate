@@ -113,10 +113,13 @@ jobs:
             config/docker/docker-bake.hcl
             cwd://${{ steps.meta-query.outputs.bake-file-tags }}
             cwd://${{ steps.meta-query.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-query.outputs.bake-file-annotations }}
             cwd://${{ steps.meta-ingest.outputs.bake-file-tags }}
             cwd://${{ steps.meta-ingest.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-ingest.outputs.bake-file-annotations }}
             cwd://${{ steps.meta-maintain.outputs.bake-file-tags }}
             cwd://${{ steps.meta-maintain.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-maintain.outputs.bake-file-annotations }}
           targets: default
           push: true
           set: |

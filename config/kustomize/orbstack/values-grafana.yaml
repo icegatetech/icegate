@@ -1,0 +1,47 @@
+# Grafana - mapped from Docker Compose grafana service
+
+# Anonymous access (dev-only, matches Docker Compose GF_AUTH_* env vars)
+grafana.ini:
+  auth.anonymous:
+    enabled: true
+    org_role: Admin
+  auth:
+    disable_login_form: true
+
+# Datasources provisioning
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://icegate-query.icegate:3100
+        isDefault: true
+        editable: false
+      - name: Tempo
+        type: tempo
+        access: proxy
+        url: http://icegate-query.icegate:3200
+        isDefault: false
+        editable: false
+      - name: Jaeger
+        type: jaeger
+        access: proxy
+        url: http://jaeger-query.observability:16686
+        isDefault: false
+        editable: false
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus-kube-prometheus-prometheus.observability:9090
+        isDefault: false
+        editable: false
+
+service:
+  type: ClusterIP
+  port: 3000
+
+persistence:
+  enabled: true
+  size: 1Gi

@@ -12,20 +12,18 @@ data:
       {{- include "icegate.catalogYaml" . | nindent 6 }}
     storage:
       {{- include "icegate.storageYaml" . | nindent 6 }}
-    {{- if .Values.ingest.queue.enabled }}
     queue:
       common:
-        base_path: {{ .Values.ingest.queue.common.basePath | quote }}
-        channel_capacity: {{ .Values.ingest.queue.common.channelCapacity }}
-        max_row_group_size: {{ .Values.ingest.queue.common.maxRowGroupSize }}
+        base_path: {{ .Values.queue.common.basePath | quote }}
+        channel_capacity: {{ .Values.queue.common.channelCapacity }}
+        max_row_group_size: {{ .Values.queue.common.maxRowGroupSize }}
       write:
-        write_retries: {{ .Values.ingest.queue.write.writeRetries }}
-        compression: {{ .Values.ingest.queue.write.compression }}
-        records_per_flush_multiplier: {{ .Values.ingest.queue.write.recordsPerFlushMultiplier }}
-        max_bytes_per_flush: {{ .Values.ingest.queue.write.maxBytesPerFlush | int }}
-        flush_interval_ms: {{ .Values.ingest.queue.write.flushIntervalMs }}
+        write_retries: {{ .Values.queue.write.writeRetries }}
+        compression: {{ .Values.queue.write.compression }}
+        records_per_flush_multiplier: {{ .Values.queue.write.recordsPerFlushMultiplier }}
+        max_bytes_per_flush: {{ .Values.queue.write.maxBytesPerFlush | int }}
+        flush_interval_ms: {{ .Values.queue.write.flushIntervalMs }}
       read: {}
-    {{- end }}
     shift:
       read:
         max_record_batches_per_task: {{ .Values.ingest.shift.read.maxRecordBatchesPerTask }}

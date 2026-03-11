@@ -1,0 +1,45 @@
+# Nessie Iceberg catalog - mapped from Docker Compose nessie service
+versionStoreType: ROCKSDB
+
+rocksdb:
+  storageClassName: local-path
+  storageSize: 5Gi
+
+# Enable the Iceberg REST catalog service
+catalog:
+  enabled: true
+
+  iceberg:
+    defaultWarehouse: warehouse
+    warehouses:
+      - name: warehouse
+        location: s3://icegatedogfooding/warehouse/
+
+  storage:
+    s3:
+      defaultOptions:
+        region: eu-central
+        endpoint: "https://hel1.your-objectstorage.com" # this endpoint has to be acceptable to icegate services.
+        pathStyleAccess: true
+        authType: STATIC
+        accessKeySecret:
+          name: icegate-aws-credentials
+          awsAccessKeyId: aws-access-key-id
+          awsSecretAccessKey: aws-secret-access-key
+
+# ServiceMonitor for Prometheus Operator discovery
+serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus
+
+# Disable authentication
+authentication:
+  enabled: false
+
+# MinIO compatibility
+extraEnv:
+  - name: AWS_REQUEST_CHECKSUM_CALCULATION
+    value: WHEN_REQUIRED
+  - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+    value: WHEN_REQUIRED

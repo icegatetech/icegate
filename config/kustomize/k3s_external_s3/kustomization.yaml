@@ -11,13 +11,6 @@ resources:
   - secret-aws-infra.yaml
 
 helmCharts:
-  - name: minio
-    repo: https://charts.min.io
-    version: 5.4.0
-    releaseName: minio
-    namespace: infra
-    valuesFile: values-minio.yaml
-
   - name: nessie
     repo: https://charts.projectnessie.org
     version: 0.107.3
@@ -35,7 +28,7 @@ helmCharts:
 
   - name: icegate
     repo: oci://ghcr.io/icegatetech/charts
-    version: 0.1.0-rc6
+    version: 0.1.0-rc2
     releaseName: icegate
     namespace: icegate
     valuesFile: values-icegate.yaml
@@ -58,70 +51,6 @@ helmCharts:
 # Kustomize's namespace transformer doesn't inject it for Helm-inflated
 # resources it cannot classify.
 patches:
-  # MinIO → infra
-  - target:
-      name: minio-sa
-      kind: ServiceAccount
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: ConfigMap
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: Secret
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio-console
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: PersistentVolumeClaim
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: Deployment
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio-post-job
-      kind: Job
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio-cluster
-      kind: Probe
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
   # Jaeger → observability
   - target:
       name: jaeger
@@ -158,3 +87,19 @@ patches:
       - op: add
         path: /metadata/namespace
         value: observability
+  # Tailscale expose → Grafana (observability)
+  - target:
+      name: grafana
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/annotations/tailscale.com~1expose
+        value: "true"
+  # Tailscale expose → Ingest (icegate)
+  - target:
+      name: icegate-ingest
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/annotations/tailscale.com~1expose
+        value: "true"

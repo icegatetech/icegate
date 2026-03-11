@@ -5,4 +5,6 @@ target/
 .tmp
 *.iml
 output.txt
-config/kustomize/charts/
+config/helm/charts/
+config/kustomize/orbstack/charts
+config/kustomize/k3s_external_s3/charts
