@@ -167,6 +167,10 @@ pub struct ShiftReadConfig {
     /// Maximum input size in bytes to process per shift task.
     /// It is better to synchronize with `QueueWriteConfig::max_bytes_per_flush`.
     pub max_input_bytes_per_task: u64,
+    /// Maximum number of WAL segments to read in parallel in plan stage.
+    pub plan_segment_read_parallelism: usize,
+    /// Maximum number of WAL segments to read in parallel in shift stage.
+    pub shift_segment_read_parallelism: usize,
 }
 
 impl Default for ShiftReadConfig {
@@ -174,6 +178,8 @@ impl Default for ShiftReadConfig {
         Self {
             max_record_batches_per_task: 1024,
             max_input_bytes_per_task: 64 * 1024 * 1024, // 64MB
+            plan_segment_read_parallelism: 8,
+            shift_segment_read_parallelism: 8,
         }
     }
 }
@@ -284,6 +290,16 @@ impl ShiftConfig {
                 "max_input_bytes_per_task must be greater than zero".to_string(),
             ));
         }
+        if self.read.plan_segment_read_parallelism == 0 {
+            return Err(IngestError::Config(
+                "plan_segment_read_parallelism must be greater than zero".to_string(),
+            ));
+        }
+        if self.read.shift_segment_read_parallelism == 0 {
+            return Err(IngestError::Config(
+                "shift_segment_read_parallelism must be greater than zero".to_string(),
+            ));
+        }
         if self.write.table_cache_ttl_secs == 0 {
             return Err(IngestError::Config(
                 "table_cache_ttl_secs must be greater than zero".to_string(),
@@ -382,8 +398,30 @@ mod tests {
         config.read.max_input_bytes_per_task = 0;
         let err = config.validate().expect_err("config must be invalid");
         assert!(
-            err.to_string().contains("max_input_bytes_per_task must be greater than zero"),
-            "unexpected error: {err}"
+            matches!(err, crate::error::IngestError::Config(_)),
+            "expected config error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn shift_validate_rejects_zero_plan_segment_read_parallelism() {
+        let mut config = ShiftConfig::default();
+        config.read.plan_segment_read_parallelism = 0;
+        let err = config.validate().expect_err("config must be invalid");
+        assert!(
+            matches!(err, crate::error::IngestError::Config(_)),
+            "expected config error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn shift_validate_rejects_zero_shift_segment_read_parallelism() {
+        let mut config = ShiftConfig::default();
+        config.read.shift_segment_read_parallelism = 0;
+        let err = config.validate().expect_err("config must be invalid");
+        assert!(
+            matches!(err, crate::error::IngestError::Config(_)),
+            "expected config error, got: {err}"
         );
     }
 

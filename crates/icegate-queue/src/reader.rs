@@ -7,7 +7,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use icegate_common::retrier::{Retrier, RetrierConfig};
 use object_store::{ObjectStore, path::Path};
 use parquet::{
@@ -25,7 +25,8 @@ use crate::{
     segment::SegmentId,
 };
 
-const PLAN_BLOCKING_MIN_ROW_GROUPS: usize = 64;
+const PLAN_ROW_GROUPS_TO_BLOCKING_THREAD: usize = 64;
+const DEFAULT_PLAN_SEGMENT_READ_PARALLELISM: usize = 8;
 
 // Reference to record batches (row groups) inside a WAL segment.
 //
@@ -169,6 +170,8 @@ pub struct ParquetQueueReader {
 
     /// Maximum number of rows per emitted [`RecordBatch`] when reading a segment.
     record_batch_size_rows: usize,
+    /// Maximum number of WAL segments to read in parallel while building the plan.
+    plan_segment_read_parallelism: usize,
 
     retrier: Retrier,
 }
@@ -193,8 +196,24 @@ impl ParquetQueueReader {
             base_path: base_path.into(),
             store,
             record_batch_size_rows,
+            plan_segment_read_parallelism: DEFAULT_PLAN_SEGMENT_READ_PARALLELISM,
             retrier: Retrier::new(RetrierConfig::default()),
         })
+    }
+
+    /// Sets the WAL segment read parallelism used by the plan stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `parallelism` is zero.
+    pub fn with_plan_segment_read_parallelism(mut self, parallelism: usize) -> Result<Self> {
+        if parallelism == 0 {
+            return Err(QueueError::Config(
+                "plan_segment_read_parallelism must be greater than zero".to_string(),
+            ));
+        }
+        self.plan_segment_read_parallelism = parallelism;
+        Ok(self)
     }
 
     /// Lists segments for a topic starting from a given offset.
@@ -403,43 +422,61 @@ impl ParquetQueueReader {
         let mut plan = Vec::new();
         let mut row_groups_total = 0usize;
         let mut input_bytes_total = 0u64;
+        let group_by_column_name = group_by_column_name.to_string();
         let mut inline_segments = 0usize;
         let mut blocking_segments = 0usize;
-
-        for segment in segments {
+        let mut stream = futures::stream::iter(segments.iter().cloned().enumerate().map(|(segment_idx, segment)| {
+            let segment_topic = segment.topic;
             let wal_offset = segment.offset;
-            let parquet_meta = self.read_parquet_metadata(&segment.topic, wal_offset, cancel_token).await?;
-            let row_groups = parquet_meta.row_groups().len();
-            let segment_entries = if Self::should_process_in_blocking(row_groups) {
-                let group_by_column_name = group_by_column_name.to_string();
-                blocking_segments = blocking_segments
-                    .checked_add(1)
-                    .ok_or_else(|| QueueError::Metadata("blocking segment count overflow".to_string()))?;
-                let span = tracing::Span::current();
-                tokio::task::spawn_blocking(move || {
-                    span.in_scope(|| {
-                        Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &group_by_column_name)
+            let group_by_column_name = group_by_column_name.clone();
+            let cancel_token = cancel_token.clone();
+            async move {
+                let parquet_meta = self.read_parquet_metadata(&segment_topic, wal_offset, &cancel_token).await?;
+                let row_groups = parquet_meta.row_groups().len();
+                let uses_blocking = row_groups >= PLAN_ROW_GROUPS_TO_BLOCKING_THREAD;
+                let segment_entries = if uses_blocking {
+                    let span = tracing::Span::current();
+                    tokio::task::spawn_blocking(move || {
+                        span.in_scope(|| {
+                            Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &group_by_column_name)
+                        })
                     })
-                })
-                .await??
-            } else {
-                inline_segments = inline_segments
-                    .checked_add(1)
-                    .ok_or_else(|| QueueError::Metadata("inline segment count overflow".to_string()))?;
-                Self::collect_segment_plan_entries(&parquet_meta, wal_offset, group_by_column_name)?
-            };
+                    .await??
+                } else {
+                    Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &group_by_column_name)?
+                };
+                Ok::<(usize, bool, SegmentRowGroups), QueueError>((segment_idx, uses_blocking, segment_entries))
+            }
+        }))
+        .buffer_unordered(self.plan_segment_read_parallelism);
 
-            for entry in segment_entries.entries {
-                Self::apply_segment_plan_entry(
-                    &mut grouped_chunks,
-                    &mut plan,
-                    segment_entries.wal_offset,
-                    entry,
-                    max_row_groups_per_grouped_batch,
-                    max_input_bytes_per_grouped_batch,
-                    &mut row_groups_total,
-                    &mut input_bytes_total,
-                )?;
+        let mut next_expected_idx = 0usize;
+        let mut pending_segment_plans: BTreeMap<usize, (bool, SegmentRowGroups)> = BTreeMap::new();
+        while let Some(result) = stream.next().await {
+            let (segment_idx, uses_blocking, segment_entries) = result?;
+            pending_segment_plans.insert(segment_idx, (uses_blocking, segment_entries));
+            while let Some((uses_blocking, segment_entries)) = pending_segment_plans.remove(&next_expected_idx) {
+                if uses_blocking {
+                    blocking_segments += 1;
+                } else {
+                    inline_segments += 1;
+                }
+                let SegmentRowGroups { wal_offset, entries } = segment_entries;
+                for entry in entries {
+                    Self::apply_segment_plan_entry(
+                        &mut grouped_chunks,
+                        &mut plan,
+                        wal_offset,
+                        entry,
+                        max_row_groups_per_grouped_batch,
+                        max_input_bytes_per_grouped_batch,
+                        &mut row_groups_total,
+                        &mut input_bytes_total,
+                    )?;
+                }
+                next_expected_idx = next_expected_idx.checked_add(1).ok_or_else(|| {
+                    QueueError::Metadata("segment index overflow while assembling plan entries".to_string())
+                })?;
             }
         }
 
@@ -453,10 +490,6 @@ impl ParquetQueueReader {
         Self::flush_remaining_chunks(grouped_chunks, &mut plan, &mut input_bytes_total)?;
 
         Ok((plan, row_groups_total, input_bytes_total))
-    }
-
-    const fn should_process_in_blocking(row_group_count: usize) -> bool {
-        row_group_count >= PLAN_BLOCKING_MIN_ROW_GROUPS
     }
 
     #[tracing::instrument(

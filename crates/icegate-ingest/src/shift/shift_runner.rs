@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use futures::{StreamExt, future::Either, pin_mut};
 use icegate_jobmanager::{Error, ImmutableTask, JobManager};
 use icegate_queue::{QueueReader, Topic};
 use tokio_util::sync::CancellationToken;
@@ -80,6 +82,14 @@ pub struct ShiftTaskResult {
     pub bytes_written_total: u64,
 }
 
+enum SegmentReadOutcome {
+    Read {
+        segment_idx: usize,
+        batches: Vec<RecordBatch>,
+    },
+    Cancelled,
+}
+
 /// Runner interface for shift tasks.
 #[async_trait]
 pub trait ShiftTaskRunner: Send + Sync {
@@ -97,6 +107,7 @@ pub struct ShiftTaskRunnerImpl<Q, S> {
     queue_reader: Arc<Q>,
     storage: Arc<S>,
     topic: Topic,
+    segment_read_parallelism: usize,
 }
 
 impl<Q, S> ShiftTaskRunnerImpl<Q, S>
@@ -104,13 +115,34 @@ where
     Q: QueueReader + 'static,
     S: Storage + 'static,
 {
+    const DEFAULT_SEGMENT_READ_PARALLELISM: usize = 8;
+
     /// Create a new shift task runner.
     pub fn new(queue_reader: Arc<Q>, storage: Arc<S>, topic: impl Into<String>) -> Self {
         Self {
             queue_reader,
             storage,
             topic: topic.into(),
+            segment_read_parallelism: Self::DEFAULT_SEGMENT_READ_PARALLELISM,
         }
+    }
+
+    /// Set WAL segment read parallelism for shift execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `segment_read_parallelism` is zero.
+    pub fn with_segment_read_parallelism(
+        mut self,
+        segment_read_parallelism: usize,
+    ) -> std::result::Result<Self, crate::error::IngestError> {
+        if segment_read_parallelism == 0 {
+            return Err(crate::error::IngestError::Config(
+                "shift_segment_read_parallelism must be greater than zero".to_string(),
+            ));
+        }
+        self.segment_read_parallelism = segment_read_parallelism;
+        Ok(self)
     }
 }
 
@@ -158,26 +190,72 @@ where
         }
 
         let mut batches = Vec::new();
-        for segment in &input.segments {
-            let segment_batches = self
-                .queue_reader
-                .read_segment(
-                    &self.topic,
-                    segment.segment_offset,
-                    &segment.record_batch_idxs,
-                    cancel_token,
-                )
-                .await
-                .map_err(|err| {
+        let mut next_expected_idx = 0usize;
+        let mut pending_batches: BTreeMap<usize, Vec<RecordBatch>> = BTreeMap::new();
+        let read_parallelism = self.segment_read_parallelism;
+        // TODO(med): for a more rigid memory-bound, we can consider buffered(read_parallelism) (ordered stream) and remove the pending_batches.
+        let read_stream = futures::stream::iter(input.segments.into_iter().enumerate())
+            .take_until(cancel_token.cancelled())
+            .map(|(segment_idx, segment)| {
+                let queue_reader = Arc::clone(&self.queue_reader);
+                let topic = self.topic.clone();
+                let cancel = cancel_token.clone();
+                async move {
+                    let segment_offset = segment.segment_offset;
+                    match futures::future::select(
+                        Box::pin(queue_reader.read_segment(
+                            &topic,
+                            segment_offset,
+                            &segment.record_batch_idxs,
+                            &cancel,
+                        )),
+                        Box::pin(cancel.cancelled()),
+                    )
+                    .await
+                    {
+                        Either::Left((read_result, _)) => {
+                            let segment_batches = read_result.map_err(|err| {
+                                Error::TaskExecution(format!(
+                                    "failed to read segment {segment_offset} row groups: {err}"
+                                ))
+                            })?;
+                            Ok::<SegmentReadOutcome, Error>(SegmentReadOutcome::Read {
+                                segment_idx,
+                                batches: segment_batches,
+                            })
+                        }
+                        Either::Right((_cancelled, _)) => {
+                            Ok::<SegmentReadOutcome, Error>(SegmentReadOutcome::Cancelled)
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(read_parallelism);
+        pin_mut!(read_stream);
+
+        while let Some(read_result) = read_stream.next().await {
+            let read_outcome =
+                read_result.map_err(|err| ShiftTaskFailure::new(ShiftTaskFailureReason::QueueRead, err))?;
+            let SegmentReadOutcome::Read {
+                segment_idx,
+                batches: segment_batches,
+            } = read_outcome
+            else {
+                return Err(ShiftTaskFailure::new(
+                    ShiftTaskFailureReason::Cancelled,
+                    Error::TaskExecution("shift task cancelled while reading queue segments".to_string()),
+                ));
+            };
+            pending_batches.insert(segment_idx, segment_batches);
+            while let Some(segment_batches) = pending_batches.remove(&next_expected_idx) {
+                batches.extend(segment_batches);
+                next_expected_idx = next_expected_idx.checked_add(1).ok_or_else(|| {
                     ShiftTaskFailure::new(
                         ShiftTaskFailureReason::QueueRead,
-                        Error::TaskExecution(format!(
-                            "failed to read segment {} row groups: {err}",
-                            segment.segment_offset
-                        )),
+                        Error::TaskExecution("segment index overflow while assembling batches".to_string()),
                     )
                 })?;
-            batches.extend(segment_batches);
+            }
         }
 
         if batches.is_empty() {
@@ -234,5 +312,663 @@ where
             parquet_files_total: write_result.data_files.len(),
             bytes_written_total,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use arrow::{
+        array::{ArrayRef, Int64Array},
+        datatypes::{DataType, Field, Schema},
+    };
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
+    use tokio::{
+        sync::{Mutex, Notify},
+        time::{sleep, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{ShiftTaskFailureReason, ShiftTaskRunner, ShiftTaskRunnerImpl};
+    use crate::{
+        error::{IngestError, Result},
+        shift::{
+            SegmentToRead, ShiftInput,
+            iceberg_storage::{Storage, WrittenDataFiles},
+        },
+    };
+
+    struct TestTask {
+        id: Uuid,
+        code: TaskCode,
+        input: Vec<u8>,
+        output: Vec<u8>,
+        error: String,
+        depends_on: Vec<Uuid>,
+    }
+
+    impl TestTask {
+        fn new(input: &ShiftInput) -> Self {
+            Self {
+                id: Uuid::new_v4(),
+                code: TaskCode::new("shift"),
+                input: serde_json::to_vec(input).expect("serialize shift input"),
+                output: Vec::new(),
+                error: String::new(),
+                depends_on: Vec::new(),
+            }
+        }
+    }
+
+    impl ImmutableTask for TestTask {
+        fn id(&self) -> &Uuid {
+            &self.id
+        }
+        fn code(&self) -> &TaskCode {
+            &self.code
+        }
+        fn get_input(&self) -> &[u8] {
+            &self.input
+        }
+        fn get_output(&self) -> &[u8] {
+            &self.output
+        }
+        fn get_error(&self) -> &str {
+            &self.error
+        }
+        fn depends_on(&self) -> &[Uuid] {
+            &self.depends_on
+        }
+        fn is_expired(&self) -> bool {
+            false
+        }
+        fn is_completed(&self) -> bool {
+            false
+        }
+        fn is_failed(&self) -> bool {
+            false
+        }
+        fn attempts(&self) -> u32 {
+            0
+        }
+    }
+
+    struct NoopJobManager;
+
+    impl JobManager for NoopJobManager {
+        fn add_task(&self, _task_def: TaskDefinition) -> std::result::Result<Uuid, icegate_jobmanager::Error> {
+            panic!("add_task is not expected in shift runner tests");
+        }
+        fn complete_task(
+            &self,
+            _task_id: &Uuid,
+            _output: Vec<u8>,
+        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("complete_task is not expected in shift runner tests");
+        }
+        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("fail_task is not expected in shift runner tests");
+        }
+        fn set_next_start_at(
+            &self,
+            _next_start_at: DateTime<Utc>,
+        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("set_next_start_at is not expected in shift runner tests");
+        }
+        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
+            panic!("get_task is not expected in shift runner tests");
+        }
+        fn get_tasks_by_code(
+            &self,
+            _code: &TaskCode,
+        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, icegate_jobmanager::Error> {
+            panic!("get_tasks_by_code is not expected in shift runner tests");
+        }
+    }
+
+    struct FakeQueueReader {
+        batches_by_offset: HashMap<u64, Vec<arrow::record_batch::RecordBatch>>,
+        delay_by_offset: HashMap<u64, Duration>,
+        fail_offset: Option<u64>,
+        started_reads: Option<Arc<AtomicUsize>>,
+        active_reads: Option<Arc<AtomicUsize>>,
+        max_active_reads: Option<Arc<AtomicUsize>>,
+        concurrency_gate: Option<Arc<ReadConcurrencyGate>>,
+    }
+
+    struct ReadConcurrencyGate {
+        required_parallel_reads: usize,
+        entered_reads: AtomicUsize,
+        is_open: AtomicBool,
+        notify: Notify,
+        wait_timeout: Duration,
+    }
+
+    impl ReadConcurrencyGate {
+        fn new(required_parallel_reads: usize, wait_timeout: Duration) -> Self {
+            Self {
+                required_parallel_reads,
+                entered_reads: AtomicUsize::new(0),
+                is_open: AtomicBool::new(false),
+                notify: Notify::new(),
+                wait_timeout,
+            }
+        }
+
+        async fn wait_until_open(&self) -> icegate_queue::Result<()> {
+            let notified = self.notify.notified();
+            if self.is_open.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let entered = self.entered_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if entered >= self.required_parallel_reads {
+                self.is_open.store(true, Ordering::SeqCst);
+                self.notify.notify_waiters();
+                return Ok(());
+            }
+
+            timeout(self.wait_timeout, notified).await.map_err(|_| {
+                icegate_queue::QueueError::Metadata(
+                    "read concurrency gate timed out: segment reads did not overlap".to_string(),
+                )
+            })?;
+            Ok(())
+        }
+    }
+
+    fn update_max_seen(max: &AtomicUsize, value: usize) {
+        let mut observed = max.load(Ordering::SeqCst);
+        while value > observed {
+            match max.compare_exchange(observed, value, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(new_observed) => observed = new_observed,
+            }
+        }
+    }
+
+    struct ActiveReadGuard {
+        counter: Option<Arc<AtomicUsize>>,
+    }
+
+    impl ActiveReadGuard {
+        fn new(counter: Option<Arc<AtomicUsize>>) -> Self {
+            Self { counter }
+        }
+    }
+
+    impl Drop for ActiveReadGuard {
+        fn drop(&mut self) {
+            if let Some(counter) = &self.counter {
+                counter.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl icegate_queue::QueueReader for FakeQueueReader {
+        async fn plan_segments(
+            &self,
+            _topic: &icegate_queue::Topic,
+            _start_offset: u64,
+            _group_by_column_name: &str,
+            _max_record_batches_per_task: usize,
+            _max_input_bytes_per_task: u64,
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<icegate_queue::SegmentsPlan> {
+            panic!("plan_segments is not expected in shift runner tests");
+        }
+
+        async fn read_segment(
+            &self,
+            _topic: &icegate_queue::Topic,
+            offset: u64,
+            _record_batch_idxs: &[usize],
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<Vec<arrow::record_batch::RecordBatch>> {
+            if let Some(started_reads) = &self.started_reads {
+                started_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            let _active_guard = self.active_reads.as_ref().map_or_else(
+                || ActiveReadGuard::new(None),
+                |active_reads| {
+                    let current = active_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some(max_active_reads) = &self.max_active_reads {
+                        update_max_seen(max_active_reads, current);
+                    }
+                    ActiveReadGuard::new(Some(Arc::clone(active_reads)))
+                },
+            );
+            if let Some(gate) = &self.concurrency_gate {
+                gate.wait_until_open().await?;
+            }
+            if let Some(delay) = self.delay_by_offset.get(&offset) {
+                sleep(*delay).await;
+            }
+            if self.fail_offset == Some(offset) {
+                return Err(icegate_queue::QueueError::Metadata(format!(
+                    "read failed for segment {offset}"
+                )));
+            }
+            Ok(self.batches_by_offset.get(&offset).cloned().unwrap_or_default())
+        }
+    }
+
+    struct FakeStorage {
+        writes: Mutex<Vec<arrow::record_batch::RecordBatch>>,
+        write_calls: AtomicUsize,
+        fail_on_write: bool,
+    }
+
+    impl FakeStorage {
+        fn new(fail_on_write: bool) -> Self {
+            Self {
+                writes: Mutex::new(Vec::new()),
+                write_calls: AtomicUsize::new(0),
+                fail_on_write,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Storage for FakeStorage {
+        async fn get_last_offset(&self, _cancel_token: &CancellationToken) -> Result<Option<u64>> {
+            panic!("get_last_offset is not expected in shift runner tests");
+        }
+
+        async fn write_record_batches(
+            &self,
+            batches: Vec<arrow::record_batch::RecordBatch>,
+            _cancel_token: &CancellationToken,
+        ) -> Result<WrittenDataFiles> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            self.writes.lock().await.extend(batches);
+            if self.fail_on_write {
+                return Err(IngestError::Shift("storage write failure".to_string()));
+            }
+            Ok(WrittenDataFiles {
+                data_files: Vec::new(),
+                rows_written: 0,
+            })
+        }
+
+        async fn get_data_files(
+            &self,
+            _parquet_paths: &[String],
+            _cancel_token: &CancellationToken,
+        ) -> Result<Vec<iceberg::spec::DataFile>> {
+            panic!("get_data_files is not expected in shift runner tests");
+        }
+
+        async fn commit(
+            &self,
+            _data_files: Vec<iceberg::spec::DataFile>,
+            _record_type: &str,
+            _last_offset: u64,
+            _cancel_token: &CancellationToken,
+        ) -> Result<usize> {
+            panic!("commit is not expected in shift runner tests");
+        }
+    }
+
+    fn test_batch(value: i64) -> arrow::record_batch::RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+        let value_col: ArrayRef = Arc::new(Int64Array::from(vec![value]));
+        arrow::record_batch::RecordBatch::try_new(schema, vec![value_col]).expect("batch")
+    }
+
+    fn values_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .map(|batch| {
+                let values = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("int64 array");
+                values.value(0)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn run_preserves_segment_order_when_reads_complete_out_of_order() {
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([
+                (1, vec![test_batch(1)]),
+                (2, vec![test_batch(2)]),
+                (3, vec![test_batch(3)]),
+            ]),
+            delay_by_offset: HashMap::from([
+                (1, Duration::from_millis(80)),
+                (2, Duration::from_millis(5)),
+                (3, Duration::from_millis(20)),
+            ]),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+        });
+        let storage = Arc::new(FakeStorage::new(true));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+            .with_segment_read_parallelism(3)
+            .expect("non-zero segment read parallelism must be accepted");
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![
+                SegmentToRead {
+                    segment_offset: 1,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 2,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 3,
+                    record_batch_idxs: vec![0],
+                },
+            ],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+
+        let Err(err) = runner.run(task, &manager, &cancel).await else {
+            panic!("storage write is expected to fail");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::Write);
+
+        let writes = storage.writes.lock().await;
+        assert_eq!(values_from_batches(&writes), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn run_fails_fast_on_queue_read_error_and_skips_storage_write() {
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([(1, vec![test_batch(1)]), (3, vec![test_batch(3)])]),
+            delay_by_offset: HashMap::from([(1, Duration::from_millis(40)), (2, Duration::from_millis(5))]),
+            fail_offset: Some(2),
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+        });
+        let storage = Arc::new(FakeStorage::new(false));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+            .with_segment_read_parallelism(3)
+            .expect("non-zero segment read parallelism must be accepted");
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![
+                SegmentToRead {
+                    segment_offset: 1,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 2,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 3,
+                    record_batch_idxs: vec![0],
+                },
+            ],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+
+        let Err(err) = runner.run(task, &manager, &cancel).await else {
+            panic!("queue read must fail");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::QueueRead);
+        assert_eq!(storage.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_proves_concurrent_reads_for_parallelism_greater_than_one() {
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let max_active_reads = Arc::new(AtomicUsize::new(0));
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([
+                (1, vec![test_batch(1)]),
+                (2, vec![test_batch(2)]),
+                (3, vec![test_batch(3)]),
+                (4, vec![test_batch(4)]),
+                (5, vec![test_batch(5)]),
+                (6, vec![test_batch(6)]),
+            ]),
+            delay_by_offset: HashMap::from([
+                (1, Duration::from_millis(40)),
+                (2, Duration::from_millis(40)),
+                (3, Duration::from_millis(40)),
+                (4, Duration::from_millis(40)),
+                (5, Duration::from_millis(40)),
+                (6, Duration::from_millis(40)),
+            ]),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: Some(Arc::clone(&active_reads)),
+            max_active_reads: Some(Arc::clone(&max_active_reads)),
+            concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
+        });
+        let storage = Arc::new(FakeStorage::new(true));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+            .with_segment_read_parallelism(2)
+            .expect("non-zero segment read parallelism must be accepted");
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![
+                SegmentToRead {
+                    segment_offset: 1,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 2,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 3,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 4,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 5,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 6,
+                    record_batch_idxs: vec![0],
+                },
+            ],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+
+        let Err(err) = runner.run(task, &manager, &cancel).await else {
+            panic!("storage write is expected to fail");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::Write);
+        assert!(
+            max_active_reads.load(Ordering::SeqCst) <= 2,
+            "max in-flight reads must not exceed configured parallelism"
+        );
+        assert!(
+            max_active_reads.load(Ordering::SeqCst) >= 2,
+            "parallel read path must overlap at least two in-flight reads"
+        );
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_keeps_reads_strictly_sequential_for_parallelism_one() {
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let max_active_reads = Arc::new(AtomicUsize::new(0));
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([
+                (1, vec![test_batch(1)]),
+                (2, vec![test_batch(2)]),
+                (3, vec![test_batch(3)]),
+            ]),
+            delay_by_offset: HashMap::from([
+                (1, Duration::from_millis(25)),
+                (2, Duration::from_millis(25)),
+                (3, Duration::from_millis(25)),
+            ]),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: Some(Arc::clone(&active_reads)),
+            max_active_reads: Some(Arc::clone(&max_active_reads)),
+            concurrency_gate: None,
+        });
+        let storage = Arc::new(FakeStorage::new(true));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+            .with_segment_read_parallelism(1)
+            .expect("non-zero segment read parallelism must be accepted");
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![
+                SegmentToRead {
+                    segment_offset: 1,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 2,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 3,
+                    record_batch_idxs: vec![0],
+                },
+            ],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+
+        let Err(err) = runner.run(task, &manager, &cancel).await else {
+            panic!("storage write is expected to fail");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::Write);
+        assert_eq!(
+            max_active_reads.load(Ordering::SeqCst),
+            1,
+            "parallelism=1 must keep exactly one in-flight read"
+        );
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn with_segment_read_parallelism_rejects_zero() {
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::new(),
+            delay_by_offset: HashMap::new(),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+        });
+        let storage = Arc::new(FakeStorage::new(false));
+
+        let result = ShiftTaskRunnerImpl::new(queue_reader, storage, "logs").with_segment_read_parallelism(0);
+
+        match result {
+            Ok(_) => panic!("zero shift_segment_read_parallelism must be rejected"),
+            Err(crate::error::IngestError::Config(_)) => {}
+            Err(other) => panic!("expected config error, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_stops_reading_and_returns_cancelled_after_cancellation() {
+        let started_reads = Arc::new(AtomicUsize::new(0));
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([
+                (1, vec![test_batch(1)]),
+                (2, vec![test_batch(2)]),
+                (3, vec![test_batch(3)]),
+                (4, vec![test_batch(4)]),
+            ]),
+            delay_by_offset: HashMap::from([
+                (1, Duration::from_secs(5)),
+                (2, Duration::from_secs(5)),
+                (3, Duration::from_secs(5)),
+                (4, Duration::from_secs(5)),
+            ]),
+            fail_offset: None,
+            started_reads: Some(Arc::clone(&started_reads)),
+            active_reads: Some(Arc::clone(&active_reads)),
+            max_active_reads: None,
+            concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
+        });
+        let storage = Arc::new(FakeStorage::new(false));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+            .with_segment_read_parallelism(2)
+            .expect("non-zero segment read parallelism must be accepted");
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![
+                SegmentToRead {
+                    segment_offset: 1,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 2,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 3,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 4,
+                    record_batch_idxs: vec![0],
+                },
+            ],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+
+        let run_handle = tokio::spawn(async move { runner.run(task, &manager, &cancel_for_task).await });
+        sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        let run_result = timeout(Duration::from_secs(1), run_handle)
+            .await
+            .expect("runner must stop promptly after cancellation")
+            .expect("shift runner task must join successfully");
+
+        let Err(err) = run_result else {
+            panic!("cancellation must fail shift run");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::Cancelled);
+        assert_eq!(storage.write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            started_reads.load(Ordering::SeqCst),
+            2,
+            "cancellation must stop scheduling reads beyond the in-flight parallelism window"
+        );
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
     }
 }

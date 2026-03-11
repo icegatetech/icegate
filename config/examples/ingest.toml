@@ -58,6 +58,8 @@ flush_interval_ms = 1000
 [shift.read]
 # max_record_batches_per_task = 128
 # max_input_bytes_per_task = 67108864
+# plan_segment_read_parallelism = 8
+# shift_segment_read_parallelism = 8
 
 [shift.write]
 # row_group_size = 10000

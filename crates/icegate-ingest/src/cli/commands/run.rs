@@ -190,11 +190,14 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
-    let queue_reader = Arc::new(ParquetQueueReader::new(
-        queue_config.common.base_path.clone(),
-        Arc::clone(&store),
-        queue_config.common.max_row_group_size,
-    )?);
+    let queue_reader = Arc::new(
+        ParquetQueueReader::new(
+            queue_config.common.base_path.clone(),
+            Arc::clone(&store),
+            queue_config.common.max_row_group_size,
+        )?
+        .with_plan_segment_read_parallelism(shift_config.read.plan_segment_read_parallelism)?,
+    );
     let shift_metrics = metrics_runtime.as_ref().map_or_else(ShiftMetrics::new_disabled, |runtime| {
         ShiftMetrics::new(&runtime.meter())
     });

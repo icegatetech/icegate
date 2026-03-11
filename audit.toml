@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0436", # `paste` is unmaintained; consider using an alternative
+    "RUSTSEC-2025-0134", # `rustls-pemfile`, is unmaintained
+    # bincode 1.x is pulled in transitively via foyer/iceberg; this advisory is tracked as an unmaintained dependency warning, not a known vulnerability in our direct code.
+    "RUSTSEC-2025-0141",
+]

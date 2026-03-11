@@ -199,6 +199,8 @@ ingest:
     read:
       maxRecordBatchesPerTask: 128
       maxInputBytesPerTask: 67108864
+      planSegmentReadParallelism: 8
+      shiftSegmentReadParallelism: 8
     write:
       rowGroupSize: 8192
       maxFileSizeMb: 64
