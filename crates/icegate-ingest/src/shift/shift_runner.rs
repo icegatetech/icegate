@@ -427,6 +427,7 @@ mod tests {
         }
 
         async fn wait_until_open(&self) -> icegate_queue::Result<()> {
+            let notified = self.notify.notified();
             if self.is_open.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -437,7 +438,7 @@ mod tests {
                 return Ok(());
             }
 
-            timeout(self.wait_timeout, self.notify.notified()).await.map_err(|_| {
+            timeout(self.wait_timeout, notified).await.map_err(|_| {
                 icegate_queue::QueueError::Metadata(
                     "read concurrency gate timed out: segment reads did not overlap".to_string(),
                 )

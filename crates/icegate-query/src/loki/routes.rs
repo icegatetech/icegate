@@ -17,7 +17,7 @@ pub fn routes(state: LokiState) -> Router {
         )
         // Label endpoints
         .route("/loki/api/v1/labels", get(handlers::labels))
-        .route("/loki/api/v1/label/:name/values", get(handlers::label_values))
+        .route("/loki/api/v1/label/{name}/values", get(handlers::label_values))
         // Series endpoint (Loki API supports both GET and POST)
         .route("/loki/api/v1/series", get(handlers::series).post(handlers::series))
         // Health check

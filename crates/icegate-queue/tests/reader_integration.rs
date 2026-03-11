@@ -155,6 +155,7 @@ impl MetadataConcurrencyGate {
     }
 
     async fn wait_until_open(&self) -> ObjectStoreResult<()> {
+        let notified = self.notify.notified();
         if self.is_open.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -165,7 +166,7 @@ impl MetadataConcurrencyGate {
             return Ok(());
         }
 
-        timeout(self.wait_timeout, self.notify.notified())
+        timeout(self.wait_timeout, notified)
             .await
             .map_err(|_| object_store::Error::Generic {
                 store: "DelayedObjectStore",
