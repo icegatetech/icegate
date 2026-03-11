@@ -16,7 +16,7 @@ pub fn routes(state: PrometheusState) -> Router {
         // Metadata endpoints
         .route("/api/v1/series", get(handlers::series))
         .route("/api/v1/labels", get(handlers::labels))
-        .route("/api/v1/label/:name/values", get(handlers::label_values))
+        .route("/api/v1/label/{name}/values", get(handlers::label_values))
         // Health check
         .route("/-/ready", get(handlers::ready))
         .with_state(state)

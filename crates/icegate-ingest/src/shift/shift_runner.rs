@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{StreamExt, future::Either, pin_mut};
 use icegate_jobmanager::{Error, ImmutableTask, JobManager};
 use icegate_queue::{QueueReader, Topic};
 use tokio_util::sync::CancellationToken;
@@ -80,6 +80,14 @@ pub struct ShiftTaskResult {
     pub parquet_files_total: usize,
     /// Total bytes written.
     pub bytes_written_total: u64,
+}
+
+enum SegmentReadOutcome {
+    Read {
+        segment_idx: usize,
+        batches: Vec<RecordBatch>,
+    },
+    Cancelled,
 }
 
 /// Runner interface for shift tasks.
@@ -186,27 +194,58 @@ where
         let mut pending_batches: BTreeMap<usize, Vec<RecordBatch>> = BTreeMap::new();
         let read_parallelism = self.segment_read_parallelism;
         // TODO(med): for a more rigid memory-bound, we can consider buffered(read_parallelism) (ordered stream) and remove the pending_batches.
-        let mut read_stream = futures::stream::iter(input.segments.into_iter().enumerate())
+        let read_stream = futures::stream::iter(input.segments.into_iter().enumerate())
+            .take_until(cancel_token.cancelled())
             .map(|(segment_idx, segment)| {
                 let queue_reader = Arc::clone(&self.queue_reader);
                 let topic = self.topic.clone();
                 let cancel = cancel_token.clone();
                 async move {
                     let segment_offset = segment.segment_offset;
-                    let segment_batches = queue_reader
-                        .read_segment(&topic, segment_offset, &segment.record_batch_idxs, &cancel)
-                        .await
-                        .map_err(|err| {
-                            Error::TaskExecution(format!("failed to read segment {segment_offset} row groups: {err}"))
-                        })?;
-                    Ok::<(usize, Vec<RecordBatch>), Error>((segment_idx, segment_batches))
+                    match futures::future::select(
+                        Box::pin(queue_reader.read_segment(
+                            &topic,
+                            segment_offset,
+                            &segment.record_batch_idxs,
+                            &cancel,
+                        )),
+                        Box::pin(cancel.cancelled()),
+                    )
+                    .await
+                    {
+                        Either::Left((read_result, _)) => {
+                            let segment_batches = read_result.map_err(|err| {
+                                Error::TaskExecution(format!(
+                                    "failed to read segment {segment_offset} row groups: {err}"
+                                ))
+                            })?;
+                            Ok::<SegmentReadOutcome, Error>(SegmentReadOutcome::Read {
+                                segment_idx,
+                                batches: segment_batches,
+                            })
+                        }
+                        Either::Right((_cancelled, _)) => {
+                            Ok::<SegmentReadOutcome, Error>(SegmentReadOutcome::Cancelled)
+                        }
+                    }
                 }
             })
             .buffer_unordered(read_parallelism);
+        pin_mut!(read_stream);
 
         while let Some(read_result) = read_stream.next().await {
-            let (segment_idx, segment_batches) =
+            let read_outcome =
                 read_result.map_err(|err| ShiftTaskFailure::new(ShiftTaskFailureReason::QueueRead, err))?;
+            let SegmentReadOutcome::Read {
+                segment_idx,
+                batches: segment_batches,
+            } = read_outcome
+            else {
+                return Err(ShiftTaskFailure::new(
+                    ShiftTaskFailureReason::Cancelled,
+                    Error::TaskExecution("shift task cancelled while reading queue segments".to_string()),
+                ));
+            };
             pending_batches.insert(segment_idx, segment_batches);
             while let Some(segment_batches) = pending_batches.remove(&next_expected_idx) {
                 batches.extend(segment_batches);
@@ -402,6 +441,7 @@ mod tests {
         batches_by_offset: HashMap<u64, Vec<arrow::record_batch::RecordBatch>>,
         delay_by_offset: HashMap<u64, Duration>,
         fail_offset: Option<u64>,
+        started_reads: Option<Arc<AtomicUsize>>,
         active_reads: Option<Arc<AtomicUsize>>,
         max_active_reads: Option<Arc<AtomicUsize>>,
         concurrency_gate: Option<Arc<ReadConcurrencyGate>>,
@@ -496,6 +536,9 @@ mod tests {
             _record_batch_idxs: &[usize],
             _cancel_token: &CancellationToken,
         ) -> icegate_queue::Result<Vec<arrow::record_batch::RecordBatch>> {
+            if let Some(started_reads) = &self.started_reads {
+                started_reads.fetch_add(1, Ordering::SeqCst);
+            }
             let _active_guard = self.active_reads.as_ref().map_or_else(
                 || ActiveReadGuard::new(None),
                 |active_reads| {
@@ -608,6 +651,7 @@ mod tests {
                 (3, Duration::from_millis(20)),
             ]),
             fail_offset: None,
+            started_reads: None,
             active_reads: None,
             max_active_reads: None,
             concurrency_gate: None,
@@ -653,6 +697,7 @@ mod tests {
             batches_by_offset: HashMap::from([(1, vec![test_batch(1)]), (3, vec![test_batch(3)])]),
             delay_by_offset: HashMap::from([(1, Duration::from_millis(40)), (2, Duration::from_millis(5))]),
             fail_offset: Some(2),
+            started_reads: None,
             active_reads: None,
             max_active_reads: None,
             concurrency_gate: None,
@@ -712,6 +757,7 @@ mod tests {
                 (6, Duration::from_millis(40)),
             ]),
             fail_offset: None,
+            started_reads: None,
             active_reads: Some(Arc::clone(&active_reads)),
             max_active_reads: Some(Arc::clone(&max_active_reads)),
             concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
@@ -785,6 +831,7 @@ mod tests {
                 (3, Duration::from_millis(25)),
             ]),
             fail_offset: None,
+            started_reads: None,
             active_reads: Some(Arc::clone(&active_reads)),
             max_active_reads: Some(Arc::clone(&max_active_reads)),
             concurrency_gate: None,
@@ -833,6 +880,7 @@ mod tests {
             batches_by_offset: HashMap::new(),
             delay_by_offset: HashMap::new(),
             fail_offset: None,
+            started_reads: None,
             active_reads: None,
             max_active_reads: None,
             concurrency_gate: None,
@@ -846,5 +894,81 @@ mod tests {
             Err(crate::error::IngestError::Config(_)) => {}
             Err(other) => panic!("expected config error, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_stops_reading_and_returns_cancelled_after_cancellation() {
+        let started_reads = Arc::new(AtomicUsize::new(0));
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([
+                (1, vec![test_batch(1)]),
+                (2, vec![test_batch(2)]),
+                (3, vec![test_batch(3)]),
+                (4, vec![test_batch(4)]),
+            ]),
+            delay_by_offset: HashMap::from([
+                (1, Duration::from_secs(5)),
+                (2, Duration::from_secs(5)),
+                (3, Duration::from_secs(5)),
+                (4, Duration::from_secs(5)),
+            ]),
+            fail_offset: None,
+            started_reads: Some(Arc::clone(&started_reads)),
+            active_reads: Some(Arc::clone(&active_reads)),
+            max_active_reads: None,
+            concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
+        });
+        let storage = Arc::new(FakeStorage::new(false));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+            .with_segment_read_parallelism(2)
+            .expect("non-zero segment read parallelism must be accepted");
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![
+                SegmentToRead {
+                    segment_offset: 1,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 2,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 3,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 4,
+                    record_batch_idxs: vec![0],
+                },
+            ],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+
+        let run_handle = tokio::spawn(async move { runner.run(task, &manager, &cancel_for_task).await });
+        sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        let run_result = timeout(Duration::from_secs(1), run_handle)
+            .await
+            .expect("runner must stop promptly after cancellation")
+            .expect("shift runner task must join successfully");
+
+        let Err(err) = run_result else {
+            panic!("cancellation must fail shift run");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::Cancelled);
+        assert_eq!(storage.write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            started_reads.load(Ordering::SeqCst),
+            2,
+            "cancellation must stop scheduling reads beyond the in-flight parallelism window"
+        );
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
     }
 }

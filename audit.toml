@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    # bincode 1.x is pulled in transitively via foyer/iceberg; this advisory is tracked as an unmaintained dependency warning, not a known vulnerability in our direct code.
+    "RUSTSEC-2025-0141",
+]
