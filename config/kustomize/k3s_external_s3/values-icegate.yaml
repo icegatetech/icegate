@@ -33,8 +33,6 @@ queue:
 
 ## Query component
 query:
-  image:
-    tag: 0.1.0-rc2
   enabled: true
   replicaCount: 1
   loki:
@@ -62,8 +60,6 @@ query:
 ## Ingest component
 ingest:
   enabled: true
-  image:
-    tag: 0.1.0-rc2
   replicaCount: 1
   otlpHttp:
     enabled: true
@@ -102,8 +98,6 @@ serviceMonitor:
 ## Migrate (runs as Helm hook: pre-install/pre-upgrade)
 migrate:
   enabled: true
-  image:
-    tag: 0.1.0-rc2
   backoffLimit: 3
   activeDeadlineSeconds: 300
   waitForDependencies:
