@@ -75,6 +75,8 @@ jobs:
           bake-target: query
           labels: |
             org.opencontainers.image.description=Query APIs for IceGate (Loki, Prometheus, Tempo)
+          annotations: |
+            org.opencontainers.image.description=Query APIs for IceGate (Loki, Prometheus, Tempo)
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -88,6 +90,8 @@ jobs:
           bake-target: ingest
           labels: |
             org.opencontainers.image.description=OTLP data ingestion for IceGate
+          annotations: |
+            org.opencontainers.image.description=OTLP data ingestion for IceGate
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -100,6 +104,8 @@ jobs:
           images: ${{ env.IMAGE_PREFIX }}-maintain
           bake-target: maintain
           labels: |
+            org.opencontainers.image.description=Maintenance operations for IceGate
+          annotations: |
             org.opencontainers.image.description=Maintenance operations for IceGate
           tags: |
             type=semver,pattern={{version}}
