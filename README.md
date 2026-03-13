@@ -78,7 +78,7 @@ The system consists of five core components for handling observability data (met
 
 2. Start the core services:
    ```bash
-   make run-monitoing-release
+   make run-monitoring-release
    ```
 
    This command builds and runs all core services in Docker containers. The first run will take a few minutes to build the images and start all services.

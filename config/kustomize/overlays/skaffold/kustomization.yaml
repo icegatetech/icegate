@@ -3,11 +3,11 @@ kind: Kustomization
 
 resources:
   - ../../base
-  # Namespace "icegate" is created by the IceGate Helm chart (namespace.create: true
-  # in values-icegate.yaml). This secret depends on that chart being rendered in
-  # the same kustomize build.
   - secret-aws.yaml
   - secret-aws-infra.yaml
+
+helmGlobals:
+  chartHome: ../../../helm
 
 helmCharts:
   - name: minio
@@ -25,8 +25,6 @@ helmCharts:
     valuesFile: values-nessie.yaml
 
   - name: icegate
-    repo: oci://ghcr.io/icegatetech/charts
-    version: 0.1.0-rc2
     releaseName: icegate
     namespace: icegate
     valuesFile: values-icegate.yaml

@@ -162,6 +162,15 @@ query:
     minAvailable: 1
     # maxUnavailable: 1
 
+  ## Wait for dependencies to be ready before starting the query server.
+  ## Uses a busybox init container to poll the endpoints.
+  waitForDependencies:
+    enabled: false
+    image: busybox:1.37
+    ## Endpoints to poll (HTTP GET). Query starts only when all return 2xx.
+    endpoints: []
+    #  - http://nessie:19120/api/v2/config
+
   ## Liveness and readiness probe overrides
   livenessProbe:
     httpGet:
@@ -288,6 +297,16 @@ ingest:
     enabled: false
     minAvailable: 1
     # maxUnavailable: 1
+
+  ## Wait for dependencies to be ready before starting the ingest server.
+  ## Uses a busybox init container to poll the endpoints.
+  waitForDependencies:
+    enabled: false
+    image: busybox:1.37
+    ## Endpoints to poll (HTTP GET). Ingest starts only when all return 2xx.
+    endpoints: []
+    #  - http://nessie:19120/api/v2/config
+    #  - http://minio:9000/minio/health/ready
 
   ## Liveness and readiness probe overrides
   livenessProbe:

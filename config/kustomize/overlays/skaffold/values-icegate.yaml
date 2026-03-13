@@ -26,10 +26,20 @@ aws:
   existingSecret: icegate-aws-credentials
   region: us-east-1
 
+## Queue (WAL) configuration
+queue:
+  common:
+    basePath: "s3://queue/"
+
 ## Query component
 query:
   enabled: true
   replicaCount: 1
+  waitForDependencies:
+    enabled: true
+    endpoints:
+      - http://nessie.infra:19120/api/v2/config
+      - http://minio.infra:9000/minio/health/ready
   loki:
     enabled: true
     port: 3100
@@ -56,6 +66,11 @@ query:
 ingest:
   enabled: true
   replicaCount: 1
+  waitForDependencies:
+    enabled: true
+    endpoints:
+      - http://nessie.infra:19120/api/v2/config
+      - http://minio.infra:9000/minio/health/ready
   otlpHttp:
     enabled: true
     port: 4318

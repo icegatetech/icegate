@@ -173,6 +173,31 @@ Usage: include "icegate.awsEnv" .
 {{- end }}
 
 {{/*
+Init container that polls HTTP endpoints until they return 2xx.
+Usage: include "icegate.waitForDeps" (dict "context" . "config" .Values.ingest.waitForDependencies)
+*/}}
+{{- define "icegate.waitForDeps" -}}
+{{- if and .config.enabled .config.endpoints }}
+initContainers:
+  - name: wait-for-deps
+    image: {{ .config.image }}
+    securityContext:
+      {{- include "icegate.containerSecurityContext" .context | nindent 6 }}
+    command:
+      - sh
+      - -c
+      - |
+        {{- range .config.endpoints }}
+        echo "Waiting for {{ . }} ..."
+        until wget -qO- --timeout=2 "{{ . }}" >/dev/null 2>&1; do
+          sleep 3
+        done
+        echo "{{ . }} is ready"
+        {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Pod security context (shared across all workloads).
 */}}
 {{- define "icegate.podSecurityContext" -}}

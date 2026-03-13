@@ -57,7 +57,7 @@ tempo:
   port: 3200
 
 # Query Engine Configuration
-engine:
+engine: {}
   # batch_size: 8192                   # DataFusion batch size (optional)
   # target_partitions: 4               # Parallelism degree (optional)
   # catalog_name: iceberg              # Catalog name in SQL queries (optional)

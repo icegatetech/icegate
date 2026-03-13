@@ -24,6 +24,9 @@ patches:
       kind: Service
     patch: |
       - op: add
+        path: /metadata/annotations
+        value: {}
+      - op: add
         path: /metadata/annotations/tailscale.com~1expose
         value: "true"
   # Tailscale expose -> Ingest (icegate)
@@ -31,6 +34,9 @@ patches:
       name: icegate-ingest
       kind: Service
     patch: |
+      - op: add
+        path: /metadata/annotations
+        value: {}
       - op: add
         path: /metadata/annotations/tailscale.com~1expose
         value: "true"

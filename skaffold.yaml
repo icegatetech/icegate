@@ -3,6 +3,9 @@ kind: Config
 metadata:
   name: icegate
 
+requires:
+  - path: skaffold-observability.yaml
+
 build:
   local:
     push: false
@@ -31,15 +34,10 @@ build:
           BINARY: maintain
         target: runtime
 
-requires:
-  - path: skaffold-observability.yaml
-    configs:
-      - observability
-
 manifests:
   kustomize:
     paths:
-      - config/kustomize/overlays/orbstack
+      - config/kustomize/overlays/skaffold
     buildArgs:
       - --enable-helm
 
@@ -58,8 +56,6 @@ profiles:
           - config/kustomize/overlays/orbstack
         buildArgs:
           - --enable-helm
-    activation:
-      - kubeContext: orbstack
 
   - name: aws-glue
     manifests:

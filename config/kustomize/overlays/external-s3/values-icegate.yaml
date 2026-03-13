@@ -35,6 +35,10 @@ queue:
 query:
   enabled: true
   replicaCount: 1
+  waitForDependencies:
+    enabled: true
+    endpoints:
+      - http://nessie.infra:19120/api/v2/config
   loki:
     enabled: true
     port: 3100
@@ -61,6 +65,10 @@ query:
 ingest:
   enabled: true
   replicaCount: 1
+  waitForDependencies:
+    enabled: true
+    endpoints:
+      - http://nessie.infra:19120/api/v2/config
   otlpHttp:
     enabled: true
     port: 4318
@@ -77,7 +85,7 @@ ingest:
         endpoint: https://hel1.your-objectstorage.com
         bucket: icegatedogfooding
         prefix: jobs/shifter
-        useSsl: false
+        useSsl: true
         jobStateCodec: json
         requestTimeoutSecs: 5
   rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"

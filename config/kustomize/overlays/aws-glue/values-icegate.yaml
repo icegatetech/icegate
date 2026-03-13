@@ -83,7 +83,7 @@ ingest:
         endpoint: "https://s3.eu-central-1.amazonaws.com"
         bucket: triplecloud-flink-eu-aws-state
         prefix: jobs/shifter
-        useSsl: false
+        useSsl: true
         jobStateCodec: json
         requestTimeoutSecs: 5
   rustLog: "info,icegate_ingest=info,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
