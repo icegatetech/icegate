@@ -27,7 +27,7 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 
 # Iceberg
-iceberg = { workspace = true }
+iceberg = { workspace = true, features = ["io-metrics"] }
 
 # Error handling
 thiserror = { workspace = true }
@@ -44,6 +44,8 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+bytes = { workspace = true }
+object_store = { workspace = true }
 
 # HTTP server
 axum = { workspace = true }
@@ -64,3 +66,6 @@ clap = { workspace = true }
 # Async utils
 async-trait = { workspace = true }
 futures = { workspace = true }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

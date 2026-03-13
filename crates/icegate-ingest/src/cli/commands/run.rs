@@ -9,13 +9,17 @@ use std::{
 
 use icegate_common::{IoCacheHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
+use object_store::ObjectStore;
 use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     IngestConfig,
     error::{IngestError, Result},
-    infra::metrics::{OtlpMetrics, ShiftMetrics, WalWriterMetrics},
+    infra::metrics::{
+        ObjectStoreMetricsDecorator, OtlpMetrics, QueueReaderS3Metrics, QueueWriterS3Metrics, ShiftMetrics,
+        WalWriterMetrics,
+    },
     runtime_threads::compute_runtime_threads,
     shift::Shifter,
 };
@@ -40,6 +44,9 @@ impl ShiftRuntimeHandle {
         }
     }
 }
+
+type ServerTaskResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type ServerTaskHandle = tokio::task::JoinHandle<ServerTaskResult>;
 
 fn panic_payload_to_string(panic: &(dyn Any + Send)) -> String {
     panic.downcast_ref::<&str>().map_or_else(
@@ -143,6 +150,31 @@ async fn shutdown_signal() {
     }
 }
 
+async fn run_servers_until_shutdown(handles: Vec<ServerTaskHandle>, cancel_token: &CancellationToken) -> Result<()> {
+    if handles.is_empty() {
+        tracing::warn!("No OTLP servers are enabled in configuration");
+        return Ok(());
+    }
+
+    tracing::info!("All enabled OTLP servers started");
+    tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
+    shutdown_signal().await;
+    tracing::info!("Shutdown signal received, stopping all servers...");
+
+    cancel_token.cancel();
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(IngestError::Other(err)),
+            Err(err) => return Err(IngestError::Join(err)),
+        }
+    }
+
+    tracing::info!("All OTLP servers stopped gracefully");
+    Ok(())
+}
+
 /// Execute the run command
 ///
 /// Starts all enabled OTLP servers and runs until Ctrl+C
@@ -179,7 +211,16 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         || WalWriterMetrics::new_disabled(Arc::new(NoopQueueWriterEvents)),
         |runtime| WalWriterMetrics::new(&runtime.meter(), Arc::new(NoopQueueWriterEvents)),
     );
-    let writer = QueueWriter::new(queue_config.clone(), Arc::clone(&store)).with_events(Arc::new(wal_writer_metrics));
+    let queue_writer_store: Arc<dyn ObjectStore> = metrics_runtime.as_ref().map_or_else(
+        || Arc::clone(&store),
+        |runtime| {
+            Arc::new(ObjectStoreMetricsDecorator::new(
+                Arc::clone(&store),
+                QueueWriterS3Metrics::new(&runtime.meter()),
+            ))
+        },
+    );
+    let writer = QueueWriter::new(queue_config.clone(), queue_writer_store).with_events(Arc::new(wal_writer_metrics));
     let writer_handle = writer.start(write_rx);
 
     tracing::info!("WAL queue initialized successfully");
@@ -190,10 +231,19 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
+    let queue_reader_store: Arc<dyn ObjectStore> = metrics_runtime.as_ref().map_or_else(
+        || Arc::clone(&store),
+        |runtime| {
+            Arc::new(ObjectStoreMetricsDecorator::new(
+                Arc::clone(&store),
+                QueueReaderS3Metrics::new(&runtime.meter()),
+            ))
+        },
+    );
     let queue_reader = Arc::new(
         ParquetQueueReader::new(
             queue_config.common.base_path.clone(),
-            Arc::clone(&store),
+            queue_reader_store,
             queue_config.common.max_row_group_size,
         )?
         .with_plan_segment_read_parallelism(shift_config.read.plan_segment_read_parallelism)?,
@@ -268,40 +318,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         handles.push(handle);
     }
 
-    let mut server_result = Ok(());
-    if handles.is_empty() {
-        tracing::warn!("No OTLP servers are enabled in configuration");
-    } else {
-        tracing::info!("All enabled OTLP servers started");
-        tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
-
-        // Wait for shutdown signal (SIGINT or SIGTERM)
-        shutdown_signal().await;
-
-        tracing::info!("Shutdown signal received, stopping all servers...");
-
-        // Cancel all servers
-        cancel_token.cancel();
-
-        // Wait for all servers to stop
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    server_result = Err(IngestError::Other(err));
-                    break;
-                }
-                Err(err) => {
-                    server_result = Err(IngestError::Join(err));
-                    break;
-                }
-            }
-        }
-
-        if server_result.is_ok() {
-            tracing::info!("All OTLP servers stopped gracefully");
-        }
-    }
+    let server_result = run_servers_until_shutdown(handles, &cancel_token).await;
 
     // Close the write channel so the writer loop can exit
     drop(write_tx);
