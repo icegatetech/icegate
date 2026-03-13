@@ -27,6 +27,9 @@ catalog:
           awsAccessKeyId: aws-access-key-id
           awsSecretAccessKey: aws-secret-access-key
 
+tests:
+  disabled: true
+
 # ServiceMonitor for Prometheus Operator discovery
 serviceMonitor:
   enabled: true

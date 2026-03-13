@@ -13,19 +13,22 @@ catalog:
     defaultWarehouse: warehouse
     warehouses:
       - name: warehouse
-        location: s3://icegatedogfooding/warehouse/
+        location: s3://warehouse/
 
   storage:
     s3:
       defaultOptions:
-        region: eu-central
-        endpoint: "https://hel1.your-objectstorage.com" # this endpoint has to be acceptable to icegate services.
+        region: us-east-1
+        endpoint: "http://minio.infra:9000/" # this endpoint has to be acceptable to icegate services.
         pathStyleAccess: true
         authType: STATIC
         accessKeySecret:
           name: icegate-aws-credentials
           awsAccessKeyId: aws-access-key-id
           awsSecretAccessKey: aws-secret-access-key
+
+tests:
+  disabled: true
 
 # ServiceMonitor for Prometheus Operator discovery
 serviceMonitor:

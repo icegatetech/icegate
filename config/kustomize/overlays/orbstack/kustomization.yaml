@@ -2,8 +2,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - namespace-infra.yaml
-  - namespace-observability.yaml
+  - ../../base
   # Namespace "icegate" is created by the IceGate Helm chart (namespace.create: true
   # in values-icegate.yaml). This secret depends on that chart being rendered in
   # the same kustomize build.
@@ -25,14 +24,6 @@ helmCharts:
     namespace: infra
     valuesFile: values-nessie.yaml
 
-  - name: kube-prometheus-stack
-    repo: https://prometheus-community.github.io/helm-charts
-    version: 72.6.2
-    releaseName: prometheus
-    includeCRDs: true
-    namespace: observability
-    valuesFile: values-prometheus.yaml
-
   - name: icegate
     repo: oci://ghcr.io/icegatetech/charts
     version: 0.1.0-rc2
@@ -40,23 +31,7 @@ helmCharts:
     namespace: icegate
     valuesFile: values-icegate.yaml
 
-  - name: grafana
-    repo: https://grafana.github.io/helm-charts
-    version: 8.8.2
-    releaseName: grafana
-    namespace: observability
-    valuesFile: values-grafana.yaml
-
-  - name: jaeger
-    repo: https://jaegertracing.github.io/helm-charts
-    version: 3.4.1
-    releaseName: jaeger
-    namespace: observability
-    valuesFile: values-jaeger.yaml
-
 # Force namespace on resources from charts that omit metadata.namespace.
-# Kustomize's namespace transformer doesn't inject it for Helm-inflated
-# resources it cannot classify.
 patches:
   # MinIO → infra
   - target:
@@ -122,39 +97,3 @@ patches:
       - op: add
         path: /metadata/namespace
         value: infra
-  # Jaeger → observability
-  - target:
-      name: jaeger
-      kind: ServiceAccount
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: observability
-  - target:
-      name: jaeger-collector
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: observability
-  - target:
-      name: jaeger-query
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: observability
-  - target:
-      name: jaeger-agent
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: observability
-  - target:
-      name: jaeger
-      kind: Deployment
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: observability

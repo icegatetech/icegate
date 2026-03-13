@@ -1,0 +1,78 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: icegate
+
+build:
+  local:
+    push: false
+  tagPolicy:
+    inputDigest: {}
+  artifacts:
+    - image: ghcr.io/icegatetech/icegate-query
+      context: .
+      docker:
+        dockerfile: config/docker/release.Dockerfile
+        buildArgs:
+          BINARY: query
+        target: runtime
+    - image: ghcr.io/icegatetech/icegate-ingest
+      context: .
+      docker:
+        dockerfile: config/docker/release.Dockerfile
+        buildArgs:
+          BINARY: ingest
+        target: runtime
+    - image: ghcr.io/icegatetech/icegate-maintain
+      context: .
+      docker:
+        dockerfile: config/docker/release.Dockerfile
+        buildArgs:
+          BINARY: maintain
+        target: runtime
+
+requires:
+  - path: skaffold-observability.yaml
+    configs:
+      - observability
+
+manifests:
+  kustomize:
+    paths:
+      - config/kustomize/overlays/orbstack
+    buildArgs:
+      - --enable-helm
+
+deploy:
+  kubectl:
+    flags:
+      apply:
+        - --server-side
+        - --force-conflicts
+
+profiles:
+  - name: orbstack
+    manifests:
+      kustomize:
+        paths:
+          - config/kustomize/overlays/orbstack
+        buildArgs:
+          - --enable-helm
+    activation:
+      - kubeContext: orbstack
+
+  - name: aws-glue
+    manifests:
+      kustomize:
+        paths:
+          - config/kustomize/overlays/aws-glue
+        buildArgs:
+          - --enable-helm
+
+  - name: k3s-external-s3
+    manifests:
+      kustomize:
+        paths:
+          - config/kustomize/overlays/k3s-external-s3
+        buildArgs:
+          - --enable-helm

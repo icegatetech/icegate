@@ -4,20 +4,8 @@ kind: Kustomization
 resources:
   - namespace-infra.yaml
   - namespace-observability.yaml
-  # Namespace "icegate" is created by the IceGate Helm chart (namespace.create: true
-  # in values-icegate.yaml). This secret depends on that chart being rendered in
-  # the same kustomize build.
-  - secret-aws.yaml
-  - secret-aws-infra.yaml
 
 helmCharts:
-  - name: nessie
-    repo: https://charts.projectnessie.org
-    version: 0.107.3
-    releaseName: nessie
-    namespace: infra
-    valuesFile: values-nessie.yaml
-
   - name: kube-prometheus-stack
     repo: https://prometheus-community.github.io/helm-charts
     version: 72.6.2
@@ -25,13 +13,6 @@ helmCharts:
     includeCRDs: true
     namespace: observability
     valuesFile: values-prometheus.yaml
-
-  - name: icegate
-    repo: oci://ghcr.io/icegatetech/charts
-    version: 0.1.0-rc3
-    releaseName: icegate
-    namespace: icegate
-    valuesFile: values-icegate.yaml
 
   - name: grafana
     repo: https://grafana.github.io/helm-charts
@@ -87,19 +68,3 @@ patches:
       - op: add
         path: /metadata/namespace
         value: observability
-  # Tailscale expose → Grafana (observability)
-  - target:
-      name: grafana
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/annotations/tailscale.com~1expose
-        value: "true"
-  # Tailscale expose → Ingest (icegate)
-  - target:
-      name: icegate-ingest
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/annotations/tailscale.com~1expose
-        value: "true"

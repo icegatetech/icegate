@@ -1,0 +1,108 @@
+# IceGate chart values - AWS Glue catalog deployment
+
+## Let the IceGate chart create the namespace from .Release.Namespace
+namespace:
+  create: true
+
+## Iceberg catalog (shared by all components)
+catalog:
+  backend: glue
+  glue:
+    catalogId: "216989114877"
+  warehouse: "s3://triplecloud-flink-eu-aws-state/warehouse/"
+  properties:
+    prefix: main
+
+## Storage configuration
+storage:
+  s3:
+    bucket: triplecloud-flink-eu-aws-state
+    region: eu-central-1
+    endpoint: ""
+
+## AWS credentials from existing Secret
+## Secret keys: aws-access-key-id, aws-secret-access-key (per _helpers.tpl:152-162)
+aws:
+  existingSecret: icegate-aws-credentials
+  region: eu-central-1
+
+## Queue (WAL) configuration
+queue:
+  common:
+    basePath: "s3://triplecloud-flink-eu-aws-state/queue"
+
+## Query component
+query:
+  enabled: true
+  replicaCount: 1
+  cache:
+    enabled: true
+    memorySizeMb: 128
+    diskDir: /tmp/icegate/cache
+    diskSizeMb: 4096
+    volumeSizeLimit: 5Gi
+  loki:
+    enabled: true
+    port: 3100
+  prometheus:
+    enabled: true
+    port: 9090
+  tempo:
+    enabled: true
+    port: 3200
+  tracing:
+    enabled: true
+    otlpEndpoint: http://jaeger-collector.observability:4317
+    sampleRatio: 1.0
+  rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 4Gi
+
+## Ingest component
+ingest:
+  enabled: true
+  replicaCount: 1
+  otlpHttp:
+    enabled: true
+    port: 4318
+  otlpGrpc:
+    enabled: true
+    port: 4317
+  tracing:
+    enabled: true
+    otlpEndpoint: http://jaeger-collector.observability:4317
+    sampleRatio: 1.0
+  shift:
+    jobsmanager:
+      storage:
+        endpoint: "https://s3.eu-central-1.amazonaws.com"
+        bucket: triplecloud-flink-eu-aws-state
+        prefix: jobs/shifter
+        useSsl: false
+        jobStateCodec: json
+        requestTimeoutSecs: 5
+  rustLog: "info,icegate_ingest=info,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+## ServiceMonitor (Prometheus Operator)
+serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus
+
+## Migrate (runs as Helm hook: pre-install/pre-upgrade)
+migrate:
+  enabled: true
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
