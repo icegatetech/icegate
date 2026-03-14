@@ -4,7 +4,7 @@ All overlays in this directory are **demo-only** environments intended for local
 
 ## Structure
 
-```
+```text
 kustomize/
 ├── base/                  # Shared infrastructure & observability stack
 └── overlays/

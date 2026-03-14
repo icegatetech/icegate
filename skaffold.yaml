@@ -58,6 +58,9 @@ profiles:
           - --enable-helm
 
   - name: aws-glue
+    build:
+      local:
+        push: true
     manifests:
       kustomize:
         paths:
@@ -66,9 +69,12 @@ profiles:
           - --enable-helm
 
   - name: k3s-external-s3
+    build:
+      local:
+        push: true
     manifests:
       kustomize:
         paths:
-          - config/kustomize/overlays/k3s-external-s3
+          - config/kustomize/overlays/external-s3
         buildArgs:
           - --enable-helm

@@ -36,7 +36,7 @@ query:
   enabled: true
   replicaCount: 1
   cache:
-    enabled: true
+    enabled: false
     memorySizeMb: 128
     diskDir: /tmp/icegate/cache
     diskSizeMb: 4096
@@ -57,11 +57,11 @@ query:
   rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
-      cpu: "1"
+      cpu: "2"
       memory: 2Gi
     limits:
-      cpu: "4"
-      memory: 4Gi
+      cpu: "2"
+      memory: 2Gi
 
 ## Ingest component
 ingest:
@@ -89,8 +89,8 @@ ingest:
   rustLog: "info,icegate_ingest=info,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
-      cpu: 500m
-      memory: 1Gi
+      cpu: "2"
+      memory: 2Gi
     limits:
       cpu: "2"
       memory: 2Gi
