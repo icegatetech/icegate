@@ -7,7 +7,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use icegate_common::retrier::{Retrier, RetrierConfig};
 use object_store::{ObjectStore, path::Path};
 use parquet::{
@@ -27,6 +27,18 @@ use crate::{
 
 const PLAN_ROW_GROUPS_TO_BLOCKING_THREAD: usize = 64;
 const DEFAULT_PLAN_SEGMENT_READ_PARALLELISM: usize = 8;
+
+/// Maximum number of concurrent HEAD requests when resolving segment file sizes.
+const MAX_CONCURRENT_HEAD_REQUESTS: usize = 32;
+
+/// Resolved segment file with its object store path and size.
+#[derive(Debug, Clone)]
+pub struct SegmentFile {
+    /// Full object store path (including `base_path` prefix).
+    pub path: String,
+    /// File size in bytes.
+    pub size: u64,
+}
 
 // Reference to record batches (row groups) inside a WAL segment.
 //
@@ -319,6 +331,51 @@ impl ParquetQueueReader {
         segments.sort_by_key(|s| s.offset);
 
         Ok(segments)
+    }
+
+    /// Lists segment files for a topic and resolves their sizes via HEAD requests.
+    ///
+    /// Combines [`Self::list_segments`] with concurrent HEAD requests to return
+    /// fully resolved file entries ready for query planning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment listing or any HEAD request fails.
+    pub async fn list_segment_files(
+        &self,
+        topic: &Topic,
+        start_offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<SegmentFile>> {
+        let segments = self.list_segments(topic, start_offset, cancel_token).await?;
+        if segments.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let files: Vec<SegmentFile> = stream::iter(segments.into_iter().map(|seg| {
+            let path = self.segment_path(&seg);
+            let store = Arc::clone(&self.store);
+            async move {
+                let meta = store.head(&path).await.map_err(QueueError::ObjectStore)?;
+                Ok::<_, QueueError>(SegmentFile {
+                    path: path.to_string(),
+                    size: meta.size,
+                })
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_HEAD_REQUESTS)
+        .try_collect()
+        .await?;
+
+        Ok(files)
+    }
+
+    /// Returns the object store backing this reader.
+    ///
+    /// Needed by callers that register the store with DataFusion's runtime.
+    #[must_use]
+    pub fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
     }
 
     /// Lists segments and plans row groups grouped by column value.

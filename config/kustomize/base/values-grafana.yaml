@@ -38,6 +38,9 @@ datasources:
         isDefault: false
         editable: false
 
+testFramework:
+  enabled: false
+
 service:
   type: ClusterIP
   port: 3000

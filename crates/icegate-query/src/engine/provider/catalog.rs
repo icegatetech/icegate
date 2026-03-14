@@ -10,12 +10,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
-use datafusion::execution::object_store::ObjectStoreUrl;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
 use icegate_common::ICEGATE_NAMESPACE;
-use object_store::ObjectStore;
+use icegate_queue::ParquetQueueReader;
 
 use super::schema::IcegateSchemaProvider;
 
@@ -38,13 +37,10 @@ impl IcegateCatalogProvider {
     /// # Errors
     ///
     /// Returns an error if namespaces or tables cannot be loaded.
-    #[tracing::instrument(skip(catalog, wal_store))]
+    #[tracing::instrument(skip(catalog, wal_reader))]
     pub async fn try_new(
         catalog: Arc<dyn Catalog>,
-        wal_store_url: ObjectStoreUrl,
-        wal_store: Arc<dyn ObjectStore>,
-        wal_base_path: String,
-        batch_size: usize,
+        wal_reader: Arc<ParquetQueueReader>,
     ) -> Result<Self, iceberg::Error> {
         let namespace_idents = catalog.list_namespaces(None).await?;
 
@@ -59,15 +55,8 @@ impl IcegateCatalogProvider {
 
             if name == ICEGATE_NAMESPACE {
                 // Use our custom WAL-merged schema provider
-                let provider = IcegateSchemaProvider::try_new(
-                    Arc::clone(&catalog),
-                    ns_ident,
-                    wal_store_url.clone(),
-                    Arc::clone(&wal_store),
-                    wal_base_path.clone(),
-                    batch_size,
-                )
-                .await?;
+                let provider =
+                    IcegateSchemaProvider::try_new(Arc::clone(&catalog), ns_ident, Arc::clone(&wal_reader)).await?;
                 schemas.insert(name.clone(), Arc::new(provider));
             } else {
                 // Standard schema provider with static table providers

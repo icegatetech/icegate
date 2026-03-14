@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::{
     arrow::{
         array::{
@@ -101,15 +100,13 @@ impl TestServer {
         // Provide an in-memory WAL store — WAL scan finds 0 segments,
         // which is correct for tests that only write to Iceberg.
         let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let wal_url = ObjectStoreUrl::parse("wal://test").unwrap();
-        let engine_config = QueryEngineConfig {
-            wal_base_path: "wal://test".to_string(),
-            ..QueryEngineConfig::default()
-        };
+        let wal_reader = Arc::new(icegate_queue::ParquetQueueReader::new("", Arc::clone(&wal_store), 8192).unwrap());
+        let engine_config = QueryEngineConfig::default();
         let query_engine = Arc::new(QueryEngine::new(
             Arc::clone(&catalog),
             engine_config,
-            (wal_store, wal_url),
+            wal_store,
+            wal_reader,
         ));
 
         let cancel_token = CancellationToken::new();
