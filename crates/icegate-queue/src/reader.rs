@@ -370,14 +370,6 @@ impl ParquetQueueReader {
         Ok(files)
     }
 
-    /// Returns the object store backing this reader.
-    ///
-    /// Needed by callers that register the store with DataFusion's runtime.
-    #[must_use]
-    pub fn store(&self) -> &Arc<dyn ObjectStore> {
-        &self.store
-    }
-
     /// Lists segments and plans row groups grouped by column value.
     pub async fn plan_segments(
         &self,

@@ -63,6 +63,8 @@ impl QueryEngine {
     /// Stores the catalog and configuration for later use by
     /// `create_session()`. No provider is built at construction time.
     ///
+    /// IMPORTANT: `wal_reader` is required to operate on WAL segments in `wal_store`.
+    ///
     /// # Arguments
     ///
     /// * `catalog` - Iceberg catalog for accessing tables
