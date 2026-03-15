@@ -355,8 +355,19 @@ impl ParquetQueueReader {
         let files: Vec<SegmentFile> = stream::iter(segments.into_iter().map(|seg| {
             let path = self.segment_path(&seg);
             let store = Arc::clone(&self.store);
+            let cancel_token = cancel_token.clone();
             async move {
-                let meta = store.head(&path).await.map_err(QueueError::ObjectStore)?;
+                let meta = self
+                    .retry(&cancel_token, {
+                        let store = Arc::clone(&store);
+                        let path = path.clone();
+                        move || {
+                            let store = Arc::clone(&store);
+                            let path = path.clone();
+                            async move { store.head(&path).await.map_err(QueueError::ObjectStore) }
+                        }
+                    })
+                    .await?;
                 Ok::<_, QueueError>(SegmentFile {
                     path: path.to_string(),
                     size: meta.size,
