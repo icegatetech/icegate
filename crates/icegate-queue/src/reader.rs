@@ -7,7 +7,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt};
 use icegate_common::retrier::{Retrier, RetrierConfig};
 use object_store::{ObjectStore, path::Path};
 use parquet::{
@@ -28,8 +28,15 @@ use crate::{
 const PLAN_ROW_GROUPS_TO_BLOCKING_THREAD: usize = 64;
 const DEFAULT_PLAN_SEGMENT_READ_PARALLELISM: usize = 8;
 
-/// Maximum number of concurrent HEAD requests when resolving segment file sizes.
-const MAX_CONCURRENT_HEAD_REQUESTS: usize = 32;
+/// A segment returned by the object store listing, carrying both its identity
+/// and the file size reported by the listing (no extra HEAD request needed).
+#[derive(Debug, Clone)]
+pub struct ListedSegment {
+    /// Parsed segment identity (topic + offset).
+    pub id: SegmentId,
+    /// File size in bytes, as reported by the object store listing.
+    pub size: u64,
+}
 
 /// Resolved segment file with its object store path and size.
 #[derive(Debug, Clone)]
@@ -230,13 +237,13 @@ impl ParquetQueueReader {
 
     /// Lists segments for a topic starting from a given offset.
     ///
-    /// Returns segment IDs sorted by offset.
+    /// Returns listed segments (with file sizes) sorted by offset.
     pub async fn list_segments(
         &self,
         topic: &Topic,
         start_offset: u64,
         cancel_token: &CancellationToken,
-    ) -> Result<Vec<SegmentId>> {
+    ) -> Result<Vec<ListedSegment>> {
         // TODO(high): if a lot of files have accumulated, we need to somehow batch them.
         // Build prefix path - handle empty base_path
         let prefix = if self.base_path.is_empty() {
@@ -288,7 +295,7 @@ impl ParquetQueueReader {
 
         debug!("list_segments_from: found {} items", items.len());
 
-        let mut segments: Vec<SegmentId> = items
+        let mut segments: Vec<ListedSegment> = items
             .into_iter()
             .filter_map(|meta| {
                 let path_str = meta.location.as_ref();
@@ -309,9 +316,9 @@ impl ParquetQueueReader {
                     };
                     let relative_path_obj = Path::from(relative_path);
                     match SegmentId::from_relative_path(&relative_path_obj) {
-                        Ok(seg) => {
-                            debug!("list_segments_from: parsed segment {:?}", seg);
-                            Some(seg)
+                        Ok(id) => {
+                            debug!("list_segments_from: parsed segment {:?}", id);
+                            Some(ListedSegment { id, size: meta.size })
                         }
                         Err(e) => {
                             debug!(
@@ -328,19 +335,19 @@ impl ParquetQueueReader {
             .collect();
 
         // Sort by offset
-        segments.sort_by_key(|s| s.offset);
+        segments.sort_by_key(|s| s.id.offset);
 
         Ok(segments)
     }
 
-    /// Lists segment files for a topic and resolves their sizes via HEAD requests.
+    /// Lists segment files for a topic with their sizes.
     ///
-    /// Combines [`Self::list_segments`] with concurrent HEAD requests to return
-    /// fully resolved file entries ready for query planning.
+    /// File sizes are obtained directly from the object store listing,
+    /// avoiding extra HEAD requests.
     ///
     /// # Errors
     ///
-    /// Returns an error if the segment listing or any HEAD request fails.
+    /// Returns an error if the segment listing fails.
     pub async fn list_segment_files(
         &self,
         topic: &Topic,
@@ -348,36 +355,16 @@ impl ParquetQueueReader {
         cancel_token: &CancellationToken,
     ) -> Result<Vec<SegmentFile>> {
         let segments = self.list_segments(topic, start_offset, cancel_token).await?;
-        if segments.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let files: Vec<SegmentFile> = stream::iter(segments.into_iter().map(|seg| {
-            let path = self.segment_path(&seg);
-            let store = Arc::clone(&self.store);
-            let cancel_token = cancel_token.clone();
-            async move {
-                let meta = self
-                    .retry(&cancel_token, {
-                        let store = Arc::clone(&store);
-                        let path = path.clone();
-                        move || {
-                            let store = Arc::clone(&store);
-                            let path = path.clone();
-                            async move { store.head(&path).await.map_err(QueueError::ObjectStore) }
-                        }
-                    })
-                    .await?;
-                Ok::<_, QueueError>(SegmentFile {
+        let files = segments
+            .into_iter()
+            .map(|seg| {
+                let path = self.segment_path(&seg.id);
+                SegmentFile {
                     path: path.to_string(),
-                    size: meta.size,
-                })
-            }
-        }))
-        .buffer_unordered(MAX_CONCURRENT_HEAD_REQUESTS)
-        .try_collect()
-        .await?;
-
+                    size: seg.size,
+                }
+            })
+            .collect();
         Ok(files)
     }
 
@@ -391,8 +378,8 @@ impl ParquetQueueReader {
         max_input_bytes_per_grouped_batch: u64,
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan> {
-        let segments = self.list_segments(topic, start_offset, cancel_token).await?;
-        if segments.is_empty() {
+        let listed = self.list_segments(topic, start_offset, cancel_token).await?;
+        if listed.is_empty() {
             return Ok(SegmentsPlan {
                 groups: Vec::new(),
                 last_segment_offset: None,
@@ -402,7 +389,8 @@ impl ParquetQueueReader {
             });
         }
 
-        let last_offset = segments.last().map(|segment| segment.offset);
+        let last_offset = listed.last().map(|s| s.id.offset);
+        let segments: Vec<SegmentId> = listed.into_iter().map(|s| s.id).collect();
         let (groups, row_groups_total, input_bytes_total) = self
             .plan_record_batches(
                 segments.as_slice(),

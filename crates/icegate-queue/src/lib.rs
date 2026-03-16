@@ -51,7 +51,8 @@ pub use channel::{Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult,
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
 pub use reader::{
-    GroupedSegmentsPlan, ParquetQueueReader, QueueReader, SegmentFile, SegmentRecordBatchIdxs, SegmentsPlan,
+    GroupedSegmentsPlan, ListedSegment, ParquetQueueReader, QueueReader, SegmentFile, SegmentRecordBatchIdxs,
+    SegmentsPlan,
 };
 pub use segment::SegmentId;
 pub use writer::{NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome};

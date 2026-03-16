@@ -22,12 +22,14 @@ for src in "$SRC_DIR"/*.json; do
   # Covers: PromQL selectors {name=…}, grouping by (name), legend {{name}},
   # and JSON key "name" — but not unrelated fields like "names" or "renameByName".
   if [[ "$filename" == Nodes* ]]; then
-    sed -i '' \
-        -e 's/{name/{pod/g' \
+    sed -i.bak \
+        -e 's/{name}/{pod}/g' \
+        -e 's/{name=/{pod=/g' \
         -e 's/by (name)/by (pod)/g' \
         -e 's/{{name}}/{{pod}}/g' \
         -e 's/"name"/"pod"/g' \
         -e 's/"Name"/"Pod"/g' "$dst"
+    rm -f "$dst.bak"
   fi
 
   echo "Synced: $filename"
