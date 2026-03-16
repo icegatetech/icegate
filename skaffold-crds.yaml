@@ -1,15 +1,12 @@
 apiVersion: skaffold/v4beta13
 kind: Config
 metadata:
-  name: observability
-
-requires:
-  - path: skaffold-crds.yaml
+  name: prometheus-crds
 
 manifests:
   kustomize:
     paths:
-      - config/kustomize/base
+      - config/kustomize/crds
     buildArgs:
       - --enable-helm
 

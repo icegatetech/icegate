@@ -35,6 +35,15 @@ queue:
 query:
   enabled: true
   replicaCount: 1
+  cache:
+    enabled: true
+    memorySizeMb: 1024
+    diskDir: /tmp/icegate/cache
+    diskSizeMb: 4096
+    ## emptyDir sizeLimit for the disk cache volume
+    volumeSizeLimit: 5Gi
+  prefetch:
+    enabled: true
   waitForDependencies:
     enabled: true
     endpoints:
@@ -53,7 +62,7 @@ query:
     enabled: true
     otlpEndpoint: http://jaeger-collector.observability:4317
     sampleRatio: 1.0
-  rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  rustLog: "debug,icegate_common=trace"
   resources:
     requests:
       cpu: "1"
@@ -90,18 +99,20 @@ ingest:
         useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
-  rustLog: "info"
+  rustLog: "debug"
   resources:
     requests:
-      cpu: 500m
-      memory: 1Gi
+      cpu: "2"
+      memory: 3Gi
     limits:
       cpu: "2"
-      memory: 2Gi
+      memory: 3Gi
 
 ## ServiceMonitor (Prometheus Operator)
 serviceMonitor:
   enabled: true
+  labels:
+    release: prometheus
 
 ## Migrate (runs as Helm hook: pre-install/pre-upgrade)
 migrate:

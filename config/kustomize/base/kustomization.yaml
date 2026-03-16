@@ -1,6 +1,13 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+configMapGenerator:
+  - name: grafana-dashboards-icegate
+    namespace: observability
+    files:
+      - dashboards/Icegate-Ingest-1769530183590.json
+      - dashboards/Nodes-1769530183590.json
+
 resources:
   - namespace-infra.yaml
   - namespace-observability.yaml
@@ -10,7 +17,7 @@ helmCharts:
     repo: https://prometheus-community.github.io/helm-charts
     version: 72.6.2
     releaseName: prometheus
-    includeCRDs: true
+    includeCRDs: false
     namespace: observability
     valuesFile: values-prometheus.yaml
 

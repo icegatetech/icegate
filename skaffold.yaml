@@ -9,6 +9,7 @@ requires:
 build:
   local:
     push: false
+    useBuildkit: true
   tagPolicy:
     inputDigest: {}
   artifacts:
@@ -43,6 +44,16 @@ manifests:
 
 deploy:
   kubectl:
+    hooks:
+      before:
+        - host:
+            command:
+              - sh
+              - -c
+              - kubectl delete job icegate-migrate -n icegate --ignore-not-found
+            os:
+              - darwin
+              - linux
     flags:
       apply:
         - --server-side

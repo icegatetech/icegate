@@ -97,6 +97,8 @@ ingest:
 ## ServiceMonitor (Prometheus Operator)
 serviceMonitor:
   enabled: true
+  labels:
+    release: prometheus
 
 ## Migrate (runs as Helm hook: pre-install/pre-upgrade)
 migrate:

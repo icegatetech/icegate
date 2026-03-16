@@ -34,6 +34,10 @@ prometheus:
         cpu: "1"
         memory: 2Gi
 
+# CRDs managed by separate prometheus-operator-crds chart (skaffold-crds.yaml)
+crds:
+  enabled: false
+
 # Prometheus Operator
 prometheusOperator:
   resources:

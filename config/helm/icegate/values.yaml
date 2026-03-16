@@ -92,6 +92,13 @@ query:
     ## emptyDir sizeLimit for the disk cache volume
     volumeSizeLimit: 5Gi
 
+  ## Parquet metadata prefetch (warms cache with column/offset indexes
+  ## and bloom filters after footer reads — never data pages)
+  prefetch:
+    enabled: false
+    ## maxPrefetchBytes: 4194304  # 4 MiB (metadata is small)
+    ## prefetchColumns: []        # empty = all columns
+
   ## Loki API
   loki:
     enabled: true
