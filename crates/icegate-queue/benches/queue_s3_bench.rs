@@ -278,7 +278,7 @@ fn end_to_end(c: &mut Criterion) {
                 let segments = reader.list_segments(&topic_e2e, 0, &cancel).await.unwrap();
                 for segment in segments {
                     // Read first row group from each segment
-                    let _ = reader.read_segment(&topic_e2e, segment.offset, &[0], &cancel).await.unwrap();
+                    let _ = reader.read_segment(&topic_e2e, segment.id.offset, &[0], &cancel).await.unwrap();
                 }
             });
         });

@@ -38,6 +38,25 @@ datasources:
         isDefault: false
         editable: false
 
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: icegate
+        orgId: 1
+        folder: Icegate
+        type: file
+        disableDeletion: false
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards/icegate
+
+dashboardsConfigMaps:
+  icegate: grafana-dashboards-icegate
+
+testFramework:
+  enabled: false
+
 service:
   type: ClusterIP
   port: 3000

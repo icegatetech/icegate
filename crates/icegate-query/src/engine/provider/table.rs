@@ -23,10 +23,11 @@ use datafusion::physical_plan::union::UnionExec;
 use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
 use icegate_common::WAL_OFFSET_PROPERTY;
-use object_store::ObjectStore;
+use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
 use super::scan::IcegateIcebergScan;
+use crate::engine::core::WAL_STORE_URL;
 
 /// Table provider that merges Iceberg (cold) and WAL (hot) data.
 ///
@@ -40,14 +41,8 @@ pub(super) struct IcegateTableProvider {
     table_ident: TableIdent,
     /// Arrow schema for the table.
     schema: ArrowSchemaRef,
-    /// Object store URL registered with the DataFusion runtime for WAL access.
-    wal_store_url: ObjectStoreUrl,
-    /// Object store for WAL segment listing and HEAD requests.
-    wal_store: Arc<dyn ObjectStore>,
-    /// WAL base path prefix (e.g., `s3://queue/`).
-    wal_base_path: String,
-    /// Batch size (rows) for WAL segment reading.
-    batch_size: usize,
+    /// Shared WAL queue reader for segment listing.
+    wal_reader: Arc<ParquetQueueReader>,
     /// Iceberg table loaded at provider construction time.
     table: Table,
 }
@@ -56,7 +51,6 @@ impl std::fmt::Debug for IcegateTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcegateTableProvider")
             .field("table_ident", &self.table_ident)
-            .field("wal_base_path", &self.wal_base_path)
             .finish_non_exhaustive()
     }
 }
@@ -72,14 +66,11 @@ impl IcegateTableProvider {
     ///
     /// Returns an error if the table cannot be loaded from the catalog or if
     /// the schema cannot be converted.
-    #[tracing::instrument(skip(catalog, wal_store), fields(%table_ident))]
+    #[tracing::instrument(skip(catalog, wal_reader), fields(%table_ident))]
     pub(super) async fn try_new(
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
-        wal_store_url: ObjectStoreUrl,
-        wal_store: Arc<dyn ObjectStore>,
-        wal_base_path: String,
-        batch_size: usize,
+        wal_reader: Arc<ParquetQueueReader>,
     ) -> Result<Self, iceberg::Error> {
         let table = catalog.load_table(&table_ident).await?;
         let schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
@@ -89,10 +80,7 @@ impl IcegateTableProvider {
         Ok(Self {
             table_ident,
             schema,
-            wal_store_url,
-            wal_store,
-            wal_base_path,
-            batch_size,
+            wal_reader,
             table,
         })
     }
@@ -154,9 +142,7 @@ impl TableProvider for IcegateTableProvider {
         // 4. Build WAL scan plan
         // Start from offset + 1 (or 0 if no offset found = fresh system)
         let wal_start = wal_offset.map_or(0, |o| o.saturating_add(1));
-        let wal_plan = self
-            .build_wal_plan(state, projection, filters, wal_start, self.batch_size)
-            .await?;
+        let wal_plan = self.build_wal_plan(state, projection, filters, wal_start).await?;
         if wal_plan.is_some() {
             tracing::debug!("WAL scan plan created");
         } else {
@@ -205,10 +191,9 @@ impl IcegateTableProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         start_offset: u64,
-        batch_size: usize,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        // List WAL segments
-        let files = list_wal_files(&self.wal_store, &self.wal_base_path, start_offset, batch_size).await?;
+        // List WAL segments via the shared reader
+        let files = self.list_wal_files(start_offset).await?;
         if files.is_empty() {
             return Ok(None);
         }
@@ -253,11 +238,9 @@ impl IcegateTableProvider {
         }
 
         // Build file scan config
-        let mut builder = FileScanConfigBuilder::new(
-            self.wal_store_url.clone(),
-            self.schema.clone(),
-            Arc::new(parquet_source),
-        );
+        let wal_url = ObjectStoreUrl::parse(WAL_STORE_URL)
+            .map_err(|e| DataFusionError::Plan(format!("Invalid WAL store URL: {e}")))?;
+        let mut builder = FileScanConfigBuilder::new(wal_url, self.schema.clone(), Arc::new(parquet_source));
         builder = builder.with_file_group(files.into());
         if let Some(proj) = projection {
             builder = builder.with_projection_indices(Some(proj.clone()));
@@ -265,6 +248,38 @@ impl IcegateTableProvider {
         let config = builder.build();
 
         Ok(Some(DataSourceExec::from_data_source(config)))
+    }
+
+    /// List WAL segment files after the given offset and return as
+    /// `PartitionedFile` entries.
+    #[tracing::instrument(level = "debug", skip(self), fields(start_offset))]
+    async fn list_wal_files(
+        &self,
+        start_offset: u64,
+    ) -> DFResult<Vec<datafusion::datasource::listing::PartitionedFile>> {
+        // Intentionally uncancellable: WAL segment listing is a short metadata
+        // operation during query planning that must run to completion.
+        let uncancellable_token = CancellationToken::new();
+        let topic: String = icegate_common::LOGS_TOPIC.to_string();
+        let segment_files = self
+            .wal_reader
+            .list_segment_files(&topic, start_offset, &uncancellable_token)
+            .await
+            .map_err(|e| DataFusionError::External(e.into()))?;
+
+        tracing::debug!(
+            segments_found = segment_files.len(),
+            start_offset,
+            "WAL segment listing complete"
+        );
+
+        let files: Vec<datafusion::datasource::listing::PartitionedFile> = segment_files
+            .into_iter()
+            .map(|sf| datafusion::datasource::listing::PartitionedFile::new(sf.path, sf.size))
+            .collect();
+
+        tracing::debug!(segments_resolved = files.len(), start_offset, "WAL resolving complete");
+        Ok(files)
     }
 }
 
@@ -329,67 +344,4 @@ fn extract_wal_offset(table: &Table) -> DFResult<Option<u64>> {
         };
         snapshot = parent;
     }
-}
-
-/// List WAL segment files after the given offset and return as
-/// `PartitionedFile` entries.
-///
-/// Uses `ParquetQueueReader::list_segments` to find segments, then issues
-/// HEAD requests to get file sizes for DataFusion's file planning.
-#[tracing::instrument(level = "debug", skip(store))]
-async fn list_wal_files(
-    store: &Arc<dyn ObjectStore>,
-    wal_base_path: &str,
-    start_offset: u64,
-    batch_size: usize,
-) -> DFResult<Vec<datafusion::datasource::listing::PartitionedFile>> {
-    use icegate_queue::ParquetQueueReader;
-
-    let reader = ParquetQueueReader::new(wal_base_path, Arc::clone(store), batch_size)
-        .map_err(|e| DataFusionError::External(e.into()))?;
-
-    // Intentionally uncancellable: WAL segment listing is a short metadata
-    // operation during query planning that must run to completion.
-    let uncancellable_token = CancellationToken::new();
-    let topic: String = icegate_common::LOGS_TOPIC.to_string();
-    let segments = reader
-        .list_segments(&topic, start_offset, &uncancellable_token)
-        .await
-        .map_err(|e| DataFusionError::External(e.into()))?;
-    tracing::debug!(
-        segments_found = segments.len(),
-        start_offset,
-        "WAL segment listing complete"
-    );
-
-    // Issue HEAD requests concurrently to avoid sequential round-trip latency.
-    // Each request is independent, so we use buffer_unordered for maximum
-    // throughput while bounding the number of in-flight requests.
-    use futures::stream::{self, StreamExt, TryStreamExt};
-
-    const MAX_CONCURRENT_HEAD_REQUESTS: usize = 32;
-
-    let files: Vec<datafusion::datasource::listing::PartitionedFile> = stream::iter(segments.into_iter().map(|seg| {
-        let relative = seg.to_relative_path();
-        let path = if wal_base_path.is_empty() {
-            relative
-        } else {
-            object_store::path::Path::from(format!("{}/{relative}", wal_base_path.trim_end_matches('/')))
-        };
-
-        async move {
-            let store = Arc::clone(store);
-            let meta = store.head(&path).await.map_err(|e| DataFusionError::External(e.into()))?;
-            Ok::<_, DataFusionError>(datafusion::datasource::listing::PartitionedFile::new(
-                path.to_string(),
-                meta.size,
-            ))
-        }
-    }))
-    .buffer_unordered(MAX_CONCURRENT_HEAD_REQUESTS)
-    .try_collect()
-    .await?;
-
-    tracing::debug!(segments_resolved = files.len(), start_offset, "WAL resolving complete");
-    Ok(files)
 }

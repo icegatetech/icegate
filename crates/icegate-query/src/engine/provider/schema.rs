@@ -11,10 +11,9 @@ use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::object_store::ObjectStoreUrl;
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
-use object_store::ObjectStore;
+use icegate_queue::ParquetQueueReader;
 
 use super::table::IcegateTableProvider;
 
@@ -42,14 +41,11 @@ impl IcegateSchemaProvider {
     /// # Errors
     ///
     /// Returns an error if tables cannot be loaded from the catalog.
-    #[tracing::instrument(skip(catalog, wal_store), fields(%namespace))]
+    #[tracing::instrument(skip(catalog, wal_reader), fields(%namespace))]
     pub(super) async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
-        wal_store_url: ObjectStoreUrl,
-        wal_store: Arc<dyn ObjectStore>,
-        wal_base_path: String,
-        batch_size: usize,
+        wal_reader: Arc<ParquetQueueReader>,
     ) -> Result<Self, iceberg::Error> {
         let table_idents = catalog.list_tables(&namespace).await?;
 
@@ -60,15 +56,8 @@ impl IcegateSchemaProvider {
             let provider: Arc<dyn TableProvider> = if name == icegate_common::LOGS_TOPIC {
                 // Logs table: use our merged provider
                 let table_ident = iceberg::TableIdent::new(namespace.clone(), name.clone());
-                let provider = IcegateTableProvider::try_new(
-                    Arc::clone(&catalog),
-                    table_ident,
-                    wal_store_url.clone(),
-                    Arc::clone(&wal_store),
-                    wal_base_path.clone(),
-                    batch_size,
-                )
-                .await?;
+                let provider =
+                    IcegateTableProvider::try_new(Arc::clone(&catalog), table_ident, Arc::clone(&wal_reader)).await?;
                 Arc::new(provider)
             } else {
                 // Other tables: standard Iceberg static provider

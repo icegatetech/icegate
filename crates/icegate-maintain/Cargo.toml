@@ -1,4 +1,4 @@
-[package]
+ [package]
 name = "icegate-maintain"
 description = "Maintenance operations for IceGate"
 readme = "../../README.md"

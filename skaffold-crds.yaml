@@ -1,0 +1,18 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: prometheus-crds
+
+manifests:
+  kustomize:
+    paths:
+      - config/kustomize/crds
+    buildArgs:
+      - --enable-helm
+
+deploy:
+  kubectl:
+    flags:
+      apply:
+        - --server-side
+        - --force-conflicts
