@@ -88,7 +88,7 @@ impl QueryMetrics {
 
         Self {
             enabled: false,
-            requests_total: meter.u64_counter("icegate_query_requests_total").build(),
+            requests_total: meter.u64_counter("icegate_query_requests").build(),
             request_duration: meter.f64_histogram("icegate_query_request_duration").build(),
             parse_duration: meter.f64_histogram("icegate_query_parse_duration").build(),
             plan_duration: meter.f64_histogram("icegate_query_plan_duration").build(),
@@ -97,7 +97,7 @@ impl QueryMetrics {
             result_rows: meter.f64_histogram("icegate_query_result_rows").build(),
             result_bytes: meter.f64_histogram("icegate_query_result_bytes").build(),
             session_create_duration: meter.f64_histogram("icegate_query_session_create_duration").build(),
-            errors_total: meter.u64_counter("icegate_query_errors_total").build(),
+            errors_total: meter.u64_counter("icegate_query_errors").build(),
             active_queries: meter.i64_up_down_counter("icegate_query_active_queries").build(),
             wal_scan_rows: meter.f64_histogram("icegate_query_wal_scan_rows").build(),
             wal_scan_bytes: meter.f64_histogram("icegate_query_wal_scan_bytes").build(),
@@ -111,7 +111,7 @@ impl QueryMetrics {
     /// Build a metrics recorder using the provided meter.
     pub fn new(meter: &Meter) -> Self {
         let requests_total = meter
-            .u64_counter("icegate_query_requests_total")
+            .u64_counter("icegate_query_requests")
             .with_description("Total query requests")
             .build();
         let request_duration = meter
@@ -151,7 +151,6 @@ impl QueryMetrics {
         let result_bytes = meter
             .f64_histogram("icegate_query_result_bytes")
             .with_description("Approximate result size")
-            .with_unit("By")
             .build();
         let session_create_duration = meter
             .f64_histogram("icegate_query_session_create_duration")
@@ -160,7 +159,7 @@ impl QueryMetrics {
             .with_boundaries(FAST_DURATION_BOUNDARIES.to_vec())
             .build();
         let errors_total = meter
-            .u64_counter("icegate_query_errors_total")
+            .u64_counter("icegate_query_errors")
             .with_description("Query errors by phase")
             .build();
         let active_queries = meter
@@ -176,13 +175,11 @@ impl QueryMetrics {
         let wal_scan_bytes = meter
             .f64_histogram("icegate_query_wal_scan_bytes")
             .with_description("Decompressed bytes from WAL per query")
-            .with_unit("By")
             .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
         let wal_scan_compressed_bytes = meter
             .f64_histogram("icegate_query_wal_scan_compressed_bytes")
             .with_description("Compressed bytes scanned from WAL Parquet files per query")
-            .with_unit("By")
             .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
         let iceberg_scan_rows = meter
@@ -193,13 +190,11 @@ impl QueryMetrics {
         let iceberg_scan_bytes = meter
             .f64_histogram("icegate_query_iceberg_scan_bytes")
             .with_description("Decompressed bytes from Iceberg per query")
-            .with_unit("By")
             .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
         let iceberg_scan_compressed_bytes = meter
             .f64_histogram("icegate_query_iceberg_scan_compressed_bytes")
             .with_description("Compressed file sizes from Iceberg manifest per query")
-            .with_unit("By")
             .with_boundaries(BYTES_BOUNDARIES.to_vec())
             .build();
 

@@ -1,6 +1,6 @@
 //! Catalog builder factory
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use iceberg::{
     Catalog, CatalogBuilder as IcebergCatalogBuilder,
@@ -11,7 +11,10 @@ use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
 
 use super::{CacheConfig, CatalogBackend, CatalogConfig};
-use crate::error::{CommonError, Result};
+use crate::error::Result;
+use crate::storage::PrefetchConfig;
+use crate::storage::cache::{StorageCache, build_storage_cache};
+use crate::storage::icegate_storage::IceGateStorageFactory;
 
 /// Handle for gracefully closing the foyer IO cache on shutdown.
 ///
@@ -29,23 +32,29 @@ use crate::error::{CommonError, Result};
 /// # Usage
 ///
 /// ```ignore
-/// let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
+/// let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
 /// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 /// // ... run servers ...
 /// // On shutdown:
 /// io_cache.close().await;
 /// ```
-pub struct IoCacheHandle {
-    cache: Option<iceberg::io::FoyerCache>,
+pub struct IoHandle {
+    cache: Option<StorageCache>,
+    prefetch: Option<PrefetchConfig>,
+    stat_ttl: Option<Duration>,
 }
 
-impl IoCacheHandle {
+impl IoHandle {
     /// Create a no-op handle (no cache configured).
     ///
     /// Useful in tests and tools that don't need IO caching.
     #[must_use]
     pub const fn noop() -> Self {
-        Self { cache: None }
+        Self {
+            cache: None,
+            prefetch: None,
+            stat_ttl: None,
+        }
     }
 
     /// Create a handle from optional cache configuration.
@@ -58,28 +67,39 @@ impl IoCacheHandle {
     ///
     /// Returns an error if the foyer cache cannot be built (e.g., memory/disk
     /// size overflow or filesystem error).
-    pub async fn from_config(config: Option<&CacheConfig>) -> Result<Self> {
-        let cache = match config {
-            Some(cache_config) => Some(Self::build_foyer_cache(cache_config).await?),
+    pub async fn from_config(
+        cache_config: Option<&CacheConfig>,
+        prefetch_config: Option<PrefetchConfig>,
+    ) -> Result<Self> {
+        let stat_ttl = cache_config.and_then(|cc| cc.stat_ttl_secs).map(Duration::from_secs);
+        let cache = match cache_config {
+            Some(cc) => Some(build_storage_cache(cc).await?),
             None => None,
         };
-        Ok(Self { cache })
+        Ok(Self {
+            cache,
+            prefetch: prefetch_config,
+            stat_ttl,
+        })
     }
 
     /// Returns a reference to the underlying foyer cache, if configured.
     ///
     /// Clone the returned cache to share it with other components (e.g., WAL
-    /// object store). `FoyerCache` is `Arc`-based, so clones share the same
+    /// object store). `StorageCache` is `Arc`-based, so clones share the same
     /// cache instance.
-    pub const fn cache(&self) -> Option<&iceberg::io::FoyerCache> {
+    pub const fn cache(&self) -> Option<&StorageCache> {
         self.cache.as_ref()
     }
 
-    /// Create an Iceberg IO cache extension from the underlying cache.
-    ///
-    /// Returns `None` when no cache was configured.
-    fn io_cache_extension(&self) -> Option<iceberg::io::IoCacheExtension> {
-        self.cache.as_ref().map(|c| iceberg::io::IoCacheExtension::new(c.clone()))
+    /// Returns a reference to the prefetch configuration, if configured.
+    pub const fn prefetch(&self) -> Option<&PrefetchConfig> {
+        self.prefetch.as_ref()
+    }
+
+    /// Returns the stat metadata cache TTL, if configured.
+    pub const fn stat_ttl(&self) -> Option<Duration> {
+        self.stat_ttl
     }
 
     /// Gracefully close the IO cache, draining background flusher tasks.
@@ -95,31 +115,20 @@ impl IoCacheHandle {
         }
     }
 
-    /// Build the foyer hybrid cache from [`CacheConfig`].
-    async fn build_foyer_cache(config: &CacheConfig) -> Result<iceberg::io::FoyerCache> {
-        let memory_bytes = config.memory_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
-            CommonError::Config(format!(
-                "memory_size_mb ({}) overflows when converted to bytes",
-                config.memory_size_mb
-            ))
-        })?;
-        let disk_bytes = config.disk_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
-            CommonError::Config(format!(
-                "disk_size_mb ({}) overflows when converted to bytes",
-                config.disk_size_mb
-            ))
-        })?;
-
-        foyer::HybridCacheBuilder::new()
-            .memory(memory_bytes)
-            .with_weighter(|key: &iceberg::io::FoyerKey, value: &iceberg::io::FoyerValue| {
-                key.path.len() + key.version.as_ref().map_or_else(|| 0, String::len) + value.len()
-            })
-            .storage(foyer::Engine::mixed())
-            .with_device_options(foyer::DirectFsDeviceOptions::new(&config.disk_dir).with_capacity(disk_bytes))
-            .build()
-            .await
-            .map_err(|e| CommonError::Config(format!("Failed to build IO cache: {e}")))
+    /// Build an [`IceGateStorageFactory`] that injects the shared cache
+    /// and an `OpenTelemetry` meter into every `FileIO` created by catalogs.
+    ///
+    /// The returned factory is passed to
+    /// [`CatalogBuilder::with_storage_factory`](iceberg::CatalogBuilder::with_storage_factory).
+    fn storage_factory(&self, scheme: &str) -> Arc<dyn iceberg::io::StorageFactory> {
+        let meter = opentelemetry::global::meter("iceberg-storage");
+        Arc::new(IceGateStorageFactory::new(
+            scheme.to_string(),
+            self.cache.clone(),
+            Some(meter),
+            self.prefetch.clone(),
+            self.stat_ttl,
+        ))
     }
 }
 
@@ -130,21 +139,23 @@ impl CatalogBuilder {
     /// Create a catalog from configuration.
     ///
     /// The `io_cache` handle is created **before** calling this method (via
-    /// [`IoCacheHandle::from_config`]) so the same cache can be shared with
+    /// [`IoHandle::from_config`]) so the same cache can be shared with
     /// other components (e.g., WAL object store) without coupling its
     /// lifecycle to catalog construction.
     ///
     /// # Errors
     ///
     /// Returns an error if the catalog cannot be created
-    pub async fn from_config(config: &CatalogConfig, io_cache: &IoCacheHandle) -> Result<Arc<dyn Catalog>> {
+    pub async fn from_config(config: &CatalogConfig, io_cache: &IoHandle) -> Result<Arc<dyn Catalog>> {
         match &config.backend {
             CatalogBackend::Memory => Self::create_memory_catalog(config).await,
             CatalogBackend::Rest { uri } => Self::create_rest_catalog(config, uri, io_cache).await,
             CatalogBackend::S3Tables { table_bucket_arn } => {
-                Self::create_s3tables_catalog(config, table_bucket_arn).await
+                Self::create_s3tables_catalog(config, table_bucket_arn, io_cache).await
             }
-            CatalogBackend::Glue { catalog_id } => Self::create_glue_catalog(config, catalog_id.as_deref()).await,
+            CatalogBackend::Glue { catalog_id } => {
+                Self::create_glue_catalog(config, catalog_id.as_deref(), io_cache).await
+            }
         }
     }
 
@@ -168,11 +179,12 @@ impl CatalogBuilder {
         Ok(Arc::new(catalog))
     }
 
-    /// Create an S3 Tables catalog
-    ///
-    /// Note: S3 Tables catalog does not currently support IO cache extensions.
-    /// AWS credentials are resolved from the environment by the AWS SDK.
-    async fn create_s3tables_catalog(config: &CatalogConfig, table_bucket_arn: &str) -> Result<Arc<dyn Catalog>> {
+    /// Create an S3 Tables catalog with `IceGateStorageFactory`.
+    async fn create_s3tables_catalog(
+        config: &CatalogConfig,
+        table_bucket_arn: &str,
+        io_cache: &IoHandle,
+    ) -> Result<Arc<dyn Catalog>> {
         let mut properties = HashMap::new();
         properties.insert("table_bucket_arn".to_string(), table_bucket_arn.to_string());
         properties.insert("warehouse".to_string(), config.warehouse.clone());
@@ -182,7 +194,10 @@ impl CatalogBuilder {
             properties.insert(key.clone(), value.clone());
         }
 
-        let catalog = S3TablesCatalogBuilder::default().load("s3tables", properties).await?;
+        let catalog = S3TablesCatalogBuilder::default()
+            .with_storage_factory(io_cache.storage_factory("s3"))
+            .load("s3tables", properties)
+            .await?;
 
         tracing::info!(
             table_bucket_arn = %table_bucket_arn,
@@ -193,11 +208,12 @@ impl CatalogBuilder {
         Ok(Arc::new(catalog))
     }
 
-    /// Create an AWS Glue catalog.
-    ///
-    /// Note: Glue catalog does not currently support IO cache extensions.
-    /// AWS credentials are resolved from the environment by the AWS SDK.
-    async fn create_glue_catalog(config: &CatalogConfig, catalog_id: Option<&str>) -> Result<Arc<dyn Catalog>> {
+    /// Create an AWS Glue catalog with `IceGateStorageFactory`.
+    async fn create_glue_catalog(
+        config: &CatalogConfig,
+        catalog_id: Option<&str>,
+        io_cache: &IoHandle,
+    ) -> Result<Arc<dyn Catalog>> {
         let mut properties = HashMap::new();
         properties.insert("warehouse".to_string(), config.warehouse.clone());
 
@@ -209,7 +225,10 @@ impl CatalogBuilder {
             properties.insert(key.clone(), value.clone());
         }
 
-        let catalog = GlueCatalogBuilder::default().load("glue", properties).await?;
+        let catalog = GlueCatalogBuilder::default()
+            .with_storage_factory(io_cache.storage_factory("s3"))
+            .load("glue", properties)
+            .await?;
 
         tracing::info!(
             catalog_id = ?catalog_id,
@@ -220,12 +239,11 @@ impl CatalogBuilder {
         Ok(Arc::new(catalog))
     }
 
-    /// Create a REST catalog
-    async fn create_rest_catalog(
-        config: &CatalogConfig,
-        uri: &str,
-        io_cache: &IoCacheHandle,
-    ) -> Result<Arc<dyn Catalog>> {
+    /// Create a REST catalog with `IceGateStorageFactory`.
+    ///
+    /// The REST catalog **requires** a `StorageFactory` — it will error
+    /// at table-load time without one.
+    async fn create_rest_catalog(config: &CatalogConfig, uri: &str, io_cache: &IoHandle) -> Result<Arc<dyn Catalog>> {
         // Build REST catalog properties
         let mut properties = HashMap::new();
         properties.insert("uri".to_string(), uri.to_string());
@@ -236,21 +254,11 @@ impl CatalogBuilder {
             properties.insert(key.clone(), value.clone());
         }
 
-        // Create REST catalog using RestCatalogBuilder
-        let mut catalog = RestCatalogBuilder::default().load("rest", properties).await?;
-
-        // Apply IO cache extension if configured
-        if let Some(ext) = io_cache.io_cache_extension() {
-            catalog = catalog.with_file_io_extension(ext);
-            if let Some(ref cache_config) = config.cache {
-                tracing::info!(
-                    memory_mb = cache_config.memory_size_mb,
-                    disk_mb = cache_config.disk_size_mb,
-                    disk_dir = %cache_config.disk_dir,
-                    "IO cache enabled for REST catalog"
-                );
-            }
-        }
+        // Create REST catalog with IceGateStorageFactory
+        let catalog = RestCatalogBuilder::default()
+            .with_storage_factory(io_cache.storage_factory("s3"))
+            .load("rest", properties)
+            .await?;
 
         tracing::info!(
             uri = %uri,

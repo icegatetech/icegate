@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CommonError, Result};
+use crate::storage::PrefetchConfig;
 
 /// Catalog configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +25,13 @@ pub struct CatalogConfig {
     /// (memory + disk) to reduce S3 round-trips for repeated reads.
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+    /// Optional Parquet column-chunk prefetch configuration.
+    ///
+    /// When set, detects footer reads on `.parquet` files and proactively
+    /// fetches column chunks into the cache before the query engine
+    /// requests them.
+    #[serde(default)]
+    pub prefetch: Option<PrefetchConfig>,
 }
 
 /// IO cache configuration for the `FileIO` layer.
@@ -38,6 +46,13 @@ pub struct CacheConfig {
     pub disk_dir: String,
     /// Disk cache capacity in mebibytes (e.g., 256).
     pub disk_size_mb: usize,
+    /// Optional TTL (in seconds) for caching `stat` (HEAD) responses.
+    ///
+    /// When set, S3 HEAD requests for immutable objects are cached in
+    /// memory and reused until the TTL expires, avoiding redundant
+    /// round-trips during query execution.
+    #[serde(default)]
+    pub stat_ttl_secs: Option<u64>,
 }
 
 /// Types of catalogs supported
@@ -131,6 +146,20 @@ impl CatalogConfig {
             if cache.disk_size_mb == 0 {
                 return Err(CommonError::Config("Cache disk_size_mb must be greater than 0".into()));
             }
+            if cache.stat_ttl_secs == Some(0) {
+                return Err(CommonError::Config(
+                    "Cache stat_ttl_secs must be greater than 0 when set".into(),
+                ));
+            }
+        }
+
+        // Validate prefetch config if present
+        if let Some(ref prefetch) = self.prefetch {
+            if prefetch.max_prefetch_bytes == 0 {
+                return Err(CommonError::Config(
+                    "Prefetch max_prefetch_bytes must be greater than 0".into(),
+                ));
+            }
         }
 
         Ok(())
@@ -144,6 +173,7 @@ impl Default for CatalogConfig {
             warehouse: "/tmp/icegate/warehouse".to_string(),
             properties: HashMap::new(),
             cache: None,
+            prefetch: None,
         }
     }
 }
