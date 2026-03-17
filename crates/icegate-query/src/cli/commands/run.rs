@@ -90,7 +90,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     let wal_reader = ParquetQueueReader::new(prefix, Arc::clone(&store), config.engine.batch_size)
         .map_err(|e| QueryError::Config(format!("Failed to create WAL reader: {e}")))?;
 
-    // Initialize query engine with cached catalog provider
+    // Initialize query engine with background catalog refresh.
     tracing::info!("Initializing query engine");
     let query_engine = Arc::new(QueryEngine::new(
         catalog,
@@ -98,6 +98,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         store,
         Arc::new(wal_reader),
     ));
+    query_engine.start_background_refresh();
 
     // Create cancellation token for coordinated shutdown
     let cancel_token = CancellationToken::new();

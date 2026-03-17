@@ -95,8 +95,13 @@ spec:
           emptyDir: {}
         {{- if .Values.query.cache.enabled }}
         - name: cache
+          {{- if .Values.query.cache.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "icegate.cachePvcName" . }}
+          {{- else }}
           emptyDir:
             sizeLimit: {{ .Values.query.cache.volumeSizeLimit }}
+          {{- end }}
         {{- end }}
       {{- with .Values.query.nodeSelector }}
       nodeSelector:
