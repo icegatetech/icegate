@@ -2,8 +2,9 @@
 //!
 //! Intercepts reads on `.parquet` files, detects footer reads by checking
 //! for the `PAR1` magic suffix, parses the Parquet metadata, and
-//! proactively issues background reads for column chunks that will be
-//! needed next. Background reads flow through the inner layer stack
+//! proactively issues background reads for dictionary pages and column
+//! metadata that will be needed next. Background reads flow through the
+//! inner layer stack
 //! (typically the foyer cache layer) so their results land in cache
 //! before the query engine asks for them.
 //!
@@ -77,6 +78,8 @@ pub(crate) struct PrefetchMetrics {
     tasks_completed_total: Counter<u64>,
     /// Duration of individual prefetch tasks.
     task_duration: Histogram<f64>,
+    /// Prefetch ranges scheduled by metadata type.
+    ranges_by_type_total: Counter<u64>,
     /// Number of reads that waited for in-flight prefetches.
     inflight_waits_total: Counter<u64>,
     /// Duration spent waiting for in-flight prefetches.
@@ -123,6 +126,10 @@ impl PrefetchMetrics {
                 .with_unit("s")
                 .with_boundaries(PREFETCH_DURATION_BOUNDARIES.to_vec())
                 .build(),
+            ranges_by_type_total: meter
+                .u64_counter("icegate_storage_prefetch_ranges_by_type")
+                .with_description("Prefetch ranges scheduled by metadata type")
+                .build(),
             inflight_waits_total: meter
                 .u64_counter("icegate_storage_prefetch_inflight_waits")
                 .with_description("Reads that waited for in-flight prefetches")
@@ -148,6 +155,7 @@ impl PrefetchMetrics {
             bytes_scheduled: meter.f64_histogram("icegate_storage_prefetch_bytes_scheduled").build(),
             tasks_completed_total: meter.u64_counter("icegate_storage_prefetch_tasks_completed").build(),
             task_duration: meter.f64_histogram("icegate_storage_prefetch_task_duration").build(),
+            ranges_by_type_total: meter.u64_counter("icegate_storage_prefetch_ranges_by_type").build(),
             inflight_waits_total: meter.u64_counter("icegate_storage_prefetch_inflight_waits").build(),
             inflight_wait_duration: meter.f64_histogram("icegate_storage_prefetch_inflight_wait_duration").build(),
         }
@@ -179,6 +187,32 @@ impl PrefetchMetrics {
         self.bytes_scheduled.record(total_bytes as f64, &[]);
     }
 
+    /// Record prefetch ranges by metadata type.
+    #[allow(clippy::cast_possible_truncation)]
+    fn record_ranges_by_type(&self, summary: &PrefetchRangeSummary) {
+        if !self.enabled {
+            return;
+        }
+        if summary.dictionary_pages > 0 {
+            self.ranges_by_type_total.add(
+                summary.dictionary_pages as u64,
+                &[KeyValue::new("type", "dictionary_page")],
+            );
+        }
+        if summary.column_indexes > 0 {
+            self.ranges_by_type_total
+                .add(summary.column_indexes as u64, &[KeyValue::new("type", "column_index")]);
+        }
+        if summary.offset_indexes > 0 {
+            self.ranges_by_type_total
+                .add(summary.offset_indexes as u64, &[KeyValue::new("type", "offset_index")]);
+        }
+        if summary.bloom_filters > 0 {
+            self.ranges_by_type_total
+                .add(summary.bloom_filters as u64, &[KeyValue::new("type", "bloom_filter")]);
+        }
+    }
+
     /// Record a completed prefetch task.
     fn record_task_completed(&self, outcome: &str, duration: Instant) {
         if !self.enabled {
@@ -200,6 +234,23 @@ impl PrefetchMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// PrefetchRangeSummary
+// ---------------------------------------------------------------------------
+
+/// Counts of prefetch ranges by metadata type, for instrumentation.
+#[derive(Debug, Default)]
+struct PrefetchRangeSummary {
+    /// Dictionary page ranges collected.
+    dictionary_pages: usize,
+    /// Column index ranges collected.
+    column_indexes: usize,
+    /// Offset index ranges collected.
+    offset_indexes: usize,
+    /// Bloom filter ranges collected.
+    bloom_filters: usize,
+}
+
+// ---------------------------------------------------------------------------
 // PrefetchConfig
 // ---------------------------------------------------------------------------
 
@@ -207,10 +258,10 @@ impl PrefetchMetrics {
 ///
 /// When enabled, the prefetch layer detects footer reads on `.parquet`
 /// files and proactively issues background reads for **metadata-only**
-/// structures referenced by the footer: column indexes, offset indexes,
-/// and bloom filters. Data pages are never prefetched — only the
-/// metadata that the query engine reads before deciding which pages
-/// to fetch.
+/// structures referenced by the footer: dictionary pages, column
+/// indexes, offset indexes, and bloom filters. Data pages are never
+/// prefetched — only the metadata that the query engine reads before
+/// deciding which pages to fetch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefetchConfig {
     /// Whether prefetching is enabled.
@@ -506,7 +557,7 @@ impl<A: Access> LayeredAccess for PrefetchAccessor<A> {
                     // `FooterParseResult`.
                     tracing::debug!(footer_bytes = bytes.len(), "Parquet footer detected");
                     inner.metrics.record_footer_detected();
-                    spawn_prefetches(&inner, path_arc, &bytes, meta_request_range);
+                    spawn_prefetches_if_needed(&inner, path_arc, &bytes, meta_request_range);
                 } else if let Some((_, expected_len)) = inner.pending_footers.remove(path_arc.as_ref()) {
                     // Case (b): follow-up metadata read after a small
                     // suffix probe. The buffer contains raw Thrift bytes
@@ -553,8 +604,8 @@ impl<A: Access> LayeredAccess for PrefetchAccessor<A> {
 /// `request_range` is the `(offset, length)` of the read that triggered
 /// this call. Prefetch ranges fully contained within it are skipped
 /// because the inner layer (cache) already has that data.
-#[tracing::instrument(level = "debug", name = "spawn_prefetches", skip(inner, bytes))]
-fn spawn_prefetches<A: Access>(
+#[tracing::instrument(level = "debug", name = "spawn_prefetches_if_needed", skip(inner, bytes))]
+fn spawn_prefetches_if_needed<A: Access>(
     inner: &Arc<PrefetchInner<A>>,
     path: Arc<str>,
     bytes: &[u8],
@@ -589,7 +640,7 @@ fn spawn_prefetches<A: Access>(
     // triggering prefetch.
     inner.seen.insert(path.clone());
 
-    let raw_ranges = compute_prefetch_ranges(&metadata, &inner.config);
+    let (raw_ranges, summary) = compute_prefetch_ranges(&metadata, &inner.config);
     if raw_ranges.is_empty() {
         return;
     }
@@ -608,10 +659,15 @@ fn spawn_prefetches<A: Access>(
         merged_ranges = merged.len(),
         prefetch_ranges = to_prefetch.len(),
         total_bytes,
+        dictionary_pages = summary.dictionary_pages,
+        column_indexes = summary.column_indexes,
+        offset_indexes = summary.offset_indexes,
+        bloom_filters = summary.bloom_filters,
         "Prefetching Parquet metadata"
     );
 
     inner.metrics.record_ranges_scheduled(to_prefetch.len(), total_bytes);
+    inner.metrics.record_ranges_by_type(&summary);
     schedule_prefetch_tasks(inner, &path, &to_prefetch);
 }
 
@@ -661,7 +717,7 @@ fn schedule_prefetch_tasks<A: Access>(inner: &Arc<PrefetchInner<A>>, path: &Arc<
 /// Decode raw Thrift metadata bytes (from a follow-up read after the
 /// initial PAR1 suffix probe) and spawn prefetches on success.
 ///
-/// Unlike [`spawn_prefetches`], this function receives bytes that do NOT
+/// Unlike [`spawn_prefetches_if_needed`], this function receives bytes that do NOT
 /// include the 8-byte Parquet footer suffix — they are the raw Thrift
 /// `FileMetaData` bytes only.
 ///
@@ -678,7 +734,7 @@ fn try_decode_and_prefetch<A: Access>(
         Ok(metadata) => {
             inner.seen.insert(path.clone());
 
-            let raw_ranges = compute_prefetch_ranges(&metadata, &inner.config);
+            let (raw_ranges, summary) = compute_prefetch_ranges(&metadata, &inner.config);
             if raw_ranges.is_empty() {
                 return;
             }
@@ -696,10 +752,15 @@ fn try_decode_and_prefetch<A: Access>(
                 merged_ranges = merged.len(),
                 prefetch_ranges = to_prefetch.len(),
                 total_bytes,
+                dictionary_pages = summary.dictionary_pages,
+                column_indexes = summary.column_indexes,
+                offset_indexes = summary.offset_indexes,
+                bloom_filters = summary.bloom_filters,
                 "Prefetching Parquet metadata (from follow-up read)"
             );
 
             inner.metrics.record_ranges_scheduled(to_prefetch.len(), total_bytes);
+            inner.metrics.record_ranges_by_type(&summary);
             schedule_prefetch_tasks(inner, &path, &to_prefetch);
         }
         Err(e) => {
@@ -824,14 +885,19 @@ fn filter_covered_ranges(ranges: &[(u64, u64)], request_range: Option<(u64, u64)
 
 /// Collect metadata-only byte ranges from Parquet footer for prefetching.
 ///
-/// Extracts ranges for column indexes, offset indexes, and bloom filters
-/// from each column chunk — these are the metadata structures the query
-/// engine reads after the footer and before issuing data page reads.
-/// Data pages are **never** included.
+/// Extracts ranges for dictionary pages, column indexes, offset indexes,
+/// and bloom filters from each column chunk — these are the metadata
+/// structures the query engine reads after the footer and before issuing
+/// data page reads. Data pages are **never** included.
 ///
-/// Returns `(offset, length)` pairs suitable for issuing range reads.
-fn compute_prefetch_ranges(metadata: &ParquetMetaData, config: &PrefetchConfig) -> Vec<(u64, u64)> {
+/// Returns `(offset, length)` pairs suitable for issuing range reads,
+/// alongside a [`PrefetchRangeSummary`] counting ranges by type.
+fn compute_prefetch_ranges(
+    metadata: &ParquetMetaData,
+    config: &PrefetchConfig,
+) -> (Vec<(u64, u64)>, PrefetchRangeSummary) {
     let mut ranges = Vec::new();
+    let mut summary = PrefetchRangeSummary::default();
     let mut total_bytes: usize = 0;
 
     for rg in metadata.row_groups() {
@@ -844,15 +910,33 @@ fn compute_prefetch_ranges(metadata: &ParquetMetaData, config: &PrefetchConfig) 
                 }
             }
 
+            // Dictionary page: offset is optional, length = data_page_offset - dict_offset.
+            if let Some(dict_off) = col.dictionary_page_offset() {
+                let data_off = col.data_page_offset();
+                if dict_off > 0 && dict_off < data_off {
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let len = (data_off - dict_off) as usize;
+                    if total_bytes + len > config.max_prefetch_bytes {
+                        return (ranges, summary);
+                    }
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        ranges.push((dict_off as u64, len as u64));
+                    }
+                    total_bytes += len;
+                    summary.dictionary_pages += 1;
+                }
+            }
+
             // Collect metadata ranges for this column chunk.
-            // Each is (offset: i64, length: i32) — both optional.
-            let metadata_ranges: [(Option<i64>, Option<i32>); 3] = [
-                (col.column_index_offset(), col.column_index_length()),
-                (col.offset_index_offset(), col.offset_index_length()),
-                (col.bloom_filter_offset(), col.bloom_filter_length()),
+            // Each is (offset: i64, length: i32, kind) — offset and length are optional.
+            let metadata_ranges = [
+                (col.column_index_offset(), col.column_index_length(), "column_index"),
+                (col.offset_index_offset(), col.offset_index_length(), "offset_index"),
+                (col.bloom_filter_offset(), col.bloom_filter_length(), "bloom_filter"),
             ];
 
-            for (offset, length) in metadata_ranges {
+            for (offset, length, kind) in metadata_ranges {
                 let (Some(off), Some(len)) = (offset, length) else {
                     continue;
                 };
@@ -865,7 +949,7 @@ fn compute_prefetch_ranges(metadata: &ParquetMetaData, config: &PrefetchConfig) 
 
                 // Budget check.
                 if total_bytes + len_usize > config.max_prefetch_bytes {
-                    return ranges;
+                    return (ranges, summary);
                 }
 
                 #[allow(clippy::cast_sign_loss)]
@@ -875,11 +959,17 @@ fn compute_prefetch_ranges(metadata: &ParquetMetaData, config: &PrefetchConfig) 
 
                 ranges.push((off_u64, len_u64));
                 total_bytes += len_usize;
+                match kind {
+                    "column_index" => summary.column_indexes += 1,
+                    "offset_index" => summary.offset_indexes += 1,
+                    "bloom_filter" => summary.bloom_filters += 1,
+                    _ => {}
+                }
             }
         }
     }
 
-    ranges
+    (ranges, summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +1029,7 @@ mod tests {
     struct TestColumnMeta {
         data_page_offset: i64,
         compressed_size: i64,
+        dictionary_page_offset: Option<i64>,
         column_index: Option<(i64, i32)>,
         offset_index: Option<(i64, i32)>,
         bloom_filter: Option<(i64, i32)>,
@@ -950,6 +1041,7 @@ mod tests {
             Self {
                 data_page_offset,
                 compressed_size,
+                dictionary_page_offset: None,
                 column_index: None,
                 offset_index: None,
                 bloom_filter: None,
@@ -969,6 +1061,9 @@ mod tests {
                 .set_total_uncompressed_size(chunk.compressed_size)
                 .set_num_values(100)
                 .set_encodings(vec![parquet::basic::Encoding::PLAIN]);
+            if let Some(dict_off) = chunk.dictionary_page_offset {
+                builder = builder.set_dictionary_page_offset(Some(dict_off));
+            }
             if let Some((off, len)) = chunk.column_index {
                 builder = builder.set_column_index_offset(Some(off)).set_column_index_length(Some(len));
             }
@@ -1042,6 +1137,7 @@ mod tests {
                 TestColumnMeta {
                     data_page_offset: 1000,
                     compressed_size: 50_000,
+                    dictionary_page_offset: None,
                     column_index: Some((100, 200)),
                     offset_index: Some((300, 150)),
                     bloom_filter: Some((500, 64)),
@@ -1049,6 +1145,7 @@ mod tests {
                 TestColumnMeta {
                     data_page_offset: 60_000,
                     compressed_size: 80_000,
+                    dictionary_page_offset: None,
                     column_index: Some((450, 180)),
                     offset_index: None,
                     bloom_filter: None,
@@ -1057,7 +1154,7 @@ mod tests {
         );
         let metadata = test_metadata(&schema, vec![rg]);
         let config = PrefetchConfig::default();
-        let ranges = compute_prefetch_ranges(&metadata, &config);
+        let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
 
         // col_a: column_index(100,200) + offset_index(300,150) + bloom(500,64)
         // col_b: column_index(450,180) only (no offset_index, no bloom)
@@ -1067,6 +1164,10 @@ mod tests {
         assert_eq!(ranges[1], (300, 150));
         assert_eq!(ranges[2], (500, 64));
         assert_eq!(ranges[3], (450, 180));
+        assert_eq!(summary.dictionary_pages, 0);
+        assert_eq!(summary.column_indexes, 2);
+        assert_eq!(summary.offset_indexes, 1);
+        assert_eq!(summary.bloom_filters, 1);
     }
 
     #[test]
@@ -1075,7 +1176,7 @@ mod tests {
         let rg = test_row_group(&schema, &[TestColumnMeta::data_only(1000, 50_000)]);
         let metadata = test_metadata(&schema, vec![rg]);
         let config = PrefetchConfig::default();
-        let ranges = compute_prefetch_ranges(&metadata, &config);
+        let (ranges, _summary) = compute_prefetch_ranges(&metadata, &config);
 
         // No column_index, offset_index, or bloom_filter → nothing to prefetch.
         assert!(ranges.is_empty());
@@ -1090,6 +1191,7 @@ mod tests {
                 TestColumnMeta {
                     data_page_offset: 1000,
                     compressed_size: 5000,
+                    dictionary_page_offset: None,
                     column_index: Some((100, 50)),
                     offset_index: Some((200, 40)),
                     bloom_filter: None,
@@ -1098,6 +1200,7 @@ mod tests {
                 TestColumnMeta {
                     data_page_offset: 3000,
                     compressed_size: 7000,
+                    dictionary_page_offset: None,
                     column_index: Some((300, 60)),
                     offset_index: None,
                     bloom_filter: None,
@@ -1110,7 +1213,7 @@ mod tests {
             prefetch_columns: Some(vec!["col_a".to_string(), "col_c".to_string()]),
             ..Default::default()
         };
-        let ranges = compute_prefetch_ranges(&metadata, &config);
+        let (ranges, _summary) = compute_prefetch_ranges(&metadata, &config);
 
         // col_a: column_index(100,50) + offset_index(200,40)
         // col_b: filtered out by allowlist
@@ -1129,6 +1232,7 @@ mod tests {
             &[TestColumnMeta {
                 data_page_offset: 1000,
                 compressed_size: 50_000,
+                dictionary_page_offset: None,
                 column_index: Some((100, 200)),
                 offset_index: Some((300, 150)),
                 bloom_filter: Some((500, 64)),
@@ -1140,11 +1244,141 @@ mod tests {
             max_prefetch_bytes: 300, // Room for column_index(200) but not offset_index(+150)
             ..Default::default()
         };
-        let ranges = compute_prefetch_ranges(&metadata, &config);
+        let (ranges, _summary) = compute_prefetch_ranges(&metadata, &config);
 
         // column_index(200) fits, offset_index(200+150=350) exceeds budget → stop
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0], (100, 200));
+    }
+
+    #[test]
+    fn test_compute_prefetch_ranges_includes_dictionary_pages() {
+        let schema = test_schema(&["col_a"]);
+        // Dictionary at offset 800, data page at 1000 → dict length = 200.
+        let rg = test_row_group(
+            &schema,
+            &[TestColumnMeta {
+                data_page_offset: 1000,
+                compressed_size: 50_000,
+                dictionary_page_offset: Some(800),
+                column_index: Some((100, 50)),
+                offset_index: None,
+                bloom_filter: None,
+            }],
+        );
+        let metadata = test_metadata(&schema, vec![rg]);
+        let config = PrefetchConfig::default();
+        let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
+
+        // Dictionary page (800, 200) + column_index (100, 50)
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], (800, 200));
+        assert_eq!(ranges[1], (100, 50));
+        assert_eq!(summary.dictionary_pages, 1);
+        assert_eq!(summary.column_indexes, 1);
+    }
+
+    #[test]
+    fn test_compute_prefetch_ranges_dictionary_budget_cap() {
+        let schema = test_schema(&["col_a"]);
+        // Dictionary at offset 800, data page at 1000 → dict length = 200.
+        let rg = test_row_group(
+            &schema,
+            &[TestColumnMeta {
+                data_page_offset: 1000,
+                compressed_size: 50_000,
+                dictionary_page_offset: Some(800),
+                column_index: Some((100, 50)),
+                offset_index: None,
+                bloom_filter: None,
+            }],
+        );
+        let metadata = test_metadata(&schema, vec![rg]);
+
+        // Budget only allows the dictionary page (200 bytes), not column_index (+50).
+        let config = PrefetchConfig {
+            max_prefetch_bytes: 200,
+            ..Default::default()
+        };
+        let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (800, 200));
+        assert_eq!(summary.dictionary_pages, 1);
+        assert_eq!(summary.column_indexes, 0);
+    }
+
+    #[test]
+    fn test_compute_prefetch_ranges_dictionary_invalid_offset() {
+        let schema = test_schema(&["col_a", "col_b"]);
+        let rg = test_row_group(
+            &schema,
+            &[
+                // dict_off >= data_off → should be skipped
+                TestColumnMeta {
+                    data_page_offset: 1000,
+                    compressed_size: 50_000,
+                    dictionary_page_offset: Some(1000),
+                    column_index: Some((100, 50)),
+                    offset_index: None,
+                    bloom_filter: None,
+                },
+                // dict_off == 0 → should be skipped
+                TestColumnMeta {
+                    data_page_offset: 2000,
+                    compressed_size: 50_000,
+                    dictionary_page_offset: Some(0),
+                    column_index: None,
+                    offset_index: None,
+                    bloom_filter: None,
+                },
+            ],
+        );
+        let metadata = test_metadata(&schema, vec![rg]);
+        let config = PrefetchConfig::default();
+        let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
+
+        // Only col_a's column_index should be collected; dict pages are invalid.
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (100, 50));
+        assert_eq!(summary.dictionary_pages, 0);
+    }
+
+    #[test]
+    fn test_compute_prefetch_ranges_summary_counts() {
+        let schema = test_schema(&["col_a", "col_b"]);
+        let rg = test_row_group(
+            &schema,
+            &[
+                TestColumnMeta {
+                    data_page_offset: 1000,
+                    compressed_size: 50_000,
+                    dictionary_page_offset: Some(800),
+                    column_index: Some((100, 50)),
+                    offset_index: Some((200, 40)),
+                    bloom_filter: Some((300, 30)),
+                },
+                TestColumnMeta {
+                    data_page_offset: 5000,
+                    compressed_size: 50_000,
+                    dictionary_page_offset: Some(4500),
+                    column_index: Some((400, 60)),
+                    offset_index: None,
+                    bloom_filter: None,
+                },
+            ],
+        );
+        let metadata = test_metadata(&schema, vec![rg]);
+        let config = PrefetchConfig::default();
+        let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
+
+        // col_a: dict(800,200) + ci(100,50) + oi(200,40) + bf(300,30)
+        // col_b: dict(4500,500) + ci(400,60)
+        assert_eq!(ranges.len(), 6);
+        assert_eq!(summary.dictionary_pages, 2);
+        assert_eq!(summary.column_indexes, 2);
+        assert_eq!(summary.offset_indexes, 1);
+        assert_eq!(summary.bloom_filters, 1);
     }
 
     #[test]

@@ -116,7 +116,7 @@ pub fn create_s3_store(
     //
     // Each `.layer()` call changes the generic type of `OperatorBuilder`, so
     // the FoyerLayer branch must be handled as a separate code path.
-    let meter = opentelemetry::global::meter("wal-opendal");
+    let meter = opentelemetry::global::meter("icegate-wal");
     let base = Operator::new(s3)
         .map_err(|e| CommonError::Config(format!("Failed to build OpenDAL S3 operator: {e}")))?
         .layer(RetryLayer::new())
