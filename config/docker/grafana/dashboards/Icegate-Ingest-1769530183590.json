@@ -3322,7 +3322,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_commit_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_get_last_offset_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "hide": false,
           "legendFormat": "{{topic}} - p50",
           "range": true,
@@ -3331,7 +3331,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, topic, status) (rate(icegate_ingest_shift_commit_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, topic, status) (rate(icegate_ingest_shift_get_last_offset_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "hide": false,
           "legendFormat": "{{topic}} - p99",
           "range": true,
