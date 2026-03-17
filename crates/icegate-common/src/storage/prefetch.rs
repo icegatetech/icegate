@@ -2,8 +2,8 @@
 //!
 //! Intercepts reads on `.parquet` files, detects footer reads by checking
 //! for the `PAR1` magic suffix, parses the Parquet metadata, and
-//! proactively issues background reads for dictionary pages and column
-//! metadata that will be needed next. Background reads flow through the
+//! proactively issues background reads for column metadata (and
+//! optionally dictionary pages) that will be needed next. Background reads flow through the
 //! inner layer stack
 //! (typically the foyer cache layer) so their results land in cache
 //! before the query engine asks for them.
@@ -258,10 +258,12 @@ struct PrefetchRangeSummary {
 ///
 /// When enabled, the prefetch layer detects footer reads on `.parquet`
 /// files and proactively issues background reads for **metadata-only**
-/// structures referenced by the footer: dictionary pages, column
-/// indexes, offset indexes, and bloom filters. Data pages are never
-/// prefetched — only the metadata that the query engine reads before
-/// deciding which pages to fetch.
+/// structures referenced by the footer: column indexes, offset indexes,
+/// and bloom filters. Dictionary pages are **opt-in** via
+/// [`prefetch_dictionary_pages`](Self::prefetch_dictionary_pages) because
+/// they can be significantly larger than other metadata. Data pages are
+/// never prefetched — only the metadata that the query engine reads
+/// before deciding which pages to fetch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefetchConfig {
     /// Whether prefetching is enabled.
@@ -275,6 +277,10 @@ pub struct PrefetchConfig {
     /// one of these entries. If `None`, all columns are eligible.
     #[serde(default)]
     pub prefetch_columns: Option<Vec<String>>,
+    /// Whether to prefetch dictionary pages for dictionary-encoded columns.
+    /// Default: `false`.
+    #[serde(default)]
+    pub prefetch_dictionary_pages: bool,
 }
 
 const fn default_enabled() -> bool {
@@ -290,6 +296,7 @@ impl Default for PrefetchConfig {
             enabled: default_enabled(),
             max_prefetch_bytes: default_max_prefetch_bytes(),
             prefetch_columns: None,
+            prefetch_dictionary_pages: false,
         }
     }
 }
@@ -911,20 +918,22 @@ fn compute_prefetch_ranges(
             }
 
             // Dictionary page: offset is optional, length = data_page_offset - dict_offset.
-            if let Some(dict_off) = col.dictionary_page_offset() {
-                let data_off = col.data_page_offset();
-                if dict_off > 0 && dict_off < data_off {
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    let len = (data_off - dict_off) as usize;
-                    if total_bytes + len > config.max_prefetch_bytes {
-                        return (ranges, summary);
+            if config.prefetch_dictionary_pages {
+                if let Some(dict_off) = col.dictionary_page_offset() {
+                    let data_off = col.data_page_offset();
+                    if dict_off > 0 && dict_off < data_off {
+                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                        let len = (data_off - dict_off) as usize;
+                        if total_bytes + len > config.max_prefetch_bytes {
+                            return (ranges, summary);
+                        }
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            ranges.push((dict_off as u64, len as u64));
+                        }
+                        total_bytes += len;
+                        summary.dictionary_pages += 1;
                     }
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        ranges.push((dict_off as u64, len as u64));
-                    }
-                    total_bytes += len;
-                    summary.dictionary_pages += 1;
                 }
             }
 
@@ -1267,7 +1276,10 @@ mod tests {
             }],
         );
         let metadata = test_metadata(&schema, vec![rg]);
-        let config = PrefetchConfig::default();
+        let config = PrefetchConfig {
+            prefetch_dictionary_pages: true,
+            ..Default::default()
+        };
         let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
 
         // Dictionary page (800, 200) + column_index (100, 50)
@@ -1298,6 +1310,7 @@ mod tests {
         // Budget only allows the dictionary page (200 bytes), not column_index (+50).
         let config = PrefetchConfig {
             max_prefetch_bytes: 200,
+            prefetch_dictionary_pages: true,
             ..Default::default()
         };
         let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
@@ -1335,7 +1348,10 @@ mod tests {
             ],
         );
         let metadata = test_metadata(&schema, vec![rg]);
-        let config = PrefetchConfig::default();
+        let config = PrefetchConfig {
+            prefetch_dictionary_pages: true,
+            ..Default::default()
+        };
         let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
 
         // Only col_a's column_index should be collected; dict pages are invalid.
@@ -1369,7 +1385,10 @@ mod tests {
             ],
         );
         let metadata = test_metadata(&schema, vec![rg]);
-        let config = PrefetchConfig::default();
+        let config = PrefetchConfig {
+            prefetch_dictionary_pages: true,
+            ..Default::default()
+        };
         let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
 
         // col_a: dict(800,200) + ci(100,50) + oi(200,40) + bf(300,30)
@@ -1379,6 +1398,32 @@ mod tests {
         assert_eq!(summary.column_indexes, 2);
         assert_eq!(summary.offset_indexes, 1);
         assert_eq!(summary.bloom_filters, 1);
+    }
+
+    #[test]
+    fn test_compute_prefetch_ranges_dictionary_pages_disabled_by_default() {
+        let schema = test_schema(&["col_a"]);
+        // Dictionary at offset 800, data page at 1000 → dict length = 200.
+        let rg = test_row_group(
+            &schema,
+            &[TestColumnMeta {
+                data_page_offset: 1000,
+                compressed_size: 50_000,
+                dictionary_page_offset: Some(800),
+                column_index: Some((100, 50)),
+                offset_index: None,
+                bloom_filter: None,
+            }],
+        );
+        let metadata = test_metadata(&schema, vec![rg]);
+        let config = PrefetchConfig::default();
+        let (ranges, summary) = compute_prefetch_ranges(&metadata, &config);
+
+        // Only column_index collected; dictionary pages skipped by default.
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (100, 50));
+        assert_eq!(summary.dictionary_pages, 0);
+        assert_eq!(summary.column_indexes, 1);
     }
 
     #[test]
