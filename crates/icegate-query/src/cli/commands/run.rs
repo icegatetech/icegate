@@ -2,6 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use icegate_common::{CatalogBuilder, IoCacheHandle, MetricsRuntime, create_object_store, run_metrics_server};
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
@@ -152,20 +153,56 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     tracing::info!("All enabled query servers started");
     tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
-    // Wait for shutdown signal (SIGINT or SIGTERM)
-    shutdown_signal().await;
+    let mut handles: FuturesUnordered<_> = handles.into_iter().collect();
+    let mut shutdown_started = false;
+    let mut failure = None;
 
-    tracing::info!("Shutdown signal received, stopping all servers...");
+    while !handles.is_empty() {
+        tokio::select! {
+            () = &mut shutdown, if !shutdown_started => {
+                tracing::info!("Shutdown signal received, stopping all servers...");
+                cancel_token.cancel();
+                shutdown_started = true;
+            }
+            result = handles.next() => {
+                let Some(result) = result else {
+                    continue;
+                };
 
-    // Cancel all servers
-    cancel_token.cancel();
+                match result {
+                    Ok(Ok(())) if shutdown_started => {}
+                    Ok(Ok(())) => {
+                        tracing::error!("Server task exited before shutdown signal");
+                        failure.get_or_insert_with(|| {
+                            QueryError::Internal("server task exited before shutdown signal".to_string())
+                        });
+                    }
+                    Ok(Err(err)) => {
+                        tracing::error!("Server task failed: {err}");
+                        failure.get_or_insert_with(|| QueryError::Internal(err.to_string()));
+                    }
+                    Err(err) => {
+                        tracing::error!("Server task join failed: {err}");
+                        failure.get_or_insert_with(|| QueryError::Internal(format!("server task join failed: {err}")));
+                    }
+                }
 
-    // Wait for all servers to stop
-    for handle in handles {
-        if let Err(e) = handle.await {
-            tracing::error!("Server task failed: {}", e);
+                if failure.is_some() && !shutdown_started {
+                    tracing::info!("Stopping remaining servers after early task exit...");
+                    cancel_token.cancel();
+                    shutdown_started = true;
+                }
+            }
         }
+    }
+
+    if let Some(err) = failure {
+        io_cache.close().await;
+        drop(tracing_guard);
+        return Err(err);
     }
 
     tracing::info!("All query servers stopped gracefully");

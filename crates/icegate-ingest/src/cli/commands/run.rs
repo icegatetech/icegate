@@ -2,11 +2,13 @@
 
 use std::{
     any::Any,
+    io,
     path::PathBuf,
     sync::{Arc, mpsc},
     thread,
 };
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use icegate_common::{IoCacheHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use object_store::ObjectStore;
@@ -158,17 +160,56 @@ async fn run_servers_until_shutdown(handles: Vec<ServerTaskHandle>, cancel_token
 
     tracing::info!("All enabled OTLP servers started");
     tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
-    shutdown_signal().await;
-    tracing::info!("Shutdown signal received, stopping all servers...");
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
-    cancel_token.cancel();
+    let mut handles: FuturesUnordered<_> = handles.into_iter().collect();
+    let mut shutdown_started = false;
+    let mut failure = None;
 
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(IngestError::Other(err)),
-            Err(err) => return Err(IngestError::Join(err)),
+    while !handles.is_empty() {
+        tokio::select! {
+            () = &mut shutdown, if !shutdown_started => {
+                tracing::info!("Shutdown signal received, stopping all servers...");
+                cancel_token.cancel();
+                shutdown_started = true;
+            }
+            result = handles.next() => {
+                let Some(result) = result else {
+                    continue;
+                };
+
+                match result {
+                    Ok(Ok(())) if shutdown_started => {}
+                    Ok(Ok(())) => {
+                        tracing::error!("Server task exited before shutdown signal");
+                        failure.get_or_insert_with(|| {
+                            IngestError::Other(Box::new(io::Error::other(
+                                "server task exited before shutdown signal",
+                            )))
+                        });
+                    }
+                    Ok(Err(err)) => {
+                        tracing::error!("Server task failed: {err}");
+                        failure.get_or_insert(IngestError::Other(err));
+                    }
+                    Err(err) => {
+                        tracing::error!("Server task join failed: {err}");
+                        failure.get_or_insert(IngestError::Join(err));
+                    }
+                }
+
+                if failure.is_some() && !shutdown_started {
+                    tracing::info!("Stopping remaining servers after early task exit...");
+                    cancel_token.cancel();
+                    shutdown_started = true;
+                }
+            }
         }
+    }
+
+    if let Some(err) = failure {
+        return Err(err);
     }
 
     tracing::info!("All OTLP servers stopped gracefully");
