@@ -6,6 +6,7 @@ configMapGenerator:
     namespace: observability
     files:
       - dashboards/Icegate-Ingest-1769530183590.json
+      - dashboards/Icegate-Query.json
       - dashboards/Nodes-1769530183590.json
 
 resources:

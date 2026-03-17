@@ -40,6 +40,7 @@ query:
     memorySizeMb: 1024
     diskDir: /tmp/icegate/cache
     diskSizeMb: 4096
+    statTtlSecs: 300
     ## emptyDir sizeLimit for the disk cache volume
     volumeSizeLimit: 5Gi
   prefetch:
@@ -62,7 +63,7 @@ query:
     enabled: true
     otlpEndpoint: http://jaeger-collector.observability:4317
     sampleRatio: 1.0
-  rustLog: "debug,icegate_common=trace"
+  rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
       cpu: "1"
@@ -99,7 +100,7 @@ ingest:
         useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
-  rustLog: "debug"
+  rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
       cpu: "2"

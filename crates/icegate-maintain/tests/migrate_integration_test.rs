@@ -17,7 +17,7 @@ use std::{
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
-use icegate_common::catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoCacheHandle};
+use icegate_common::catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle};
 use icegate_maintain::migrate::operations::{MigrationOperation, create_tables, upgrade_schemas};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -139,6 +139,7 @@ async fn setup_containers() -> (ContainerAsync<MinIO>, ContainerAsync<GenericIma
         warehouse: format!("s3://{BUCKET_NAME}/"),
         properties,
         cache: None,
+        prefetch: None,
     };
 
     (minio, iceberg, config)
@@ -172,7 +173,7 @@ async fn test_migrate_create_tables() {
 
     println!("Creating catalog with config: {:?}", config);
 
-    let catalog = CatalogBuilder::from_config(&config, &IoCacheHandle::noop())
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())
         .await
         .expect("Failed to create catalog");
 
@@ -212,7 +213,7 @@ async fn test_migrate_create_tables() {
 async fn test_migrate_create_tables_dry_run() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config, &IoCacheHandle::noop())
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())
         .await
         .expect("Failed to create catalog");
 
@@ -240,7 +241,7 @@ async fn test_migrate_create_tables_dry_run() {
 async fn test_migrate_create_tables_idempotent() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config, &IoCacheHandle::noop())
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())
         .await
         .expect("Failed to create catalog");
 
@@ -266,7 +267,7 @@ async fn test_migrate_create_tables_idempotent() {
 async fn test_migrate_upgrade_schemas() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config, &IoCacheHandle::noop())
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())
         .await
         .expect("Failed to create catalog");
 

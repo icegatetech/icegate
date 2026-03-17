@@ -27,7 +27,7 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 
 # Iceberg
-iceberg = { workspace = true, features = ["io-metrics"] }
+iceberg = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

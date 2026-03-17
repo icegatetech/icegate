@@ -26,7 +26,7 @@ use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator,
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoCacheHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
 };
 use icegate_query::engine::{QueryEngine, QueryEngineConfig};
 use icegate_query::loki::LokiConfig;
@@ -55,6 +55,7 @@ impl TestServer {
             warehouse: warehouse_str.clone(),
             properties: std::collections::HashMap::default(),
             cache: None,
+            prefetch: None,
         };
 
         let loki_config = LokiConfig {
@@ -63,7 +64,7 @@ impl TestServer {
             port: 0,
         };
 
-        let catalog = CatalogBuilder::from_config(&catalog_config, &IoCacheHandle::noop()).await?;
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop()).await?;
 
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
 
