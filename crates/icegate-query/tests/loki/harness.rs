@@ -109,8 +109,6 @@ impl TestServer {
             wal_store,
             wal_reader,
         ));
-        query_engine.start_background_refresh();
-
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();
         let server_engine = Arc::clone(&query_engine);
