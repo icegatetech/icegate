@@ -15,7 +15,6 @@ use datafusion::arrow::array::{
     ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::DataType;
-use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::parquet::file::properties::WriterProperties;
 use iceberg::Catalog;
 use iceberg::spec::DataFileFormat;
@@ -85,17 +84,14 @@ impl TestServer {
 
         // Provide an in-memory WAL store — WAL scan finds 0 segments,
         // which is correct for benchmarks that only write to Iceberg.
-        let wal_base_path = "wal://bench";
         let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let wal_url = ObjectStoreUrl::parse(wal_base_path).unwrap();
-        let engine_config = QueryEngineConfig {
-            wal_base_path: wal_base_path.to_string(),
-            ..QueryEngineConfig::default()
-        };
+        let wal_reader = Arc::new(icegate_queue::ParquetQueueReader::new("", Arc::clone(&wal_store), 8192).unwrap());
+        let engine_config = QueryEngineConfig::default();
         let query_engine = Arc::new(QueryEngine::new(
             Arc::clone(&catalog),
             engine_config,
-            (wal_store, wal_url),
+            wal_store,
+            wal_reader,
         ));
 
         let cancel_token = CancellationToken::new();

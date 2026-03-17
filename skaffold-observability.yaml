@@ -1,0 +1,21 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: observability
+
+requires:
+  - path: skaffold-crds.yaml
+
+manifests:
+  kustomize:
+    paths:
+      - config/kustomize/base
+    buildArgs:
+      - --enable-helm
+
+deploy:
+  kubectl:
+    flags:
+      apply:
+        - --server-side
+        - --force-conflicts

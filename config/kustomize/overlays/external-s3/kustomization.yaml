@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  # Namespace "icegate" is created by the IceGate Helm chart (namespace.create: true
+  # in values-icegate.yaml). This secret depends on that chart being rendered in
+  # the same kustomize build.
+  - secret-aws.yaml
+  - secret-aws-infra.yaml
+
+helmCharts:
+  - name: nessie
+    repo: https://charts.projectnessie.org
+    version: 0.107.3
+    releaseName: nessie
+    namespace: infra
+    valuesFile: values-nessie.yaml
+
+  - name: icegate
+    repo: oci://ghcr.io/icegatetech/charts
+    version: 0.1.0-rc3
+    releaseName: icegate
+    namespace: icegate
+    valuesFile: values-icegate.yaml
+
+# Force namespace on resources from charts that omit metadata.namespace.
+patches:
+  # Tailscale expose → Grafana (observability)
+  - target:
+      name: grafana
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/annotations/tailscale.com~1expose
+        value: "true"
+  # Tailscale expose → Ingest (icegate)
+  - target:
+      name: icegate-ingest
+      kind: Service
+    patch: |
+      - op: add
+        path: /metadata/annotations/tailscale.com~1expose
+        value: "true"

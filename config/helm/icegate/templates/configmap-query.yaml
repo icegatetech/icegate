@@ -16,11 +16,27 @@ data:
         disk_dir: {{ .Values.query.cache.diskDir }}
         disk_size_mb: {{ .Values.query.cache.diskSizeMb }}
       {{- end }}
+      {{- if .Values.query.prefetch.enabled }}
+      prefetch:
+        enabled: true
+        {{- with .Values.query.prefetch.maxPrefetchBytes }}
+        max_prefetch_bytes: {{ . }}
+        {{- end }}
+        {{- with .Values.query.prefetch.prefetchColumns }}
+        prefetch_columns:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- end }}
     engine:
-      wal_base_path: {{ .Values.query.engine.walBasePath | quote }}
       batch_size: {{ .Values.query.engine.batchSize }}
       target_partitions: {{ .Values.query.engine.targetPartitions }}
       catalog_name: {{ .Values.query.engine.catalogName | quote }}
+    queue:
+      common:
+        base_path: {{ .Values.queue.common.basePath | quote }}
+        channel_capacity: {{ .Values.queue.common.channelCapacity }}
+        max_row_group_size: {{ .Values.queue.common.maxRowGroupSize }}
+      read: {}
     storage:
       {{- include "icegate.storageYaml" . | nindent 6 }}
     loki:

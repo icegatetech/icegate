@@ -15,11 +15,18 @@ use datafusion::{
 };
 use datafusion_tracing::{InstrumentationOptions, instrument_with_debug_spans};
 use iceberg::Catalog;
+use icegate_queue::ParquetQueueReader;
 use object_store::ObjectStore;
 
 use super::QueryEngineConfig;
 use super::provider::IcegateCatalogProvider;
 use crate::error::Result;
+
+/// Fixed DataFusion object store URL for WAL segments.
+///
+/// This is an arbitrary registry key — DataFusion uses it to look up the
+/// object store at query time. It is not a real URL.
+pub const WAL_STORE_URL: &str = "wal://queue";
 
 /// Query execution engine with per-session catalog provider.
 ///
@@ -32,7 +39,8 @@ use crate::error::Result;
 ///
 /// ```ignore
 /// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
-/// let engine = Arc::new(QueryEngine::new(catalog, config, (wal_store, wal_url)));
+/// let reader = Arc::new(ParquetQueueReader::new(prefix, store.clone(), batch_size)?);
+/// let engine = Arc::new(QueryEngine::new(catalog, config, store, reader));
 ///
 /// // In handlers:
 /// let session_ctx = engine.create_session().await?;
@@ -43,8 +51,10 @@ pub struct QueryEngine {
     catalog: Arc<dyn Catalog>,
     /// Engine configuration.
     config: QueryEngineConfig,
-    /// WAL object store and registered URL for hot data reading.
-    wal_store: (Arc<dyn ObjectStore>, ObjectStoreUrl),
+    /// WAL object store for DataFusion runtime registration.
+    wal_store: Arc<dyn ObjectStore>,
+    /// Shared WAL queue reader for segment listing and reading.
+    wal_reader: Arc<ParquetQueueReader>,
 }
 
 impl QueryEngine {
@@ -53,21 +63,26 @@ impl QueryEngine {
     /// Stores the catalog and configuration for later use by
     /// `create_session()`. No provider is built at construction time.
     ///
+    /// IMPORTANT: `wal_reader` is required to operate on WAL segments in `wal_store`.
+    ///
     /// # Arguments
     ///
     /// * `catalog` - Iceberg catalog for accessing tables
     /// * `config` - Engine configuration
-    /// * `wal_store` - WAL object store and URL for hot data reading
+    /// * `wal_store` - WAL object store for DataFusion runtime registration
+    /// * `wal_reader` - Shared queue reader for WAL segment operations
     #[must_use]
     pub fn new(
         catalog: Arc<dyn Catalog>,
         config: QueryEngineConfig,
-        wal_store: (Arc<dyn ObjectStore>, ObjectStoreUrl),
+        wal_store: Arc<dyn ObjectStore>,
+        wal_reader: Arc<ParquetQueueReader>,
     ) -> Self {
         Self {
             catalog,
             config,
             wal_store,
+            wal_reader,
         }
     }
 
@@ -108,19 +123,15 @@ impl QueryEngine {
         // owns its own RuntimeEnv, so register_object_store must be called
         // per-session (not once globally) for DataFusion's ParquetSource to
         // resolve WAL Parquet files through the registered URL.
-        let (ref store, ref url) = self.wal_store;
-        session_ctx.runtime_env().register_object_store(url.as_ref(), Arc::clone(store));
+        let wal_url = ObjectStoreUrl::parse(WAL_STORE_URL)
+            .map_err(|e| crate::error::QueryError::Config(format!("Invalid WAL store URL: {e}")))?;
+        session_ctx
+            .runtime_env()
+            .register_object_store(wal_url.as_ref(), Arc::clone(&self.wal_store));
 
         // Build a fresh provider from the catalog
         let provider: Arc<dyn CatalogProvider> = {
-            let p = IcegateCatalogProvider::try_new(
-                Arc::clone(&self.catalog),
-                url.clone(),
-                Arc::clone(store),
-                self.config.wal_base_path.clone(),
-                self.config.batch_size,
-            )
-            .await?;
+            let p = IcegateCatalogProvider::try_new(Arc::clone(&self.catalog), Arc::clone(&self.wal_reader)).await?;
             Arc::new(p)
         };
 

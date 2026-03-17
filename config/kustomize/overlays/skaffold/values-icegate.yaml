@@ -1,0 +1,126 @@
+# IceGate chart values - mapped from Docker Compose query/ingest/migrate configs
+
+## Let the IceGate chart create the namespace from .Release.Namespace
+namespace:
+  create: true
+
+## Iceberg catalog (shared by all components)
+catalog:
+  backend: rest
+  rest:
+    uri: http://nessie.infra:19120/iceberg
+  warehouse: "s3://warehouse/"
+  properties:
+    prefix: main
+
+## Storage configuration
+storage:
+  s3:
+    bucket: warehouse
+    region: us-east-1
+    endpoint: http://minio.infra:9000
+
+## AWS credentials from existing Secret
+## Secret keys: aws-access-key-id, aws-secret-access-key (per _helpers.tpl:152-162)
+aws:
+  existingSecret: icegate-aws-credentials
+  region: us-east-1
+
+## Queue (WAL) configuration
+queue:
+  common:
+    basePath: "s3://queue/"
+
+## Query component
+query:
+  enabled: true
+  replicaCount: 1
+  cache:
+    enabled: true
+    memorySizeMb: 1024
+    diskDir: /tmp/icegate/cache
+    diskSizeMb: 4096
+    ## emptyDir sizeLimit for the disk cache volume
+    volumeSizeLimit: 5Gi
+  prefetch:
+    enabled: true
+  waitForDependencies:
+    enabled: true
+    endpoints:
+      - http://nessie.infra:19120/api/v2/config
+      - http://minio.infra:9000/minio/health/ready
+  loki:
+    enabled: true
+    port: 3100
+  prometheus:
+    enabled: true
+    port: 9090
+  tempo:
+    enabled: true
+    port: 3200
+  tracing:
+    enabled: true
+    otlpEndpoint: http://jaeger-collector.observability:4317
+    sampleRatio: 1.0
+  rustLog: "debug,icegate_common=trace"
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 4Gi
+
+## Ingest component
+ingest:
+  enabled: true
+  replicaCount: 1
+  waitForDependencies:
+    enabled: true
+    endpoints:
+      - http://nessie.infra:19120/api/v2/config
+      - http://minio.infra:9000/minio/health/ready
+  otlpHttp:
+    enabled: true
+    port: 4318
+  otlpGrpc:
+    enabled: true
+    port: 4317
+  tracing:
+    enabled: true
+    otlpEndpoint: http://jaeger-collector.observability:4317
+    sampleRatio: 1.0
+  shift:
+    jobsmanager:
+      storage:
+        endpoint: http://minio.infra:9000
+        bucket: jobs
+        prefix: shifter
+        useSsl: false
+        jobStateCodec: json
+        requestTimeoutSecs: 5
+  rustLog: "debug"
+  resources:
+    requests:
+      cpu: "2"
+      memory: 3Gi
+    limits:
+      cpu: "2"
+      memory: 3Gi
+
+## ServiceMonitor (Prometheus Operator)
+serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus
+
+## Migrate (runs as Helm hook: pre-install/pre-upgrade)
+migrate:
+  enabled: true
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  waitForDependencies:
+    enabled: true
+    endpoints:
+      - http://nessie.infra:19120/api/v2/config
+      - http://minio.infra:9000/minio/health/ready

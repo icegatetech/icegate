@@ -25,6 +25,7 @@ spec:
       serviceAccountName: {{ include "icegate.serviceAccountName" . }}
       securityContext:
         {{- include "icegate.podSecurityContext" . | nindent 8 }}
+      {{- include "icegate.waitForDeps" (dict "context" . "config" .Values.ingest.waitForDependencies) | nindent 6 }}
       containers:
         - name: ingest
           image: {{ include "icegate.image" (dict "image" .Values.ingest.image "tag" .Chart.AppVersion) }}

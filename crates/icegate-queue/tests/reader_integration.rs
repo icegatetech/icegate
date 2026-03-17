@@ -373,8 +373,8 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(segments.len(), 5, "Should list all 5 segments");
     for (i, segment) in segments.iter().enumerate() {
-        assert_eq!(segment.offset, i as u64, "Segment offset should match index");
-        assert_eq!(segment.topic, "logs", "Topic should match");
+        assert_eq!(segment.id.offset, i as u64, "Segment offset should match index");
+        assert_eq!(segment.id.topic, "logs", "Topic should match");
     }
     Ok(())
 }
@@ -413,9 +413,9 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
     let segments = reader.list_segments(&"logs".to_string(), 2, &cancel).await.unwrap();
 
     assert_eq!(segments.len(), 3, "Should list segments 2, 3, 4");
-    assert_eq!(segments[0].offset, 2);
-    assert_eq!(segments[1].offset, 3);
-    assert_eq!(segments[2].offset, 4);
+    assert_eq!(segments[0].id.offset, 2);
+    assert_eq!(segments[1].id.offset, 3);
+    assert_eq!(segments[2].id.offset, 4);
     Ok(())
 }
 
