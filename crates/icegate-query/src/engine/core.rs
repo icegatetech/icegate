@@ -1,12 +1,13 @@
-//! Query execution engine with per-session catalog provider.
+//! Query execution engine with background-refreshed catalog provider.
 //!
-//! The `QueryEngine` builds a fresh catalog provider on each
-//! `create_session()` call, ensuring every query sees the latest committed
-//! Iceberg data. The Iceberg `io-cache` feature (foyer hybrid cache) handles
-//! caching expensive S3/FileIO reads, so the per-session rebuild only costs
-//! catalog REST API calls.
+//! The `QueryEngine` keeps a cached catalog provider that is refreshed
+//! in the background every `refresh_interval` (default 5s). The cached
+//! provider remains valid for up to `max_age` (default 10s). Queries
+//! never block on catalog rebuilds unless the cache is completely cold
+//! (first query or after a prolonged refresh failure).
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use datafusion::{
     catalog::CatalogProvider,
@@ -17,6 +18,7 @@ use datafusion_tracing::{InstrumentationOptions, instrument_with_debug_spans};
 use iceberg::Catalog;
 use icegate_queue::ParquetQueueReader;
 use object_store::ObjectStore;
+use tokio::sync::watch;
 
 use super::QueryEngineConfig;
 use super::provider::IcegateCatalogProvider;
@@ -28,12 +30,30 @@ use crate::error::Result;
 /// object store at query time. It is not a real URL.
 pub const WAL_STORE_URL: &str = "wal://queue";
 
-/// Query execution engine with per-session catalog provider.
+/// Default interval between background catalog refreshes.
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Default maximum age before the cached provider is considered stale.
+/// If the background refresh fails for longer than this, queries will
+/// block on a synchronous rebuild.
+const DEFAULT_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Cached catalog provider with creation timestamp.
+#[derive(Clone)]
+struct CachedProvider {
+    /// The cached catalog provider (thread-safe, immutable after creation).
+    provider: Arc<dyn CatalogProvider>,
+    /// When this provider was built — used for staleness detection.
+    created_at: Instant,
+}
+
+/// Query execution engine with background-refreshed catalog provider.
 ///
-/// `QueryEngine` builds a fresh catalog provider on each `create_session()`
-/// call, so every query sees the latest committed Iceberg metadata. The
-/// Iceberg `io-cache` (foyer hybrid cache) handles caching expensive
-/// S3/FileIO reads underneath.
+/// `QueryEngine` keeps a `watch` channel with the latest
+/// `IcegateCatalogProvider`. A background task rebuilds the provider
+/// every `refresh_interval` so queries see fresh metadata without
+/// blocking on catalog REST calls. The Iceberg `io-cache` (foyer hybrid
+/// cache) handles caching expensive S3/FileIO reads underneath.
 ///
 /// # Usage
 ///
@@ -41,6 +61,9 @@ pub const WAL_STORE_URL: &str = "wal://queue";
 /// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 /// let reader = Arc::new(ParquetQueueReader::new(prefix, store.clone(), batch_size)?);
 /// let engine = Arc::new(QueryEngine::new(catalog, config, store, reader));
+///
+/// // Start background refresh (must be called once after construction).
+/// engine.start_background_refresh();
 ///
 /// // In handlers:
 /// let session_ctx = engine.create_session().await?;
@@ -55,13 +78,24 @@ pub struct QueryEngine {
     wal_store: Arc<dyn ObjectStore>,
     /// Shared WAL queue reader for segment listing and reading.
     wal_reader: Arc<ParquetQueueReader>,
+    /// Watch channel receiver for the cached catalog provider.
+    /// `None` means the cache is cold (no provider built yet).
+    provider_rx: watch::Receiver<Option<CachedProvider>>,
+    /// Watch channel sender — held to keep the channel alive and used
+    /// by the background refresh task.
+    provider_tx: Arc<watch::Sender<Option<CachedProvider>>>,
+    /// Maximum age before a cached provider is considered too stale.
+    max_age: Duration,
+    /// Interval between background refresh cycles.
+    refresh_interval: Duration,
 }
 
 impl QueryEngine {
     /// Create a new `QueryEngine`.
     ///
-    /// Stores the catalog and configuration for later use by
-    /// `create_session()`. No provider is built at construction time.
+    /// The catalog provider cache starts cold. Call
+    /// [`start_background_refresh`] after construction to begin
+    /// periodic catalog refreshes.
     ///
     /// IMPORTANT: `wal_reader` is required to operate on WAL segments in `wal_store`.
     ///
@@ -78,19 +112,85 @@ impl QueryEngine {
         wal_store: Arc<dyn ObjectStore>,
         wal_reader: Arc<ParquetQueueReader>,
     ) -> Self {
+        let (provider_tx, provider_rx) = watch::channel(None);
         Self {
             catalog,
             config,
             wal_store,
             wal_reader,
+            provider_rx,
+            provider_tx: Arc::new(provider_tx),
+            max_age: DEFAULT_MAX_AGE,
+            refresh_interval: DEFAULT_REFRESH_INTERVAL,
         }
+    }
+
+    /// Start the background catalog refresh task.
+    ///
+    /// Spawns a tokio task that rebuilds the catalog provider every
+    /// `refresh_interval`. The task runs until the `QueryEngine` is
+    /// dropped (the `watch::Sender` is closed).
+    pub fn start_background_refresh(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            // Build the initial provider eagerly so the first query
+            // doesn't have to wait.
+            match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
+                Ok(provider) => {
+                    let _ = engine.provider_tx.send(Some(CachedProvider {
+                        provider,
+                        created_at: Instant::now(),
+                    }));
+                    tracing::info!("Initial catalog provider built");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to build initial catalog provider");
+                }
+            }
+
+            loop {
+                tokio::time::sleep(engine.refresh_interval).await;
+
+                // Stop if all receivers are dropped (engine is gone).
+                if engine.provider_tx.is_closed() {
+                    tracing::debug!("Catalog refresh task stopping: channel closed");
+                    break;
+                }
+
+                match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
+                    Ok(provider) => {
+                        let _ = engine.provider_tx.send(Some(CachedProvider {
+                            provider,
+                            created_at: Instant::now(),
+                        }));
+                        tracing::debug!("Catalog provider refreshed");
+                    }
+                    Err(e) => {
+                        // Keep serving the stale provider — it's better than
+                        // failing queries. The max_age check in create_session
+                        // will force a synchronous rebuild if staleness exceeds
+                        // the threshold.
+                        tracing::warn!(error = %e, "Background catalog refresh failed, keeping stale provider");
+                    }
+                }
+            }
+        });
+    }
+
+    /// Build a new catalog provider from the Iceberg catalog.
+    async fn build_provider(
+        catalog: Arc<dyn Catalog>,
+        wal_reader: Arc<ParquetQueueReader>,
+    ) -> Result<Arc<dyn CatalogProvider>> {
+        let p = IcegateCatalogProvider::try_new(catalog, wal_reader).await?;
+        Ok(Arc::new(p))
     }
 
     /// Create a new `SessionContext` with the Iceberg catalog registered.
     ///
-    /// Builds a fresh catalog provider from the Iceberg catalog, ensuring the
-    /// session sees the latest committed table metadata. Each call creates a
-    /// fresh `SessionContext` (required by `DataFusion` for concurrent queries).
+    /// Uses the background-refreshed catalog provider when available.
+    /// Falls back to a synchronous rebuild if the cache is cold or too
+    /// stale (older than `max_age`).
     ///
     /// # Errors
     ///
@@ -103,8 +203,6 @@ impl QueryEngine {
             .with_target_partitions(self.config.target_partitions);
 
         // Instrument DataFusion execution plans with tracing spans.
-        // Each physical plan node (scan, filter, sort, aggregate, etc.) gets
-        // its own debug-level span with optional metrics recording.
         let options = InstrumentationOptions::builder().record_metrics(true).build();
         let instrument_rule = instrument_with_debug_spans!(options: options);
 
@@ -119,25 +217,47 @@ impl QueryEngine {
         let session_ctx = SessionContext::new_with_state(session_state);
 
         // Register the WAL object store with this session's RuntimeEnv.
-        // Each SessionContext built via SessionStateBuilder::new()...build()
-        // owns its own RuntimeEnv, so register_object_store must be called
-        // per-session (not once globally) for DataFusion's ParquetSource to
-        // resolve WAL Parquet files through the registered URL.
         let wal_url = ObjectStoreUrl::parse(WAL_STORE_URL)
             .map_err(|e| crate::error::QueryError::Config(format!("Invalid WAL store URL: {e}")))?;
         session_ctx
             .runtime_env()
             .register_object_store(wal_url.as_ref(), Arc::clone(&self.wal_store));
 
-        // Build a fresh provider from the catalog
-        let provider: Arc<dyn CatalogProvider> = {
-            let p = IcegateCatalogProvider::try_new(Arc::clone(&self.catalog), Arc::clone(&self.wal_reader)).await?;
-            Arc::new(p)
-        };
+        // Get the cached provider or fall back to synchronous rebuild.
+        let provider = self.get_provider().await?;
 
         session_ctx.register_catalog(&self.config.catalog_name, provider);
 
         Ok(session_ctx)
+    }
+
+    /// Get the cached catalog provider, or rebuild synchronously if the
+    /// cache is cold or too stale.
+    async fn get_provider(&self) -> Result<Arc<dyn CatalogProvider>> {
+        let cached = self.provider_rx.borrow().clone();
+
+        if let Some(cached) = cached {
+            if cached.created_at.elapsed() < self.max_age {
+                return Ok(cached.provider);
+            }
+            // Provider is too stale — fall through to synchronous rebuild.
+            tracing::warn!(
+                age_ms = cached.created_at.elapsed().as_millis(),
+                max_age_ms = self.max_age.as_millis(),
+                "Cached catalog provider exceeded max_age, rebuilding synchronously"
+            );
+        }
+
+        // Cold cache or stale provider — synchronous rebuild.
+        let provider = Self::build_provider(Arc::clone(&self.catalog), Arc::clone(&self.wal_reader)).await?;
+
+        // Update the watch channel so subsequent queries use this provider.
+        let _ = self.provider_tx.send(Some(CachedProvider {
+            provider: Arc::clone(&provider),
+            created_at: Instant::now(),
+        }));
+
+        Ok(provider)
     }
 
     /// Get reference to the underlying Iceberg catalog.
@@ -160,6 +280,8 @@ impl std::fmt::Debug for QueryEngine {
         f.debug_struct("QueryEngine")
             .field("catalog", &"Arc<dyn Catalog>")
             .field("config", &self.config)
+            .field("refresh_interval", &self.refresh_interval)
+            .field("max_age", &self.max_age)
             .finish_non_exhaustive()
     }
 }

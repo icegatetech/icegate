@@ -2,6 +2,13 @@
 
 allInOne:
   enabled: true
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 500m
+      memory: 1Gi
 
 # Disable individual components (all-in-one bundles them)
 collector:

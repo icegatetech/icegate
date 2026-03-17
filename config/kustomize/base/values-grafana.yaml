@@ -54,6 +54,14 @@ dashboardProviders:
 dashboardsConfigMaps:
   icegate: grafana-dashboards-icegate
 
+resources:
+  requests:
+    cpu: 500m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
 testFramework:
   enabled: false
 

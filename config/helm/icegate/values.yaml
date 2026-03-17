@@ -91,8 +91,34 @@ query:
     diskSizeMb: 4096
     ## TTL (seconds) for caching stat/HEAD responses (optional, omit to disable)
     statTtlSecs: 300
-    ## emptyDir sizeLimit for the disk cache volume
+    ## Volume size for the disk cache (used as emptyDir sizeLimit or PVC storage request)
     volumeSizeLimit: 5Gi
+    ## Persistent storage for the disk cache (EBS volume).
+    ## When enabled, replaces the emptyDir with a PersistentVolumeClaim.
+    ## PVC size is derived from volumeSizeLimit above.
+    persistence:
+      enabled: false
+      ## Use an existing StorageClass name (leave empty to use the auto-created one)
+      storageClassName: ""
+      ## Use an existing PVC (skip StorageClass and PVC creation)
+      existingClaim: ""
+      accessModes:
+        - ReadWriteOnce
+      annotations: {}
+      ## StorageClass definition (created only when persistence.enabled=true,
+      ## storageClassName is empty, and storageClass.create=true)
+      storageClass:
+        create: true
+        name: ""
+        type: gp3
+        iops: "3000"
+        throughput: "125"
+        fsType: ext4
+        encrypted: "true"
+        kmsKeyId: ""
+        volumeBindingMode: WaitForFirstConsumer
+        reclaimPolicy: Delete
+        allowVolumeExpansion: true
 
   ## Parquet metadata prefetch (warms cache with column/offset indexes
   ## and bloom filters after footer reads — never data pages)
