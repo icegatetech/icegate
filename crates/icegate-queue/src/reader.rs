@@ -710,7 +710,7 @@ impl ParquetQueueReader {
             .map_err(|_| QueueError::Metadata(format!("file size {file_size} exceeds addressable size")))?;
         let mut tail_len = std::cmp::min(file_size_usize, 64 * 1024);
 
-        // TODO(crit): сделать через retry
+        // TODO(high): сделать через retry
         // The footer size is taken from the end of the parquet file: the last 8 bytes are footer_len (4 bytes LE) + "PAR1".
         // Therefore, the code first reads the tail to 64 KB (or less if the file is small) in the hope that it will be enough right away.
         // If there is not enough, try_parse_sized returns NeedMoreData(need), and the code reads the larger tail.

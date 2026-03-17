@@ -5,7 +5,12 @@ WORKDIR /app
 
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-COPY ./crates ./crates
+COPY crates/icegate-common/Cargo.toml crates/icegate-common/Cargo.toml
+COPY crates/icegate-ingest/Cargo.toml crates/icegate-ingest/Cargo.toml
+COPY crates/icegate-jobmanager/Cargo.toml crates/icegate-jobmanager/Cargo.toml
+COPY crates/icegate-maintain/Cargo.toml crates/icegate-maintain/Cargo.toml
+COPY crates/icegate-query/Cargo.toml crates/icegate-query/Cargo.toml
+COPY crates/icegate-queue/Cargo.toml crates/icegate-queue/Cargo.toml
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
