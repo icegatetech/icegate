@@ -458,7 +458,11 @@ impl QueueWriter {
                 self.set_offset(topic, offset).await;
                 return Ok(offset);
             }
-            offset = offset.saturating_add(1);
+            offset = offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                topic: topic.clone(),
+                offset,
+                source: "offset space exhausted (u64::MAX reached)".into(),
+            })?;
         }
     }
 

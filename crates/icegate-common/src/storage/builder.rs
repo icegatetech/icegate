@@ -108,7 +108,7 @@ pub fn create_s3_store(
     // Build Operator with layers (outermost applied last, executed first).
     // Desired execution order (outermost → innermost):
     //
-    //   [FoyerCache] → OtelMetrics → OtelTrace → Retry → S3
+    //   [FoyerCache] → OtelMetrics → OtelTrace → S3
     //
     // Tracing and metrics sit below the cache so they only
     // observe actual S3 round-trips (cache misses).

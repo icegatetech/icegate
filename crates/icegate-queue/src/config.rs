@@ -258,7 +258,7 @@ mod tests {
     fn test_builder_pattern() {
         let config = QueueConfig::new("s3://bucket/queue")
             .with_channel_capacity(512)
-            .with_write_retries(5)
+            .with_write_retries(3)
             .with_compression(CompressionCodec::Snappy)
             .with_max_row_group_size(5000)
             .with_records_per_flush_multiplier(2)
@@ -267,7 +267,7 @@ mod tests {
 
         assert_eq!(config.common.channel_capacity, 512);
         assert_eq!(config.common.max_row_group_size, 5000);
-        assert_eq!(config.write.write_retries, 5);
+        assert_eq!(config.write.write_retries, 3);
         assert!(matches!(config.write.compression, CompressionCodec::Snappy));
         assert_eq!(config.write.records_per_flush_multiplier, 2);
         assert_eq!(config.write.max_bytes_per_flush, 32 * 1024 * 1024);
