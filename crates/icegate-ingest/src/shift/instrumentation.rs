@@ -332,7 +332,16 @@ where
     S: Storage + 'static,
 {
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> crate::error::Result<Option<u64>> {
-        self.inner.get_last_offset(cancel_token).await
+        let start = Instant::now();
+        let result = self.inner.get_last_offset(cancel_token).await;
+        let duration = start.elapsed();
+        let status = if result.is_ok() {
+            TaskStatus::Ok.as_str()
+        } else {
+            TaskStatus::Error.as_str()
+        };
+        self.metrics.record_get_last_offset_duration(duration, &self.topic, status);
+        result
     }
 
     async fn write_record_batches(

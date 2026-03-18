@@ -184,7 +184,7 @@ pub struct ParquetQueueReader {
     /// Base path for queue segments.
     base_path: String,
 
-    /// Object store backend.
+    /// Object store backend abstraction.
     store: Arc<dyn ObjectStore>,
 
     /// Maximum number of rows per emitted [`RecordBatch`] when reading a segment.
@@ -285,11 +285,7 @@ impl ParquetQueueReader {
                 let store = Arc::clone(&store);
                 let prefix = prefix.clone();
                 let offset_path = offset_path.clone();
-                async move {
-                    let list_stream = store.list_with_offset(Some(&prefix), &offset_path);
-                    let items: Vec<_> = list_stream.try_collect().await?;
-                    Ok(items)
-                }
+                async move { Ok(store.list_with_offset(Some(&prefix), &offset_path).try_collect().await?) }
             })
             .await?;
 
@@ -714,6 +710,7 @@ impl ParquetQueueReader {
             .map_err(|_| QueueError::Metadata(format!("file size {file_size} exceeds addressable size")))?;
         let mut tail_len = std::cmp::min(file_size_usize, 64 * 1024);
 
+        // TODO(high): need to use retrier
         // The footer size is taken from the end of the parquet file: the last 8 bytes are footer_len (4 bytes LE) + "PAR1".
         // Therefore, the code first reads the tail to 64 KB (or less if the file is small) in the hope that it will be enough right away.
         // If there is not enough, try_parse_sized returns NeedMoreData(need), and the code reads the larger tail.

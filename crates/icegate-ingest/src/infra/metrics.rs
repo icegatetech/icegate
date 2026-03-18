@@ -1,9 +1,19 @@
 use std::{
+    fmt, io,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt};
 use icegate_queue::{QueueWriterEvents, WriteBatchOutcome};
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
+};
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram, Meter, MeterProvider as _},
@@ -33,6 +43,7 @@ pub struct ShiftMetrics {
     bytes_written_total: Counter<u64>,
     get_data_files_duration: Histogram<f64>,
     commit_duration: Histogram<f64>,
+    get_last_offset_duration: Histogram<f64>,
     already_committed_total: Counter<u64>,
     task_failures_total: Counter<u64>,
     task_success_total: Counter<u64>,
@@ -67,6 +78,7 @@ impl ShiftMetrics {
             bytes_written_total: meter.u64_counter("icegate_ingest_shift_bytes_written").build(),
             get_data_files_duration: meter.f64_histogram("icegate_ingest_shift_get_data_files_duration").build(),
             commit_duration: meter.f64_histogram("icegate_ingest_shift_commit_duration").build(),
+            get_last_offset_duration: meter.f64_histogram("icegate_ingest_shift_get_last_offset_duration").build(),
             already_committed_total: meter.u64_counter("icegate_ingest_shift_already_committed").build(),
             task_failures_total: meter.u64_counter("icegate_ingest_shift_task_failures").build(),
             task_success_total: meter.u64_counter("icegate_ingest_shift_task_success").build(),
@@ -143,6 +155,11 @@ impl ShiftMetrics {
             .with_description("Duration of storage.commit execution")
             .with_unit("s")
             .build();
+        let get_last_offset_duration = meter
+            .f64_histogram("icegate_ingest_shift_get_last_offset_duration")
+            .with_description("Duration of storage.get_last_offset execution")
+            .with_unit("s")
+            .build();
         let already_committed_total = meter
             .u64_counter("icegate_ingest_shift_already_committed")
             .with_description("Number of commit tasks resolved as already committed")
@@ -173,6 +190,7 @@ impl ShiftMetrics {
             bytes_written_total,
             get_data_files_duration,
             commit_duration,
+            get_last_offset_duration,
             already_committed_total,
             task_failures_total,
             task_success_total,
@@ -347,6 +365,20 @@ impl ShiftMetrics {
         );
     }
 
+    /// Record `get_last_offset` duration.
+    pub fn record_get_last_offset_duration(&self, duration: Duration, topic: &str, status: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.get_last_offset_duration.record(
+            duration.as_secs_f64(),
+            &[
+                KeyValue::new("topic", topic.to_string()),
+                KeyValue::new("status", status.to_string()),
+            ],
+        );
+    }
+
     /// Record already committed path.
     pub fn add_already_committed(&self, topic: &str) {
         if !self.enabled {
@@ -383,6 +415,332 @@ impl ShiftMetrics {
                 KeyValue::new("topic", topic.to_string()),
             ],
         );
+    }
+}
+
+/// Metrics collected for S3 calls made by `ParquetQueueReader`.
+#[derive(Clone)]
+pub struct QueueReaderS3Metrics {
+    enabled: bool,
+    request_duration: Histogram<f64>,
+}
+
+impl QueueReaderS3Metrics {
+    /// Build a metrics recorder that performs no-ops.
+    pub fn new_disabled() -> Self {
+        let provider = SdkMeterProvider::builder().build();
+        let meter = provider.meter("ingest_shift_queue_reader_s3");
+
+        Self {
+            enabled: false,
+            request_duration: meter
+                .f64_histogram("icegate_ingest_shift_queue_reader_s3_request_duration")
+                .build(),
+        }
+    }
+
+    /// Build a metrics recorder using the provided meter.
+    pub fn new(meter: &Meter) -> Self {
+        let request_duration = meter
+            .f64_histogram("icegate_ingest_shift_queue_reader_s3_request_duration")
+            .with_description("Queue reader S3 request duration")
+            .with_unit("s")
+            .build();
+
+        Self {
+            enabled: true,
+            request_duration,
+        }
+    }
+}
+
+/// Metrics collected for S3 calls made by `QueueWriter`.
+#[derive(Clone)]
+pub struct QueueWriterS3Metrics {
+    enabled: bool,
+    request_duration: Histogram<f64>,
+}
+
+impl QueueWriterS3Metrics {
+    /// Build a metrics recorder that performs no-ops.
+    pub fn new_disabled() -> Self {
+        let provider = SdkMeterProvider::builder().build();
+        let meter = provider.meter("ingest_wal_queue_writer_s3");
+
+        Self {
+            enabled: false,
+            request_duration: meter
+                .f64_histogram("icegate_ingest_shift_queue_writer_s3_request_duration")
+                .build(),
+        }
+    }
+
+    /// Build a metrics recorder using the provided meter.
+    pub fn new(meter: &Meter) -> Self {
+        let request_duration = meter
+            .f64_histogram("icegate_ingest_shift_queue_writer_s3_request_duration")
+            .with_description("Queue writer S3 request duration")
+            .with_unit("s")
+            .build();
+
+        Self {
+            enabled: true,
+            request_duration,
+        }
+    }
+}
+
+/// Generic S3 request metrics sink used by `ObjectStoreMetricsDecorator`.
+pub trait S3RequestMetrics: Clone + Send + Sync + 'static {
+    /// Record one object-store request observation.
+    fn record(&self, operation: &str, status: &str, error_kind: &str, duration: Duration);
+}
+
+impl S3RequestMetrics for QueueReaderS3Metrics {
+    fn record(&self, operation: &str, status: &str, error_kind: &str, duration: Duration) {
+        if !self.enabled {
+            return;
+        }
+        let labels = &[
+            KeyValue::new("operation", operation.to_string()),
+            KeyValue::new("status", status.to_string()),
+            KeyValue::new("error_kind", error_kind.to_string()),
+            KeyValue::new("component", "queue_reader"),
+        ];
+        self.request_duration.record(duration.as_secs_f64(), labels);
+    }
+}
+
+impl S3RequestMetrics for QueueWriterS3Metrics {
+    fn record(&self, operation: &str, status: &str, error_kind: &str, duration: Duration) {
+        if !self.enabled {
+            return;
+        }
+        let labels = &[
+            KeyValue::new("operation", operation.to_string()),
+            KeyValue::new("status", status.to_string()),
+            KeyValue::new("error_kind", error_kind.to_string()),
+            KeyValue::new("component", "queue_writer"),
+        ];
+        self.request_duration.record(duration.as_secs_f64(), labels);
+    }
+}
+
+struct InstrumentedListStream<M: S3RequestMetrics> {
+    inner: BoxStream<'static, object_store::Result<ObjectMeta>>,
+    metrics: Arc<M>,
+    operation: &'static str,
+    started_at: Instant,
+    completed: bool,
+    yielded_item: bool,
+}
+
+impl<M: S3RequestMetrics> InstrumentedListStream<M> {
+    fn new(
+        inner: BoxStream<'static, object_store::Result<ObjectMeta>>,
+        metrics: Arc<M>,
+        operation: &'static str,
+    ) -> Self {
+        Self {
+            inner,
+            metrics,
+            operation,
+            started_at: Instant::now(),
+            completed: false,
+            yielded_item: false,
+        }
+    }
+}
+
+impl<M: S3RequestMetrics> Stream for InstrumentedListStream<M> {
+    type Item = object_store::Result<ObjectMeta>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.completed {
+            return Poll::Ready(None);
+        }
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(meta))) => {
+                this.yielded_item = true;
+                Poll::Ready(Some(Ok(meta)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.metrics.record(
+                    this.operation,
+                    "error",
+                    ObjectStoreMetricsDecorator::<M>::object_store_error_kind(&error),
+                    this.started_at.elapsed(),
+                );
+                this.completed = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.metrics.record(this.operation, "ok", "none", this.started_at.elapsed());
+                this.completed = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<M: S3RequestMetrics> Drop for InstrumentedListStream<M> {
+    fn drop(&mut self) {
+        if self.completed || !self.yielded_item {
+            return;
+        }
+        self.metrics.record(self.operation, "ok", "none", self.started_at.elapsed());
+        self.completed = true;
+    }
+}
+
+/// Object store decorator that records queue S3 call metrics.
+pub struct ObjectStoreMetricsDecorator<M> {
+    inner: Arc<dyn ObjectStore>,
+    metrics: M,
+}
+
+impl<M> fmt::Debug for ObjectStoreMetricsDecorator<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ObjectStoreMetricsDecorator").finish()
+    }
+}
+
+impl<M> fmt::Display for ObjectStoreMetricsDecorator<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ObjectStoreMetricsDecorator")
+    }
+}
+
+impl<M: S3RequestMetrics> ObjectStoreMetricsDecorator<M> {
+    /// Create a new object-store metrics decorator.
+    pub const fn new(inner: Arc<dyn ObjectStore>, metrics: M) -> Self {
+        Self { inner, metrics }
+    }
+
+    fn record_object_store_outcome<T>(&self, operation: &str, started_at: Instant, outcome: &object_store::Result<T>) {
+        let duration = started_at.elapsed();
+        match outcome {
+            Ok(_) => self.metrics.record(operation, "ok", "none", duration),
+            Err(error) => self
+                .metrics
+                .record(operation, "error", Self::object_store_error_kind(error), duration),
+        }
+    }
+
+    fn instrument_list_stream(
+        &self,
+        operation: &'static str,
+        inner_stream: BoxStream<'static, object_store::Result<ObjectMeta>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        InstrumentedListStream::new(inner_stream, Arc::new(self.metrics.clone()), operation).boxed()
+    }
+
+    fn object_store_error_kind(error: &object_store::Error) -> &'static str {
+        match error {
+            object_store::Error::AlreadyExists { .. } => "already_exists",
+            object_store::Error::NotFound { .. } => "not_found",
+            object_store::Error::PermissionDenied { .. } | object_store::Error::Unauthenticated { .. } => {
+                "permission_denied"
+            }
+            object_store::Error::Generic { source, .. } => {
+                source.downcast_ref::<io::Error>().map_or("other", |io_error| {
+                    if Self::is_timeout_io(io_error) {
+                        "timeout"
+                    } else {
+                        "other"
+                    }
+                })
+            }
+            _ => "other",
+        }
+    }
+
+    fn is_timeout_io(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::HostUnreachable
+        )
+    }
+}
+
+#[async_trait]
+impl<M: S3RequestMetrics> ObjectStore for ObjectStoreMetricsDecorator<M> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let started_at = Instant::now();
+        let outcome = self.inner.put_opts(location, payload, opts).await;
+        self.record_object_store_outcome("put", started_at, &outcome);
+        outcome
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        let operation = if options.head {
+            "head"
+        } else if options.range.is_some() {
+            "get_range"
+        } else {
+            "get"
+        };
+        let started_at = Instant::now();
+        let outcome = self.inner.get_opts(location, options).await;
+        self.record_object_store_outcome(operation, started_at, &outcome);
+        outcome
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let inner_stream = self.inner.list(prefix);
+        self.instrument_list_stream("list", inner_stream)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        let inner_stream = self.inner.list_with_offset(prefix, offset);
+        self.instrument_list_stream("list_with_offset", inner_stream)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        let started_at = Instant::now();
+        let outcome = self.inner.list_with_delimiter(prefix).await;
+        self.record_object_store_outcome("list_with_delimiter", started_at, &outcome);
+        outcome
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
     }
 }
 
@@ -930,6 +1288,441 @@ impl QueueWriterEvents for WalWriterMetrics {
                 KeyValue::new("topic", topic.to_string()),
                 KeyValue::new("reason", reason.to_string()),
             ],
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use icegate_queue::{ParquetQueueReader, Topic};
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
+    };
+    use opentelemetry::{KeyValue, metrics::MeterProvider as _};
+    use opentelemetry_sdk::metrics::{
+        InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        data::{AggregatedMetrics, MetricData},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    struct FlakyListStore {
+        inner: Arc<dyn ObjectStore>,
+        failures_left: Mutex<usize>,
+        attempts: AtomicUsize,
+    }
+
+    impl FlakyListStore {
+        fn new(inner: Arc<dyn ObjectStore>, failures: usize) -> Self {
+            Self {
+                inner,
+                failures_left: Mutex::new(failures),
+                attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Debug for FlakyListStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.debug_struct("FlakyListStore").finish()
+        }
+    }
+
+    impl std::fmt::Display for FlakyListStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "FlakyListStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FlakyListStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let should_fail = {
+                let mut failures_left = self.failures_left.lock().expect("poisoned lock");
+                if *failures_left == 0 {
+                    false
+                } else {
+                    *failures_left -= 1;
+                    true
+                }
+            };
+            if should_fail {
+                let error = object_store::Error::Generic {
+                    store: "FlakyListStore",
+                    source: Box::new(io::Error::new(io::ErrorKind::TimedOut, "temporary timeout")),
+                };
+                return futures::stream::once(async move { Err(error) }).boxed();
+            }
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn metric_labels(data_point: &[KeyValue]) -> Vec<(String, String)> {
+        let mut labels = data_point
+            .iter()
+            .map(|kv| (kv.key.as_str().to_string(), kv.value.as_str().into_owned()))
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels
+    }
+
+    fn labels_match(labels: &[(String, String)], expected: &[(&str, &str)]) -> bool {
+        if labels.len() != expected.len() {
+            return false;
+        }
+        expected.iter().all(|(key, value)| {
+            labels
+                .iter()
+                .any(|(label_key, label_value)| label_key == key && label_value == value)
+        })
+    }
+
+    fn build_meter_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        (provider, exporter)
+    }
+
+    fn find_histogram_count(
+        exporter: &InMemoryMetricExporter,
+        metric_name: &str,
+        expected_labels: &[(&str, &str)],
+    ) -> u64 {
+        let mut total = 0_u64;
+        let resource_metrics = exporter.get_finished_metrics().expect("failed to read metrics");
+        for rm in resource_metrics {
+            for sm in rm.scope_metrics() {
+                for metric in sm.metrics() {
+                    if metric.name() != metric_name {
+                        continue;
+                    }
+                    if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() {
+                        for point in histogram.data_points() {
+                            let labels = metric_labels(&point.attributes().cloned().collect::<Vec<_>>());
+                            if labels_match(&labels, expected_labels) {
+                                total = total.saturating_add(point.count());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn queue_reader_object_store_metrics_decorator_records_success_and_error() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("queue/logs/00000000000000000000.parquet");
+        store
+            .put(&path, PutPayload::from_bytes(Bytes::from_static(b"segment")))
+            .await
+            .expect("failed to put object");
+
+        let (provider, exporter) = build_meter_provider();
+        let meter = provider.meter("test_queue_reader_object_store_metrics");
+        let metrics = QueueReaderS3Metrics::new(&meter);
+        let decorated: Arc<dyn ObjectStore> = Arc::new(ObjectStoreMetricsDecorator::new(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            metrics,
+        ));
+
+        decorated.head(&path).await.expect("head should succeed");
+        let missing_path = Path::from("queue/logs/missing.parquet");
+        let _ = decorated.head(&missing_path).await;
+        let range_bytes = decorated.get_range(&path, 0..3).await.expect("range read should succeed");
+        assert_eq!(range_bytes, Bytes::from_static(b"seg"));
+        provider.force_flush().expect("failed to flush metrics");
+
+        let ok_labels = &[
+            ("operation", "head"),
+            ("status", "ok"),
+            ("error_kind", "none"),
+            ("component", "queue_reader"),
+        ];
+        let error_labels = &[
+            ("operation", "head"),
+            ("status", "error"),
+            ("error_kind", "not_found"),
+            ("component", "queue_reader"),
+        ];
+        let get_range_labels = &[
+            ("operation", "get_range"),
+            ("status", "ok"),
+            ("error_kind", "none"),
+            ("component", "queue_reader"),
+        ];
+
+        assert!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_shift_queue_reader_s3_request_duration",
+                ok_labels,
+            ) >= 1
+        );
+        assert!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_shift_queue_reader_s3_request_duration",
+                error_labels,
+            ) >= 1
+        );
+        assert_eq!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_shift_queue_reader_s3_request_duration",
+                get_range_labels,
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_reader_retries_are_counted_as_multiple_s3_attempts() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("queue/logs/00000000000000000000.parquet");
+        store
+            .put(&path, PutPayload::from_bytes(Bytes::from_static(b"segment")))
+            .await
+            .expect("failed to put object");
+
+        let base_store: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let flaky_store = Arc::new(FlakyListStore::new(base_store, 1));
+
+        let (provider, exporter) = build_meter_provider();
+        let meter = provider.meter("test_queue_reader_retry_metrics");
+        let metrics = QueueReaderS3Metrics::new(&meter);
+        let decorated_store: Arc<dyn ObjectStore> = Arc::new(ObjectStoreMetricsDecorator::new(
+            Arc::clone(&flaky_store) as Arc<dyn ObjectStore>,
+            metrics,
+        ));
+        let reader = ParquetQueueReader::new("queue", decorated_store, 128).expect("reader init failed");
+
+        let topic: Topic = "logs".to_string();
+        let cancel = CancellationToken::new();
+        let segments = reader
+            .list_segments(&topic, 0, &cancel)
+            .await
+            .expect("list_segments should succeed after retry");
+
+        assert_eq!(segments.len(), 1);
+        assert!(flaky_store.attempts() > 1, "expected retries for list_with_offset");
+
+        provider.force_flush().expect("failed to flush metrics");
+        let operation_labels = &[
+            ("operation", "list_with_offset"),
+            ("component", "queue_reader"),
+            ("status", "error"),
+            ("error_kind", "timeout"),
+        ];
+        let success_labels = &[
+            ("operation", "list_with_offset"),
+            ("component", "queue_reader"),
+            ("status", "ok"),
+            ("error_kind", "none"),
+        ];
+        let error_attempts = find_histogram_count(
+            &exporter,
+            "icegate_ingest_shift_queue_reader_s3_request_duration",
+            operation_labels,
+        );
+        let success_attempts = find_histogram_count(
+            &exporter,
+            "icegate_ingest_shift_queue_reader_s3_request_duration",
+            success_labels,
+        );
+        assert!(error_attempts >= 1, "retry error attempt must be counted");
+        assert!(success_attempts >= 1, "successful retry attempt must be counted");
+        assert!(
+            error_attempts + success_attempts > 1,
+            "all retry attempts must contribute to request rate metric"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_writer_object_store_metrics_decorator_records_put_conflict_and_head() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("queue/logs/00000000000000000000.parquet");
+
+        let (provider, exporter) = build_meter_provider();
+        let meter = provider.meter("test_queue_writer_object_store_metrics");
+        let metrics = QueueWriterS3Metrics::new(&meter);
+        let decorated: Arc<dyn ObjectStore> = Arc::new(ObjectStoreMetricsDecorator::new(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            metrics,
+        ));
+
+        let create_opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        decorated
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(Bytes::from_static(b"segment")),
+                create_opts.clone(),
+            )
+            .await
+            .expect("first put should succeed");
+        let _ = decorated
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(Bytes::from_static(b"segment")),
+                create_opts,
+            )
+            .await;
+        decorated.head(&path).await.expect("head should succeed");
+
+        provider.force_flush().expect("failed to flush metrics");
+
+        let put_ok_labels = &[
+            ("operation", "put"),
+            ("status", "ok"),
+            ("error_kind", "none"),
+            ("component", "queue_writer"),
+        ];
+        let put_conflict_labels = &[
+            ("operation", "put"),
+            ("status", "error"),
+            ("error_kind", "already_exists"),
+            ("component", "queue_writer"),
+        ];
+        let head_ok_labels = &[
+            ("operation", "head"),
+            ("status", "ok"),
+            ("error_kind", "none"),
+            ("component", "queue_writer"),
+        ];
+
+        assert_eq!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_shift_queue_writer_s3_request_duration",
+                put_ok_labels,
+            ),
+            1
+        );
+        assert!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_shift_queue_writer_s3_request_duration",
+                put_conflict_labels,
+            ) >= 1
+        );
+        assert_eq!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_shift_queue_writer_s3_request_duration",
+                head_ok_labels,
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_writer_object_store_metrics_decorator_records_list_on_first_item() {
+        let store = Arc::new(InMemory::new());
+        let path_1 = Path::from("queue/logs/00000000000000000000.parquet");
+        let path_2 = Path::from("queue/logs/00000000000000000001.parquet");
+        store
+            .put(&path_1, PutPayload::from_bytes(Bytes::from_static(b"segment-1")))
+            .await
+            .expect("failed to put object");
+        store
+            .put(&path_2, PutPayload::from_bytes(Bytes::from_static(b"segment-2")))
+            .await
+            .expect("failed to put object");
+
+        let (provider, exporter) = build_meter_provider();
+        let meter = provider.meter("test_queue_writer_list_metrics");
+        let metrics = QueueWriterS3Metrics::new(&meter);
+        let decorated: Arc<dyn ObjectStore> = Arc::new(ObjectStoreMetricsDecorator::new(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            metrics,
+        ));
+
+        let prefix = Path::from("queue/logs/");
+        let mut stream = decorated.list(Some(&prefix));
+        let first = stream.next().await.expect("expected at least one list item");
+        assert!(first.is_ok(), "first list item should be ok");
+        drop(stream);
+
+        provider.force_flush().expect("failed to flush metrics");
+
+        let list_ok_labels = &[
+            ("operation", "list"),
+            ("status", "ok"),
+            ("error_kind", "none"),
+            ("component", "queue_writer"),
+        ];
+
+        assert_eq!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_shift_queue_writer_s3_request_duration",
+                list_ok_labels,
+            ),
+            1
         );
     }
 }
