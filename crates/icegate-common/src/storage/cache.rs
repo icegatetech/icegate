@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use foyer::{DeviceBuilder, HybridCache};
+use foyer::{DeviceBuilder as _, HybridCache};
 use futures::future::try_join_all;
 use opendal::raw::oio::{self, Read};
 use opendal::raw::{
@@ -714,7 +714,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             // Merge into cache value.
             let mut merged = existing.unwrap_or_else(CacheValue::new);
             for (offset, data) in &fetched {
-                merged.insert_range(*offset, &data.to_vec());
+                merged.insert_range(*offset, &data.to_bytes());
             }
 
             // Extract requested range before inserting into cache (avoids
@@ -827,7 +827,7 @@ impl<A: Access> oio::Write for CacheWriter<A> {
             version: metadata.version().map(str::to_string),
         };
         let mut value = CacheValue::new();
-        value.insert_range(0, &buffer.to_vec());
+        value.insert_range(0, &buffer.to_bytes());
         self.inner.cache.insert(key.clone(), value);
         self.inner.stat_cache.remove(&key);
 

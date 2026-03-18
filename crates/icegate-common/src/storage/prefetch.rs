@@ -30,6 +30,7 @@ use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider as _};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
@@ -281,6 +282,14 @@ pub struct PrefetchConfig {
     /// Default: `false`.
     #[serde(default)]
     pub prefetch_dictionary_pages: bool,
+    /// Maximum number of concurrent prefetch tasks.
+    /// Default: 32.
+    #[serde(default = "default_max_concurrent_prefetches")]
+    pub max_concurrent_prefetches: usize,
+}
+
+const fn default_max_concurrent_prefetches() -> usize {
+    32
 }
 
 const fn default_enabled() -> bool {
@@ -297,6 +306,7 @@ impl Default for PrefetchConfig {
             max_prefetch_bytes: default_max_prefetch_bytes(),
             prefetch_columns: None,
             prefetch_dictionary_pages: false,
+            max_concurrent_prefetches: default_max_concurrent_prefetches(),
         }
     }
 }
@@ -432,6 +442,7 @@ impl<A: Access> Layer<A> for PrefetchLayer {
         PrefetchAccessor {
             inner: Arc::new(PrefetchInner {
                 accessor: inner,
+                prefetch_semaphore: Arc::new(Semaphore::new(self.config.max_concurrent_prefetches)),
                 config: self.config.clone(),
                 seen: self.seen.clone(),
                 tracker: self.tracker.clone(),
@@ -446,6 +457,10 @@ impl<A: Access> Layer<A> for PrefetchLayer {
 // PrefetchAccessor
 // ---------------------------------------------------------------------------
 
+/// Maximum number of entries in the `seen` set before it is cleared.
+/// Prevents unbounded memory growth for long-running processes.
+const MAX_SEEN_ENTRIES: usize = 100_000;
+
 /// Shared state between the accessor and spawned prefetch tasks.
 struct PrefetchInner<A: Access> {
     accessor: A,
@@ -458,6 +473,9 @@ struct PrefetchInner<A: Access> {
     /// with PAR1) can be detected and decoded.
     pending_footers: DashMap<Arc<str>, usize>,
     metrics: PrefetchMetrics,
+    /// Bounds the number of concurrent prefetch tasks to avoid
+    /// overwhelming the backend with parallel reads.
+    prefetch_semaphore: Arc<Semaphore>,
 }
 
 /// The accessor produced by [`PrefetchLayer`].
@@ -471,6 +489,15 @@ struct PrefetchInner<A: Access> {
 ///    reads for column chunks.
 pub(crate) struct PrefetchAccessor<A: Access> {
     inner: Arc<PrefetchInner<A>>,
+}
+
+/// Insert a path into the `seen` set, clearing it first if it has grown
+/// beyond [`MAX_SEEN_ENTRIES`] to prevent unbounded memory growth.
+fn bounded_seen_insert(seen: &DashSet<Arc<str>>, path: Arc<str>) {
+    if seen.len() > MAX_SEEN_ENTRIES {
+        seen.clear();
+    }
+    seen.insert(path);
 }
 
 /// Maximum read size (in bytes) considered for footer detection.
@@ -637,7 +664,7 @@ fn spawn_prefetches_if_needed<A: Access>(
             tracing::warn!(%path, error = %e, "Parquet footer metadata decode failed, skipping prefetch");
             inner.metrics.record_footer_parse_failure();
             // Mark as seen to avoid retrying decode on every read.
-            inner.seen.insert(path);
+            bounded_seen_insert(&inner.seen, path);
             return;
         }
     };
@@ -645,7 +672,7 @@ fn spawn_prefetches_if_needed<A: Access>(
     // Mark as seen only after successful parse — the initial small suffix
     // read must not prevent the subsequent full-metadata read from
     // triggering prefetch.
-    inner.seen.insert(path.clone());
+    bounded_seen_insert(&inner.seen, path.clone());
 
     let (raw_ranges, summary) = compute_prefetch_ranges(&metadata, &inner.config);
     if raw_ranges.is_empty() {
@@ -680,17 +707,27 @@ fn spawn_prefetches_if_needed<A: Access>(
 
 /// Spawn background read tasks for the given byte ranges.
 ///
-/// Each task reads a merged range through the inner layer stack (so the
-/// result lands in the cache) and notifies waiters on completion.
+/// Each task acquires a permit from the prefetch semaphore before reading,
+/// bounding the number of concurrent prefetch tasks. The task reads a
+/// merged range through the inner layer stack (so the result lands in the
+/// cache) and notifies waiters on completion.
 fn schedule_prefetch_tasks<A: Access>(inner: &Arc<PrefetchInner<A>>, path: &Arc<str>, ranges: &[(u64, u64)]) {
     for &(offset, length) in ranges {
         let inner = inner.clone();
         let path = path.clone();
         inner.tracker.register(path.clone(), offset, length);
         let task_span = tracing::debug_span!("prefetch_task", %path, offset, length);
+        let semaphore = inner.prefetch_semaphore.clone();
 
         tokio::spawn(
             async move {
+                // Acquire a permit to bound concurrent prefetch tasks.
+                // If the semaphore is closed (shouldn't happen), skip gracefully.
+                let Ok(_permit) = semaphore.acquire().await else {
+                    inner.tracker.complete(&path, offset, length);
+                    return;
+                };
+
                 let task_start = Instant::now();
                 let range = opendal::raw::BytesRange::new(offset, Some(length));
                 let result = inner.accessor.read(&path, OpRead::default().with_range(range)).await;
@@ -739,7 +776,7 @@ fn try_decode_and_prefetch<A: Access>(
 ) {
     match ParquetMetaDataReader::decode_metadata(bytes) {
         Ok(metadata) => {
-            inner.seen.insert(path.clone());
+            bounded_seen_insert(&inner.seen, path.clone());
 
             let (raw_ranges, summary) = compute_prefetch_ranges(&metadata, &inner.config);
             if raw_ranges.is_empty() {
@@ -773,7 +810,7 @@ fn try_decode_and_prefetch<A: Access>(
         Err(e) => {
             tracing::warn!(%path, error = %e, "Parquet metadata decode failed on follow-up read");
             inner.metrics.record_footer_parse_failure();
-            inner.seen.insert(path);
+            bounded_seen_insert(&inner.seen, path);
         }
     }
 }

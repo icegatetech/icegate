@@ -1,4 +1,7 @@
 {{- if .Values.query.enabled -}}
+{{- if and .Values.query.cache.persistence.enabled (gt (int .Values.query.replicaCount) 1) }}
+{{- fail "persistence.enabled cannot be true when query.replicaCount > 1 with RWO PVC" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +11,11 @@ metadata:
     {{- include "icegate.componentLabels" (dict "context" . "component" "query") | nindent 4 }}
 spec:
   replicas: {{ .Values.query.replicaCount }}
+  # TODO(medium): Think about make it more safe
+  {{- if and .Values.query.cache.enabled .Values.query.cache.persistence.enabled }}
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "icegate.selectorLabels" (dict "context" . "component" "query") | nindent 6 }}

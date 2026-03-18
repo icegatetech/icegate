@@ -110,6 +110,8 @@ query:
       storageClass:
         create: true
         name: ""
+        ## CSI provisioner: use "ebs.csi.eks.amazonaws.com" for EKS Auto Mode
+        provisioner: ebs.csi.aws.com
         type: gp3
         iops: "3000"
         throughput: "125"

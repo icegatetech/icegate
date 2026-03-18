@@ -47,6 +47,7 @@ query:
       enabled: true
       storageClass:
         create: true
+        provisioner: ebs.csi.eks.amazonaws.com
         type: gp3
         iops: "6000"
         throughput: "500"

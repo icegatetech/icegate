@@ -52,6 +52,7 @@ impl IcegateSchemaProvider {
 
         // Load all tables concurrently — each table requires a catalog
         // REST call, so parallelizing cuts wall-clock time significantly.
+        // With only 4 tables, unbounded concurrency is fine.
         let tables_loaded = try_join_all(table_idents.iter().map(|ident| {
             let name = ident.name().to_string();
             let catalog = Arc::clone(&catalog);

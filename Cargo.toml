@@ -73,7 +73,7 @@ async-trait = "0.1"
 antlr4rust = "0.5"
 
 # Iceberg — fork of apache/iceberg-rust `develop` branch.
-# Pinned to a specific revision for DataFusion 51 + Arrow 57 compat.
+# Pinned to a specific revision for DataFusion 52 + Arrow 57 compat.
 # Fork adds WAL-aware table scan support; track upstream merge progress in GH-71.
 iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
 iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }

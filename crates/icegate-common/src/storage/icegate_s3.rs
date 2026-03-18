@@ -65,7 +65,7 @@ pub fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
         cfg.region = Some(region);
     }
     if let Some(path_style_access) = m.remove(S3_PATH_STYLE_ACCESS) {
-        cfg.enable_virtual_host_style = !is_truthy(path_style_access.to_lowercase().as_str());
+        cfg.enable_virtual_host_style = !is_truthy(&path_style_access);
     }
     if let Some(arn) = m.remove(S3_ASSUME_ROLE_ARN) {
         cfg.role_arn = Some(arn);
@@ -103,17 +103,17 @@ pub fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
     }
 
     if let Some(allow_anonymous) = m.remove(S3_ALLOW_ANONYMOUS)
-        && is_truthy(allow_anonymous.to_lowercase().as_str())
+        && is_truthy(&allow_anonymous)
     {
         cfg.allow_anonymous = true;
     }
     if let Some(disable_ec2_metadata) = m.remove(S3_DISABLE_EC2_METADATA)
-        && is_truthy(disable_ec2_metadata.to_lowercase().as_str())
+        && is_truthy(&disable_ec2_metadata)
     {
         cfg.disable_ec2_metadata = true;
     }
     if let Some(disable_config_load) = m.remove(S3_DISABLE_CONFIG_LOAD)
-        && is_truthy(disable_config_load.to_lowercase().as_str())
+        && is_truthy(&disable_config_load)
     {
         cfg.disable_config_load = true;
     }

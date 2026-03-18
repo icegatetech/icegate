@@ -1,8 +1,8 @@
 //! Query execution engine with background-refreshed catalog provider.
 //!
 //! The `QueryEngine` keeps a cached catalog provider that is refreshed
-//! in the background every `refresh_interval` (default 5s). The cached
-//! provider remains valid for up to `max_age` (default 10s). Queries
+//! in the background every `refresh_interval` (default 15s). The cached
+//! provider remains valid for up to `max_age` (default 30s). Queries
 //! never block on catalog rebuilds unless the cache is completely cold
 //! (first query or after a prolonged refresh failure).
 
@@ -128,13 +128,14 @@ impl QueryEngine {
     /// Start the background catalog refresh task.
     ///
     /// Spawns a tokio task that rebuilds the catalog provider every
-    /// `refresh_interval`. The task runs until the `QueryEngine` is
-    /// dropped (the `watch::Sender` is closed).
+    /// `refresh_interval`. The task holds a `Weak` reference to the
+    /// engine and stops automatically when the engine is dropped.
     pub fn start_background_refresh(self: &Arc<Self>) {
-        let engine = Arc::clone(self);
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             // Build the initial provider eagerly so the first query
             // doesn't have to wait.
+            let Some(engine) = weak.upgrade() else { return };
             match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
                 Ok(provider) => {
                     let _ = engine.provider_tx.send(Some(CachedProvider {
@@ -147,11 +148,17 @@ impl QueryEngine {
                     tracing::error!(error = %e, "Failed to build initial catalog provider");
                 }
             }
+            let refresh_interval = engine.refresh_interval;
+            drop(engine); // Release strong ref during sleep
 
             loop {
-                tokio::time::sleep(engine.refresh_interval).await;
+                tokio::time::sleep(refresh_interval).await;
 
-                // Stop if all receivers are dropped (engine is gone).
+                let Some(engine) = weak.upgrade() else {
+                    tracing::debug!("Catalog refresh task stopping: engine dropped");
+                    break;
+                };
+
                 if engine.provider_tx.is_closed() {
                     tracing::debug!("Catalog refresh task stopping: channel closed");
                     break;
@@ -173,6 +180,7 @@ impl QueryEngine {
                         tracing::warn!(error = %e, "Background catalog refresh failed, keeping stale provider");
                     }
                 }
+                drop(engine); // Release strong ref during sleep
             }
         });
     }

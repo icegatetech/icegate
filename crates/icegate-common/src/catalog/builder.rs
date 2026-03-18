@@ -76,9 +76,10 @@ impl IoHandle {
             Some(cc) => Some(build_storage_cache(cc).await?),
             None => None,
         };
+        let prefetch = if cache.is_some() { prefetch_config } else { None };
         Ok(Self {
             cache,
-            prefetch: prefetch_config,
+            prefetch,
             stat_ttl,
         })
     }

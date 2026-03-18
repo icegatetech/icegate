@@ -5,7 +5,7 @@ metadata:
   name: {{ include "icegate.cacheStorageClassName" . }}
   labels:
     {{- include "icegate.componentLabels" (dict "context" . "component" "query") | nindent 4 }}
-provisioner: ebs.csi.aws.com
+provisioner: {{ .Values.query.cache.persistence.storageClass.provisioner }}
 parameters:
   type: {{ .Values.query.cache.persistence.storageClass.type }}
   {{- if has .Values.query.cache.persistence.storageClass.type (list "gp3" "io1" "io2") }}

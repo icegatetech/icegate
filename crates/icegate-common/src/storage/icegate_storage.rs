@@ -7,12 +7,13 @@
 //! # Layer stack (outermost → innermost)
 //!
 //! ```text
-//! OtelMetrics → FoyerCache → OtelTrace → Retry → S3
+//! Prefetch → FoyerCache → OtelMetrics → OtelTrace → Retry → S3
 //! ```
 //!
-//! - **`OtelMetrics`** sees every request including cache hits.
+//! - **`Prefetch`** triggers background reads for Parquet metadata/column chunks.
 //! - **`FoyerCache`** short-circuits reads on cache hits.
-//! - **`OtelTrace`** only traces actual S3 round-trips.
+//! - **`OtelMetrics`** records metrics for all requests (cache hits + misses).
+//! - **`OtelTrace`** traces actual S3 round-trips (cache misses only).
 //! - **`Retry`** retries transient S3 failures.
 
 use std::sync::Arc;
@@ -84,7 +85,14 @@ impl IceGateStorage {
     fn create_operator<'a>(&self, path: &'a str) -> Result<(Operator, &'a str)> {
         match self {
             Self::Memory(op) => {
-                let relative = path.strip_prefix("memory:/").unwrap_or_else(|| path.get(1..).unwrap_or(path));
+                let relative = if let Some(rest) = path.strip_prefix("memory:/") {
+                    rest.trim_start_matches('/')
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid memory URL: {path}, expected prefix memory:/"),
+                    ));
+                };
                 Ok((op.clone(), relative))
             }
             Self::S3 {
@@ -110,10 +118,11 @@ impl IceGateStorage {
                 };
 
                 // Layer stack (applied bottom-up, executed top-down):
-                //   Retry → OtelTrace → OtelMetrics → [FoyerCache]
+                //   Retry → OtelTrace → OtelMetrics → [FoyerCache] → [Prefetch]
                 //
-                // Tracing and metrics sit below the cache so they only
-                // observe actual S3 round-trips (cache misses).
+                // OtelTrace sits below OtelMetrics; cache sits outermost (before Prefetch).
+                // OtelMetrics sees all requests (cache hits + misses).
+                // OtelTrace only traces actual S3 round-trips (below cache).
                 //
                 // `Operator::layer()` returns `Operator` directly (type-erased),
                 // so no `.finish()` is needed.

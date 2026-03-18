@@ -29,6 +29,9 @@ use tracing::instrument;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
 
+/// Default batch size for Iceberg table scans.
+const ICEBERG_SCAN_BATCH_SIZE: usize = 8192;
+
 /// Convert an Iceberg error into a DataFusion error.
 fn to_datafusion_error(error: iceberg::Error) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::External(error.into())
@@ -193,7 +196,10 @@ async fn get_batch_stream(
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
-    let table_scan = scan_builder.with_batch_size(Some(8192)).build().map_err(to_datafusion_error)?;
+    let table_scan = scan_builder
+        .with_batch_size(Some(ICEBERG_SCAN_BATCH_SIZE))
+        .build()
+        .map_err(to_datafusion_error)?;
 
     // Stream file plan directly into ArrowReader via to_arrow() — data
     // reading starts as soon as the first file task arrives from manifest
