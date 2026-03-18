@@ -242,13 +242,15 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
     let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
 
+    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), config.catalog.prefetch.clone()).await?;
+
     // Create object store based on queue base_path
     // Ingest writes data — no read cache or stat cache needed, pass None.
     let (store, normalized_path) = create_object_store(
         &queue_config.common.base_path,
         Some(&config.storage.backend),
-        None,
-        None,
+        io_cache.cache(),
+        io_cache.prefetch(),
         None,
     )?;
 

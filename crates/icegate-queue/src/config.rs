@@ -92,7 +92,7 @@ pub struct QueueWriteConfig {
 impl Default for QueueWriteConfig {
     fn default() -> Self {
         Self {
-            write_retries: 3,
+            write_retries: 5,
             compression: CompressionCodec::default(),
             records_per_flush_multiplier: 1,
             max_bytes_per_flush: 64 * 1024 * 1024, // 64 MB
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(config.common.base_path, "s3://bucket/queue");
         assert_eq!(config.common.channel_capacity, 1024);
         assert_eq!(config.common.max_row_group_size, 8192);
-        assert_eq!(config.write.write_retries, 3);
+        assert_eq!(config.write.write_retries, 5);
         assert_eq!(config.write.records_per_flush_multiplier, 1);
         assert_eq!(config.write.max_bytes_per_flush, 64 * 1024 * 1024);
         assert_eq!(config.write.flush_interval_ms, 200);

@@ -575,35 +575,41 @@ impl<A: Access> LayeredAccess for PrefetchAccessor<A> {
             //    too small for the full metadata, we store the expected
             //    metadata_len in `pending_footers` so we can recognize
             //    read (b) when it arrives.
-            if inner.config.enabled && should_check_for_footer(&path, buf.len()) && !inner.seen.contains(path.as_str())
-            {
-                let bytes = buf.to_bytes();
+            if inner.config.enabled && path.ends_with(".parquet") && !inner.seen.contains(path.as_str()) {
                 let path_arc: Arc<str> = Arc::from(path.as_str());
 
-                // Build the request range so prefetch can skip ranges
-                // already covered by this read.
-                let meta_request_range = range.size().map(|s| (req_offset, s));
-
-                if is_parquet_footer(&bytes) {
-                    // Case (a): buffer ends with PAR1 — either a small
-                    // suffix probe or a large read that includes the full
-                    // footer. `spawn_prefetches` handles both via
-                    // `FooterParseResult`.
-                    tracing::debug!(footer_bytes = bytes.len(), "Parquet footer detected");
-                    inner.metrics.record_footer_detected();
-                    spawn_prefetches_if_needed(&inner, path_arc, &bytes, meta_request_range);
-                } else if let Some((_, expected_len)) = inner.pending_footers.remove(path_arc.as_ref()) {
-                    // Case (b): follow-up metadata read after a small
-                    // suffix probe. The buffer contains raw Thrift bytes
-                    // without the PAR1 suffix. Verify the size matches
-                    // before attempting decode.
+                // Check for a pending follow-up metadata read BEFORE
+                // applying the size gate — the Thrift metadata blob can
+                // exceed MAX_FOOTER_READ_SIZE for wide tables.
+                if let Some(entry) = inner.pending_footers.get(path_arc.as_ref()) {
+                    let expected_len = *entry;
+                    drop(entry); // release DashMap read guard
+                    let bytes = buf.to_bytes();
                     if bytes.len() >= expected_len {
+                        // Case (b): follow-up metadata read after a small
+                        // suffix probe. The buffer contains raw Thrift bytes
+                        // without the PAR1 suffix. Only remove the pending
+                        // entry now that we've matched the expected size.
+                        inner.pending_footers.remove(path_arc.as_ref());
+                        let meta_request_range = range.size().map(|s| (req_offset, s));
                         tracing::debug!(
                             footer_bytes = bytes.len(),
                             expected_len,
                             "Parquet metadata read detected (follow-up)"
                         );
                         try_decode_and_prefetch(&inner, path_arc, &bytes, meta_request_range);
+                    }
+                    // If bytes.len() < expected_len, this is a short
+                    // intermediate read — leave the pending entry for
+                    // the real metadata read.
+                } else if should_check_for_footer(&path, buf.len()) {
+                    // Case (a): initial read — check for PAR1 magic suffix.
+                    let bytes = buf.to_bytes();
+                    if is_parquet_footer(&bytes) {
+                        let meta_request_range = range.size().map(|s| (req_offset, s));
+                        tracing::debug!(footer_bytes = bytes.len(), "Parquet footer detected");
+                        inner.metrics.record_footer_detected();
+                        spawn_prefetches_if_needed(&inner, path_arc, &bytes, meta_request_range);
                     }
                 }
             }

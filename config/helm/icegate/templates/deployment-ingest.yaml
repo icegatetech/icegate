@@ -78,12 +78,21 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.ingest.cache.enabled }}
+            - name: cache
+              mountPath: {{ .Values.ingest.cache.diskDir }}
+            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "icegate.componentName" (dict "context" . "component" "ingest") }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.ingest.cache.enabled }}
+        - name: cache
+          emptyDir:
+            sizeLimit: {{ .Values.ingest.cache.volumeSizeLimit }}
+        {{- end }}
       {{- with .Values.ingest.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

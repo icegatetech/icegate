@@ -12,8 +12,8 @@
 //!
 //! - **`Prefetch`** triggers background reads for Parquet metadata/column chunks.
 //! - **`FoyerCache`** short-circuits reads on cache hits.
-//! - **`OtelMetrics`** records metrics for all requests (cache hits + misses).
-//! - **`OtelTrace`** traces actual S3 round-trips (cache misses only).
+//! - **`OtelMetrics`** records metrics for S3 round-trips (cache misses only).
+//! - **`OtelTrace`** adds per-request tracing spans for S3 calls (cache misses only).
 //! - **`Retry`** retries transient S3 failures.
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use bytes::Bytes;
 use iceberg::io::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig, StorageFactory};
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
-use opendal::layers::{OtelMetricsLayer, OtelTraceLayer, RetryLayer};
+use opendal::layers::{OtelMetricsLayer, OtelTraceLayer};
 use opendal::services::S3Config;
 use opentelemetry::metrics::Meter;
 use serde::{Deserialize, Serialize};
@@ -126,7 +126,7 @@ impl IceGateStorage {
                 //
                 // `Operator::layer()` returns `Operator` directly (type-erased),
                 // so no `.finish()` is needed.
-                let mut operator = bare.layer(RetryLayer::new()).layer(OtelTraceLayer::default());
+                let mut operator = bare.layer(OtelTraceLayer::default());
 
                 if let Some(m) = meter {
                     operator = operator.layer(OtelMetricsLayer::builder().register(m));

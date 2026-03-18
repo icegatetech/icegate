@@ -75,7 +75,15 @@ query:
 ## Ingest component
 ingest:
   enabled: true
-  replicaCount: 1
+  replicaCount: 3
+  cache:
+    enabled: true
+    memorySizeMb: 512
+    diskDir: /tmp/icegate/cache
+    diskSizeMb: 4096
+    volumeSizeLimit: 5Gi
+  prefetch:
+    enabled: true
   waitForDependencies:
     enabled: true
     endpoints:
@@ -103,11 +111,11 @@ ingest:
   rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
-      cpu: "2"
-      memory: 3Gi
+      cpu: "1"
+      memory: 2Gi
     limits:
-      cpu: "2"
-      memory: 3Gi
+      cpu: "1"
+      memory: 2Gi
 
 ## ServiceMonitor (Prometheus Operator)
 serviceMonitor:

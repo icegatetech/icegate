@@ -10,7 +10,7 @@ use std::time::Duration;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use object_store_opendal::OpendalStore;
 use opendal::Operator;
-use opendal::layers::{OtelMetricsLayer, OtelTraceLayer, RetryLayer};
+use opendal::layers::{OtelMetricsLayer, OtelTraceLayer};
 use opendal::services::S3;
 
 use super::StorageBackend;
@@ -32,7 +32,6 @@ pub type ObjectStoreWithPath = (Arc<dyn ObjectStore>, String);
 /// 1. **`OtelMetricsLayer`** — `OpenTelemetry` storage metrics (sees cache hits)
 /// 2. **`FoyerLayer`** — shared hybrid cache (if `cache` is provided)
 /// 3. **`OtelTraceLayer`** — `OpenTelemetry` distributed tracing (S3 calls only)
-/// 4. **`RetryLayer`** — automatic retries with exponential backoff
 ///
 /// The resulting [`Operator`] is wrapped in [`OpendalStore`] to satisfy
 /// the `Arc<dyn ObjectStore>` interface expected by all downstream code.
@@ -119,7 +118,6 @@ pub fn create_s3_store(
     let meter = opentelemetry::global::meter("icegate-wal");
     let base = Operator::new(s3)
         .map_err(|e| CommonError::Config(format!("Failed to build OpenDAL S3 operator: {e}")))?
-        .layer(RetryLayer::new())
         .layer(OtelTraceLayer::default())
         .layer(OtelMetricsLayer::builder().register(&meter));
 
