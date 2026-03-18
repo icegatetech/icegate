@@ -75,16 +75,16 @@ query:
 ## Ingest component
 ingest:
   enabled: true
-  replicaCount: 3
+  replicaCount: 2
   cache:
     enabled: true
-    memorySizeMb: 512
+    memorySizeMb: 128
     diskDir: /tmp/icegate/cache
-    diskSizeMb: 4096
+    diskSizeMb: 1024
     statTtlSecs: 300
-    volumeSizeLimit: 5Gi
+    volumeSizeLimit: 2Gi
   prefetch:
-    enabled: true
+    enabled: false
   waitForDependencies:
     enabled: true
     endpoints:
@@ -113,10 +113,10 @@ ingest:
   resources:
     requests:
       cpu: "1"
-      memory: 2Gi
+      memory: 2.5Gi
     limits:
       cpu: "1"
-      memory: 2Gi
+      memory: 2.5Gi
 
 ## ServiceMonitor (Prometheus Operator)
 serviceMonitor:

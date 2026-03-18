@@ -5,10 +5,10 @@ allInOne:
   resources:
     requests:
       cpu: 500m
-      memory: 1Gi
+      memory: 1.5Gi
     limits:
       cpu: 500m
-      memory: 1Gi
+      memory: 1.5Gi
 
 # Disable individual components (all-in-one bundles them)
 collector:
