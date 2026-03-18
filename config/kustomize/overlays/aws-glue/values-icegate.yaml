@@ -36,11 +36,24 @@ query:
   enabled: true
   replicaCount: 1
   cache:
-    enabled: false
-    memorySizeMb: 128
+    enabled: true
+    memorySizeMb: 1024
     diskDir: /tmp/icegate/cache
     diskSizeMb: 4096
-    volumeSizeLimit: 5Gi
+    statTtlSecs: 300
+    ## Volume size for the disk cache (emptyDir sizeLimit or PVC storage request)
+    volumeSizeLimit: 20Gi
+    persistence:
+      enabled: true
+      storageClass:
+        create: true
+        provisioner: ebs.csi.eks.amazonaws.com
+        type: gp3
+        iops: "6000"
+        throughput: "500"
+        encrypted: "true"
+  prefetch:
+    enabled: true
   loki:
     enabled: true
     port: 3100
@@ -86,14 +99,14 @@ ingest:
         useSsl: true
         jobStateCodec: json
         requestTimeoutSecs: 5
-  rustLog: "info,icegate_ingest=info,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
       cpu: "2"
-      memory: 2Gi
+      memory: 4Gi
     limits:
       cpu: "2"
-      memory: 2Gi
+      memory: 4Gi
 
 ## ServiceMonitor (Prometheus Operator)
 serviceMonitor:

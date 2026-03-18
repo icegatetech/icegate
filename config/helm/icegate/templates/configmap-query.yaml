@@ -15,6 +15,9 @@ data:
         memory_size_mb: {{ .Values.query.cache.memorySizeMb }}
         disk_dir: {{ .Values.query.cache.diskDir }}
         disk_size_mb: {{ .Values.query.cache.diskSizeMb }}
+        {{- with .Values.query.cache.statTtlSecs }}
+        stat_ttl_secs: {{ . }}
+        {{- end }}
       {{- end }}
       {{- if .Values.query.prefetch.enabled }}
       prefetch:

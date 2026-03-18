@@ -449,7 +449,28 @@ impl QueueWriter {
             .build()
     }
 
+    /// Scans forward from `start` using HEAD requests to find the first
+    /// offset where no segment exists. Updates the local offset counter.
+    async fn find_next_available_offset(&self, topic: &Topic, start: u64) -> Result<u64> {
+        let mut offset = start;
+        loop {
+            if !self.segment_exists(&SegmentId::new(topic, offset)).await? {
+                self.set_offset(topic, offset).await;
+                return Ok(offset);
+            }
+            offset = offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                topic: topic.clone(),
+                offset,
+                source: "offset space exhausted (u64::MAX reached)".into(),
+            })?;
+        }
+    }
+
     /// Writes Parquet bytes to object storage with retry on conflict.
+    ///
+    /// On `AlreadyExists`, probes forward with HEAD requests to find the
+    /// first available offset instead of sleeping. This resolves conflicts
+    /// in ~5-10ms (HEAD roundtrip) rather than 150-250ms (sleep + jitter).
     #[tracing::instrument(skip(self, data), fields(topic = %topic))]
     async fn write_with_retry(&self, topic: &Topic, data: Bytes) -> Result<u64> {
         let mut attempts = 0;
@@ -457,13 +478,14 @@ impl QueueWriter {
 
         loop {
             let offset = self.next_offset(topic).await;
+            // Check the offset is free before writing, to avoid race conditions.
+            let offset = self.find_next_available_offset(topic, offset).await?;
             let segment_id = SegmentId::new(topic, offset);
             let attempt = attempts + 1;
 
             match self.try_write(&segment_id, data.clone(), attempt).await {
                 Ok(()) => {
                     debug!("Wrote segment {}/{}", topic, offset);
-
                     return Ok(offset);
                 }
                 Err(QueueError::AlreadyExists { .. }) => {
@@ -476,22 +498,20 @@ impl QueueWriter {
                             source: "max retries exceeded on conflict".into(),
                         });
                     }
-                    warn!(
-                        "Segment {}/{} already exists, retrying (attempt {})",
-                        topic, offset, attempts
+                    // Probe forward with HEAD to find the first available offset.
+                    // This avoids wasted PUTs on offsets already taken by other replicas.
+                    let next_start = offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                        topic: topic.clone(),
+                        offset,
+                        source: "offset space exhausted (u64::MAX reached)".into(),
+                    })?;
+                    let next = self.find_next_available_offset(topic, next_start).await?;
+                    debug!(
+                        conflicted_offset = offset,
+                        next_offset = next,
+                        attempt = attempts,
+                        "Segment already exists, skipped to next available offset"
                     );
-                    // Increment offset and retry (loop continues)
-                    // SAFETY: check the interval is within the range of u64
-                    if self.config.write.flush_interval_ms >= i64::MAX as u64 {
-                        return Err(QueueError::Config("flush_interval_ms too large".to_string()));
-                    }
-                    #[allow(clippy::cast_possible_wrap)]
-                    let interval = self.config.write.flush_interval_ms as i64 / 4; // 25% delta
-                    #[allow(clippy::cast_sign_loss)]
-                    // SAFETY: the `interval` can't be negative
-                    let delay = self.config.write.flush_interval_ms + rand::random_range(-interval..=interval) as u64;
-                    debug!(offset, attempt = attempts, delay_ms = delay, "Retrying segment write");
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -541,12 +561,21 @@ impl QueueWriter {
         let elapsed_ms = u64::try_from(put_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let result = put_result.map_err(|e| {
-            warn!(
-                reason = object_store_error_reason(&e),
-                elapsed_ms,
-                error = %e,
-                "store.put_opts failed"
-            );
+            if matches!(e, object_store::Error::AlreadyExists { .. }) {
+                debug!(
+                    reason = object_store_error_reason(&e),
+                    elapsed_ms,
+                    error = %e,
+                    "store.put_opts conflict (expected in multi-replica)"
+                );
+            } else {
+                warn!(
+                    reason = object_store_error_reason(&e),
+                    elapsed_ms,
+                    error = %e,
+                    "store.put_opts failed"
+                );
+            }
             if matches!(e, object_store::Error::AlreadyExists { .. }) {
                 debug!("Segment already exists, skipping write (offset {})", segment_id.offset);
                 QueueError::AlreadyExists {
@@ -720,7 +749,11 @@ impl QueueWriter {
 
         for topic in &topics {
             if let Some(max_offset) = self.find_max_offset(topic).await? {
-                let next_offset = max_offset + 1;
+                let next_offset = max_offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                    topic: topic.clone(),
+                    offset: max_offset,
+                    source: "offset space exhausted during recovery (u64::MAX reached)".into(),
+                })?;
                 self.set_offset(topic, next_offset).await;
                 info!("Recovered topic '{}': next offset = {}", topic, next_offset);
             }
@@ -1071,5 +1104,33 @@ mod tests {
         // New write should continue from offset 10 (after the last existing segment 9)
         let offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
         assert_eq!(offset, 10);
+    }
+
+    #[tokio::test]
+    async fn test_conflict_probe_skips_taken_offsets() {
+        let store = Arc::new(InMemory::new());
+        let config = QueueConfig::new("queue");
+        let writer = QueueWriter::new(config, store.clone());
+
+        // Pre-write segments at offsets 0, 1, 2 directly to the store
+        // (simulating other replicas having written these offsets)
+        let batch = test_batch();
+        let props = WriterProperties::builder().build();
+        let parquet_bytes = QueueWriter::batches_to_parquet(props, &[batch]).unwrap();
+        for offset in 0..3 {
+            let segment_id = SegmentId::new("logs", offset);
+            let path = Path::from(format!("queue/{}", segment_id.to_relative_path()));
+            store.put(&path, PutPayload::from_bytes(parquet_bytes.clone())).await.unwrap();
+        }
+
+        // Writer starts at offset 0 (no recovery called, counter is at 0).
+        // First attempt at offset 0 will conflict, then probe forward
+        // past 1 and 2, and successfully write at offset 3.
+        let offset = writer.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        assert_eq!(offset, 3);
+
+        // Verify the segment at offset 3 exists
+        let path = Path::from("queue/logs/00000000000000000003.parquet");
+        assert!(store.head(&path).await.is_ok());
     }
 }

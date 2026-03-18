@@ -1,0 +1,25 @@
+{{- if and .Values.query.enabled .Values.query.cache.enabled .Values.query.cache.persistence.enabled (not .Values.query.cache.persistence.existingClaim) (not .Values.query.cache.persistence.storageClassName) .Values.query.cache.persistence.storageClass.create -}}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ include "icegate.cacheStorageClassName" . }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "query") | nindent 4 }}
+provisioner: {{ .Values.query.cache.persistence.storageClass.provisioner }}
+parameters:
+  type: {{ .Values.query.cache.persistence.storageClass.type }}
+  {{- if has .Values.query.cache.persistence.storageClass.type (list "gp3" "io1" "io2") }}
+  iops: {{ .Values.query.cache.persistence.storageClass.iops | quote }}
+  {{- end }}
+  {{- if eq .Values.query.cache.persistence.storageClass.type "gp3" }}
+  throughput: {{ .Values.query.cache.persistence.storageClass.throughput | quote }}
+  {{- end }}
+  fsType: {{ .Values.query.cache.persistence.storageClass.fsType }}
+  encrypted: {{ .Values.query.cache.persistence.storageClass.encrypted | quote }}
+  {{- if .Values.query.cache.persistence.storageClass.kmsKeyId }}
+  kmsKeyId: {{ .Values.query.cache.persistence.storageClass.kmsKeyId }}
+  {{- end }}
+volumeBindingMode: {{ .Values.query.cache.persistence.storageClass.volumeBindingMode }}
+reclaimPolicy: {{ .Values.query.cache.persistence.storageClass.reclaimPolicy }}
+allowVolumeExpansion: {{ .Values.query.cache.persistence.storageClass.allowVolumeExpansion }}
+{{- end }}

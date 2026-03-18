@@ -9,7 +9,7 @@ use std::{
 };
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use icegate_common::{IoCacheHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
+use icegate_common::{IoHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use object_store::ObjectStore;
 use tokio::runtime::Builder;
@@ -229,25 +229,35 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     tracing::info!("Loading configuration from {:?}", config_path);
     tracing::info!("Configuration loaded successfully");
 
-    // Initialize WAL queue based on queue config's base_path
-    tracing::info!("Initializing WAL queue");
-    let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
-    let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
-
-    // Create object store based on queue base_path
-    // Ingest writes data — no read cache needed, pass None.
-    let (store, normalized_path) =
-        create_object_store(&queue_config.common.base_path, Some(&config.storage.backend), None)?;
-
-    // Update queue config with normalized base path
-    let mut queue_config = queue_config;
-    queue_config.common.base_path = normalized_path;
-
+    // Initialize metrics early so that the global meter provider is available
+    // for OpenDAL's OtelMetricsLayer and Iceberg's IceGateStorageFactory.
     let metrics_runtime = if config.metrics.enabled {
         Some(Arc::new(MetricsRuntime::new("ingest")?))
     } else {
         None
     };
+
+    // Initialize WAL queue based on queue config's base_path
+    tracing::info!("Initializing WAL queue");
+    let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
+    let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
+
+    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), config.catalog.prefetch.clone()).await?;
+
+    // Create object store based on queue base_path.
+    // Read cache, prefetch, and stat TTL are supplied via io_cache for the
+    // shifter's queue reader which shares this store.
+    let (store, normalized_path) = create_object_store(
+        &queue_config.common.base_path,
+        Some(&config.storage.backend),
+        io_cache.cache(),
+        io_cache.prefetch(),
+        io_cache.stat_ttl(),
+    )?;
+
+    // Update queue config with normalized base path
+    let mut queue_config = queue_config;
+    queue_config.common.base_path = normalized_path;
     let wal_writer_metrics = metrics_runtime.as_ref().map_or_else(
         || WalWriterMetrics::new_disabled(Arc::new(NoopQueueWriterEvents)),
         |runtime| WalWriterMetrics::new(&runtime.meter(), Arc::new(NoopQueueWriterEvents)),
@@ -268,7 +278,6 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
-    let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
     let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());

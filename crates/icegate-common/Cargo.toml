@@ -18,11 +18,17 @@ testing = ["testcontainers", "aws-config", "aws-sdk-s3"]
 
 [dependencies]
 # Iceberg
-iceberg = { workspace = true, features = ["io-cache"] }
+iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-catalog-s3tables = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 foyer = { workspace = true, features = ["tracing"] }
+parquet = { workspace = true }
+typetag = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+url = { workspace = true }
 
 # Storage
 object_store = { workspace = true }
@@ -41,8 +47,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
+
+# Async runtime
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 axum = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-instrumentation-tokio = { workspace = true }

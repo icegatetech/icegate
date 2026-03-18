@@ -5,5 +5,5 @@
 mod builder;
 mod config;
 
-pub use builder::{CatalogBuilder, IoCacheHandle};
+pub use builder::{CatalogBuilder, IoHandle};
 pub use config::{CacheConfig, CatalogBackend, CatalogConfig};

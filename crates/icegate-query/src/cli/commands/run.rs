@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use icegate_common::{CatalogBuilder, IoCacheHandle, MetricsRuntime, create_object_store, run_metrics_server};
+use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, create_object_store, run_metrics_server};
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
@@ -51,9 +51,17 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     tracing::info!("Loading configuration from {:?}", config_path);
     tracing::info!("Configuration loaded successfully");
 
+    // Initialize metrics early so that the global meter provider is available
+    // for OpenDAL's OtelMetricsLayer and Iceberg's IceGateStorageFactory.
+    let metrics_runtime = if config.metrics.enabled {
+        Some(Arc::new(MetricsRuntime::new("query")?))
+    } else {
+        None
+    };
+
     // Initialize catalog
     tracing::info!("Initializing catalog");
-    let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
+    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), config.catalog.prefetch.clone()).await?;
     let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 
     tracing::info!("Catalog initialized successfully");
@@ -61,9 +69,12 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Validate engine config
     config.engine.validate()?;
 
-    // Extract the shared foyer cache from the IO cache handle so the WAL
-    // object store can share the same hybrid cache as the Iceberg catalog.
+    // Extract the shared foyer cache, prefetch config, and stat TTL from the
+    // IO cache handle so the WAL object store shares the same layers as the
+    // Iceberg catalog.
     let foyer_cache = io_cache.cache().cloned();
+    let prefetch = io_cache.prefetch().cloned();
+    let stat_ttl = io_cache.stat_ttl();
 
     // Initialize WAL object store from queue config
     tracing::info!(queue_base_path = %config.queue.common.base_path, "Initializing WAL object store");
@@ -71,13 +82,15 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         &config.queue.common.base_path,
         Some(&config.storage.backend),
         foyer_cache.as_ref(),
+        prefetch.as_ref(),
+        stat_ttl,
     )?;
 
     // Build the shared WAL queue reader
     let wal_reader = ParquetQueueReader::new(prefix, Arc::clone(&store), config.engine.batch_size)
         .map_err(|e| QueryError::Config(format!("Failed to create WAL reader: {e}")))?;
 
-    // Initialize query engine with cached catalog provider
+    // Initialize query engine with background catalog refresh.
     tracing::info!("Initializing query engine");
     let query_engine = Arc::new(QueryEngine::new(
         catalog,
@@ -85,18 +98,14 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         store,
         Arc::new(wal_reader),
     ));
+    query_engine.start_background_refresh();
 
     // Create cancellation token for coordinated shutdown
     let cancel_token = CancellationToken::new();
 
     tracing::info!("Query engine initialized successfully");
 
-    // Initialize metrics
-    let metrics_runtime = if config.metrics.enabled {
-        Some(Arc::new(MetricsRuntime::new("query")?))
-    } else {
-        None
-    };
+    // Build query-level metrics instruments from the (already-initialized) meter.
     let query_metrics = Arc::new(
         metrics_runtime.as_ref().map_or_else(QueryMetrics::new_disabled, |runtime| {
             QueryMetrics::new(&runtime.meter())

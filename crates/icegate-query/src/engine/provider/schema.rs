@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
+use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
 use icegate_queue::ParquetQueueReader;
@@ -49,24 +50,32 @@ impl IcegateSchemaProvider {
     ) -> Result<Self, iceberg::Error> {
         let table_idents = catalog.list_tables(&namespace).await?;
 
-        let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::with_capacity(table_idents.len());
-
-        for ident in &table_idents {
+        // Load all tables concurrently — each table requires a catalog
+        // REST call, so parallelizing cuts wall-clock time significantly.
+        // With only 4 tables, unbounded concurrency is fine.
+        let tables_loaded = try_join_all(table_idents.iter().map(|ident| {
             let name = ident.name().to_string();
-            let provider: Arc<dyn TableProvider> = if name == icegate_common::LOGS_TOPIC {
-                // Logs table: use our merged provider
-                let table_ident = iceberg::TableIdent::new(namespace.clone(), name.clone());
-                let provider =
-                    IcegateTableProvider::try_new(Arc::clone(&catalog), table_ident, Arc::clone(&wal_reader)).await?;
-                Arc::new(provider)
-            } else {
-                // Other tables: standard Iceberg static provider
-                let table = catalog.load_table(ident).await?;
-                let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
-                Arc::new(provider)
-            };
-            tables.insert(name, provider);
-        }
+            let catalog = Arc::clone(&catalog);
+            let namespace = namespace.clone();
+            let wal_reader = Arc::clone(&wal_reader);
+            async move {
+                let provider: Arc<dyn TableProvider> = if name == icegate_common::LOGS_TOPIC {
+                    // Logs table: use our merged provider
+                    let table_ident = iceberg::TableIdent::new(namespace, name.clone());
+                    let provider = IcegateTableProvider::try_new(catalog, table_ident, wal_reader).await?;
+                    Arc::new(provider)
+                } else {
+                    // Other tables: standard Iceberg static provider
+                    let table = catalog.load_table(ident).await?;
+                    let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
+                    Arc::new(provider)
+                };
+                Ok::<_, iceberg::Error>((name, provider))
+            }
+        }))
+        .await?;
+
+        let tables: HashMap<String, Arc<dyn TableProvider>> = tables_loaded.into_iter().collect();
 
         tracing::debug!(table_count = tables.len(), "Schema provider initialized");
         Ok(Self { tables })

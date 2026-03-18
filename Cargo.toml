@@ -53,9 +53,14 @@ icegate-queue = { path = "crates/icegate-queue" }
 arrow = { version = "57.0", default-features = false, features = ["prettyprint"] }
 parquet = { version = "57.0", default-features = false, features = ["arrow", "object_store", "zstd"] }
 object_store = { version = "0.12", features = ["aws"] }
-opendal = { version = "0.55", features = ["services-s3", "layers-otel-trace", "layers-otel-metrics"] }
-object_store_opendal = "0.55"
-foyer = { version = "0.18", features = ["serde"] }
+opendal = { git = "https://github.com/apache/opendal", rev = "67cd00d744e8a6a64b9729f49bdaa1f4de215885", features = ["services-s3", "layers-otel-trace", "layers-otel-metrics"]}
+object_store_opendal = { git = "https://github.com/apache/opendal", rev = "67cd00d744e8a6a64b9729f49bdaa1f4de215885" }
+foyer = { version = "0.22", features = ["serde"] }
+typetag = "0.2"
+# reqsign is a transitive dep of iceberg-storage-opendal; `reqwest_request` and
+# `services-aws` were previously unified by the crates.io opendal `services-s3`
+# feature but are lost under the git patch.  Declaring it here restores them.
+reqsign = { version = "0.16", default-features = false, features = ["reqwest_request", "services-aws"] }
 
 # Error handling
 thiserror = "2"
@@ -67,18 +72,17 @@ async-trait = "0.1"
 # ANTLR parser
 antlr4rust = "0.5"
 
-# Iceberg — fork of apache/iceberg-rust `develop` branch.
-# Pinned to a specific revision for DataFusion 51 + Arrow 57 compat.
-# Fork adds WAL-aware table scan support; track upstream merge progress in GH-71.
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
-iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
-iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "5d933cea2fdfeae6c25052cfdd4bfd89e555ac1e" }
+# Iceberg — pinned revision from upstream apache/iceberg-rust `develop` branch.
+# Pinned for DataFusion 52 + Arrow 57 compat; WAL-aware scan work tracked in GH-71.
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
+iceberg-catalog-s3tables = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
+iceberg-catalog-glue = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
 
 # DataFusion
-datafusion = "51.0"
-datafusion-tracing = "51.0"
+datafusion = "52.2"
+datafusion-tracing = "52.0"
 
 # Async runtime
 tokio = { version = "1.48.0", features = ["full", "tracing"] }
@@ -129,6 +133,8 @@ regex = "1.12"
 # Utilities
 itoa = "1"
 bytes = "1.11.1"
+dashmap = "6.1"
+url = "2"
 hex = "0.4"
 rand = "0.9.2"
 
