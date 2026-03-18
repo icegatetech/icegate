@@ -81,6 +81,7 @@ services:
       context: ../..
       dockerfile: config/docker/Dockerfile
       args:
+        BINARY: maintain
         PROFILE: ${PROFILE:-release}
     command: ["/usr/local/bin/maintain", "migrate", "create", "--config", "/etc/icegate/maintain.yaml"]
     volumes:
@@ -100,6 +101,7 @@ services:
       context: ../..
       dockerfile: config/docker/Dockerfile
       args:
+        BINARY: query
         PROFILE: ${PROFILE:-release}
     command: ["/usr/local/bin/query", "run", "--config", "/etc/icegate/query.yaml"]
     deploy:
@@ -133,6 +135,7 @@ services:
       context: ../..
       dockerfile: config/docker/Dockerfile
       args:
+        BINARY: ingest
         PROFILE: ${PROFILE:-release}
     command: ["/usr/local/bin/ingest", "run", "--config", "/etc/icegate/ingest.yaml"]
     ports:
