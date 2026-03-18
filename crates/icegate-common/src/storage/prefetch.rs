@@ -442,9 +442,7 @@ impl<A: Access> Layer<A> for PrefetchLayer {
         PrefetchAccessor {
             inner: Arc::new(PrefetchInner {
                 accessor: inner,
-                prefetch_semaphore: Arc::new(Semaphore::new(
-                    self.config.max_concurrent_prefetches.max(1),
-                )),
+                prefetch_semaphore: Arc::new(Semaphore::new(self.config.max_concurrent_prefetches.max(1))),
                 config: self.config.clone(),
                 seen: self.seen.clone(),
                 tracker: self.tracker.clone(),
