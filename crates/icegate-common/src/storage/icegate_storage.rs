@@ -7,14 +7,13 @@
 //! # Layer stack (outermost → innermost)
 //!
 //! ```text
-//! Prefetch → FoyerCache → OtelMetrics → OtelTrace → Retry → S3
+//! Prefetch → FoyerCache → OtelMetrics → OtelTrace → S3
 //! ```
 //!
 //! - **`Prefetch`** triggers background reads for Parquet metadata/column chunks.
 //! - **`FoyerCache`** short-circuits reads on cache hits.
 //! - **`OtelMetrics`** records metrics for S3 round-trips (cache misses only).
 //! - **`OtelTrace`** adds per-request tracing spans for S3 calls (cache misses only).
-//! - **`Retry`** retries transient S3 failures.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,11 +117,10 @@ impl IceGateStorage {
                 };
 
                 // Layer stack (applied bottom-up, executed top-down):
-                //   Retry → OtelTrace → OtelMetrics → [FoyerCache] → [Prefetch]
+                //   OtelTrace → OtelMetrics → [FoyerCache] → [Prefetch]
                 //
-                // OtelTrace sits below OtelMetrics; cache sits outermost (before Prefetch).
-                // OtelMetrics sees all requests (cache hits + misses).
-                // OtelTrace only traces actual S3 round-trips (below cache).
+                // OtelTrace and OtelMetrics sit below the cache so they only
+                // observe actual S3 round-trips (cache misses).
                 //
                 // `Operator::layer()` returns `Operator` directly (type-erased),
                 // so no `.finish()` is needed.

@@ -500,7 +500,12 @@ impl QueueWriter {
                     }
                     // Probe forward with HEAD to find the first available offset.
                     // This avoids wasted PUTs on offsets already taken by other replicas.
-                    let next = self.find_next_available_offset(topic, offset + 1).await?;
+                    let next_start = offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                        topic: topic.clone(),
+                        offset,
+                        source: "offset space exhausted (u64::MAX reached)".into(),
+                    })?;
+                    let next = self.find_next_available_offset(topic, next_start).await?;
                     debug!(
                         conflicted_offset = offset,
                         next_offset = next,
@@ -744,7 +749,11 @@ impl QueueWriter {
 
         for topic in &topics {
             if let Some(max_offset) = self.find_max_offset(topic).await? {
-                let next_offset = max_offset + 1;
+                let next_offset = max_offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                    topic: topic.clone(),
+                    offset: max_offset,
+                    source: "offset space exhausted during recovery (u64::MAX reached)".into(),
+                })?;
                 self.set_offset(topic, next_offset).await;
                 info!("Recovered topic '{}': next offset = {}", topic, next_offset);
             }

@@ -89,8 +89,14 @@ pub fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
                 cfg.server_side_encryption_aws_kms_key_id = s3_sse_key;
             }
             "custom" => {
+                let key = s3_sse_key.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("{S3_SSE_TYPE} is 'custom' (SSE-C) but {S3_SSE_KEY} is not set"),
+                    )
+                })?;
                 cfg.server_side_encryption_customer_algorithm = Some("AES256".to_string());
-                cfg.server_side_encryption_customer_key = s3_sse_key;
+                cfg.server_side_encryption_customer_key = Some(key);
                 cfg.server_side_encryption_customer_key_md5 = m.remove(S3_SSE_MD5);
             }
             _ => {
@@ -125,8 +131,8 @@ pub fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
 ///
 /// Parses `path` (e.g. `s3://bucket/prefix/file.json`) to extract the
 /// bucket name, then constructs a bare operator **without** any layers.
-/// Callers are responsible for adding retry, tracing, metrics, and
-/// caching layers before calling `.finish()`.
+/// Callers are responsible for adding tracing, metrics, and caching
+/// layers before calling `.finish()`.
 ///
 /// # Arguments
 ///

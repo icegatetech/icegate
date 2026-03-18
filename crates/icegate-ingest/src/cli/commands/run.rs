@@ -277,7 +277,6 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
-    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), config.catalog.prefetch.clone()).await?;
     let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());

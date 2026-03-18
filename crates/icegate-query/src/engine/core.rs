@@ -84,6 +84,8 @@ pub struct QueryEngine {
     /// Watch channel sender — held to keep the channel alive and used
     /// by the background refresh task.
     provider_tx: Arc<watch::Sender<Option<CachedProvider>>>,
+    /// Guards synchronous rebuilds so only one task rebuilds at a time.
+    rebuild_lock: tokio::sync::Mutex<()>,
     /// Maximum age before a cached provider is considered too stale.
     max_age: Duration,
     /// Interval between background refresh cycles.
@@ -120,6 +122,7 @@ impl QueryEngine {
             wal_reader,
             provider_rx,
             provider_tx: Arc::new(provider_tx),
+            rebuild_lock: tokio::sync::Mutex::new(()),
             max_age: DEFAULT_MAX_AGE,
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
         }
@@ -254,6 +257,17 @@ impl QueryEngine {
                 max_age_ms = self.max_age.as_millis(),
                 "Cached catalog provider exceeded max_age, rebuilding synchronously"
             );
+        }
+
+        // Single-flight rebuild guard: only one task rebuilds at a time.
+        let _guard = self.rebuild_lock.lock().await;
+
+        // Re-check after acquiring lock — another task may have rebuilt.
+        let rechecked = self.provider_rx.borrow().clone();
+        if let Some(cached) = rechecked {
+            if cached.created_at.elapsed() < self.max_age {
+                return Ok(cached.provider);
+            }
         }
 
         // Cold cache or stale provider — synchronous rebuild.

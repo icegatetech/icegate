@@ -29,9 +29,10 @@ pub type ObjectStoreWithPath = (Arc<dyn ObjectStore>, String);
 /// Parses the S3 URL, reads credentials from environment, and builds the store
 /// with the following layer stack (outermost first):
 ///
-/// 1. **`OtelMetricsLayer`** — `OpenTelemetry` storage metrics (sees cache hits)
+/// 1. **`PrefetchLayer`** — Parquet column-chunk prefetch (outermost, if configured)
 /// 2. **`FoyerLayer`** — shared hybrid cache (if `cache` is provided)
-/// 3. **`OtelTraceLayer`** — `OpenTelemetry` distributed tracing (S3 calls only)
+/// 3. **`OtelMetricsLayer`** — `OpenTelemetry` storage metrics (S3 round-trips / cache misses only)
+/// 4. **`OtelTraceLayer`** — `OpenTelemetry` distributed tracing (S3 calls only)
 ///
 /// The resulting [`Operator`] is wrapped in [`OpendalStore`] to satisfy
 /// the `Arc<dyn ObjectStore>` interface expected by all downstream code.
