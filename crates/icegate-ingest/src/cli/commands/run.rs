@@ -244,14 +244,15 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), config.catalog.prefetch.clone()).await?;
 
-    // Create object store based on queue base_path
-    // Ingest writes data — no read cache or stat cache needed, pass None.
+    // Create object store based on queue base_path.
+    // Read cache, prefetch, and stat TTL are supplied via io_cache for the
+    // shifter's queue reader which shares this store.
     let (store, normalized_path) = create_object_store(
         &queue_config.common.base_path,
         Some(&config.storage.backend),
         io_cache.cache(),
         io_cache.prefetch(),
-        None,
+        io_cache.stat_ttl(),
     )?;
 
     // Update queue config with normalized base path

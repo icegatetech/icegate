@@ -276,6 +276,8 @@ ingest:
     memorySizeMb: 1024
     diskDir: /tmp/icegate/cache
     diskSizeMb: 4096
+    ## TTL (seconds) for caching stat/HEAD responses (optional, omit to disable)
+    statTtlSecs: 300
     ## Volume size for the disk cache (used as emptyDir sizeLimit)
     volumeSizeLimit: 5Gi
 

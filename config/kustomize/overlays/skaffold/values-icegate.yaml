@@ -81,6 +81,7 @@ ingest:
     memorySizeMb: 512
     diskDir: /tmp/icegate/cache
     diskSizeMb: 4096
+    statTtlSecs: 300
     volumeSizeLimit: 5Gi
   prefetch:
     enabled: true
