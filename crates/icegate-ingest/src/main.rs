@@ -14,7 +14,7 @@ fn main() -> Result<()> {
     let mut builder = Builder::new_multi_thread();
     builder
         .worker_threads(plan.main_threads)
-        .thread_name("icegate-ingest-main".to_string())
+        .thread_name("icegate-ingest-main")
         .enable_all();
     #[cfg(tokio_unstable)]
     builder.enable_metrics_poll_time_histogram();

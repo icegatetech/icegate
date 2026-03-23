@@ -3726,7 +3726,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (rate(icegate_ingest_shift_planned_segments_total{job=\"icegate-ingest\"}[1m]))\n/\nsum by (topic) (rate(icegate_ingest_shift_planned_tasks_total{job=\"icegate-ingest\"}[1m]))",
+          "expr": "sum by (topic) (rate(icegate_ingest_shift_planned_segments_total{job=\"icegate-ingest\"}[1m]))\n/\nclamp_min(sum by (topic) (rate(icegate_ingest_shift_planned_tasks_total{job=\"icegate-ingest\"}[1m])), 1e-12)",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
@@ -4331,7 +4331,7 @@
               }
             ]
           },
-          "unit": "bytes"
+          "unit": "Bps"
         },
         "overrides": []
       },
@@ -4366,7 +4366,7 @@
           "refId": "A"
         }
       ],
-      "title": "Shift task: parquet write bytes [1m]",
+      "title": "Shift task: parquet write throughput [1m]",
       "type": "timeseries"
     },
     {
@@ -4677,7 +4677,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (rate(icegate_ingest_shift_already_committed_total{job=\"icegate-ingest\"}[1m]))\n",
+          "expr": "sum by (topic) (increase(icegate_ingest_shift_already_committed_total{job=\"icegate-ingest\"}[1m]))\n",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"

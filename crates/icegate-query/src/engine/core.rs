@@ -7,6 +7,7 @@
 //! (first query or after a prolonged refresh failure).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use datafusion::{
@@ -78,6 +79,8 @@ pub struct QueryEngine {
     provider_tx: Arc<watch::Sender<Option<CachedProvider>>>,
     /// Guards synchronous rebuilds so only one task rebuilds at a time.
     rebuild_lock: tokio::sync::Mutex<()>,
+    /// Ensures `start_background_refresh` is called at most once.
+    refresh_started: AtomicBool,
     /// Maximum age before a cached provider is considered too stale.
     max_age: Duration,
     /// Interval between background refresh cycles.
@@ -117,6 +120,7 @@ impl QueryEngine {
             provider_rx,
             provider_tx: Arc::new(provider_tx),
             rebuild_lock: tokio::sync::Mutex::new(()),
+            refresh_started: AtomicBool::new(false),
             max_age,
             refresh_interval,
         }
@@ -128,21 +132,30 @@ impl QueryEngine {
     /// `refresh_interval`. The task holds a `Weak` reference to the
     /// engine and stops automatically when the engine is dropped.
     pub fn start_background_refresh(self: &Arc<Self>) {
+        if self.refresh_started.swap(true, Ordering::SeqCst) {
+            tracing::warn!("start_background_refresh called more than once, ignoring");
+            return;
+        }
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             // Build the initial provider eagerly so the first query
             // doesn't have to wait.
             let Some(engine) = weak.upgrade() else { return };
-            match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
-                Ok(provider) => {
-                    let _ = engine.provider_tx.send(Some(CachedProvider {
-                        provider,
-                        created_at: Instant::now(),
-                    }));
-                    tracing::info!("Initial catalog provider built");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to build initial catalog provider");
+            {
+                // Hold rebuild_lock so synchronous rebuilds in get_provider
+                // don't race with the initial eager build.
+                let _guard = engine.rebuild_lock.lock().await;
+                match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
+                    Ok(provider) => {
+                        let _ = engine.provider_tx.send(Some(CachedProvider {
+                            provider,
+                            created_at: Instant::now(),
+                        }));
+                        tracing::info!("Initial catalog provider built");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to build initial catalog provider");
+                    }
                 }
             }
             let refresh_interval = engine.refresh_interval;
@@ -161,20 +174,23 @@ impl QueryEngine {
                     break;
                 }
 
-                match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
-                    Ok(provider) => {
-                        let _ = engine.provider_tx.send(Some(CachedProvider {
-                            provider,
-                            created_at: Instant::now(),
-                        }));
-                        tracing::debug!("Catalog provider refreshed");
-                    }
-                    Err(e) => {
-                        // Keep serving the stale provider — it's better than
-                        // failing queries. The max_age check in create_session
-                        // will force a synchronous rebuild if staleness exceeds
-                        // the threshold.
-                        tracing::warn!(error = %e, "Background catalog refresh failed, keeping stale provider");
+                {
+                    let _guard = engine.rebuild_lock.lock().await;
+                    match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
+                        Ok(provider) => {
+                            let _ = engine.provider_tx.send(Some(CachedProvider {
+                                provider,
+                                created_at: Instant::now(),
+                            }));
+                            tracing::debug!("Catalog provider refreshed");
+                        }
+                        Err(e) => {
+                            // Keep serving the stale provider — it's better than
+                            // failing queries. The max_age check in create_session
+                            // will force a synchronous rebuild if staleness exceeds
+                            // the threshold.
+                            tracing::warn!(error = %e, "Background catalog refresh failed, keeping stale provider");
+                        }
                     }
                 }
                 drop(engine); // Release strong ref during sleep

@@ -64,7 +64,7 @@ async fn test_sequential_writes_monotonic_offsets() -> Result<(), Box<dyn std::e
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch: batch.clone(),
-    
+
             response_tx,
             trace_context: None,
         })

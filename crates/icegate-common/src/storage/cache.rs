@@ -254,10 +254,10 @@ pub struct CacheValue {
 /// Helper to convert `u64` to `usize` safely.
 ///
 /// On 64-bit targets this is a no-op. On 32-bit targets it saturates
-/// (which is fine — files >4 `GiB` are not expected there).
+/// to `usize::MAX` (which is fine — files >4 `GiB` are not expected there).
 #[allow(clippy::cast_possible_truncation)]
 const fn u64_to_usize(v: u64) -> usize {
-    v as usize
+    if v > usize::MAX as u64 { usize::MAX } else { v as usize }
 }
 
 impl CacheValue {
@@ -828,10 +828,7 @@ impl<A: Access> oio::Write for CacheWriter<A> {
         let metadata = self.w.close().await?;
 
         let bytes_written = buffer.len();
-        let exceeds_limit = self
-            .inner
-            .max_write_cache_size
-            .is_some_and(|limit| bytes_written > limit);
+        let exceeds_limit = self.inner.max_write_cache_size.is_some_and(|limit| bytes_written > limit);
 
         if exceeds_limit {
             tracing::trace!(
@@ -847,11 +844,7 @@ impl<A: Access> oio::Write for CacheWriter<A> {
             value.insert_range(0, &buffer.to_bytes());
             self.inner.cache.insert(key.clone(), value);
             self.inner.stat_cache.remove(&key);
-            tracing::trace!(
-                path = self.path,
-                bytes = bytes_written,
-                "Cache populated on write"
-            );
+            tracing::trace!(path = self.path, bytes = bytes_written, "Cache populated on write");
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -895,6 +888,7 @@ impl<A: Access> oio::Delete for CacheDeleter<A> {
     }
 
     async fn flush(&mut self) -> Result<usize> {
+        let count = self.deleter.flush().await?;
         for key in &self.keys {
             tracing::trace!(path = key.path, "Cache evicted on delete");
             self.inner.cache.remove(key);
@@ -902,7 +896,7 @@ impl<A: Access> oio::Delete for CacheDeleter<A> {
             self.inner.locks.remove(key);
             self.inner.metrics.record_eviction();
         }
-        self.deleter.flush().await
+        Ok(count)
     }
 }
 

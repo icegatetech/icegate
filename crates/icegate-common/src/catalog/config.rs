@@ -158,6 +158,11 @@ impl CatalogConfig {
                     "Cache stat_ttl_secs must be greater than 0 when set".into(),
                 ));
             }
+            if cache.max_write_cache_size_mb == Some(0) {
+                return Err(CommonError::Config(
+                    "Cache max_write_cache_size_mb must be greater than 0 when set".into(),
+                ));
+            }
         }
 
         // Validate prefetch config if present

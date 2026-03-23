@@ -57,7 +57,9 @@ pub enum IceGateStorage {
     S3 {
         /// URL scheme (`s3` or `s3a`).
         configured_scheme: String,
-        /// Parsed S3 configuration.
+        /// Parsed S3 configuration (skipped during serialization to avoid
+        /// leaking credentials).
+        #[serde(skip, default = "default_s3_config")]
         config: Arc<S3Config>,
         /// Shared foyer hybrid cache (if configured).
         #[serde(skip)]
@@ -75,6 +77,11 @@ pub enum IceGateStorage {
         #[serde(skip)]
         max_write_cache_size: Option<usize>,
     },
+}
+
+/// Build a default `S3Config` for serde deserialization fallback.
+fn default_s3_config() -> Arc<S3Config> {
+    Arc::new(S3Config::default())
 }
 
 /// Build a default memory operator for serde deserialization fallback.
@@ -108,9 +115,19 @@ impl IceGateStorage {
             Self::Fs { root } => {
                 // Accept both `file:///path/to/file` and bare `/path/to/file`.
                 let absolute = path.strip_prefix("file://").unwrap_or(path);
-                let relative = absolute
-                    .strip_prefix(root.trim_end_matches('/'))
-                    .map_or(absolute, |r| r.trim_start_matches('/'));
+                // Use Path::strip_prefix for component-boundary-safe matching
+                // (prevents `/tmp/warehouse-backup` matching root `/tmp/warehouse`).
+                let abs_path = std::path::Path::new(absolute);
+                let root_path = std::path::Path::new(root.trim_end_matches('/'));
+                let relative = match abs_path.strip_prefix(root_path) {
+                    Ok(p) => p.to_str().unwrap_or(absolute),
+                    Err(_) => {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Path {absolute} is outside root {root}",),
+                        ));
+                    }
+                };
                 let mut fs_config = opendal::services::FsConfig::default();
                 fs_config.root = Some(root.clone());
                 let op = Operator::from_config(fs_config)
@@ -134,6 +151,9 @@ impl IceGateStorage {
 
                 let relative = if path.starts_with(&prefix) {
                     &path[prefix.len()..]
+                } else if path == prefix.trim_end_matches('/') {
+                    // Exact bucket root (no trailing slash) → empty relative path.
+                    ""
                 } else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,

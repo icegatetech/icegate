@@ -2438,7 +2438,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "container_memory_usage_bytes{name!=\"\"}",
+          "expr": "container_memory_usage_bytes{pod!=\"\"}",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -2451,7 +2451,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "container_spec_memory_limit_bytes{name!=\"\"}",
+          "expr": "container_spec_memory_limit_bytes{pod!=\"\"}",
           "format": "time_series",
           "hide": true,
           "interval": "",

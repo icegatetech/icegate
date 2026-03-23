@@ -354,7 +354,7 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch: batch.clone(),
-    
+
             response_tx,
             trace_context: None,
         })
@@ -395,7 +395,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch: batch.clone(),
-    
+
             response_tx,
             trace_context: None,
         })
@@ -566,7 +566,7 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-    
+
             response_tx,
             trace_context: None,
         })
@@ -617,7 +617,7 @@ async fn test_plan_max_row_groups_limit() -> Result<(), Box<dyn std::error::Erro
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-    
+
             response_tx,
             trace_context: None,
         })
@@ -663,7 +663,7 @@ async fn test_plan_segments_with_small_input_bytes_limit() -> Result<(), Box<dyn
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-    
+
             response_tx,
             trace_context: None,
         })
@@ -707,7 +707,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result() -> Result<(), Bo
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-    
+
             response_tx,
             trace_context: None,
         })
@@ -805,7 +805,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_with_skewed_metada
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-    
+
             response_tx,
             trace_context: None,
         })
@@ -899,7 +899,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metada
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-    
+
             response_tx,
             trace_context: None,
         })
@@ -989,7 +989,7 @@ async fn test_plan_segments_parallel_fails_fast_on_metadata_error_without_partia
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-    
+
             response_tx,
             trace_context: None,
         })
@@ -1043,7 +1043,7 @@ async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_with
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-    
+
             response_tx,
             trace_context: None,
         })

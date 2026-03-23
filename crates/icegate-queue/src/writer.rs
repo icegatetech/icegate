@@ -384,7 +384,6 @@ impl QueueWriter {
                 } else {
                     trace!(topic = %topic, offset, "claimed offset");
                 }
-                self.set_offset(topic, next).await;
                 return Ok(offset);
             }
             trace!(topic = %topic, offset, "offset occupied, advancing");
@@ -409,6 +408,7 @@ impl QueueWriter {
 
             match self.try_write(&segment_id, data.clone(), attempt).await {
                 Ok(()) => {
+                    self.set_offset(topic, offset + 1).await;
                     debug!("Wrote segment {}/{}", topic, offset);
                     return Ok(offset);
                 }
@@ -483,6 +483,10 @@ impl QueueWriter {
                     error = %e,
                     "store.put_opts conflict (expected in multi-replica)"
                 );
+                QueueError::AlreadyExists {
+                    topic: segment_id.topic.clone(),
+                    offset: segment_id.offset,
+                }
             } else {
                 warn!(
                     reason = object_store_error_reason(&e),
@@ -490,14 +494,6 @@ impl QueueWriter {
                     error = %e,
                     "store.put_opts failed"
                 );
-            }
-            if matches!(e, object_store::Error::AlreadyExists { .. }) {
-                debug!("Segment already exists, skipping write (offset {})", segment_id.offset);
-                QueueError::AlreadyExists {
-                    topic: segment_id.topic.clone(),
-                    offset: segment_id.offset,
-                }
-            } else {
                 QueueError::Write {
                     topic: segment_id.topic.clone(),
                     offset: segment_id.offset,

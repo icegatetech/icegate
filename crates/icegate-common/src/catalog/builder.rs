@@ -32,7 +32,10 @@ use crate::storage::icegate_storage::IceGateStorageFactory;
 /// # Usage
 ///
 /// ```ignore
-/// let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
+/// let io_cache = IoHandle::from_config(
+///     config.catalog.cache.as_ref(),
+///     config.catalog.prefetch.clone(),
+/// ).await?;
 /// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 /// // ... run servers ...
 /// // On shutdown:
