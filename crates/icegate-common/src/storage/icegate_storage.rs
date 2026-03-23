@@ -38,12 +38,20 @@ use super::prefetch::{PrefetchConfig, PrefetchLayer, PrefetchMetrics};
 
 /// IceGate storage backend with observability and caching layers.
 ///
-/// Only S3 and Memory backends are supported — IceGate does not need
-/// local-filesystem, GCS, OSS, or Azure DLS variants.
+/// Supports S3, Memory, and local Filesystem backends.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum IceGateStorage {
     /// In-memory storage (testing / ephemeral).
     Memory(#[serde(skip, default = "default_memory_operator")] Operator),
+
+    /// Local filesystem storage (development / testing).
+    ///
+    /// Uses a bare `OpenDAL` `Fs` operator without cache, metrics, or
+    /// prefetch layers — local disk doesn't need them.
+    Fs {
+        /// Root directory for the filesystem operator.
+        root: String,
+    },
 
     /// S3-compatible storage with optional caching and metrics.
     S3 {
@@ -63,6 +71,9 @@ pub enum IceGateStorage {
         /// Stat metadata cache TTL (if configured).
         #[serde(skip)]
         stat_ttl: Option<Duration>,
+        /// Max value size (bytes) to cache on writes (if configured).
+        #[serde(skip)]
+        max_write_cache_size: Option<usize>,
     },
 }
 
@@ -94,6 +105,19 @@ impl IceGateStorage {
                 };
                 Ok((op.clone(), relative))
             }
+            Self::Fs { root } => {
+                // Accept both `file:///path/to/file` and bare `/path/to/file`.
+                let absolute = path.strip_prefix("file://").unwrap_or(path);
+                let relative = absolute
+                    .strip_prefix(root.trim_end_matches('/'))
+                    .map_or(absolute, |r| r.trim_start_matches('/'));
+                let mut fs_config = opendal::services::FsConfig::default();
+                fs_config.root = Some(root.clone());
+                let op = Operator::from_config(fs_config)
+                    .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
+                    .finish();
+                Ok((op, relative))
+            }
             Self::S3 {
                 configured_scheme,
                 config,
@@ -101,6 +125,7 @@ impl IceGateStorage {
                 meter,
                 prefetch,
                 stat_ttl,
+                max_write_cache_size,
             } => {
                 // Build a bare operator from the S3 config + path.
                 let bare = s3_config_build(config, path)?;
@@ -124,7 +149,7 @@ impl IceGateStorage {
                 //
                 // `Operator::layer()` returns `Operator` directly (type-erased),
                 // so no `.finish()` is needed.
-                let mut operator = bare.layer(OtelTraceLayer::default());
+                let mut operator = bare.layer(OtelTraceLayer);
 
                 if let Some(m) = meter {
                     operator = operator.layer(OtelMetricsLayer::builder().register(m));
@@ -132,7 +157,12 @@ impl IceGateStorage {
 
                 if let Some(fc) = cache {
                     let cache_metrics = meter.as_ref().map_or_else(CacheMetrics::new_disabled, CacheMetrics::new);
-                    operator = operator.layer(CacheLayer::new(fc.clone(), cache_metrics, *stat_ttl));
+                    operator = operator.layer(CacheLayer::new(
+                        fc.clone(),
+                        cache_metrics,
+                        *stat_ttl,
+                        *max_write_cache_size,
+                    ));
                 }
 
                 // Prefetch layer sits outermost so background reads flow
@@ -204,7 +234,7 @@ impl Storage for IceGateStorage {
         } else {
             format!("{relative}/")
         };
-        op.delete_with(&dir_path).recursive(true).await.map_err(from_opendal_error)?;
+        op.remove_all(&dir_path).await.map_err(from_opendal_error)?;
         Ok(())
     }
 
@@ -260,9 +290,12 @@ impl FileWrite for IceGateFileWrite {
 /// Injected into catalog builders via
 /// [`CatalogBuilder::with_storage_factory`](iceberg::CatalogBuilder::with_storage_factory)
 /// so every `FileIO` created by the catalog uses IceGate's layered operator.
+///
+/// The factory auto-detects the storage scheme from [`StorageConfig`]
+/// properties (warehouse URI), producing `Memory`, `Fs`, or `S3` variants
+/// accordingly.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IceGateStorageFactory {
-    configured_scheme: String,
     #[serde(skip)]
     cache: Option<StorageCache>,
     #[serde(skip)]
@@ -271,6 +304,8 @@ pub struct IceGateStorageFactory {
     prefetch: Option<PrefetchConfig>,
     #[serde(skip)]
     stat_ttl: Option<Duration>,
+    #[serde(skip)]
+    max_write_cache_size: Option<usize>,
 }
 
 impl IceGateStorageFactory {
@@ -278,24 +313,45 @@ impl IceGateStorageFactory {
     ///
     /// # Arguments
     ///
-    /// * `scheme` — URL scheme (typically `"s3"` or `"s3a"`)
     /// * `cache` — optional shared foyer cache
     /// * `meter` — optional `OpenTelemetry` meter for storage metrics
     /// * `prefetch` — optional Parquet column-chunk prefetch configuration
     /// * `stat_ttl` — optional TTL for stat metadata caching
+    /// * `max_write_cache_size` — optional max value size (bytes) to cache on writes
     pub const fn new(
-        scheme: String,
         cache: Option<StorageCache>,
         meter: Option<Meter>,
         prefetch: Option<PrefetchConfig>,
         stat_ttl: Option<Duration>,
+        max_write_cache_size: Option<usize>,
     ) -> Self {
         Self {
-            configured_scheme: scheme,
             cache,
             meter,
             prefetch,
             stat_ttl,
+            max_write_cache_size,
+        }
+    }
+
+    /// Detect the storage scheme from config properties.
+    ///
+    /// Inspects the `warehouse` property to determine the URI scheme.
+    /// Falls back to `"s3"` if no warehouse is set.
+    fn detect_scheme(config: &StorageConfig) -> &str {
+        let props = config.props();
+        let warehouse = props.get("warehouse").map_or("", String::as_str);
+        if warehouse.starts_with("memory://") || warehouse.starts_with("memory:/") {
+            "memory"
+        } else if warehouse.starts_with("file://") || warehouse.starts_with('/') {
+            // Bare absolute paths (e.g. `/tmp/warehouse`) are treated as
+            // local filesystem — common in tests and the Memory catalog.
+            "file"
+        } else if warehouse.starts_with("s3a://") {
+            "s3a"
+        } else {
+            // Default to S3 for s3://, empty, or unknown schemes.
+            "s3"
         }
     }
 }
@@ -303,13 +359,25 @@ impl IceGateStorageFactory {
 #[typetag::serde(name = "IceGateStorageFactory")]
 impl StorageFactory for IceGateStorageFactory {
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        Ok(Arc::new(IceGateStorage::S3 {
-            configured_scheme: self.configured_scheme.clone(),
-            config: s3_config_parse(config.props().clone())?.into(),
-            cache: self.cache.clone(),
-            meter: self.meter.clone(),
-            prefetch: self.prefetch.clone(),
-            stat_ttl: self.stat_ttl,
-        }))
+        match Self::detect_scheme(config) {
+            "memory" => Ok(Arc::new(IceGateStorage::Memory(default_memory_operator()))),
+            "file" => {
+                let warehouse = config.props().get("warehouse").cloned().unwrap_or_default();
+                let root = warehouse.strip_prefix("file://").unwrap_or(&warehouse).to_string();
+                Ok(Arc::new(IceGateStorage::Fs { root }))
+            }
+            scheme => {
+                // S3 or S3a — apply cache/metrics/prefetch layers.
+                Ok(Arc::new(IceGateStorage::S3 {
+                    configured_scheme: scheme.to_string(),
+                    config: s3_config_parse(config.props().clone())?.into(),
+                    cache: self.cache.clone(),
+                    meter: self.meter.clone(),
+                    prefetch: self.prefetch.clone(),
+                    stat_ttl: self.stat_ttl,
+                    max_write_cache_size: self.max_write_cache_size,
+                }))
+            }
+        }
     }
 }

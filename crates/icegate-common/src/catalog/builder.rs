@@ -42,6 +42,7 @@ pub struct IoHandle {
     cache: Option<StorageCache>,
     prefetch: Option<PrefetchConfig>,
     stat_ttl: Option<Duration>,
+    max_write_cache_size: Option<usize>,
 }
 
 impl IoHandle {
@@ -54,6 +55,7 @@ impl IoHandle {
             cache: None,
             prefetch: None,
             stat_ttl: None,
+            max_write_cache_size: None,
         }
     }
 
@@ -72,6 +74,9 @@ impl IoHandle {
         prefetch_config: Option<PrefetchConfig>,
     ) -> Result<Self> {
         let stat_ttl = cache_config.and_then(|cc| cc.stat_ttl_secs).map(Duration::from_secs);
+        let max_write_cache_size = cache_config
+            .and_then(|cc| cc.max_write_cache_size_mb)
+            .map(|mb| mb * 1024 * 1024);
         let cache = match cache_config {
             Some(cc) => Some(build_storage_cache(cc).await?),
             None => None,
@@ -81,6 +86,7 @@ impl IoHandle {
             cache,
             prefetch,
             stat_ttl,
+            max_write_cache_size,
         })
     }
 
@@ -103,6 +109,11 @@ impl IoHandle {
         self.stat_ttl
     }
 
+    /// Returns the max value size (bytes) to cache on writes, if configured.
+    pub const fn max_write_cache_size(&self) -> Option<usize> {
+        self.max_write_cache_size
+    }
+
     /// Gracefully close the IO cache, draining background flusher tasks.
     ///
     /// No-op when no cache was configured.
@@ -119,16 +130,16 @@ impl IoHandle {
     /// Build an [`IceGateStorageFactory`] that injects the shared cache
     /// and an `OpenTelemetry` meter into every `FileIO` created by catalogs.
     ///
-    /// The returned factory is passed to
-    /// [`CatalogBuilder::with_storage_factory`](iceberg::CatalogBuilder::with_storage_factory).
-    fn storage_factory(&self, scheme: &str) -> Arc<dyn iceberg::io::StorageFactory> {
+    /// The returned factory auto-detects the storage scheme from
+    /// [`StorageConfig`] properties, so callers don't need to specify it.
+    pub fn storage_factory(&self) -> Arc<dyn iceberg::io::StorageFactory> {
         let meter = opentelemetry::global::meter("iceberg-storage");
         Arc::new(IceGateStorageFactory::new(
-            scheme.to_string(),
             self.cache.clone(),
             Some(meter),
             self.prefetch.clone(),
             self.stat_ttl,
+            self.max_write_cache_size,
         ))
     }
 }
@@ -160,7 +171,10 @@ impl CatalogBuilder {
         }
     }
 
-    /// Create a memory catalog
+    /// Create a memory catalog.
+    ///
+    /// The Memory catalog stores everything in memory and does not need
+    /// the storage factory (no cache, metrics, or prefetch layers).
     async fn create_memory_catalog(config: &CatalogConfig) -> Result<Arc<dyn Catalog>> {
         let mut properties = HashMap::new();
         properties.insert(MEMORY_CATALOG_WAREHOUSE.to_string(), config.warehouse.clone());
@@ -196,7 +210,7 @@ impl CatalogBuilder {
         }
 
         let catalog = S3TablesCatalogBuilder::default()
-            .with_storage_factory(io_cache.storage_factory("s3"))
+            .with_storage_factory(io_cache.storage_factory())
             .load("s3tables", properties)
             .await?;
 
@@ -227,7 +241,7 @@ impl CatalogBuilder {
         }
 
         let catalog = GlueCatalogBuilder::default()
-            .with_storage_factory(io_cache.storage_factory("s3"))
+            .with_storage_factory(io_cache.storage_factory())
             .load("glue", properties)
             .await?;
 
@@ -257,7 +271,7 @@ impl CatalogBuilder {
 
         // Create REST catalog with IceGateStorageFactory
         let catalog = RestCatalogBuilder::default()
-            .with_storage_factory(io_cache.storage_factory("s3"))
+            .with_storage_factory(io_cache.storage_factory())
             .load("rest", properties)
             .await?;
 

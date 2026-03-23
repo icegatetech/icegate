@@ -33,7 +33,6 @@ let (response_tx, response_rx) = oneshot::channel();
 tx.send(WriteRequest {
     topic: "logs".to_string(),
     batch: record_batch,
-    group_by_column: Some("tenant_id".to_string()),
     response_tx,
 }).await?;
 

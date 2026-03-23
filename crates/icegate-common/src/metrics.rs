@@ -121,7 +121,9 @@ impl MetricsRuntime {
         let meter = meter_provider.meter(service_name);
 
         opentelemetry::global::set_meter_provider(meter_provider.clone());
-        opentelemetry_instrumentation_tokio::observe_current_runtime();
+        opentelemetry_instrumentation_tokio::Config::new()
+            .with_label("runtime.name", "main")
+            .observe_current_runtime();
 
         Ok(Self {
             registry,

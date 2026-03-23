@@ -15,7 +15,7 @@ pub mod icegate_storage;
 pub mod prefetch;
 
 pub use builder::{ObjectStoreWithPath, create_local_store, create_memory_store, create_object_store, create_s3_store};
-pub use cache::{StorageCache, build_storage_cache};
+pub use cache::{StorageCache, build_storage_cache, register_foyer_metrics};
 pub use config::{S3Config, StorageBackend, StorageConfig};
 pub use icegate_storage::{IceGateStorage, IceGateStorageFactory};
 pub use prefetch::PrefetchConfig;

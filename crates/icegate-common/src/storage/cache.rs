@@ -233,11 +233,10 @@ impl CacheMetrics {
 // Cache key / value types
 // ---------------------------------------------------------------------------
 
-/// Cache key: file path + optional version.
+/// Cache key: file path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheKey {
     path: String,
-    version: Option<String>,
 }
 
 /// Sparse range cache value.
@@ -478,6 +477,7 @@ pub(crate) struct CacheLayer {
     locks: Arc<KeyLocks>,
     metrics: CacheMetrics,
     stat_ttl: Option<Duration>,
+    max_write_cache_size: Option<usize>,
 }
 
 impl std::fmt::Debug for KeyLocks {
@@ -491,12 +491,22 @@ impl CacheLayer {
     ///
     /// When `stat_ttl` is `Some`, stat (HEAD) responses are cached in
     /// memory for the given duration, avoiding redundant S3 round-trips.
-    pub(crate) fn new(cache: StorageCache, metrics: CacheMetrics, stat_ttl: Option<Duration>) -> Self {
+    ///
+    /// When `max_write_cache_size` is `Some`, writes larger than the
+    /// threshold (in bytes) bypass the cache to prevent large data files
+    /// from evicting smaller WAL segments.
+    pub(crate) fn new(
+        cache: StorageCache,
+        metrics: CacheMetrics,
+        stat_ttl: Option<Duration>,
+        max_write_cache_size: Option<usize>,
+    ) -> Self {
         Self {
             cache,
             locks: Arc::new(KeyLocks::new()),
             metrics,
             stat_ttl,
+            max_write_cache_size,
         }
     }
 }
@@ -513,6 +523,7 @@ impl<A: Access> Layer<A> for CacheLayer {
                 metrics: self.metrics.clone(),
                 stat_cache: DashMap::new(),
                 stat_ttl: self.stat_ttl,
+                max_write_cache_size: self.max_write_cache_size,
             }),
         }
     }
@@ -522,7 +533,7 @@ impl<A: Access> Layer<A> for CacheLayer {
 // CacheAccessor
 // ---------------------------------------------------------------------------
 
-/// In-memory cache for stat (HEAD) metadata, keyed by path + version.
+/// In-memory cache for stat (HEAD) metadata, keyed by path.
 type StatCache = DashMap<CacheKey, (Instant, Metadata)>;
 
 struct CacheInner<A: Access> {
@@ -532,6 +543,7 @@ struct CacheInner<A: Access> {
     metrics: CacheMetrics,
     stat_cache: StatCache,
     stat_ttl: Option<Duration>,
+    max_write_cache_size: Option<usize>,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -587,10 +599,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
 
         async move {
             let start = Instant::now();
-            let key = CacheKey {
-                path: path.clone(),
-                version: args.version().map(str::to_string),
-            };
+            let key = CacheKey { path: path.clone() };
 
             let range = args.range();
             let range_start = range.offset();
@@ -742,10 +751,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             let Some(ttl) = inner.stat_ttl else {
                 return inner.accessor.stat(&path, args).await;
             };
-            let key = CacheKey {
-                path: path.clone(),
-                version: args.version().map(str::to_string),
-            };
+            let key = CacheKey { path: path.clone() };
             if let Some(entry) = inner.stat_cache.get(&key) {
                 let (inserted_at, metadata) = entry.value();
                 if inserted_at.elapsed() < ttl {
@@ -822,18 +828,34 @@ impl<A: Access> oio::Write for CacheWriter<A> {
         let metadata = self.w.close().await?;
 
         let bytes_written = buffer.len();
-        let key = CacheKey {
-            path: self.path.clone(),
-            version: metadata.version().map(str::to_string),
-        };
-        let mut value = CacheValue::new();
-        value.insert_range(0, &buffer.to_bytes());
-        self.inner.cache.insert(key.clone(), value);
-        self.inner.stat_cache.remove(&key);
+        let exceeds_limit = self
+            .inner
+            .max_write_cache_size
+            .is_some_and(|limit| bytes_written > limit);
+
+        if exceeds_limit {
+            tracing::trace!(
+                path = self.path,
+                bytes = bytes_written,
+                "Write exceeds max_write_cache_size, skipping cache"
+            );
+        } else {
+            let key = CacheKey {
+                path: self.path.clone(),
+            };
+            let mut value = CacheValue::new();
+            value.insert_range(0, &buffer.to_bytes());
+            self.inner.cache.insert(key.clone(), value);
+            self.inner.stat_cache.remove(&key);
+            tracing::trace!(
+                path = self.path,
+                bytes = bytes_written,
+                "Cache populated on write"
+            );
+        }
 
         #[allow(clippy::cast_possible_truncation)]
         self.inner.metrics.record_write_bytes(bytes_written as u64);
-        tracing::trace!(path = self.path, bytes = bytes_written, "Cache populated on write");
 
         Ok(metadata)
     }
@@ -866,16 +888,13 @@ impl<A: Access> CacheDeleter<A> {
 }
 
 impl<A: Access> oio::Delete for CacheDeleter<A> {
-    async fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
-        self.deleter.delete(path, args.clone()).await?;
-        self.keys.push(CacheKey {
-            path: path.to_string(),
-            version: args.version().map(str::to_string),
-        });
+    fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
+        self.deleter.delete(path, args)?;
+        self.keys.push(CacheKey { path: path.to_string() });
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<usize> {
         for key in &self.keys {
             tracing::trace!(path = key.path, "Cache evicted on delete");
             self.inner.cache.remove(key);
@@ -883,7 +902,7 @@ impl<A: Access> oio::Delete for CacheDeleter<A> {
             self.inner.locks.remove(key);
             self.inner.metrics.record_eviction();
         }
-        self.deleter.close().await
+        self.deleter.flush().await
     }
 }
 
@@ -928,6 +947,119 @@ pub async fn build_storage_cache(config: &CacheConfig) -> CommonResult<StorageCa
         .build()
         .await
         .map_err(|e| CommonError::Config(format!("Failed to build storage cache: {e}")))
+}
+
+/// Register `OpenTelemetry` observable instruments that expose foyer
+/// [`HybridCache`] internals as Prometheus-scrapeable gauges and counters.
+///
+/// The instruments are sampled lazily on each Prometheus scrape (via the
+/// `OTel` callback mechanism), so they add zero overhead between scrapes.
+///
+/// # Metrics
+///
+/// | Name | Type | Unit | Description |
+/// |------|------|------|-------------|
+/// | `icegate_foyer_memory_usage_bytes` | Gauge | `By` | Current memory tier usage |
+/// | `icegate_foyer_memory_capacity_bytes` | Gauge | `By` | Memory tier capacity |
+/// | `icegate_foyer_entries` | Gauge | — | Number of cached entries |
+/// | `icegate_foyer_disk_write_bytes_total` | Counter | `By` | Cumulative disk writes |
+/// | `icegate_foyer_disk_read_bytes_total` | Counter | `By` | Cumulative disk reads |
+/// | `icegate_foyer_disk_write_ios_total` | Counter | — | Cumulative disk write IOs |
+/// | `icegate_foyer_disk_read_ios_total` | Counter | — | Cumulative disk read IOs |
+/// | `icegate_foyer_read_throttled` | Gauge | — | 1 if reads are throttled |
+/// | `icegate_foyer_write_throttled` | Gauge | — | 1 if writes are throttled |
+pub fn register_foyer_metrics(cache: &StorageCache, meter: &Meter) {
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_memory_usage_bytes")
+        .with_description("Current foyer memory tier usage")
+        .with_unit("By")
+        .with_callback(move |gauge| {
+            #[allow(clippy::cast_possible_truncation)]
+            gauge.observe(c.memory().usage() as u64, &[]);
+        })
+        .build();
+
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_memory_capacity_bytes")
+        .with_description("Foyer memory tier capacity")
+        .with_unit("By")
+        .with_callback(move |gauge| {
+            #[allow(clippy::cast_possible_truncation)]
+            gauge.observe(c.memory().capacity() as u64, &[]);
+        })
+        .build();
+
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_entries")
+        .with_description("Number of entries in foyer memory tier")
+        .with_callback(move |gauge| {
+            #[allow(clippy::cast_possible_truncation)]
+            gauge.observe(c.memory().entries() as u64, &[]);
+        })
+        .build();
+
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_disk_write_bytes_total")
+        .with_description("Cumulative bytes written to foyer disk tier")
+        .with_unit("By")
+        .with_callback(move |gauge| {
+            #[allow(clippy::cast_possible_truncation)]
+            gauge.observe(c.statistics().disk_write_bytes() as u64, &[]);
+        })
+        .build();
+
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_disk_read_bytes_total")
+        .with_description("Cumulative bytes read from foyer disk tier")
+        .with_unit("By")
+        .with_callback(move |gauge| {
+            #[allow(clippy::cast_possible_truncation)]
+            gauge.observe(c.statistics().disk_read_bytes() as u64, &[]);
+        })
+        .build();
+
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_disk_write_ios_total")
+        .with_description("Cumulative foyer disk write IO operations")
+        .with_callback(move |gauge| {
+            #[allow(clippy::cast_possible_truncation)]
+            gauge.observe(c.statistics().disk_write_ios() as u64, &[]);
+        })
+        .build();
+
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_disk_read_ios_total")
+        .with_description("Cumulative foyer disk read IO operations")
+        .with_callback(move |gauge| {
+            #[allow(clippy::cast_possible_truncation)]
+            gauge.observe(c.statistics().disk_read_ios() as u64, &[]);
+        })
+        .build();
+
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_read_throttled")
+        .with_description("Whether foyer read operations are throttled (1=yes, 0=no)")
+        .with_callback(move |gauge| {
+            gauge.observe(u64::from(c.statistics().is_read_throttled()), &[]);
+        })
+        .build();
+
+    let c = cache.clone();
+    meter
+        .u64_observable_gauge("icegate_foyer_write_throttled")
+        .with_description("Whether foyer write operations are throttled (1=yes, 0=no)")
+        .with_callback(move |gauge| {
+            gauge.observe(u64::from(c.statistics().is_write_throttled()), &[]);
+        })
+        .build();
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,7 +1153,7 @@ mod tests {
 
         opendal::Operator::from_config(opendal::services::MemoryConfig::default())
             .expect("memory operator")
-            .layer(CacheLayer::new(cache, metrics, stat_ttl))
+            .layer(CacheLayer::new(cache, metrics, stat_ttl, None))
             .finish()
     }
 

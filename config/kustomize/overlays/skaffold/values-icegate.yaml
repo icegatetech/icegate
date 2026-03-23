@@ -8,7 +8,7 @@ namespace:
 catalog:
   backend: rest
   rest:
-    uri: http://nessie.infra:19120/iceberg
+    uri: http://nessie.infra.svc.cluster.local.:19120/iceberg
   warehouse: "s3://warehouse/"
   properties:
     prefix: main
@@ -18,7 +18,7 @@ storage:
   s3:
     bucket: warehouse
     region: us-east-1
-    endpoint: http://minio.infra:9000
+    endpoint: http://minio.infra.svc.cluster.local.:9000
 
 ## AWS credentials from existing Secret
 ## Secret keys: aws-access-key-id, aws-secret-access-key (per _helpers.tpl:152-162)
@@ -48,8 +48,8 @@ query:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra:19120/api/v2/config
-      - http://minio.infra:9000/minio/health/ready
+      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
+      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
   loki:
     enabled: true
     port: 3100
@@ -61,9 +61,9 @@ query:
     port: 3200
   tracing:
     enabled: true
-    otlpEndpoint: http://jaeger-collector.observability:4317
+    otlpEndpoint: http://jaeger-collector.observability.svc.cluster.local.:4317
     sampleRatio: 1.0
-  rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,reqwest_tracing=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
       cpu: "1"
@@ -75,10 +75,10 @@ query:
 ## Ingest component
 ingest:
   enabled: true
-  replicaCount: 2
+  replicaCount: 1
   cache:
     enabled: true
-    memorySizeMb: 128
+    memorySizeMb: 512
     diskDir: /tmp/icegate/cache
     diskSizeMb: 1024
     statTtlSecs: 300
@@ -88,35 +88,38 @@ ingest:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra:19120/api/v2/config
-      - http://minio.infra:9000/minio/health/ready
+      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
+      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
   otlpHttp:
     enabled: true
     port: 4318
   otlpGrpc:
     enabled: true
     port: 4317
+  tokioConsole:
+    enabled: true
+    port: 6669
   tracing:
     enabled: true
-    otlpEndpoint: http://jaeger-collector.observability:4317
+    otlpEndpoint: http://jaeger-collector.observability.svc.cluster.local.:4317
     sampleRatio: 1.0
   shift:
     jobsmanager:
       storage:
-        endpoint: http://minio.infra:9000
+        endpoint: http://minio.infra.svc.cluster.local.:9000
         bucket: jobs
         prefix: shifter
         useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
-  rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=trace,opendal=debug,reqwest_tracing=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
-      cpu: "1"
-      memory: 2.5Gi
+      cpu: "2"
+      memory: 5Gi
     limits:
-      cpu: "1"
-      memory: 2.5Gi
+      cpu: "2"
+      memory: 5Gi
 
 ## ServiceMonitor (Prometheus Operator)
 serviceMonitor:
@@ -132,5 +135,5 @@ migrate:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra:19120/api/v2/config
-      - http://minio.infra:9000/minio/health/ready
+      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
+      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready

@@ -57,6 +57,9 @@ opentelemetry-proto = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 
+# Metrics
+opentelemetry-instrumentation-tokio = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 

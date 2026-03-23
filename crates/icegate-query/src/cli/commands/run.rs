@@ -62,6 +62,13 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Initialize catalog
     tracing::info!("Initializing catalog");
     let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), config.catalog.prefetch.clone()).await?;
+
+    // Register foyer cache metrics with the meter provider so Prometheus can
+    // scrape memory usage, disk I/O, entry counts, and throttle state.
+    if let (Some(cache), Some(runtime)) = (io_cache.cache(), metrics_runtime.as_ref()) {
+        icegate_common::register_foyer_metrics(cache, &runtime.meter());
+    }
+
     let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 
     tracing::info!("Catalog initialized successfully");
@@ -84,6 +91,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         foyer_cache.as_ref(),
         prefetch.as_ref(),
         stat_ttl,
+        io_cache.max_write_cache_size(),
     )?;
 
     // Build the shared WAL queue reader

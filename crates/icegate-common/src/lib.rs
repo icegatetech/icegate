@@ -79,6 +79,7 @@ pub use retrier::{Retrier, RetrierConfig, RetryError};
 pub use storage::{
     IceGateStorage, IceGateStorageFactory, ObjectStoreWithPath, PrefetchConfig, S3Config, StorageBackend, StorageCache,
     StorageConfig, build_storage_cache, create_local_store, create_memory_store, create_object_store, create_s3_store,
+    register_foyer_metrics,
 };
 pub use tracing::{
     TracingConfig, TracingGuard, add_span_link, add_span_links, extract_current_trace_context, init_tracing,

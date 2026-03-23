@@ -18,6 +18,9 @@ data:
         {{- with .Values.ingest.cache.statTtlSecs }}
         stat_ttl_secs: {{ . }}
         {{- end }}
+        {{- with .Values.ingest.cache.maxWriteCacheSizeMb }}
+        max_write_cache_size_mb: {{ . }}
+        {{- end }}
       {{- end }}
       {{- if .Values.ingest.prefetch.enabled }}
       prefetch:

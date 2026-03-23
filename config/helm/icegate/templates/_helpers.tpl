@@ -95,32 +95,6 @@ Usage: include "icegate.image" (dict "image" .Values.query.image "tag" .Chart.Ap
 {{- end }}
 
 {{/*
-PVC name for the query cache volume.
-Returns existingClaim if set, otherwise generates "<query-component>-cache".
-*/}}
-{{- define "icegate.cachePvcName" -}}
-{{- if .Values.query.cache.persistence.existingClaim -}}
-{{- .Values.query.cache.persistence.existingClaim -}}
-{{- else -}}
-{{- printf "%s-cache" (include "icegate.componentName" (dict "context" . "component" "query")) -}}
-{{- end -}}
-{{- end }}
-
-{{/*
-StorageClass name for the query cache volume.
-Returns storageClassName if set, otherwise generates "<query-component>-cache".
-*/}}
-{{- define "icegate.cacheStorageClassName" -}}
-{{- if .Values.query.cache.persistence.storageClassName -}}
-{{- .Values.query.cache.persistence.storageClassName -}}
-{{- else if .Values.query.cache.persistence.storageClass.name -}}
-{{- .Values.query.cache.persistence.storageClass.name -}}
-{{- else -}}
-{{- printf "%s-cache" (include "icegate.componentName" (dict "context" . "component" "query")) -}}
-{{- end -}}
-{{- end }}
-
-{{/*
 Render catalog YAML block (zero-indented).
 Produces the YAML tagged union that serde expects: `!rest { uri: ... }` or `!s3tables { ... }`.
 Callers must use `nindent N` to place at the correct indentation level.

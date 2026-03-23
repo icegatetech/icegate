@@ -2438,7 +2438,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "container_memory_usage_bytes{pod!=\"\"}",
+          "expr": "container_memory_usage_bytes{name!=\"\"}",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -2451,7 +2451,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "container_spec_memory_limit_bytes{pod!=\"\"}",
+          "expr": "container_spec_memory_limit_bytes{name!=\"\"}",
           "format": "time_series",
           "hide": true,
           "interval": "",
@@ -2549,7 +2549,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum(container_memory_rss{pod!=\"\"}) by (pod)",
+          "expr": "sum(container_memory_rss{name!=\"\"}) by (pod)",
           "format": "time_series",
           "hide": false,
           "interval": "",

@@ -44,6 +44,7 @@ pub type ObjectStoreWithPath = (Arc<dyn ObjectStore>, String);
 /// * `cache` - Optional foyer cache shared with the Iceberg catalog's storage layer
 /// * `prefetch` - Optional Parquet column-chunk prefetch configuration
 /// * `stat_ttl` - Optional TTL for caching stat (HEAD) responses
+/// * `max_write_cache_size` - Optional max value size (bytes) to cache on writes
 ///
 /// # Returns
 ///
@@ -55,9 +56,13 @@ pub fn create_s3_store(
     cache: Option<&StorageCache>,
     prefetch: Option<&PrefetchConfig>,
     stat_ttl: Option<Duration>,
+    max_write_cache_size: Option<usize>,
 ) -> Result<ObjectStoreWithPath> {
-    // Parse S3 URL: s3://bucket/prefix
-    let path_without_scheme = base_path.strip_prefix("s3://").unwrap_or(base_path);
+    // Parse S3 URL: s3://bucket/prefix or s3a://bucket/prefix
+    let path_without_scheme = base_path
+        .strip_prefix("s3://")
+        .or_else(|| base_path.strip_prefix("s3a://"))
+        .unwrap_or(base_path);
     let (bucket, prefix) = path_without_scheme.split_once('/').map_or_else(
         || (path_without_scheme.to_string(), String::new()),
         |(b, p)| (b.to_string(), p.to_string()),
@@ -119,12 +124,12 @@ pub fn create_s3_store(
     let meter = opentelemetry::global::meter("icegate-wal");
     let base = Operator::new(s3)
         .map_err(|e| CommonError::Config(format!("Failed to build OpenDAL S3 operator: {e}")))?
-        .layer(OtelTraceLayer::default())
+        .layer(OtelTraceLayer)
         .layer(OtelMetricsLayer::builder().register(&meter));
 
     let mut operator = if let Some(foyer_cache) = cache {
         let cache_metrics = CacheMetrics::new(&meter);
-        base.layer(CacheLayer::new(foyer_cache.clone(), cache_metrics, stat_ttl))
+        base.layer(CacheLayer::new(foyer_cache.clone(), cache_metrics, stat_ttl, max_write_cache_size))
             .finish()
     } else {
         base.finish()
@@ -199,9 +204,10 @@ pub fn create_object_store(
     cache: Option<&StorageCache>,
     prefetch: Option<&PrefetchConfig>,
     stat_ttl: Option<Duration>,
+    max_write_cache_size: Option<usize>,
 ) -> Result<ObjectStoreWithPath> {
-    if base_path.starts_with("s3://") {
-        create_s3_store(base_path, backend, cache, prefetch, stat_ttl)
+    if base_path.starts_with("s3://") || base_path.starts_with("s3a://") {
+        create_s3_store(base_path, backend, cache, prefetch, stat_ttl, max_write_cache_size)
     } else if base_path.starts_with("file://") || base_path.starts_with('/') {
         create_local_store(base_path)
     } else {

@@ -21,13 +21,6 @@ pub struct WriteRequest {
     /// Arrow `RecordBatch` to write.
     pub batch: RecordBatch,
 
-    /// Optional column name to group by when creating row groups.
-    ///
-    /// If specified, the batch will be sorted by this column and
-    /// each unique value will be written as a separate row group.
-    /// This enables efficient row group pruning on reads.
-    pub group_by_column: Option<String>,
-
     /// Channel to send the write result back to the caller.
     pub response_tx: oneshot::Sender<WriteResult>,
 

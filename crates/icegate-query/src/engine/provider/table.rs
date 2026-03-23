@@ -236,6 +236,8 @@ impl IcegateTableProvider {
         if let Some(pred) = physical_predicate {
             parquet_source = parquet_source.with_predicate(pred);
         }
+        // TODO(low): Add reverse order to optimize ORDER BY time desc
+        // TODO(medium):: metadata_size_hint
 
         // Build file scan config
         let wal_url = ObjectStoreUrl::parse(WAL_STORE_URL)

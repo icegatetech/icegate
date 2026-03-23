@@ -11,9 +11,14 @@ alertmanager:
 # Prometheus server configuration
 prometheus:
   prometheusSpec:
-    # Scrape ServiceMonitors in any namespace (namespace set at apply time)
+    # Scrape all ServiceMonitors/Probes in any namespace (override chart
+    # default that filters on release=prometheus label).
     serviceMonitorNamespaceSelector: {}
     serviceMonitorSelector: {}
+    probeNamespaceSelector: {}
+    probeSelector: {}
+    serviceMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
 
     retention: 7d
 

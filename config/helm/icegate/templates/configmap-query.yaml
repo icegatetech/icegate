@@ -18,6 +18,9 @@ data:
         {{- with .Values.query.cache.statTtlSecs }}
         stat_ttl_secs: {{ . }}
         {{- end }}
+        {{- with .Values.query.cache.maxWriteCacheSizeMb }}
+        max_write_cache_size_mb: {{ . }}
+        {{- end }}
       {{- end }}
       {{- if .Values.query.prefetch.enabled }}
       prefetch:
@@ -34,6 +37,12 @@ data:
       batch_size: {{ .Values.query.engine.batchSize }}
       target_partitions: {{ .Values.query.engine.targetPartitions }}
       catalog_name: {{ .Values.query.engine.catalogName | quote }}
+      {{- with .Values.query.engine.refreshIntervalSecs }}
+      refresh_interval_secs: {{ . }}
+      {{- end }}
+      {{- with .Values.query.engine.maxAgeSecs }}
+      max_age_secs: {{ . }}
+      {{- end }}
     queue:
       common:
         base_path: {{ .Values.queue.common.basePath | quote }}

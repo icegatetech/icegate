@@ -106,7 +106,6 @@ impl LogsService for OtlpGrpcService {
         let write_request = icegate_queue::WriteRequest {
             topic: LOGS_TOPIC.to_string(),
             batch,
-            group_by_column: Some("tenant_id".to_string()),
             response_tx,
             trace_context: icegate_common::extract_current_trace_context(),
         };

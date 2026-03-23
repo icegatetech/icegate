@@ -23,6 +23,7 @@ missing_docs = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
 dead_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
@@ -53,8 +54,8 @@ icegate-queue = { path = "crates/icegate-queue" }
 arrow = { version = "57.0", default-features = false, features = ["prettyprint"] }
 parquet = { version = "57.0", default-features = false, features = ["arrow", "object_store", "zstd"] }
 object_store = { version = "0.12", features = ["aws"] }
-opendal = { git = "https://github.com/apache/opendal", rev = "67cd00d744e8a6a64b9729f49bdaa1f4de215885", features = ["services-s3", "layers-otel-trace", "layers-otel-metrics"]}
-object_store_opendal = { git = "https://github.com/apache/opendal", rev = "67cd00d744e8a6a64b9729f49bdaa1f4de215885" }
+opendal = { version = "0.55", features = ["services-s3", "services-fs", "layers-otel-trace", "layers-otel-metrics"]}
+object_store_opendal = { version = "0.55" }
 foyer = { version = "0.22", features = ["serde"] }
 typetag = "0.2"
 # reqsign is a transitive dep of iceberg-storage-opendal; `reqwest_request` and
@@ -72,13 +73,11 @@ async-trait = "0.1"
 # ANTLR parser
 antlr4rust = "0.5"
 
-# Iceberg — pinned revision from upstream apache/iceberg-rust `develop` branch.
-# Pinned for DataFusion 52 + Arrow 57 compat; WAL-aware scan work tracked in GH-71.
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
-iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
-iceberg-catalog-s3tables = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
-iceberg-catalog-glue = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
-iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "335961ae013b491667d8c815b26aa6a2c43d4de2" }
+iceberg = { version = "0.9.0" }
+iceberg-catalog-rest = { version = "0.9.0" }
+iceberg-catalog-s3tables = { version = "0.9.0" }
+iceberg-catalog-glue = { version = "0.9.0" }
+iceberg-datafusion = { version = "0.9.0" }
 
 # DataFusion
 datafusion = "52.2"

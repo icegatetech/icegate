@@ -21,7 +21,7 @@ async fn test_recovery_empty_store() -> Result<(), Box<dyn std::error::Error>> {
     tx.send(WriteRequest {
         topic: "logs".to_string(),
         batch: batch.clone(),
-        group_by_column: None,
+
         response_tx,
         trace_context: None,
     })
@@ -58,7 +58,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
             tx.send(WriteRequest {
                 topic: "logs".to_string(),
                 batch: batch.clone(),
-                group_by_column: None,
+        
                 response_tx,
                 trace_context: None,
             })
@@ -81,7 +81,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
     tx.send(WriteRequest {
         topic: "logs".to_string(),
         batch: batch.clone(),
-        group_by_column: None,
+
         response_tx,
         trace_context: None,
     })
@@ -119,7 +119,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
             tx.send(WriteRequest {
                 topic: "logs".to_string(),
                 batch: batch.clone(),
-                group_by_column: None,
+        
                 response_tx,
                 trace_context: None,
             })
@@ -134,7 +134,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
             tx.send(WriteRequest {
                 topic: "events".to_string(),
                 batch: batch.clone(),
-                group_by_column: None,
+        
                 response_tx,
                 trace_context: None,
             })
@@ -148,7 +148,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
         tx.send(WriteRequest {
             topic: "metrics".to_string(),
             batch: batch.clone(),
-            group_by_column: None,
+    
             response_tx,
             trace_context: None,
         })
@@ -171,7 +171,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
     tx.send(WriteRequest {
         topic: "logs".to_string(),
         batch: batch.clone(),
-        group_by_column: None,
+
         response_tx,
         trace_context: None,
     })
@@ -189,7 +189,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
     tx.send(WriteRequest {
         topic: "events".to_string(),
         batch: batch.clone(),
-        group_by_column: None,
+
         response_tx,
         trace_context: None,
     })
@@ -207,7 +207,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
     tx.send(WriteRequest {
         topic: "metrics".to_string(),
         batch: batch.clone(),
-        group_by_column: None,
+
         response_tx,
         trace_context: None,
     })
@@ -242,7 +242,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
             tx.send(WriteRequest {
                 topic: "logs".to_string(),
                 batch: batch.clone(),
-                group_by_column: None,
+        
                 response_tx,
                 trace_context: None,
             })
@@ -265,7 +265,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
     tx.send(WriteRequest {
         topic: "logs".to_string(),
         batch: batch.clone(),
-        group_by_column: None,
+
         response_tx,
         trace_context: None,
     })
@@ -294,7 +294,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
         .send(WriteRequest {
             topic: "logs".to_string(),
             batch: batch.clone(),
-            group_by_column: None,
+    
             response_tx,
             trace_context: None,
         })

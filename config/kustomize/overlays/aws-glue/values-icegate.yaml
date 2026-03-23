@@ -42,18 +42,9 @@ query:
     diskSizeMb: 4096
     statTtlSecs: 300
     ## Volume size for the disk cache (emptyDir sizeLimit or PVC storage request)
-    volumeSizeLimit: 20Gi
-    persistence:
-      enabled: true
-      storageClass:
-        create: true
-        provisioner: ebs.csi.eks.amazonaws.com
-        type: gp3
-        iops: "6000"
-        throughput: "500"
-        encrypted: "true"
+    volumeSizeLimit: 5Gi
   prefetch:
-    enabled: true
+    enabled: false
   loki:
     enabled: true
     port: 3100
@@ -80,6 +71,15 @@ query:
 ingest:
   enabled: true
   replicaCount: 1
+  cache:
+    enabled: true
+    memorySizeMb: 128
+    diskDir: /tmp/icegate/cache
+    diskSizeMb: 1024
+    statTtlSecs: 300
+    volumeSizeLimit: 2Gi
+  prefetch:
+    enabled: false
   otlpHttp:
     enabled: true
     port: 4318

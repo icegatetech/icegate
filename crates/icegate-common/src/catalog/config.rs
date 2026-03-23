@@ -53,6 +53,13 @@ pub struct CacheConfig {
     /// round-trips during query execution.
     #[serde(default)]
     pub stat_ttl_secs: Option<u64>,
+    /// Maximum value size (in mebibytes) to cache on writes.
+    ///
+    /// Files larger than this are written to storage but not cached,
+    /// preventing large data files from evicting smaller WAL segments.
+    /// Defaults to 2 `MiB` when not set.
+    #[serde(default)]
+    pub max_write_cache_size_mb: Option<usize>,
 }
 
 /// Types of catalogs supported

@@ -82,6 +82,10 @@ query:
     batchSize: 8192
     targetPartitions: 4
     catalogName: iceberg
+    ## Interval (seconds) between background catalog refreshes (default: 15)
+    # refreshIntervalSecs: 15
+    ## Max age (seconds) before cached provider is considered stale (default: 30)
+    # maxAgeSecs: 30
 
   ## FileIO cache configuration (optional)
   cache:
@@ -91,36 +95,11 @@ query:
     diskSizeMb: 4096
     ## TTL (seconds) for caching stat/HEAD responses (optional, omit to disable)
     statTtlSecs: 300
-    ## Volume size for the disk cache (used as emptyDir sizeLimit or PVC storage request)
+    ## Max value size (MiB) to cache on writes. Larger files pass through
+    ## without caching to avoid eviction storms. Default: 2 MiB.
+    maxWriteCacheSizeMb: 2
+    ## Volume size for the disk cache (used as emptyDir sizeLimit)
     volumeSizeLimit: 5Gi
-    ## Persistent storage for the disk cache (EBS volume).
-    ## When enabled, replaces the emptyDir with a PersistentVolumeClaim.
-    ## PVC size is derived from volumeSizeLimit above.
-    persistence:
-      enabled: false
-      ## Use an existing StorageClass name (leave empty to use the auto-created one)
-      storageClassName: ""
-      ## Use an existing PVC (skip StorageClass and PVC creation)
-      existingClaim: ""
-      accessModes:
-        - ReadWriteOnce
-      annotations: {}
-      ## StorageClass definition (created only when persistence.enabled=true,
-      ## storageClassName is empty, and storageClass.create=true)
-      storageClass:
-        create: true
-        name: ""
-        ## CSI provisioner: use "ebs.csi.eks.amazonaws.com" for EKS Auto Mode
-        provisioner: ebs.csi.aws.com
-        type: gp3
-        iops: "3000"
-        throughput: "125"
-        fsType: ext4
-        encrypted: "true"
-        kmsKeyId: ""
-        volumeBindingMode: WaitForFirstConsumer
-        reclaimPolicy: Delete
-        allowVolumeExpansion: true
 
   ## Parquet metadata prefetch (warms cache with column/offset indexes
   ## and bloom filters after footer reads — never data pages)
@@ -278,6 +257,9 @@ ingest:
     diskSizeMb: 4096
     ## TTL (seconds) for caching stat/HEAD responses (optional, omit to disable)
     statTtlSecs: 300
+    ## Max value size (MiB) to cache on writes. Larger files pass through
+    ## without caching to avoid eviction storms. Default: 2 MiB.
+    maxWriteCacheSizeMb: 2
     ## Volume size for the disk cache (used as emptyDir sizeLimit)
     volumeSizeLimit: 5Gi
 

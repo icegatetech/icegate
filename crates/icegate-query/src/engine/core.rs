@@ -30,14 +30,6 @@ use crate::error::Result;
 /// object store at query time. It is not a real URL.
 pub const WAL_STORE_URL: &str = "wal://queue";
 
-/// Default interval between background catalog refreshes.
-const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-
-/// Default maximum age before the cached provider is considered stale.
-/// If the background refresh fails for longer than this, queries will
-/// block on a synchronous rebuild.
-const DEFAULT_MAX_AGE: Duration = Duration::from_secs(30);
-
 /// Cached catalog provider with creation timestamp.
 #[derive(Clone)]
 struct CachedProvider {
@@ -115,6 +107,8 @@ impl QueryEngine {
         wal_reader: Arc<ParquetQueueReader>,
     ) -> Self {
         let (provider_tx, provider_rx) = watch::channel(None);
+        let max_age = Duration::from_secs(config.max_age_secs);
+        let refresh_interval = Duration::from_secs(config.refresh_interval_secs);
         Self {
             catalog,
             config,
@@ -123,8 +117,8 @@ impl QueryEngine {
             provider_rx,
             provider_tx: Arc::new(provider_tx),
             rebuild_lock: tokio::sync::Mutex::new(()),
-            max_age: DEFAULT_MAX_AGE,
-            refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            max_age,
+            refresh_interval,
         }
     }
 
