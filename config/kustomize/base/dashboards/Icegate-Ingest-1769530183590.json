@@ -4567,7 +4567,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, topic, status) (rate(icegate_ingest_shift_get_data_files_duration_seconds_bucket{job=\"icegate-ingest\"}[1m])))",
-          "legendFormat": "{{topic}} - p95",
+          "legendFormat": "{{topic}}/{{status}} - p95",
           "range": true,
           "refId": "A"
         },
@@ -4576,7 +4576,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by (le, topic, status) (rate(icegate_ingest_shift_get_data_files_duration_seconds_bucket{job=\"icegate-ingest\"}[1m])))",
           "hide": false,
-          "legendFormat": "{{topic}} - p50",
+          "legendFormat": "{{topic}}/{{status}} - p50",
           "range": true,
           "refId": "B"
         },
@@ -4585,7 +4585,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, topic, status) (rate(icegate_ingest_shift_get_data_files_duration_seconds_bucket{job=\"icegate-ingest\"}[1m])))",
           "hide": false,
-          "legendFormat": "{{topic}} - p99",
+          "legendFormat": "{{topic}}/{{status}} - p99",
           "range": true,
           "refId": "C"
         }
@@ -4865,7 +4865,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "(\n  sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"icegate-ingest\"}[1m]))\n  or\n  sum by (topic, task) (rate(icegate_ingest_shift_task_failures_total{job=\"icegate-ingest\"}[1m])) * 0\n)\n/\nclamp_min(\n  (\n    sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"icegate-ingest\"}[1m]))\n  ) +\n  (\n    sum by (topic, task) (rate(icegate_ingest_shift_task_failures_total{job=\"icegate-ingest\"}[1m]))\n    or\n    sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"icegate-ingest\"}[1m])) * 0\n  ),\n  1e-12\n)\n",
+          "expr": "(\n  sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"icegate-ingest\"}[1m]))\n  or\n  sum by (topic, task) (rate(icegate_ingest_shift_task_failures_total{job=\"icegate-ingest\"}[1m])) * 0\n)\n/\nclamp_min(\n  (\n    sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"icegate-ingest\"}[1m]))\n    or\n    sum by (topic, task) (rate(icegate_ingest_shift_task_failures_total{job=\"icegate-ingest\"}[1m])) * 0\n  ) +\n  (\n    sum by (topic, task) (rate(icegate_ingest_shift_task_failures_total{job=\"icegate-ingest\"}[1m]))\n    or\n    sum by (topic, task) (rate(icegate_ingest_shift_task_success_total{job=\"icegate-ingest\"}[1m])) * 0\n  ),\n  1e-12\n)\n",
           "legendFormat": "{{topic}}-{{task}}",
           "range": true,
           "refId": "A"
@@ -4958,7 +4958,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic, task, reason) (rate(icegate_ingest_shift_task_failures_total{job=\"icegate-ingest\"}[1m]))\n",
+          "expr": "sum by (topic, task, reason) (increase(icegate_ingest_shift_task_failures_total{job=\"icegate-ingest\"}[1m]))\n",
           "legendFormat": "{{topic}}-{{task}}-{{reason}}",
           "range": true,
           "refId": "A"

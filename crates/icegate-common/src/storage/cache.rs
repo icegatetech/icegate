@@ -600,11 +600,16 @@ impl<A: Access> std::fmt::Debug for CacheAccessor<A> {
 }
 
 /// Build the response pair from extracted bytes.
-fn make_read_response(data: Vec<u8>, range_start: u64, range_end: u64) -> (RpRead, Buffer) {
+///
+/// `total_size` is the full object size for the `Content-Range` header.
+/// Pass `None` when the total size is unknown (e.g. fast-path cache hits
+/// where no stat has been performed).
+fn make_read_response(data: Vec<u8>, range_start: u64, range_end: u64, total_size: Option<u64>) -> (RpRead, Buffer) {
     let buf = Buffer::from(data);
-    let content_range = BytesContentRange::default()
-        .with_range(range_start, range_end - 1)
-        .with_size(range_end);
+    let mut content_range = BytesContentRange::default().with_range(range_start, range_end - 1);
+    if let Some(size) = total_size {
+        content_range = content_range.with_size(size);
+    }
     let rp = RpRead::new().with_size(Some(buf.len() as u64)).with_range(Some(content_range));
     (rp, buf)
 }
@@ -662,7 +667,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                                 .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
                             inner.metrics.record_hit("fast_path", range_end - range_start);
                             inner.metrics.record_read_duration(start);
-                            return Ok(make_read_response(data, range_start, range_end));
+                            return Ok(make_read_response(data, range_start, range_end, None));
                         }
                     }
                 }
@@ -670,13 +675,11 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
 
             // --- Slow path: need to fetch gaps, requires per-key lock ---
 
+            // Get total object size from stat cache for Content-Range header.
+            let total_size = inner.cached_stat(&path).await?.content_length();
+
             // Determine the end of the requested range.
-            let range_end = if let Some(size) = range_size {
-                range_start + size
-            } else {
-                // Full-file read: stat to get content length (via stat cache).
-                inner.cached_stat(&path).await?.content_length()
-            };
+            let range_end = range_size.map_or(total_size, |size| range_start + size);
 
             if range_start >= range_end {
                 inner.metrics.record_read_duration(start);
@@ -707,7 +710,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                         .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
                     inner.metrics.record_hit("lock_path", range_end - range_start);
                     inner.metrics.record_read_duration(start);
-                    return Ok(make_read_response(data, range_start, range_end));
+                    return Ok(make_read_response(data, range_start, range_end, Some(total_size)));
                 }
             }
 
@@ -762,7 +765,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             let data = merged
                 .read_range(range_start, range_end)
                 .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache merge failed to cover range"))?;
-            let response = make_read_response(data, range_start, range_end);
+            let response = make_read_response(data, range_start, range_end, Some(total_size));
 
             // Update cache.
             inner.cache.insert(key, merged);
@@ -1043,43 +1046,43 @@ pub fn register_foyer_metrics(cache: &StorageCache, meter: &Meter) {
 
     let c = cache.clone();
     meter
-        .u64_observable_gauge("icegate_foyer_disk_write_bytes_total")
+        .u64_observable_counter("icegate_foyer_disk_write_bytes_total")
         .with_description("Cumulative bytes written to foyer disk tier")
         .with_unit("By")
-        .with_callback(move |gauge| {
+        .with_callback(move |counter| {
             #[allow(clippy::cast_possible_truncation)]
-            gauge.observe(c.statistics().disk_write_bytes() as u64, &[]);
+            counter.observe(c.statistics().disk_write_bytes() as u64, &[]);
         })
         .build();
 
     let c = cache.clone();
     meter
-        .u64_observable_gauge("icegate_foyer_disk_read_bytes_total")
+        .u64_observable_counter("icegate_foyer_disk_read_bytes_total")
         .with_description("Cumulative bytes read from foyer disk tier")
         .with_unit("By")
-        .with_callback(move |gauge| {
+        .with_callback(move |counter| {
             #[allow(clippy::cast_possible_truncation)]
-            gauge.observe(c.statistics().disk_read_bytes() as u64, &[]);
+            counter.observe(c.statistics().disk_read_bytes() as u64, &[]);
         })
         .build();
 
     let c = cache.clone();
     meter
-        .u64_observable_gauge("icegate_foyer_disk_write_ios_total")
+        .u64_observable_counter("icegate_foyer_disk_write_ios_total")
         .with_description("Cumulative foyer disk write IO operations")
-        .with_callback(move |gauge| {
+        .with_callback(move |counter| {
             #[allow(clippy::cast_possible_truncation)]
-            gauge.observe(c.statistics().disk_write_ios() as u64, &[]);
+            counter.observe(c.statistics().disk_write_ios() as u64, &[]);
         })
         .build();
 
     let c = cache.clone();
     meter
-        .u64_observable_gauge("icegate_foyer_disk_read_ios_total")
+        .u64_observable_counter("icegate_foyer_disk_read_ios_total")
         .with_description("Cumulative foyer disk read IO operations")
-        .with_callback(move |gauge| {
+        .with_callback(move |counter| {
             #[allow(clippy::cast_possible_truncation)]
-            gauge.observe(c.statistics().disk_read_ios() as u64, &[]);
+            counter.observe(c.statistics().disk_read_ios() as u64, &[]);
         })
         .build();
 
