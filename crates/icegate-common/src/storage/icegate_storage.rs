@@ -61,21 +61,18 @@ pub enum IceGateStorage {
         /// leaking credentials).
         #[serde(skip, default = "default_s3_config")]
         config: Arc<S3Config>,
-        /// Shared foyer hybrid cache (if configured).
+        /// Pre-built cache layer (if configured). Stored here so that
+        /// shared state (key locks, stat cache) survives across
+        /// `create_operator()` calls.
         #[serde(skip)]
-        cache: Option<StorageCache>,
+        #[allow(private_interfaces)]
+        cache_layer: Option<Box<CacheLayer>>,
         /// `OpenTelemetry` meter for storage metrics (if configured).
         #[serde(skip)]
         meter: Option<Meter>,
         /// Parquet column-chunk prefetch configuration (if configured).
         #[serde(skip)]
         prefetch: Option<PrefetchConfig>,
-        /// Stat metadata cache TTL (if configured).
-        #[serde(skip)]
-        stat_ttl: Option<Duration>,
-        /// Max value size (bytes) to cache on writes (if configured).
-        #[serde(skip)]
-        max_write_cache_size: Option<usize>,
     },
 }
 
@@ -138,26 +135,35 @@ impl IceGateStorage {
             Self::S3 {
                 configured_scheme,
                 config,
-                cache,
+                cache_layer,
                 meter,
                 prefetch,
-                stat_ttl,
-                max_write_cache_size,
             } => {
                 // Build a bare operator from the S3 config + path.
                 let bare = s3_config_build(config, path)?;
                 let op_info = bare.info();
                 let prefix = format!("{configured_scheme}://{}/", op_info.name());
 
+                // Accept both s3:// and s3a:// regardless of which scheme was
+                // used when the storage was configured.
+                let alt_scheme = match configured_scheme.as_str() {
+                    "s3" => "s3a",
+                    "s3a" => "s3",
+                    other => other,
+                };
+                let alt_prefix = format!("{alt_scheme}://{}/", op_info.name());
+
                 let relative = if path.starts_with(&prefix) {
                     &path[prefix.len()..]
-                } else if path == prefix.trim_end_matches('/') {
+                } else if path.starts_with(&alt_prefix) {
+                    &path[alt_prefix.len()..]
+                } else if path == prefix.trim_end_matches('/') || path == alt_prefix.trim_end_matches('/') {
                     // Exact bucket root (no trailing slash) → empty relative path.
                     ""
                 } else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Invalid S3 URL: {path}, expected prefix {prefix}"),
+                        format!("Invalid S3 URL: {path}, expected prefix {prefix} or {alt_prefix}"),
                     ));
                 };
 
@@ -175,14 +181,10 @@ impl IceGateStorage {
                     operator = operator.layer(OtelMetricsLayer::builder().register(m));
                 }
 
-                if let Some(fc) = cache {
-                    let cache_metrics = meter.as_ref().map_or_else(CacheMetrics::new_disabled, CacheMetrics::new);
-                    operator = operator.layer(CacheLayer::new(
-                        fc.clone(),
-                        cache_metrics,
-                        *stat_ttl,
-                        *max_write_cache_size,
-                    ));
+                // Reuse the pre-built CacheLayer so that key locks and stat
+                // cache survive across create_operator() calls.
+                if let Some(cl) = cache_layer.as_deref() {
+                    operator = operator.layer(cl.clone());
                 }
 
                 // Prefetch layer sits outermost so background reads flow
@@ -387,15 +389,25 @@ impl StorageFactory for IceGateStorageFactory {
                 Ok(Arc::new(IceGateStorage::Fs { root }))
             }
             scheme => {
-                // S3 or S3a — apply cache/metrics/prefetch layers.
+                // S3 or S3a — build the CacheLayer once so its internal
+                // key locks and stat cache persist across create_operator()
+                // calls.
+                let cache_layer = self.cache.as_ref().map(|fc| {
+                    let cache_metrics = self.meter.as_ref().map_or_else(CacheMetrics::new_disabled, CacheMetrics::new);
+                    Box::new(CacheLayer::new(
+                        fc.clone(),
+                        cache_metrics,
+                        self.stat_ttl,
+                        self.max_write_cache_size,
+                    ))
+                });
+
                 Ok(Arc::new(IceGateStorage::S3 {
                     configured_scheme: scheme.to_string(),
                     config: s3_config_parse(config.props().clone())?.into(),
-                    cache: self.cache.clone(),
+                    cache_layer,
                     meter: self.meter.clone(),
                     prefetch: self.prefetch.clone(),
-                    stat_ttl: self.stat_ttl,
-                    max_write_cache_size: self.max_write_cache_size,
                 }))
             }
         }

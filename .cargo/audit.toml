@@ -4,4 +4,6 @@ ignore = [
     "RUSTSEC-2025-0134", # `rustls-pemfile`, is unmaintained
     # bincode 1.x is pulled in transitively via foyer/iceberg; this advisory is tracked as an unmaintained dependency warning, not a known vulnerability in our direct code.
     "RUSTSEC-2025-0141",
+    # TODO: rustls-webpki 0.101.7 CRL matching flaw; transitive via aws-smithy-http-client -> rustls 0.21. Remove once AWS SDK drops legacy rustls.
+    "RUSTSEC-2026-0049",
 ]

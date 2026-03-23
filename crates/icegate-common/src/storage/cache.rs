@@ -466,16 +466,20 @@ impl KeyLocks {
 // CacheLayer (opendal Layer impl)
 // ---------------------------------------------------------------------------
 
+/// In-memory cache for stat (HEAD) metadata, keyed by path.
+pub(crate) type StatCache = DashMap<CacheKey, (Instant, Metadata)>;
+
 /// Custom sparse-range cache layer for `OpenDAL`.
 ///
 /// Wraps a foyer [`HybridCache`] and implements [`Layer`] so it can be
 /// inserted into an operator's layer stack. Reads cache individual byte
 /// ranges; writes and deletes keep the cache consistent.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CacheLayer {
     cache: StorageCache,
     locks: Arc<KeyLocks>,
     metrics: CacheMetrics,
+    stat_cache: Arc<StatCache>,
     stat_ttl: Option<Duration>,
     max_write_cache_size: Option<usize>,
 }
@@ -505,6 +509,7 @@ impl CacheLayer {
             cache,
             locks: Arc::new(KeyLocks::new()),
             metrics,
+            stat_cache: Arc::new(DashMap::new()),
             stat_ttl,
             max_write_cache_size,
         }
@@ -521,7 +526,7 @@ impl<A: Access> Layer<A> for CacheLayer {
                 cache: self.cache.clone(),
                 locks: self.locks.clone(),
                 metrics: self.metrics.clone(),
-                stat_cache: DashMap::new(),
+                stat_cache: self.stat_cache.clone(),
                 stat_ttl: self.stat_ttl,
                 max_write_cache_size: self.max_write_cache_size,
             }),
@@ -533,15 +538,12 @@ impl<A: Access> Layer<A> for CacheLayer {
 // CacheAccessor
 // ---------------------------------------------------------------------------
 
-/// In-memory cache for stat (HEAD) metadata, keyed by path.
-type StatCache = DashMap<CacheKey, (Instant, Metadata)>;
-
 struct CacheInner<A: Access> {
     accessor: A,
     cache: StorageCache,
     locks: Arc<KeyLocks>,
     metrics: CacheMetrics,
-    stat_cache: StatCache,
+    stat_cache: Arc<StatCache>,
     stat_ttl: Option<Duration>,
     max_write_cache_size: Option<usize>,
 }
@@ -553,6 +555,36 @@ impl<A: Access> std::fmt::Debug for CacheInner<A> {
             .field("locks", &self.locks)
             .field("metrics", &self.metrics)
             .finish()
+    }
+}
+
+impl<A: Access> CacheInner<A> {
+    /// Return stat metadata, using the stat cache when `stat_ttl` is set.
+    ///
+    /// On cache miss the underlying accessor is queried and the result is
+    /// stored so subsequent calls within the TTL window avoid an S3
+    /// round-trip.
+    async fn cached_stat(&self, path: &str) -> Result<Metadata> {
+        if let Some(ttl) = self.stat_ttl {
+            let key = CacheKey { path: path.to_string() };
+            if let Some(entry) = self.stat_cache.get(&key) {
+                let (inserted_at, metadata) = entry.value();
+                if inserted_at.elapsed() < ttl {
+                    self.metrics.record_stat_hit();
+                    return Ok(metadata.clone());
+                }
+                drop(entry);
+                self.stat_cache.remove(&key);
+            }
+            self.metrics.record_stat_miss();
+            let rp = self.accessor.stat(path, OpStat::default()).await?;
+            let metadata = rp.into_metadata();
+            self.stat_cache.insert(key, (Instant::now(), metadata.clone()));
+            Ok(metadata)
+        } else {
+            let rp = self.accessor.stat(path, OpStat::default()).await?;
+            Ok(rp.into_metadata())
+        }
     }
 }
 
@@ -642,9 +674,8 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             let range_end = if let Some(size) = range_size {
                 range_start + size
             } else {
-                // Full-file read: stat to get content length.
-                let rp_stat = inner.accessor.stat(&path, OpStat::default()).await?;
-                rp_stat.into_metadata().content_length()
+                // Full-file read: stat to get content length (via stat cache).
+                inner.cached_stat(&path).await?.content_length()
             };
 
             if range_start >= range_end {
@@ -743,30 +774,12 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
         .await
     }
 
-    fn stat(&self, path: &str, args: OpStat) -> impl Future<Output = Result<RpStat>> + MaybeSend {
+    fn stat(&self, path: &str, _args: OpStat) -> impl Future<Output = Result<RpStat>> + MaybeSend {
         let span = tracing::debug_span!("cache_stat", path = path);
         let inner = self.inner.clone();
         let path = path.to_string();
         async move {
-            let Some(ttl) = inner.stat_ttl else {
-                return inner.accessor.stat(&path, args).await;
-            };
-            let key = CacheKey { path: path.clone() };
-            if let Some(entry) = inner.stat_cache.get(&key) {
-                let (inserted_at, metadata) = entry.value();
-                if inserted_at.elapsed() < ttl {
-                    tracing::debug!("Stat cache hit");
-                    inner.metrics.record_stat_hit();
-                    return Ok(RpStat::new(metadata.clone()));
-                }
-                drop(entry);
-                inner.stat_cache.remove(&key);
-            }
-            tracing::debug!("Stat cache miss");
-            let rp = inner.accessor.stat(&path, args).await?;
-            let metadata = rp.into_metadata();
-            inner.stat_cache.insert(key, (Instant::now(), metadata.clone()));
-            inner.metrics.record_stat_miss();
+            let metadata = inner.cached_stat(&path).await?;
             Ok(RpStat::new(metadata))
         }
         .instrument(span)
@@ -799,9 +812,19 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
 // ---------------------------------------------------------------------------
 
 /// Writer that buffers data and populates the cache on close.
+///
+/// Tracks total bytes written so that chunks are only buffered while
+/// below `max_write_cache_size`. Once exceeded, further chunks are
+/// passed through to the inner writer without buffering to avoid
+/// holding large payloads in memory.
 pub(crate) struct CacheWriter<A: Access> {
     w: A::Writer,
     buf: oio::QueueBuf,
+    /// Running total of bytes passed to `write()`.
+    buffered_bytes: usize,
+    /// Set to `true` once `buffered_bytes` exceeds the configured limit,
+    /// signalling that no further chunks should be buffered.
+    exceeded: bool,
     path: String,
     inner: Arc<CacheInner<A>>,
 }
@@ -811,6 +834,8 @@ impl<A: Access> CacheWriter<A> {
         Self {
             w,
             buf: oio::QueueBuf::new(),
+            buffered_bytes: 0,
+            exceeded: false,
             path,
             inner,
         }
@@ -819,42 +844,63 @@ impl<A: Access> CacheWriter<A> {
 
 impl<A: Access> oio::Write for CacheWriter<A> {
     async fn write(&mut self, bs: Buffer) -> Result<()> {
-        self.buf.push(bs.clone());
+        let chunk_len = bs.len();
+        self.buffered_bytes += chunk_len;
+
+        // Only buffer while below the write-cache size limit.
+        if !self.exceeded {
+            if self.inner.max_write_cache_size.is_some_and(|limit| self.buffered_bytes > limit) {
+                // Crossed the threshold — drop what we've buffered so far
+                // and stop buffering future chunks.
+                self.exceeded = true;
+                self.buf.clear();
+            } else {
+                self.buf.push(bs.clone());
+            }
+        }
+
         self.w.write(bs).await
     }
 
     async fn close(&mut self) -> Result<Metadata> {
-        let buffer = self.buf.clone().collect();
         let metadata = self.w.close().await?;
 
-        let bytes_written = buffer.len();
-        let exceeds_limit = self.inner.max_write_cache_size.is_some_and(|limit| bytes_written > limit);
+        let key = CacheKey {
+            path: self.path.clone(),
+        };
 
-        if exceeds_limit {
+        if self.exceeded {
             tracing::trace!(
                 path = self.path,
-                bytes = bytes_written,
+                bytes = self.buffered_bytes,
                 "Write exceeds max_write_cache_size, skipping cache"
             );
+            // Evict any stale entry from a previous, smaller write to this path.
+            self.inner.cache.remove(&key);
+            self.inner.stat_cache.remove(&key);
         } else {
-            let key = CacheKey {
-                path: self.path.clone(),
-            };
+            let buffer = self.buf.clone().collect();
             let mut value = CacheValue::new();
             value.insert_range(0, &buffer.to_bytes());
             self.inner.cache.insert(key.clone(), value);
             self.inner.stat_cache.remove(&key);
-            tracing::trace!(path = self.path, bytes = bytes_written, "Cache populated on write");
+            tracing::trace!(
+                path = self.path,
+                bytes = self.buffered_bytes,
+                "Cache populated on write"
+            );
         }
 
         #[allow(clippy::cast_possible_truncation)]
-        self.inner.metrics.record_write_bytes(bytes_written as u64);
+        self.inner.metrics.record_write_bytes(self.buffered_bytes as u64);
 
         Ok(metadata)
     }
 
     async fn abort(&mut self) -> Result<()> {
         self.buf.clear();
+        self.buffered_bytes = 0;
+        self.exceeded = false;
         self.w.abort().await
     }
 }

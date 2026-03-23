@@ -5,7 +5,7 @@
 //! the Iceberg `DataFile` manifest entries. This enables file-level pruning
 //! during scans — without bounds, the query engine must open every data file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iceberg::{
     arrow::ArrowFileReader,
@@ -313,6 +313,14 @@ fn extract_column_statistics(
     let mut lower_bounds: HashMap<i32, Datum> = HashMap::new();
     let mut upper_bounds: HashMap<i32, Datum> = HashMap::new();
 
+    // Track fields where any row group lacks complete statistics.
+    // Once a field is marked incomplete, its null counts / bounds are
+    // removed and no longer accumulated — partial file-level stats are
+    // worse than no stats because they can cause incorrect pruning.
+    let mut incomplete_null_counts: HashSet<i32> = HashSet::new();
+    let mut incomplete_lower: HashSet<i32> = HashSet::new();
+    let mut incomplete_upper: HashSet<i32> = HashSet::new();
+
     for row_group in parquet_metadata.row_groups() {
         for col_meta in row_group.columns() {
             let parquet_path = col_meta.column_descr().path().string();
@@ -327,25 +335,57 @@ fn extract_column_statistics(
                 *value_counts.entry(fid).or_insert(0) += col_meta.num_values() as u64;
             }
 
-            if let Some(stats) = col_meta.statistics() {
+            let Some(stats) = col_meta.statistics() else {
+                // No statistics at all — invalidate all stat fields.
+                mark_incomplete(fid, &mut incomplete_null_counts, &mut null_value_counts);
+                mark_incomplete(fid, &mut incomplete_lower, &mut lower_bounds);
+                mark_incomplete(fid, &mut incomplete_upper, &mut upper_bounds);
+                continue;
+            };
+
+            // --- null counts ---
+            if !incomplete_null_counts.contains(&fid) {
                 if let Some(null_count) = stats.null_count_opt() {
                     *null_value_counts.entry(fid).or_insert(0) += null_count;
+                } else {
+                    mark_incomplete(fid, &mut incomplete_null_counts, &mut null_value_counts);
                 }
+            }
 
-                // Resolve the Iceberg primitive type for this field to convert stats.
-                if let Some(field) = schema.field_by_id(fid) {
-                    if let Type::Primitive(ref prim_type) = *field.field_type {
-                        if stats.min_is_exact() {
-                            if let Ok(Some(min_datum)) = parquet_stat_min_as_datum(prim_type, stats) {
-                                update_lower_bound(&mut lower_bounds, fid, min_datum);
-                            }
-                        }
-                        if stats.max_is_exact() {
-                            if let Ok(Some(max_datum)) = parquet_stat_max_as_datum(prim_type, stats) {
-                                update_upper_bound(&mut upper_bounds, fid, max_datum);
-                            }
-                        }
+            // --- lower / upper bounds ---
+            let prim_type = schema.field_by_id(fid).and_then(|f| match *f.field_type {
+                Type::Primitive(ref p) => Some(p.clone()),
+                _ => None,
+            });
+
+            // Non-primitive fields cannot carry bounds.
+            let Some(prim_type) = prim_type else {
+                mark_incomplete(fid, &mut incomplete_lower, &mut lower_bounds);
+                mark_incomplete(fid, &mut incomplete_upper, &mut upper_bounds);
+                continue;
+            };
+
+            // Lower bound
+            if !incomplete_lower.contains(&fid) {
+                if stats.min_is_exact() {
+                    match parquet_stat_min_as_datum(&prim_type, stats) {
+                        Ok(Some(min_datum)) => update_lower_bound(&mut lower_bounds, fid, min_datum),
+                        _ => mark_incomplete(fid, &mut incomplete_lower, &mut lower_bounds),
                     }
+                } else {
+                    mark_incomplete(fid, &mut incomplete_lower, &mut lower_bounds);
+                }
+            }
+
+            // Upper bound
+            if !incomplete_upper.contains(&fid) {
+                if stats.max_is_exact() {
+                    match parquet_stat_max_as_datum(&prim_type, stats) {
+                        Ok(Some(max_datum)) => update_upper_bound(&mut upper_bounds, fid, max_datum),
+                        _ => mark_incomplete(fid, &mut incomplete_upper, &mut upper_bounds),
+                    }
+                } else {
+                    mark_incomplete(fid, &mut incomplete_upper, &mut upper_bounds);
                 }
             }
         }
@@ -357,6 +397,17 @@ fn extract_column_statistics(
         null_value_counts,
         lower_bounds,
         upper_bounds,
+    }
+}
+
+/// Marks a field as incomplete and removes any previously accumulated value.
+///
+/// Once a field is marked incomplete it stays incomplete for the rest of
+/// the file — partial aggregation across row groups would produce an
+/// incorrect file-level statistic.
+fn mark_incomplete<V>(fid: i32, incomplete: &mut HashSet<i32>, map: &mut HashMap<i32, V>) {
+    if incomplete.insert(fid) {
+        map.remove(&fid);
     }
 }
 
