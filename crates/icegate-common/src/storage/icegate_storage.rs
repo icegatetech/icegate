@@ -394,12 +394,9 @@ impl StorageFactory for IceGateStorageFactory {
                 // calls.
                 let cache_layer = self.cache.as_ref().map(|fc| {
                     let cache_metrics = self.meter.as_ref().map_or_else(CacheMetrics::new_disabled, CacheMetrics::new);
-                    Box::new(CacheLayer::new(
-                        fc.clone(),
-                        cache_metrics,
-                        self.stat_ttl,
-                        self.max_write_cache_size,
-                    ))
+                    let layer = CacheLayer::new(fc.clone(), cache_metrics, self.stat_ttl, self.max_write_cache_size);
+                    layer.spawn_sweep();
+                    Box::new(layer)
                 });
 
                 Ok(Arc::new(IceGateStorage::S3 {

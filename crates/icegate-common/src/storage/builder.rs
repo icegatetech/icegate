@@ -129,13 +129,9 @@ pub fn create_s3_store(
 
     let mut operator = if let Some(foyer_cache) = cache {
         let cache_metrics = CacheMetrics::new(&meter);
-        base.layer(CacheLayer::new(
-            foyer_cache.clone(),
-            cache_metrics,
-            stat_ttl,
-            max_write_cache_size,
-        ))
-        .finish()
+        let cache_layer = CacheLayer::new(foyer_cache.clone(), cache_metrics, stat_ttl, max_write_cache_size);
+        cache_layer.spawn_sweep();
+        base.layer(cache_layer).finish()
     } else {
         base.finish()
     };

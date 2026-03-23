@@ -460,6 +460,25 @@ impl KeyLocks {
     fn remove(&self, key: &CacheKey) {
         self.0.remove(key);
     }
+
+    /// Remove lock entries that are not held by any active reader.
+    ///
+    /// An entry is idle when the only remaining `Arc` reference is the one
+    /// stored inside the `DashMap` itself (strong count == 1).
+    fn prune_idle(&self) -> usize {
+        let mut pruned = 0;
+        self.0.retain(|_key, arc| {
+            // strong_count == 1 means only the DashMap holds a reference;
+            // no task is currently using this lock.
+            if Arc::strong_count(arc) == 1 {
+                pruned += 1;
+                false
+            } else {
+                true
+            }
+        });
+        pruned
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +486,50 @@ impl KeyLocks {
 // ---------------------------------------------------------------------------
 
 /// In-memory cache for stat (HEAD) metadata, keyed by path.
-pub(crate) type StatCache = DashMap<CacheKey, (Instant, Metadata)>;
+type StatCacheInner = DashMap<CacheKey, (Instant, Metadata)>;
+
+/// Wrapper around the stat cache `DashMap` with periodic pruning support.
+#[derive(Debug)]
+pub(crate) struct StatCache {
+    inner: StatCacheInner,
+}
+
+impl StatCache {
+    fn new() -> Self {
+        Self { inner: DashMap::new() }
+    }
+
+    /// Get a cached stat entry.
+    fn get(&self, key: &CacheKey) -> Option<dashmap::mapref::one::Ref<'_, CacheKey, (Instant, Metadata)>> {
+        self.inner.get(key)
+    }
+
+    /// Insert a stat entry.
+    fn insert(&self, key: CacheKey, value: (Instant, Metadata)) {
+        self.inner.insert(key, value);
+    }
+
+    /// Remove a stat entry.
+    fn remove(&self, key: &CacheKey) {
+        self.inner.remove(key);
+    }
+
+    /// Remove all entries older than `ttl`.
+    ///
+    /// Returns the number of pruned entries.
+    fn prune_expired(&self, ttl: Duration) -> usize {
+        let mut pruned = 0;
+        self.inner.retain(|_key, (inserted_at, _metadata)| {
+            if inserted_at.elapsed() >= ttl {
+                pruned += 1;
+                false
+            } else {
+                true
+            }
+        });
+        pruned
+    }
+}
 
 /// Custom sparse-range cache layer for `OpenDAL`.
 ///
@@ -490,6 +552,11 @@ impl std::fmt::Debug for KeyLocks {
     }
 }
 
+/// How often the background sweep runs to prune idle locks and expired
+/// stat-cache entries. Chosen to be frequent enough to bound memory
+/// growth but infrequent enough to be negligible overhead.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 impl CacheLayer {
     /// Create a new sparse-range cache layer with metrics.
     ///
@@ -509,10 +576,45 @@ impl CacheLayer {
             cache,
             locks: Arc::new(KeyLocks::new()),
             metrics,
-            stat_cache: Arc::new(DashMap::new()),
+            stat_cache: Arc::new(StatCache::new()),
             stat_ttl,
             max_write_cache_size,
         }
+    }
+
+    /// Spawn a background task that periodically prunes idle key-locks
+    /// and expired stat-cache entries.
+    ///
+    /// The task runs every [`SWEEP_INTERVAL`] and stops automatically
+    /// when all clones of the returned [`CacheLayer`] are dropped (the
+    /// `Arc`s go to strong-count 1, which is the task's own reference).
+    ///
+    /// Call this once after constructing the layer; calling it multiple
+    /// times spawns duplicate sweepers (harmless but wasteful).
+    pub(crate) fn spawn_sweep(&self) {
+        let locks = Arc::clone(&self.locks);
+        let stat_cache = Arc::clone(&self.stat_cache);
+        let stat_ttl = self.stat_ttl;
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+
+                // Stop if we are the last holder — the layer has been dropped.
+                if Arc::strong_count(&locks) <= 1 && Arc::strong_count(&stat_cache) <= 1 {
+                    tracing::debug!("Cache sweep task stopping: layer dropped");
+                    break;
+                }
+
+                let pruned_locks = locks.prune_idle();
+
+                let pruned_stats = stat_ttl.map_or(0, |ttl| stat_cache.prune_expired(ttl));
+
+                if pruned_locks > 0 || pruned_stats > 0 {
+                    tracing::debug!(pruned_locks, pruned_stats, "Cache sweep completed");
+                }
+            }
+        });
     }
 }
 
