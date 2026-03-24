@@ -34,7 +34,6 @@ use crate::storage::icegate_storage::IceGateStorageFactory;
 /// ```ignore
 /// let io_cache = IoHandle::from_config(
 ///     config.catalog.cache.as_ref(),
-///     config.catalog.prefetch.clone(),
 /// ).await?;
 /// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
 /// // ... run servers ...
@@ -72,10 +71,7 @@ impl IoHandle {
     ///
     /// Returns an error if the foyer cache cannot be built (e.g., memory/disk
     /// size overflow or filesystem error).
-    pub async fn from_config(
-        cache_config: Option<&CacheConfig>,
-        prefetch_config: Option<PrefetchConfig>,
-    ) -> Result<Self> {
+    pub async fn from_config(cache_config: Option<&CacheConfig>) -> Result<Self> {
         let stat_ttl = cache_config.and_then(|cc| cc.stat_ttl_secs).map(Duration::from_secs);
         let max_write_cache_size = cache_config
             .and_then(|cc| cc.max_write_cache_size_mb)
@@ -84,7 +80,7 @@ impl IoHandle {
             Some(cc) => Some(build_storage_cache(cc).await?),
             None => None,
         };
-        let prefetch = if cache.is_some() { prefetch_config } else { None };
+        let prefetch = cache_config.and_then(|cc| cc.prefetch.clone());
         Ok(Self {
             cache,
             prefetch,

@@ -23,15 +23,10 @@ pub struct CatalogConfig {
     ///
     /// When set, wraps the Iceberg `FileIO` with a foyer hybrid cache
     /// (memory + disk) to reduce S3 round-trips for repeated reads.
+    /// Prefetch configuration is nested here because it requires a
+    /// cache to store the prefetched data.
     #[serde(default)]
     pub cache: Option<CacheConfig>,
-    /// Optional Parquet column-chunk prefetch configuration.
-    ///
-    /// When set, detects footer reads on `.parquet` files and proactively
-    /// fetches column chunks into the cache before the query engine
-    /// requests them.
-    #[serde(default)]
-    pub prefetch: Option<PrefetchConfig>,
 }
 
 /// IO cache configuration for the `FileIO` layer.
@@ -57,9 +52,15 @@ pub struct CacheConfig {
     ///
     /// Files larger than this are written to storage but not cached,
     /// preventing large data files from evicting smaller WAL segments.
-    /// Defaults to 2 `MiB` when not set.
     #[serde(default)]
     pub max_write_cache_size_mb: Option<usize>,
+    /// Optional Parquet column-chunk prefetch configuration.
+    ///
+    /// When set, detects footer reads on `.parquet` files and proactively
+    /// fetches column chunks into the cache before the query engine
+    /// requests them.
+    #[serde(default)]
+    pub prefetch: Option<PrefetchConfig>,
 }
 
 /// Types of catalogs supported
@@ -163,14 +164,12 @@ impl CatalogConfig {
                     "Cache max_write_cache_size_mb must be greater than 0 when set".into(),
                 ));
             }
-        }
-
-        // Validate prefetch config if present
-        if let Some(ref prefetch) = self.prefetch {
-            if prefetch.max_prefetch_bytes == 0 {
-                return Err(CommonError::Config(
-                    "Prefetch max_prefetch_bytes must be greater than 0".into(),
-                ));
+            if let Some(ref prefetch) = cache.prefetch {
+                if prefetch.max_prefetch_bytes == 0 {
+                    return Err(CommonError::Config(
+                        "Prefetch max_prefetch_bytes must be greater than 0".into(),
+                    ));
+                }
             }
         }
 
@@ -185,7 +184,6 @@ impl Default for CatalogConfig {
             warehouse: "/tmp/icegate/warehouse".to_string(),
             properties: HashMap::new(),
             cache: None,
-            prefetch: None,
         }
     }
 }

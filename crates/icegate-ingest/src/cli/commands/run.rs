@@ -248,7 +248,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
     let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
 
-    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), config.catalog.prefetch.clone()).await?;
+    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
 
     if let (Some(cache), Some(runtime)) = (io_cache.cache(), metrics_runtime.as_ref()) {
         icegate_common::register_foyer_metrics(cache, &runtime.meter());
@@ -286,8 +286,9 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Run the WAL writer on a dedicated runtime so flush I/O is not
     // blocked by OTLP request processing on the main runtime.
+    let wal_threads = compute_runtime_threads();
     let wal_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(wal_threads.main_threads)
         .thread_name("icegate-wal")
         .enable_all()
         .build()

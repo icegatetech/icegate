@@ -21,16 +21,16 @@ data:
         {{- with .Values.query.cache.maxWriteCacheSizeMb }}
         max_write_cache_size_mb: {{ . }}
         {{- end }}
-      {{- end }}
-      {{- if .Values.query.prefetch.enabled }}
-      prefetch:
-        enabled: true
-        {{- with .Values.query.prefetch.maxPrefetchBytes }}
-        max_prefetch_bytes: {{ . }}
-        {{- end }}
-        {{- with .Values.query.prefetch.prefetchColumns }}
-        prefetch_columns:
-          {{- toYaml . | nindent 10 }}
+        {{- if .Values.query.cache.prefetch.enabled }}
+        prefetch:
+          enabled: true
+          {{- with .Values.query.cache.prefetch.maxPrefetchBytes }}
+          max_prefetch_bytes: {{ . }}
+          {{- end }}
+          {{- with .Values.query.cache.prefetch.prefetchColumns }}
+          prefetch_columns:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
         {{- end }}
       {{- end }}
     engine:

@@ -139,7 +139,6 @@ async fn setup_containers() -> (ContainerAsync<MinIO>, ContainerAsync<GenericIma
         warehouse: format!("s3://{BUCKET_NAME}/"),
         properties,
         cache: None,
-        prefetch: None,
     };
 
     (minio, iceberg, config)

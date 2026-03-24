@@ -55,7 +55,6 @@ impl TestServer {
             warehouse: warehouse_str.clone(),
             properties: std::collections::HashMap::default(),
             cache: None,
-            prefetch: None,
         };
 
         let loki_config = LokiConfig {

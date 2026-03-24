@@ -61,7 +61,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     // Initialize catalog
     tracing::info!("Initializing catalog");
-    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), config.catalog.prefetch.clone()).await?;
+    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
 
     // Register foyer cache metrics with the meter provider so Prometheus can
     // scrape memory usage, disk I/O, entry counts, and throttle state.

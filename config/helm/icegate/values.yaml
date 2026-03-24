@@ -100,13 +100,12 @@ query:
     maxWriteCacheSizeMb: 2
     ## Volume size for the disk cache (used as emptyDir sizeLimit)
     volumeSizeLimit: 5Gi
-
-  ## Parquet metadata prefetch (warms cache with column/offset indexes
-  ## and bloom filters after footer reads — never data pages)
-  prefetch:
-    enabled: false
-    ## maxPrefetchBytes: 4194304  # 4 MiB (metadata is small)
-    ## prefetchColumns: []        # empty = all columns
+    ## Parquet metadata prefetch (warms cache with column/offset indexes
+    ## and bloom filters after footer reads — never data pages)
+    prefetch:
+      enabled: false
+      ## maxPrefetchBytes: 4194304  # 4 MiB (metadata is small)
+      ## prefetchColumns: []        # empty = all columns
 
   ## Loki API
   loki:
@@ -262,13 +261,12 @@ ingest:
     maxWriteCacheSizeMb: 2
     ## Volume size for the disk cache (used as emptyDir sizeLimit)
     volumeSizeLimit: 5Gi
-
-  ## Parquet metadata prefetch (warms cache with column/offset indexes
-  ## and bloom filters after footer reads — never data pages)
-  prefetch:
-    enabled: false
-    ## maxPrefetchBytes: 4194304  # 4 MiB (metadata is small)
-    ## prefetchColumns: []        # empty = all columns
+    ## Parquet metadata prefetch (warms cache with column/offset indexes
+    ## and bloom filters after footer reads — never data pages)
+    prefetch:
+      enabled: false
+      ## maxPrefetchBytes: 4194304  # 4 MiB (metadata is small)
+      ## prefetchColumns: []        # empty = all columns
 
   ## OTLP HTTP receiver
   otlpHttp:

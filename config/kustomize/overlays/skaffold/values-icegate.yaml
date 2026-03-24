@@ -43,8 +43,8 @@ query:
     statTtlSecs: 300
     ## emptyDir sizeLimit for the disk cache volume
     volumeSizeLimit: 5Gi
-  prefetch:
-    enabled: true
+    prefetch:
+      enabled: true
   waitForDependencies:
     enabled: true
     endpoints:
@@ -83,8 +83,8 @@ ingest:
     diskSizeMb: 1024
     statTtlSecs: 300
     volumeSizeLimit: 2Gi
-  prefetch:
-    enabled: false
+    prefetch:
+      enabled: false
   waitForDependencies:
     enabled: true
     endpoints:

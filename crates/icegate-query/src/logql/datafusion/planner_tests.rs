@@ -168,7 +168,6 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
         warehouse: warehouse_str,
         properties: std::collections::HashMap::new(),
         cache: None,
-        prefetch: None,
     };
 
     let iceberg_catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())

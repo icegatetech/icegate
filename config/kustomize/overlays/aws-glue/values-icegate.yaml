@@ -43,8 +43,8 @@ query:
     statTtlSecs: 300
     ## Volume size for the disk cache (emptyDir sizeLimit or PVC storage request)
     volumeSizeLimit: 5Gi
-  prefetch:
-    enabled: false
+    prefetch:
+      enabled: false
   loki:
     enabled: true
     port: 3100
@@ -78,8 +78,8 @@ ingest:
     diskSizeMb: 1024
     statTtlSecs: 300
     volumeSizeLimit: 2Gi
-  prefetch:
-    enabled: false
+    prefetch:
+      enabled: false
   otlpHttp:
     enabled: true
     port: 4318
