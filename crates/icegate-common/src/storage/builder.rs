@@ -5,14 +5,17 @@
 //! retry, caching, and `OpenTelemetry` observability layers.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use object_store_opendal::OpendalStore;
 use opendal::Operator;
-use opendal::layers::{OtelMetricsLayer, OtelTraceLayer, RetryLayer};
+use opendal::layers::{OtelMetricsLayer, OtelTraceLayer};
 use opendal::services::S3;
 
 use super::StorageBackend;
+use super::cache::{CacheLayer, CacheMetrics, StorageCache};
+use super::prefetch::{PrefetchConfig, PrefetchLayer, PrefetchMetrics};
 use crate::error::{CommonError, Result};
 
 /// Result containing the object store and the normalized base path.
@@ -26,10 +29,10 @@ pub type ObjectStoreWithPath = (Arc<dyn ObjectStore>, String);
 /// Parses the S3 URL, reads credentials from environment, and builds the store
 /// with the following layer stack (outermost first):
 ///
-/// 1. **`OtelMetricsLayer`** — `OpenTelemetry` storage metrics (sees cache hits)
+/// 1. **`PrefetchLayer`** — Parquet column-chunk prefetch (outermost, if configured)
 /// 2. **`FoyerLayer`** — shared hybrid cache (if `cache` is provided)
-/// 3. **`OtelTraceLayer`** — `OpenTelemetry` distributed tracing (S3 calls only)
-/// 4. **`RetryLayer`** — automatic retries with exponential backoff
+/// 3. **`OtelMetricsLayer`** — `OpenTelemetry` storage metrics (S3 round-trips / cache misses only)
+/// 4. **`OtelTraceLayer`** — `OpenTelemetry` distributed tracing (S3 calls only)
 ///
 /// The resulting [`Operator`] is wrapped in [`OpendalStore`] to satisfy
 /// the `Arc<dyn ObjectStore>` interface expected by all downstream code.
@@ -38,7 +41,10 @@ pub type ObjectStoreWithPath = (Arc<dyn ObjectStore>, String);
 ///
 /// * `base_path` - S3 URL in the format `s3://bucket/prefix`
 /// * `backend` - Optional storage backend configuration for endpoint/region settings
-/// * `cache` - Optional foyer cache shared with the Iceberg catalog's IO layer
+/// * `cache` - Optional foyer cache shared with the Iceberg catalog's storage layer
+/// * `prefetch` - Optional Parquet column-chunk prefetch configuration
+/// * `stat_ttl` - Optional TTL for caching stat (HEAD) responses
+/// * `max_write_cache_size` - Optional max value size (bytes) to cache on writes
 ///
 /// # Returns
 ///
@@ -47,10 +53,16 @@ pub type ObjectStoreWithPath = (Arc<dyn ObjectStore>, String);
 pub fn create_s3_store(
     base_path: &str,
     backend: Option<&StorageBackend>,
-    cache: Option<&iceberg::io::FoyerCache>,
+    cache: Option<&StorageCache>,
+    prefetch: Option<&PrefetchConfig>,
+    stat_ttl: Option<Duration>,
+    max_write_cache_size: Option<usize>,
 ) -> Result<ObjectStoreWithPath> {
-    // Parse S3 URL: s3://bucket/prefix
-    let path_without_scheme = base_path.strip_prefix("s3://").unwrap_or(base_path);
+    // Parse S3 URL: s3://bucket/prefix or s3a://bucket/prefix
+    let path_without_scheme = base_path
+        .strip_prefix("s3://")
+        .or_else(|| base_path.strip_prefix("s3a://"))
+        .unwrap_or(base_path);
     let (bucket, prefix) = path_without_scheme.split_once('/').map_or_else(
         || (path_without_scheme.to_string(), String::new()),
         |(b, p)| (b.to_string(), p.to_string()),
@@ -102,27 +114,36 @@ pub fn create_s3_store(
     // Build Operator with layers (outermost applied last, executed first).
     // Desired execution order (outermost → innermost):
     //
-    //   OtelMetrics → [FoyerCache] → OtelTrace → Retry → S3
+    //   [Prefetch] → [FoyerCache] → OtelMetrics → OtelTrace → S3
     //
-    // Metrics observe every request (including cache hits), while traces
-    // only cover actual S3 round-trips beneath the cache.
+    // Tracing and metrics sit below the cache so they only
+    // observe actual S3 round-trips (cache misses).
     //
     // Each `.layer()` call changes the generic type of `OperatorBuilder`, so
     // the FoyerLayer branch must be handled as a separate code path.
-    let meter = opentelemetry::global::meter("wal-opendal");
+    let meter = opentelemetry::global::meter("icegate-wal");
     let base = Operator::new(s3)
         .map_err(|e| CommonError::Config(format!("Failed to build OpenDAL S3 operator: {e}")))?
-        .layer(RetryLayer::new())
-        .layer(OtelTraceLayer);
+        .layer(OtelTraceLayer)
+        .layer(OtelMetricsLayer::builder().register(&meter));
 
-    let operator = if let Some(foyer_cache) = cache {
-        let foyer_layer = iceberg::io::FoyerLayer::new(foyer_cache.clone());
-        base.layer(foyer_layer)
-            .layer(OtelMetricsLayer::builder().register(&meter))
-            .finish()
+    let mut operator = if let Some(foyer_cache) = cache {
+        let cache_metrics = CacheMetrics::new(&meter);
+        let cache_layer = CacheLayer::new(foyer_cache.clone(), cache_metrics, stat_ttl, max_write_cache_size);
+        cache_layer.spawn_sweep();
+        base.layer(cache_layer).finish()
     } else {
-        base.layer(OtelMetricsLayer::builder().register(&meter)).finish()
+        base.finish()
     };
+
+    // Prefetch layer sits outermost so background reads flow through the
+    // cache layer and land in the foyer cache.
+    if let Some(pf) = prefetch {
+        if pf.enabled {
+            let pf_metrics = PrefetchMetrics::new(&meter);
+            operator = operator.layer(PrefetchLayer::new(pf.clone(), pf_metrics));
+        }
+    }
 
     let store: Arc<dyn ObjectStore> = Arc::new(OpendalStore::new(operator));
 
@@ -172,6 +193,8 @@ pub fn create_memory_store(base_path: &str) -> ObjectStoreWithPath {
 /// * `base_path` - The storage path with optional scheme prefix
 /// * `backend` - Optional storage backend configuration (used for S3 endpoint/region)
 /// * `cache` - Optional foyer cache for S3 read caching (ignored for non-S3 backends)
+/// * `prefetch` - Optional Parquet prefetch config (ignored for non-S3 backends)
+/// * `stat_ttl` - Optional TTL for caching stat (HEAD) responses (ignored for non-S3 backends)
 ///
 /// # Returns
 ///
@@ -179,10 +202,13 @@ pub fn create_memory_store(base_path: &str) -> ObjectStoreWithPath {
 pub fn create_object_store(
     base_path: &str,
     backend: Option<&StorageBackend>,
-    cache: Option<&iceberg::io::FoyerCache>,
+    cache: Option<&StorageCache>,
+    prefetch: Option<&PrefetchConfig>,
+    stat_ttl: Option<Duration>,
+    max_write_cache_size: Option<usize>,
 ) -> Result<ObjectStoreWithPath> {
-    if base_path.starts_with("s3://") {
-        create_s3_store(base_path, backend, cache)
+    if base_path.starts_with("s3://") || base_path.starts_with("s3a://") {
+        create_s3_store(base_path, backend, cache, prefetch, stat_ttl, max_write_cache_size)
     } else if base_path.starts_with("file://") || base_path.starts_with('/') {
         create_local_store(base_path)
     } else {

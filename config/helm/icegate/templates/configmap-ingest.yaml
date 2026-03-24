@@ -10,6 +10,29 @@ data:
   ingest.yaml: |
     catalog:
       {{- include "icegate.catalogYaml" . | nindent 6 }}
+      {{- if .Values.ingest.cache.enabled }}
+      cache:
+        memory_size_mb: {{ .Values.ingest.cache.memorySizeMb }}
+        disk_dir: {{ .Values.ingest.cache.diskDir }}
+        disk_size_mb: {{ .Values.ingest.cache.diskSizeMb }}
+        {{- with .Values.ingest.cache.statTtlSecs }}
+        stat_ttl_secs: {{ . }}
+        {{- end }}
+        {{- with .Values.ingest.cache.maxWriteCacheSizeMb }}
+        max_write_cache_size_mb: {{ . }}
+        {{- end }}
+        {{- if .Values.ingest.cache.prefetch.enabled }}
+        prefetch:
+          enabled: true
+          {{- with .Values.ingest.cache.prefetch.maxPrefetchBytes }}
+          max_prefetch_bytes: {{ . }}
+          {{- end }}
+          {{- with .Values.ingest.cache.prefetch.prefetchColumns }}
+          prefetch_columns:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
     storage:
       {{- include "icegate.storageYaml" . | nindent 6 }}
     queue:

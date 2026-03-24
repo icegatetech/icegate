@@ -6,11 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow::{
-    array::ArrayRef,
-    compute::{SortColumn, SortOptions, lexsort_to_indices, take},
-    record_batch::RecordBatch,
-};
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use futures::{StreamExt, future::join_all};
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
@@ -249,19 +245,8 @@ impl QueueWriter {
 
         let total_records: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
-        // Concatenate all batches into one
-        let concatenated = match TopicAccumulator::concat_batches(&batches) {
-            Ok(batch) => batch,
-            Err(e) => {
-                self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
-                self.events.on_write_error(topic.as_str(), write_error_reason(&e));
-                TopicAccumulator::send_failure(response_channels, &e.to_string(), flush_trace_context.as_ref());
-                return Err(e);
-            }
-        };
-
-        // Write the concatenated batch
-        match self.write_batch(topic, concatenated, None).await {
+        // Write the accumulated batches directly (each becomes a row group)
+        match self.write_batches(topic, batches).await {
             Ok(offset) => {
                 self.events.on_flush_finish(topic.as_str(), "ok", flush_start.elapsed());
                 debug!(offset, "Flush completed");
@@ -293,28 +278,23 @@ impl QueueWriter {
         Ok(())
     }
 
-    /// Writes a batch to object storage, returning the offset.
+    /// Writes accumulated batches to object storage, returning the offset.
     ///
-    /// This is the core write method used internally. For normal usage, prefer using the channel-based approach via `start()`.
-    /// We flush after each prepared batch, but large batches can still be split by parquet max row group size.
+    /// Each batch becomes a separate Parquet row group, preserving original
+    /// batch boundaries. This avoids an expensive `concat_batches` copy by
+    /// passing individual batches directly to the Parquet writer.
     #[tracing::instrument(
-        skip(self, batch),
+        skip(self, batches),
         fields(topic = %topic)
     )]
-    async fn write_batch(&self, topic: &Topic, batch: RecordBatch, group_by_column: Option<String>) -> Result<u64> {
-        let record_count = batch.num_rows();
+    async fn write_batches(&self, topic: &Topic, batches: Vec<RecordBatch>) -> Result<u64> {
+        let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
         if record_count == 0 {
-            debug!("Empty batch, skipping write");
+            debug!("Empty batches, skipping write");
             return Ok(self.get_current_offset(topic).await);
         }
 
-        // Prepare batches (optionally grouped by column)
-        let batches = match group_by_column {
-            Some(ref col) => self.group_by_column(&batch, col)?,
-            None => vec![batch],
-        };
-
-        // Convert to Parquet bytes
+        // Convert to Parquet bytes — each batch becomes a row group
         let row_group_count = batches.len();
         let writer_properties = self.writer_properties();
         let span = tracing::Span::current();
@@ -344,75 +324,6 @@ impl QueueWriter {
         );
 
         Ok(offset)
-    }
-
-    /// Groups a record batch by the values in a column.
-    ///
-    /// Returns separate batches, one per unique value in the column.
-    /// Each batch becomes a separate row group in the Parquet file.
-    #[allow(clippy::unused_self)] // May need self for future configuration access
-    fn group_by_column(&self, batch: &RecordBatch, column_name: &str) -> Result<Vec<RecordBatch>> {
-        let col_idx = batch
-            .schema()
-            .index_of(column_name)
-            .map_err(|e| QueueError::Config(format!("group_by column '{column_name}' not found: {e}")))?;
-
-        let column = batch.column(col_idx);
-
-        // Sort by the grouping column
-        let sort_column = SortColumn {
-            values: Arc::clone(column),
-            options: Some(SortOptions {
-                descending: false,
-                nulls_first: true,
-            }),
-        };
-
-        let indices = lexsort_to_indices(&[sort_column], None)?;
-
-        // Take sorted values
-        let sorted_columns: Vec<ArrayRef> = batch
-            .columns()
-            .iter()
-            .map(|col| take(col.as_ref(), &indices, None))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        let sorted_batch = RecordBatch::try_new(batch.schema(), sorted_columns)?;
-        let sorted_group_col = sorted_batch.column(col_idx);
-
-        // Find group boundaries
-        let mut boundaries = vec![0usize];
-        for i in 1..sorted_batch.num_rows() {
-            // Compare adjacent values to find group changes
-            let prev_null = sorted_group_col.is_null(i - 1);
-            let curr_null = sorted_group_col.is_null(i);
-
-            let is_boundary = match (prev_null, curr_null) {
-                (true, true) => false,                 // Both null, same group
-                (true, false) | (false, true) => true, // Null/non-null boundary
-                (false, false) => {
-                    // Compare actual values using array equality
-                    let prev_slice = sorted_group_col.slice(i - 1, 1);
-                    let curr_slice = sorted_group_col.slice(i, 1);
-                    prev_slice.as_ref() != curr_slice.as_ref()
-                }
-            };
-
-            if is_boundary {
-                boundaries.push(i);
-            }
-        }
-        boundaries.push(sorted_batch.num_rows());
-
-        // Create batches for each group
-        let mut result = Vec::with_capacity(boundaries.len() - 1);
-        for window in boundaries.windows(2) {
-            let start = window[0];
-            let length = window[1] - start;
-            result.push(sorted_batch.slice(start, length));
-        }
-
-        Ok(result)
     }
 
     /// Converts record batches to Parquet bytes.
@@ -449,21 +360,56 @@ impl QueueWriter {
             .build()
     }
 
+    /// Claims the next available offset for a topic.
+    ///
+    /// Reads the current counter, scans forward with HEAD requests to find the
+    /// first offset where no segment exists, updates the counter, and returns
+    /// the claimed offset. Combines counter management and availability probing
+    /// in a single operation.
+    async fn claim_offset(&self, topic: &Topic) -> Result<u64> {
+        let start_offset = self.get_current_offset(topic).await;
+        trace!(topic = %topic, start_offset, "claiming offset");
+        let mut offset = start_offset;
+        loop {
+            let found_free = !self.segment_exists(&SegmentId::new(topic, offset)).await?;
+            let next = offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                topic: topic.clone(),
+                offset,
+                source: "offset space exhausted (u64::MAX reached)".into(),
+            })?;
+            if found_free {
+                let skipped = offset - start_offset;
+                if skipped > 0 {
+                    debug!(topic = %topic, offset, skipped, "claimed offset after skipping occupied slots");
+                } else {
+                    trace!(topic = %topic, offset, "claimed offset");
+                }
+                return Ok(offset);
+            }
+            trace!(topic = %topic, offset, "offset occupied, advancing");
+            offset = next;
+        }
+    }
+
     /// Writes Parquet bytes to object storage with retry on conflict.
+    ///
+    /// On `AlreadyExists`, probes forward with HEAD requests to find the
+    /// first available offset instead of sleeping. This resolves conflicts
+    /// in ~5-10ms (HEAD roundtrip) rather than 150-250ms (sleep + jitter).
     #[tracing::instrument(skip(self, data), fields(topic = %topic))]
     async fn write_with_retry(&self, topic: &Topic, data: Bytes) -> Result<u64> {
         let mut attempts = 0;
         let max_attempts = self.config.write.write_retries;
 
         loop {
-            let offset = self.next_offset(topic).await;
+            let offset = self.claim_offset(topic).await?;
             let segment_id = SegmentId::new(topic, offset);
             let attempt = attempts + 1;
 
             match self.try_write(&segment_id, data.clone(), attempt).await {
                 Ok(()) => {
+                    self.set_offset(topic, offset + 1).await;
                     debug!("Wrote segment {}/{}", topic, offset);
-
                     return Ok(offset);
                 }
                 Err(QueueError::AlreadyExists { .. }) => {
@@ -476,22 +422,11 @@ impl QueueWriter {
                             source: "max retries exceeded on conflict".into(),
                         });
                     }
-                    warn!(
-                        "Segment {}/{} already exists, retrying (attempt {})",
-                        topic, offset, attempts
+                    debug!(
+                        conflicted_offset = offset,
+                        attempt = attempts,
+                        "Segment already exists, will probe for next available offset"
                     );
-                    // Increment offset and retry (loop continues)
-                    // SAFETY: check the interval is within the range of u64
-                    if self.config.write.flush_interval_ms >= i64::MAX as u64 {
-                        return Err(QueueError::Config("flush_interval_ms too large".to_string()));
-                    }
-                    #[allow(clippy::cast_possible_wrap)]
-                    let interval = self.config.write.flush_interval_ms as i64 / 4; // 25% delta
-                    #[allow(clippy::cast_sign_loss)]
-                    // SAFETY: the `interval` can't be negative
-                    let delay = self.config.write.flush_interval_ms + rand::random_range(-interval..=interval) as u64;
-                    debug!(offset, attempt = attempts, delay_ms = delay, "Retrying segment write");
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -541,19 +476,24 @@ impl QueueWriter {
         let elapsed_ms = u64::try_from(put_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let result = put_result.map_err(|e| {
-            warn!(
-                reason = object_store_error_reason(&e),
-                elapsed_ms,
-                error = %e,
-                "store.put_opts failed"
-            );
             if matches!(e, object_store::Error::AlreadyExists { .. }) {
-                debug!("Segment already exists, skipping write (offset {})", segment_id.offset);
+                debug!(
+                    reason = object_store_error_reason(&e),
+                    elapsed_ms,
+                    error = %e,
+                    "store.put_opts conflict (expected in multi-replica)"
+                );
                 QueueError::AlreadyExists {
                     topic: segment_id.topic.clone(),
                     offset: segment_id.offset,
                 }
             } else {
+                warn!(
+                    reason = object_store_error_reason(&e),
+                    elapsed_ms,
+                    error = %e,
+                    "store.put_opts failed"
+                );
                 QueueError::Write {
                     topic: segment_id.topic.clone(),
                     offset: segment_id.offset,
@@ -576,16 +516,6 @@ impl QueueWriter {
     async fn get_current_offset(&self, topic: &Topic) -> u64 {
         let offsets = self.offsets.read().await;
         offsets.get(topic).copied().unwrap_or(0)
-    }
-
-    /// Gets the next offset for a topic and increments the counter.
-    #[allow(clippy::significant_drop_tightening)]
-    async fn next_offset(&self, topic: &Topic) -> u64 {
-        let mut offsets = self.offsets.write().await;
-        let offset = offsets.entry(topic.clone()).or_insert(0);
-        let current = *offset;
-        *offset += 1;
-        current
     }
 
     /// Sets the offset for a topic (used during recovery).
@@ -720,7 +650,11 @@ impl QueueWriter {
 
         for topic in &topics {
             if let Some(max_offset) = self.find_max_offset(topic).await? {
-                let next_offset = max_offset + 1;
+                let next_offset = max_offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                    topic: topic.clone(),
+                    offset: max_offset,
+                    source: "offset space exhausted during recovery (u64::MAX reached)".into(),
+                })?;
                 self.set_offset(topic, next_offset).await;
                 info!("Recovered topic '{}': next offset = {}", topic, next_offset);
             }
@@ -858,7 +792,7 @@ mod tests {
         let writer = QueueWriter::new(config, store.clone());
 
         let batch = test_batch();
-        let offset = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
+        let offset = writer.write_batches(&"logs".to_string(), vec![batch]).await.unwrap();
 
         assert_eq!(offset, 0);
 
@@ -869,21 +803,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_batch_with_grouping() {
-        let store = Arc::new(InMemory::new());
-        let config = QueueConfig::new("queue");
-        let writer = QueueWriter::new(config, store.clone());
-
-        let batch = test_batch();
-        let offset = writer
-            .write_batch(&"logs".to_string(), batch, Some("tenant_id".to_string()))
-            .await
-            .unwrap();
-
-        assert_eq!(offset, 0);
-    }
-
-    #[tokio::test]
     async fn test_sequential_offsets() {
         let store = Arc::new(InMemory::new());
         let config = QueueConfig::new("queue");
@@ -891,11 +810,11 @@ mod tests {
 
         let batch = test_batch();
 
-        let offset1 = writer.write_batch(&"logs".to_string(), batch.clone(), None).await.unwrap();
+        let offset1 = writer.write_batches(&"logs".to_string(), vec![batch.clone()]).await.unwrap();
 
-        let offset2 = writer.write_batch(&"logs".to_string(), batch.clone(), None).await.unwrap();
+        let offset2 = writer.write_batches(&"logs".to_string(), vec![batch.clone()]).await.unwrap();
 
-        let offset3 = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
+        let offset3 = writer.write_batches(&"logs".to_string(), vec![batch]).await.unwrap();
 
         assert_eq!(offset1, 0);
         assert_eq!(offset2, 1);
@@ -917,7 +836,7 @@ mod tests {
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             batch,
-            group_by_column: None,
+
             response_tx,
             trace_context: None,
         })
@@ -931,29 +850,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_group_by_column() {
-        let store = Arc::new(InMemory::new());
-        let config = QueueConfig::new("queue");
-        let writer = QueueWriter::new(config, store);
-
-        let batch = test_batch();
-        let grouped = writer.group_by_column(&batch, "tenant_id").unwrap();
-
-        // Should have 2 groups: acme and globex
-        assert_eq!(grouped.len(), 2);
-
-        // Each group should have 2 records
-        assert_eq!(grouped[0].num_rows(), 2);
-        assert_eq!(grouped[1].num_rows(), 2);
-    }
-
-    #[tokio::test]
     async fn test_max_row_group_size_limits_row_group_size() {
         let store = Arc::new(InMemory::new());
         let config = QueueConfig::new("queue").with_max_row_group_size(2);
         let writer = QueueWriter::new(config, store.clone());
 
-        writer.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        writer.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
 
         let reader = ParquetQueueReader::new("queue", store, 2).unwrap();
         let cancel = CancellationToken::new();
@@ -975,7 +877,7 @@ mod tests {
 
         // First write should start at offset 0
         let batch = test_batch();
-        let offset = writer.write_batch(&"logs".to_string(), batch, None).await.unwrap();
+        let offset = writer.write_batches(&"logs".to_string(), vec![batch]).await.unwrap();
         assert_eq!(offset, 0);
     }
 
@@ -986,9 +888,9 @@ mod tests {
         // Write some segments with first writer
         let config1 = QueueConfig::new("queue");
         let writer1 = QueueWriter::new(config1, store.clone());
-        writer1.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
-        writer1.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
-        writer1.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        writer1.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
+        writer1.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
+        writer1.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
 
         // Create new writer (simulating restart) and recover
         let config2 = QueueConfig::new("queue");
@@ -996,7 +898,7 @@ mod tests {
         writer2.recover().await.unwrap();
 
         // New write should continue from offset 3
-        let offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        let offset = writer2.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
         assert_eq!(offset, 3);
     }
 
@@ -1007,9 +909,9 @@ mod tests {
         // Write segments to different topics
         let config1 = QueueConfig::new("queue");
         let writer1 = QueueWriter::new(config1, store.clone());
-        writer1.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
-        writer1.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
-        writer1.write_batch(&"events".to_string(), test_batch(), None).await.unwrap();
+        writer1.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
+        writer1.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
+        writer1.write_batches(&"events".to_string(), vec![test_batch()]).await.unwrap();
 
         // Create new writer and recover
         let config2 = QueueConfig::new("queue");
@@ -1017,8 +919,8 @@ mod tests {
         writer2.recover().await.unwrap();
 
         // Writes should continue from recovered offsets
-        let logs_offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
-        let events_offset = writer2.write_batch(&"events".to_string(), test_batch(), None).await.unwrap();
+        let logs_offset = writer2.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
+        let events_offset = writer2.write_batches(&"events".to_string(), vec![test_batch()]).await.unwrap();
 
         assert_eq!(logs_offset, 2);
         assert_eq!(events_offset, 1);
@@ -1033,7 +935,7 @@ mod tests {
         // Write enough segments to validate exponential + binary search
         let segment_count = 2000;
         for _ in 0..segment_count {
-            writer.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+            writer.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
         }
 
         // Simulate restart
@@ -1041,7 +943,7 @@ mod tests {
         let writer2 = QueueWriter::new(config2, store);
         writer2.recover().await.unwrap();
 
-        let offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        let offset = writer2.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
         assert_eq!(offset, segment_count);
     }
 
@@ -1053,7 +955,7 @@ mod tests {
         let config1 = QueueConfig::new("queue");
         let writer1 = QueueWriter::new(config1, store.clone());
         for _ in 0..10 {
-            writer1.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+            writer1.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
         }
 
         // Delete segments 0-4 (simulating TTL clearing early segments)
@@ -1069,7 +971,35 @@ mod tests {
         writer2.recover().await.unwrap();
 
         // New write should continue from offset 10 (after the last existing segment 9)
-        let offset = writer2.write_batch(&"logs".to_string(), test_batch(), None).await.unwrap();
+        let offset = writer2.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
         assert_eq!(offset, 10);
+    }
+
+    #[tokio::test]
+    async fn test_conflict_probe_skips_taken_offsets() {
+        let store = Arc::new(InMemory::new());
+        let config = QueueConfig::new("queue");
+        let writer = QueueWriter::new(config, store.clone());
+
+        // Pre-write segments at offsets 0, 1, 2 directly to the store
+        // (simulating other replicas having written these offsets)
+        let batch = test_batch();
+        let props = WriterProperties::builder().build();
+        let parquet_bytes = QueueWriter::batches_to_parquet(props, &[batch]).unwrap();
+        for offset in 0..3 {
+            let segment_id = SegmentId::new("logs", offset);
+            let path = Path::from(format!("queue/{}", segment_id.to_relative_path()));
+            store.put(&path, PutPayload::from_bytes(parquet_bytes.clone())).await.unwrap();
+        }
+
+        // Writer starts at offset 0 (no recovery called, counter is at 0).
+        // First attempt at offset 0 will conflict, then probe forward
+        // past 1 and 2, and successfully write at offset 3.
+        let offset = writer.write_batches(&"logs".to_string(), vec![test_batch()]).await.unwrap();
+        assert_eq!(offset, 3);
+
+        // Verify the segment at offset 3 exists
+        let path = Path::from("queue/logs/00000000000000000003.parquet");
+        assert!(store.head(&path).await.is_ok());
     }
 }

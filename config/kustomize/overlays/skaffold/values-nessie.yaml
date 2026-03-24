@@ -19,7 +19,7 @@ catalog:
     s3:
       defaultOptions:
         region: us-east-1
-        endpoint: "http://minio.infra:9000/" # this endpoint has to be acceptable to icegate services.
+        endpoint: "http://minio.infra.svc.cluster.local.:9000/" # this endpoint has to be acceptable to icegate services.
         pathStyleAccess: true
         authType: STATIC
         accessKeySecret:

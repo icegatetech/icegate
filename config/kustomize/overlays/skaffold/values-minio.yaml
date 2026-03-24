@@ -1,7 +1,7 @@
 # MinIO (S3-compatible object storage) - standalone mode for development
 image:
   repository: minio/minio
-  tag: RELEASE.2025-02-28T09-55-16Z
+  tag: RELEASE.2025-09-07T16-13-09Z
   pullPolicy: IfNotPresent
 
 mode: standalone
@@ -47,5 +47,8 @@ buckets:
 metrics:
   serviceMonitor:
     enabled: true
+    public: true
+    namespace: infra
+    includeNode: true
     interval: 30s
     scrapeTimeout: 10s

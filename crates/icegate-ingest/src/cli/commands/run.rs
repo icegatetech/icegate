@@ -9,11 +9,12 @@ use std::{
 };
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use icegate_common::{IoCacheHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
+use icegate_common::{IoHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use object_store::ObjectStore;
 use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use crate::{
     IngestConfig,
@@ -84,14 +85,19 @@ fn spawn_shift_runtime(shifter: Shifter, shift_threads: usize) -> Result<ShiftRu
     let join_handle = thread::Builder::new()
         .name("icegate-shift-runtime".to_string())
         .spawn(move || -> Result<()> {
-            let runtime = Builder::new_multi_thread()
-                .worker_threads(shift_threads)
-                .enable_all()
-                .build()
-                .map_err(IngestError::Io)?;
+            let mut builder = Builder::new_multi_thread();
+            builder.worker_threads(shift_threads).enable_all();
+            #[cfg(tokio_unstable)]
+            builder.enable_metrics_poll_time_histogram();
+            let runtime = builder.build().map_err(IngestError::Io)?;
 
             let shifter_handle = {
                 let _guard = runtime.enter();
+                opentelemetry_instrumentation_tokio::Config::new()
+                    .with_label("runtime.name", "shift")
+                    .observe_current_runtime();
+                info!("Shift starting on runtime {}", runtime.handle().id());
+
                 match shifter.start() {
                     Ok(handle) => {
                         let _ = startup_tx.send(Ok(()));
@@ -229,25 +235,76 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     tracing::info!("Loading configuration from {:?}", config_path);
     tracing::info!("Configuration loaded successfully");
 
-    // Initialize WAL queue based on queue config's base_path
-    tracing::info!("Initializing WAL queue");
-    let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
-    let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
-
-    // Create object store based on queue base_path
-    // Ingest writes data — no read cache needed, pass None.
-    let (store, normalized_path) =
-        create_object_store(&queue_config.common.base_path, Some(&config.storage.backend), None)?;
-
-    // Update queue config with normalized base path
-    let mut queue_config = queue_config;
-    queue_config.common.base_path = normalized_path;
-
+    // Initialize metrics early so that the global meter provider is available
+    // for OpenDAL's OtelMetricsLayer and Iceberg's IceGateStorageFactory.
     let metrics_runtime = if config.metrics.enabled {
         Some(Arc::new(MetricsRuntime::new("ingest")?))
     } else {
         None
     };
+
+    // Initialize WAL queue based on queue config's base_path
+    tracing::info!("Initializing WAL queue");
+    let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
+    let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
+
+    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
+
+    // Run the fallible startup/run path, then always close the IO cache.
+    // Foyer's background flusher tasks need a clean close to avoid channel errors.
+    let result = run_services(
+        &config,
+        &io_cache,
+        metrics_runtime.as_ref(),
+        queue_config,
+        write_tx,
+        write_rx,
+    )
+    .await;
+
+    // Gracefully close the IO cache to drain foyer's background flusher tasks.
+    // This runs regardless of whether the startup/run path succeeded or failed.
+    io_cache.close().await;
+
+    // Keep tracing guard alive until the very end
+    drop(tracing_guard);
+
+    result
+}
+
+/// Start all services (WAL writer, shifter, OTLP servers) and run until
+/// shutdown, returning the combined result.
+///
+/// Extracted from [`execute`] so that `io_cache.close()` is always called
+/// in the caller regardless of early `?` returns here.
+#[allow(clippy::too_many_lines)]
+async fn run_services(
+    config: &IngestConfig,
+    io_cache: &IoHandle,
+    metrics_runtime: Option<&Arc<MetricsRuntime>>,
+    queue_config: QueueConfig,
+    write_tx: icegate_queue::WriteChannel,
+    write_rx: icegate_queue::WriteReceiver,
+) -> Result<()> {
+    if let (Some(cache), Some(runtime)) = (io_cache.cache(), metrics_runtime.as_ref()) {
+        icegate_common::register_foyer_metrics(cache, &runtime.meter());
+    }
+
+    // Create object store based on queue base_path.
+    // Read cache, prefetch, and stat TTL are supplied via io_cache for the
+    // shifter's queue reader which shares this store.
+    let (store, normalized_path) = create_object_store(
+        &queue_config.common.base_path,
+        Some(&config.storage.backend),
+        io_cache.cache(),
+        io_cache.prefetch(),
+        io_cache.stat_ttl(),
+        io_cache.max_write_cache_size(),
+    )?;
+
+    // Update queue config with normalized base path
+    let mut queue_config = queue_config;
+    queue_config.common.base_path = normalized_path;
     let wal_writer_metrics = metrics_runtime.as_ref().map_or_else(
         || WalWriterMetrics::new_disabled(Arc::new(NoopQueueWriterEvents)),
         |runtime| WalWriterMetrics::new(&runtime.meter(), Arc::new(NoopQueueWriterEvents)),
@@ -262,14 +319,26 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         },
     );
     let writer = QueueWriter::new(queue_config.clone(), queue_writer_store).with_events(Arc::new(wal_writer_metrics));
-    let writer_handle = writer.start(write_rx);
 
-    tracing::info!("WAL queue initialized successfully");
+    // Run the WAL writer on a dedicated runtime so flush I/O is not
+    // blocked by OTLP request processing on the main runtime.
+    let wal_threads = compute_runtime_threads();
+    let wal_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(wal_threads.main_threads)
+        .thread_name("icegate-wal")
+        .enable_all()
+        .build()
+        .map_err(IngestError::Io)?;
+    let writer_handle = {
+        let _guard = wal_runtime.enter();
+        writer.start(write_rx)
+    };
+
+    tracing::info!("WAL queue initialized on dedicated runtime");
 
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
-    let io_cache = IoCacheHandle::from_config(config.catalog.cache.as_ref()).await?;
-    let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, io_cache).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
     let queue_reader_store: Arc<dyn ObjectStore> = metrics_runtime.as_ref().map_or_else(
@@ -372,12 +441,6 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     if shift_result.is_ok() {
         tracing::info!("Shifter stopped gracefully");
     }
-
-    // Gracefully close the IO cache to drain foyer's background flusher tasks.
-    io_cache.close().await;
-
-    // Keep tracing guard alive until the very end
-    drop(tracing_guard);
 
     server_result?;
     shift_result?;

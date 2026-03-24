@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CommonError, Result};
+use crate::storage::PrefetchConfig;
 
 /// Catalog configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,8 @@ pub struct CatalogConfig {
     ///
     /// When set, wraps the Iceberg `FileIO` with a foyer hybrid cache
     /// (memory + disk) to reduce S3 round-trips for repeated reads.
+    /// Prefetch configuration is nested here because it requires a
+    /// cache to store the prefetched data.
     #[serde(default)]
     pub cache: Option<CacheConfig>,
 }
@@ -38,6 +41,26 @@ pub struct CacheConfig {
     pub disk_dir: String,
     /// Disk cache capacity in mebibytes (e.g., 256).
     pub disk_size_mb: usize,
+    /// Optional TTL (in seconds) for caching `stat` (HEAD) responses.
+    ///
+    /// When set, S3 HEAD requests for immutable objects are cached in
+    /// memory and reused until the TTL expires, avoiding redundant
+    /// round-trips during query execution.
+    #[serde(default)]
+    pub stat_ttl_secs: Option<u64>,
+    /// Maximum value size (in mebibytes) to cache on writes.
+    ///
+    /// Files larger than this are written to storage but not cached,
+    /// preventing large data files from evicting smaller WAL segments.
+    #[serde(default)]
+    pub max_write_cache_size_mb: Option<usize>,
+    /// Optional Parquet column-chunk prefetch configuration.
+    ///
+    /// When set, detects footer reads on `.parquet` files and proactively
+    /// fetches column chunks into the cache before the query engine
+    /// requests them.
+    #[serde(default)]
+    pub prefetch: Option<PrefetchConfig>,
 }
 
 /// Types of catalogs supported
@@ -130,6 +153,23 @@ impl CatalogConfig {
             }
             if cache.disk_size_mb == 0 {
                 return Err(CommonError::Config("Cache disk_size_mb must be greater than 0".into()));
+            }
+            if cache.stat_ttl_secs == Some(0) {
+                return Err(CommonError::Config(
+                    "Cache stat_ttl_secs must be greater than 0 when set".into(),
+                ));
+            }
+            if cache.max_write_cache_size_mb == Some(0) {
+                return Err(CommonError::Config(
+                    "Cache max_write_cache_size_mb must be greater than 0 when set".into(),
+                ));
+            }
+            if let Some(ref prefetch) = cache.prefetch {
+                if prefetch.max_prefetch_bytes == 0 {
+                    return Err(CommonError::Config(
+                        "Prefetch max_prefetch_bytes must be greater than 0".into(),
+                    ));
+                }
             }
         }
 

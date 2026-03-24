@@ -15,22 +15,34 @@ data:
         memory_size_mb: {{ .Values.query.cache.memorySizeMb }}
         disk_dir: {{ .Values.query.cache.diskDir }}
         disk_size_mb: {{ .Values.query.cache.diskSizeMb }}
-      {{- end }}
-      {{- if .Values.query.prefetch.enabled }}
-      prefetch:
-        enabled: true
-        {{- with .Values.query.prefetch.maxPrefetchBytes }}
-        max_prefetch_bytes: {{ . }}
+        {{- with .Values.query.cache.statTtlSecs }}
+        stat_ttl_secs: {{ . }}
         {{- end }}
-        {{- with .Values.query.prefetch.prefetchColumns }}
-        prefetch_columns:
-          {{- toYaml . | nindent 10 }}
+        {{- with .Values.query.cache.maxWriteCacheSizeMb }}
+        max_write_cache_size_mb: {{ . }}
+        {{- end }}
+        {{- if .Values.query.cache.prefetch.enabled }}
+        prefetch:
+          enabled: true
+          {{- with .Values.query.cache.prefetch.maxPrefetchBytes }}
+          max_prefetch_bytes: {{ . }}
+          {{- end }}
+          {{- with .Values.query.cache.prefetch.prefetchColumns }}
+          prefetch_columns:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
         {{- end }}
       {{- end }}
     engine:
       batch_size: {{ .Values.query.engine.batchSize }}
       target_partitions: {{ .Values.query.engine.targetPartitions }}
       catalog_name: {{ .Values.query.engine.catalogName | quote }}
+      {{- with .Values.query.engine.refreshIntervalSecs }}
+      refresh_interval_secs: {{ . }}
+      {{- end }}
+      {{- with .Values.query.engine.maxAgeSecs }}
+      max_age_secs: {{ . }}
+      {{- end }}
     queue:
       common:
         base_path: {{ .Values.queue.common.basePath | quote }}

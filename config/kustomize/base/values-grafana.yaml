@@ -2,6 +2,8 @@
 
 # Anonymous access (dev-only, matches Docker Compose GF_AUTH_* env vars)
 grafana.ini:
+  users:
+    default_theme: system
   auth.anonymous:
     enabled: true
     org_role: Admin
@@ -16,25 +18,25 @@ datasources:
       - name: Loki
         type: loki
         access: proxy
-        url: http://icegate-query.icegate:3100
+        url: http://icegate-query.icegate.svc.cluster.local.:3100
         isDefault: true
         editable: false
       - name: Tempo
         type: tempo
         access: proxy
-        url: http://icegate-query.icegate:3200
+        url: http://icegate-query.icegate.svc.cluster.local.:3200
         isDefault: false
         editable: false
       - name: Jaeger
         type: jaeger
         access: proxy
-        url: http://jaeger-query.observability:16686
+        url: http://jaeger-query.observability.svc.cluster.local.:16686
         isDefault: false
         editable: false
       - name: Prometheus
         type: prometheus
         access: proxy
-        url: http://prometheus-kube-prometheus-prometheus.observability:9090
+        url: http://prometheus-kube-prometheus-prometheus.observability.svc.cluster.local.:9090
         isDefault: false
         editable: false
 
@@ -53,6 +55,14 @@ dashboardProviders:
 
 dashboardsConfigMaps:
   icegate: grafana-dashboards-icegate
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
 
 testFramework:
   enabled: false

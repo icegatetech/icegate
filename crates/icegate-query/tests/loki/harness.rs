@@ -34,7 +34,7 @@ use iceberg::{
     },
 };
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoCacheHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
@@ -76,7 +76,7 @@ impl TestServer {
             port: 0,
         };
 
-        let catalog = CatalogBuilder::from_config(&catalog_config, &IoCacheHandle::noop()).await?;
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop()).await?;
 
         // Create namespace and table
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
@@ -108,7 +108,6 @@ impl TestServer {
             wal_store,
             wal_reader,
         ));
-
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();
         let server_engine = Arc::clone(&query_engine);

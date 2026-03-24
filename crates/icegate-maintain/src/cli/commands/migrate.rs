@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use icegate_common::{CatalogBuilder, IoCacheHandle};
+use icegate_common::{CatalogBuilder, IoHandle};
 
 use crate::{
     cli::MigrateCommands,
@@ -29,7 +29,7 @@ async fn create(config_path: PathBuf, dry_run: bool) -> Result<(), MaintainError
     let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
     tracing::info!("Initializing catalog");
-    let catalog = CatalogBuilder::from_config(&config.catalog, &IoCacheHandle::noop()).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &IoHandle::noop()).await?;
 
     if dry_run {
         tracing::info!("Running in dry-run mode - no changes will be made");
@@ -47,7 +47,7 @@ async fn upgrade(config_path: PathBuf, dry_run: bool) -> Result<(), MaintainErro
     let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
     tracing::info!("Initializing catalog");
-    let catalog = CatalogBuilder::from_config(&config.catalog, &IoCacheHandle::noop()).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &IoHandle::noop()).await?;
 
     if dry_run {
         tracing::info!("Running in dry-run mode - no changes will be made");

@@ -23,12 +23,14 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{Stream, StreamExt, TryStreamExt};
-use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
 use tracing::instrument;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+
+/// Default batch size for Iceberg table scans.
+const ICEBERG_SCAN_BATCH_SIZE: usize = 8192;
 
 /// Convert an Iceberg error into a DataFusion error.
 fn to_datafusion_error(error: iceberg::Error) -> datafusion::error::DataFusionError {
@@ -168,11 +170,9 @@ impl DisplayAs for IcegateIcebergScan {
 
 /// Build and execute an Iceberg table scan, tracking metrics.
 ///
-/// Single-scan approach:
-/// 1. Build one scan with projection + predicates
-/// 2. `plan_files()` — collect file tasks
-/// 3. Feed collected tasks to `ArrowReaderBuilder.build().read()` for data
-/// 4. Track output metrics per batch
+/// Uses `TableScan::to_arrow()` which streams `plan_files()` directly into
+/// `ArrowReaderBuilder::read()`, so data reading begins as soon as the first
+/// file task arrives from manifest scanning — no collect barrier.
 ///
 /// Note: `compressed_bytes` is not tracked because `FileScanTask.length` is the
 /// full Parquet file size, not the compressed bytes actually read. With column
@@ -196,27 +196,18 @@ async fn get_batch_stream(
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
-    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
-
-    // Plan files: collect tasks for the ArrowReader.
-    let mut file_tasks = Vec::new();
-    let mut file_stream = table_scan.plan_files().await.map_err(to_datafusion_error)?;
-    while let Some(task_result) = file_stream.next().await {
-        let task = task_result.map_err(to_datafusion_error)?;
-        file_tasks.push(Ok(task));
-    }
-    tracing::debug!(file_count = file_tasks.len(), "Iceberg file plan complete");
-
-    // Feed collected tasks to ArrowReader for data reading.
-    let task_stream = Box::pin(futures::stream::iter(file_tasks));
-    let stream = ArrowReaderBuilder::new(table.file_io().clone())
-        .with_batch_size(8192)
+    let table_scan = scan_builder
+        .with_batch_size(Some(ICEBERG_SCAN_BATCH_SIZE))
         .build()
-        .read(task_stream)
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
+        .map_err(to_datafusion_error)?;
 
-    let mapped = stream.map(move |result| result.map(|batch| batch.record_output(&baseline)));
+    // Stream file plan directly into ArrowReader via to_arrow() — data
+    // reading starts as soon as the first file task arrives from manifest
+    // scanning, eliminating the collect barrier.
+    let stream = table_scan.to_arrow().await.map_err(to_datafusion_error)?;
+
+    let mapped =
+        stream.map(move |result| result.map_err(to_datafusion_error).map(|batch| batch.record_output(&baseline)));
 
     Ok(Box::pin(mapped))
 }

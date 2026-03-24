@@ -232,18 +232,20 @@ impl IcegateTableProvider {
         };
 
         // Build ParquetSource with predicate pushdown
-        let mut parquet_source = ParquetSource::default();
+        let mut parquet_source = ParquetSource::new(self.schema.clone());
         if let Some(pred) = physical_predicate {
             parquet_source = parquet_source.with_predicate(pred);
         }
+        // TODO(low): Add reverse order to optimize ORDER BY time desc
+        // TODO(medium):: metadata_size_hint
 
         // Build file scan config
         let wal_url = ObjectStoreUrl::parse(WAL_STORE_URL)
             .map_err(|e| DataFusionError::Plan(format!("Invalid WAL store URL: {e}")))?;
-        let mut builder = FileScanConfigBuilder::new(wal_url, self.schema.clone(), Arc::new(parquet_source));
+        let mut builder = FileScanConfigBuilder::new(wal_url, Arc::new(parquet_source));
         builder = builder.with_file_group(files.into());
         if let Some(proj) = projection {
-            builder = builder.with_projection_indices(Some(proj.clone()));
+            builder = builder.with_projection_indices(Some(proj.clone()))?;
         }
         let config = builder.build();
 

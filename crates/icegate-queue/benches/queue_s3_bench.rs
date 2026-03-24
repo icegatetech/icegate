@@ -2,7 +2,7 @@
 //!
 //! Benchmarks cover:
 //! 1. Write performance (small batches, large batches, concurrent topics)
-//! 2. Write with grouping (`tenant_id` grouping vs no grouping)
+//! 2. Write performance with multi-tenant batches
 //! 3. Read performance (list segments, read single segment, plan segments)
 //! 4. End-to-end (write then read)
 
@@ -42,17 +42,11 @@ fn start_writer(
 }
 
 /// Helper to write a single batch and wait for result.
-async fn write_batch(
-    tx: &icegate_queue::WriteChannel,
-    topic: &str,
-    batch: arrow::record_batch::RecordBatch,
-    group_by_column: Option<String>,
-) {
+async fn write_batch(tx: &icegate_queue::WriteChannel, topic: &str, batch: arrow::record_batch::RecordBatch) {
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: topic.to_string(),
         batch,
-        group_by_column,
         response_tx,
         trace_context: None,
     })
@@ -79,7 +73,7 @@ fn write_performance(c: &mut Criterion) {
                 let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
                 let batches = generate_batches_for_throughput(10, 100);
                 for batch in batches {
-                    write_batch(&tx, "small", batch, None).await;
+                    write_batch(&tx, "small", batch).await;
                 }
                 drop(tx);
                 writer_handle.await.unwrap().unwrap();
@@ -94,7 +88,7 @@ fn write_performance(c: &mut Criterion) {
                 let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
                 let batches = generate_batches_for_throughput(10, 10_000);
                 for batch in batches {
-                    write_batch(&tx, "large", batch, None).await;
+                    write_batch(&tx, "large", batch).await;
                 }
                 drop(tx);
                 writer_handle.await.unwrap().unwrap();
@@ -113,9 +107,9 @@ fn write_performance(c: &mut Criterion) {
 
                 // Interleave writes from 3 topics
                 for i in 0..10 {
-                    write_batch(&tx, "topic1", batches_topic1[i].clone(), None).await;
-                    write_batch(&tx, "topic2", batches_topic2[i].clone(), None).await;
-                    write_batch(&tx, "topic3", batches_topic3[i].clone(), None).await;
+                    write_batch(&tx, "topic1", batches_topic1[i].clone()).await;
+                    write_batch(&tx, "topic2", batches_topic2[i].clone()).await;
+                    write_batch(&tx, "topic3", batches_topic3[i].clone()).await;
                 }
                 drop(tx);
                 writer_handle.await.unwrap().unwrap();
@@ -130,55 +124,7 @@ fn write_performance(c: &mut Criterion) {
     });
 }
 
-/// Benchmark Group 2: Write Grouping
-fn write_grouping(c: &mut Criterion) {
-    let mut group = c.benchmark_group("write_grouping");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(40));
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    // Setup: Shared MinIO for all benchmarks in this group
-    let (minio, store) = rt.block_on(async { setup_minio_and_bucket("write-grouping").await });
-
-    // Benchmark 4: With grouping - 10 batches with tenant_id grouping
-    group.bench_function("with_grouping", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
-                let batches = generate_batches_with_grouping(10, 100, 5);
-                for batch in batches {
-                    write_batch(&tx, "grouped", batch, Some("tenant_id".to_string())).await;
-                }
-                drop(tx);
-                writer_handle.await.unwrap().unwrap();
-            });
-        });
-    });
-
-    // Benchmark 5: Without grouping - same data, no grouping
-    group.bench_function("without_grouping", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
-                let batches = generate_batches_with_grouping(10, 100, 5);
-                for batch in batches {
-                    write_batch(&tx, "ungrouped", batch, None).await;
-                }
-                drop(tx);
-                writer_handle.await.unwrap().unwrap();
-            });
-        });
-    });
-
-    drop(group);
-    // Explicitly drop MinIO within the runtime context
-    rt.block_on(async {
-        drop(minio);
-    });
-}
-
-/// Benchmark Group 3: Read Performance
+/// Benchmark Group 2: Read Performance
 fn read_performance(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_performance");
     group.sample_size(10);
@@ -194,7 +140,7 @@ fn read_performance(c: &mut Criterion) {
         // Pre-write 10 segments for listing test (without grouping)
         let batches = generate_batches_for_throughput(10, 100);
         for batch in batches {
-            write_batch(&tx, "reads", batch, None).await;
+            write_batch(&tx, "reads", batch).await;
         }
         drop(tx);
         writer_handle.await.unwrap().unwrap();
@@ -264,7 +210,7 @@ fn end_to_end(c: &mut Criterion) {
                 let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
                 let batches = generate_batches_with_grouping(5, 100, 5);
                 for batch in batches {
-                    write_batch(&tx, "e2e", batch, Some("tenant_id".to_string())).await;
+                    write_batch(&tx, "e2e", batch).await;
                 }
                 drop(tx);
                 writer_handle.await.unwrap().unwrap();
@@ -291,5 +237,5 @@ fn end_to_end(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, write_performance, write_grouping, read_performance, end_to_end);
+criterion_group!(benches, write_performance, read_performance, end_to_end);
 criterion_main!(benches);

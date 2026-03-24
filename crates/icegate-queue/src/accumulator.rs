@@ -1,15 +1,15 @@
 //! Batch accumulator for efficient WAL writes.
 //!
 //! Accumulates `RecordBatches` per topic until a flush threshold is reached,
-//! then concatenates them for a single write operation.
+//! then passes them directly to the Parquet writer as individual row groups.
 
 use std::time::Instant;
 
-use arrow::{compute::concat_batches, record_batch::RecordBatch};
+use arrow::record_batch::RecordBatch;
 use tokio::sync::oneshot;
 use tracing::trace;
 
-use crate::{channel::WriteResult, config::QueueConfig, error::Result};
+use crate::{channel::WriteResult, config::QueueConfig};
 
 /// A pending batch with its response channel and optional trace context.
 #[derive(Debug)]
@@ -164,21 +164,6 @@ impl TopicAccumulator {
         std::mem::take(&mut self.pending)
     }
 
-    /// Concatenates multiple `RecordBatches` into a single batch.
-    ///
-    /// All batches must have the same schema.
-    pub fn concat_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
-        if batches.is_empty() {
-            return Err(crate::error::QueueError::Config(
-                "No batches to concatenate".to_string(),
-            ));
-        }
-
-        let schema = batches[0].schema();
-        let concatenated = concat_batches(&schema, batches)?;
-        Ok(concatenated)
-    }
-
     /// Estimates the size of a `RecordBatch` in bytes.
     ///
     /// This is an approximation based on array memory sizes.
@@ -302,16 +287,6 @@ mod tests {
         let config = QueueConfig::new("test");
 
         assert!(!acc.should_flush(&config));
-    }
-
-    #[test]
-    fn test_concat_batches() {
-        let batch1 = test_batch(100);
-        let batch2 = test_batch(50);
-
-        let concatenated = TopicAccumulator::concat_batches(&[batch1, batch2]).expect("concat");
-
-        assert_eq!(concatenated.num_rows(), 150);
     }
 
     #[tokio::test]

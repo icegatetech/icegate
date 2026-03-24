@@ -27,7 +27,7 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 
 # Iceberg
-iceberg = { workspace = true, features = ["io-metrics"] }
+iceberg = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -56,6 +56,9 @@ prost = { workspace = true }
 opentelemetry-proto = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+
+# Metrics
+opentelemetry-instrumentation-tokio = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

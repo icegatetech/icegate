@@ -2549,7 +2549,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum(container_memory_rss{pod!=\"\"}) by (pod)",
+          "expr": "sum(container_memory_rss{name!=\"\"}) by (pod)",
           "format": "time_series",
           "hide": false,
           "interval": "",
