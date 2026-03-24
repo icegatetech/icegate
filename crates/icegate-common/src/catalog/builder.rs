@@ -75,7 +75,7 @@ impl IoHandle {
         let stat_ttl = cache_config.and_then(|cc| cc.stat_ttl_secs).map(Duration::from_secs);
         let max_write_cache_size = cache_config
             .and_then(|cc| cc.max_write_cache_size_mb)
-            .map(|mb| mb * 1024 * 1024);
+            .map(|mb| mb.saturating_mul(1024 * 1024));
         let cache = match cache_config {
             Some(cc) => Some(build_storage_cache(cc).await?),
             None => None,

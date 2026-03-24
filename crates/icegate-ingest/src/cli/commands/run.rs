@@ -250,6 +250,42 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
 
+    // Run the fallible startup/run path, then always close the IO cache.
+    // Foyer's background flusher tasks need a clean close to avoid channel errors.
+    let result = run_services(
+        &config,
+        &io_cache,
+        metrics_runtime.as_ref(),
+        queue_config,
+        write_tx,
+        write_rx,
+    )
+    .await;
+
+    // Gracefully close the IO cache to drain foyer's background flusher tasks.
+    // This runs regardless of whether the startup/run path succeeded or failed.
+    io_cache.close().await;
+
+    // Keep tracing guard alive until the very end
+    drop(tracing_guard);
+
+    result
+}
+
+/// Start all services (WAL writer, shifter, OTLP servers) and run until
+/// shutdown, returning the combined result.
+///
+/// Extracted from [`execute`] so that `io_cache.close()` is always called
+/// in the caller regardless of early `?` returns here.
+#[allow(clippy::too_many_lines)]
+async fn run_services(
+    config: &IngestConfig,
+    io_cache: &IoHandle,
+    metrics_runtime: Option<&Arc<MetricsRuntime>>,
+    queue_config: QueueConfig,
+    write_tx: icegate_queue::WriteChannel,
+    write_rx: icegate_queue::WriteReceiver,
+) -> Result<()> {
     if let (Some(cache), Some(runtime)) = (io_cache.cache(), metrics_runtime.as_ref()) {
         icegate_common::register_foyer_metrics(cache, &runtime.meter());
     }
@@ -302,7 +338,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
-    let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, io_cache).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
     let queue_reader_store: Arc<dyn ObjectStore> = metrics_runtime.as_ref().map_or_else(
@@ -405,12 +441,6 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     if shift_result.is_ok() {
         tracing::info!("Shifter stopped gracefully");
     }
-
-    // Gracefully close the IO cache to drain foyer's background flusher tasks.
-    io_cache.close().await;
-
-    // Keep tracing guard alive until the very end
-    drop(tracing_guard);
 
     server_result?;
     shift_result?;

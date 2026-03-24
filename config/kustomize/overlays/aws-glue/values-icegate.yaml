@@ -37,7 +37,7 @@ query:
   replicaCount: 1
   cache:
     enabled: true
-    memorySizeMb: 1024
+    memorySizeMb: 512
     diskDir: /tmp/icegate/cache
     diskSizeMb: 4096
     statTtlSecs: 300
