@@ -8,7 +8,9 @@ use std::time::Instant;
 use icegate_common::{LOGS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
 use icegate_queue::WriteChannel;
 use opentelemetry_proto::tonic::collector::{
-    logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService},
+    logs::v1::{
+        ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService,
+    },
     metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse, metrics_service_server::MetricsService},
     trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse, trace_service_server::TraceService},
 };
@@ -16,8 +18,11 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
-use crate::infra::metrics::{OtlpMetrics, OtlpRequestRecorder};
 use crate::transform;
+use crate::{
+    infra::metrics::{OtlpMetrics, OtlpRequestRecorder},
+    otlp_grpc::error::GrpcError,
+};
 
 const SIGNAL_LOGS: &str = "logs";
 const PROTOCOL_GRPC: &str = "grpc";
@@ -48,14 +53,20 @@ fn extract_tenant_id<T>(request: &Request<T>) -> Option<String> {
 pub struct OtlpGrpcService {
     /// Write channel for sending batches to the WAL queue.
     write_channel: WriteChannel,
+    /// Maximum number of rows per WAL row group.
+    wal_row_group_size: usize,
     /// Metrics recorder for OTLP intake.
     metrics: OtlpMetrics,
 }
 
 impl OtlpGrpcService {
     /// Create a new OTLP gRPC service.
-    pub const fn new(write_channel: WriteChannel, metrics: OtlpMetrics) -> Self {
-        Self { write_channel, metrics }
+    pub const fn new(write_channel: WriteChannel, wal_row_group_size: usize, metrics: OtlpMetrics) -> Self {
+        Self {
+            write_channel,
+            wal_row_group_size,
+            metrics,
+        }
     }
 }
 
@@ -84,12 +95,14 @@ impl LogsService for OtlpGrpcService {
 
         // Transform OTLP logs to Arrow RecordBatch (offload to blocking thread)
         let span = tracing::Span::current();
+        let transform_start = Instant::now();
         let batch = tokio::task::spawn_blocking(move || {
             span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
         })
         .await
         .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
-        .map_err(|e| Status::internal(format!("Failed to transform logs: {e}")))?;
+        .map_err(|e| Status::from(GrpcError(e)))?;
+        request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
         let Some(batch) = batch else {
             // No records to process - return success with 0 rejected
             request_metrics.record_records_per_request(0);
@@ -101,56 +114,63 @@ impl LogsService for OtlpGrpcService {
         debug!(records = record_count, "Transformed OTLP logs to RecordBatch");
         request_metrics.record_records_per_request(record_count);
 
-        // Create write request for the WAL queue
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let write_request = icegate_queue::WriteRequest {
-            topic: LOGS_TOPIC.to_string(),
-            batch,
-            response_tx,
-            trace_context: icegate_common::extract_current_trace_context(),
+        let trace_context = icegate_common::extract_current_trace_context();
+        let prepare_start = Instant::now();
+        let prepared = crate::wal_sort::prepare_sorted_logs_for_wal(&batch, self.wal_row_group_size, trace_context)
+            .map_err(|err| {
+                request_metrics.finish_error();
+                Status::from(GrpcError(err))
+            })?;
+        request_metrics.record_transform_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
+        let Some(prepared) = prepared else {
+            request_metrics.finish_ok();
+            return Ok(Response::new(ExportLogsServiceResponse { partial_success: None }));
         };
 
-        // Send to WAL queue
         let enqueue_start = Instant::now();
-        self.write_channel.send(write_request).await.map_err(|e| {
-            request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
-            request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
-            request_metrics.finish_error();
-            Status::unavailable(format!("WAL queue unavailable: {e}"))
-        })?;
+        let pending = crate::wal_sort::submit_sorted_logs_to_wal(&self.write_channel, prepared)
+            .await
+            .map_err(|err| {
+                request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
+                request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
+                request_metrics.finish_error();
+                Status::from(GrpcError(err))
+            })?;
         request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_OK);
 
-        // Wait for write result
         let ack_start = Instant::now();
-        let result = response_rx.await.map_err(|e| {
+        let ack_outcome = pending.wait_for_ack().await.map_err(|err| {
             request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
             request_metrics.finish_error();
-            Status::internal(format!("Failed to receive write result: {e}"))
+            Status::from(GrpcError(err))
         })?;
 
-        // Add link to flush operation if trace context is available
-        if let Some(tc) = result.trace_context() {
-            icegate_common::add_span_link(tc);
-        }
-
-        match result {
-            icegate_queue::WriteResult::Success { offset, records, .. } => {
-                debug!(offset, records, "OTLP GRPC request ended successfully");
+        match ack_outcome {
+            crate::wal_sort::WalAckOutcome::Success(write_result) => {
+                if let Some(trace_context) = write_result.trace_context.as_deref() {
+                    icegate_common::add_span_link(trace_context);
+                }
+                debug!(
+                    offset = write_result.offset.unwrap_or_default(),
+                    records = write_result.records,
+                    "OTLP GRPC request ended successfully"
+                );
                 request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_OK);
                 request_metrics.finish_ok();
                 Ok(Response::new(ExportLogsServiceResponse { partial_success: None }))
             }
-            icegate_queue::WriteResult::Failed { reason, .. } => {
-                // Return partial success with all records rejected
+            crate::wal_sort::WalAckOutcome::Partial(partial) => {
+                if let Some(trace_context) = partial.trace_context.as_deref() {
+                    icegate_common::add_span_link(trace_context);
+                }
                 request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
                 request_metrics.finish_partial();
                 Ok(Response::new(ExportLogsServiceResponse {
-                    partial_success: Some(
-                        opentelemetry_proto::tonic::collector::logs::v1::ExportLogsPartialSuccess {
-                            rejected_log_records: record_count as i64,
-                            error_message: reason,
-                        },
-                    ),
+                    partial_success: Some(ExportLogsPartialSuccess {
+                        rejected_log_records: i64::try_from(partial.rejected_records)
+                            .map_err(|_| Status::internal("Rejected logs count exceeds i64"))?,
+                        error_message: partial.reason,
+                    }),
                 }))
             }
         }
@@ -203,5 +223,115 @@ impl MetricsService for OtlpGrpcService {
         Err(Status::unimplemented(
             "OTLP metrics ingestion: Parse OTLP → transform → write to Iceberg",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use icegate_queue::{WriteResult, channel};
+    use opentelemetry_proto::tonic::{
+        common::v1::{AnyValue, KeyValue, any_value::Value},
+        logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+        resource::v1::Resource,
+    };
+
+    use super::*;
+
+    fn create_test_request() -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue("test-service".to_string())),
+                        }),
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        observed_time_unix_nano: 1_700_000_000_000_000_000,
+                        severity_number: 9,
+                        severity_text: "INFO".to_string(),
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("Test message".to_string())),
+                        }),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: vec![0; 16],
+                        span_id: vec![0; 8],
+                        event_name: String::new(),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn test_service(write_channel: icegate_queue::WriteChannel) -> OtlpGrpcService {
+        OtlpGrpcService::new(write_channel, 4, OtlpMetrics::new_disabled())
+    }
+
+    #[tokio::test]
+    async fn export_logs_returns_success_on_full_wal_ack() {
+        let (tx, mut rx) = channel(1);
+        let writer = tokio::spawn(async move {
+            let request = rx.recv().await.expect("write request");
+            let total_rows = request.batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+            request
+                .response_tx
+                .send(WriteResult::success(17, total_rows, None))
+                .expect("send wal ack");
+        });
+
+        let service = test_service(tx);
+        let response = LogsService::export(&service, Request::new(create_test_request()))
+            .await
+            .expect("grpc response")
+            .into_inner();
+        writer.await.expect("writer task");
+
+        assert!(response.partial_success.is_none());
+    }
+
+    #[tokio::test]
+    async fn export_logs_returns_partial_success_on_wal_partial_failure() {
+        let (tx, mut rx) = channel(1);
+        let writer = tokio::spawn(async move {
+            let request = rx.recv().await.expect("write request");
+            request
+                .response_tx
+                .send(WriteResult::failed("wal partial failure", None))
+                .expect("send wal ack");
+        });
+
+        let service = test_service(tx);
+        let response = LogsService::export(&service, Request::new(create_test_request()))
+            .await
+            .expect("grpc response")
+            .into_inner();
+        writer.await.expect("writer task");
+
+        let partial = response.partial_success.expect("partial success");
+        assert_eq!(partial.rejected_log_records, 1);
+        assert_eq!(partial.error_message, "wal partial failure");
+    }
+
+    #[tokio::test]
+    async fn export_logs_returns_internal_when_write_channel_is_closed() {
+        let (tx, rx) = channel(1);
+        drop(rx);
+
+        let service = test_service(tx);
+        let status = LogsService::export(&service, Request::new(create_test_request()))
+            .await
+            .expect_err("grpc status");
+        assert_eq!(status.code(), tonic::Code::Internal);
     }
 }

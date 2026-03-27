@@ -30,7 +30,7 @@
 //! let (response_tx, response_rx) = oneshot::channel();
 //! tx.send(WriteRequest {
 //!     topic: "logs".to_string(),
-//!     batch: record_batch,
+//!     batches: vec![record_batch],
 //!     response_tx,
 //! }).await?;
 //!
@@ -50,8 +50,8 @@ pub use channel::{Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult,
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
 pub use reader::{
-    GroupedSegmentsPlan, ListedSegment, ParquetQueueReader, QueueReader, SegmentFile, SegmentRecordBatchIdxs,
-    SegmentsPlan,
+    GroupedSegmentsPlan, ListedSegment, ParquetQueueReader, QueueReader, RecordBatchStream, SegmentFile,
+    SegmentRecordBatchIdxs, SegmentsPlan,
 };
 pub use segment::SegmentId;
 pub use writer::{NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome};

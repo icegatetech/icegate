@@ -1063,6 +1063,11 @@ impl<'a> OtlpRequestRecorder<'a> {
         self.metrics.record_records_per_request(count, self.signal);
     }
 
+    /// Record transform duration.
+    pub fn record_transform_duration(&self, duration: Duration, signal: &str, status: &str) {
+        self.metrics.record_transform_duration(duration, signal, status);
+    }
+
     /// Record WAL enqueue duration.
     pub fn record_wal_enqueue_duration(&self, duration: Duration, topic: &str, status: &str) {
         self.metrics.record_wal_enqueue_duration(duration, topic, status);

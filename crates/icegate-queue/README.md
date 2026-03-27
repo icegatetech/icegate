@@ -32,7 +32,7 @@ let _handle = writer.start(rx);
 let (response_tx, response_rx) = oneshot::channel();
 tx.send(WriteRequest {
     topic: "logs".to_string(),
-    batch: record_batch,
+    batches: vec![record_batch],
     response_tx,
 }).await?;
 

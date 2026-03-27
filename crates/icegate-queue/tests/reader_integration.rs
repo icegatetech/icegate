@@ -13,7 +13,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::{TryStreamExt, stream::BoxStream};
 use icegate_queue::{ParquetQueueReader, QueueConfig, QueueWriter, SegmentsPlan, WriteRequest, channel};
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
@@ -353,7 +353,7 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch: batch.clone(),
+            batches: vec![batch.clone()],
 
             response_tx,
             trace_context: None,
@@ -394,7 +394,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch: batch.clone(),
+            batches: vec![batch.clone()],
 
             response_tx,
             trace_context: None,
@@ -445,7 +445,7 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batch: original_batch.clone(),
+        batches: vec![original_batch.clone()],
 
         response_tx,
         trace_context: None,
@@ -462,7 +462,13 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
     // Read phase
     let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
-    let batches = reader.read_segment(&"logs".to_string(), offset, &[0], &cancel).await.unwrap();
+    let batches = reader
+        .read_segment(&"logs".to_string(), offset, &[0], &cancel)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
     // Verify data
     assert_eq!(batches.len(), 1, "Should read one batch");
@@ -485,7 +491,7 @@ async fn test_read_segment_uses_configured_record_batch_size() -> Result<(), Box
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batch: original_batch,
+        batches: vec![original_batch],
 
         response_tx,
         trace_context: None,
@@ -501,7 +507,13 @@ async fn test_read_segment_uses_configured_record_batch_size() -> Result<(), Box
     // Read with smaller batch size to force 25 rows => 10 + 10 + 5.
     let reader = ParquetQueueReader::new("queue", store, 10)?;
     let cancel = CancellationToken::new();
-    let batches = reader.read_segment(&"logs".to_string(), offset, &[0], &cancel).await.unwrap();
+    let batches = reader
+        .read_segment(&"logs".to_string(), offset, &[0], &cancel)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
     assert_eq!(batches.len(), 3);
     assert_eq!(batches[0].num_rows(), 10);
@@ -524,7 +536,7 @@ async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batch: batch.clone(),
+        batches: vec![batch.clone()],
 
         response_tx,
         trace_context: None,
@@ -541,7 +553,13 @@ async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error
     // Read the single row group
     let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
-    let batches = reader.read_segment(&"logs".to_string(), offset, &[0], &cancel).await.unwrap();
+    let batches = reader
+        .read_segment(&"logs".to_string(), offset, &[0], &cancel)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
     assert_eq!(batches.len(), 1, "Should read 1 row group");
     assert_eq!(batches[0].num_rows(), 100, "Row group should have all rows");
@@ -565,7 +583,7 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,
@@ -616,7 +634,7 @@ async fn test_plan_max_row_groups_limit() -> Result<(), Box<dyn std::error::Erro
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,
@@ -662,7 +680,7 @@ async fn test_plan_segments_with_small_input_bytes_limit() -> Result<(), Box<dyn
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,
@@ -706,7 +724,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result() -> Result<(), Bo
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,
@@ -804,7 +822,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_with_skewed_metada
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,
@@ -898,7 +916,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metada
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,
@@ -988,7 +1006,7 @@ async fn test_plan_segments_parallel_fails_fast_on_metadata_error_without_partia
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,
@@ -1042,7 +1060,7 @@ async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_with
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,

@@ -16,6 +16,7 @@ pub mod parquet_meta_reader;
 pub mod plan_runner;
 /// Shift task runner for shift operations.
 pub mod shift_runner;
+mod sorted_batch_merger;
 /// Task timeout estimation utilities.
 mod timeout;
 
@@ -94,8 +95,13 @@ impl Shifter {
         let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), LOGS_TOPIC));
         let shift_storage_for_runner = Arc::clone(&shift_storage);
         let shift_runner = Arc::new(
-            ShiftTaskRunnerImpl::new(queue_reader, shift_storage_for_runner, LOGS_TOPIC)
-                .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
+            ShiftTaskRunnerImpl::new(
+                queue_reader,
+                shift_storage_for_runner,
+                LOGS_TOPIC,
+                shift_config.write.row_group_size,
+            )
+            .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
         );
         let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(
             shift_runner,

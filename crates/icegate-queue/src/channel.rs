@@ -15,11 +15,13 @@ pub type WriteReceiver = mpsc::Receiver<WriteRequest>;
 /// Message sent to the queue writer.
 #[derive(Debug)]
 pub struct WriteRequest {
-    /// Topic name for this batch.
+    /// Topic name for this logical write request.
     pub topic: Topic,
 
-    /// Arrow `RecordBatch` to write.
-    pub batch: RecordBatch,
+    /// Arrow `RecordBatch` values to write as a single logical request.
+    ///
+    /// Each batch becomes a separate Parquet row group in the flushed segment.
+    pub batches: Vec<RecordBatch>,
 
     /// Channel to send the write result back to the caller.
     pub response_tx: oneshot::Sender<WriteResult>,
@@ -38,7 +40,7 @@ pub enum WriteResult {
     Success {
         /// Offset of the written segment.
         offset: u64,
-        /// Number of records written.
+        /// Number of records written by this logical request.
         records: usize,
         /// W3C trace context for distributed tracing (traceparent header format).
         trace_context: Option<String>,

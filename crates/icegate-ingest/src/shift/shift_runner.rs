@@ -1,17 +1,24 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::{StreamExt, future::Either, pin_mut};
+use futures::{future::Either, pin_mut, StreamExt};
+use icegate_common::retrier::{Retrier, RetrierConfig};
 use icegate_jobmanager::{Error, ImmutableTask, JobManager};
-use icegate_queue::{QueueReader, Topic};
+use icegate_queue::{QueueReader, RecordBatchStream, Topic};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use super::{
-    ShiftInput, ShiftOutput,
-    executor::{TaskStatus, parse_task_input},
-    iceberg_storage::Storage,
+    executor::{parse_task_input, TaskStatus}, iceberg_storage::Storage, sorted_batch_merger::SortedBatchMerger,
+    SegmentToRead,
+    ShiftInput,
+    ShiftOutput,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -46,6 +53,7 @@ impl ShiftTaskFailureReason {
 }
 
 /// Shift task failure with reason and underlying error.
+#[derive(Debug)]
 pub struct ShiftTaskFailure {
     reason: ShiftTaskFailureReason,
     error: Error,
@@ -85,7 +93,7 @@ pub struct ShiftTaskResult {
 enum SegmentReadOutcome {
     Read {
         segment_idx: usize,
-        batches: Vec<RecordBatch>,
+        stream: RecordBatchStream,
     },
     Cancelled,
 }
@@ -107,7 +115,9 @@ pub struct ShiftTaskRunnerImpl<Q, S> {
     queue_reader: Arc<Q>,
     storage: Arc<S>,
     topic: Topic,
+    output_batch_size: usize,
     segment_read_parallelism: usize,
+    retrier: Retrier,
 }
 
 impl<Q, S> ShiftTaskRunnerImpl<Q, S>
@@ -118,12 +128,14 @@ where
     const DEFAULT_SEGMENT_READ_PARALLELISM: usize = 8;
 
     /// Create a new shift task runner.
-    pub fn new(queue_reader: Arc<Q>, storage: Arc<S>, topic: impl Into<String>) -> Self {
+    pub fn new(queue_reader: Arc<Q>, storage: Arc<S>, topic: impl Into<String>, output_batch_size: usize) -> Self {
         Self {
             queue_reader,
             storage,
             topic: topic.into(),
+            output_batch_size,
             segment_read_parallelism: Self::DEFAULT_SEGMENT_READ_PARALLELISM,
+            retrier: Retrier::new(RetrierConfig::default()),
         }
     }
 
@@ -189,86 +201,18 @@ where
             });
         }
 
-        let mut batches = Vec::new();
-        let mut next_expected_idx = 0usize;
-        let mut pending_batches: BTreeMap<usize, Vec<RecordBatch>> = BTreeMap::new();
-        let read_parallelism = self.segment_read_parallelism;
-        // TODO(med): for a more rigid memory-bound, we can consider buffered(read_parallelism) (ordered stream) and remove the pending_batches.
-        let read_stream = futures::stream::iter(input.segments.into_iter().enumerate())
-            .take_until(cancel_token.cancelled())
-            .map(|(segment_idx, segment)| {
-                let queue_reader = Arc::clone(&self.queue_reader);
-                let topic = self.topic.clone();
-                let cancel = cancel_token.clone();
-                async move {
-                    let segment_offset = segment.segment_offset;
-                    match futures::future::select(
-                        Box::pin(queue_reader.read_segment(
-                            &topic,
-                            segment_offset,
-                            &segment.record_batch_idxs,
-                            &cancel,
-                        )),
-                        Box::pin(cancel.cancelled()),
-                    )
-                    .await
-                    {
-                        Either::Left((read_result, _)) => {
-                            let segment_batches = read_result.map_err(|err| {
-                                Error::TaskExecution(format!(
-                                    "failed to read segment {segment_offset} row groups: {err}"
-                                ))
-                            })?;
-                            Ok::<SegmentReadOutcome, Error>(SegmentReadOutcome::Read {
-                                segment_idx,
-                                batches: segment_batches,
-                            })
-                        }
-                        Either::Right((_cancelled, _)) => {
-                            Ok::<SegmentReadOutcome, Error>(SegmentReadOutcome::Cancelled)
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(read_parallelism);
-        pin_mut!(read_stream);
+        let record_batches_total = input.segments.iter().map(|segment| segment.record_batch_idxs.len()).sum();
+        let write_result = self
+            .write_record_batches_with_retry(input.segments.as_slice(), cancel_token)
+            .await
+            .map_err(|err| ShiftTaskFailure::new(err.reason, err.error))?;
 
-        while let Some(read_result) = read_stream.next().await {
-            let read_outcome =
-                read_result.map_err(|err| ShiftTaskFailure::new(ShiftTaskFailureReason::QueueRead, err))?;
-            let SegmentReadOutcome::Read {
-                segment_idx,
-                batches: segment_batches,
-            } = read_outcome
-            else {
-                return Err(ShiftTaskFailure::new(
-                    ShiftTaskFailureReason::Cancelled,
-                    Error::TaskExecution("shift task cancelled while reading queue segments".to_string()),
-                ));
-            };
-            pending_batches.insert(segment_idx, segment_batches);
-            while let Some(segment_batches) = pending_batches.remove(&next_expected_idx) {
-                batches.extend(segment_batches);
-                next_expected_idx = next_expected_idx.checked_add(1).ok_or_else(|| {
-                    ShiftTaskFailure::new(
-                        ShiftTaskFailureReason::QueueRead,
-                        Error::TaskExecution("segment index overflow while assembling batches".to_string()),
-                    )
-                })?;
-            }
-        }
-
-        if batches.is_empty() {
+        if write_result.rows_written == 0 {
             return Err(ShiftTaskFailure::new(
                 ShiftTaskFailureReason::EmptyBatches,
-                Error::TaskExecution("shift produced no record batches to write".to_string()),
+                Error::TaskExecution("shift produced no rows to write".to_string()),
             ));
         }
-
-        let record_batches_total = batches.len();
-        let write_result = self.storage.write_record_batches(batches, cancel_token).await.map_err(|err| {
-            ShiftTaskFailure::new(ShiftTaskFailureReason::Write, Error::TaskExecution(err.to_string()))
-        })?;
 
         if write_result.data_files.is_empty() {
             return Err(ShiftTaskFailure::new(
@@ -315,23 +259,221 @@ where
     }
 }
 
+struct ShiftWriteError {
+    reason: ShiftTaskFailureReason,
+    error: Error,
+    source: Option<crate::error::IngestError>,
+}
+
+impl ShiftWriteError {
+    fn queue_read(err: impl std::fmt::Display) -> Self {
+        Self {
+            reason: ShiftTaskFailureReason::QueueRead,
+            error: Error::TaskExecution(err.to_string()),
+            source: None,
+        }
+    }
+}
+
+impl icegate_common::RetryError for ShiftWriteError {
+    fn cancelled() -> Self {
+        Self {
+            reason: ShiftTaskFailureReason::Cancelled,
+            error: Error::TaskExecution("shift task cancelled during write retry".to_string()),
+            source: Some(crate::error::IngestError::Cancelled),
+        }
+    }
+
+    fn max_attempts() -> Self {
+        Self {
+            reason: ShiftTaskFailureReason::Write,
+            error: Error::TaskExecution("max retry attempts reached".to_string()),
+            source: Some(crate::error::IngestError::MaxAttemptsReached),
+        }
+    }
+}
+
+impl<Q, S> ShiftTaskRunnerImpl<Q, S>
+where
+    Q: QueueReader + 'static,
+    S: Storage + 'static,
+{
+    async fn write_record_batches_with_retry(
+        &self,
+        segments: &[SegmentToRead],
+        cancel_token: &CancellationToken,
+    ) -> Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError> {
+        // Since we use streaming and merging via k-way, in case of problems, we need to completely restart the flow along with reading.
+        let attempt = AtomicUsize::new(0);
+        let result = self
+            .retrier
+            .retry::<
+                _,
+                _,
+                Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError>,
+                ShiftWriteError,
+            >(
+                || {
+                    let current_attempt = attempt.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        match self.write_record_batches_once(segments, cancel_token).await {
+                            Ok(result) => Ok((false, Ok(result))),
+                            Err(err) => {
+                                let retryable =
+                                    matches!(err.reason, ShiftTaskFailureReason::Write) && err.is_retryable();
+                                if retryable {
+                                    tracing::warn!(
+                                        attempt = current_attempt,
+                                        error = %err,
+                                        "shift write attempt failed, retrying with reopened WAL streams"
+                                    );
+                                }
+                                Ok((retryable, Err(err)))
+                            }
+                        }
+                    }
+                },
+                cancel_token,
+            )
+            .await?;
+
+        match result {
+            Ok(written) => Ok(written),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn write_record_batches_once(
+        &self,
+        segments: &[SegmentToRead],
+        cancel_token: &CancellationToken,
+    ) -> Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError> {
+        let streams = self.read_segments_in_order(segments, cancel_token).await?;
+        let merged_stream = SortedBatchMerger::try_new(streams, self.output_batch_size)
+            .await
+            .map(SortedBatchMerger::into_stream)
+            .map_err(ShiftWriteError::queue_read)?;
+        self.storage
+            .write_record_batches(merged_stream, cancel_token)
+            .await
+            .map_err(ShiftWriteError::from)
+    }
+
+    async fn read_segments_in_order(
+        &self,
+        segments: &[SegmentToRead],
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<RecordBatchStream>, ShiftWriteError> {
+        let mut streams = Vec::new();
+        let mut next_expected_idx = 0usize;
+        let mut pending_streams: BTreeMap<usize, RecordBatchStream> = BTreeMap::new();
+        let read_parallelism = self.segment_read_parallelism;
+        // Getting segments in parallel with the restriction in segment_read_parallelism
+        let read_plan: Vec<(usize, u64, Vec<usize>)> = segments
+            .iter()
+            .enumerate()
+            .map(|(segment_idx, segment)| (segment_idx, segment.segment_offset, segment.record_batch_idxs.clone()))
+            .collect();
+        let read_stream = futures::stream::iter(read_plan)
+            .take_until(cancel_token.cancelled())
+            .map(|(segment_idx, segment_offset, record_batch_idxs)| {
+                let queue_reader = Arc::clone(&self.queue_reader);
+                let topic = self.topic.clone();
+                let cancel = cancel_token.clone();
+                async move {
+                    match futures::future::select(
+                        Box::pin(queue_reader.read_segment(&topic, segment_offset, &record_batch_idxs, &cancel)),
+                        Box::pin(cancel.cancelled()),
+                    )
+                    .await
+                    {
+                        Either::Left((read_result, _)) => {
+                            let segment_stream = read_result.map_err(|err| {
+                                ShiftWriteError::queue_read(format!(
+                                    "failed to read segment {segment_offset} row groups: {err}"
+                                ))
+                            })?;
+                            Ok::<SegmentReadOutcome, ShiftWriteError>(SegmentReadOutcome::Read {
+                                segment_idx,
+                                stream: segment_stream,
+                            })
+                        }
+                        Either::Right((_cancelled, _)) => {
+                            Ok::<SegmentReadOutcome, ShiftWriteError>(SegmentReadOutcome::Cancelled)
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(read_parallelism);
+        pin_mut!(read_stream);
+
+        while let Some(read_result) = read_stream.next().await {
+            let read_outcome = read_result?;
+            let SegmentReadOutcome::Read {
+                segment_idx,
+                stream: segment_stream,
+            } = read_outcome
+            else {
+                return Err(ShiftWriteError {
+                    reason: ShiftTaskFailureReason::Cancelled,
+                    error: Error::TaskExecution("shift task cancelled while reading queue segments".to_string()),
+                    source: Some(crate::error::IngestError::Cancelled),
+                });
+            };
+            pending_streams.insert(segment_idx, segment_stream);
+            while let Some(segment_stream) = pending_streams.remove(&next_expected_idx) {
+                streams.push(segment_stream);
+                next_expected_idx = next_expected_idx
+                    .checked_add(1)
+                    .ok_or_else(|| ShiftWriteError::queue_read("segment index overflow while assembling batches"))?;
+            }
+        }
+
+        Ok(streams)
+    }
+}
+
+impl From<crate::error::IngestError> for ShiftWriteError {
+    fn from(err: crate::error::IngestError) -> Self {
+        Self {
+            reason: ShiftTaskFailureReason::Write,
+            error: Error::TaskExecution(err.to_string()),
+            source: Some(err),
+        }
+    }
+}
+
+impl std::fmt::Display for ShiftWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl ShiftWriteError {
+    fn is_retryable(&self) -> bool {
+        self.source.as_ref().is_some_and(crate::error::IngestError::is_retryable)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
         },
         time::Duration,
     };
 
     use arrow::{
-        array::{ArrayRef, Int64Array},
-        datatypes::{DataType, Field, Schema},
+        array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
+        datatypes::{DataType, Field, Schema, TimeUnit},
     };
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
+    use futures::TryStreamExt;
+    use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Struct};
     use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
     use tokio::{
         sync::{Mutex, Notify},
@@ -344,8 +486,9 @@ mod tests {
     use crate::{
         error::{IngestError, Result},
         shift::{
-            SegmentToRead, ShiftInput,
-            iceberg_storage::{Storage, WrittenDataFiles},
+            executor::TaskStatus, iceberg_storage::{Storage, WrittenDataFiles}, SegmentToRead,
+            ShiftInput,
+            ShiftOutput,
         },
     };
 
@@ -429,6 +572,51 @@ mod tests {
         fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
             panic!("get_task is not expected in shift runner tests");
         }
+        fn get_tasks_by_code(
+            &self,
+            _code: &TaskCode,
+        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, icegate_jobmanager::Error> {
+            panic!("get_tasks_by_code is not expected in shift runner tests");
+        }
+    }
+
+    struct RecordingJobManager {
+        completed: std::sync::Mutex<Vec<(Uuid, Vec<u8>)>>,
+    }
+
+    impl RecordingJobManager {
+        fn new() -> Self {
+            Self {
+                completed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl JobManager for RecordingJobManager {
+        fn add_task(&self, _task_def: TaskDefinition) -> std::result::Result<Uuid, icegate_jobmanager::Error> {
+            panic!("add_task is not expected in shift runner tests");
+        }
+
+        fn complete_task(&self, task_id: &Uuid, output: Vec<u8>) -> std::result::Result<(), icegate_jobmanager::Error> {
+            self.completed.lock().expect("completed lock").push((*task_id, output));
+            Ok(())
+        }
+
+        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("fail_task is not expected in shift runner tests");
+        }
+
+        fn set_next_start_at(
+            &self,
+            _next_start_at: DateTime<Utc>,
+        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("set_next_start_at is not expected in shift runner tests");
+        }
+
+        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
+            panic!("get_task is not expected in shift runner tests");
+        }
+
         fn get_tasks_by_code(
             &self,
             _code: &TaskCode,
@@ -535,7 +723,7 @@ mod tests {
             offset: u64,
             _record_batch_idxs: &[usize],
             _cancel_token: &CancellationToken,
-        ) -> icegate_queue::Result<Vec<arrow::record_batch::RecordBatch>> {
+        ) -> icegate_queue::Result<icegate_queue::RecordBatchStream> {
             if let Some(started_reads) = &self.started_reads {
                 started_reads.fetch_add(1, Ordering::SeqCst);
             }
@@ -560,22 +748,43 @@ mod tests {
                     "read failed for segment {offset}"
                 )));
             }
-            Ok(self.batches_by_offset.get(&offset).cloned().unwrap_or_default())
+            Ok(Box::pin(futures::stream::iter(
+                self.batches_by_offset
+                    .get(&offset)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Ok),
+            )))
         }
     }
 
     struct FakeStorage {
-        writes: Mutex<Vec<arrow::record_batch::RecordBatch>>,
+        writes: Mutex<Vec<Vec<arrow::record_batch::RecordBatch>>>,
         write_calls: AtomicUsize,
-        fail_on_write: bool,
+        fail_attempts_remaining: AtomicUsize,
+        fail_retryable: bool,
+        returned_data_files: Vec<DataFile>,
     }
 
     impl FakeStorage {
-        fn new(fail_on_write: bool) -> Self {
+        fn always_fail() -> Self {
             Self {
                 writes: Mutex::new(Vec::new()),
                 write_calls: AtomicUsize::new(0),
-                fail_on_write,
+                fail_attempts_remaining: AtomicUsize::new(usize::MAX),
+                fail_retryable: false,
+                returned_data_files: Vec::new(),
+            }
+        }
+
+        fn fail_then_succeed(fail_attempts: usize, returned_data_files: Vec<DataFile>) -> Self {
+            Self {
+                writes: Mutex::new(Vec::new()),
+                write_calls: AtomicUsize::new(0),
+                fail_attempts_remaining: AtomicUsize::new(fail_attempts),
+                fail_retryable: true,
+                returned_data_files,
             }
         }
     }
@@ -588,17 +797,32 @@ mod tests {
 
         async fn write_record_batches(
             &self,
-            batches: Vec<arrow::record_batch::RecordBatch>,
+            batches: crate::shift::iceberg_storage::BoxRecordBatchStream,
             _cancel_token: &CancellationToken,
         ) -> Result<WrittenDataFiles> {
             self.write_calls.fetch_add(1, Ordering::SeqCst);
-            self.writes.lock().await.extend(batches);
-            if self.fail_on_write {
-                return Err(IngestError::Shift("storage write failure".to_string()));
+            let attempt_batches = batches.try_collect::<Vec<_>>().await?;
+            let rows_written = attempt_batches.iter().map(arrow::record_batch::RecordBatch::num_rows).sum();
+            self.writes.lock().await.push(attempt_batches);
+            if self
+                .fail_attempts_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then_some(remaining.saturating_sub(1))
+                })
+                .is_ok()
+            {
+                return Err(if self.fail_retryable {
+                    IngestError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "transient storage write failure",
+                    ))
+                } else {
+                    IngestError::Shift("storage write failure".to_string())
+                });
             }
             Ok(WrittenDataFiles {
-                data_files: Vec::new(),
-                rows_written: 0,
+                data_files: self.returned_data_files.clone(),
+                rows_written,
             })
         }
 
@@ -622,19 +846,45 @@ mod tests {
     }
 
     fn test_batch(value: i64) -> arrow::record_batch::RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
-        let value_col: ArrayRef = Arc::new(Int64Array::from(vec![value]));
-        arrow::record_batch::RecordBatch::try_new(schema, vec![value_col]).expect("batch")
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cloud_account_id", DataType::Utf8, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("acc")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("svc")])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(1)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![value])) as ArrayRef,
+            ],
+        )
+        .expect("batch")
     }
 
     fn values_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
         batches
             .iter()
-            .map(|batch| {
-                let values = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("int64 array");
-                values.value(0)
+            .flat_map(|batch| {
+                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("int64 array");
+                (0..values.len()).map(|idx| values.value(idx)).collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    fn test_data_file(path: &str, rows: u64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(128)
+            .record_count(rows)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .build()
+            .expect("data file")
     }
 
     #[tokio::test]
@@ -656,8 +906,8 @@ mod tests {
             max_active_reads: None,
             concurrency_gate: None,
         });
-        let storage = Arc::new(FakeStorage::new(true));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+        let storage = Arc::new(FakeStorage::always_fail());
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
             .with_segment_read_parallelism(3)
             .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
@@ -688,7 +938,78 @@ mod tests {
         assert_eq!(err.reason(), ShiftTaskFailureReason::Write);
 
         let writes = storage.writes.lock().await;
-        assert_eq!(values_from_batches(&writes), vec![1, 2, 3]);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(values_from_batches(&writes[0]), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn run_retries_transient_write_failure_with_reopened_wal_streams() {
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([
+                (1, vec![test_batch(1)]),
+                (2, vec![test_batch(2)]),
+                (3, vec![test_batch(3)]),
+            ]),
+            delay_by_offset: HashMap::new(),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+        });
+        let storage = Arc::new(FakeStorage::fail_then_succeed(
+            1,
+            vec![test_data_file("s3://warehouse/logs/part-00001.parquet", 3)],
+        ));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 2)
+            .with_segment_read_parallelism(3)
+            .expect("non-zero segment read parallelism must be accepted");
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![
+                SegmentToRead {
+                    segment_offset: 1,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 2,
+                    record_batch_idxs: vec![0],
+                },
+                SegmentToRead {
+                    segment_offset: 3,
+                    record_batch_idxs: vec![0],
+                },
+            ],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = RecordingJobManager::new();
+        let cancel = CancellationToken::new();
+
+        let result = runner.run(task, &manager, &cancel).await.expect("write retry must succeed");
+
+        assert_eq!(result.status, TaskStatus::Ok);
+        assert_eq!(result.rows_total, 3);
+        assert_eq!(result.parquet_files_total, 1);
+        assert_eq!(result.bytes_written_total, 128);
+        assert_eq!(storage.write_calls.load(Ordering::SeqCst), 2);
+
+        let writes = storage.writes.lock().await;
+        assert_eq!(writes.len(), 2);
+        assert_eq!(values_from_batches(&writes[0]), vec![1, 2, 3]);
+        assert_eq!(values_from_batches(&writes[1]), vec![1, 2, 3]);
+        assert_eq!(
+            writes[1].iter().map(arrow::record_batch::RecordBatch::num_rows).sum::<usize>(),
+            3
+        );
+
+        let completed = manager.completed.lock().expect("completed lock");
+        assert_eq!(completed.len(), 1);
+        let output: ShiftOutput = serde_json::from_slice(&completed[0].1).expect("shift output");
+        assert_eq!(
+            output.parquet_files,
+            vec!["s3://warehouse/logs/part-00001.parquet".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -702,8 +1023,8 @@ mod tests {
             max_active_reads: None,
             concurrency_gate: None,
         });
-        let storage = Arc::new(FakeStorage::new(false));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+        let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
             .with_segment_read_parallelism(3)
             .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
@@ -762,8 +1083,8 @@ mod tests {
             max_active_reads: Some(Arc::clone(&max_active_reads)),
             concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
         });
-        let storage = Arc::new(FakeStorage::new(true));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+        let storage = Arc::new(FakeStorage::always_fail());
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
             .with_segment_read_parallelism(2)
             .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
@@ -836,8 +1157,8 @@ mod tests {
             max_active_reads: Some(Arc::clone(&max_active_reads)),
             concurrency_gate: None,
         });
-        let storage = Arc::new(FakeStorage::new(true));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+        let storage = Arc::new(FakeStorage::always_fail());
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
             .with_segment_read_parallelism(1)
             .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
@@ -885,9 +1206,9 @@ mod tests {
             max_active_reads: None,
             concurrency_gate: None,
         });
-        let storage = Arc::new(FakeStorage::new(false));
+        let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
 
-        let result = ShiftTaskRunnerImpl::new(queue_reader, storage, "logs").with_segment_read_parallelism(0);
+        let result = ShiftTaskRunnerImpl::new(queue_reader, storage, "logs", 1).with_segment_read_parallelism(0);
 
         match result {
             Ok(_) => panic!("zero shift_segment_read_parallelism must be rejected"),
@@ -919,8 +1240,8 @@ mod tests {
             max_active_reads: None,
             concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
         });
-        let storage = Arc::new(FakeStorage::new(false));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs")
+        let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
             .with_segment_read_parallelism(2)
             .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {

@@ -142,9 +142,9 @@ impl QueueWriter {
         })
     }
 
-    /// Handles a single write request by accumulating the batch.
+    /// Handles a single write request by accumulating all of its batches.
     ///
-    /// The batch is added to the topic's accumulator. If thresholds are met,
+    /// The request is added to the topic's accumulator. If thresholds are met,
     /// a flush is triggered automatically.
     #[allow(clippy::significant_drop_tightening)] // Lock must be held while checking flush condition
     #[tracing::instrument(skip(self, request), fields(topic = %request.topic))]
@@ -157,7 +157,7 @@ impl QueueWriter {
             let mut accumulators = self.accumulators.write().await;
             trace!("Accumulator acquisition complete");
             let accumulator = accumulators.entry(topic).or_insert_with(TopicAccumulator::new);
-            accumulator.add(request.batch, request.response_tx, trace_context);
+            accumulator.add(request.batches, request.response_tx, trace_context);
             (
                 accumulator.pending_batches(),
                 accumulator.pending_records(),
@@ -207,56 +207,48 @@ impl QueueWriter {
     #[tracing::instrument(skip(self), fields(topic = %topic))]
     async fn flush_topic(&self, topic: &Topic) -> Result<()> {
         let flush_start = Instant::now();
-        let pending = {
+        let pending_flush = {
             let mut accumulators = self.accumulators.write().await;
             if let Some(accumulator) = accumulators.get_mut(topic) {
-                accumulator.take()
+                accumulator.take_pending_flush()
             } else {
                 return Ok(());
             }
         };
 
-        debug!(batches = pending.len(), "Flushing topic batches");
-        self.events.on_accumulator_state_update(topic.as_str(), 0, 0, 0);
-
-        if pending.is_empty() {
+        if pending_flush.is_empty() {
             debug!("No batches to flush");
             return Ok(());
         }
 
-        // Decompose pending into separate vectors to avoid cloning batches
-        let capacity = pending.len();
-        let mut batches = Vec::with_capacity(capacity);
-        let mut response_channels = Vec::with_capacity(capacity);
-        let mut trace_contexts = Vec::with_capacity(capacity);
-
-        for p in pending {
-            batches.push(p.batch);
-            response_channels.push(p.response_tx);
-            trace_contexts.push(p.trace_context);
-        }
+        let request_count = pending_flush.request_count();
+        let total_row_groups = pending_flush.row_group_count();
+        debug!(
+            requests = request_count,
+            row_groups = total_row_groups,
+            "Flushing topic batches"
+        );
+        self.events.on_accumulator_state_update(topic.as_str(), 0, 0, 0);
 
         // Add span links for all trace contexts from batched requests
-        let trace_context_refs: Vec<&str> = trace_contexts.iter().filter_map(Option::as_deref).collect();
-        icegate_common::add_span_links(trace_context_refs);
+        icegate_common::add_span_links(pending_flush.trace_contexts());
 
         // Extract trace context from current flush_topic span
         let flush_trace_context = icegate_common::extract_current_trace_context();
 
-        let total_records: usize = batches.iter().map(RecordBatch::num_rows).sum();
-
         // Write the accumulated batches directly (each becomes a row group)
-        match self.write_batches(topic, batches).await {
+        match self.write_batches(topic, pending_flush.batches()).await {
             Ok(offset) => {
                 self.events.on_flush_finish(topic.as_str(), "ok", flush_start.elapsed());
                 debug!(offset, "Flush completed");
-                TopicAccumulator::send_success(response_channels, offset, total_records, flush_trace_context.as_ref());
+                pending_flush.send_success(offset, flush_trace_context.clone());
                 Ok(())
             }
             Err(e) => {
                 self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
                 self.events.on_write_error(topic.as_str(), write_error_reason(&e));
-                TopicAccumulator::send_failure(response_channels, &e.to_string(), flush_trace_context.as_ref());
+                let reason = e.to_string();
+                pending_flush.send_failure(reason, flush_trace_context.clone());
                 Err(e)
             }
         }
@@ -759,6 +751,7 @@ mod tests {
         array::{Int32Array, StringArray},
         datatypes::{DataType, Field, Schema},
     };
+    use futures::TryStreamExt;
     use object_store::memory::InMemory;
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
@@ -835,7 +828,7 @@ mod tests {
 
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batch,
+            batches: vec![batch],
 
             response_tx,
             trace_context: None,
@@ -850,6 +843,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_channel_write_acknowledges_only_request_records() {
+        let store = Arc::new(InMemory::new());
+        let config = QueueConfig::new("queue").with_max_row_group_size(16).with_flush_interval_ms(50);
+        let writer = QueueWriter::new(config, store);
+
+        let (tx, rx) = channel(10);
+        let handle = writer.start(rx);
+
+        let (response_tx1, response_rx1) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: "logs".to_string(),
+            batches: vec![test_batch(), test_batch()],
+            response_tx: response_tx1,
+            trace_context: None,
+        })
+        .await
+        .unwrap();
+
+        let (response_tx2, response_rx2) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: "logs".to_string(),
+            batches: vec![test_batch()],
+            response_tx: response_tx2,
+            trace_context: None,
+        })
+        .await
+        .unwrap();
+
+        let result1 = response_rx1.await.unwrap();
+        let result2 = response_rx2.await.unwrap();
+
+        assert_eq!(result1.offset(), Some(0));
+        assert_eq!(result2.offset(), Some(0));
+        assert_eq!(result1.records(), Some(8));
+        assert_eq!(result2.records(), Some(4));
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_max_row_group_size_limits_row_group_size() {
         let store = Arc::new(InMemory::new());
         let config = QueueConfig::new("queue").with_max_row_group_size(2);
@@ -859,7 +893,13 @@ mod tests {
 
         let reader = ParquetQueueReader::new("queue", store, 2).unwrap();
         let cancel = CancellationToken::new();
-        let batches = reader.read_segment(&"logs".to_string(), 0, &[0, 1], &cancel).await.unwrap();
+        let batches = reader
+            .read_segment(&"logs".to_string(), 0, &[0, 1], &cancel)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
 
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].num_rows(), 2);

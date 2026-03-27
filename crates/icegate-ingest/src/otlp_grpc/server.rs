@@ -30,12 +30,13 @@ use crate::infra::metrics::OtlpMetrics;
 /// - The server encounters a fatal error during operation
 pub async fn run(
     write_channel: WriteChannel,
+    wal_row_group_size: usize, // TODO(crit): точно нужно?
     metrics: OtlpMetrics,
     config: OtlpGrpcConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", config.host, config.port).parse()?;
-    let service = OtlpGrpcService::new(write_channel, metrics);
+    let service = OtlpGrpcService::new(write_channel, wal_row_group_size, metrics);
 
     tracing::info!("Starting OTLP gRPC server on {}", addr);
 

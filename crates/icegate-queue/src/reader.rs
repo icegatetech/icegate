@@ -2,12 +2,13 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    pin::Pin,
     sync::Arc,
 };
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use icegate_common::retrier::{Retrier, RetrierConfig};
 use object_store::{ObjectStore, path::Path};
 use parquet::{
@@ -154,6 +155,9 @@ impl RowGroupsInSegments {
 }
 
 /// Queue reader dependency surface for shift executors.
+pub type RecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
+
+/// Queue reader dependency surface for shift executors.
 #[async_trait]
 pub trait QueueReader: Send + Sync {
     /// Build a plan of record batches to process.
@@ -167,14 +171,14 @@ pub trait QueueReader: Send + Sync {
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan>;
 
-    /// Read record batches for a specific segment.
+    /// Open a streaming reader for a specific segment.
     async fn read_segment(
         &self,
         topic: &Topic,
         offset: u64,
         record_batch_idxs: &[usize],
         cancel_token: &CancellationToken,
-    ) -> Result<Vec<RecordBatch>>;
+    ) -> Result<RecordBatchStream>;
 }
 
 /// Queue reader for reading Parquet segments from object storage.
@@ -406,16 +410,16 @@ impl ParquetQueueReader {
         })
     }
 
-    /// Reads specific record batches (by index) from a segment by topic and offset.
+    /// Opens a streaming reader for specific record batches (by index) from a segment by topic and offset.
     pub async fn read_segment(
         &self,
         topic: &Topic,
         offset: u64,
         record_batch_idxs: &[usize],
         cancel_token: &CancellationToken,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> Result<RecordBatchStream> {
         if record_batch_idxs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Box::pin(futures::stream::empty()));
         }
 
         let segment_id = SegmentId::new(topic, offset);
@@ -437,8 +441,7 @@ impl ParquetQueueReader {
             .with_row_groups(record_batch_idxs.to_vec())
             .build()?;
 
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        Ok(batches)
+        Ok(Box::pin(stream.map_err(QueueError::from)))
     }
 
     /// Plan to read record batches grouped by column value across a list of segments.
@@ -864,7 +867,7 @@ impl QueueReader for ParquetQueueReader {
         offset: u64,
         record_batch_idxs: &[usize],
         cancel_token: &CancellationToken,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> Result<RecordBatchStream> {
         Self::read_segment(self, topic, offset, record_batch_idxs, cancel_token).await
     }
 }

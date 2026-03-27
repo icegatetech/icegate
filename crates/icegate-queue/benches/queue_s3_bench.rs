@@ -11,6 +11,7 @@
 use std::{sync::Arc, time::Duration};
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use futures::TryStreamExt;
 use icegate_common::testing::{MinIOContainer, create_s3_bucket, create_s3_object_store};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, WriteRequest, channel};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -46,7 +47,7 @@ async fn write_batch(tx: &icegate_queue::WriteChannel, topic: &str, batch: arrow
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: topic.to_string(),
-        batch,
+        batches: vec![batch],
         response_tx,
         trace_context: None,
     })
@@ -167,7 +168,13 @@ fn read_performance(c: &mut Criterion) {
             rt.block_on(async {
                 let cancel = CancellationToken::new();
                 // Read row group 0 from segment 0
-                let _ = reader.read_segment(&topic, 0, &[0], &cancel).await.unwrap();
+                let _ = reader
+                    .read_segment(&topic, 0, &[0], &cancel)
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
             });
         });
     });
@@ -224,7 +231,13 @@ fn end_to_end(c: &mut Criterion) {
                 let segments = reader.list_segments(&topic_e2e, 0, &cancel).await.unwrap();
                 for segment in segments {
                     // Read first row group from each segment
-                    let _ = reader.read_segment(&topic_e2e, segment.id.offset, &[0], &cancel).await.unwrap();
+                    let _ = reader
+                        .read_segment(&topic_e2e, segment.id.offset, &[0], &cancel)
+                        .await
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
                 }
             });
         });

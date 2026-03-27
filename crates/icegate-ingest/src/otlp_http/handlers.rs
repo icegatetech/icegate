@@ -10,7 +10,6 @@ use axum::{
     response::IntoResponse,
 };
 use icegate_common::{LOGS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
-use icegate_queue::{WriteRequest, WriteResult};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
 use tracing::debug;
@@ -83,10 +82,13 @@ pub async fn ingest_logs(
 
     // Transform OTLP logs to Arrow RecordBatch (offload to blocking thread)
     let span = tracing::Span::current();
+    let transform_start = Instant::now();
     let batch = tokio::task::spawn_blocking(move || {
         span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
     })
     .await??;
+    // TODO(crit): точно ли надо?
+    request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
     let Some(batch) = batch else {
         // No records to process - return success with 0 rejected
         request_metrics.record_records_per_request(0);
@@ -98,57 +100,64 @@ pub async fn ingest_logs(
     debug!(records = record_count, "Transformed OTLP logs to RecordBatch");
     request_metrics.record_records_per_request(record_count);
 
-    // Create write request for the WAL queue
-    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-    let write_request = WriteRequest {
-        topic: LOGS_TOPIC.to_string(),
-        batch,
-        response_tx,
-        trace_context: icegate_common::extract_current_trace_context(),
+    let trace_context = icegate_common::extract_current_trace_context();
+    let prepare_start = Instant::now();
+    let prepared = crate::wal_sort::prepare_sorted_logs_for_wal(&batch, state.wal_row_group_size, trace_context)
+        .map_err(|e| {
+            request_metrics.finish_error();
+            OtlpError(e)
+        })?;
+    // TODO(crit): метрика такая же как сверху, на графике будет непонятно
+    request_metrics.record_transform_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
+    let Some(prepared) = prepared else {
+        request_metrics.finish_ok();
+        return Ok(Json(ExportLogsResponse::default()));
     };
 
-    // Send to WAL queue
     let enqueue_start = Instant::now();
-    state.write_channel.send(write_request).await.map_err(|e| {
-        request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
-        request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
-        request_metrics.finish_error();
-        OtlpError(IngestError::Io(std::io::Error::other(format!(
-            "WAL queue unavailable: {e}"
-        ))))
-    })?;
+    let pending = crate::wal_sort::submit_sorted_logs_to_wal(&state.write_channel, prepared)
+        .await
+        .map_err(|e| {
+            request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
+            request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
+            request_metrics.finish_error();
+            OtlpError(e)
+        })?;
     request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_OK);
 
-    // Wait for write result
     let ack_start = Instant::now();
-    let result = response_rx.await.map_err(|e| {
+    let ack_outcome = pending.wait_for_ack().await.map_err(|e| {
         request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
         request_metrics.finish_error();
-        OtlpError(IngestError::Io(std::io::Error::other(format!(
-            "Failed to receive write result: {e}"
-        ))))
+        OtlpError(e)
     })?;
 
-    // Add link to flush operation if trace context is available
-    if let Some(tc) = result.trace_context() {
-        icegate_common::add_span_link(tc);
-    }
-
-    match result {
-        WriteResult::Success { offset, records, .. } => {
-            debug!(offset, records, "Logs written to WAL");
+    match ack_outcome {
+        crate::wal_sort::WalAckOutcome::Success(write_result) => {
+            if let Some(trace_context) = write_result.trace_context.as_deref() {
+                icegate_common::add_span_link(trace_context);
+            }
+            debug!(
+                offset = write_result.offset.unwrap_or_default(),
+                records = write_result.records,
+                "Logs written to WAL"
+            );
             request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_OK);
             request_metrics.finish_ok();
             Ok(Json(ExportLogsResponse::default()))
         }
-        WriteResult::Failed { reason, .. } => {
-            // Return partial success with all records rejected
+        crate::wal_sort::WalAckOutcome::Partial(partial) => {
+            if let Some(trace_context) = partial.trace_context.as_deref() {
+                icegate_common::add_span_link(trace_context);
+            }
             request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
             request_metrics.finish_partial();
             Ok(Json(ExportLogsResponse {
                 partial_success: Some(LogsPartialSuccess {
-                    rejected_log_records: record_count as i64,
-                    error_message: Some(reason),
+                    rejected_log_records: i64::try_from(partial.rejected_records).map_err(|_| {
+                        OtlpError(IngestError::Validation("Rejected logs count exceeds i64".to_string()))
+                    })?,
+                    error_message: Some(partial.reason),
                 }),
             }))
         }
@@ -223,6 +232,7 @@ fn otlp_encoding_from_content_type(content_type: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use axum::body::Bytes;
+    use icegate_queue::{WriteResult, channel};
     use opentelemetry_proto::tonic::{
         common::v1::{AnyValue, KeyValue, any_value::Value},
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
@@ -231,6 +241,7 @@ mod tests {
     use prost::Message;
 
     use super::*;
+    use crate::{infra::metrics::OtlpMetrics, otlp_http::server::OtlpHttpState};
 
     fn create_test_request() -> ExportLogsServiceRequest {
         ExportLogsServiceRequest {
@@ -266,6 +277,18 @@ mod tests {
                 }],
                 schema_url: String::new(),
             }],
+        }
+    }
+
+    fn encode_protobuf_request() -> Bytes {
+        Bytes::from(create_test_request().encode_to_vec())
+    }
+
+    fn test_state(write_channel: icegate_queue::WriteChannel) -> OtlpHttpState {
+        OtlpHttpState {
+            write_channel,
+            wal_row_group_size: 4,
+            metrics: OtlpMetrics::new_disabled(),
         }
     }
 
@@ -318,5 +341,66 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(TENANT_ID_HEADER, "bad/tenant".parse().unwrap());
         assert_eq!(extract_tenant_id(&headers), None);
+    }
+
+    #[tokio::test]
+    async fn ingest_logs_returns_success_on_full_wal_ack() {
+        let (tx, mut rx) = channel(1);
+        let writer = tokio::spawn(async move {
+            let request = rx.recv().await.expect("write request");
+            let total_rows = request.batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+            request
+                .response_tx
+                .send(WriteResult::success(11, total_rows, None))
+                .expect("send wal ack");
+        });
+
+        let response = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request())
+            .await
+            .expect("http response");
+        writer.await.expect("writer task");
+
+        assert!(response.0.partial_success.is_none());
+    }
+
+    #[tokio::test]
+    async fn ingest_logs_returns_partial_success_on_wal_partial_failure() {
+        let (tx, mut rx) = channel(1);
+        let writer = tokio::spawn(async move {
+            let request = rx.recv().await.expect("write request");
+            request
+                .response_tx
+                .send(WriteResult::failed("wal partial failure", None))
+                .expect("send wal ack");
+        });
+
+        let response = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request())
+            .await
+            .expect("http response");
+        writer.await.expect("writer task");
+
+        let partial = response.0.partial_success.expect("partial success");
+        assert_eq!(partial.rejected_log_records, 1);
+        assert_eq!(partial.error_message.as_deref(), Some("wal partial failure"));
+    }
+
+    #[tokio::test]
+    async fn ingest_logs_returns_error_before_send_on_invalid_request() {
+        let (tx, mut rx) = channel(1);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "text/plain".parse().expect("content type"));
+
+        let result = ingest_logs(State(test_state(tx)), headers, Bytes::from_static(b"invalid")).await;
+        assert!(result.is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ingest_logs_returns_error_when_write_channel_is_closed() {
+        let (tx, rx) = channel(1);
+        drop(rx);
+
+        let result = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request()).await;
+        assert!(result.is_err());
     }
 }

@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
     future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use arrow::{compute::SortOptions, record_batch::RecordBatch};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use iceberg::spec::TableMetadata;
+use futures::{Stream, TryStreamExt};
 use iceberg::{
     Catalog, NamespaceIdent, TableIdent,
     arrow::RecordBatchPartitionSplitter,
@@ -46,6 +47,9 @@ pub struct WrittenDataFiles {
     pub rows_written: usize,
 }
 
+/// Stream of merge-ordered record batches written to Iceberg.
+pub type BoxRecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
+
 /// Iceberg storage dependency surface for shift executors.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -55,7 +59,7 @@ pub trait Storage: Send + Sync {
     /// Write parquet files from record batches without committing.
     async fn write_record_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles>;
 
@@ -126,52 +130,28 @@ impl IcebergStorage {
 
     /// Writes record batches into parquet data files without committing to Iceberg.
     /// This method:
-    /// 1. Sorts the batches by the table's sort order
-    /// 2. Splits data by partition using `RecordBatchPartitionSplitter`
-    /// 3. Writes each partition's data using `FanoutWriter`
+    /// 1. Reads merge-ordered batches from the input stream
+    /// 2. Splits every batch by partition using `RecordBatchPartitionSplitter`
+    /// 3. Writes partition batches immediately via `FanoutWriter`
     pub async fn write_record_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        let batches = Arc::new(batches);
-        self.retry(cancel_token, || {
-            let batches = Arc::clone(&batches);
-            async move { self.write_parquet_files_once(batches.as_ref().clone(), cancel_token).await }
-        })
-        .await
+        self.write_parquet_files_once(batches, cancel_token).await
     }
 
     #[tracing::instrument(skip(self, batches, cancel_token))]
     async fn write_parquet_files_once(
         &self,
-        batches: Vec<RecordBatch>,
+        mut batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        if batches.is_empty() {
-            return Ok(WrittenDataFiles {
-                data_files: Vec::new(),
-                rows_written: 0,
-            });
-        }
-
-        tracing::info!("Start preparing parquet file. Batches: {}", batches.len());
-        let queue_schema = batches[0].schema();
-        let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
         let table = self.load_table(cancel_token).await?;
         let table_metadata = table.metadata().clone();
         let table_file_io = table.file_io().clone();
-        let metadata_for_sort = table_metadata.clone();
-        tracing::debug!("Sorting batch");
-        let span = tracing::Span::current();
-        let sorted_batch = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| sort_by_table_order(&metadata_for_sort, combined_batch))
-        })
-        .await??;
-        tracing::debug!("Sorted batch has {} rows", sorted_batch.num_rows());
 
-        let location_generator = DefaultLocationGenerator::new(table_metadata.clone())
-            .map_err(|e| IngestError::Shift(format!("failed to create location generator: {e}")))?;
+        let location_generator = DefaultLocationGenerator::new(table_metadata.clone()).map_err(IngestError::Iceberg)?;
 
         // Generate unique file prefix with UUID to avoid conflicts
         let write_id = Uuid::now_v7();
@@ -204,45 +184,54 @@ impl IcebergStorage {
             table_metadata.current_schema().clone(),
             table_metadata.default_partition_spec().clone(),
         )
-        .map_err(|e| IngestError::Shift(format!("failed to create partition splitter: {e}")))?;
+        .map_err(IngestError::Iceberg)?;
 
-        // Split batch by partition and write each partition
-        let partitioned_batches = splitter
-            .split(&sorted_batch)
-            .map_err(|e| IngestError::Shift(format!("failed to split batch by partition: {e}")))?;
-        let partitioned_batches_len = partitioned_batches.len();
+        let mut rows_written = 0usize;
+        let mut partitioned_batches_total = 0usize;
+        while let Some(batch) = batches.try_next().await? {
+            if cancel_token.is_cancelled() {
+                return Err(IngestError::Shift(
+                    "shift task cancelled during parquet write".to_string(),
+                ));
+            }
+            rows_written = rows_written
+                .checked_add(batch.num_rows())
+                .ok_or_else(|| IngestError::Shift("rows written overflow".to_string()))?;
+            let partitioned_batches = splitter
+                .split(&batch)
+                .map_err(|e| IngestError::Shift(format!("failed to split batch by partition: {e}")))?;
+            partitioned_batches_total = partitioned_batches_total
+                .checked_add(partitioned_batches.len())
+                .ok_or_else(|| IngestError::Shift("partitioned batch count overflow".to_string()))?;
 
-        for (partition_key, partition_batch) in partitioned_batches {
-            let partition_path = partition_key.to_path();
-            let span = tracing::info_span!(
-                "iceberg_partition_write",
-                partition_key = %partition_path,
-                rows = partition_batch.num_rows()
-            );
-            fanout_writer
-                .write(partition_key, partition_batch)
-                .instrument(span)
-                .await
-                .map_err(|e| IngestError::Shift(format!("failed to write partition batch: {e}")))?;
+            for (partition_key, partition_batch) in partitioned_batches {
+                let partition_path = partition_key.to_path();
+                let span = tracing::info_span!(
+                    "iceberg_partition_write",
+                    partition_key = %partition_path,
+                    rows = partition_batch.num_rows()
+                );
+                fanout_writer
+                    .write(partition_key, partition_batch)
+                    .instrument(span)
+                    .await
+                    .map_err(IngestError::Iceberg)?;
+            }
         }
 
         // Close writer and get data files
         let span = tracing::info_span!("iceberg_write_close");
-        let data_files: Vec<DataFile> = fanout_writer
-            .close()
-            .instrument(span)
-            .await
-            .map_err(|e| IngestError::Shift(format!("failed to close fanout writer: {e}")))?;
+        let data_files: Vec<DataFile> = fanout_writer.close().instrument(span).await.map_err(IngestError::Iceberg)?;
 
         tracing::info!(
             "Complete write {} parquet files for {} partitions",
             data_files.len(),
-            partitioned_batches_len
+            partitioned_batches_total
         );
 
         Ok(WrittenDataFiles {
             data_files,
-            rows_written: sorted_batch.num_rows(),
+            rows_written,
         })
     }
 
@@ -370,7 +359,7 @@ impl Storage for IcebergStorage {
 
     async fn write_record_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
         self.write_record_batches(batches, cancel_token).await
@@ -393,63 +382,6 @@ impl Storage for IcebergStorage {
     ) -> Result<usize> {
         self.commit(data_files, record_type, last_offset, cancel_token).await
     }
-}
-
-/// Sorts a record batch by the table's sort order.
-fn sort_by_table_order(table_metadata: &TableMetadata, batch: RecordBatch) -> Result<RecordBatch> {
-    let sort_order = table_metadata.default_sort_order();
-
-    if sort_order.fields.is_empty() {
-        // No sort order defined, return as-is
-        return Ok(batch);
-    }
-
-    let schema = table_metadata.current_schema();
-    let batch_schema = batch.schema();
-
-    // Build sort columns from Iceberg sort order
-    let mut sort_columns = Vec::with_capacity(sort_order.fields.len());
-
-    for sort_field in &sort_order.fields {
-        // Get field name from schema using source_id
-        let field = schema.field_by_id(sort_field.source_id).ok_or_else(|| {
-            IngestError::Shift(format!(
-                "sort field with id {} not found in schema",
-                sort_field.source_id
-            ))
-        })?;
-
-        // Find column index in batch
-        let col_idx = batch_schema
-            .index_of(&field.name)
-            .map_err(|e| IngestError::Shift(format!("sort column '{}' not in batch: {e}", field.name)))?;
-
-        let descending = matches!(sort_field.direction, iceberg::spec::SortDirection::Descending);
-
-        let nulls_first = matches!(sort_field.null_order, iceberg::spec::NullOrder::First);
-
-        sort_columns.push(arrow::compute::SortColumn {
-            values: batch.column(col_idx).clone(),
-            options: Some(SortOptions {
-                descending,
-                nulls_first,
-            }),
-        });
-    }
-
-    // Compute sort indices
-    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)?;
-
-    // Reorder all columns
-    let sorted_columns: Vec<_> = batch
-        .columns()
-        .iter()
-        .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let sorted_batch = RecordBatch::try_new(batch_schema, sorted_columns)?;
-
-    Ok(sorted_batch)
 }
 
 // Table loader with caching

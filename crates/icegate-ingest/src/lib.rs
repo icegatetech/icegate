@@ -26,4 +26,6 @@ pub mod shift;
 /// Runtime thread planning helpers.
 pub mod runtime_threads;
 
+mod wal_sort;
+
 pub use config::IngestConfig;
