@@ -26,6 +26,7 @@ use icegate_common::WAL_OFFSET_PROPERTY;
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
+use super::WalQueryConfig;
 use super::scan::IcegateIcebergScan;
 use crate::engine::core::WAL_STORE_URL;
 
@@ -45,6 +46,8 @@ pub(super) struct IcegateTableProvider {
     wal_reader: Arc<ParquetQueueReader>,
     /// Iceberg table loaded at provider construction time.
     table: Table,
+    /// WAL query configuration (enabled flag, metadata size hint).
+    wal_config: WalQueryConfig,
 }
 
 impl std::fmt::Debug for IcegateTableProvider {
@@ -71,6 +74,7 @@ impl IcegateTableProvider {
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
         wal_reader: Arc<ParquetQueueReader>,
+        wal_config: WalQueryConfig,
     ) -> Result<Self, iceberg::Error> {
         let table = catalog.load_table(&table_ident).await?;
         let schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
@@ -82,6 +86,7 @@ impl IcegateTableProvider {
             schema,
             wal_reader,
             table,
+            wal_config,
         })
     }
 }
@@ -192,6 +197,11 @@ impl IcegateTableProvider {
         filters: &[Expr],
         start_offset: u64,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        if !self.wal_config.enabled {
+            tracing::debug!("WAL query disabled, skipping WAL scan");
+            return Ok(None);
+        }
+
         // List WAL segments via the shared reader
         let files = self.list_wal_files(start_offset).await?;
         if files.is_empty() {
@@ -231,13 +241,15 @@ impl IcegateTableProvider {
             }
         };
 
-        // Build ParquetSource with predicate pushdown
+        // Build ParquetSource with predicate pushdown and metadata size hint
         let mut parquet_source = ParquetSource::new(self.schema.clone());
         if let Some(pred) = physical_predicate {
             parquet_source = parquet_source.with_predicate(pred);
         }
+        if let Some(hint) = self.wal_config.metadata_size_hint {
+            parquet_source = parquet_source.with_metadata_size_hint(hint);
+        }
         // TODO(low): Add reverse order to optimize ORDER BY time desc
-        // TODO(medium):: metadata_size_hint
 
         // Build file scan config
         let wal_url = ObjectStoreUrl::parse(WAL_STORE_URL)

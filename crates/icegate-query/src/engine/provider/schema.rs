@@ -16,6 +16,7 @@ use iceberg::{Catalog, NamespaceIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
 use icegate_queue::ParquetQueueReader;
 
+use super::WalQueryConfig;
 use super::table::IcegateTableProvider;
 
 /// Schema provider that substitutes `IcegateTableProvider` for the "logs" table
@@ -42,11 +43,12 @@ impl IcegateSchemaProvider {
     /// # Errors
     ///
     /// Returns an error if tables cannot be loaded from the catalog.
-    #[tracing::instrument(skip(catalog, wal_reader), fields(%namespace))]
+    #[tracing::instrument(skip(catalog, wal_reader, wal_config), fields(%namespace))]
     pub(super) async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         wal_reader: Arc<ParquetQueueReader>,
+        wal_config: WalQueryConfig,
     ) -> Result<Self, iceberg::Error> {
         let table_idents = catalog.list_tables(&namespace).await?;
 
@@ -58,11 +60,12 @@ impl IcegateSchemaProvider {
             let catalog = Arc::clone(&catalog);
             let namespace = namespace.clone();
             let wal_reader = Arc::clone(&wal_reader);
+            let wal_config = wal_config.clone();
             async move {
                 let provider: Arc<dyn TableProvider> = if name == icegate_common::LOGS_TOPIC {
                     // Logs table: use our merged provider
                     let table_ident = iceberg::TableIdent::new(namespace, name.clone());
-                    let provider = IcegateTableProvider::try_new(catalog, table_ident, wal_reader).await?;
+                    let provider = IcegateTableProvider::try_new(catalog, table_ident, wal_reader, wal_config).await?;
                     Arc::new(provider)
                 } else {
                     // Other tables: standard Iceberg static provider
