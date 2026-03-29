@@ -806,13 +806,14 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
 
                 // Re-check cache under lock — another task may have filled
                 // the gaps while we waited.
-                if let Some(entry) = inner
+                let existing: Option<CacheValue> = inner
                     .cache
                     .get(&key)
                     .await
                     .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
-                {
-                    let cached = entry.value();
+                    .map(|entry| entry.value().clone());
+
+                if let Some(ref cached) = existing {
                     if cached.covers(range_start, range_end) {
                         tracing::debug!(
                             offset = range_start,
@@ -828,14 +829,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                     }
                 }
 
-                // Find uncached gaps while still under lock.
-                let existing: Option<CacheValue> = inner
-                    .cache
-                    .get(&key)
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
-                    .map(|entry| entry.value().clone());
-
+                // Find uncached gaps using the already-fetched entry.
                 #[allow(clippy::single_range_in_vec_init)]
                 let gaps = existing
                     .as_ref()
@@ -894,16 +888,27 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             }
 
             // Phase 4: Read from the now-warm cache without the lock.
-            // The data we just merged is guaranteed to cover our range.
-            let entry = inner
-                .cache
-                .get(&key)
-                .await
-                .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?;
-            let data = entry
-                .as_ref()
-                .and_then(|e| e.value().read_range(range_start, range_end))
-                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache merge failed to cover range"))?;
+            // Fall back to reconstructing from fetched data if the cache
+            // entry was evicted between Phase 3 and this read.
+            let data = match inner.cache.get(&key).await {
+                Ok(Some(entry)) => entry.value().read_range(range_start, range_end),
+                _ => None,
+            };
+            let data = match data {
+                Some(d) => d,
+                None => {
+                    // Cache evicted between merge and read — reconstruct from
+                    // the fetched buffers we still hold.
+                    tracing::debug!("Cache miss after merge, using fetched data as fallback");
+                    let mut fallback = CacheValue::new();
+                    for (offset, buf) in &fetched {
+                        fallback.insert_range(*offset, &buf.to_bytes());
+                    }
+                    fallback.read_range(range_start, range_end).ok_or_else(|| {
+                        Error::new(ErrorKind::Unexpected, "fetched data does not cover requested range")
+                    })?
+                }
+            };
             let response = make_read_response(data, range_start, range_end, total_size);
 
             inner.metrics.record_read_duration(start);

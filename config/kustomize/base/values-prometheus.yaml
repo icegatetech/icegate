@@ -78,9 +78,22 @@ kubelet:
         regex: 'container_spec.*'
       # --- CFS orphan fix ---
       # For container-level cgroup CFS metrics (pod=""), extract pod UID
-      # from the cgroup id path: /kubepods/.../pod<UID>/<container-id>
+      # from the cgroup id path. Supports:
+      #   cgroup v1: /kubepods/burstable/pod<UID>/<ctr>
+      #   cgroup v1 (cgroupfs, no QoS): /kubepods/pod<UID>/<ctr>
+      #   cgroup v2 (systemd): kubepods-burstable.slice/kubepods-burstable-pod<UID>.slice/<ctr>
       - sourceLabels: [id]
         regex: '/kubepods/(?:burstable|guaranteed|besteffort)/pod([^/]+)/.*'
+        targetLabel: uid
+        replacement: '$1'
+        action: replace
+      - sourceLabels: [id]
+        regex: '/kubepods/pod([^/]+)/.*'
+        targetLabel: uid
+        replacement: '$1'
+        action: replace
+      - sourceLabels: [id]
+        regex: 'kubepods(?:-[^.]*)?\.slice/kubepods-[^-]*-pod([0-9a-f_-]+)\.slice/.*'
         targetLabel: uid
         replacement: '$1'
         action: replace
@@ -124,18 +137,22 @@ additionalPrometheusRulesMap:
         interval: 15s
         rules:
           # Throttle ratio: fraction of CFS periods that were throttled.
+          # Aggregated to pod scope (container-level series summed per pod).
           - record: container:cpu_cfs_throttle_ratio
             expr: |
-              rate(container_cpu_cfs_throttled_periods_total{pod!=""}[5m])
-              / rate(container_cpu_cfs_periods_total{pod!=""}[5m])
+              sum by(namespace, pod) (rate(container_cpu_cfs_throttled_periods_total{pod!=""}[5m]))
+              / sum by(namespace, pod) (rate(container_cpu_cfs_periods_total{pod!=""}[5m]))
           # Same metric but resolved from container-level cgroups via uid join.
+          # Aggregated to uid scope before join, then to pod scope after.
           - record: container:cpu_cfs_throttle_ratio:by_uid
             expr: |
-              (
-                rate(container_cpu_cfs_throttled_periods_total{pod="",uid!=""}[5m])
-                / rate(container_cpu_cfs_periods_total{pod="",uid!=""}[5m])
-              ) * on(uid) group_left(namespace, pod)
-              topk by(uid) (1, kube_pod_info)
+              sum by(namespace, pod) (
+                (
+                  sum by(uid) (rate(container_cpu_cfs_throttled_periods_total{pod="",uid!=""}[5m]))
+                  / sum by(uid) (rate(container_cpu_cfs_periods_total{pod="",uid!=""}[5m]))
+                ) * on(uid) group_left(namespace, pod)
+                topk by(uid) (1, kube_pod_info)
+              )
 
 # node-exporter
 prometheus-node-exporter:

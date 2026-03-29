@@ -3215,7 +3215,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "rate(container_cpu_cfs_throttled_periods_total{pod!=\"\"}[5m]) / rate(container_cpu_cfs_periods_total{pod!=\"\"}[5m])",
+          "expr": "sum by(namespace, pod) (rate(container_cpu_cfs_throttled_periods_total{pod!=\"\"}[5m])) / sum by(namespace, pod) (rate(container_cpu_cfs_periods_total{pod!=\"\"}[5m]))",
           "legendFormat": "{{namespace}}/{{pod}}",
           "range": true,
           "refId": "A"
@@ -3223,7 +3223,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "(\n  rate(container_cpu_cfs_throttled_periods_total{pod=\"\",uid!=\"\"}[5m])\n  / rate(container_cpu_cfs_periods_total{pod=\"\",uid!=\"\"}[5m])\n) * on(uid) group_left(namespace, pod)\ntopk by(uid) (1, kube_pod_info)",
+          "expr": "sum by(namespace, pod) (\n  (\n    sum by(uid) (rate(container_cpu_cfs_throttled_periods_total{pod=\"\",uid!=\"\"}[5m]))\n    / sum by(uid) (rate(container_cpu_cfs_periods_total{pod=\"\",uid!=\"\"}[5m]))\n  ) * on(uid) group_left(namespace, pod)\n  topk by(uid) (1, kube_pod_info)\n)",
           "legendFormat": "{{namespace}}/{{pod}}",
           "range": true,
           "refId": "B"
@@ -3435,7 +3435,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by(namespace, pod) (rate(container_cpu_usage_seconds_total{pod!=\"\",image!=\"\"}[5m]))\n/ on(namespace, pod) group_left\nsum by(namespace, pod) (kube_pod_container_resource_limits{resource=\"cpu\"})",
+          "expr": "sum by(namespace, pod) (rate(container_cpu_usage_seconds_total{pod!=\"\"}[5m]))\n/ on(namespace, pod) group_left\nsum by(namespace, pod) (kube_pod_container_resource_limits{resource=\"cpu\"})",
           "legendFormat": "{{namespace}}/{{pod}}",
           "range": true,
           "refId": "A"
@@ -3537,7 +3537,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by(namespace, pod) (rate(container_cpu_usage_seconds_total{pod!=\"\",image!=\"\"}[5m]))\n/ on(namespace, pod) group_left\nsum by(namespace, pod) (kube_pod_container_resource_requests{resource=\"cpu\"})",
+          "expr": "sum by(namespace, pod) (rate(container_cpu_usage_seconds_total{pod!=\"\"}[5m]))\n/ on(namespace, pod) group_left\nsum by(namespace, pod) (kube_pod_container_resource_requests{resource=\"cpu\"})",
           "legendFormat": "{{namespace}}/{{pod}}",
           "range": true,
           "refId": "A"
@@ -3640,7 +3640,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "node_load1 / count without(cpu, mode) (node_cpu_seconds_total{mode=\"idle\"})",
-          "legendFormat": "load1/core",
+          "legendFormat": "{{instance}} load1/core",
           "range": true,
           "refId": "A"
         },
@@ -3648,7 +3648,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "node_load5 / count without(cpu, mode) (node_cpu_seconds_total{mode=\"idle\"})",
-          "legendFormat": "load5/core",
+          "legendFormat": "{{instance}} load5/core",
           "range": true,
           "refId": "B"
         },
@@ -3656,7 +3656,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "node_load15 / count without(cpu, mode) (node_cpu_seconds_total{mode=\"idle\"})",
-          "legendFormat": "load15/core",
+          "legendFormat": "{{instance}} load15/core",
           "range": true,
           "refId": "C"
         }
