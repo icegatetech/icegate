@@ -768,7 +768,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "count(container_last_seen{image=~ \"(.)+\"})",
+          "expr": "count(container_last_seen{pod!=\"\"})",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -2212,7 +2212,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "exemplar": true,
-          "expr": "sum(rate(container_network_receive_bytes_total{id=\"/\"}[$__rate_interval])) by (id)",
+          "expr": "sum(rate(node_network_receive_bytes_total{device!~\"lo|veth.*|cali.*|flannel.*\"}[$__rate_interval])) by (device)",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -2226,12 +2226,12 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "exemplar": true,
-          "expr": "- sum(rate(container_network_transmit_bytes_total{id=\"/\"}[$__rate_interval])) by (id)",
+          "expr": "- sum(rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|cali.*|flannel.*\"}[$__rate_interval])) by (device)",
           "format": "time_series",
           "hide": false,
           "interval": "",
           "intervalFactor": 2,
-          "legendFormat": "sent {{device}} ",
+          "legendFormat": "sent {{device}}",
           "range": true,
           "refId": "B",
           "step": 600
@@ -2451,7 +2451,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "container_spec_memory_limit_bytes{pod!=\"\"}",
+          "expr": "sum by(namespace, pod) (kube_pod_container_resource_limits{resource=\"memory\", pod!=\"\"})",
           "format": "time_series",
           "hide": true,
           "interval": "",
@@ -2549,7 +2549,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum(container_memory_rss{name!=\"\"}) by (pod)",
+          "expr": "sum(container_memory_rss{pod!=\"\"}) by (pod)",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -2663,10 +2663,10 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum(rate(container_network_receive_bytes_total{pod=~\".+\"}[$__rate_interval])) by (pod)",
+          "expr": "sum by(device) (rate(node_network_receive_bytes_total{device!~\"lo|veth.*|cali.*|flannel.*\"}[$__rate_interval]))",
           "hide": false,
           "interval": "",
-          "legendFormat": "{{pod}}",
+          "legendFormat": "{{device}}",
           "range": true,
           "refId": "A"
         }
@@ -2762,9 +2762,9 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum(rate(container_network_transmit_bytes_total{pod=~\".+\"}[$__rate_interval])) by (pod)",
+          "expr": "sum by(device) (rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|cali.*|flannel.*\"}[$__rate_interval]))",
           "interval": "",
-          "legendFormat": "{{pod}}",
+          "legendFormat": "{{device}}",
           "range": true,
           "refId": "A"
         }
@@ -2861,7 +2861,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "exemplar": true,
-          "expr": "sum without (dc,from,id,csv) (irate(container_fs_writes_bytes_total{image!=\"\",device!~\"/dev/dm.*\"}[$__rate_interval]))",
+          "expr": "sum by(pod) (irate(container_fs_writes_bytes_total{pod!=\"\",device!~\"/dev/dm.*\"}[$__rate_interval]))",
           "interval": "",
           "intervalFactor": 1,
           "legendFormat": "{{pod}}",
@@ -2961,7 +2961,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "exemplar": true,
-          "expr": "sum without (dc,from,id,csv) (irate(container_fs_reads_bytes_total{image!=\"\",device!~\"/dev/dm.*\"}[$__rate_interval]))",
+          "expr": "sum by(pod) (irate(container_fs_reads_bytes_total{pod!=\"\",device!~\"/dev/dm.*\"}[$__rate_interval]))",
           "interval": "",
           "intervalFactor": 1,
           "legendFormat": "{{pod}}",
