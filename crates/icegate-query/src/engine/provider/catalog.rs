@@ -16,6 +16,7 @@ use iceberg_datafusion::IcebergStaticTableProvider;
 use icegate_common::ICEGATE_NAMESPACE;
 use icegate_queue::ParquetQueueReader;
 
+use super::WalQueryConfig;
 use super::schema::IcegateSchemaProvider;
 
 /// Catalog provider that substitutes our custom schema provider for the
@@ -37,10 +38,11 @@ impl IcegateCatalogProvider {
     /// # Errors
     ///
     /// Returns an error if namespaces or tables cannot be loaded.
-    #[tracing::instrument(skip(catalog, wal_reader))]
+    #[tracing::instrument(skip(catalog, wal_reader, wal_config))]
     pub async fn try_new(
         catalog: Arc<dyn Catalog>,
         wal_reader: Arc<ParquetQueueReader>,
+        wal_config: WalQueryConfig,
     ) -> Result<Self, iceberg::Error> {
         let namespace_idents = catalog.list_namespaces(None).await?;
 
@@ -55,8 +57,13 @@ impl IcegateCatalogProvider {
 
             if name == ICEGATE_NAMESPACE {
                 // Use our custom WAL-merged schema provider
-                let provider =
-                    IcegateSchemaProvider::try_new(Arc::clone(&catalog), ns_ident, Arc::clone(&wal_reader)).await?;
+                let provider = IcegateSchemaProvider::try_new(
+                    Arc::clone(&catalog),
+                    ns_ident,
+                    Arc::clone(&wal_reader),
+                    wal_config.clone(),
+                )
+                .await?;
                 schemas.insert(name.clone(), Arc::new(provider));
             } else {
                 // Standard schema provider with static table providers

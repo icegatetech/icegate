@@ -22,6 +22,12 @@ const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 15;
 /// Default maximum age (in seconds) before the cached provider is considered stale.
 const DEFAULT_MAX_AGE_SECS: u64 = 30;
 
+/// Default Parquet metadata size hint in bytes for WAL file footer reads.
+///
+/// 64 KB is large enough to capture the entire footer of typical WAL files
+/// (~125 KB each) in a single S3 read, eliminating the 8-byte probe round-trip.
+const DEFAULT_WAL_METADATA_SIZE_HINT: usize = 65_536;
+
 /// Configuration for the `QueryEngine`
 ///
 /// Controls `DataFusion` session parameters and catalog provider behavior.
@@ -58,6 +64,20 @@ pub struct QueryEngineConfig {
     /// If the background refresh fails for longer than this, queries will
     /// block on a synchronous rebuild. Must be >= `refresh_interval_secs`.
     pub max_age_secs: u64,
+
+    /// Whether to include WAL (hot) segments in query results.
+    ///
+    /// When `false` (default), queries only read committed Iceberg data.
+    /// Enable this to query data that has not yet been shifted to Iceberg.
+    pub wal_query_enabled: bool,
+
+    /// Parquet metadata size hint in bytes for WAL file footer reads.
+    ///
+    /// When set, DataFusion reads this many bytes from the file tail in a
+    /// single request instead of an 8-byte probe followed by a full footer
+    /// read. For WAL files (~125 KB), 64 KB captures the entire footer in
+    /// one read. Set to `None` to use the DataFusion default.
+    pub wal_metadata_size_hint: Option<usize>,
 }
 
 impl Default for QueryEngineConfig {
@@ -68,6 +88,8 @@ impl Default for QueryEngineConfig {
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             max_age_secs: DEFAULT_MAX_AGE_SECS,
+            wal_query_enabled: false,
+            wal_metadata_size_hint: Some(DEFAULT_WAL_METADATA_SIZE_HINT),
         }
     }
 }
@@ -100,6 +122,13 @@ impl QueryEngineConfig {
             return Err(QueryError::Config(
                 "max_age_secs must be >= refresh_interval_secs".into(),
             ));
+        }
+        if let Some(hint) = self.wal_metadata_size_hint {
+            if hint == 0 {
+                return Err(QueryError::Config(
+                    "wal_metadata_size_hint must be greater than 0 when set".into(),
+                ));
+            }
         }
         Ok(())
     }

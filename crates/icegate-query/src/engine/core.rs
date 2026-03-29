@@ -22,7 +22,7 @@ use object_store::ObjectStore;
 use tokio::sync::watch;
 
 use super::QueryEngineConfig;
-use super::provider::IcegateCatalogProvider;
+use super::provider::{IcegateCatalogProvider, WalQueryConfig};
 use crate::error::Result;
 
 /// Fixed DataFusion object store URL for WAL segments.
@@ -85,6 +85,8 @@ pub struct QueryEngine {
     max_age: Duration,
     /// Interval between background refresh cycles.
     refresh_interval: Duration,
+    /// WAL query configuration derived from engine config.
+    wal_config: WalQueryConfig,
 }
 
 impl QueryEngine {
@@ -112,6 +114,10 @@ impl QueryEngine {
         let (provider_tx, provider_rx) = watch::channel(None);
         let max_age = Duration::from_secs(config.max_age_secs);
         let refresh_interval = Duration::from_secs(config.refresh_interval_secs);
+        let wal_config = WalQueryConfig {
+            enabled: config.wal_query_enabled,
+            metadata_size_hint: config.wal_metadata_size_hint,
+        };
         Self {
             catalog,
             config,
@@ -123,6 +129,7 @@ impl QueryEngine {
             refresh_started: AtomicBool::new(false),
             max_age,
             refresh_interval,
+            wal_config,
         }
     }
 
@@ -145,7 +152,13 @@ impl QueryEngine {
                 // Hold rebuild_lock so synchronous rebuilds in get_provider
                 // don't race with the initial eager build.
                 let _guard = engine.rebuild_lock.lock().await;
-                match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
+                match Self::build_provider(
+                    Arc::clone(&engine.catalog),
+                    Arc::clone(&engine.wal_reader),
+                    engine.wal_config.clone(),
+                )
+                .await
+                {
                     Ok(provider) => {
                         let _ = engine.provider_tx.send(Some(CachedProvider {
                             provider,
@@ -176,7 +189,13 @@ impl QueryEngine {
 
                 {
                     let _guard = engine.rebuild_lock.lock().await;
-                    match Self::build_provider(Arc::clone(&engine.catalog), Arc::clone(&engine.wal_reader)).await {
+                    match Self::build_provider(
+                        Arc::clone(&engine.catalog),
+                        Arc::clone(&engine.wal_reader),
+                        engine.wal_config.clone(),
+                    )
+                    .await
+                    {
                         Ok(provider) => {
                             let _ = engine.provider_tx.send(Some(CachedProvider {
                                 provider,
@@ -202,8 +221,9 @@ impl QueryEngine {
     async fn build_provider(
         catalog: Arc<dyn Catalog>,
         wal_reader: Arc<ParquetQueueReader>,
+        wal_config: WalQueryConfig,
     ) -> Result<Arc<dyn CatalogProvider>> {
-        let p = IcegateCatalogProvider::try_new(catalog, wal_reader).await?;
+        let p = IcegateCatalogProvider::try_new(catalog, wal_reader, wal_config).await?;
         Ok(Arc::new(p))
     }
 
@@ -281,7 +301,12 @@ impl QueryEngine {
         }
 
         // Cold cache or stale provider — synchronous rebuild.
-        let provider = Self::build_provider(Arc::clone(&self.catalog), Arc::clone(&self.wal_reader)).await?;
+        let provider = Self::build_provider(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.wal_reader),
+            self.wal_config.clone(),
+        )
+        .await?;
 
         // Update the watch channel so subsequent queries use this provider.
         let _ = self.provider_tx.send(Some(CachedProvider {

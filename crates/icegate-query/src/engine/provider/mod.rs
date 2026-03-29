@@ -23,3 +23,15 @@ mod table;
 
 pub use catalog::IcegateCatalogProvider;
 pub use metrics::{SourceMetrics, extract_source_metrics};
+
+/// WAL-specific query configuration passed through the provider chain.
+///
+/// Constructed from [`QueryEngineConfig`](super::QueryEngineConfig) fields
+/// and threaded through `CatalogProvider` → `SchemaProvider` → `TableProvider`.
+#[derive(Debug, Clone)]
+pub struct WalQueryConfig {
+    /// Whether WAL scanning is enabled for queries.
+    pub enabled: bool,
+    /// Parquet metadata size hint in bytes for WAL file footer reads.
+    pub metadata_size_hint: Option<usize>,
+}
