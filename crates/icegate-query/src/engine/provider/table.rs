@@ -123,9 +123,16 @@ impl TableProvider for IcegateTableProvider {
         // 1. Clone table (cheap: inner data is Arc-wrapped)
         let table = self.table.clone();
 
-        // 2. Extract WAL offset from snapshot history
-        let wal_offset = extract_wal_offset(&table)?;
-        tracing::debug!(wal_offset = ?wal_offset, "Resolved WAL boundary offset");
+        // 2. Early exit when WAL is disabled — skip snapshot history walk
+        let wal_enabled = self.wal_config.enabled;
+        let wal_offset = if wal_enabled {
+            let offset = extract_wal_offset(&table)?;
+            tracing::debug!(wal_offset = ?offset, "Resolved WAL boundary offset");
+            offset
+        } else {
+            tracing::debug!("WAL query disabled, skipping WAL offset extraction");
+            None
+        };
 
         // 3. Build Iceberg scan plan (our reimplemented scan with metrics)
         let has_snapshot = table.metadata().current_snapshot().is_some();
@@ -146,8 +153,12 @@ impl TableProvider for IcegateTableProvider {
 
         // 4. Build WAL scan plan
         // Start from offset + 1 (or 0 if no offset found = fresh system)
-        let wal_start = wal_offset.map_or(0, |o| o.saturating_add(1));
-        let wal_plan = self.build_wal_plan(state, projection, filters, wal_start).await?;
+        let wal_plan = if wal_enabled {
+            let wal_start = wal_offset.map_or(0, |o| o.saturating_add(1));
+            self.build_wal_plan(state, projection, filters, wal_start).await?
+        } else {
+            None
+        };
         if wal_plan.is_some() {
             tracing::debug!("WAL scan plan created");
         } else {
