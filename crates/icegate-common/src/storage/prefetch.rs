@@ -293,7 +293,7 @@ const fn default_max_concurrent_prefetches() -> usize {
 }
 
 const fn default_enabled() -> bool {
-    true
+    false
 }
 const fn default_max_prefetch_bytes() -> usize {
     4 * 1024 * 1024 // 4 MiB — metadata is much smaller than data

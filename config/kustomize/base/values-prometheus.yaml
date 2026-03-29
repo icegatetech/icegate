@@ -39,6 +39,69 @@ prometheus:
         cpu: "1"
         memory: 2Gi
 
+# kubelet / cadvisor scraping overrides.
+# The default cAdVisorMetricRelabelings drops all metrics with empty pod
+# labels, but on OrbStack (cgroups-v2) CFS bandwidth metrics are only
+# emitted at the container-level cgroup which lacks pod metadata.
+# We extract the pod UID from the cgroup id path and keep those metrics.
+kubelet:
+  serviceMonitor:
+    cAdvisorMetricRelabelings:
+      # Drop less useful container CPU metrics (keep cfs_throttled_seconds_total
+      # unlike upstream, as it is needed for throttle analysis).
+      - sourceLabels: [__name__]
+        action: drop
+        regex: 'container_cpu_(load_average_10s|system_seconds_total|user_seconds_total)'
+      # Drop less useful container / always zero filesystem metrics.
+      - sourceLabels: [__name__]
+        action: drop
+        regex: 'container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)'
+      # Drop less useful / always zero container memory metrics.
+      - sourceLabels: [__name__]
+        action: drop
+        regex: 'container_memory_(mapped_file|swap)'
+      # Drop less useful container process metrics.
+      - sourceLabels: [__name__]
+        action: drop
+        regex: 'container_(file_descriptors|tasks_state|threads_max)'
+      # Drop container_memory_failures_total{scope="hierarchy"} metrics.
+      - sourceLabels: [__name__, scope]
+        action: drop
+        regex: 'container_memory_failures_total;hierarchy'
+      # Drop container_network metrics for CNI interfaces.
+      - sourceLabels: [__name__, interface]
+        action: drop
+        regex: 'container_network_.*;(cali|cilium|cni|lxc|nodelocaldns|tunl).*'
+      # Drop container spec metrics that overlap with kube-state-metrics.
+      - sourceLabels: [__name__]
+        action: drop
+        regex: 'container_spec.*'
+      # --- CFS orphan fix ---
+      # For container-level cgroup CFS metrics (pod=""), extract pod UID
+      # from the cgroup id path. Supports:
+      #   cgroup v1: /kubepods/burstable/pod<UID>/<ctr>
+      #   cgroup v1 (cgroupfs, no QoS): /kubepods/pod<UID>/<ctr>
+      #   cgroup v2 (systemd): kubepods-burstable.slice/kubepods-burstable-pod<UID>.slice/<ctr>
+      - sourceLabels: [id]
+        regex: '/kubepods/(?:burstable|guaranteed|besteffort)/pod([^/]+)/.*'
+        targetLabel: uid
+        replacement: '$1'
+        action: replace
+      - sourceLabels: [id]
+        regex: '/kubepods/pod([^/]+)/.*'
+        targetLabel: uid
+        replacement: '$1'
+        action: replace
+      - sourceLabels: [id]
+        regex: 'kubepods(?:-[^.]*)?\.slice/kubepods-[^-]*-pod([0-9a-f_-]+)\.slice/.*'
+        targetLabel: uid
+        replacement: '$1'
+        action: replace
+      # Drop cgroup metrics with no pod AND no uid (truly unattributable).
+      - sourceLabels: [id, pod, uid]
+        action: drop
+        regex: '.+;;'
+
 # CRDs managed by separate prometheus-operator-crds chart (skaffold-crds.yaml)
 crds:
   enabled: false
@@ -62,6 +125,34 @@ kube-state-metrics:
     limits:
       cpu: 200m
       memory: 128Mi
+
+# Recording rules for CFS throttling with proper pod labels.
+# Raw cadvisor CFS metrics for container-level cgroups lack pod/namespace
+# labels (OrbStack / cgroups-v2 quirk). These rules join by pod UID
+# extracted into the `uid` label during cadvisor metric relabeling.
+additionalPrometheusRulesMap:
+  icegate-cfs-throttling:
+    groups:
+      - name: cfs-throttling
+        interval: 15s
+        rules:
+          # Throttle ratio: fraction of CFS periods that were throttled.
+          # Aggregated to pod scope (container-level series summed per pod).
+          - record: container:cpu_cfs_throttle_ratio
+            expr: |
+              sum by(namespace, pod) (rate(container_cpu_cfs_throttled_periods_total{pod!=""}[5m]))
+              / sum by(namespace, pod) (rate(container_cpu_cfs_periods_total{pod!=""}[5m]))
+          # Same metric but resolved from container-level cgroups via uid join.
+          # Aggregated to uid scope before join, then to pod scope after.
+          - record: container:cpu_cfs_throttle_ratio:by_uid
+            expr: |
+              sum by(namespace, pod) (
+                (
+                  sum by(uid) (rate(container_cpu_cfs_throttled_periods_total{pod="",uid!=""}[5m]))
+                  / sum by(uid) (rate(container_cpu_cfs_periods_total{pod="",uid!=""}[5m]))
+                ) * on(uid) group_left(namespace, pod)
+                topk by(uid) (1, kube_pod_info)
+              )
 
 # node-exporter
 prometheus-node-exporter:

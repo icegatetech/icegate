@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
     sync::Arc,
 };
 
@@ -9,6 +10,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use icegate_common::retrier::{Retrier, RetrierConfig};
+use lru::LruCache;
 use object_store::{ObjectStore, path::Path};
 use parquet::{
     arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
@@ -16,6 +18,7 @@ use parquet::{
     file::metadata::{ParquetMetaData, ParquetMetaDataReader},
     file::statistics::Statistics,
 };
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -179,7 +182,9 @@ pub trait QueueReader: Send + Sync {
 
 /// Queue reader for reading Parquet segments from object storage.
 ///
-/// Provides methods to list segments and read record batches.
+/// Provides methods to list segments and read record batches. Optionally
+/// caches parsed Parquet metadata in a bounded LRU cache. WAL files are
+/// immutable once written, so cached metadata never goes stale.
 pub struct ParquetQueueReader {
     /// Base path for queue segments.
     base_path: String,
@@ -193,10 +198,20 @@ pub struct ParquetQueueReader {
     plan_segment_read_parallelism: usize,
 
     retrier: Retrier,
+
+    /// LRU cache for parsed Parquet metadata, keyed by segment file path.
+    /// `None` when caching is disabled (capacity = 0).
+    metadata_cache: Option<Arc<Mutex<LruCache<String, Arc<ParquetMetaData>>>>>,
 }
 
 impl ParquetQueueReader {
     /// Creates a new queue reader.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_path` - Base path for queue segments in object storage
+    /// * `store` - Object store backend
+    /// * `record_batch_size_rows` - Maximum rows per emitted `RecordBatch`
     ///
     /// # Errors
     ///
@@ -206,17 +221,45 @@ impl ParquetQueueReader {
         store: Arc<dyn ObjectStore>,
         record_batch_size_rows: usize,
     ) -> Result<Self> {
+        Self::with_metadata_cache_capacity(base_path, store, record_batch_size_rows, 0)
+    }
+
+    /// Creates a new queue reader with a Parquet metadata cache.
+    ///
+    /// When `metadata_cache_capacity` is non-zero, parsed `ParquetMetaData`
+    /// from WAL files is cached in a bounded LRU cache. Since WAL files are
+    /// immutable, cached entries never go stale.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_path` - Base path for queue segments in object storage
+    /// * `store` - Object store backend
+    /// * `record_batch_size_rows` - Maximum rows per emitted `RecordBatch`
+    /// * `metadata_cache_capacity` - LRU cache capacity (0 to disable)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `record_batch_size_rows` is zero.
+    pub fn with_metadata_cache_capacity(
+        base_path: impl Into<String>,
+        store: Arc<dyn ObjectStore>,
+        record_batch_size_rows: usize,
+        metadata_cache_capacity: usize,
+    ) -> Result<Self> {
         if record_batch_size_rows == 0 {
             return Err(QueueError::Config(
                 "record_batch_size_rows must be greater than zero".to_string(),
             ));
         }
+        let metadata_cache =
+            NonZeroUsize::new(metadata_cache_capacity).map(|cap| Arc::new(Mutex::new(LruCache::new(cap))));
         Ok(Self {
             base_path: base_path.into(),
             store,
             record_batch_size_rows,
             plan_segment_read_parallelism: DEFAULT_PLAN_SEGMENT_READ_PARALLELISM,
             retrier: Retrier::new(RetrierConfig::default()),
+            metadata_cache,
         })
     }
 
@@ -680,15 +723,45 @@ impl ParquetQueueReader {
         Ok(total_bytes)
     }
 
-    /// Reads Parquet footer metadata using range requests (no full file download).
+    /// Reads Parquet footer metadata, using the LRU cache when available.
+    ///
+    /// WAL files are immutable, so cached metadata never goes stale.
     async fn read_parquet_metadata(
         &self,
         topic: &Topic,
         offset: u64,
         cancel_token: &CancellationToken,
-    ) -> Result<ParquetMetaData> {
+    ) -> Result<Arc<ParquetMetaData>> {
         let segment_id = SegmentId::new(topic, offset);
-        let path = self.segment_path(&segment_id);
+        let cache_key = self.segment_path(&segment_id).to_string();
+
+        // Check cache first
+        if let Some(cache) = &self.metadata_cache {
+            let mut guard = cache.lock().await;
+            if let Some(cached) = guard.get(&cache_key) {
+                return Ok(Arc::clone(cached));
+            }
+        }
+
+        // Cache miss: read from S3
+        let metadata = Arc::new(self.read_parquet_metadata_from_store(&cache_key, cancel_token).await?);
+
+        // Insert into cache
+        if let Some(cache) = &self.metadata_cache {
+            let mut guard = cache.lock().await;
+            guard.put(cache_key, Arc::clone(&metadata));
+        }
+
+        Ok(metadata)
+    }
+
+    /// Reads Parquet footer metadata from object storage using range requests.
+    async fn read_parquet_metadata_from_store(
+        &self,
+        path_str: &str,
+        cancel_token: &CancellationToken,
+    ) -> Result<ParquetMetaData> {
+        let path = Path::from(path_str);
         let store = Arc::clone(&self.store);
         let path_for_head = path.clone();
         let object_meta = self
