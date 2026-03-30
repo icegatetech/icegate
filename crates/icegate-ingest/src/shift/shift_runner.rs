@@ -1,13 +1,13 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
 use async_trait::async_trait;
-use futures::{future::Either, pin_mut, StreamExt};
+use futures::{StreamExt, future::Either, pin_mut};
 use icegate_common::retrier::{Retrier, RetrierConfig};
 use icegate_jobmanager::{Error, ImmutableTask, JobManager};
 use icegate_queue::{QueueReader, RecordBatchStream, Topic};
@@ -15,10 +15,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use super::{
-    executor::{parse_task_input, TaskStatus}, iceberg_storage::Storage, sorted_batch_merger::SortedBatchMerger,
-    SegmentToRead,
-    ShiftInput,
-    ShiftOutput,
+    SegmentToRead, ShiftInput, ShiftOutput,
+    executor::{TaskStatus, parse_task_input},
+    iceberg_storage::Storage,
+    sorted_batch_merger::SortedBatchMerger,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -307,12 +307,7 @@ where
         let attempt = AtomicUsize::new(0);
         let result = self
             .retrier
-            .retry::<
-                _,
-                _,
-                Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError>,
-                ShiftWriteError,
-            >(
+            .retry::<_, _, Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError>, ShiftWriteError>(
                 || {
                     let current_attempt = attempt.fetch_add(1, Ordering::SeqCst) + 1;
                     async move {
@@ -460,8 +455,8 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -486,9 +481,9 @@ mod tests {
     use crate::{
         error::{IngestError, Result},
         shift::{
-            executor::TaskStatus, iceberg_storage::{Storage, WrittenDataFiles}, SegmentToRead,
-            ShiftInput,
-            ShiftOutput,
+            SegmentToRead, ShiftInput, ShiftOutput,
+            executor::TaskStatus,
+            iceberg_storage::{Storage, WrittenDataFiles},
         },
     };
 

@@ -32,6 +32,10 @@ struct ShiftRuntimeHandle {
     join_handle: thread::JoinHandle<Result<()>>,
 }
 
+struct WalRuntimeHandle {
+    join_handle: thread::JoinHandle<Result<()>>,
+}
+
 impl ShiftRuntimeHandle {
     fn shutdown(self) -> Result<()> {
         if self.shutdown_tx.send(()).is_err() {
@@ -44,6 +48,18 @@ impl ShiftRuntimeHandle {
                 "shift runtime thread panicked: {}",
                 panic_payload_to_string(&*panic)
             ))),
+        }
+    }
+}
+
+impl WalRuntimeHandle {
+    fn shutdown(self) -> Result<()> {
+        match self.join_handle.join() {
+            Ok(result) => result,
+            Err(panic) => Err(IngestError::Other(Box::new(io::Error::other(format!(
+                "wal runtime thread panicked: {}",
+                panic_payload_to_string(&*panic)
+            ))))),
         }
     }
 }
@@ -75,6 +91,59 @@ fn resolve_shift_startup_failure(
             "shift runtime thread panicked: {}",
             panic_payload_to_string(&*panic)
         )),
+    }
+}
+
+fn resolve_wal_startup_failure(
+    join_result: thread::Result<Result<()>>,
+    fallback_error: Option<IngestError>,
+) -> IngestError {
+    match join_result {
+        Ok(Err(err)) => err,
+        Ok(Ok(())) => fallback_error.unwrap_or_else(|| {
+            IngestError::Other(Box::new(io::Error::other(
+                "wal runtime exited before reporting startup status",
+            )))
+        }),
+        Err(panic) => IngestError::Other(Box::new(io::Error::other(format!(
+            "wal runtime thread panicked: {}",
+            panic_payload_to_string(&*panic)
+        )))),
+    }
+}
+
+fn spawn_wal_runtime(
+    writer: QueueWriter,
+    write_rx: icegate_queue::WriteReceiver,
+    wal_threads: usize,
+) -> Result<WalRuntimeHandle> {
+    let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<()>>(1);
+
+    let join_handle = thread::Builder::new()
+        .name("icegate-wal-runtime".to_string())
+        .spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(wal_threads)
+                .thread_name("icegate-wal")
+                .enable_all()
+                .build()
+                .map_err(IngestError::Io)?;
+
+            let writer_handle = {
+                let _guard = runtime.enter();
+                writer.start(write_rx)
+            };
+            let _ = startup_tx.send(Ok(()));
+
+            runtime.block_on(async { writer_handle.await }).map_err(IngestError::Join)??;
+            Ok(())
+        })
+        .map_err(IngestError::Io)?;
+
+    match startup_rx.recv() {
+        Ok(Ok(())) => Ok(WalRuntimeHandle { join_handle }),
+        Ok(Err(err)) => Err(resolve_wal_startup_failure(join_handle.join(), Some(err))),
+        Err(_) => Err(resolve_wal_startup_failure(join_handle.join(), None)),
     }
 }
 
@@ -323,16 +392,7 @@ async fn run_services(
     // Run the WAL writer on a dedicated runtime so flush I/O is not
     // blocked by OTLP request processing on the main runtime.
     let wal_threads = compute_runtime_threads();
-    let wal_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(wal_threads.main_threads)
-        .thread_name("icegate-wal")
-        .enable_all()
-        .build()
-        .map_err(IngestError::Io)?;
-    let writer_handle = {
-        let _guard = wal_runtime.enter();
-        writer.start(write_rx)
-    };
+    let wal_runtime = spawn_wal_runtime(writer, write_rx, wal_threads.main_threads)?;
 
     tracing::info!("WAL queue initialized on dedicated runtime");
 
@@ -437,8 +497,8 @@ async fn run_services(
     // Close the write channel so the writer loop can exit
     drop(write_tx);
 
-    // Wait for the writer task to finish
-    let writer_result = writer_handle.await;
+    // Wait for the writer task to finish on its dedicated runtime thread.
+    let writer_result = wal_runtime.shutdown();
 
     tracing::info!("Stopping shifter...");
     let shift_result = shift_runtime.shutdown();
@@ -448,7 +508,7 @@ async fn run_services(
 
     server_result?;
     shift_result?;
-    writer_result??;
+    writer_result?;
 
     Ok(())
 }
