@@ -363,21 +363,25 @@ where
         let mut next_expected_idx = 0usize;
         let mut pending_streams: BTreeMap<usize, RecordBatchStream> = BTreeMap::new();
         let read_parallelism = self.segment_read_parallelism;
-        // Getting segments in parallel with the restriction in segment_read_parallelism
-        let read_plan: Vec<(usize, u64, Vec<usize>)> = segments
-            .iter()
-            .enumerate()
-            .map(|(segment_idx, segment)| (segment_idx, segment.segment_offset, segment.record_batch_idxs.clone()))
-            .collect();
+        // Each WAL row group is sorted independently, but a segment may contain
+        // multiple sorted row groups appended in flush order. Read them as
+        // independent streams so the k-way merger can restore global ordering.
+        let mut read_plan = Vec::new();
+        for segment in segments {
+            for &row_group_idx in &segment.record_batch_idxs {
+                let stream_idx = read_plan.len();
+                read_plan.push((stream_idx, segment.segment_offset, row_group_idx));
+            }
+        }
         let read_stream = futures::stream::iter(read_plan)
             .take_until(cancel_token.cancelled())
-            .map(|(segment_idx, segment_offset, record_batch_idxs)| {
+            .map(|(stream_idx, segment_offset, row_group_idx)| {
                 let queue_reader = Arc::clone(&self.queue_reader);
                 let topic = self.topic.clone();
                 let cancel = cancel_token.clone();
                 async move {
                     match futures::future::select(
-                        Box::pin(queue_reader.read_segment(&topic, segment_offset, &record_batch_idxs, &cancel)),
+                        Box::pin(queue_reader.read_segment(&topic, segment_offset, &[row_group_idx], &cancel)),
                         Box::pin(cancel.cancelled()),
                     )
                     .await
@@ -389,7 +393,7 @@ where
                                 ))
                             })?;
                             Ok::<SegmentReadOutcome, ShiftWriteError>(SegmentReadOutcome::Read {
-                                segment_idx,
+                                segment_idx: stream_idx,
                                 stream: segment_stream,
                             })
                         }
@@ -466,10 +470,19 @@ mod tests {
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
     use async_trait::async_trait;
+    use bytes::Bytes;
     use chrono::{DateTime, Utc};
     use futures::TryStreamExt;
     use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Struct};
     use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
+    use parquet::{
+        arrow::arrow_writer::ArrowWriter,
+        file::{
+            properties::WriterProperties,
+            reader::{FileReader, SerializedFileReader},
+            statistics::Statistics,
+        },
+    };
     use tokio::{
         sync::{Mutex, Notify},
         time::{sleep, timeout},
@@ -716,9 +729,10 @@ mod tests {
             &self,
             _topic: &icegate_queue::Topic,
             offset: u64,
-            _record_batch_idxs: &[usize],
+            record_batch_idxs: &[usize],
             _cancel_token: &CancellationToken,
         ) -> icegate_queue::Result<icegate_queue::RecordBatchStream> {
+            let record_batch_idxs = record_batch_idxs.to_vec();
             if let Some(started_reads) = &self.started_reads {
                 started_reads.fetch_add(1, Ordering::SeqCst);
             }
@@ -749,6 +763,8 @@ mod tests {
                     .cloned()
                     .unwrap_or_default()
                     .into_iter()
+                    .enumerate()
+                    .filter_map(move |(idx, batch)| record_batch_idxs.contains(&idx).then_some(batch))
                     .map(Ok),
             )))
         }
@@ -859,12 +875,83 @@ mod tests {
         .expect("batch")
     }
 
+    fn logs_batch_for_shift(
+        rows: Vec<(Option<&str>, Option<&str>, Option<i64>, i64)>,
+    ) -> arrow::record_batch::RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cloud_account_id", DataType::Utf8, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(cloud_account_id, _, _, _)| *cloud_account_id)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, service_name, _, _)| *service_name).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|(_, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, _, value)| *value).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("logs batch")
+    }
+
     fn values_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
         batches
             .iter()
             .flat_map(|batch| {
                 let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("int64 array");
                 (0..values.len()).map(|idx| values.value(idx)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn parquet_bytes_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let props = WriterProperties::builder().set_max_row_group_size(2).build();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, batches[0].schema(), Some(props)).expect("arrow writer");
+            for batch in batches {
+                writer.write(batch).expect("write batch");
+                writer.flush().expect("flush row group");
+            }
+            writer.close().expect("close writer");
+        }
+        buffer
+    }
+
+    fn service_name_bounds_from_parquet(parquet_bytes: Vec<u8>) -> Vec<(String, String)> {
+        let reader = SerializedFileReader::new(Bytes::from(parquet_bytes)).expect("serialized reader");
+        reader
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|row_group| {
+                let stats = row_group
+                    .columns()
+                    .get(1)
+                    .and_then(|column| column.statistics())
+                    .expect("service_name stats");
+                let Statistics::ByteArray(stats) = stats else {
+                    panic!("service_name must have byte array stats");
+                };
+                let min = std::str::from_utf8(stats.min_bytes_opt().expect("min bytes"))
+                    .expect("utf8 min")
+                    .to_string();
+                let max = std::str::from_utf8(stats.max_bytes_opt().expect("max bytes"))
+                    .expect("utf8 max")
+                    .to_string();
+                (min, max)
             })
             .collect()
     }
@@ -935,6 +1022,109 @@ mod tests {
         let writes = storage.writes.lock().await;
         assert_eq!(writes.len(), 1);
         assert_eq!(values_from_batches(&writes[0]), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn run_merges_row_groups_within_single_segment_globally() {
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([(
+                1,
+                vec![
+                    logs_batch_for_shift(vec![
+                        (Some("acc-1"), Some("svc-3"), Some(30), 1),
+                        (Some("acc-1"), Some("svc-4"), Some(20), 2),
+                    ]),
+                    logs_batch_for_shift(vec![
+                        (Some("acc-1"), Some("svc-2"), Some(40), 3),
+                        (Some("acc-1"), Some("svc-5"), Some(10), 4),
+                    ]),
+                ],
+            )]),
+            delay_by_offset: HashMap::new(),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+        });
+        let storage = Arc::new(FakeStorage::always_fail());
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 4);
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![SegmentToRead {
+                segment_offset: 1,
+                record_batch_idxs: vec![0, 1],
+            }],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+
+        let Err(err) = runner.run(task, &manager, &cancel).await else {
+            panic!("storage write is expected to fail");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::Write);
+
+        let writes = storage.writes.lock().await;
+        assert_eq!(writes.len(), 1);
+        assert_eq!(values_from_batches(&writes[0]), vec![3, 1, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn run_produces_non_overlapping_service_name_bounds_in_parquet_row_groups() {
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([(
+                1,
+                vec![
+                    logs_batch_for_shift(vec![
+                        (Some("acc-1"), Some("svc-3"), Some(30), 1),
+                        (Some("acc-1"), Some("svc-4"), Some(20), 2),
+                    ]),
+                    logs_batch_for_shift(vec![
+                        (Some("acc-1"), Some("svc-2"), Some(40), 3),
+                        (Some("acc-1"), Some("svc-5"), Some(10), 4),
+                    ]),
+                ],
+            )]),
+            delay_by_offset: HashMap::new(),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+        });
+        let storage = Arc::new(FakeStorage::always_fail());
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 2);
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![SegmentToRead {
+                segment_offset: 1,
+                record_batch_idxs: vec![0, 1],
+            }],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+
+        let Err(err) = runner.run(task, &manager, &cancel).await else {
+            panic!("storage write is expected to fail");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::Write);
+
+        let writes = storage.writes.lock().await;
+        assert_eq!(writes.len(), 1);
+        let parquet_bytes = parquet_bytes_from_batches(&writes[0]);
+        let bounds = service_name_bounds_from_parquet(parquet_bytes);
+
+        assert_eq!(
+            bounds,
+            vec![
+                ("svc-2".to_string(), "svc-3".to_string()),
+                ("svc-4".to_string(), "svc-5".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
