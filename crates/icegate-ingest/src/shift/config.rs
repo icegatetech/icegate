@@ -171,6 +171,10 @@ pub struct ShiftReadConfig {
     pub plan_segment_read_parallelism: usize,
     /// Maximum number of WAL segments to read in parallel in shift stage.
     pub shift_segment_read_parallelism: usize,
+    /// Maximum number of active row-group readers retained by the lazy merger.
+    ///
+    /// When omitted, inherits `shift_segment_read_parallelism`.
+    pub max_active_row_group_streams: Option<usize>,
 }
 
 impl Default for ShiftReadConfig {
@@ -180,7 +184,16 @@ impl Default for ShiftReadConfig {
             max_input_bytes_per_task: 64 * 1024 * 1024, // 64MB
             plan_segment_read_parallelism: 8,
             shift_segment_read_parallelism: 8,
+            max_active_row_group_streams: None,
         }
+    }
+}
+
+impl ShiftReadConfig {
+    /// Return the effective active row-group reader cap for the lazy merger.
+    #[must_use]
+    pub fn effective_max_active_row_group_streams(&self) -> usize {
+        self.max_active_row_group_streams.unwrap_or(self.shift_segment_read_parallelism)
     }
 }
 
@@ -298,6 +311,11 @@ impl ShiftConfig {
         if self.read.shift_segment_read_parallelism == 0 {
             return Err(IngestError::Config(
                 "shift_segment_read_parallelism must be greater than zero".to_string(),
+            ));
+        }
+        if self.read.max_active_row_group_streams == Some(0) {
+            return Err(IngestError::Config(
+                "max_active_row_group_streams must be greater than zero".to_string(),
             ));
         }
         if self.write.table_cache_ttl_secs == 0 {
@@ -418,6 +436,36 @@ mod tests {
     fn shift_validate_rejects_zero_shift_segment_read_parallelism() {
         let mut config = ShiftConfig::default();
         config.read.shift_segment_read_parallelism = 0;
+        let err = config.validate().expect_err("config must be invalid");
+        assert!(
+            matches!(err, crate::error::IngestError::Config(_)),
+            "expected config error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn shift_read_effective_max_active_row_group_streams_inherits_shift_parallelism() {
+        let mut config = ShiftConfig::default();
+        config.read.shift_segment_read_parallelism = 13;
+
+        assert_eq!(config.read.max_active_row_group_streams, None);
+        assert_eq!(config.read.effective_max_active_row_group_streams(), 13);
+    }
+
+    #[test]
+    fn shift_read_effective_max_active_row_group_streams_prefers_explicit_value() {
+        let mut config = ShiftConfig::default();
+        config.read.shift_segment_read_parallelism = 13;
+        config.read.max_active_row_group_streams = Some(5);
+
+        assert_eq!(config.read.effective_max_active_row_group_streams(), 5);
+    }
+
+    #[test]
+    fn shift_validate_rejects_zero_max_active_row_group_streams() {
+        let mut config = ShiftConfig::default();
+        config.read.max_active_row_group_streams = Some(0);
+
         let err = config.validate().expect_err("config must be invalid");
         assert!(
             matches!(err, crate::error::IngestError::Config(_)),

@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use icegate_common::RowGroupBoundaryKey;
 use icegate_jobmanager::{ImmutableTask, JobManager, registry::TaskExecutorFn};
 use serde::{Deserialize, Serialize};
 
@@ -44,13 +45,24 @@ impl TaskStatus {
     }
 }
 
+/// Planned row group to read from WAL.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlannedRowGroup {
+    /// Row group index inside the WAL segment.
+    pub row_group_idx: usize,
+    /// Compressed row group size in bytes.
+    pub row_group_bytes: u64,
+    /// Exact first-row merge key for this row group.
+    pub boundary_key: RowGroupBoundaryKey,
+}
+
 /// Segment metadata used for shift input. Segments are WAL files.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SegmentToRead {
     /// segment offset.
     pub segment_offset: u64,
-    /// Batch offsets for this tenant inside the segment. Batches are grouped by column.
-    pub record_batch_idxs: Vec<usize>,
+    /// Planned row groups for this tenant inside the segment.
+    pub row_groups: Vec<PlannedRowGroup>,
 }
 
 /// Input for the shift task.

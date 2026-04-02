@@ -55,6 +55,8 @@ pub mod catalog;
 pub mod config;
 /// Error types for common operations.
 pub mod error;
+/// Shared logs merge-order contract.
+pub mod logs_merge;
 /// Prometheus metrics utilities.
 pub mod metrics;
 /// Retry utilities.
@@ -74,6 +76,7 @@ pub mod testing;
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle};
 pub use config::{ServerConfig, check_port_conflicts, load_config_file};
 pub use error::Result;
+pub use logs_merge::{RowGroupBoundaryKey, compare_option_ord};
 pub use metrics::{MetricsConfig, MetricsRuntime, run_metrics_server};
 pub use retrier::{Retrier, RetrierConfig, RetryError};
 pub use storage::{

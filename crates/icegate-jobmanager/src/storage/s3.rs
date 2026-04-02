@@ -302,9 +302,9 @@ impl S3Storage {
                 }
             }
             aws_sdk_s3::error::SdkError::TimeoutError(_) => StorageError::Timeout,
-            aws_sdk_s3::error::SdkError::DispatchFailure(e) => {
-                // Network/connection errors - should be retryable
-                StorageError::S3(format!("Network error: {e:?}"))
+            aws_sdk_s3::error::SdkError::DispatchFailure(_) => {
+                // Network/connection errors are transient and should be retried.
+                StorageError::ServiceUnavailable
             }
             _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
         }

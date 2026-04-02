@@ -87,7 +87,7 @@ pub async fn ingest_logs(
         span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
     })
     .await??;
-    // TODO(crit): точно ли надо?
+    // TODO(crit): really need this?
     request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
     let Some(batch) = batch else {
         // No records to process - return success with 0 rejected
@@ -107,7 +107,7 @@ pub async fn ingest_logs(
             request_metrics.finish_error();
             OtlpError(e)
         })?;
-    // TODO(crit): метрика такая же как сверху, на графике будет непонятно
+    // TODO(crit): metric is same that upside
     request_metrics.record_transform_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
     let Some(prepared) = prepared else {
         request_metrics.finish_ok();
@@ -348,7 +348,11 @@ mod tests {
         let (tx, mut rx) = channel(1);
         let writer = tokio::spawn(async move {
             let request = rx.recv().await.expect("write request");
-            let total_rows = request.batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+            let total_rows = request
+                .row_groups
+                .iter()
+                .map(|row_group| row_group.batch.num_rows())
+                .sum::<usize>();
             request
                 .response_tx
                 .send(WriteResult::success(11, total_rows, None))

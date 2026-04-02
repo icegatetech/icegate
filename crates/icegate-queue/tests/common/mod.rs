@@ -2,8 +2,14 @@
 
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{Array, ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
+    datatypes::{DataType, Field, Schema, TimeUnit},
+    record_batch::RecordBatch,
+};
+use icegate_common::RowGroupBoundaryKey;
 use icegate_common::testing::{MinIOContainer, create_s3_bucket, create_s3_object_store};
+use icegate_queue::PreparedWalRowGroup;
 use object_store::ObjectStore;
 use uuid::Uuid;
 
@@ -36,8 +42,7 @@ pub async fn setup_queue_test() -> Result<(MinIOContainer, Arc<dyn ObjectStore>,
 ///
 /// Returns an error if `RecordBatch` creation fails.
 pub fn test_batch(rows: usize, tenant_cardinality: usize) -> Result<RecordBatch, arrow::error::ArrowError> {
-    use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::array::{Float64Array, TimestampNanosecondArray};
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("tenant_id", DataType::Utf8, false),
@@ -79,4 +84,75 @@ pub fn test_batch(rows: usize, tenant_cardinality: usize) -> Result<RecordBatch,
             Arc::new(StringArray::from(messages)) as ArrayRef,
         ],
     )
+}
+
+pub fn prepared_row_groups(batches: Vec<RecordBatch>) -> Vec<PreparedWalRowGroup> {
+    batches.into_iter().map(PreparedWalRowGroup::new).collect()
+}
+
+#[allow(dead_code)]
+pub fn logs_batch(rows: Vec<(Option<&str>, Option<&str>, Option<i64>, i64)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("cloud_account_id", DataType::Utf8, true),
+        Field::new("service_name", DataType::Utf8, true),
+        Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(cloud_account_id, _, _, _)| *cloud_account_id)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, service_name, _, _)| *service_name).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(
+                rows.iter().map(|(_, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, _, value)| *value).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .expect("logs batch")
+}
+
+#[allow(dead_code)]
+pub fn logs_row_group_boundary_key(batch: &RecordBatch) -> RowGroupBoundaryKey {
+    assert!(
+        batch.num_rows() > 0,
+        "logs_row_group_boundary_key requires a non-empty batch"
+    );
+
+    let cloud_account_id = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("cloud_account_id");
+    let service_name = batch.column(1).as_any().downcast_ref::<StringArray>().expect("service_name");
+    let timestamp = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("timestamp");
+
+    RowGroupBoundaryKey {
+        cloud_account_id: (!cloud_account_id.is_null(0)).then(|| cloud_account_id.value(0).to_string()),
+        service_name: (!service_name.is_null(0)).then(|| service_name.value(0).to_string()),
+        timestamp_micros: (!timestamp.is_null(0)).then(|| timestamp.value(0)),
+    }
+}
+
+#[allow(dead_code)]
+pub fn prepared_logs_row_groups(batches: Vec<RecordBatch>) -> Vec<PreparedWalRowGroup> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let metadata = serde_json::to_string(&logs_row_group_boundary_key(&batch)).expect("serialize boundary key");
+            PreparedWalRowGroup::new(batch).with_metadata(metadata)
+        })
+        .collect()
 }

@@ -1,16 +1,12 @@
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
-use futures::{StreamExt, future::Either, pin_mut};
 use icegate_common::retrier::{Retrier, RetrierConfig};
 use icegate_jobmanager::{Error, ImmutableTask, JobManager};
-use icegate_queue::{QueueReader, RecordBatchStream, Topic};
+use icegate_queue::{QueueReader, Topic};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
@@ -90,14 +86,6 @@ pub struct ShiftTaskResult {
     pub bytes_written_total: u64,
 }
 
-enum SegmentReadOutcome {
-    Read {
-        segment_idx: usize,
-        stream: RecordBatchStream,
-    },
-    Cancelled,
-}
-
 /// Runner interface for shift tasks.
 #[async_trait]
 pub trait ShiftTaskRunner: Send + Sync {
@@ -117,6 +105,7 @@ pub struct ShiftTaskRunnerImpl<Q, S> {
     topic: Topic,
     output_batch_size: usize,
     segment_read_parallelism: usize,
+    max_active_row_group_streams: Option<usize>,
     retrier: Retrier,
 }
 
@@ -135,6 +124,7 @@ where
             topic: topic.into(),
             output_batch_size,
             segment_read_parallelism: Self::DEFAULT_SEGMENT_READ_PARALLELISM,
+            max_active_row_group_streams: None,
             retrier: Retrier::new(RetrierConfig::default()),
         }
     }
@@ -155,6 +145,24 @@ where
         }
         self.segment_read_parallelism = segment_read_parallelism;
         Ok(self)
+    }
+
+    /// Set the maximum number of active row-group readers in the merger.
+    pub fn with_max_active_row_group_streams(
+        mut self,
+        max_active_row_group_streams: usize,
+    ) -> std::result::Result<Self, crate::error::IngestError> {
+        if max_active_row_group_streams == 0 {
+            return Err(crate::error::IngestError::Config(
+                "max_active_row_group_streams must be greater than zero".to_string(),
+            ));
+        }
+        self.max_active_row_group_streams = Some(max_active_row_group_streams);
+        Ok(self)
+    }
+
+    fn effective_max_active_row_group_streams(&self) -> usize {
+        self.max_active_row_group_streams.unwrap_or(self.segment_read_parallelism)
     }
 }
 
@@ -201,7 +209,7 @@ where
             });
         }
 
-        let record_batches_total = input.segments.iter().map(|segment| segment.record_batch_idxs.len()).sum();
+        let record_batches_total = input.segments.iter().map(|segment| segment.row_groups.len()).sum();
         let write_result = self
             .write_record_batches_with_retry(input.segments.as_slice(), cancel_token)
             .await
@@ -343,92 +351,23 @@ where
         segments: &[SegmentToRead],
         cancel_token: &CancellationToken,
     ) -> Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError> {
-        let streams = self.read_segments_in_order(segments, cancel_token).await?;
-        let merged_stream = SortedBatchMerger::try_new(streams, self.output_batch_size)
-            .await
-            .map(SortedBatchMerger::into_stream)
-            .map_err(ShiftWriteError::queue_read)?;
+        let read_plan = super::sorted_batch_merger::PlannedRowGroupRead::from_segments(segments);
+        let merged_stream = SortedBatchMerger::try_new(
+            Arc::clone(&self.queue_reader),
+            self.topic.clone(),
+            read_plan,
+            self.output_batch_size,
+            self.segment_read_parallelism,
+            self.effective_max_active_row_group_streams(),
+            cancel_token.clone(),
+        )
+        .await
+        .map(SortedBatchMerger::into_stream)
+        .map_err(ShiftWriteError::queue_read)?;
         self.storage
             .write_record_batches(merged_stream, cancel_token)
             .await
             .map_err(ShiftWriteError::from)
-    }
-
-    async fn read_segments_in_order(
-        &self,
-        segments: &[SegmentToRead],
-        cancel_token: &CancellationToken,
-    ) -> Result<Vec<RecordBatchStream>, ShiftWriteError> {
-        let mut streams = Vec::new();
-        let mut next_expected_idx = 0usize;
-        let mut pending_streams: BTreeMap<usize, RecordBatchStream> = BTreeMap::new();
-        let read_parallelism = self.segment_read_parallelism;
-        // Each WAL row group is sorted independently, but a segment may contain
-        // multiple sorted row groups appended in flush order. Read them as
-        // independent streams so the k-way merger can restore global ordering.
-        let mut read_plan = Vec::new();
-        for segment in segments {
-            for &row_group_idx in &segment.record_batch_idxs {
-                let stream_idx = read_plan.len();
-                read_plan.push((stream_idx, segment.segment_offset, row_group_idx));
-            }
-        }
-        let read_stream = futures::stream::iter(read_plan)
-            .take_until(cancel_token.cancelled())
-            .map(|(stream_idx, segment_offset, row_group_idx)| {
-                let queue_reader = Arc::clone(&self.queue_reader);
-                let topic = self.topic.clone();
-                let cancel = cancel_token.clone();
-                async move {
-                    match futures::future::select(
-                        Box::pin(queue_reader.read_segment(&topic, segment_offset, &[row_group_idx], &cancel)),
-                        Box::pin(cancel.cancelled()),
-                    )
-                    .await
-                    {
-                        Either::Left((read_result, _)) => {
-                            let segment_stream = read_result.map_err(|err| {
-                                ShiftWriteError::queue_read(format!(
-                                    "failed to read segment {segment_offset} row groups: {err}"
-                                ))
-                            })?;
-                            Ok::<SegmentReadOutcome, ShiftWriteError>(SegmentReadOutcome::Read {
-                                segment_idx: stream_idx,
-                                stream: segment_stream,
-                            })
-                        }
-                        Either::Right((_cancelled, _)) => {
-                            Ok::<SegmentReadOutcome, ShiftWriteError>(SegmentReadOutcome::Cancelled)
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(read_parallelism);
-        pin_mut!(read_stream);
-
-        while let Some(read_result) = read_stream.next().await {
-            let read_outcome = read_result?;
-            let SegmentReadOutcome::Read {
-                segment_idx,
-                stream: segment_stream,
-            } = read_outcome
-            else {
-                return Err(ShiftWriteError {
-                    reason: ShiftTaskFailureReason::Cancelled,
-                    error: Error::TaskExecution("shift task cancelled while reading queue segments".to_string()),
-                    source: Some(crate::error::IngestError::Cancelled),
-                });
-            };
-            pending_streams.insert(segment_idx, segment_stream);
-            while let Some(segment_stream) = pending_streams.remove(&next_expected_idx) {
-                streams.push(segment_stream);
-                next_expected_idx = next_expected_idx
-                    .checked_add(1)
-                    .ok_or_else(|| ShiftWriteError::queue_read("segment index overflow while assembling batches"))?;
-            }
-        }
-
-        Ok(streams)
     }
 }
 
@@ -494,10 +433,11 @@ mod tests {
     use crate::{
         error::{IngestError, Result},
         shift::{
-            SegmentToRead, ShiftInput, ShiftOutput,
+            PlannedRowGroup, SegmentToRead, ShiftInput, ShiftOutput,
             executor::TaskStatus,
             iceberg_storage::{Storage, WrittenDataFiles},
         },
+        wal_sort::logs_row_group_boundary_key_from_batch,
     };
 
     struct TestTask {
@@ -768,6 +708,15 @@ mod tests {
                     .map(Ok),
             )))
         }
+
+        async fn read_segment_row_group_metadata(
+            &self,
+            _topic: &icegate_queue::Topic,
+            _offset: u64,
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<std::collections::HashMap<usize, String>> {
+            panic!("read_segment_row_group_metadata is not expected in shift runner tests");
+        }
     }
 
     struct FakeStorage {
@@ -906,6 +855,14 @@ mod tests {
         .expect("logs batch")
     }
 
+    fn ordered_single_row_batch(
+        service_name: &'static str,
+        timestamp_micros: i64,
+        value: i64,
+    ) -> arrow::record_batch::RecordBatch {
+        logs_batch_for_shift(vec![(Some("acc"), Some(service_name), Some(timestamp_micros), value)])
+    }
+
     fn values_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
         batches
             .iter()
@@ -969,6 +926,23 @@ mod tests {
             .expect("data file")
     }
 
+    fn planned_row_groups(
+        batches: &[arrow::record_batch::RecordBatch],
+        row_group_idxs: &[usize],
+    ) -> Vec<PlannedRowGroup> {
+        row_group_idxs
+            .iter()
+            .map(|row_group_idx| {
+                let batch = batches.get(*row_group_idx).expect("row group batch");
+                PlannedRowGroup {
+                    row_group_idx: *row_group_idx,
+                    row_group_bytes: 1,
+                    boundary_key: logs_row_group_boundary_key_from_batch(batch).expect("boundary key"),
+                }
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn run_preserves_segment_order_when_reads_complete_out_of_order() {
         let queue_reader = Arc::new(FakeQueueReader {
@@ -992,20 +966,23 @@ mod tests {
         let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
             .with_segment_read_parallelism(3)
             .expect("non-zero segment read parallelism must be accepted");
+        let segment_1 = vec![test_batch(1)];
+        let segment_2 = vec![test_batch(2)];
+        let segment_3 = vec![test_batch(3)];
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_1, &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 2,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_2, &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 3,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_3, &[0]),
                 },
             ],
             trace_context: None,
@@ -1049,11 +1026,21 @@ mod tests {
         });
         let storage = Arc::new(FakeStorage::always_fail());
         let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 4);
+        let segment_1 = vec![
+            logs_batch_for_shift(vec![
+                (Some("acc-1"), Some("svc-3"), Some(30), 1),
+                (Some("acc-1"), Some("svc-4"), Some(20), 2),
+            ]),
+            logs_batch_for_shift(vec![
+                (Some("acc-1"), Some("svc-2"), Some(40), 3),
+                (Some("acc-1"), Some("svc-5"), Some(10), 4),
+            ]),
+        ];
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![SegmentToRead {
                 segment_offset: 1,
-                record_batch_idxs: vec![0, 1],
+                row_groups: planned_row_groups(&segment_1, &[0, 1]),
             }],
             trace_context: None,
         };
@@ -1096,11 +1083,21 @@ mod tests {
         });
         let storage = Arc::new(FakeStorage::always_fail());
         let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 2);
+        let segment_1 = vec![
+            logs_batch_for_shift(vec![
+                (Some("acc-1"), Some("svc-3"), Some(30), 1),
+                (Some("acc-1"), Some("svc-4"), Some(20), 2),
+            ]),
+            logs_batch_for_shift(vec![
+                (Some("acc-1"), Some("svc-2"), Some(40), 3),
+                (Some("acc-1"), Some("svc-5"), Some(10), 4),
+            ]),
+        ];
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![SegmentToRead {
                 segment_offset: 1,
-                record_batch_idxs: vec![0, 1],
+                row_groups: planned_row_groups(&segment_1, &[0, 1]),
             }],
             trace_context: None,
         };
@@ -1149,20 +1146,23 @@ mod tests {
         let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 2)
             .with_segment_read_parallelism(3)
             .expect("non-zero segment read parallelism must be accepted");
+        let segment_1 = vec![test_batch(1)];
+        let segment_2 = vec![test_batch(2)];
+        let segment_3 = vec![test_batch(3)];
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_1, &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 2,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_2, &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 3,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_3, &[0]),
                 },
             ],
             trace_context: None,
@@ -1212,20 +1212,23 @@ mod tests {
         let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
             .with_segment_read_parallelism(3)
             .expect("non-zero segment read parallelism must be accepted");
+        let segment_1 = vec![test_batch(1)];
+        let segment_2 = vec![test_batch(2)];
+        let segment_3 = vec![test_batch(3)];
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_1, &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 2,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_2, &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 3,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segment_3, &[0]),
                 },
             ],
             trace_context: None,
@@ -1245,14 +1248,22 @@ mod tests {
     async fn run_proves_concurrent_reads_for_parallelism_greater_than_one() {
         let active_reads = Arc::new(AtomicUsize::new(0));
         let max_active_reads = Arc::new(AtomicUsize::new(0));
+        let segments = vec![
+            vec![ordered_single_row_batch("svc-01", 60, 1)],
+            vec![ordered_single_row_batch("svc-02", 50, 2)],
+            vec![ordered_single_row_batch("svc-03", 40, 3)],
+            vec![ordered_single_row_batch("svc-04", 30, 4)],
+            vec![ordered_single_row_batch("svc-05", 20, 5)],
+            vec![ordered_single_row_batch("svc-06", 10, 6)],
+        ];
         let queue_reader = Arc::new(FakeQueueReader {
             batches_by_offset: HashMap::from([
-                (1, vec![test_batch(1)]),
-                (2, vec![test_batch(2)]),
-                (3, vec![test_batch(3)]),
-                (4, vec![test_batch(4)]),
-                (5, vec![test_batch(5)]),
-                (6, vec![test_batch(6)]),
+                (1, segments[0].clone()),
+                (2, segments[1].clone()),
+                (3, segments[2].clone()),
+                (4, segments[3].clone()),
+                (5, segments[4].clone()),
+                (6, segments[5].clone()),
             ]),
             delay_by_offset: HashMap::from([
                 (1, Duration::from_millis(40)),
@@ -1277,27 +1288,27 @@ mod tests {
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[0], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 2,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[1], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 3,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[2], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 4,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[3], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 5,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[4], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 6,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[5], &[0]),
                 },
             ],
             trace_context: None,
@@ -1325,11 +1336,16 @@ mod tests {
     async fn run_keeps_reads_strictly_sequential_for_parallelism_one() {
         let active_reads = Arc::new(AtomicUsize::new(0));
         let max_active_reads = Arc::new(AtomicUsize::new(0));
+        let segments = vec![
+            vec![ordered_single_row_batch("svc-01", 30, 1)],
+            vec![ordered_single_row_batch("svc-02", 20, 2)],
+            vec![ordered_single_row_batch("svc-03", 10, 3)],
+        ];
         let queue_reader = Arc::new(FakeQueueReader {
             batches_by_offset: HashMap::from([
-                (1, vec![test_batch(1)]),
-                (2, vec![test_batch(2)]),
-                (3, vec![test_batch(3)]),
+                (1, segments[0].clone()),
+                (2, segments[1].clone()),
+                (3, segments[2].clone()),
             ]),
             delay_by_offset: HashMap::from([
                 (1, Duration::from_millis(25)),
@@ -1351,15 +1367,15 @@ mod tests {
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[0], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 2,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[1], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 3,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[2], &[0]),
                 },
             ],
             trace_context: None,
@@ -1403,6 +1419,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_inherits_max_active_row_group_streams_from_segment_parallelism_when_omitted() {
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let max_active_reads = Arc::new(AtomicUsize::new(0));
+        let segments = vec![
+            vec![ordered_single_row_batch("svc-01", 30, 1)],
+            vec![ordered_single_row_batch("svc-02", 20, 2)],
+            vec![ordered_single_row_batch("svc-03", 10, 3)],
+        ];
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([
+                (1, segments[0].clone()),
+                (2, segments[1].clone()),
+                (3, segments[2].clone()),
+            ]),
+            delay_by_offset: HashMap::from([
+                (1, Duration::from_millis(40)),
+                (2, Duration::from_millis(40)),
+                (3, Duration::from_millis(40)),
+            ]),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: Some(Arc::clone(&active_reads)),
+            max_active_reads: Some(Arc::clone(&max_active_reads)),
+            concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
+        });
+        let storage = Arc::new(FakeStorage::always_fail());
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
+            .with_segment_read_parallelism(2)
+            .expect("non-zero segment read parallelism must be accepted");
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![
+                SegmentToRead {
+                    segment_offset: 1,
+                    row_groups: planned_row_groups(&segments[0], &[0]),
+                },
+                SegmentToRead {
+                    segment_offset: 2,
+                    row_groups: planned_row_groups(&segments[1], &[0]),
+                },
+                SegmentToRead {
+                    segment_offset: 3,
+                    row_groups: planned_row_groups(&segments[2], &[0]),
+                },
+            ],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+
+        let Err(err) = runner.run(task, &manager, &cancel).await else {
+            panic!("storage write is expected to fail");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::Write);
+        assert!(
+            max_active_reads.load(Ordering::SeqCst) <= 2,
+            "effective max_active_row_group_streams must inherit shift_segment_read_parallelism"
+        );
+    }
+
+    #[tokio::test]
     async fn run_stops_reading_and_returns_cancelled_after_cancellation() {
         let started_reads = Arc::new(AtomicUsize::new(0));
         let active_reads = Arc::new(AtomicUsize::new(0));
@@ -1429,24 +1507,25 @@ mod tests {
         let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
             .with_segment_read_parallelism(2)
             .expect("non-zero segment read parallelism must be accepted");
+        let segments = (1..=4).map(test_batch).map(|batch| vec![batch]).collect::<Vec<_>>();
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[0], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 2,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[1], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 3,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[2], &[0]),
                 },
                 SegmentToRead {
                     segment_offset: 4,
-                    record_batch_idxs: vec![0],
+                    row_groups: planned_row_groups(&segments[3], &[0]),
                 },
             ],
             trace_context: None,

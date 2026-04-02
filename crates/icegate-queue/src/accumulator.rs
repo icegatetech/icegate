@@ -10,13 +10,16 @@ use arrow::record_batch::RecordBatch;
 use tokio::sync::oneshot;
 use tracing::trace;
 
-use crate::{channel::WriteResult, config::QueueConfig};
+use crate::{
+    channel::{PreparedWalRowGroup, WriteResult},
+    config::QueueConfig,
+};
 
 /// A pending logical write request with its response channel and trace context.
 #[derive(Debug)]
 struct PendingRequest {
     /// The record batches to be written.
-    batches: Vec<RecordBatch>,
+    row_groups: Vec<PreparedWalRowGroup>,
     /// Total rows across all batches in this request.
     records: usize,
     /// Response channel for this request.
@@ -47,18 +50,18 @@ impl PendingFlush {
     /// Returns the number of physical row groups in this flush.
     #[must_use]
     pub fn row_group_count(&self) -> usize {
-        self.requests.iter().map(|request| request.batches.len()).sum()
+        self.requests.iter().map(|request| request.row_groups.len()).sum()
     }
 
     /// Returns all batches in flush order.
     #[must_use]
-    pub fn batches(&self) -> Vec<RecordBatch> {
+    pub fn row_groups(&self) -> Vec<PreparedWalRowGroup> {
         // TODO(low): remove copy
-        let mut batches = Vec::with_capacity(self.row_group_count());
+        let mut row_groups = Vec::with_capacity(self.row_group_count());
         for request in &self.requests {
-            batches.extend(request.batches.iter().cloned());
+            row_groups.extend(request.row_groups.iter().cloned());
         }
-        batches
+        row_groups
     }
 
     /// Returns request trace contexts without exposing internal request layout.
@@ -134,18 +137,21 @@ impl TopicAccumulator {
     /// Adds a request and its response channel to the accumulator.
     pub fn add(
         &mut self,
-        batches: Vec<RecordBatch>,
+        row_groups: Vec<PreparedWalRowGroup>,
         response_tx: oneshot::Sender<WriteResult>,
         trace_context: Option<String>,
     ) {
-        let records = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-        let bytes = batches.iter().map(Self::estimate_batch_size).sum::<usize>();
+        let records = row_groups.iter().map(|row_group| row_group.batch.num_rows()).sum::<usize>();
+        let bytes = row_groups
+            .iter()
+            .map(|row_group| Self::estimate_batch_size(&row_group.batch))
+            .sum::<usize>();
 
         self.total_records += records;
         self.total_bytes += bytes;
-        self.total_batches += batches.len();
+        self.total_batches += row_groups.len();
         self.pending.push(PendingRequest {
-            batches,
+            row_groups,
             records,
             response_tx,
             trace_context,
@@ -285,12 +291,19 @@ mod tests {
         .expect("batch creation")
     }
 
+    fn prepared_batch(rows: usize) -> PreparedWalRowGroup {
+        PreparedWalRowGroup {
+            batch: test_batch(rows),
+            metadata: None,
+        }
+    }
+
     #[test]
     fn test_accumulator_add() {
         let mut acc = TopicAccumulator::new();
         let (tx, _rx) = oneshot::channel();
 
-        acc.add(vec![test_batch(100)], tx, None);
+        acc.add(vec![prepared_batch(100)], tx, None);
 
         assert_eq!(acc.request_count(), 1);
         assert_eq!(acc.pending_batches(), 1);
@@ -304,8 +317,8 @@ mod tests {
         let (tx1, _rx1) = oneshot::channel();
         let (tx2, _rx2) = oneshot::channel();
 
-        acc.add(vec![test_batch(100)], tx1, None);
-        acc.add(vec![test_batch(50)], tx2, None);
+        acc.add(vec![prepared_batch(100)], tx1, None);
+        acc.add(vec![prepared_batch(50)], tx2, None);
 
         assert_eq!(acc.total_records(), 150);
 
@@ -323,13 +336,24 @@ mod tests {
         let mut acc = TopicAccumulator::new();
         let (tx, _rx) = oneshot::channel();
 
-        acc.add(vec![test_batch(2), test_batch(3)], tx, Some("trace-a".to_string()));
+        acc.add(
+            vec![prepared_batch(2), prepared_batch(3)],
+            tx,
+            Some("trace-a".to_string()),
+        );
 
         let pending = acc.take_pending_flush();
 
         assert_eq!(pending.request_count(), 1);
         assert_eq!(pending.row_group_count(), 2);
-        assert_eq!(pending.batches().iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+        assert_eq!(
+            pending
+                .row_groups()
+                .iter()
+                .map(|row_group| row_group.batch.num_rows())
+                .sum::<usize>(),
+            5
+        );
         assert_eq!(pending.trace_contexts(), vec!["trace-a"]);
     }
 
@@ -341,11 +365,11 @@ mod tests {
             .with_records_per_flush_multiplier(2);
 
         let (tx, _rx) = oneshot::channel();
-        acc.add(vec![test_batch(50)], tx, None);
+        acc.add(vec![prepared_batch(50)], tx, None);
         assert!(!acc.should_flush(&config));
 
         let (tx, _rx) = oneshot::channel();
-        acc.add(vec![test_batch(60)], tx, None);
+        acc.add(vec![prepared_batch(60)], tx, None);
         assert!(acc.should_flush(&config)); // 110 >= (50 * 2)
     }
 
@@ -362,7 +386,7 @@ mod tests {
         let mut acc = TopicAccumulator::new();
         let (tx, _rx) = oneshot::channel();
 
-        acc.add(vec![test_batch(2), test_batch(3)], tx, None);
+        acc.add(vec![prepared_batch(2), prepared_batch(3)], tx, None);
 
         assert_eq!(acc.request_count(), 1);
         assert_eq!(acc.pending_batches(), 2);

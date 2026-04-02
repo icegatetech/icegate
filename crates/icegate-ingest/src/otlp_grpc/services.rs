@@ -283,7 +283,11 @@ mod tests {
         let (tx, mut rx) = channel(1);
         let writer = tokio::spawn(async move {
             let request = rx.recv().await.expect("write request");
-            let total_rows = request.batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+            let total_rows = request
+                .row_groups
+                .iter()
+                .map(|row_group| row_group.batch.num_rows())
+                .sum::<usize>();
             request
                 .response_tx
                 .send(WriteResult::success(17, total_rows, None))

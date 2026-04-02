@@ -26,7 +26,8 @@ use chrono::Duration as ChronoDuration;
 use commit_runner::CommitTaskRunnerImpl;
 pub use config::ShiftConfig;
 pub use executor::{
-    COMMIT_TASK_CODE, CommitInput, Executor, PLAN_TASK_CODE, SHIFT_TASK_CODE, SegmentToRead, ShiftInput, ShiftOutput,
+    COMMIT_TASK_CODE, CommitInput, Executor, PLAN_TASK_CODE, PlannedRowGroup, SHIFT_TASK_CODE, SegmentToRead,
+    ShiftInput, ShiftOutput,
 };
 use iceberg::Catalog;
 pub use iceberg_storage::{IcebergStorage, WrittenDataFiles};
@@ -94,6 +95,7 @@ impl Shifter {
 
         let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), LOGS_TOPIC));
         let shift_storage_for_runner = Arc::clone(&shift_storage);
+        let effective_max_active_row_group_streams = shift_config.read.effective_max_active_row_group_streams();
         let shift_runner = Arc::new(
             ShiftTaskRunnerImpl::new(
                 queue_reader,
@@ -101,7 +103,8 @@ impl Shifter {
                 LOGS_TOPIC,
                 shift_config.write.row_group_size,
             )
-            .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
+            .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?
+            .with_max_active_row_group_streams(effective_max_active_row_group_streams)?,
         );
         let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(
             shift_runner,

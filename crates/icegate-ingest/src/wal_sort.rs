@@ -1,17 +1,17 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
-    array::{Array, StringArray, UInt32Array},
+    array::{Array, StringArray, TimestampMicrosecondArray, UInt32Array},
     compute::{SortColumn, SortOptions, lexsort_to_indices, take},
     record_batch::RecordBatch,
 };
-use icegate_common::LOGS_TOPIC;
-use icegate_queue::{WriteChannel, WriteRequest, WriteResult};
+use icegate_common::{LOGS_TOPIC, RowGroupBoundaryKey};
+use icegate_queue::{PreparedWalRowGroup, WriteChannel, WriteRequest, WriteResult};
 use tokio::sync::oneshot;
 
 use crate::error::{IngestError, Result};
 
-// TODO(crit): нужно брать из схемы, а не хардкодить
+// TODO(crit): remove hardcode
 const LOGS_SORT_COLUMNS: [&str; 3] = ["cloud_account_id", "service_name", "timestamp"];
 
 /// Summary of WAL write acknowledgements for one ingest request.
@@ -67,7 +67,7 @@ impl PreWalTenantSorter {
     }
 
     /// Sort logs for WAL so that each output batch contains exactly one tenant.
-    fn sort_logs(&self, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn sort_logs(&self, batch: &RecordBatch) -> Result<Vec<PreparedWalRowGroup>> {
         if batch.num_rows() == 0 {
             return Ok(Vec::new());
         }
@@ -97,14 +97,17 @@ impl PreWalTenantSorter {
 
         let mut output = Vec::new();
         for tenant_row_idxs in row_idxs_by_tenant.into_values() {
-            // TODO(crit): можно ли обойтись без take?
+            // TODO(crit): can we remove take?
             let tenant_batch = take_rows(batch, UInt32Array::from(tenant_row_idxs))?;
             let sorted_tenant_batch = sort_single_tenant_logs(&tenant_batch)?;
             let mut offset = 0usize;
             while offset < sorted_tenant_batch.num_rows() {
-                // TODO(crit): точно ли нужно?
+                // TODO(crit): is it really necessary?
                 let len = self.row_group_size.min(sorted_tenant_batch.num_rows() - offset);
-                output.push(sorted_tenant_batch.slice(offset, len));
+                let row_group_batch = sorted_tenant_batch.slice(offset, len);
+                let metadata =
+                    serialize_logs_row_group_metadata(&logs_row_group_boundary_key_from_batch(&row_group_batch)?)?;
+                output.push(PreparedWalRowGroup::new(row_group_batch).with_metadata(metadata));
                 offset += len;
             }
         }
@@ -119,17 +122,17 @@ pub fn prepare_sorted_logs_for_wal(
     row_group_size: usize,
     trace_context: Option<String>,
 ) -> Result<Option<PreparedWalWrite>> {
-    let batches = PreWalTenantSorter::new(row_group_size).sort_logs(batch)?;
-    if batches.is_empty() {
+    let row_groups = PreWalTenantSorter::new(row_group_size).sort_logs(batch)?;
+    if row_groups.is_empty() {
         return Ok(None);
     }
 
-    let records = batches.iter().map(RecordBatch::num_rows).sum();
+    let records = row_groups.iter().map(|row_group| row_group.batch.num_rows()).sum();
     let (response_tx, response_rx) = oneshot::channel();
     Ok(Some(PreparedWalWrite {
         write_request: WriteRequest {
             topic: LOGS_TOPIC.to_string(),
-            batches,
+            row_groups,
             response_tx,
             trace_context,
         },
@@ -138,7 +141,7 @@ pub fn prepare_sorted_logs_for_wal(
     }))
 }
 
-// TODO(crit): при чем тут wal_sort?
+// TODO(crit): replace from wal_sort
 /// Submit a prepared WAL request into the queue.
 pub async fn submit_sorted_logs_to_wal(
     write_channel: &WriteChannel,
@@ -155,7 +158,7 @@ pub async fn submit_sorted_logs_to_wal(
     })
 }
 
-// TODO(crit): почему это тут?
+// TODO(crit): replace from wal_sort
 impl PendingWalWrite {
     /// Wait for the WAL writer acknowledgement.
     pub async fn wait_for_ack(self) -> Result<WalAckOutcome> {
@@ -184,7 +187,7 @@ impl PendingWalWrite {
 }
 
 fn sort_single_tenant_logs(batch: &RecordBatch) -> Result<RecordBatch> {
-    // TODO(crit): нельзя ли оптимизировать?
+    // TODO(crit): optimise?
 
     let sort_columns = LOGS_SORT_COLUMNS
         .iter()
@@ -223,6 +226,76 @@ fn take_rows(batch: &RecordBatch, row_idxs: UInt32Array) -> Result<RecordBatch> 
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
+pub(crate) fn logs_row_group_boundary_key_from_batch(batch: &RecordBatch) -> Result<RowGroupBoundaryKey> {
+    if batch.num_rows() == 0 {
+        return Err(IngestError::Shift(
+            "cannot build boundary key from empty WAL row group".to_string(),
+        ));
+    }
+
+    let cloud_account_id = string_value(batch, "cloud_account_id", 0)?;
+    let service_name = string_value(batch, "service_name", 0)?;
+    let timestamp_micros = timestamp_value(batch, "timestamp", 0)?;
+
+    Ok(RowGroupBoundaryKey {
+        cloud_account_id,
+        service_name,
+        timestamp_micros,
+    })
+}
+
+pub(crate) fn serialize_logs_row_group_metadata(boundary_key: &RowGroupBoundaryKey) -> Result<String> {
+    serde_json::to_string(boundary_key)
+        .map_err(|err| IngestError::Shift(format!("failed to serialize WAL row-group metadata: {err}")))
+}
+
+pub(crate) fn deserialize_logs_row_group_metadata(metadata: &str) -> Result<RowGroupBoundaryKey> {
+    let value: serde_json::Value = serde_json::from_str(metadata)
+        .map_err(|err| IngestError::Shift(format!("failed to deserialize WAL row-group metadata: {err}")))?;
+    let object = value.as_object().ok_or_else(|| {
+        IngestError::Shift("failed to deserialize WAL row-group metadata: expected JSON object".to_string())
+    })?;
+    for key in ["cloud_account_id", "service_name", "timestamp_micros"] {
+        if !object.contains_key(key) {
+            return Err(IngestError::Shift(format!(
+                "failed to deserialize WAL row-group metadata: missing field '{key}'"
+            )));
+        }
+    }
+    serde_json::from_value(value)
+        .map_err(|err| IngestError::Shift(format!("failed to deserialize WAL row-group metadata: {err}")))
+}
+
+fn string_value(batch: &RecordBatch, column_name: &str, row_idx: usize) -> Result<Option<String>> {
+    let column_idx = batch
+        .schema()
+        .index_of(column_name)
+        .map_err(|err| IngestError::Shift(format!("logs batch is missing {column_name}: {err}")))?;
+    let values = batch
+        .column(column_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| IngestError::Shift(format!("{column_name} must be Utf8 for WAL boundary key")))?;
+    Ok((!values.is_null(row_idx)).then(|| values.value(row_idx).to_string()))
+}
+
+fn timestamp_value(batch: &RecordBatch, column_name: &str, row_idx: usize) -> Result<Option<i64>> {
+    let column_idx = batch
+        .schema()
+        .index_of(column_name)
+        .map_err(|err| IngestError::Shift(format!("logs batch is missing {column_name}: {err}")))?;
+    let values = batch
+        .column(column_idx)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .ok_or_else(|| {
+            IngestError::Shift(format!(
+                "{column_name} must be Timestamp(Microsecond) for WAL boundary key"
+            ))
+        })?;
+    Ok((!values.is_null(row_idx)).then(|| values.value(row_idx)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -232,9 +305,13 @@ mod tests {
         datatypes::{DataType, Field, Schema, TimeUnit},
         record_batch::RecordBatch,
     };
+    use icegate_common::RowGroupBoundaryKey;
     use icegate_queue::{WriteResult, channel};
 
-    use super::{PreWalTenantSorter, WalAckOutcome, prepare_sorted_logs_for_wal, submit_sorted_logs_to_wal};
+    use super::{
+        PreWalTenantSorter, WalAckOutcome, deserialize_logs_row_group_metadata, logs_row_group_boundary_key_from_batch,
+        prepare_sorted_logs_for_wal, serialize_logs_row_group_metadata, submit_sorted_logs_to_wal,
+    };
     use crate::error::IngestError;
 
     fn logs_batch() -> RecordBatch {
@@ -288,7 +365,10 @@ mod tests {
         let batches = PreWalTenantSorter::new(2).sort_logs(&logs_batch()).expect("sort logs");
 
         assert_eq!(batches.len(), 3);
-        let tenant_batches = batches.iter().map(tenant_values).collect::<Vec<_>>();
+        let tenant_batches = batches
+            .iter()
+            .map(|row_group| tenant_values(&row_group.batch))
+            .collect::<Vec<_>>();
         assert!(tenant_batches.contains(&vec!["tenant-a".to_string(), "tenant-a".to_string()]));
         assert!(tenant_batches.contains(&vec!["tenant-a".to_string()]));
         assert!(tenant_batches.contains(&vec!["tenant-b".to_string(), "tenant-b".to_string()]));
@@ -299,15 +379,26 @@ mod tests {
         let batches = PreWalTenantSorter::new(8).sort_logs(&logs_batch()).expect("sort logs");
         let tenant_a = batches
             .iter()
-            .find(|batch| tenant_values(batch).first().is_some_and(|tenant_id| tenant_id == "tenant-a"))
+            .find(|row_group| {
+                tenant_values(&row_group.batch)
+                    .first()
+                    .is_some_and(|tenant_id| tenant_id == "tenant-a")
+            })
             .expect("tenant-a batch");
         let cloud_account_id = tenant_a
+            .batch
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("cloud_account_id");
-        let service_name = tenant_a.column(2).as_any().downcast_ref::<StringArray>().expect("service_name");
+        let service_name = tenant_a
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("service_name");
         let timestamps = tenant_a
+            .batch
             .column(3)
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -326,9 +417,32 @@ mod tests {
         let batches = PreWalTenantSorter::new(1).sort_logs(&logs_batch()).expect("sort logs");
 
         for batch in batches {
-            let tenant_ids = tenant_values(&batch);
+            let tenant_ids = tenant_values(&batch.batch);
             assert!(tenant_ids.iter().all(|tenant_id| tenant_id == &tenant_ids[0]));
         }
+    }
+
+    #[test]
+    fn logs_row_group_boundary_key_roundtrips_for_first_row() {
+        let batch = logs_batch();
+        let expected = RowGroupBoundaryKey {
+            cloud_account_id: Some("acc-2".to_string()),
+            service_name: Some("svc-1".to_string()),
+            timestamp_micros: Some(20),
+        };
+
+        let boundary = logs_row_group_boundary_key_from_batch(&batch.slice(1, 3)).expect("boundary key");
+        let metadata = serialize_logs_row_group_metadata(&boundary).expect("serialize metadata");
+        let restored = deserialize_logs_row_group_metadata(&metadata).expect("deserialize metadata");
+
+        assert_eq!(boundary, expected);
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn deserialize_logs_row_group_metadata_rejects_missing_boundary_fields() {
+        let err = deserialize_logs_row_group_metadata("{}").expect_err("metadata must be rejected");
+        assert!(err.to_string().contains("missing field"));
     }
 
     #[test]
@@ -363,8 +477,12 @@ mod tests {
         let writer = tokio::spawn(async move {
             let request = rx.recv().await.expect("write request");
             assert_eq!(request.topic, icegate_common::LOGS_TOPIC);
-            assert_eq!(request.batches.len(), 2);
-            let total_rows = request.batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            assert_eq!(request.row_groups.len(), 2);
+            let total_rows = request
+                .row_groups
+                .iter()
+                .map(|row_group| row_group.batch.num_rows())
+                .sum::<usize>();
             assert_eq!(total_rows, 5);
             request
                 .response_tx

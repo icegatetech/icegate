@@ -303,6 +303,15 @@ where
         }
         result
     }
+
+    async fn read_segment_row_group_metadata(
+        &self,
+        topic: &Topic,
+        offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> icegate_queue::Result<std::collections::HashMap<usize, String>> {
+        self.inner.read_segment_row_group_metadata(topic, offset, cancel_token).await
+    }
 }
 
 /// Storage wrapper that records metrics.

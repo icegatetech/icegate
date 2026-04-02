@@ -18,7 +18,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use icegate_queue::{QueueConfig, QueueWriter, WriteRequest, Topic};
+//! use icegate_queue::{PreparedWalRowGroup, QueueConfig, QueueWriter, WriteRequest, Topic};
 //! use arrow::record_batch::RecordBatch;
 //! use tokio::sync::oneshot;
 //!
@@ -30,8 +30,9 @@
 //! let (response_tx, response_rx) = oneshot::channel();
 //! tx.send(WriteRequest {
 //!     topic: "logs".to_string(),
-//!     batches: vec![record_batch],
+//!     row_groups: vec![PreparedWalRowGroup::new(record_batch)],
 //!     response_tx,
+//!     trace_context: None,
 //! }).await?;
 //!
 //! // Wait for result
@@ -46,12 +47,12 @@ mod reader;
 mod segment;
 mod writer;
 
-pub use channel::{Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult, channel};
+pub use channel::{PreparedWalRowGroup, Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult, channel};
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
 pub use reader::{
-    GroupedSegmentsPlan, ListedSegment, ParquetQueueReader, QueueReader, RecordBatchStream, SegmentFile,
-    SegmentRecordBatchIdxs, SegmentsPlan,
+    GroupedSegmentsPlan, ListedSegment, ParquetQueueReader, PlannedRowGroup, QueueReader, RecordBatchStream,
+    SegmentFile, SegmentRecordBatchIdxs, SegmentsPlan,
 };
 pub use segment::SegmentId;
 pub use writer::{NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome};

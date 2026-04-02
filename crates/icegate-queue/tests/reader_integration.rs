@@ -33,7 +33,12 @@ fn normalize_plan(plan: &SegmentsPlan) -> Vec<(String, Vec<(u64, Vec<usize>)>, u
             let mut segments = group
                 .segments
                 .iter()
-                .map(|segment| (segment.segment_offset, segment.record_batch_idxs.clone()))
+                .map(|segment| {
+                    (
+                        segment.segment_offset,
+                        segment.row_groups.iter().map(|row_group| row_group.row_group_idx).collect(),
+                    )
+                })
                 .collect::<Vec<_>>();
             segments.sort_by_key(|(offset, _)| *offset);
             (
@@ -353,7 +358,7 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch.clone()],
+            row_groups: common::prepared_row_groups(vec![batch.clone()]),
 
             response_tx,
             trace_context: None,
@@ -394,7 +399,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch.clone()],
+            row_groups: common::prepared_row_groups(vec![batch.clone()]),
 
             response_tx,
             trace_context: None,
@@ -445,7 +450,7 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![original_batch.clone()],
+        row_groups: common::prepared_row_groups(vec![original_batch.clone()]),
 
         response_tx,
         trace_context: None,
@@ -491,7 +496,7 @@ async fn test_read_segment_uses_configured_record_batch_size() -> Result<(), Box
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![original_batch],
+        row_groups: common::prepared_row_groups(vec![original_batch]),
 
         response_tx,
         trace_context: None,
@@ -536,7 +541,7 @@ async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![batch.clone()],
+        row_groups: common::prepared_row_groups(vec![batch.clone()]),
 
         response_tx,
         trace_context: None,
@@ -583,7 +588,7 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch],
+            row_groups: common::prepared_row_groups(vec![batch]),
 
             response_tx,
             trace_context: None,
@@ -634,7 +639,7 @@ async fn test_plan_max_row_groups_limit() -> Result<(), Box<dyn std::error::Erro
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch],
+            row_groups: common::prepared_row_groups(vec![batch]),
 
             response_tx,
             trace_context: None,
@@ -680,7 +685,7 @@ async fn test_plan_segments_with_small_input_bytes_limit() -> Result<(), Box<dyn
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch],
+            row_groups: common::prepared_row_groups(vec![batch]),
 
             response_tx,
             trace_context: None,
@@ -724,7 +729,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result() -> Result<(), Bo
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch],
+            row_groups: common::prepared_row_groups(vec![batch]),
 
             response_tx,
             trace_context: None,
@@ -822,7 +827,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_with_skewed_metada
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch],
+            row_groups: common::prepared_row_groups(vec![batch]),
 
             response_tx,
             trace_context: None,
@@ -916,7 +921,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metada
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch],
+            row_groups: common::prepared_row_groups(vec![batch]),
 
             response_tx,
             trace_context: None,
@@ -1006,7 +1011,7 @@ async fn test_plan_segments_parallel_fails_fast_on_metadata_error_without_partia
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch],
+            row_groups: common::prepared_row_groups(vec![batch]),
 
             response_tx,
             trace_context: None,
@@ -1060,7 +1065,7 @@ async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_with
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch],
+            row_groups: common::prepared_row_groups(vec![batch]),
 
             response_tx,
             trace_context: None,

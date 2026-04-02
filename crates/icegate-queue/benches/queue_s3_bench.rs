@@ -13,7 +13,9 @@ use std::{sync::Arc, time::Duration};
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 use icegate_common::testing::{MinIOContainer, create_s3_bucket, create_s3_object_store};
-use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, WriteRequest, channel};
+use icegate_queue::{
+    NoopQueueWriterEvents, ParquetQueueReader, PreparedWalRowGroup, QueueConfig, QueueWriter, WriteRequest, channel,
+};
 use tokio::{sync::oneshot, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -47,7 +49,7 @@ async fn write_batch(tx: &icegate_queue::WriteChannel, topic: &str, batch: arrow
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: topic.to_string(),
-        batches: vec![batch],
+        row_groups: vec![PreparedWalRowGroup::new(batch)],
         response_tx,
         trace_context: None,
     })

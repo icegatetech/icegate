@@ -22,7 +22,7 @@ async fn test_write_single_batch_to_s3() -> Result<(), Box<dyn std::error::Error
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![batch.clone()],
+        row_groups: common::prepared_row_groups(vec![batch.clone()]),
 
         response_tx,
         trace_context: None,
@@ -64,7 +64,7 @@ async fn test_sequential_writes_monotonic_offsets() -> Result<(), Box<dyn std::e
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            batches: vec![batch.clone()],
+            row_groups: common::prepared_row_groups(vec![batch.clone()]),
 
             response_tx,
             trace_context: None,
@@ -105,7 +105,7 @@ async fn test_write_empty_batch() -> Result<(), Box<dyn std::error::Error>> {
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![batch.clone()],
+        row_groups: common::prepared_row_groups(vec![batch.clone()]),
 
         response_tx,
         trace_context: None,
@@ -143,7 +143,7 @@ async fn test_write_with_base_path() -> Result<(), Box<dyn std::error::Error>> {
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![batch.clone()],
+        row_groups: common::prepared_row_groups(vec![batch.clone()]),
 
         response_tx,
         trace_context: None,
@@ -178,7 +178,7 @@ async fn test_channel_write_response() -> Result<(), Box<dyn std::error::Error>>
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![batch.clone()],
+        row_groups: common::prepared_row_groups(vec![batch.clone()]),
 
         response_tx,
         trace_context: None,
@@ -213,7 +213,7 @@ async fn test_multi_batch_request_gets_single_ack_and_multiple_row_groups() -> R
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![batch_a.clone(), batch_b.clone()],
+        row_groups: common::prepared_row_groups(vec![batch_a.clone(), batch_b.clone()]),
         response_tx,
         trace_context: None,
     })
@@ -245,6 +245,65 @@ async fn test_multi_batch_request_gets_single_ack_and_multiple_row_groups() -> R
 }
 
 #[tokio::test]
+async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -> Result<(), Box<dyn std::error::Error>>
+{
+    use icegate_common::RowGroupBoundaryKey;
+    use icegate_queue::ParquetQueueReader;
+    use tokio_util::sync::CancellationToken;
+
+    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+
+    let config = QueueConfig::new("queue").with_flush_interval_ms(50);
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, store.clone());
+    let handle = writer.start(rx);
+
+    let batch_a = common::logs_batch(vec![
+        (Some("acc-1"), Some("svc-2"), Some(40), 1),
+        (Some("acc-1"), Some("svc-2"), Some(30), 2),
+    ]);
+    let batch_b = common::logs_batch(vec![
+        (Some("acc-2"), Some("svc-1"), Some(20), 3),
+        (Some("acc-2"), Some("svc-1"), Some(10), 4),
+    ]);
+    let expected_a = common::logs_row_group_boundary_key(&batch_a);
+    let expected_b = common::logs_row_group_boundary_key(&batch_b);
+
+    let (response_tx, response_rx) = oneshot::channel();
+    tx.send(WriteRequest {
+        topic: "logs".to_string(),
+        row_groups: common::prepared_logs_row_groups(vec![batch_a, batch_b]),
+        response_tx,
+        trace_context: None,
+    })
+    .await
+    .unwrap();
+
+    let result = response_rx.await.unwrap();
+    assert!(result.is_success());
+    assert_eq!(result.offset(), Some(0));
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let metadata = reader
+        .read_segment_row_group_metadata(&"logs".to_string(), 0, &CancellationToken::new())
+        .await?;
+
+    assert_eq!(metadata.len(), 2);
+    assert_eq!(
+        serde_json::from_str::<RowGroupBoundaryKey>(metadata.get(&0).expect("row group 0 metadata"))?,
+        expected_a
+    );
+    assert_eq!(
+        serde_json::from_str::<RowGroupBoundaryKey>(metadata.get(&1).expect("row group 1 metadata"))?,
+        expected_b
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_requests_in_same_flush_share_offset_but_keep_own_record_counts() -> Result<(), Box<dyn std::error::Error>>
 {
     let (_minio, store, _bucket) = common::setup_queue_test().await?;
@@ -260,7 +319,7 @@ async fn test_requests_in_same_flush_share_offset_but_keep_own_record_counts() -
     let (response_tx1, response_rx1) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![common::test_batch(3, 1)?, common::test_batch(4, 1)?],
+        row_groups: common::prepared_row_groups(vec![common::test_batch(3, 1)?, common::test_batch(4, 1)?]),
         response_tx: response_tx1,
         trace_context: None,
     })
@@ -270,7 +329,7 @@ async fn test_requests_in_same_flush_share_offset_but_keep_own_record_counts() -
     let (response_tx2, response_rx2) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![common::test_batch(5, 1)?],
+        row_groups: common::prepared_row_groups(vec![common::test_batch(5, 1)?]),
         response_tx: response_tx2,
         trace_context: None,
     })
@@ -309,7 +368,7 @@ async fn test_write_then_read_roundtrip() -> Result<(), Box<dyn std::error::Erro
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![original_batch.clone()],
+        row_groups: common::prepared_row_groups(vec![original_batch.clone()]),
 
         response_tx,
         trace_context: None,
@@ -365,7 +424,7 @@ async fn test_write_read_schema_preservation() -> Result<(), Box<dyn std::error:
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "events".to_string(),
-        batches: vec![original_batch.clone()],
+        row_groups: common::prepared_row_groups(vec![original_batch.clone()]),
 
         response_tx,
         trace_context: None,
@@ -419,7 +478,7 @@ async fn test_write_read_with_compression() -> Result<(), Box<dyn std::error::Er
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
-        batches: vec![original_batch.clone()],
+        row_groups: common::prepared_row_groups(vec![original_batch.clone()]),
 
         response_tx,
         trace_context: None,
