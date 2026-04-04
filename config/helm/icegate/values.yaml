@@ -50,7 +50,7 @@ queue:
   common:
     basePath: "s3://queue/"
     channelCapacity: 1024
-    maxRowGroupSize: 8192
+    maxRowGroupSize: 16384
   write:
     writeRetries: 3
     compression: zstd

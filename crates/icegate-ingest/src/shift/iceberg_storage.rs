@@ -138,16 +138,49 @@ impl IcebergStorage {
         batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        self.write_parquet_files_once(batches, cancel_token).await
+        // Move the entire Parquet write pipeline off the tokio async-worker
+        // threads.  `write_parquet_files_once` performs CPU-heavy Arrow →
+        // Parquet encoding (column encoding, ZSTD compression, statistics)
+        // synchronously inside `AsyncArrowWriter::write`, which starves the
+        // ingest hot-path (GRPC handler / WAL flush) when both share the
+        // same tokio runtime.
+        //
+        // `spawn_blocking` runs on a dedicated thread-pool.  Inside it we
+        // re-enter the runtime via `Handle::block_on` so that async S3 I/O
+        // still resolves normally.
+        let handle = tokio::runtime::Handle::current();
+        let row_group_size = self.row_group_size;
+        let max_file_size_mb = self.max_file_size_mb;
+        let cancel = cancel_token.clone();
+        let table = self.load_table(cancel_token).await?;
+
+        // Capture the current tracing span so that `write_parquet_files_once`
+        // remains a child of the caller (e.g. `shift_run`) even though it
+        // executes on a different thread.
+        let span = tracing::Span::current();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
+            handle.block_on(Self::write_parquet_files_once(
+                table,
+                row_group_size,
+                max_file_size_mb,
+                batches,
+                &cancel,
+            ))
+        })
+        .await
+        .map_err(|e| IngestError::Shift(format!("shift write task panicked: {e}")))?
     }
 
-    #[tracing::instrument(skip(self, batches, cancel_token))]
+    #[tracing::instrument(skip(table, batches, cancel_token))]
     async fn write_parquet_files_once(
-        &self,
+        table: Table,
+        row_group_size: usize,
+        max_file_size_mb: usize,
         mut batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        let table = self.load_table(cancel_token).await?;
         let table_metadata = table.metadata().clone();
         let table_file_io = table.file_io().clone();
 
@@ -159,16 +192,16 @@ impl IcebergStorage {
 
         let writer_props = WriterProperties::builder()
             .set_statistics_enabled(EnabledStatistics::Page)
-            .set_data_page_row_count_limit(self.row_group_size / 10)
+            .set_data_page_row_count_limit(row_group_size / 10)
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .set_max_row_group_size(self.row_group_size)
+            .set_max_row_group_size(row_group_size)
             .build();
 
         let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table_metadata.current_schema().clone());
 
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
-            self.max_file_size_mb * 1024 * 1024,
+            max_file_size_mb * 1024 * 1024,
             table_file_io,
             location_generator,
             file_name_generator,
