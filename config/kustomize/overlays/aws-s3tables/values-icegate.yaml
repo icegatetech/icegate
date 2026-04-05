@@ -1,4 +1,4 @@
-# IceGate chart values - AWS Glue catalog deployment
+# IceGate chart values - AWS S3Tables deployment
 
 ## Let the IceGate chart create the namespace from .Release.Namespace
 namespace:
