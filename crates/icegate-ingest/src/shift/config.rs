@@ -330,6 +330,7 @@ impl ShiftConfig {
 /// Timeout settings for shift-related tasks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(clippy::struct_field_names)]
 pub struct ShiftTimeoutsConfig {
     /// Base timeout for plan task in milliseconds.
     pub plan_base_ms: u64,

@@ -14,7 +14,7 @@ pub struct OtlpHttpState {
     /// Write channel for sending batches to the WAL queue.
     pub write_channel: WriteChannel,
     /// Maximum number of rows per WAL row group.
-    pub wal_row_group_size: usize, // TODO(crit): we really need this?
+    pub wal_row_group_size: usize,
     /// Metrics recorder for OTLP intake.
     pub metrics: OtlpMetrics,
 }

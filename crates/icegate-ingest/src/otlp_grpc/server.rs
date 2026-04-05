@@ -30,7 +30,7 @@ use crate::infra::metrics::OtlpMetrics;
 /// - The server encounters a fatal error during operation
 pub async fn run(
     write_channel: WriteChannel,
-    wal_row_group_size: usize, // TODO(crit): really need this?
+    wal_row_group_size: usize,
     metrics: OtlpMetrics,
     config: OtlpGrpcConfig,
     cancel_token: CancellationToken,

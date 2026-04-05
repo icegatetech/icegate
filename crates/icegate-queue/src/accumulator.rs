@@ -74,21 +74,24 @@ impl PendingFlush {
     }
 
     /// Sends success result to all requests in this flush.
-    pub fn send_success(self, offset: u64, trace_context: Option<String>) {
+    pub fn send_success(self, offset: u64, trace_context: Option<&str>) {
         for request in self.requests {
-            let _ = request
-                .response_tx
-                .send(WriteResult::success(offset, request.records, trace_context.clone()));
+            let _ = request.response_tx.send(WriteResult::success(
+                offset,
+                request.records,
+                trace_context.map(std::borrow::ToOwned::to_owned),
+            ));
         }
     }
 
     /// Sends failure result to all requests in this flush.
-    pub fn send_failure(self, reason: impl Into<String>, trace_context: Option<String>) {
+    pub fn send_failure(self, reason: impl Into<String>, trace_context: Option<&str>) {
         let reason = reason.into();
         for request in self.requests {
-            let _ = request
-                .response_tx
-                .send(WriteResult::failed(reason.clone(), trace_context.clone()));
+            let _ = request.response_tx.send(WriteResult::failed(
+                reason.clone(),
+                trace_context.map(std::borrow::ToOwned::to_owned),
+            ));
         }
     }
 }
@@ -198,33 +201,10 @@ impl TopicAccumulator {
         false
     }
 
-    // TODO(crit): remove methods only for tests
-
-    /// Returns true if the accumulator has pending requests.
-    #[cfg(test)]
-    #[must_use]
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    /// Returns the number of pending requests.
-    #[cfg(test)]
-    #[must_use]
-    pub fn request_count(&self) -> usize {
-        self.pending.len()
-    }
-
     /// Returns the number of pending physical batches.
     #[must_use]
-    pub fn pending_batches(&self) -> usize {
+    pub const fn pending_batches(&self) -> usize {
         self.total_batches
-    }
-
-    /// Returns the total record count.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn total_records(&self) -> usize {
-        self.total_records
     }
 
     /// Returns the total pending record count.
@@ -305,10 +285,9 @@ mod tests {
 
         acc.add(vec![prepared_batch(100)], tx, None);
 
-        assert_eq!(acc.request_count(), 1);
         assert_eq!(acc.pending_batches(), 1);
-        assert_eq!(acc.total_records(), 100);
-        assert!(acc.has_pending());
+        assert_eq!(acc.pending_records(), 100);
+        assert!(acc.pending_batches() > 0);
     }
 
     #[test]
@@ -320,15 +299,14 @@ mod tests {
         acc.add(vec![prepared_batch(100)], tx1, None);
         acc.add(vec![prepared_batch(50)], tx2, None);
 
-        assert_eq!(acc.total_records(), 150);
+        assert_eq!(acc.pending_records(), 150);
 
         let pending = acc.take_pending_flush();
 
         assert_eq!(pending.request_count(), 2);
         assert_eq!(pending.row_group_count(), 2);
-        assert_eq!(acc.request_count(), 0);
-        assert_eq!(acc.total_records(), 0);
-        assert!(!acc.has_pending());
+        assert_eq!(acc.pending_batches(), 0);
+        assert_eq!(acc.pending_records(), 0);
     }
 
     #[test]
@@ -388,8 +366,10 @@ mod tests {
 
         acc.add(vec![prepared_batch(2), prepared_batch(3)], tx, None);
 
-        assert_eq!(acc.request_count(), 1);
         assert_eq!(acc.pending_batches(), 2);
-        assert_eq!(acc.total_records(), 5);
+        assert_eq!(acc.pending_records(), 5);
+
+        let pending = acc.take_pending_flush();
+        assert_eq!(pending.request_count(), 1);
     }
 }

@@ -27,7 +27,7 @@ pub struct PreparedWalRowGroup {
 impl PreparedWalRowGroup {
     /// Create a row group without metadata.
     #[must_use]
-    pub fn new(batch: RecordBatch) -> Self {
+    pub const fn new(batch: RecordBatch) -> Self {
         Self { batch, metadata: None }
     }
 

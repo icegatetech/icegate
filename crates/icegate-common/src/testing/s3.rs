@@ -40,8 +40,7 @@ pub async fn create_s3_bucket(endpoint: &str, bucket_name: &str) -> Result<(), B
     loop {
         match client.create_bucket().bucket(bucket_name).send().await {
             Ok(_) => break,
-            Err(aws_sdk_s3::error::SdkError::DispatchFailure(_))
-            | Err(aws_sdk_s3::error::SdkError::TimeoutError(_))
+            Err(aws_sdk_s3::error::SdkError::DispatchFailure(_) | aws_sdk_s3::error::SdkError::TimeoutError(_))
                 if Instant::now() < deadline =>
             {
                 tokio::time::sleep(Duration::from_millis(100)).await;

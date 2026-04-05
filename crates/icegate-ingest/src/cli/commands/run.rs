@@ -135,7 +135,7 @@ fn spawn_wal_runtime(
             };
             let _ = startup_tx.send(Ok(()));
 
-            runtime.block_on(async { writer_handle.await }).map_err(IngestError::Join)??;
+            runtime.block_on(writer_handle).map_err(IngestError::Join)??;
             Ok(())
         })
         .map_err(IngestError::Io)?;

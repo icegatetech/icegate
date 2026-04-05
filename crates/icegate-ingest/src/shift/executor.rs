@@ -4,11 +4,11 @@
 
 use std::sync::Arc;
 
-use icegate_common::RowGroupBoundaryRange;
 use icegate_jobmanager::{ImmutableTask, JobManager, registry::TaskExecutorFn};
 use serde::{Deserialize, Serialize};
 
 use super::{commit_runner::CommitTaskRunner, plan_runner::PlanTaskRunner, shift_runner::ShiftTaskRunner};
+use crate::wal::RowGroupBoundaryRange;
 
 /// Task code for plan segments.
 pub const PLAN_TASK_CODE: &str = "plan";
@@ -25,6 +25,7 @@ pub enum TaskStatus {
     /// Task failed with an error.
     Error,
     /// Task exceeded its timeout.
+    #[allow(dead_code)]
     Timeout,
     /// Task was cancelled.
     Cancelled,
@@ -45,7 +46,6 @@ impl TaskStatus {
     }
 }
 
-// TODO(crit): точно ли тут место?
 /// Planned row group to read from WAL.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PlannedRowGroup {

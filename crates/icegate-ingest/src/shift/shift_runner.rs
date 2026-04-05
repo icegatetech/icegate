@@ -14,7 +14,7 @@ use super::{
     SegmentToRead, ShiftInput, ShiftOutput,
     executor::{TaskStatus, parse_task_input},
     iceberg_storage::Storage,
-    sorted_batch_merger::{SortedBatchMerger, SortedBatchMergerConfig},
+    row_groups_merger::{RowGroupsMerger, SortedBatchMergerConfig},
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -191,7 +191,7 @@ where
 
         let record_batches_total = input.segments.iter().map(|segment| segment.row_groups.len()).sum();
         let write_result = self
-            .write_record_batches_with_retry(input.segments.as_slice(), cancel_token)
+            .write_row_groups_with_retry(input.segments.as_slice(), cancel_token)
             .await
             .map_err(|err| ShiftTaskFailure::new(err.reason, err.error))?;
 
@@ -252,7 +252,7 @@ where
     Q: QueueReader + 'static,
     S: Storage + 'static,
 {
-    async fn write_record_batches_with_retry(
+    async fn write_row_groups_with_retry(
         &self,
         segments: &[SegmentToRead],
         cancel_token: &CancellationToken,
@@ -265,7 +265,7 @@ where
                 || {
                     let current_attempt = attempt.fetch_add(1, Ordering::SeqCst) + 1;
                     async move {
-                        match self.write_record_batches_once(segments, cancel_token).await {
+                        match self.write_row_groups_once(segments, cancel_token).await {
                             Ok(result) => Ok((false, Ok(result))),
                             Err(err) => {
                                 let retryable =
@@ -292,15 +292,14 @@ where
         }
     }
 
-    async fn write_record_batches_once(
+    async fn write_row_groups_once(
         &self,
         segments: &[SegmentToRead],
         cancel_token: &CancellationToken,
     ) -> Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError> {
-        let read_plan = super::sorted_batch_merger::PlannedRowGroupRead::from_segments(segments);
-        let mut merger = SortedBatchMerger::try_new(
+        let mut merger = RowGroupsMerger::try_new_from_segments(
             Arc::clone(&self.queue_reader),
-            read_plan,
+            segments,
             SortedBatchMergerConfig {
                 row_group_size: self.output_batch_size,
                 read_parallelism: self.segment_read_parallelism,
@@ -308,9 +307,8 @@ where
                 cancel_token: cancel_token.clone(),
             },
         )
-        .await
         .map_err(ShiftWriteError::queue_read)?;
-        merger.prefetch_first_batch().await.map_err(ShiftWriteError::queue_read)?;
+        merger.prefetch_first_group().await.map_err(ShiftWriteError::queue_read)?;
         let merged_stream = merger.into_stream();
         self.storage
             .write_record_batches(merged_stream, cancel_token)
@@ -384,7 +382,7 @@ impl std::fmt::Display for ShiftWriteError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -402,6 +400,9 @@ mod tests {
     use futures::TryStreamExt;
     use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Struct};
     use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
+    use icegate_queue::{
+        GroupedSegmentsPlan, PlannedRowGroup as QueuePlannedRowGroup, SegmentRecordBatchIdxs, SegmentsPlan,
+    };
     use parquet::{
         arrow::arrow_writer::ArrowWriter,
         file::{
@@ -421,11 +422,13 @@ mod tests {
     use crate::{
         error::{IngestError, Result},
         shift::{
-            PlannedRowGroup, SegmentToRead, ShiftInput, ShiftOutput,
+            PlannedRowGroup, SHIFT_TASK_CODE, SegmentToRead, ShiftConfig, ShiftInput, ShiftOutput,
             executor::TaskStatus,
             iceberg_storage::{Storage, WrittenDataFiles},
+            plan_runner::{PlanTaskRunner, PlanTaskRunnerImpl},
+            timeout::TimeoutEstimator,
         },
-        wal_sort::logs_row_group_boundary_range_from_batch,
+        wal::{logs_row_group_boundary_range_from_batch, sort_logs},
     };
 
     struct TestTask {
@@ -865,6 +868,7 @@ mod tests {
         .expect("batch")
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn logs_batch_for_shift(
         rows: Vec<(Option<&str>, Option<&str>, Option<i64>, i64)>,
     ) -> arrow::record_batch::RecordBatch {
@@ -984,6 +988,289 @@ mod tests {
             .collect()
     }
 
+    #[allow(clippy::needless_pass_by_value)]
+    fn logs_ingest_batch(
+        rows: Vec<(&str, Option<&str>, Option<&str>, Option<i64>, i64)>,
+    ) -> arrow::record_batch::RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("cloud_account_id", DataType::Utf8, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("row_id", DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(tenant_id, _, _, _, _)| *tenant_id).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(_, cloud_account_id, _, _, _)| *cloud_account_id)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, _, service_name, _, _)| *service_name).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|(_, _, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, _, _, row_id)| *row_id).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("logs ingest batch")
+    }
+
+    fn row_ids_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let row_ids = batch.column(4).as_any().downcast_ref::<Int64Array>().expect("row_id");
+                (0..batch.num_rows()).map(|row_idx| row_ids.value(row_idx)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn tenant_ids_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let tenant_ids = batch.column(0).as_any().downcast_ref::<StringArray>().expect("tenant_id");
+                (0..batch.num_rows())
+                    .map(|row_idx| tenant_ids.value(row_idx).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[derive(Clone)]
+    struct E2eWalSegment {
+        offset: u64,
+        row_groups: Vec<icegate_queue::PreparedWalRowGroup>,
+    }
+
+    struct E2eQueueReader {
+        plan: SegmentsPlan,
+        segments: HashMap<u64, Vec<icegate_queue::PreparedWalRowGroup>>,
+    }
+
+    #[async_trait]
+    impl icegate_queue::QueueReader for E2eQueueReader {
+        async fn plan_segments(
+            &self,
+            _topic: &icegate_queue::Topic,
+            _start_offset: u64,
+            _group_by_column_name: &str,
+            _max_record_batches_per_task: usize,
+            _max_input_bytes_per_task: u64,
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<SegmentsPlan> {
+            Ok(self.plan.clone())
+        }
+
+        async fn read_segment(
+            &self,
+            _topic: &icegate_queue::Topic,
+            offset: u64,
+            record_batch_idxs: &[usize],
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<icegate_queue::RecordBatchStream> {
+            let row_groups = self.segments.get(&offset).cloned().unwrap_or_default();
+            let requested = record_batch_idxs.to_vec();
+            let batches = row_groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, row_group)| requested.contains(&idx).then_some(row_group.batch))
+                .map(Ok)
+                .collect::<Vec<_>>();
+            Ok(Box::pin(futures::stream::iter(batches)))
+        }
+
+        async fn read_segment_row_group_metadata(
+            &self,
+            _topic: &icegate_queue::Topic,
+            offset: u64,
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<HashMap<usize, String>> {
+            let row_groups = self.segments.get(&offset).cloned().unwrap_or_default();
+            Ok(row_groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|(row_group_idx, row_group)| row_group.metadata.map(|metadata| (row_group_idx, metadata)))
+                .collect())
+        }
+    }
+
+    struct E2ePlanStorage;
+
+    #[async_trait]
+    impl Storage for E2ePlanStorage {
+        async fn get_last_offset(&self, _cancel_token: &CancellationToken) -> Result<Option<u64>> {
+            Ok(None)
+        }
+
+        async fn write_record_batches(
+            &self,
+            _batches: crate::shift::iceberg_storage::BoxRecordBatchStream,
+            _cancel_token: &CancellationToken,
+        ) -> Result<WrittenDataFiles> {
+            panic!("write_record_batches is not expected in plan stage");
+        }
+
+        async fn get_data_files(
+            &self,
+            _parquet_paths: &[String],
+            _cancel_token: &CancellationToken,
+        ) -> Result<Vec<DataFile>> {
+            panic!("get_data_files is not expected in plan stage");
+        }
+
+        async fn commit(
+            &self,
+            _data_files: Vec<DataFile>,
+            _record_type: &str,
+            _last_offset: u64,
+            _cancel_token: &CancellationToken,
+        ) -> Result<usize> {
+            panic!("commit is not expected in plan stage");
+        }
+    }
+
+    #[derive(Clone)]
+    struct AddedTaskDefinition {
+        id: Uuid,
+        code: TaskCode,
+        input: Vec<u8>,
+    }
+
+    struct E2eManager {
+        added_tasks: std::sync::Mutex<Vec<AddedTaskDefinition>>,
+        completed_tasks: std::sync::Mutex<Vec<Uuid>>,
+    }
+
+    impl E2eManager {
+        fn new() -> Self {
+            Self {
+                added_tasks: std::sync::Mutex::new(Vec::new()),
+                completed_tasks: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl JobManager for E2eManager {
+        fn add_task(&self, task_def: TaskDefinition) -> std::result::Result<Uuid, icegate_jobmanager::Error> {
+            let task_id = Uuid::new_v4();
+            self.added_tasks.lock().expect("added tasks lock").push(AddedTaskDefinition {
+                id: task_id,
+                code: task_def.code().clone(),
+                input: task_def.input().to_vec(),
+            });
+            Ok(task_id)
+        }
+
+        fn complete_task(
+            &self,
+            task_id: &Uuid,
+            _output: Vec<u8>,
+        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+            self.completed_tasks.lock().expect("completed tasks lock").push(*task_id);
+            Ok(())
+        }
+
+        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("fail_task is not expected in e2e test");
+        }
+
+        fn set_next_start_at(
+            &self,
+            _next_start_at: DateTime<Utc>,
+        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("set_next_start_at is not expected in e2e test");
+        }
+
+        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
+            panic!("get_task is not expected in e2e test");
+        }
+
+        fn get_tasks_by_code(
+            &self,
+            _code: &TaskCode,
+        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, icegate_jobmanager::Error> {
+            panic!("get_tasks_by_code is not expected in e2e test");
+        }
+    }
+
+    fn build_segments_plan(segments: &[E2eWalSegment]) -> SegmentsPlan {
+        let mut groups: BTreeMap<String, BTreeMap<u64, Vec<QueuePlannedRowGroup>>> = BTreeMap::new();
+        let mut total_row_groups = 0usize;
+        for segment in segments {
+            for (row_group_idx, row_group) in segment.row_groups.iter().enumerate() {
+                let tenant_ids = row_group
+                    .batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("tenant_id");
+                let tenant_id = tenant_ids.value(0).to_string();
+                groups
+                    .entry(tenant_id)
+                    .or_default()
+                    .entry(segment.offset)
+                    .or_default()
+                    .push(QueuePlannedRowGroup {
+                        row_group_idx,
+                        row_group_bytes: 1,
+                        row_group_metadata: row_group.metadata.clone(),
+                    });
+                total_row_groups = total_row_groups.saturating_add(1);
+            }
+        }
+
+        let grouped = groups
+            .into_iter()
+            .map(|(tenant_id, by_segment)| {
+                let segments = by_segment
+                    .into_iter()
+                    .map(|(segment_offset, row_groups)| SegmentRecordBatchIdxs {
+                        segment_offset,
+                        row_groups,
+                    })
+                    .collect::<Vec<_>>();
+                let record_batches_total = segments.iter().map(|segment| segment.row_groups.len()).sum::<usize>();
+                GroupedSegmentsPlan {
+                    group_col_val: tenant_id,
+                    segments_count: segments.len(),
+                    record_batches_total,
+                    input_bytes_total: record_batches_total as u64,
+                    segments,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        SegmentsPlan {
+            groups: grouped,
+            last_segment_offset: segments.iter().map(|segment| segment.offset).max(),
+            segments_count: segments.len(),
+            record_batches_total: total_row_groups,
+            input_bytes_total: total_row_groups as u64,
+        }
+    }
+
+    fn test_timeouts() -> TimeoutEstimator {
+        TimeoutEstimator::new(&crate::shift::config::ShiftTimeoutsConfig {
+            plan_base_ms: 1,
+            shift_base_ms: 1,
+            shift_per_record_batch_ms: 1,
+            shift_per_segment_ms: 1,
+            commit_base_ms: 1,
+            commit_per_parquet_file_ms: 1,
+        })
+        .expect("timeouts")
+    }
+
     #[tokio::test]
     async fn run_preserves_segment_order_when_reads_complete_out_of_order() {
         let queue_reader = Arc::new(FakeQueueReader {
@@ -1040,6 +1327,7 @@ mod tests {
         let writes = storage.writes.lock().await;
         assert_eq!(writes.len(), 1);
         assert_eq!(values_from_batches(&writes[0]), vec![1, 2, 3]);
+        drop(writes);
     }
 
     #[tokio::test]
@@ -1097,6 +1385,7 @@ mod tests {
         let writes = storage.writes.lock().await;
         assert_eq!(writes.len(), 1);
         assert_eq!(values_from_batches(&writes[0]), vec![3, 1, 2, 4]);
+        drop(writes);
     }
 
     #[tokio::test]
@@ -1154,6 +1443,7 @@ mod tests {
         let writes = storage.writes.lock().await;
         assert_eq!(writes.len(), 1);
         let parquet_bytes = parquet_bytes_from_batches(&writes[0]);
+        drop(writes);
         let bounds = service_name_bounds_from_parquet(parquet_bytes);
 
         assert_eq!(
@@ -1228,10 +1518,12 @@ mod tests {
             writes[1].iter().map(arrow::record_batch::RecordBatch::num_rows).sum::<usize>(),
             3
         );
+        drop(writes);
 
         let completed = manager.completed.lock().expect("completed lock");
         assert_eq!(completed.len(), 1);
         let output: ShiftOutput = serde_json::from_slice(&completed[0].1).expect("shift output");
+        drop(completed);
         assert_eq!(
             output.parquet_files,
             vec!["s3://warehouse/logs/part-00001.parquet".to_string()]
@@ -1333,7 +1625,7 @@ mod tests {
     async fn run_proves_concurrent_reads_for_parallelism_greater_than_one() {
         let active_reads = Arc::new(AtomicUsize::new(0));
         let max_active_reads = Arc::new(AtomicUsize::new(0));
-        let segments = vec![
+        let segments = [
             vec![logs_batch_for_shift(vec![
                 (Some("acc"), Some("svc"), Some(100), 1),
                 (Some("acc"), Some("svc"), Some(70), 2),
@@ -1439,7 +1731,7 @@ mod tests {
     async fn run_keeps_reads_strictly_sequential_for_parallelism_one() {
         let active_reads = Arc::new(AtomicUsize::new(0));
         let max_active_reads = Arc::new(AtomicUsize::new(0));
-        let segments = vec![
+        let segments = [
             vec![ordered_single_row_batch("svc", 30, 1)],
             vec![ordered_single_row_batch("svc", 30, 2)],
             vec![ordered_single_row_batch("svc", 30, 3)],
@@ -1525,7 +1817,7 @@ mod tests {
     async fn run_respects_shift_segment_read_parallelism_for_reading() {
         let active_reads = Arc::new(AtomicUsize::new(0));
         let max_active_reads = Arc::new(AtomicUsize::new(0));
-        let segments = vec![
+        let segments = [
             vec![ordered_single_row_batch("svc-01", 30, 1)],
             vec![ordered_single_row_batch("svc-02", 20, 2)],
             vec![ordered_single_row_batch("svc-03", 10, 3)],
@@ -1674,5 +1966,133 @@ mod tests {
             "cancellation must stop scheduling reads beyond the in-flight parallelism window"
         );
         assert_eq!(active_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_end_to_end_mixed_tenant_planning_and_shift_merge_preserves_boundaries_and_order() {
+        let ingest_segment_100 = logs_ingest_batch(vec![
+            ("tenant-b", Some("acc-2"), Some("svc-z"), Some(10), 900),
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 101),
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 102),
+            ("tenant-b", Some("acc-2"), Some("svc-y"), Some(20), 901),
+            ("tenant-a", Some("acc-1"), Some("svc-0"), Some(110), 103),
+            ("tenant-a", Some("acc-2"), Some("svc-a"), Some(50), 104),
+        ]);
+        let ingest_segment_101 = logs_ingest_batch(vec![
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 201),
+            ("tenant-b", Some("acc-2"), Some("svc-x"), Some(30), 902),
+            ("tenant-a", Some("acc-1"), Some("svc-2"), Some(90), 202),
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 203),
+            ("tenant-b", Some("acc-1"), Some("svc-a"), Some(70), 903),
+        ]);
+        let prepared_100 = sort_logs(&ingest_segment_100, 2, None)
+            .expect("prepare WAL segment 100")
+            .expect("segment 100 row groups");
+        let prepared_101 = sort_logs(&ingest_segment_101, 2, None)
+            .expect("prepare WAL segment 101")
+            .expect("segment 101 row groups");
+
+        let wal_segments = vec![
+            E2eWalSegment {
+                offset: 100,
+                row_groups: prepared_100.write_request.row_groups,
+            },
+            E2eWalSegment {
+                offset: 101,
+                row_groups: prepared_101.write_request.row_groups,
+            },
+        ];
+        let segments_map = wal_segments
+            .iter()
+            .map(|segment| (segment.offset, segment.row_groups.clone()))
+            .collect::<HashMap<_, _>>();
+        let queue_reader = Arc::new(E2eQueueReader {
+            plan: build_segments_plan(&wal_segments),
+            segments: segments_map,
+        });
+
+        let plan_runner = PlanTaskRunnerImpl::new(
+            Arc::clone(&queue_reader),
+            Arc::new(E2ePlanStorage),
+            Arc::new(ShiftConfig::default()),
+            test_timeouts(),
+            "logs",
+        );
+        let manager = E2eManager::new();
+        let cancel = CancellationToken::new();
+        let plan_result = plan_runner
+            .run(Uuid::new_v4(), &manager, &cancel)
+            .await
+            .expect("plan runner should schedule shift tasks");
+
+        assert_eq!(plan_result.status, TaskStatus::Ok);
+        assert_eq!(
+            plan_result.shift_task_ids.len(),
+            2,
+            "two tenants must produce two shift tasks"
+        );
+
+        let added_tasks = manager.added_tasks.lock().expect("added tasks lock").clone();
+        let mut shift_inputs = added_tasks
+            .iter()
+            .filter(|task| task.code == TaskCode::new(SHIFT_TASK_CODE))
+            .map(|task| {
+                let input: ShiftInput = serde_json::from_slice(&task.input).expect("shift input");
+                (task.id, input)
+            })
+            .collect::<Vec<_>>();
+        shift_inputs.sort_by(|left, right| left.1.tenant_id.cmp(&right.1.tenant_id));
+        assert_eq!(shift_inputs.len(), 2);
+
+        let expected_row_ids_by_tenant = HashMap::from([
+            ("tenant-a".to_string(), vec![103, 101, 102, 201, 203, 202, 104]),
+            ("tenant-b".to_string(), vec![903, 902, 901, 900]),
+        ]);
+
+        for (task_id, shift_input) in shift_inputs {
+            let storage = Arc::new(FakeStorage::fail_then_succeed(
+                0,
+                vec![test_data_file(
+                    &format!("s3://warehouse/logs/{}/part-0001.parquet", shift_input.tenant_id),
+                    1,
+                )],
+            ));
+            let shift_runner = ShiftTaskRunnerImpl::new(Arc::clone(&queue_reader), Arc::clone(&storage), "logs", 2)
+                .with_segment_read_parallelism(2)
+                .expect("valid read parallelism");
+            let manager = RecordingJobManager::new();
+            let task = Arc::new(TestTask {
+                id: task_id,
+                code: TaskCode::new(SHIFT_TASK_CODE),
+                input: serde_json::to_vec(&shift_input).expect("serialize shift input"),
+                output: Vec::new(),
+                error: String::new(),
+                depends_on: Vec::new(),
+            });
+
+            let result = shift_runner.run(task, &manager, &cancel).await.expect("shift task run");
+            assert_eq!(result.status, TaskStatus::Ok);
+
+            let writes = storage.writes.lock().await;
+            assert_eq!(writes.len(), 1, "shift task must write one merged stream");
+
+            let tenant_ids = tenant_ids_from_batches(&writes[0]);
+            assert!(
+                tenant_ids.iter().all(|tenant_id| tenant_id == &shift_input.tenant_id),
+                "tenant boundary violated: expected only {}, got {:?}",
+                shift_input.tenant_id,
+                tenant_ids
+            );
+
+            let actual_row_ids = row_ids_from_batches(&writes[0]);
+            drop(writes);
+            let expected_row_ids = expected_row_ids_by_tenant
+                .get(&shift_input.tenant_id)
+                .expect("expected rows by tenant");
+            assert_eq!(
+                &actual_row_ids, expected_row_ids,
+                "merged order must match sort order and WAL-stable tie-breakers"
+            );
+        }
     }
 }

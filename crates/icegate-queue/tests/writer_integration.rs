@@ -247,7 +247,6 @@ async fn test_multi_batch_request_gets_single_ack_and_multiple_row_groups() -> R
 #[tokio::test]
 async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -> Result<(), Box<dyn std::error::Error>>
 {
-    use icegate_common::RowGroupBoundaryRange;
     use icegate_queue::ParquetQueueReader;
     use tokio_util::sync::CancellationToken;
 
@@ -258,11 +257,11 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
-    let batch_a = common::logs_batch(vec![
+    let batch_a = common::logs_batch(&[
         (Some("acc-1"), Some("svc-2"), Some(40), 1),
         (Some("acc-1"), Some("svc-2"), Some(30), 2),
     ]);
-    let batch_b = common::logs_batch(vec![
+    let batch_b = common::logs_batch(&[
         (Some("acc-2"), Some("svc-1"), Some(20), 3),
         (Some("acc-2"), Some("svc-1"), Some(10), 4),
     ]);
@@ -293,11 +292,11 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
 
     assert_eq!(metadata.len(), 2);
     assert_eq!(
-        serde_json::from_str::<RowGroupBoundaryRange>(metadata.get(&0).expect("row group 0 metadata"))?,
+        serde_json::from_str::<common::RowGroupBoundaryRange>(metadata.get(&0).expect("row group 0 metadata"))?,
         expected_a
     );
     assert_eq!(
-        serde_json::from_str::<RowGroupBoundaryRange>(metadata.get(&1).expect("row group 1 metadata"))?,
+        serde_json::from_str::<common::RowGroupBoundaryRange>(metadata.get(&1).expect("row group 1 metadata"))?,
         expected_b
     );
     Ok(())
@@ -316,28 +315,28 @@ async fn test_requests_in_same_flush_share_offset_but_keep_own_record_counts() -
     let writer = QueueWriter::new(config, store);
     let handle = writer.start(rx);
 
-    let (response_tx1, response_rx1) = oneshot::channel();
+    let (first_response_tx, first_response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
         row_groups: common::prepared_row_groups(vec![common::test_batch(3, 1)?, common::test_batch(4, 1)?]),
-        response_tx: response_tx1,
+        response_tx: first_response_tx,
         trace_context: None,
     })
     .await
     .unwrap();
 
-    let (response_tx2, response_rx2) = oneshot::channel();
+    let (second_response_tx, second_response_rx) = oneshot::channel();
     tx.send(WriteRequest {
         topic: "logs".to_string(),
         row_groups: common::prepared_row_groups(vec![common::test_batch(5, 1)?]),
-        response_tx: response_tx2,
+        response_tx: second_response_tx,
         trace_context: None,
     })
     .await
     .unwrap();
 
-    let result1 = response_rx1.await.unwrap();
-    let result2 = response_rx2.await.unwrap();
+    let result1 = first_response_rx.await.unwrap();
+    let result2 = second_response_rx.await.unwrap();
 
     assert!(result1.is_success());
     assert!(result2.is_success());

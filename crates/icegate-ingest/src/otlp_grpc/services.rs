@@ -97,6 +97,7 @@ impl LogsService for OtlpGrpcService {
         let span = tracing::Span::current();
         let transform_start = Instant::now();
         let batch = tokio::task::spawn_blocking(move || {
+            // TODO(med): Add a check - if the request size is not large, then we do not go into a separate thread. With small volumes, the overhead on the stream will not cover the costs.
             span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
         })
         .await
@@ -114,21 +115,21 @@ impl LogsService for OtlpGrpcService {
         debug!(records = record_count, "Transformed OTLP logs to RecordBatch");
         request_metrics.record_records_per_request(record_count);
 
+        let wal_row_group_size = self.wal_row_group_size;
         let trace_context = icegate_common::extract_current_trace_context();
         let prepare_start = Instant::now();
-        let prepared = crate::wal_sort::prepare_sorted_logs_for_wal(&batch, self.wal_row_group_size, trace_context)
-            .map_err(|err| {
-                request_metrics.finish_error();
-                Status::from(GrpcError(err))
-            })?;
-        request_metrics.record_transform_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
+        let prepared = crate::wal::sort_logs(&batch, wal_row_group_size, trace_context).map_err(|err| {
+            request_metrics.finish_error();
+            Status::from(GrpcError(err))
+        })?;
+        request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
         let Some(prepared) = prepared else {
             request_metrics.finish_ok();
             return Ok(Response::new(ExportLogsServiceResponse { partial_success: None }));
         };
 
         let enqueue_start = Instant::now();
-        let pending = crate::wal_sort::submit_sorted_logs_to_wal(&self.write_channel, prepared)
+        let pending = crate::wal::submit_sorted_logs_to_wal(&self.write_channel, prepared)
             .await
             .map_err(|err| {
                 request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
@@ -146,7 +147,7 @@ impl LogsService for OtlpGrpcService {
         })?;
 
         match ack_outcome {
-            crate::wal_sort::WalAckOutcome::Success(write_result) => {
+            crate::wal::WalAckOutcome::Success(write_result) => {
                 if let Some(trace_context) = write_result.trace_context.as_deref() {
                     icegate_common::add_span_link(trace_context);
                 }
@@ -159,7 +160,7 @@ impl LogsService for OtlpGrpcService {
                 request_metrics.finish_ok();
                 Ok(Response::new(ExportLogsServiceResponse { partial_success: None }))
             }
-            crate::wal_sort::WalAckOutcome::Partial(partial) => {
+            crate::wal::WalAckOutcome::Partial(partial) => {
                 if let Some(trace_context) = partial.trace_context.as_deref() {
                     icegate_common::add_span_link(trace_context);
                 }
@@ -337,5 +338,18 @@ mod tests {
             .await
             .expect_err("grpc status");
         assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn export_logs_returns_internal_when_wal_prepare_fails_in_blocking_worker() {
+        let (tx, mut rx) = channel(1);
+        let service = OtlpGrpcService::new(tx, 0, OtlpMetrics::new_disabled());
+
+        let status = LogsService::export(&service, Request::new(create_test_request()))
+            .await
+            .expect_err("grpc status");
+
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(rx.try_recv().is_err());
     }
 }

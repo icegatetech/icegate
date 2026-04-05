@@ -14,9 +14,9 @@ pub mod instrumentation;
 pub mod parquet_meta_reader;
 /// Plan task runner for shift operations.
 pub mod plan_runner;
+mod row_groups_merger;
 /// Shift task runner for shift operations.
 pub mod shift_runner;
-mod sorted_batch_merger;
 /// Task timeout estimation utilities.
 mod timeout;
 
@@ -24,13 +24,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
 use commit_runner::CommitTaskRunnerImpl;
-pub use config::ShiftConfig;
-pub use executor::{
+pub(crate) use config::ShiftConfig;
+pub(crate) use executor::{
     COMMIT_TASK_CODE, CommitInput, Executor, PLAN_TASK_CODE, PlannedRowGroup, SHIFT_TASK_CODE, SegmentToRead,
     ShiftInput, ShiftOutput,
 };
 use iceberg::Catalog;
-pub use iceberg_storage::{IcebergStorage, WrittenDataFiles};
+pub(crate) use iceberg_storage::IcebergStorage;
 use icegate_common::{LOGS_TABLE, LOGS_TOPIC};
 use icegate_jobmanager::{
     CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
@@ -41,7 +41,6 @@ use instrumentation::{
     CommitTaskRunnerWithMetrics, PlanTaskRunnerWithMetrics, QueueReaderWithMetrics, ShiftTaskRunnerWithMetrics,
     StorageWithMetrics,
 };
-pub use parquet_meta_reader::data_files_from_parquet_paths;
 use plan_runner::PlanTaskRunnerImpl;
 use shift_runner::ShiftTaskRunnerImpl;
 use timeout::TimeoutEstimator;

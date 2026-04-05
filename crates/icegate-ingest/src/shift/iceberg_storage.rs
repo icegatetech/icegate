@@ -40,8 +40,13 @@ use uuid::Uuid;
 use super::{config::ShiftConfig, parquet_meta_reader::data_files_from_parquet_paths};
 use crate::error::{IngestError, Result};
 
-// TODO(crit): зачем это?
-
+/// Wrapper around the default Iceberg location generator that records every
+/// generated output path.
+///
+/// Parquet files may already be created in object storage before the write
+/// pipeline finishes successfully. If the write later fails, the shift task
+/// must remove those orphaned files. This wrapper keeps the generated paths so
+/// cleanup can delete everything that was allocated during the failed write.
 #[derive(Clone, Debug)]
 struct TrackingLocationGenerator {
     inner: DefaultLocationGenerator,
@@ -49,7 +54,7 @@ struct TrackingLocationGenerator {
 }
 
 impl TrackingLocationGenerator {
-    fn new(inner: DefaultLocationGenerator, generated_paths: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+    const fn new(inner: DefaultLocationGenerator, generated_paths: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
         Self { inner, generated_paths }
     }
 }
@@ -57,10 +62,10 @@ impl TrackingLocationGenerator {
 impl LocationGenerator for TrackingLocationGenerator {
     fn generate_location(&self, partition_key: Option<&iceberg::spec::PartitionKey>, file_name: &str) -> String {
         let path = self.inner.generate_location(partition_key, file_name);
-        let mut generated_paths = self
-            .generated_paths
-            .lock()
-            .expect("tracking location generator mutex must not be poisoned");
+        let mut generated_paths = match self.generated_paths.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         generated_paths.push(path.clone());
         path
     }
@@ -221,6 +226,7 @@ impl IcebergStorage {
         let write_id = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(write_id.to_string(), None, DataFileFormat::Parquet);
 
+        // TODO(med): add semaphore/CPU budget. The limit should protect ingest from ZSTD spikes during multiple shift tasks.
         let writer_props = WriterProperties::builder()
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_data_page_row_count_limit(row_group_size / 10)
@@ -426,10 +432,10 @@ impl IcebergStorage {
 }
 
 async fn cleanup_generated_data_files(file_io: &FileIO, generated_paths: &Arc<std::sync::Mutex<Vec<String>>>) {
-    let generated = generated_paths
-        .lock()
-        .expect("generated paths mutex must not be poisoned")
-        .clone();
+    let generated = match generated_paths.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
     let mut unique_paths = HashSet::with_capacity(generated.len());
 
     for path in generated {

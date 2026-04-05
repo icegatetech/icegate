@@ -251,14 +251,14 @@ impl QueueWriter {
             Ok(offset) => {
                 self.events.on_flush_finish(topic.as_str(), "ok", flush_start.elapsed());
                 debug!(offset, "Flush completed");
-                pending_flush.send_success(offset, flush_trace_context.clone());
+                pending_flush.send_success(offset, flush_trace_context.as_deref());
                 Ok(())
             }
             Err(e) => {
                 self.events.on_flush_finish(topic.as_str(), "error", flush_start.elapsed());
                 self.events.on_write_error(topic.as_str(), write_error_reason(&e));
                 let reason = e.to_string();
-                pending_flush.send_failure(reason, flush_trace_context.clone());
+                pending_flush.send_failure(reason, flush_trace_context.as_deref());
                 Err(e)
             }
         }
@@ -881,28 +881,28 @@ mod tests {
         let (tx, rx) = channel(10);
         let handle = writer.start(rx);
 
-        let (response_tx1, response_rx1) = oneshot::channel();
+        let (first_response_tx, first_response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             row_groups: vec![prepared_batch(), prepared_batch()],
-            response_tx: response_tx1,
+            response_tx: first_response_tx,
             trace_context: None,
         })
         .await
         .unwrap();
 
-        let (response_tx2, response_rx2) = oneshot::channel();
+        let (second_response_tx, second_response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
             row_groups: vec![prepared_batch()],
-            response_tx: response_tx2,
+            response_tx: second_response_tx,
             trace_context: None,
         })
         .await
         .unwrap();
 
-        let result1 = response_rx1.await.unwrap();
-        let result2 = response_rx2.await.unwrap();
+        let result1 = first_response_rx.await.unwrap();
+        let result2 = second_response_rx.await.unwrap();
 
         assert_eq!(result1.offset(), Some(0));
         assert_eq!(result2.offset(), Some(0));

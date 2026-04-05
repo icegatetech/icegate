@@ -95,6 +95,8 @@ pub struct PlannedRowGroup {
     pub row_group_idx: usize,
     /// Compressed row group size in bytes.
     pub row_group_bytes: u64,
+    /// Optional opaque row-group metadata captured from the parquet footer.
+    pub row_group_metadata: Option<String>,
 }
 
 /// Planned row groups inside a WAL segment.
@@ -188,7 +190,7 @@ pub trait QueueReader: Send + Sync {
         cancel_token: &CancellationToken,
     ) -> Result<RecordBatchStream>;
 
-    /// Read optional opaque row-group metadata for a segment.
+    /// Read optional opaque (raw) row-group metadata for a segment.
     async fn read_segment_row_group_metadata(
         &self,
         topic: &Topic,
@@ -578,6 +580,7 @@ impl ParquetQueueReader {
     ) -> Result<SegmentRowGroups> {
         // it is necessary to return the temp buffer (SegmentRowGroups), because the function is used in spawn
 
+        let metadata_by_row_group = Self::row_group_metadata_from_parquet(parquet_meta, wal_offset)?;
         let schema = parquet_meta.file_metadata().schema_descr();
         let column_idx = schema
             .columns()
@@ -598,6 +601,7 @@ impl ParquetQueueReader {
                 plan: PlannedRowGroup {
                     row_group_idx,
                     row_group_bytes,
+                    row_group_metadata: metadata_by_row_group.get(&row_group_idx).cloned(),
                 },
             });
         }

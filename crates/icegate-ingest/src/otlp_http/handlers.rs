@@ -75,6 +75,7 @@ pub async fn ingest_logs(
 
     // Parse the request based on content type
     let export_request = request_metrics
+        // TODO(med): Add a check - if the request size is not large, then we do not go into a separate thread. With small volumes, the overhead on the stream will not cover the costs.
         .record_decode(content_type, || parse_logs_request(content_type, &body))
         .map_err(OtlpError::from)?;
 
@@ -84,10 +85,10 @@ pub async fn ingest_logs(
     let span = tracing::Span::current();
     let transform_start = Instant::now();
     let batch = tokio::task::spawn_blocking(move || {
+        // TODO(med): Add a check - if the request size is not large, then we do not go into a separate thread. With small volumes, the overhead on the stream will not cover the costs.
         span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
     })
     .await??;
-    // TODO(crit): really need this?
     request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
     let Some(batch) = batch else {
         // No records to process - return success with 0 rejected
@@ -102,20 +103,18 @@ pub async fn ingest_logs(
 
     let trace_context = icegate_common::extract_current_trace_context();
     let prepare_start = Instant::now();
-    let prepared = crate::wal_sort::prepare_sorted_logs_for_wal(&batch, state.wal_row_group_size, trace_context)
-        .map_err(|e| {
-            request_metrics.finish_error();
-            OtlpError(e)
-        })?;
-    // TODO(crit): metric is same that upside
-    request_metrics.record_transform_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
+    let prepared = crate::wal::sort_logs(&batch, state.wal_row_group_size, trace_context).map_err(|e| {
+        request_metrics.finish_error();
+        OtlpError(e)
+    })?;
+    request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
     let Some(prepared) = prepared else {
         request_metrics.finish_ok();
         return Ok(Json(ExportLogsResponse::default()));
     };
 
     let enqueue_start = Instant::now();
-    let pending = crate::wal_sort::submit_sorted_logs_to_wal(&state.write_channel, prepared)
+    let pending = crate::wal::submit_sorted_logs_to_wal(&state.write_channel, prepared)
         .await
         .map_err(|e| {
             request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
@@ -133,7 +132,7 @@ pub async fn ingest_logs(
     })?;
 
     match ack_outcome {
-        crate::wal_sort::WalAckOutcome::Success(write_result) => {
+        crate::wal::WalAckOutcome::Success(write_result) => {
             if let Some(trace_context) = write_result.trace_context.as_deref() {
                 icegate_common::add_span_link(trace_context);
             }
@@ -146,7 +145,7 @@ pub async fn ingest_logs(
             request_metrics.finish_ok();
             Ok(Json(ExportLogsResponse::default()))
         }
-        crate::wal_sort::WalAckOutcome::Partial(partial) => {
+        crate::wal::WalAckOutcome::Partial(partial) => {
             if let Some(trace_context) = partial.trace_context.as_deref() {
                 icegate_common::add_span_link(trace_context);
             }
@@ -406,5 +405,19 @@ mod tests {
 
         let result = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ingest_logs_returns_error_when_wal_prepare_fails_in_blocking_worker() {
+        let (tx, mut rx) = channel(1);
+        let state = OtlpHttpState {
+            write_channel: tx,
+            wal_row_group_size: 0,
+            metrics: OtlpMetrics::new_disabled(),
+        };
+
+        let result = ingest_logs(State(state), HeaderMap::new(), encode_protobuf_request()).await;
+        assert!(result.is_err());
+        assert!(rx.try_recv().is_err());
     }
 }
