@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use icegate_common::RowGroupBoundaryKey;
+use icegate_common::RowGroupBoundaryRange;
 use icegate_jobmanager::{ImmutableTask, JobManager, registry::TaskExecutorFn};
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +45,7 @@ impl TaskStatus {
     }
 }
 
+// TODO(crit): точно ли тут место?
 /// Planned row group to read from WAL.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PlannedRowGroup {
@@ -52,8 +53,8 @@ pub struct PlannedRowGroup {
     pub row_group_idx: usize,
     /// Compressed row group size in bytes.
     pub row_group_bytes: u64,
-    /// Exact first-row merge key for this row group.
-    pub boundary_key: RowGroupBoundaryKey,
+    /// Inclusive merge-key boundary range for this row group.
+    pub boundary_range: RowGroupBoundaryRange,
 }
 
 /// Segment metadata used for shift input. Segments are WAL files.

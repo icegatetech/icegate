@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -12,6 +12,7 @@ use futures::{Stream, TryStreamExt};
 use iceberg::{
     Catalog, NamespaceIdent, TableIdent,
     arrow::RecordBatchPartitionSplitter,
+    io::FileIO,
     spec::{DataFile, DataFileFormat},
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
@@ -19,7 +20,7 @@ use iceberg::{
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
             ParquetWriterBuilder,
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator},
             rolling_writer::RollingFileWriterBuilder,
         },
         partitioning::{PartitioningWriter, fanout_writer::FanoutWriter},
@@ -33,11 +34,37 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
 use super::{config::ShiftConfig, parquet_meta_reader::data_files_from_parquet_paths};
 use crate::error::{IngestError, Result};
+
+// TODO(crit): зачем это?
+
+#[derive(Clone, Debug)]
+struct TrackingLocationGenerator {
+    inner: DefaultLocationGenerator,
+    generated_paths: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl TrackingLocationGenerator {
+    fn new(inner: DefaultLocationGenerator, generated_paths: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        Self { inner, generated_paths }
+    }
+}
+
+impl LocationGenerator for TrackingLocationGenerator {
+    fn generate_location(&self, partition_key: Option<&iceberg::spec::PartitionKey>, file_name: &str) -> String {
+        let path = self.inner.generate_location(partition_key, file_name);
+        let mut generated_paths = self
+            .generated_paths
+            .lock()
+            .expect("tracking location generator mutex must not be poisoned");
+        generated_paths.push(path.clone());
+        path
+    }
+}
 
 /// Result of writing batches into parquet data files.
 pub struct WrittenDataFiles {
@@ -184,7 +211,11 @@ impl IcebergStorage {
         let table_metadata = table.metadata().clone();
         let table_file_io = table.file_io().clone();
 
-        let location_generator = DefaultLocationGenerator::new(table_metadata.clone()).map_err(IngestError::Iceberg)?;
+        let generated_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let location_generator = TrackingLocationGenerator::new(
+            DefaultLocationGenerator::new(table_metadata.clone()).map_err(IngestError::Iceberg)?,
+            Arc::clone(&generated_paths),
+        );
 
         // Generate unique file prefix with UUID to avoid conflicts
         let write_id = Uuid::now_v7();
@@ -202,7 +233,7 @@ impl IcebergStorage {
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
             max_file_size_mb * 1024 * 1024,
-            table_file_io,
+            table_file_io.clone(),
             location_generator,
             file_name_generator,
         );
@@ -219,53 +250,63 @@ impl IcebergStorage {
         )
         .map_err(IngestError::Iceberg)?;
 
-        let mut rows_written = 0usize;
-        let mut partitioned_batches_total = 0usize;
-        while let Some(batch) = batches.try_next().await? {
-            if cancel_token.is_cancelled() {
-                return Err(IngestError::Shift(
-                    "shift task cancelled during parquet write".to_string(),
-                ));
-            }
-            rows_written = rows_written
-                .checked_add(batch.num_rows())
-                .ok_or_else(|| IngestError::Shift("rows written overflow".to_string()))?;
-            let partitioned_batches = splitter
-                .split(&batch)
-                .map_err(|e| IngestError::Shift(format!("failed to split batch by partition: {e}")))?;
-            partitioned_batches_total = partitioned_batches_total
-                .checked_add(partitioned_batches.len())
-                .ok_or_else(|| IngestError::Shift("partitioned batch count overflow".to_string()))?;
+        let write_result = async {
+            let mut rows_written = 0usize;
+            let mut partitioned_batches_total = 0usize;
+            while let Some(batch) = batches.try_next().await? {
+                if cancel_token.is_cancelled() {
+                    return Err(IngestError::Shift(
+                        "shift task cancelled during parquet write".to_string(),
+                    ));
+                }
+                rows_written = rows_written
+                    .checked_add(batch.num_rows())
+                    .ok_or_else(|| IngestError::Shift("rows written overflow".to_string()))?;
+                let partitioned_batches = splitter
+                    .split(&batch)
+                    .map_err(|e| IngestError::Shift(format!("failed to split batch by partition: {e}")))?;
+                partitioned_batches_total = partitioned_batches_total
+                    .checked_add(partitioned_batches.len())
+                    .ok_or_else(|| IngestError::Shift("partitioned batch count overflow".to_string()))?;
 
-            for (partition_key, partition_batch) in partitioned_batches {
-                let partition_path = partition_key.to_path();
-                let span = tracing::info_span!(
-                    "iceberg_partition_write",
-                    partition_key = %partition_path,
-                    rows = partition_batch.num_rows()
-                );
-                fanout_writer
-                    .write(partition_key, partition_batch)
-                    .instrument(span)
-                    .await
-                    .map_err(IngestError::Iceberg)?;
+                for (partition_key, partition_batch) in partitioned_batches {
+                    let partition_path = partition_key.to_path();
+                    let span = tracing::info_span!(
+                        "iceberg_partition_write",
+                        partition_key = %partition_path,
+                        rows = partition_batch.num_rows()
+                    );
+                    fanout_writer
+                        .write(partition_key, partition_batch)
+                        .instrument(span)
+                        .await
+                        .map_err(IngestError::Iceberg)?;
+                }
             }
+
+            // Close writer and get data files
+            let span = tracing::info_span!("iceberg_write_close");
+            let data_files: Vec<DataFile> =
+                fanout_writer.close().instrument(span).await.map_err(IngestError::Iceberg)?;
+
+            tracing::info!(
+                "Complete write {} parquet files for {} partitions",
+                data_files.len(),
+                partitioned_batches_total
+            );
+
+            Ok(WrittenDataFiles {
+                data_files,
+                rows_written,
+            })
+        }
+        .await;
+
+        if write_result.is_err() {
+            cleanup_generated_data_files(&table_file_io, &generated_paths).await;
         }
 
-        // Close writer and get data files
-        let span = tracing::info_span!("iceberg_write_close");
-        let data_files: Vec<DataFile> = fanout_writer.close().instrument(span).await.map_err(IngestError::Iceberg)?;
-
-        tracing::info!(
-            "Complete write {} parquet files for {} partitions",
-            data_files.len(),
-            partitioned_batches_total
-        );
-
-        Ok(WrittenDataFiles {
-            data_files,
-            rows_written,
-        })
+        write_result
     }
 
     /// Commits parquet data files to Iceberg with offset tracking.
@@ -384,6 +425,31 @@ impl IcebergStorage {
     }
 }
 
+async fn cleanup_generated_data_files(file_io: &FileIO, generated_paths: &Arc<std::sync::Mutex<Vec<String>>>) {
+    let generated = generated_paths
+        .lock()
+        .expect("generated paths mutex must not be poisoned")
+        .clone();
+    let mut unique_paths = HashSet::with_capacity(generated.len());
+
+    for path in generated {
+        if !unique_paths.insert(path.clone()) {
+            continue;
+        }
+        match file_io.exists(&path).await {
+            Ok(true) => {
+                if let Err(err) = file_io.delete(&path).await {
+                    warn!(path = %path, error = %err, "failed to cleanup uncommitted parquet file");
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(path = %path, error = %err, "failed to check uncommitted parquet file existence");
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Storage for IcebergStorage {
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
@@ -467,5 +533,46 @@ impl TableLoader {
         });
 
         Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use iceberg::io::FileIO;
+
+    use super::cleanup_generated_data_files;
+
+    #[tokio::test]
+    async fn cleanup_generated_data_files_deletes_existing_paths() {
+        let file_io = FileIO::new_with_memory();
+        let path_1 = "memory://cleanup/test-1.parquet";
+        let path_2 = "memory://cleanup/test-2.parquet";
+
+        file_io
+            .new_output(path_1)
+            .expect("output path_1")
+            .write("one".into())
+            .await
+            .expect("write path_1");
+        file_io
+            .new_output(path_2)
+            .expect("output path_2")
+            .write("two".into())
+            .await
+            .expect("write path_2");
+
+        let generated_paths = Arc::new(std::sync::Mutex::new(vec![
+            path_1.to_string(),
+            path_1.to_string(),
+            path_2.to_string(),
+            "memory://cleanup/missing.parquet".to_string(),
+        ]));
+
+        cleanup_generated_data_files(&file_io, &generated_paths).await;
+
+        assert!(!file_io.exists(path_1).await.expect("exists path_1"));
+        assert!(!file_io.exists(path_2).await.expect("exists path_2"));
     }
 }

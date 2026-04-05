@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -11,15 +11,17 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use futures::{StreamExt, TryStreamExt};
-use icegate_common::{RowGroupBoundaryKey, compare_option_ord};
+use icegate_common::{RowGroupBoundaryRange, compare_option_ord};
 use icegate_queue::{QueueReader, RecordBatchStream, Topic};
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use crate::{
     error::{IngestError, Result},
     shift::executor::PlannedRowGroup,
 };
 
+// TODO(crit): from scheme
 const LOGS_MERGE_SORT_COLUMNS: [&str; 3] = ["cloud_account_id", "service_name", "timestamp"];
 
 enum CachedSortColumn {
@@ -43,7 +45,8 @@ struct MergeCursor {
     segment_row_idx: u64,
 }
 
-struct InputStreamState {
+/// /// Cluster is a set of Row Groups that are involved in sorting together at a given time
+struct ActiveClusterState {
     source: PlannedRowGroupRead,
     stream: Option<RecordBatchStream>,
     current_batch: Option<RecordBatch>,
@@ -51,7 +54,6 @@ struct InputStreamState {
     batch_generation: u64,
     cache: Option<SortColumnCache>,
     rows_consumed_total: u64,
-    open: bool,
 }
 
 struct MergeHeap {
@@ -65,10 +67,6 @@ impl MergeHeap {
 
     fn is_empty(&self) -> bool {
         self.cursors.is_empty()
-    }
-
-    fn peek(&self) -> Option<&MergeCursor> {
-        self.cursors.first()
     }
 
     fn push(&mut self, cursor: MergeCursor, comparator: &RowComparator<'_>) -> Result<()> {
@@ -121,11 +119,11 @@ impl MergeHeap {
 }
 
 struct RowComparator<'a> {
-    streams: &'a [InputStreamState],
+    streams: &'a [ActiveClusterState],
 }
 
 impl<'a> RowComparator<'a> {
-    fn new(streams: &'a [InputStreamState]) -> Self {
+    fn new(streams: &'a [ActiveClusterState]) -> Self {
         Self { streams }
     }
 
@@ -159,7 +157,7 @@ impl<'a> RowComparator<'a> {
 pub struct PlannedRowGroupRead {
     pub segment_offset: u64,
     pub row_group_idx: usize,
-    pub boundary_key: RowGroupBoundaryKey,
+    pub boundary_range: RowGroupBoundaryRange,
     pub plan_idx: usize,
 }
 
@@ -177,8 +175,9 @@ impl PendingRowGroupEntry {
 impl Ord for PendingRowGroupEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.source
-            .boundary_key
-            .compare(&other.source.boundary_key)
+            .boundary_range
+            .min_key
+            .compare(&other.source.boundary_range.min_key)
             .then_with(|| self.source.plan_idx.cmp(&other.source.plan_idx))
     }
 }
@@ -189,65 +188,92 @@ impl PartialOrd for PendingRowGroupEntry {
     }
 }
 
+/// Cluster is a set of Row Groups that are involved in sorting together at a given time
+#[derive(Debug, Clone, Copy, Default)]
+struct ActiveClusterStats {
+    row_groups: usize,
+    segments: usize,
+    frontier_extensions: usize,
+}
+
+/// Immutable parameters that define how the merger reads and emits data.
+#[derive(Debug, Clone)]
+pub struct SortedBatchMergerConfig {
+    /// Maximum number of rows in a merged output batch.
+    pub row_group_size: usize,
+    /// Limit for opening row groups in parallel while building a cluster.
+    pub read_parallelism: usize,
+    /// Topic from which row groups are read.
+    pub topic: Topic,
+    /// Shared cancellation token for all queue reads.
+    pub cancel_token: CancellationToken,
+}
+
+/// Streams sorted row groups from WAL and merges them into one sorted output stream.
+///
+/// The merger only keeps one overlap cluster in memory at a time: it opens the
+/// row groups whose key ranges intersect, performs k-way merge across them, and
+/// then moves to the next cluster.
 pub struct SortedBatchMerger<Q: QueueReader + ?Sized> {
+    /// Immutable read/output settings.
+    config: SortedBatchMergerConfig,
+    /// Schema shared by all opened batches. Filled from the first batch.
     schema: SchemaRef,
-    row_group_size: usize,
+    /// Queue reader used to open WAL row groups as Arrow streams.
     queue_reader: Arc<Q>,
-    topic: Topic,
+    /// Row groups that are not opened yet, ordered by their lower boundary.
     pending_row_groups: BTreeSet<PendingRowGroupEntry>,
-    active_streams: Vec<InputStreamState>,
-    active_stream_count: usize,
-    read_parallelism: usize,
-    max_active_row_group_streams: usize,
+    /// Streams that belong to the current overlap cluster.
+    active_cluster_streams: Vec<ActiveClusterState>,
+    /// Min-heap of next candidate rows from active streams.
     heap: MergeHeap,
-    cancel_token: CancellationToken,
+    /// Debug stats for the cluster currently being merged.
+    active_cluster: Option<ActiveClusterStats>,
+    /// Prefetched merged batches, used to fail fast before storage starts writing.
+    prefetched_batches: VecDeque<RecordBatch>,
 }
 
 impl<Q> SortedBatchMerger<Q>
 where
     Q: QueueReader + 'static + ?Sized,
 {
-    #[allow(clippy::too_many_arguments)]
     pub async fn try_new(
         queue_reader: Arc<Q>,
-        topic: Topic,
         read_plan: Vec<PlannedRowGroupRead>,
-        row_group_size: usize,
-        read_parallelism: usize,
-        max_active_row_group_streams: usize,
-        cancel_token: CancellationToken,
+        config: SortedBatchMergerConfig,
     ) -> Result<Self> {
-        if row_group_size == 0 {
+        if config.row_group_size == 0 {
             return Err(IngestError::Config(
                 "row_group_size must be greater than zero".to_string(),
             ));
         }
-        if max_active_row_group_streams == 0 {
-            return Err(IngestError::Config(
-                "max_active_row_group_streams must be greater than zero".to_string(),
-            ));
-        }
-        if read_parallelism == 0 {
+        if config.read_parallelism == 0 {
             return Err(IngestError::Config(
                 "shift_segment_read_parallelism must be greater than zero".to_string(),
             ));
         }
 
-        let mut merger = Self {
+        Ok(Self {
+            config,
             schema: SchemaRef::new(arrow::datatypes::Schema::empty()),
-            row_group_size,
             queue_reader,
-            topic,
             pending_row_groups: read_plan.into_iter().map(PendingRowGroupEntry::new).collect(),
-            active_streams: Vec::new(),
-            active_stream_count: 0,
-            read_parallelism,
-            max_active_row_group_streams,
+            active_cluster_streams: Vec::new(),
             heap: MergeHeap::new(),
-            cancel_token,
-        };
-        merger.ensure_order_window().await?;
-        Ok(merger)
+            active_cluster: None,
+            prefetched_batches: VecDeque::new(),
+        })
+    }
+
+    /// Preload the first merged output batch so QueueRead failures happen
+    /// before the storage write pipeline is started.
+    pub async fn prefetch_first_batch(&mut self) -> Result<()> {
+        if self.prefetched_batches.is_empty() {
+            if let Some(batch) = self.next_batch_inner().await? {
+                self.prefetched_batches.push_back(batch);
+            }
+        }
+        Ok(())
     }
 
     pub fn into_stream(self) -> super::iceberg_storage::BoxRecordBatchStream {
@@ -261,134 +287,172 @@ where
     }
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        self.ensure_order_window().await?;
-        if self.heap.is_empty() {
-            return Ok(None);
+        if let Some(batch) = self.prefetched_batches.pop_front() {
+            return Ok(Some(batch));
         }
-
-        let mut source_batches = Vec::new();
-        let mut source_batch_idxs = HashMap::new();
-        let mut interleave_indices = Vec::with_capacity(self.row_group_size);
-
-        while interleave_indices.len() < self.row_group_size {
-            self.ensure_order_window().await?;
-            let Some(cursor) = ({
-                let comparator = RowComparator::new(&self.active_streams);
-                self.heap.pop(&comparator)?
-            }) else {
-                break;
-            };
-            let stream_state = self
-                .active_streams
-                .get(cursor.stream_idx)
-                .ok_or_else(|| IngestError::Shift("merge cursor stream index out of bounds".to_string()))?;
-            let current_batch = stream_state
-                .current_batch
-                .as_ref()
-                .ok_or_else(|| IngestError::Shift("merge cursor points to missing input batch".to_string()))?;
-            if stream_state.batch_generation != cursor.batch_generation {
-                return Err(IngestError::Shift("stale merge cursor generation".to_string()));
-            }
-
-            let source_idx =
-                if let Some(source_idx) = source_batch_idxs.get(&(cursor.stream_idx, cursor.batch_generation)) {
-                    *source_idx
-                } else {
-                    let source_idx = source_batches.len();
-                    source_batches.push(current_batch.clone());
-                    source_batch_idxs.insert((cursor.stream_idx, cursor.batch_generation), source_idx);
-                    source_idx
-                };
-            interleave_indices.push((source_idx, cursor.row_idx));
-
-            let next_cursor = self.advance_cursor(cursor).await?;
-            if let Some(next_cursor) = next_cursor {
-                let comparator = RowComparator::new(&self.active_streams);
-                self.heap.push(next_cursor, &comparator)?;
-            }
-        }
-
-        if interleave_indices.is_empty() {
-            return Ok(None);
-        }
-
-        let source_refs = source_batches.iter().collect::<Vec<_>>();
-        Ok(Some(interleave_record_batch(&source_refs, &interleave_indices)?))
+        self.next_batch_inner().await
     }
 
-    async fn ensure_order_window(&mut self) -> Result<()> {
+    async fn next_batch_inner(&mut self) -> Result<Option<RecordBatch>> {
         loop {
-            if self.heap.is_empty() && self.active_stream_count == 0 {
-                self.preopen_initial_window().await?;
-                if self.heap.is_empty() && self.pending_row_groups.is_empty() {
-                    return Ok(());
-                }
-                if self.heap.is_empty() {
-                    continue;
+            // Open the next group of overlapping ranges only when the current cluster is exhausted.
+            if self.heap.is_empty() {
+                if !self.open_next_overlap_cluster().await? {
+                    return Ok(None);
                 }
             }
 
-            let Some(next_pending) = self.peek_pending_source() else {
-                return Ok(());
-            };
-            let Some(current_min) = self.current_heap_min_boundary_key()? else {
-                return Ok(());
-            };
-            if next_pending.boundary_key.compare(&current_min) == Ordering::Greater {
-                return Ok(());
+            let mut source_batches = Vec::new();
+            let mut source_batch_idxs = HashMap::new();
+            let mut interleave_indices = Vec::with_capacity(self.config.row_group_size);
+
+            // Repeatedly take the smallest next row across active streams.
+            while interleave_indices.len() < self.config.row_group_size {
+                let Some(cursor) = ({
+                    let comparator = RowComparator::new(&self.active_cluster_streams);
+                    self.heap.pop(&comparator)?
+                }) else {
+                    break;
+                };
+                let stream_state = self
+                    .active_cluster_streams
+                    .get(cursor.stream_idx)
+                    .ok_or_else(|| IngestError::Shift("merge cursor stream index out of bounds".to_string()))?;
+                let current_batch = stream_state
+                    .current_batch
+                    .as_ref()
+                    .ok_or_else(|| IngestError::Shift("merge cursor points to missing input batch".to_string()))?;
+                if stream_state.batch_generation != cursor.batch_generation {
+                    return Err(IngestError::Shift("stale merge cursor generation".to_string()));
+                }
+
+                let source_idx =
+                    if let Some(source_idx) = source_batch_idxs.get(&(cursor.stream_idx, cursor.batch_generation)) {
+                        *source_idx
+                    } else {
+                        let source_idx = source_batches.len();
+                        source_batches.push(current_batch.clone());
+                        source_batch_idxs.insert((cursor.stream_idx, cursor.batch_generation), source_idx);
+                        source_idx
+                    };
+                interleave_indices.push((source_idx, cursor.row_idx));
+
+                let next_cursor = self.advance_cursor(cursor).await?;
+                if let Some(next_cursor) = next_cursor {
+                    let comparator = RowComparator::new(&self.active_cluster_streams);
+                    self.heap.push(next_cursor, &comparator)?;
+                }
             }
-            if self.active_stream_count >= self.max_active_row_group_streams {
-                return Err(IngestError::Shift(format!(
-                    "configured max_active_row_group_streams={} is too small to preserve merge order for segment {} row group {}",
-                    self.max_active_row_group_streams, next_pending.segment_offset, next_pending.row_group_idx
-                )));
+
+            if interleave_indices.is_empty() {
+                self.complete_active_cluster();
+                continue;
             }
-            let next_pending = self.pop_pending_source()?.ok_or_else(|| {
-                IngestError::Shift("pending row groups disappeared during lazy activation".to_string())
-            })?;
-            self.activate_source(next_pending).await?;
+
+            let source_refs = source_batches.iter().collect::<Vec<_>>();
+            let merged = interleave_record_batch(&source_refs, &interleave_indices)?;
+            if self.heap.is_empty() {
+                self.complete_active_cluster();
+            }
+            return Ok(Some(merged));
         }
     }
 
-    async fn preopen_initial_window(&mut self) -> Result<()> {
-        let open_count = self
-            .pending_row_groups
-            .len()
-            .min(self.read_parallelism)
-            .min(self.max_active_row_group_streams);
-        if open_count == 0 {
-            return Ok(());
+    async fn open_next_overlap_cluster(&mut self) -> Result<bool> {
+        while !self.pending_row_groups.is_empty() {
+            // Row groups with intersecting boundary ranges must be merged together.
+            let (cluster_sources, cluster_stats) = self.pop_next_cluster_sources()?;
+            debug!(
+                cluster_row_groups = cluster_stats.row_groups,
+                cluster_segments = cluster_stats.segments,
+                cluster_frontier_extensions = cluster_stats.frontier_extensions,
+                "shift merger cluster started"
+            );
+
+            let open_parallelism = cluster_sources.len().min(self.config.read_parallelism);
+            let queue_reader = Arc::clone(&self.queue_reader);
+            let topic = self.config.topic.clone();
+            let cancel_token = self.config.cancel_token.clone();
+            let mut opened = futures::stream::iter(cluster_sources.into_iter().enumerate().map(|(idx, source)| {
+                let queue_reader = Arc::clone(&queue_reader);
+                let topic = topic.clone();
+                let cancel_token = cancel_token.clone();
+                async move {
+                    let opened = open_source(queue_reader, topic, source, cancel_token).await?;
+                    Ok::<_, IngestError>((idx, opened))
+                }
+            }))
+            .buffer_unordered(open_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+            opened.sort_by_key(|(idx, _)| *idx);
+            for (_idx, opened) in opened {
+                if let Some(opened) = opened {
+                    self.push_opened_source(opened)?;
+                }
+            }
+
+            self.active_cluster = Some(cluster_stats);
+            if !self.heap.is_empty() {
+                return Ok(true);
+            }
+            self.complete_active_cluster();
+        }
+        Ok(false)
+    }
+
+    fn pop_next_cluster_sources(&mut self) -> Result<(Vec<PlannedRowGroupRead>, ActiveClusterStats)> {
+        let first = self.pop_pending_source()?.ok_or_else(|| {
+            IngestError::Shift("pending row groups disappeared while building overlap cluster".to_string())
+        })?;
+
+        // Extend the cluster while the next row group's lower bound still overlaps the frontier.
+        let mut cluster_sources = Vec::new();
+        let mut frontier = first.boundary_range.max_key.clone();
+        let mut frontier_extensions = 0usize;
+        cluster_sources.push(first);
+
+        while let Some(next_pending) = self.peek_pending_source().cloned() {
+            if next_pending.boundary_range.min_key.compare(&frontier) == Ordering::Greater {
+                break;
+            }
+            let next = self.pop_pending_source()?.ok_or_else(|| {
+                IngestError::Shift("pending row groups disappeared while extending overlap cluster".to_string())
+            })?;
+            if next.boundary_range.max_key.compare(&frontier) == Ordering::Greater {
+                frontier = next.boundary_range.max_key.clone();
+                frontier_extensions = frontier_extensions
+                    .checked_add(1)
+                    .ok_or_else(|| IngestError::Shift("cluster frontier extensions overflow".to_string()))?;
+            }
+            cluster_sources.push(next);
         }
 
-        let mut sources = Vec::with_capacity(open_count);
-        for source_order in 0..open_count {
-            let source = self.pop_pending_source()?.ok_or_else(|| {
-                IngestError::Shift("pending row groups disappeared during initial window activation".to_string())
-            })?;
-            sources.push((source_order, source));
+        let cluster_segments = cluster_sources
+            .iter()
+            .map(|source| source.segment_offset)
+            .collect::<HashSet<_>>()
+            .len();
+        let stats = ActiveClusterStats {
+            row_groups: cluster_sources.len(),
+            segments: cluster_segments,
+            frontier_extensions,
+        };
+
+        Ok((cluster_sources, stats))
+    }
+
+    fn complete_active_cluster(&mut self) {
+        if let Some(stats) = self.active_cluster.take() {
+            debug!(
+                cluster_row_groups = stats.row_groups,
+                cluster_segments = stats.segments,
+                cluster_frontier_extensions = stats.frontier_extensions,
+                "shift merger cluster completed"
+            );
         }
-        let queue_reader = Arc::clone(&self.queue_reader);
-        let topic = self.topic.clone();
-        let cancel_token = self.cancel_token.clone();
-        let mut opened = futures::stream::iter(sources.into_iter().map(|(source_order, source)| {
-            let queue_reader = Arc::clone(&queue_reader);
-            let topic = topic.clone();
-            let cancel_token = cancel_token.clone();
-            async move {
-                let opened = open_source(queue_reader, topic, source, cancel_token).await?;
-                Ok::<_, IngestError>((source_order, opened))
-            }
-        }))
-        .buffer_unordered(open_count)
-        .try_collect::<Vec<_>>()
-        .await?;
-        opened.sort_by_key(|(source_order, _)| *source_order);
-        for (_source_order, opened) in opened {
-            if let Some(opened) = opened {
-                self.push_opened_source(opened)?;
-            }
-        }
-        Ok(())
+        self.active_cluster_streams.clear();
+        self.heap = MergeHeap::new();
     }
 
     fn peek_pending_source(&self) -> Option<&PlannedRowGroupRead> {
@@ -405,21 +469,6 @@ where
         Ok(Some(removed.source))
     }
 
-    async fn activate_source(&mut self, source: PlannedRowGroupRead) -> Result<()> {
-        let Some(opened) = open_source(
-            Arc::clone(&self.queue_reader),
-            self.topic.clone(),
-            source,
-            self.cancel_token.clone(),
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        self.push_opened_source(opened)?;
-        Ok(())
-    }
-
     fn push_opened_source(&mut self, opened: OpenedSource) -> Result<()> {
         if self.schema.fields().is_empty() {
             self.schema = opened.batch.schema();
@@ -431,8 +480,8 @@ where
         }
 
         let cache = SortColumnCache::try_new(&opened.batch)?;
-        let stream_idx = self.active_streams.len();
-        self.active_streams.push(InputStreamState {
+        let stream_idx = self.active_cluster_streams.len();
+        self.active_cluster_streams.push(ActiveClusterState {
             source: opened.source,
             stream: Some(opened.stream),
             current_batch: Some(opened.batch),
@@ -440,10 +489,8 @@ where
             batch_generation: 1,
             cache: Some(cache),
             rows_consumed_total: 0,
-            open: true,
         });
-        self.active_stream_count += 1;
-        let comparator = RowComparator::new(&self.active_streams);
+        let comparator = RowComparator::new(&self.active_cluster_streams);
         self.heap.push(
             MergeCursor {
                 stream_idx,
@@ -456,24 +503,9 @@ where
         Ok(())
     }
 
-    fn current_heap_min_boundary_key(&self) -> Result<Option<RowGroupBoundaryKey>> {
-        let Some(cursor) = self.heap.peek() else {
-            return Ok(None);
-        };
-        let state = self
-            .active_streams
-            .get(cursor.stream_idx)
-            .ok_or_else(|| IngestError::Shift("heap cursor stream index out of bounds".to_string()))?;
-        let cache = state
-            .cache
-            .as_ref()
-            .ok_or_else(|| IngestError::Shift("heap cursor cache is missing".to_string()))?;
-        Ok(Some(cache.row_boundary_key(cursor.row_idx)?))
-    }
-
     async fn advance_cursor(&mut self, cursor: MergeCursor) -> Result<Option<MergeCursor>> {
         let stream_state = self
-            .active_streams
+            .active_cluster_streams
             .get_mut(cursor.stream_idx)
             .ok_or_else(|| IngestError::Shift("merge cursor stream index out of bounds".to_string()))?;
         let current_batch = stream_state
@@ -512,19 +544,18 @@ where
             )));
         };
         let Some(next_batch) = next_non_empty_batch(stream).await.map_err(|err| {
-            IngestError::Shift(format!(
-                "failed to advance WAL segment {} row group {}: {err}",
-                stream_state.source.segment_offset, stream_state.source.row_group_idx
-            ))
+            queue_read_error(
+                err,
+                format!(
+                    "failed to advance WAL segment {} row group {}",
+                    stream_state.source.segment_offset, stream_state.source.row_group_idx
+                ),
+            )
         })?
         else {
             stream_state.current_batch = None;
             stream_state.cache = None;
             stream_state.stream = None;
-            if stream_state.open {
-                stream_state.open = false;
-                self.active_stream_count = self.active_stream_count.saturating_sub(1);
-            }
             return Ok(None);
         };
         if next_batch.schema() != self.schema {
@@ -570,21 +601,35 @@ where
         .read_segment(&topic, source.segment_offset, &[source.row_group_idx], &cancel_token)
         .await
         .map_err(|err| {
-            IngestError::Shift(format!(
-                "failed to open WAL segment {} row group {}: {err}",
-                source.segment_offset, source.row_group_idx
-            ))
+            queue_read_error(
+                err.into(),
+                format!(
+                    "failed to open WAL segment {} row group {}",
+                    source.segment_offset, source.row_group_idx
+                ),
+            )
         })?;
     let Some(batch) = next_non_empty_batch(&mut stream).await.map_err(|err| {
-        IngestError::Shift(format!(
-            "failed to read WAL segment {} row group {}: {err}",
-            source.segment_offset, source.row_group_idx
-        ))
+        queue_read_error(
+            err,
+            format!(
+                "failed to read WAL segment {} row group {}",
+                source.segment_offset, source.row_group_idx
+            ),
+        )
     })?
     else {
         return Ok(None);
     };
     Ok(Some(OpenedSource { source, stream, batch }))
+}
+
+fn queue_read_error(err: IngestError, context: String) -> IngestError {
+    if matches!(err, IngestError::Cancelled) {
+        IngestError::Cancelled
+    } else {
+        IngestError::ShiftQueueRead(format!("{context}: {err}"))
+    }
 }
 
 struct SortColumnCache {
@@ -662,30 +707,6 @@ impl SortColumnCache {
 
         Ok(Ordering::Equal)
     }
-
-    fn row_boundary_key(&self, row_idx: usize) -> Result<RowGroupBoundaryKey> {
-        let CachedSortColumn::Utf8 {
-            values: cloud_account_id,
-            ..
-        } = &self.columns[0]
-        else {
-            return Err(IngestError::Shift("cloud_account_id cache type is invalid".to_string()));
-        };
-        let CachedSortColumn::Utf8 {
-            values: service_name, ..
-        } = &self.columns[1]
-        else {
-            return Err(IngestError::Shift("service_name cache type is invalid".to_string()));
-        };
-        let CachedSortColumn::TimestampMicrosecond { values: timestamp, .. } = &self.columns[2] else {
-            return Err(IngestError::Shift("timestamp cache type is invalid".to_string()));
-        };
-        Ok(RowGroupBoundaryKey {
-            cloud_account_id: (!cloud_account_id.is_null(row_idx)).then(|| cloud_account_id.value(row_idx).to_string()),
-            service_name: (!service_name.is_null(row_idx)).then(|| service_name.value(row_idx).to_string()),
-            timestamp_micros: (!timestamp.is_null(row_idx)).then(|| timestamp.value(row_idx)),
-        })
-    }
 }
 
 async fn next_non_empty_batch(stream: &mut RecordBatchStream) -> Result<Option<RecordBatch>> {
@@ -751,7 +772,7 @@ impl PlannedRowGroupRead {
         Self {
             segment_offset,
             row_group_idx: row_group.row_group_idx,
-            boundary_key: row_group.boundary_key.clone(),
+            boundary_range: row_group.boundary_range.clone(),
             plan_idx,
         }
     }
@@ -768,12 +789,13 @@ mod tests {
     };
     use async_trait::async_trait;
     use futures::TryStreamExt;
+    use icegate_common::{RowGroupBoundaryKey, RowGroupBoundaryRange};
     use tokio_util::sync::CancellationToken;
 
-    use super::{PlannedRowGroupRead, SortedBatchMerger};
+    use super::{PlannedRowGroupRead, SortedBatchMerger, SortedBatchMergerConfig};
     use crate::{
         shift::executor::{PlannedRowGroup, SegmentToRead},
-        wal_sort::logs_row_group_boundary_key_from_batch,
+        wal_sort::logs_row_group_boundary_range_from_batch,
     };
 
     #[derive(Debug)]
@@ -852,13 +874,59 @@ mod tests {
             row_groups: vec![PlannedRowGroup {
                 row_group_idx,
                 row_group_bytes: 1,
-                boundary_key: logs_row_group_boundary_key_from_batch(batch).expect("boundary key"),
+                boundary_range: logs_row_group_boundary_range_from_batch(batch).expect("boundary range"),
             }],
         }
     }
 
+    fn plan_with_range(
+        segment_offset: u64,
+        row_group_idx: usize,
+        min_key: RowGroupBoundaryKey,
+        max_key: RowGroupBoundaryKey,
+    ) -> SegmentToRead {
+        SegmentToRead {
+            segment_offset,
+            row_groups: vec![PlannedRowGroup {
+                row_group_idx,
+                row_group_bytes: 1,
+                boundary_range: RowGroupBoundaryRange { min_key, max_key },
+            }],
+        }
+    }
+
+    fn cluster_sizes_from_metadata(segments: Vec<SegmentToRead>) -> Vec<usize> {
+        let mut merger = SortedBatchMerger::<FakeQueueReader> {
+            config: SortedBatchMergerConfig {
+                row_group_size: 8,
+                read_parallelism: 1,
+                topic: "logs".to_string(),
+                cancel_token: CancellationToken::new(),
+            },
+            schema: Arc::new(Schema::empty()),
+            queue_reader: Arc::new(FakeQueueReader {
+                batches: HashMap::new(),
+            }),
+            pending_row_groups: PlannedRowGroupRead::from_segments(&segments)
+                .into_iter()
+                .map(super::PendingRowGroupEntry::new)
+                .collect(),
+            active_cluster_streams: Vec::new(),
+            heap: super::MergeHeap::new(),
+            active_cluster: None,
+            prefetched_batches: std::collections::VecDeque::new(),
+        };
+
+        let mut sizes = Vec::new();
+        while !merger.pending_row_groups.is_empty() {
+            let (cluster, _) = merger.pop_next_cluster_sources().expect("cluster");
+            sizes.push(cluster.len());
+        }
+        sizes
+    }
+
     #[tokio::test]
-    async fn lazy_merger_preserves_global_order() {
+    async fn merger_preserves_global_order_across_non_overlapping_clusters() {
         let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 1)]);
         let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(20), 2)]);
         let batch_3 = logs_batch(vec![(Some("acc-2"), Some("svc-1"), Some(10), 3)]);
@@ -872,12 +940,13 @@ mod tests {
         let segments = vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2), plan(3, 0, &batch_3)];
         let merger = SortedBatchMerger::try_new(
             queue_reader,
-            "logs".to_string(),
             PlannedRowGroupRead::from_segments(&segments),
-            8,
-            2,
-            2,
-            CancellationToken::new(),
+            SortedBatchMergerConfig {
+                row_group_size: 8,
+                read_parallelism: 2,
+                topic: "logs".to_string(),
+                cancel_token: CancellationToken::new(),
+            },
         )
         .await
         .expect("merger");
@@ -894,35 +963,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_merger_fails_when_order_requires_more_active_sources() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(30), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(30), 2)]);
-        let queue_reader = Arc::new(FakeQueueReader {
-            batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
-        });
-        let segments = vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2)];
-        let err = match SortedBatchMerger::try_new(
-            queue_reader,
-            "logs".to_string(),
-            PlannedRowGroupRead::from_segments(&segments),
-            8,
-            1,
-            1,
-            CancellationToken::new(),
-        )
-        .await
-        {
-            Ok(_) => panic!("must fail"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("max_active_row_group_streams"));
-    }
-
-    #[tokio::test]
-    async fn lazy_merger_activates_global_min_pending_source() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(30), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(20), 2)]);
-        let batch_3 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(40), 3)]);
+    async fn merger_merges_overlapping_row_groups_in_single_cluster() {
+        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 1)]);
+        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(20), 2)]);
+        let batch_3 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(40), 3)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([
                 ((1, 0), vec![batch_1.clone()]),
@@ -934,12 +978,13 @@ mod tests {
 
         let merger = SortedBatchMerger::try_new(
             queue_reader,
-            "logs".to_string(),
             PlannedRowGroupRead::from_segments(&segments),
-            8,
-            1,
-            2,
-            CancellationToken::new(),
+            SortedBatchMergerConfig {
+                row_group_size: 8,
+                read_parallelism: 1,
+                topic: "logs".to_string(),
+                cancel_token: CancellationToken::new(),
+            },
         )
         .await
         .expect("merger");
@@ -955,118 +1000,148 @@ mod tests {
         assert_eq!(values, vec![3, 1, 2]);
     }
 
-    #[tokio::test]
-    async fn lazy_merger_preopens_initial_window_by_boundary_order() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(30), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(20), 2)]);
-        let batch_3 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(40), 3)]);
-        let queue_reader = Arc::new(FakeQueueReader {
-            batches: HashMap::from([
-                ((1, 0), vec![batch_1.clone()]),
-                ((2, 0), vec![batch_2.clone()]),
-                ((3, 0), vec![batch_3.clone()]),
-            ]),
-        });
-        let segments = vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2), plan(3, 0, &batch_3)];
+    #[test]
+    fn cluster_builder_forms_overlap_chain() {
+        let segments = vec![
+            plan_with_range(
+                1,
+                0,
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(50),
+                },
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(30),
+                },
+            ),
+            plan_with_range(
+                2,
+                0,
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(40),
+                },
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(20),
+                },
+            ),
+            plan_with_range(
+                3,
+                0,
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(25),
+                },
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(10),
+                },
+            ),
+        ];
 
-        let merger = SortedBatchMerger::try_new(
-            queue_reader,
-            "logs".to_string(),
-            PlannedRowGroupRead::from_segments(&segments),
-            8,
-            2,
-            2,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("merger");
-
-        let batches = merger.into_stream().try_collect::<Vec<_>>().await.expect("merged");
-        let values = batches
-            .iter()
-            .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
-                (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(values, vec![3, 1, 2]);
+        assert_eq!(cluster_sizes_from_metadata(segments), vec![3]);
     }
 
-    #[tokio::test]
-    async fn lazy_merger_breaks_equal_boundary_ties_by_plan_order() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(30), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(40), 2)]);
-        let batch_3 = logs_batch(vec![(Some("acc-1"), Some("svc"), Some(40), 3)]);
-        let queue_reader = Arc::new(FakeQueueReader {
-            batches: HashMap::from([
-                ((1, 0), vec![batch_1.clone()]),
-                ((2, 0), vec![batch_2.clone()]),
-                ((3, 0), vec![batch_3.clone()]),
-            ]),
-        });
-        let segments = vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2), plan(3, 0, &batch_3)];
+    #[test]
+    fn cluster_builder_splits_non_overlapping_row_groups() {
+        let segments = vec![
+            plan_with_range(
+                1,
+                0,
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(50),
+                },
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(40),
+                },
+            ),
+            plan_with_range(
+                2,
+                0,
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-b".to_string()),
+                    timestamp_micros: Some(30),
+                },
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-b".to_string()),
+                    timestamp_micros: Some(20),
+                },
+            ),
+        ];
 
-        let merger = SortedBatchMerger::try_new(
-            queue_reader,
-            "logs".to_string(),
-            PlannedRowGroupRead::from_segments(&segments),
-            8,
-            1,
-            3,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("merger");
-
-        let batches = merger.into_stream().try_collect::<Vec<_>>().await.expect("merged");
-        let values = batches
-            .iter()
-            .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
-                (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(values, vec![2, 3, 1]);
+        assert_eq!(cluster_sizes_from_metadata(segments), vec![1, 1]);
     }
 
-    #[tokio::test]
-    async fn lazy_merger_uses_full_composite_boundary_key_for_lazy_activation() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-z"), Some(10), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-2"), Some("svc-a"), Some(100), 2)]);
-        let batch_3 = logs_batch(vec![(Some("acc-2"), Some("svc-b"), Some(90), 3)]);
-        let queue_reader = Arc::new(FakeQueueReader {
-            batches: HashMap::from([
-                ((1, 0), vec![batch_1.clone()]),
-                ((2, 0), vec![batch_2.clone()]),
-                ((3, 0), vec![batch_3.clone()]),
-            ]),
-        });
-        let segments = vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2), plan(3, 0, &batch_3)];
+    #[test]
+    fn cluster_builder_tracks_data_driven_width_pattern() {
+        let mut segments = Vec::new();
 
-        let merger = SortedBatchMerger::try_new(
-            queue_reader,
-            "logs".to_string(),
-            PlannedRowGroupRead::from_segments(&segments),
-            8,
-            1,
-            1,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("merger");
+        for idx in 0..4 {
+            let start = 100 - idx as i64;
+            segments.push(plan_with_range(
+                u64::try_from(idx + 1).expect("segment offset"),
+                0,
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(start),
+                },
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-a".to_string()),
+                    timestamp_micros: Some(80),
+                },
+            ));
+        }
+        for idx in 0..2 {
+            let start = 70 - idx as i64;
+            segments.push(plan_with_range(
+                u64::try_from(idx + 10).expect("segment offset"),
+                0,
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-b".to_string()),
+                    timestamp_micros: Some(start),
+                },
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-1".to_string()),
+                    service_name: Some("svc-b".to_string()),
+                    timestamp_micros: Some(60),
+                },
+            ));
+        }
+        for idx in 0..10 {
+            let start = 50 - idx as i64;
+            segments.push(plan_with_range(
+                u64::try_from(idx + 20).expect("segment offset"),
+                0,
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-2".to_string()),
+                    service_name: Some("svc-c".to_string()),
+                    timestamp_micros: Some(start),
+                },
+                RowGroupBoundaryKey {
+                    cloud_account_id: Some("acc-2".to_string()),
+                    service_name: Some("svc-c".to_string()),
+                    timestamp_micros: Some(30),
+                },
+            ));
+        }
 
-        let batches = merger.into_stream().try_collect::<Vec<_>>().await.expect("merged");
-        let values = batches
-            .iter()
-            .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
-                (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            values,
-            vec![1, 2, 3],
-            "a boundary key that looked only at timestamp would activate the wrong source here"
-        );
+        assert_eq!(cluster_sizes_from_metadata(segments), vec![4, 2, 10]);
     }
 }

@@ -7,8 +7,8 @@ use arrow::{
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
-use icegate_common::RowGroupBoundaryKey;
 use icegate_common::testing::{MinIOContainer, create_s3_bucket, create_s3_object_store};
+use icegate_common::{RowGroupBoundaryKey, RowGroupBoundaryRange};
 use icegate_queue::PreparedWalRowGroup;
 use object_store::ObjectStore;
 use uuid::Uuid;
@@ -121,10 +121,10 @@ pub fn logs_batch(rows: Vec<(Option<&str>, Option<&str>, Option<i64>, i64)>) -> 
 }
 
 #[allow(dead_code)]
-pub fn logs_row_group_boundary_key(batch: &RecordBatch) -> RowGroupBoundaryKey {
+pub fn logs_row_group_boundary_range(batch: &RecordBatch) -> RowGroupBoundaryRange {
     assert!(
         batch.num_rows() > 0,
-        "logs_row_group_boundary_key requires a non-empty batch"
+        "logs_row_group_boundary_range requires a non-empty batch"
     );
 
     let cloud_account_id = batch
@@ -139,10 +139,21 @@ pub fn logs_row_group_boundary_key(batch: &RecordBatch) -> RowGroupBoundaryKey {
         .downcast_ref::<TimestampMicrosecondArray>()
         .expect("timestamp");
 
-    RowGroupBoundaryKey {
-        cloud_account_id: (!cloud_account_id.is_null(0)).then(|| cloud_account_id.value(0).to_string()),
-        service_name: (!service_name.is_null(0)).then(|| service_name.value(0).to_string()),
-        timestamp_micros: (!timestamp.is_null(0)).then(|| timestamp.value(0)),
+    let first_row_idx = 0usize;
+    let last_row_idx = batch.num_rows() - 1;
+    RowGroupBoundaryRange {
+        min_key: RowGroupBoundaryKey {
+            cloud_account_id: (!cloud_account_id.is_null(first_row_idx))
+                .then(|| cloud_account_id.value(first_row_idx).to_string()),
+            service_name: (!service_name.is_null(first_row_idx)).then(|| service_name.value(first_row_idx).to_string()),
+            timestamp_micros: (!timestamp.is_null(first_row_idx)).then(|| timestamp.value(first_row_idx)),
+        },
+        max_key: RowGroupBoundaryKey {
+            cloud_account_id: (!cloud_account_id.is_null(last_row_idx))
+                .then(|| cloud_account_id.value(last_row_idx).to_string()),
+            service_name: (!service_name.is_null(last_row_idx)).then(|| service_name.value(last_row_idx).to_string()),
+            timestamp_micros: (!timestamp.is_null(last_row_idx)).then(|| timestamp.value(last_row_idx)),
+        },
     }
 }
 
@@ -151,7 +162,8 @@ pub fn prepared_logs_row_groups(batches: Vec<RecordBatch>) -> Vec<PreparedWalRow
     batches
         .into_iter()
         .map(|batch| {
-            let metadata = serde_json::to_string(&logs_row_group_boundary_key(&batch)).expect("serialize boundary key");
+            let metadata =
+                serde_json::to_string(&logs_row_group_boundary_range(&batch)).expect("serialize boundary range");
             PreparedWalRowGroup::new(batch).with_metadata(metadata)
         })
         .collect()

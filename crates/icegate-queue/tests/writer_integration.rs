@@ -247,7 +247,7 @@ async fn test_multi_batch_request_gets_single_ack_and_multiple_row_groups() -> R
 #[tokio::test]
 async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -> Result<(), Box<dyn std::error::Error>>
 {
-    use icegate_common::RowGroupBoundaryKey;
+    use icegate_common::RowGroupBoundaryRange;
     use icegate_queue::ParquetQueueReader;
     use tokio_util::sync::CancellationToken;
 
@@ -266,8 +266,8 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
         (Some("acc-2"), Some("svc-1"), Some(20), 3),
         (Some("acc-2"), Some("svc-1"), Some(10), 4),
     ]);
-    let expected_a = common::logs_row_group_boundary_key(&batch_a);
-    let expected_b = common::logs_row_group_boundary_key(&batch_b);
+    let expected_a = common::logs_row_group_boundary_range(&batch_a);
+    let expected_b = common::logs_row_group_boundary_range(&batch_b);
 
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
@@ -293,11 +293,11 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
 
     assert_eq!(metadata.len(), 2);
     assert_eq!(
-        serde_json::from_str::<RowGroupBoundaryKey>(metadata.get(&0).expect("row group 0 metadata"))?,
+        serde_json::from_str::<RowGroupBoundaryRange>(metadata.get(&0).expect("row group 0 metadata"))?,
         expected_a
     );
     assert_eq!(
-        serde_json::from_str::<RowGroupBoundaryKey>(metadata.get(&1).expect("row group 1 metadata"))?,
+        serde_json::from_str::<RowGroupBoundaryRange>(metadata.get(&1).expect("row group 1 metadata"))?,
         expected_b
     );
     Ok(())

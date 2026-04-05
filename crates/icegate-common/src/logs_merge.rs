@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
+// TODO(crit): странный нейминг файла
+
 /// Exact first-row boundary key for a sorted logs row group.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RowGroupBoundaryKey {
@@ -13,6 +15,15 @@ pub struct RowGroupBoundaryKey {
     pub service_name: Option<String>,
     /// Timestamp in microseconds.
     pub timestamp_micros: Option<i64>,
+}
+
+/// Inclusive boundary range for a sorted logs row group.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RowGroupBoundaryRange {
+    /// First-row merge key in the row group.
+    pub min_key: RowGroupBoundaryKey,
+    /// Last-row merge key in the row group.
+    pub max_key: RowGroupBoundaryKey,
 }
 
 impl RowGroupBoundaryKey {
@@ -68,7 +79,7 @@ pub fn compare_option_ord<T: Ord>(left: Option<T>, right: Option<T>, descending:
 mod tests {
     use std::cmp::Ordering;
 
-    use super::{RowGroupBoundaryKey, compare_option_ord};
+    use super::{RowGroupBoundaryKey, RowGroupBoundaryRange, compare_option_ord};
 
     #[test]
     fn compare_option_ord_handles_desc_nulls_first() {
@@ -98,5 +109,45 @@ mod tests {
         assert_eq!(null_cloud.compare(&lower), Ordering::Less);
         assert_eq!(higher.compare(&lower), Ordering::Less);
         assert_eq!(lower.compare(&higher), Ordering::Greater);
+    }
+
+    #[test]
+    fn row_group_boundary_range_preserves_key_order() {
+        let min_key = RowGroupBoundaryKey {
+            cloud_account_id: Some("acc-1".to_string()),
+            service_name: Some("svc-a".to_string()),
+            timestamp_micros: Some(50),
+        };
+        let max_key = RowGroupBoundaryKey {
+            cloud_account_id: Some("acc-1".to_string()),
+            service_name: Some("svc-b".to_string()),
+            timestamp_micros: Some(10),
+        };
+        let range = RowGroupBoundaryRange {
+            min_key: min_key.clone(),
+            max_key: max_key.clone(),
+        };
+
+        assert_eq!(range.min_key.compare(&range.max_key), Ordering::Less);
+    }
+
+    #[test]
+    fn row_group_boundary_range_handles_equal_prefix_and_timestamp_desc() {
+        let min_key = RowGroupBoundaryKey {
+            cloud_account_id: Some("acc-9".to_string()),
+            service_name: Some("svc-z".to_string()),
+            timestamp_micros: Some(100),
+        };
+        let max_key = RowGroupBoundaryKey {
+            cloud_account_id: Some("acc-9".to_string()),
+            service_name: Some("svc-z".to_string()),
+            timestamp_micros: Some(1),
+        };
+        let range = RowGroupBoundaryRange {
+            min_key: min_key.clone(),
+            max_key: max_key.clone(),
+        };
+
+        assert_eq!(range.min_key.compare(&range.max_key), Ordering::Less);
     }
 }

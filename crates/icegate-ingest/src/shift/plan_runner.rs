@@ -217,12 +217,12 @@ async fn schedule_shift_tasks(
                             segment.segment_offset, row_group.row_group_idx
                         ))
                     })?;
-                    let boundary_key = deserialize_logs_row_group_metadata(metadata)
+                    let boundary_range = deserialize_logs_row_group_metadata(metadata)
                         .map_err(|e| Error::TaskExecution(e.to_string()))?;
                     Ok(super::PlannedRowGroup {
                         row_group_idx: row_group.row_group_idx,
                         row_group_bytes: row_group.row_group_bytes,
-                        boundary_key,
+                        boundary_range,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -446,10 +446,17 @@ mod tests {
                 7,
                 HashMap::from([(
                     0,
-                    serialize_logs_row_group_metadata(&icegate_common::RowGroupBoundaryKey {
-                        cloud_account_id: Some("acc-1".to_string()),
-                        service_name: Some("svc-2".to_string()),
-                        timestamp_micros: Some(30),
+                    serialize_logs_row_group_metadata(&icegate_common::RowGroupBoundaryRange {
+                        min_key: icegate_common::RowGroupBoundaryKey {
+                            cloud_account_id: Some("acc-1".to_string()),
+                            service_name: Some("svc-2".to_string()),
+                            timestamp_micros: Some(30),
+                        },
+                        max_key: icegate_common::RowGroupBoundaryKey {
+                            cloud_account_id: Some("acc-1".to_string()),
+                            service_name: Some("svc-2".to_string()),
+                            timestamp_micros: Some(30),
+                        },
                     })
                     .expect("serialize metadata"),
                 )]),

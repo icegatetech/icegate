@@ -14,7 +14,7 @@ use super::{
     SegmentToRead, ShiftInput, ShiftOutput,
     executor::{TaskStatus, parse_task_input},
     iceberg_storage::Storage,
-    sorted_batch_merger::SortedBatchMerger,
+    sorted_batch_merger::{SortedBatchMerger, SortedBatchMergerConfig},
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -105,7 +105,6 @@ pub struct ShiftTaskRunnerImpl<Q, S> {
     topic: Topic,
     output_batch_size: usize,
     segment_read_parallelism: usize,
-    max_active_row_group_streams: Option<usize>,
     retrier: Retrier,
 }
 
@@ -124,7 +123,6 @@ where
             topic: topic.into(),
             output_batch_size,
             segment_read_parallelism: Self::DEFAULT_SEGMENT_READ_PARALLELISM,
-            max_active_row_group_streams: None,
             retrier: Retrier::new(RetrierConfig::default()),
         }
     }
@@ -145,24 +143,6 @@ where
         }
         self.segment_read_parallelism = segment_read_parallelism;
         Ok(self)
-    }
-
-    /// Set the maximum number of active row-group readers in the merger.
-    pub fn with_max_active_row_group_streams(
-        mut self,
-        max_active_row_group_streams: usize,
-    ) -> std::result::Result<Self, crate::error::IngestError> {
-        if max_active_row_group_streams == 0 {
-            return Err(crate::error::IngestError::Config(
-                "max_active_row_group_streams must be greater than zero".to_string(),
-            ));
-        }
-        self.max_active_row_group_streams = Some(max_active_row_group_streams);
-        Ok(self)
-    }
-
-    fn effective_max_active_row_group_streams(&self) -> usize {
-        self.max_active_row_group_streams.unwrap_or(self.segment_read_parallelism)
     }
 }
 
@@ -267,40 +247,6 @@ where
     }
 }
 
-struct ShiftWriteError {
-    reason: ShiftTaskFailureReason,
-    error: Error,
-    source: Option<crate::error::IngestError>,
-}
-
-impl ShiftWriteError {
-    fn queue_read(err: impl std::fmt::Display) -> Self {
-        Self {
-            reason: ShiftTaskFailureReason::QueueRead,
-            error: Error::TaskExecution(err.to_string()),
-            source: None,
-        }
-    }
-}
-
-impl icegate_common::RetryError for ShiftWriteError {
-    fn cancelled() -> Self {
-        Self {
-            reason: ShiftTaskFailureReason::Cancelled,
-            error: Error::TaskExecution("shift task cancelled during write retry".to_string()),
-            source: Some(crate::error::IngestError::Cancelled),
-        }
-    }
-
-    fn max_attempts() -> Self {
-        Self {
-            reason: ShiftTaskFailureReason::Write,
-            error: Error::TaskExecution("max retry attempts reached".to_string()),
-            source: Some(crate::error::IngestError::MaxAttemptsReached),
-        }
-    }
-}
-
 impl<Q, S> ShiftTaskRunnerImpl<Q, S>
 where
     Q: QueueReader + 'static,
@@ -352,18 +298,20 @@ where
         cancel_token: &CancellationToken,
     ) -> Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError> {
         let read_plan = super::sorted_batch_merger::PlannedRowGroupRead::from_segments(segments);
-        let merged_stream = SortedBatchMerger::try_new(
+        let mut merger = SortedBatchMerger::try_new(
             Arc::clone(&self.queue_reader),
-            self.topic.clone(),
             read_plan,
-            self.output_batch_size,
-            self.segment_read_parallelism,
-            self.effective_max_active_row_group_streams(),
-            cancel_token.clone(),
+            SortedBatchMergerConfig {
+                row_group_size: self.output_batch_size,
+                read_parallelism: self.segment_read_parallelism,
+                topic: self.topic.clone(),
+                cancel_token: cancel_token.clone(),
+            },
         )
         .await
-        .map(SortedBatchMerger::into_stream)
         .map_err(ShiftWriteError::queue_read)?;
+        merger.prefetch_first_batch().await.map_err(ShiftWriteError::queue_read)?;
+        let merged_stream = merger.into_stream();
         self.storage
             .write_record_batches(merged_stream, cancel_token)
             .await
@@ -371,10 +319,56 @@ where
     }
 }
 
-impl From<crate::error::IngestError> for ShiftWriteError {
-    fn from(err: crate::error::IngestError) -> Self {
+struct ShiftWriteError {
+    reason: ShiftTaskFailureReason,
+    error: Error,
+    source: Option<crate::error::IngestError>,
+}
+
+impl ShiftWriteError {
+    fn queue_read(err: crate::error::IngestError) -> Self {
+        if matches!(err, crate::error::IngestError::Cancelled) {
+            return <Self as icegate_common::RetryError>::cancelled();
+        }
+        Self {
+            reason: ShiftTaskFailureReason::QueueRead,
+            error: Error::TaskExecution(err.to_string()),
+            source: Some(err),
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        self.source.as_ref().is_some_and(crate::error::IngestError::is_retryable)
+    }
+}
+
+impl icegate_common::RetryError for ShiftWriteError {
+    fn cancelled() -> Self {
+        Self {
+            reason: ShiftTaskFailureReason::Cancelled,
+            error: Error::TaskExecution("shift task cancelled during write retry".to_string()),
+            source: Some(crate::error::IngestError::Cancelled),
+        }
+    }
+
+    fn max_attempts() -> Self {
         Self {
             reason: ShiftTaskFailureReason::Write,
+            error: Error::TaskExecution("max retry attempts reached".to_string()),
+            source: Some(crate::error::IngestError::MaxAttemptsReached),
+        }
+    }
+}
+
+impl From<crate::error::IngestError> for ShiftWriteError {
+    fn from(err: crate::error::IngestError) -> Self {
+        let reason = match err {
+            crate::error::IngestError::ShiftQueueRead(_) => ShiftTaskFailureReason::QueueRead,
+            crate::error::IngestError::Cancelled => ShiftTaskFailureReason::Cancelled,
+            _ => ShiftTaskFailureReason::Write,
+        };
+        Self {
+            reason,
             error: Error::TaskExecution(err.to_string()),
             source: Some(err),
         }
@@ -384,12 +378,6 @@ impl From<crate::error::IngestError> for ShiftWriteError {
 impl std::fmt::Display for ShiftWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.error.fmt(f)
-    }
-}
-
-impl ShiftWriteError {
-    fn is_retryable(&self) -> bool {
-        self.source.as_ref().is_some_and(crate::error::IngestError::is_retryable)
     }
 }
 
@@ -429,7 +417,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use super::{ShiftTaskFailureReason, ShiftTaskRunner, ShiftTaskRunnerImpl};
+    use super::{ShiftTaskFailureReason, ShiftTaskRunner, ShiftTaskRunnerImpl, ShiftWriteError};
     use crate::{
         error::{IngestError, Result},
         shift::{
@@ -437,7 +425,7 @@ mod tests {
             executor::TaskStatus,
             iceberg_storage::{Storage, WrittenDataFiles},
         },
-        wal_sort::logs_row_group_boundary_key_from_batch,
+        wal_sort::logs_row_group_boundary_range_from_batch,
     };
 
     struct TestTask {
@@ -719,6 +707,59 @@ mod tests {
         }
     }
 
+    struct StreamFailingQueueReader {
+        batches_by_offset: HashMap<u64, Vec<arrow::record_batch::RecordBatch>>,
+        fail_after_batch_offset: Option<(u64, usize)>,
+    }
+
+    #[async_trait]
+    impl icegate_queue::QueueReader for StreamFailingQueueReader {
+        async fn plan_segments(
+            &self,
+            _topic: &icegate_queue::Topic,
+            _start_offset: u64,
+            _group_by_column_name: &str,
+            _max_record_batches_per_task: usize,
+            _max_input_bytes_per_task: u64,
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<icegate_queue::SegmentsPlan> {
+            panic!("plan_segments is not expected in shift runner tests");
+        }
+
+        async fn read_segment(
+            &self,
+            _topic: &icegate_queue::Topic,
+            offset: u64,
+            _record_batch_idxs: &[usize],
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<icegate_queue::RecordBatchStream> {
+            let mut outputs = Vec::new();
+            let batches = self.batches_by_offset.get(&offset).cloned().unwrap_or_default();
+            for (idx, batch) in batches.into_iter().enumerate() {
+                outputs.push(Ok(batch));
+                if let Some((fail_offset, fail_after_batch_index)) = self.fail_after_batch_offset
+                    && fail_offset == offset
+                    && idx + 1 == fail_after_batch_index
+                {
+                    outputs.push(Err(icegate_queue::QueueError::Metadata(format!(
+                        "stream read failed for segment {offset}"
+                    ))));
+                    break;
+                }
+            }
+            Ok(Box::pin(futures::stream::iter(outputs)))
+        }
+
+        async fn read_segment_row_group_metadata(
+            &self,
+            _topic: &icegate_queue::Topic,
+            _offset: u64,
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<std::collections::HashMap<usize, String>> {
+            panic!("read_segment_row_group_metadata is not expected in shift runner tests");
+        }
+    }
+
     struct FakeStorage {
         writes: Mutex<Vec<Vec<arrow::record_batch::RecordBatch>>>,
         write_calls: AtomicUsize,
@@ -937,7 +978,7 @@ mod tests {
                 PlannedRowGroup {
                     row_group_idx: *row_group_idx,
                     row_group_bytes: 1,
-                    boundary_key: logs_row_group_boundary_key_from_batch(batch).expect("boundary key"),
+                    boundary_range: logs_row_group_boundary_range_from_batch(batch).expect("boundary range"),
                 }
             })
             .collect()
@@ -1241,7 +1282,51 @@ mod tests {
             panic!("queue read must fail");
         };
         assert_eq!(err.reason(), ShiftTaskFailureReason::QueueRead);
-        assert_eq!(storage.write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            storage.write_calls.load(Ordering::SeqCst),
+            0,
+            "queue read failure before write pipeline start must not call storage write"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_on_late_queue_read_and_preserves_typed_reason() {
+        let queue_reader = Arc::new(StreamFailingQueueReader {
+            batches_by_offset: HashMap::from([(
+                1,
+                vec![
+                    ordered_single_row_batch("svc", 30, 1),
+                    ordered_single_row_batch("svc", 20, 2),
+                    ordered_single_row_batch("svc", 10, 3),
+                ],
+            )]),
+            fail_after_batch_offset: Some((1, 2)),
+        });
+        let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
+        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1);
+        let segment_1 = vec![ordered_single_row_batch("svc", 30, 1)];
+        let input = ShiftInput {
+            tenant_id: "tenant-a".to_string(),
+            segments: vec![SegmentToRead {
+                segment_offset: 1,
+                row_groups: planned_row_groups(&segment_1, &[0]),
+            }],
+            trace_context: None,
+        };
+        let task = Arc::new(TestTask::new(&input));
+        let manager = NoopJobManager;
+        let cancel = CancellationToken::new();
+
+        let Err(err) = runner.run(task, &manager, &cancel).await else {
+            panic!("late queue read must fail");
+        };
+        assert_eq!(err.reason(), ShiftTaskFailureReason::QueueRead);
+        assert_eq!(
+            storage.write_calls.load(Ordering::SeqCst),
+            1,
+            "late queue read after first prefetch batch is allowed to start storage write pipeline"
+        );
+        assert_eq!(storage.writes.lock().await.len(), 0);
     }
 
     #[tokio::test]
@@ -1249,12 +1334,30 @@ mod tests {
         let active_reads = Arc::new(AtomicUsize::new(0));
         let max_active_reads = Arc::new(AtomicUsize::new(0));
         let segments = vec![
-            vec![ordered_single_row_batch("svc-01", 60, 1)],
-            vec![ordered_single_row_batch("svc-02", 50, 2)],
-            vec![ordered_single_row_batch("svc-03", 40, 3)],
-            vec![ordered_single_row_batch("svc-04", 30, 4)],
-            vec![ordered_single_row_batch("svc-05", 20, 5)],
-            vec![ordered_single_row_batch("svc-06", 10, 6)],
+            vec![logs_batch_for_shift(vec![
+                (Some("acc"), Some("svc"), Some(100), 1),
+                (Some("acc"), Some("svc"), Some(70), 2),
+            ])],
+            vec![logs_batch_for_shift(vec![
+                (Some("acc"), Some("svc"), Some(95), 3),
+                (Some("acc"), Some("svc"), Some(65), 4),
+            ])],
+            vec![logs_batch_for_shift(vec![
+                (Some("acc"), Some("svc"), Some(90), 5),
+                (Some("acc"), Some("svc"), Some(60), 6),
+            ])],
+            vec![logs_batch_for_shift(vec![
+                (Some("acc"), Some("svc"), Some(85), 7),
+                (Some("acc"), Some("svc"), Some(55), 8),
+            ])],
+            vec![logs_batch_for_shift(vec![
+                (Some("acc"), Some("svc"), Some(80), 9),
+                (Some("acc"), Some("svc"), Some(50), 10),
+            ])],
+            vec![logs_batch_for_shift(vec![
+                (Some("acc"), Some("svc"), Some(75), 11),
+                (Some("acc"), Some("svc"), Some(45), 12),
+            ])],
         ];
         let queue_reader = Arc::new(FakeQueueReader {
             batches_by_offset: HashMap::from([
@@ -1277,7 +1380,7 @@ mod tests {
             started_reads: None,
             active_reads: Some(Arc::clone(&active_reads)),
             max_active_reads: Some(Arc::clone(&max_active_reads)),
-            concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
+            concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::always_fail());
         let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
@@ -1337,9 +1440,9 @@ mod tests {
         let active_reads = Arc::new(AtomicUsize::new(0));
         let max_active_reads = Arc::new(AtomicUsize::new(0));
         let segments = vec![
-            vec![ordered_single_row_batch("svc-01", 30, 1)],
-            vec![ordered_single_row_batch("svc-02", 20, 2)],
-            vec![ordered_single_row_batch("svc-03", 10, 3)],
+            vec![ordered_single_row_batch("svc", 30, 1)],
+            vec![ordered_single_row_batch("svc", 30, 2)],
+            vec![ordered_single_row_batch("svc", 30, 3)],
         ];
         let queue_reader = Arc::new(FakeQueueReader {
             batches_by_offset: HashMap::from([
@@ -1419,7 +1522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_inherits_max_active_row_group_streams_from_segment_parallelism_when_omitted() {
+    async fn run_respects_shift_segment_read_parallelism_for_reading() {
         let active_reads = Arc::new(AtomicUsize::new(0));
         let max_active_reads = Arc::new(AtomicUsize::new(0));
         let segments = vec![
@@ -1442,7 +1545,7 @@ mod tests {
             started_reads: None,
             active_reads: Some(Arc::clone(&active_reads)),
             max_active_reads: Some(Arc::clone(&max_active_reads)),
-            concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
+            concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::always_fail());
         let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
@@ -1476,8 +1579,21 @@ mod tests {
         assert_eq!(err.reason(), ShiftTaskFailureReason::Write);
         assert!(
             max_active_reads.load(Ordering::SeqCst) <= 2,
-            "effective max_active_row_group_streams must inherit shift_segment_read_parallelism"
+            "shift_segment_read_parallelism must cap in-flight reads"
         );
+    }
+
+    #[test]
+    fn shift_write_error_classifies_queue_read_by_type_not_by_message() {
+        let typed = ShiftWriteError::from(IngestError::ShiftQueueRead(
+            "arbitrary queue read failure text".to_string(),
+        ));
+        assert_eq!(typed.reason, ShiftTaskFailureReason::QueueRead);
+
+        let plain_shift_with_same_words = ShiftWriteError::from(IngestError::Shift(
+            "failed to open WAL segment 7 row group 0: but this is plain Shift variant".to_string(),
+        ));
+        assert_eq!(plain_shift_with_same_words.reason, ShiftTaskFailureReason::Write);
     }
 
     #[tokio::test]
@@ -1548,10 +1664,13 @@ mod tests {
             panic!("cancellation must fail shift run");
         };
         assert_eq!(err.reason(), ShiftTaskFailureReason::Cancelled);
-        assert_eq!(storage.write_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            started_reads.load(Ordering::SeqCst),
-            2,
+            storage.write_calls.load(Ordering::SeqCst),
+            0,
+            "cancellation before write pipeline start must not call storage write"
+        );
+        assert!(
+            started_reads.load(Ordering::SeqCst) <= 2,
             "cancellation must stop scheduling reads beyond the in-flight parallelism window"
         );
         assert_eq!(active_reads.load(Ordering::SeqCst), 0);
