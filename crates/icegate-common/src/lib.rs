@@ -43,6 +43,9 @@ pub fn is_valid_tenant_id(value: &str) -> bool {
 /// Topic name for logs in the WAL queue.
 pub const LOGS_TOPIC: &str = "logs";
 
+/// Topic name for metrics in the WAL queue.
+pub const METRICS_TOPIC: &str = "metrics";
+
 /// Iceberg snapshot summary key for the last committed WAL queue offset.
 ///
 /// Written by the Shifter after each WAL-to-Iceberg commit and read by the

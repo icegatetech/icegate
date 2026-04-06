@@ -20,6 +20,9 @@ pub mod loki;
 /// LogQL query language implementation
 pub mod logql;
 
+/// PromQL query language implementation
+pub mod promql;
+
 /// Prometheus API server (PromQL)
 pub mod prometheus;
 

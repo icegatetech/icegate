@@ -15,7 +15,7 @@ datasources:
   datasources.yaml:
     apiVersion: 1
     datasources:
-      - name: Loki
+      - name: IceGate Logs
         type: loki
         access: proxy
         url: http://icegate-query.icegate.svc.cluster.local.:3100
@@ -31,6 +31,12 @@ datasources:
         type: jaeger
         access: proxy
         url: http://jaeger-query.observability.svc.cluster.local.:16686
+        isDefault: false
+        editable: false
+      - name: IceGate Metrics
+        type: prometheus
+        access: proxy
+        url: http://icegate-query.icegate.svc.cluster.local.:9090
         isDefault: false
         editable: false
       - name: Prometheus

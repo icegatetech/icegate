@@ -5,14 +5,15 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 use super::PrometheusConfig;
-use crate::engine::QueryEngine;
+use crate::{engine::QueryEngine, infra::metrics::QueryMetrics};
 
 /// Shared application state for Prometheus server
 #[derive(Clone)]
 pub struct PrometheusState {
     /// Query engine for creating `DataFusion` sessions
-    #[allow(dead_code)]
     pub engine: Arc<QueryEngine>,
+    /// Query metrics recorder
+    pub metrics: Arc<QueryMetrics>,
 }
 
 /// Run the Prometheus HTTP server
@@ -24,10 +25,11 @@ pub async fn run(
     engine: Arc<QueryEngine>,
     config: PrometheusConfig,
     cancel_token: CancellationToken,
+    metrics: Arc<QueryMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = PrometheusState { engine };
+    let state = PrometheusState { engine, metrics };
 
     let app = super::routes::routes(state);
 

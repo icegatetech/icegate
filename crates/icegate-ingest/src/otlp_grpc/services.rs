@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use icegate_common::{LOGS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
+use icegate_common::{LOGS_TOPIC, METRICS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
 use icegate_queue::WriteChannel;
 use opentelemetry_proto::tonic::collector::{
     logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService},
@@ -20,6 +20,7 @@ use crate::infra::metrics::{OtlpMetrics, OtlpRequestRecorder};
 use crate::transform;
 
 const SIGNAL_LOGS: &str = "logs";
+const SIGNAL_METRICS: &str = "metrics";
 const PROTOCOL_GRPC: &str = "grpc";
 const ENCODING_PROTOBUF: &str = "protobuf";
 const STATUS_OK: &str = "ok";
@@ -185,23 +186,96 @@ impl TraceService for OtlpGrpcService {
 impl MetricsService for OtlpGrpcService {
     /// Handle OTLP metrics export request.
     ///
-    /// # TODO
-    /// - Parse OTLP metrics from request
-    /// - Handle different metric types (gauge, sum, histogram, summary)
-    /// - Transform to Iceberg schema format (from schema.rs)
-    /// - Write metrics to Iceberg metrics table via catalog
-    /// - Handle batching and backpressure
-    /// - Return partial success for rejected metrics
-    #[tracing::instrument(
-        skip(self, _request),
-        fields(method = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export")
-    )]
+    /// Transforms OTLP metric data points to Arrow `RecordBatch` and writes to the WAL
+    /// queue. Returns partial success response with count of rejected
+    /// data points.
+    #[allow(clippy::cast_possible_wrap)]
+    #[tracing::instrument(name = "export_metrics", skip(self, request))]
     async fn export(
         &self,
-        _request: Request<ExportMetricsServiceRequest>,
+        request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        Err(Status::unimplemented(
-            "OTLP metrics ingestion: Parse OTLP → transform → write to Iceberg",
-        ))
+        debug!("Start handle OTLP GRPC request");
+        let request_size = request.get_ref().encoded_len();
+        let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_METRICS, ENCODING_PROTOBUF);
+        request_metrics.record_request_size(request_size);
+
+        let tenant_id = extract_tenant_id(&request);
+
+        // TODO(med): instrument gRPC decoding time by wrapping tonic/prost codec; handler receives decoded payload.
+        let export_request = request.into_inner();
+
+        // Transform OTLP metrics to Arrow RecordBatch (offload to blocking thread)
+        let span = tracing::Span::current();
+        let batch = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| transform::metrics_to_record_batch(&export_request, tenant_id.as_deref()))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("Failed to transform metrics: {e}")))?;
+        let Some(batch) = batch else {
+            // No records to process - return success with 0 rejected
+            request_metrics.record_records_per_request(0);
+            request_metrics.finish_ok();
+            return Ok(Response::new(ExportMetricsServiceResponse { partial_success: None }));
+        };
+
+        let record_count = batch.num_rows();
+        debug!(records = record_count, "Transformed OTLP metrics to RecordBatch");
+        request_metrics.record_records_per_request(record_count);
+
+        // Create write request for the WAL queue
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let write_request = icegate_queue::WriteRequest {
+            topic: METRICS_TOPIC.to_string(),
+            batch,
+            response_tx,
+            trace_context: icegate_common::extract_current_trace_context(),
+        };
+
+        // Send to WAL queue
+        let enqueue_start = Instant::now();
+        self.write_channel.send(write_request).await.map_err(|e| {
+            request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), METRICS_TOPIC, STATUS_ERROR);
+            request_metrics.add_wal_queue_unavailable(METRICS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
+            request_metrics.finish_error();
+            Status::unavailable(format!("WAL queue unavailable: {e}"))
+        })?;
+        request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), METRICS_TOPIC, STATUS_OK);
+
+        // Wait for write result
+        let ack_start = Instant::now();
+        let result = response_rx.await.map_err(|e| {
+            request_metrics.record_wal_ack_duration(ack_start.elapsed(), METRICS_TOPIC, STATUS_ERROR);
+            request_metrics.finish_error();
+            Status::internal(format!("Failed to receive write result: {e}"))
+        })?;
+
+        // Add link to flush operation if trace context is available
+        if let Some(tc) = result.trace_context() {
+            icegate_common::add_span_link(tc);
+        }
+
+        match result {
+            icegate_queue::WriteResult::Success { offset, records, .. } => {
+                debug!(offset, records, "OTLP GRPC request ended successfully");
+                request_metrics.record_wal_ack_duration(ack_start.elapsed(), METRICS_TOPIC, STATUS_OK);
+                request_metrics.finish_ok();
+                Ok(Response::new(ExportMetricsServiceResponse { partial_success: None }))
+            }
+            icegate_queue::WriteResult::Failed { reason, .. } => {
+                // Return partial success with all records rejected
+                request_metrics.record_wal_ack_duration(ack_start.elapsed(), METRICS_TOPIC, STATUS_ERROR);
+                request_metrics.finish_partial();
+                Ok(Response::new(ExportMetricsServiceResponse {
+                    partial_success: Some(
+                        opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsPartialSuccess {
+                            rejected_data_points: record_count as i64,
+                            error_message: reason,
+                        },
+                    ),
+                }))
+            }
+        }
     }
 }

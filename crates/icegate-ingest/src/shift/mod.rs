@@ -29,7 +29,7 @@ pub use executor::{
 };
 use iceberg::Catalog;
 pub use iceberg_storage::{IcebergStorage, WrittenDataFiles};
-use icegate_common::{LOGS_TABLE, LOGS_TOPIC};
+use icegate_common::{LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC};
 use icegate_jobmanager::{
     CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
     Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
@@ -61,6 +61,10 @@ pub struct ShifterHandle {
 
 impl Shifter {
     /// Create a new shifter instance.
+    ///
+    /// Registers shift jobs for all WAL-backed topics (logs and metrics).
+    /// Each topic gets its own plan/shift/commit pipeline with independent
+    /// executors and metrics.
     pub async fn new(
         catalog: Arc<dyn Catalog>,
         queue_reader: Arc<ParquetQueueReader>,
@@ -70,54 +74,6 @@ impl Shifter {
         jobs_manager_metrics: JobMetrics,
     ) -> Result<Self> {
         shift_config.validate()?;
-        let storage = Arc::new(IcebergStorage::new(
-            Arc::clone(&catalog),
-            LOGS_TABLE,
-            shift_config.as_ref(),
-        ));
-        let timeouts = TimeoutEstimator::new(&shift_config.timeouts)?;
-        let plan_timeout = timeouts.plan_timeout();
-        let queue_reader = Arc::new(QueueReaderWithMetrics::new(queue_reader, shift_metrics.clone()));
-        let plan_runner = Arc::new(PlanTaskRunnerImpl::new(
-            Arc::clone(&queue_reader),
-            Arc::clone(&storage),
-            shift_config.clone(),
-            timeouts,
-            LOGS_TOPIC,
-        ));
-        let plan_runner = Arc::new(PlanTaskRunnerWithMetrics::new(
-            plan_runner,
-            shift_metrics.clone(),
-            LOGS_TOPIC,
-        ));
-
-        let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), LOGS_TOPIC));
-        let shift_storage_for_runner = Arc::clone(&shift_storage);
-        let shift_runner = Arc::new(
-            ShiftTaskRunnerImpl::new(queue_reader, shift_storage_for_runner, LOGS_TOPIC)
-                .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
-        );
-        let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(
-            shift_runner,
-            shift_metrics.clone(),
-            LOGS_TOPIC,
-        ));
-        let commit_runner = Arc::new(CommitTaskRunnerImpl::new(Arc::clone(&shift_storage), LOGS_TOPIC));
-        let commit_runner = Arc::new(CommitTaskRunnerWithMetrics::new(
-            commit_runner,
-            shift_metrics,
-            LOGS_TOPIC,
-        ));
-
-        let executor = Arc::new(Executor::new(plan_runner, shift_runner, commit_runner));
-
-        let initial_task =
-            TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), vec![], plan_timeout).map_err(map_shift_error)?;
-
-        let mut executors = HashMap::new();
-        executors.insert(TaskCode::new(PLAN_TASK_CODE), Arc::clone(&executor).plan_executor());
-        executors.insert(TaskCode::new(SHIFT_TASK_CODE), Arc::clone(&executor).shift_executor());
-        executors.insert(TaskCode::new(COMMIT_TASK_CODE), Arc::clone(&executor).commit_executor());
 
         let iteration_interval_ms =
             i64::try_from(shift_config.jobsmanager.iteration_interval_millisecs).map_err(|_| {
@@ -126,11 +82,32 @@ impl Shifter {
                     shift_config.jobsmanager.iteration_interval_millisecs
                 ))
             })?;
-        let job_def = JobDefinition::new("shift_logs".into(), vec![initial_task], executors)
-            .map_err(map_shift_error)?
-            .with_iteration_interval(ChronoDuration::milliseconds(iteration_interval_ms))
-            .map_err(map_shift_error)?;
-        let job_registry = Arc::new(JobRegistry::new(vec![job_def]).map_err(map_shift_error)?);
+        let iteration_interval = ChronoDuration::milliseconds(iteration_interval_ms);
+        let queue_reader = Arc::new(QueueReaderWithMetrics::new(queue_reader, shift_metrics.clone()));
+
+        // Create a shift job for each WAL-backed topic
+        let logs_job = Self::create_job_definition(
+            "shift_logs",
+            LOGS_TABLE,
+            LOGS_TOPIC,
+            &catalog,
+            &queue_reader,
+            &shift_config,
+            &shift_metrics,
+            iteration_interval,
+        )?;
+        let metrics_job = Self::create_job_definition(
+            "shift_metrics",
+            METRICS_TABLE,
+            METRICS_TOPIC,
+            &catalog,
+            &queue_reader,
+            &shift_config,
+            &shift_metrics,
+            iteration_interval,
+        )?;
+
+        let job_registry = Arc::new(JobRegistry::new(vec![logs_job, metrics_job]).map_err(map_shift_error)?);
 
         let s3_storage = Arc::new(
             S3Storage::new(jobs_storage, job_registry.clone(), jobs_manager_metrics.clone())
@@ -156,6 +133,62 @@ impl Shifter {
         .map_err(map_shift_error)?;
 
         Ok(Self { manager })
+    }
+
+    /// Creates a `JobDefinition` for shifting a single WAL topic to its
+    /// Iceberg table.
+    #[allow(clippy::too_many_arguments)]
+    fn create_job_definition(
+        job_code: &str,
+        table_name: &str,
+        topic: &str,
+        catalog: &Arc<dyn Catalog>,
+        queue_reader: &Arc<QueueReaderWithMetrics<ParquetQueueReader>>,
+        shift_config: &Arc<ShiftConfig>,
+        shift_metrics: &ShiftMetrics,
+        iteration_interval: ChronoDuration,
+    ) -> Result<JobDefinition> {
+        let storage = Arc::new(IcebergStorage::new(Arc::clone(catalog), table_name, shift_config.as_ref()));
+        let timeouts = TimeoutEstimator::new(&shift_config.timeouts)?;
+        let plan_timeout = timeouts.plan_timeout();
+
+        let plan_runner = Arc::new(PlanTaskRunnerImpl::new(
+            Arc::clone(queue_reader),
+            Arc::clone(&storage),
+            shift_config.clone(),
+            timeouts,
+            topic,
+        ));
+        let plan_runner = Arc::new(PlanTaskRunnerWithMetrics::new(plan_runner, shift_metrics.clone(), topic));
+
+        let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), topic));
+        let shift_runner = Arc::new(
+            ShiftTaskRunnerImpl::new(Arc::clone(queue_reader), Arc::clone(&shift_storage), topic)
+                .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
+        );
+        let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(shift_runner, shift_metrics.clone(), topic));
+
+        let commit_runner = Arc::new(CommitTaskRunnerImpl::new(Arc::clone(&shift_storage), topic));
+        let commit_runner = Arc::new(CommitTaskRunnerWithMetrics::new(
+            commit_runner,
+            shift_metrics.clone(),
+            topic,
+        ));
+
+        let executor = Arc::new(Executor::new(plan_runner, shift_runner, commit_runner));
+
+        let initial_task =
+            TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), vec![], plan_timeout).map_err(map_shift_error)?;
+
+        let mut executors = HashMap::new();
+        executors.insert(TaskCode::new(PLAN_TASK_CODE), Arc::clone(&executor).plan_executor());
+        executors.insert(TaskCode::new(SHIFT_TASK_CODE), Arc::clone(&executor).shift_executor());
+        executors.insert(TaskCode::new(COMMIT_TASK_CODE), Arc::clone(&executor).commit_executor());
+
+        JobDefinition::new(job_code.into(), vec![initial_task], executors)
+            .map_err(map_shift_error)?
+            .with_iteration_interval(iteration_interval)
+            .map_err(map_shift_error)
     }
 
     /// Start shifter workers and return a handle for shutdown.

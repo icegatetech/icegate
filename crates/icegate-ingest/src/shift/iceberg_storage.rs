@@ -217,7 +217,9 @@ impl IcebergStorage {
             let span = tracing::info_span!(
                 "iceberg_partition_write",
                 partition_key = %partition_path,
-                rows = partition_batch.num_rows()
+                rows = partition_batch.num_rows(),
+                schema = ?partition_batch.schema(),
+                table_schema = ?table_metadata.current_schema(),
             );
             fanout_writer
                 .write(partition_key, partition_batch)

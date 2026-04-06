@@ -36,25 +36,17 @@ use crate::error::Result;
 /// Field IDs are assigned sequentially to match Iceberg catalog behavior.
 /// Map nested fields (key=12, value=13) come after attributes (11).
 pub fn logs_schema() -> Result<Schema> {
-    // Create Map<String, String> for attributes
-    // Nested field IDs must be sequential after parent (11 -> 12, 13)
-    let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(
-            12, // Sequential after attributes field (11)
-            "key",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::required(
-            13, // Sequential after key (12)
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
+    //  1  tenant_id        7  trace_id
+    //  2  cloud_account_id 8  span_id
+    //  3  service_name     9  severity_text
+    //  4  timestamp       10  body
+    //  5  observed_ts     11  attributes (Map)
+    //  6  ingested_ts       12 key
+    //                       13 value
 
     let schema = Schema::builder()
         .with_schema_id(1)
         .with_fields(vec![
-            // Multi-tenancy fields
             Arc::new(NestedField::required(
                 1,
                 "tenant_id",
@@ -70,7 +62,6 @@ pub fn logs_schema() -> Result<Schema> {
                 "service_name",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Timestamp fields (microsecond precision)
             Arc::new(NestedField::required(
                 4,
                 "timestamp",
@@ -86,7 +77,6 @@ pub fn logs_schema() -> Result<Schema> {
                 "ingested_timestamp",
                 Type::Primitive(PrimitiveType::Timestamp),
             )),
-            // W3C trace context
             Arc::new(NestedField::optional(
                 7,
                 "trace_id",
@@ -97,21 +87,29 @@ pub fn logs_schema() -> Result<Schema> {
                 "span_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Severity information
             Arc::new(NestedField::optional(
                 9,
                 "severity_text",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Body (simplified from AnyValue variant to String)
             Arc::new(NestedField::optional(
                 10,
                 "body",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Attributes (merged from resource, scope, and log attributes)
-            // Map nested fields use IDs 12, 13
-            Arc::new(NestedField::required(11, "attributes", attributes_map)),
+            // 11-13: Attributes MAP(String, String)
+            Arc::new(NestedField::required(
+                11,
+                "attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(12, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        13,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
+            )),
         ])
         .build()?;
 
@@ -201,86 +199,36 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// - `timestamp` (descending)
 #[allow(clippy::too_many_lines)]
 pub fn spans_schema() -> Result<Schema> {
-    // Create Map<String, String> for main attributes (field IDs: 24, 25)
-    let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(24, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            25,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-
-    // Create Map<String, String> for event attributes (field IDs: 26, 27)
-    let event_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(26, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            27,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-
-    // Create Map<String, String> for link attributes (field IDs: 28, 29)
-    let link_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(28, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            29,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-
-    // Event struct (nested in spans) - NO trace_id/span_id
-    let event_struct = Type::Struct(StructType::new(vec![
-        Arc::new(NestedField::required(
-            30,
-            "timestamp",
-            Type::Primitive(PrimitiveType::Timestamp),
-        )),
-        Arc::new(NestedField::required(
-            31,
-            "name",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::required(32, "attributes", event_attributes_map)),
-        Arc::new(NestedField::required(
-            33,
-            "dropped_attributes_count",
-            Type::Primitive(PrimitiveType::Int),
-        )),
-    ]));
-
-    // Link struct (nested in spans) - HAS trace_id/span_id
-    let link_struct = Type::Struct(StructType::new(vec![
-        Arc::new(NestedField::required(
-            34,
-            "trace_id",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::required(
-            35,
-            "span_id",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::optional(
-            36,
-            "trace_state",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::required(37, "attributes", link_attributes_map)),
-        Arc::new(NestedField::required(
-            38,
-            "dropped_attributes_count",
-            Type::Primitive(PrimitiveType::Int),
-        )),
-        Arc::new(NestedField::optional(39, "flags", Type::Primitive(PrimitiveType::Int))),
-    ]));
+    // Field IDs are sequential with complex type sub-fields immediately
+    // after their parent, matching catalog-assigned ordering.
+    //
+    //   1  tenant_id              19 flags
+    //   2  cloud_account_id       20 dropped_attributes_count
+    //   3  service_name           21 dropped_events_count
+    //   4  trace_id               22 dropped_links_count
+    //   5  span_id                23 events (List)
+    //   6  parent_span_id           24 element (Struct)
+    //   7  timestamp                  25 timestamp
+    //   8  end_timestamp              26 name
+    //   9  ingested_timestamp         27 attributes (Map)
+    //  10  duration_micros              28 key
+    //  11  trace_state                  29 value
+    //  12  name                       30 dropped_attributes_count
+    //  13  kind                   31 links (List)
+    //  14  status_code              32 element (Struct)
+    //  15  status_message             33 trace_id
+    //  16  attributes (Map)           34 span_id
+    //    17 key                       35 trace_state
+    //    18 value                      36 attributes (Map)
+    //                                   37 key
+    //                                   38 value
+    //                                 39 dropped_attributes_count
+    //                                 40 flags
 
     let schema = Schema::builder()
         .with_schema_id(2)
         .with_fields(vec![
-            // Multi-tenancy fields
+            // 1-3: Multi-tenancy fields
             Arc::new(NestedField::required(
                 1,
                 "tenant_id",
@@ -296,7 +244,7 @@ pub fn spans_schema() -> Result<Schema> {
                 "service_name",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Trace identifiers
+            // 4-6: Trace identifiers
             Arc::new(NestedField::required(
                 4,
                 "trace_id",
@@ -312,7 +260,7 @@ pub fn spans_schema() -> Result<Schema> {
                 "parent_span_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Timestamp fields
+            // 7-11: Timestamp fields
             Arc::new(NestedField::required(
                 7,
                 "timestamp",
@@ -338,7 +286,7 @@ pub fn spans_schema() -> Result<Schema> {
                 "trace_state",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Span metadata
+            // 12-15: Span metadata
             Arc::new(NestedField::required(
                 12,
                 "name",
@@ -355,42 +303,115 @@ pub fn spans_schema() -> Result<Schema> {
                 "status_message",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Attributes (merged from resource, scope, and span attributes)
-            Arc::new(NestedField::required(16, "attributes", attributes_map)),
-            // Flags and monitoring
-            Arc::new(NestedField::optional(17, "flags", Type::Primitive(PrimitiveType::Int))),
+            // 16-18: Attributes MAP(String, String)
+            Arc::new(NestedField::required(
+                16,
+                "attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(17, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        18,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
+            )),
+            // 19-22: Flags and monitoring counters
+            Arc::new(NestedField::optional(19, "flags", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::optional(
-                18,
+                20,
                 "dropped_attributes_count",
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
-                19,
+                21,
                 "dropped_events_count",
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
-                20,
+                22,
                 "dropped_links_count",
                 Type::Primitive(PrimitiveType::Int),
             )),
-            // Nested events (NO trace_id/span_id - inherits from parent span)
+            // 23-30: Events List<Struct{timestamp, name, attributes, dropped_attributes_count}>
             Arc::new(NestedField::optional(
-                21,
+                23,
                 "events",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    40,
-                    event_struct,
+                    24,
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::required(
+                            25,
+                            "timestamp",
+                            Type::Primitive(PrimitiveType::Timestamp),
+                        )),
+                        Arc::new(NestedField::required(
+                            26,
+                            "name",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::required(
+                            27,
+                            "attributes",
+                            Type::Map(MapType::new(
+                                Arc::new(NestedField::required(28, "key", Type::Primitive(PrimitiveType::String))),
+                                Arc::new(NestedField::required(
+                                    29,
+                                    "value",
+                                    Type::Primitive(PrimitiveType::String),
+                                )),
+                            )),
+                        )),
+                        Arc::new(NestedField::required(
+                            30,
+                            "dropped_attributes_count",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                    ])),
                     true,
                 )))),
             )),
-            // Nested links (HAS trace_id/span_id - references linked span)
+            // 31-40: Links List<Struct{trace_id, span_id, trace_state, attributes, dropped_attributes_count, flags}>
             Arc::new(NestedField::optional(
-                22,
+                31,
                 "links",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    41,
-                    link_struct,
+                    32,
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::required(
+                            33,
+                            "trace_id",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::required(
+                            34,
+                            "span_id",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            35,
+                            "trace_state",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::required(
+                            36,
+                            "attributes",
+                            Type::Map(MapType::new(
+                                Arc::new(NestedField::required(37, "key", Type::Primitive(PrimitiveType::String))),
+                                Arc::new(NestedField::required(
+                                    38,
+                                    "value",
+                                    Type::Primitive(PrimitiveType::String),
+                                )),
+                            )),
+                        )),
+                        Arc::new(NestedField::required(
+                            39,
+                            "dropped_attributes_count",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                        Arc::new(NestedField::optional(40, "flags", Type::Primitive(PrimitiveType::Int))),
+                    ])),
                     true,
                 )))),
             )),
@@ -487,20 +508,17 @@ pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// - `service_name` (ascending)
 /// - `timestamp` (descending) - recent-first ordering
 pub fn events_schema() -> Result<Schema> {
-    // Create Map<String, String> for attributes (field IDs: 12, 13)
-    let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(12, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            13,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
+    //  1  tenant_id        7  event_domain
+    //  2  cloud_account_id 8  event_name
+    //  3  service_name     9  trace_id
+    //  4  timestamp       10  span_id
+    //  5  observed_ts     11  attributes (Map)
+    //  6  ingested_ts       12 key
+    //                       13 value
 
     let schema = Schema::builder()
         .with_schema_id(3)
         .with_fields(vec![
-            // Multi-tenancy fields
             Arc::new(NestedField::required(
                 1,
                 "tenant_id",
@@ -516,7 +534,6 @@ pub fn events_schema() -> Result<Schema> {
                 "service_name",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Timestamp fields
             Arc::new(NestedField::required(
                 4,
                 "timestamp",
@@ -532,7 +549,6 @@ pub fn events_schema() -> Result<Schema> {
                 "ingested_timestamp",
                 Type::Primitive(PrimitiveType::Timestamp),
             )),
-            // Event identification
             Arc::new(NestedField::required(
                 7,
                 "event_domain",
@@ -543,7 +559,6 @@ pub fn events_schema() -> Result<Schema> {
                 "event_name",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Trace context
             Arc::new(NestedField::optional(
                 9,
                 "trace_id",
@@ -554,8 +569,19 @@ pub fn events_schema() -> Result<Schema> {
                 "span_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Event attributes
-            Arc::new(NestedField::required(11, "attributes", attributes_map)),
+            // 11-13: Attributes MAP(String, String)
+            Arc::new(NestedField::required(
+                11,
+                "attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(12, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        13,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
+            )),
         ])
         .build()?;
 
@@ -645,74 +671,33 @@ pub fn events_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// - `timestamp` (descending) - recent-first ordering
 #[allow(clippy::too_many_lines)]
 pub fn metrics_schema() -> Result<Schema> {
-    // Create Map<String, String> for main attributes (field IDs: 34, 35)
-    let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(34, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            35,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-
-    // Create Map<String, String> for exemplar attributes (field IDs: 36, 37)
-    let exemplar_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(36, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            37,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-
-    // Quantile value struct for summary metrics
-    let quantile_struct = Type::Struct(StructType::new(vec![
-        Arc::new(NestedField::required(
-            38,
-            "quantile",
-            Type::Primitive(PrimitiveType::Double),
-        )),
-        Arc::new(NestedField::required(
-            39,
-            "value",
-            Type::Primitive(PrimitiveType::Double),
-        )),
-    ]));
-
-    // Exemplar struct for histogram/gauge/sum metrics
-    let exemplar_struct = Type::Struct(StructType::new(vec![
-        Arc::new(NestedField::optional(
-            40,
-            "timestamp",
-            Type::Primitive(PrimitiveType::Timestamp),
-        )),
-        Arc::new(NestedField::optional(
-            41,
-            "value_double",
-            Type::Primitive(PrimitiveType::Double),
-        )),
-        Arc::new(NestedField::optional(
-            42,
-            "value_int",
-            Type::Primitive(PrimitiveType::Long),
-        )),
-        Arc::new(NestedField::optional(
-            43,
-            "span_id",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::optional(
-            44,
-            "trace_id",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::required(45, "attributes", exemplar_attributes_map)),
-    ]));
+    // Field IDs are sequential with complex type sub-fields immediately
+    // after their parent. This matches the order assigned by Iceberg
+    // catalogs (Nessie/REST) during table creation.
+    //
+    //   1  tenant_id              17 value_double            33 negative_offset
+    //   2  cloud_account_id       18 value_int               34 negative_bucket_counts
+    //   3  service_name           19 count                     35 element
+    //   4  service_instance_id    20 sum                     36 quantile_values
+    //   5  timestamp              21 min                       37 element (Struct)
+    //   6  start_timestamp        22 max                         38 quantile
+    //   7  ingested_timestamp     23 bucket_counts               39 value
+    //   8  metric_name              24 element                40 flags
+    //   9  metric_type            25 explicit_bounds          41 exemplars
+    //  10  description              26 element                  42 element (Struct)
+    //  11  unit                   27 scale                        43 timestamp
+    //  12  aggregation_temp.      28 zero_count                   44 value_double
+    //  13  is_monotonic           29 zero_threshold               45 value_int
+    //  14  attributes             30 positive_offset              46 span_id
+    //    15 key                   31 positive_bucket_counts       47 trace_id
+    //    16 value                   32 element                    48 attributes
+    //                                                               49 key
+    //                                                               50 value
 
     let schema = Schema::builder()
         .with_schema_id(4)
         .with_fields(vec![
-            // Multi-tenancy fields
+            // 1-4: Multi-tenancy fields
             Arc::new(NestedField::required(
                 1,
                 "tenant_id",
@@ -733,7 +718,7 @@ pub fn metrics_schema() -> Result<Schema> {
                 "service_instance_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Timestamp fields
+            // 5-7: Timestamp fields
             Arc::new(NestedField::required(
                 5,
                 "timestamp",
@@ -749,7 +734,7 @@ pub fn metrics_schema() -> Result<Schema> {
                 "ingested_timestamp",
                 Type::Primitive(PrimitiveType::Timestamp),
             )),
-            // Metric identification
+            // 8-11: Metric identification
             Arc::new(NestedField::required(
                 8,
                 "metric_name",
@@ -770,7 +755,7 @@ pub fn metrics_schema() -> Result<Schema> {
                 "unit",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Metric metadata
+            // 12-13: Metric metadata
             Arc::new(NestedField::optional(
                 12,
                 "aggregation_temporality",
@@ -781,101 +766,163 @@ pub fn metrics_schema() -> Result<Schema> {
                 "is_monotonic",
                 Type::Primitive(PrimitiveType::Boolean),
             )),
-            // Attributes (merged from resource, scope, and metric/data point attributes)
-            Arc::new(NestedField::required(14, "attributes", attributes_map)),
-            // Value fields (for gauge and sum metrics)
+            // 14-16: Attributes MAP(String, String)
+            Arc::new(NestedField::required(
+                14,
+                "attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(15, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        16,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
+            )),
+            // 17-18: Value fields (gauge/sum)
             Arc::new(NestedField::optional(
-                15,
+                17,
                 "value_double",
                 Type::Primitive(PrimitiveType::Double),
             )),
             Arc::new(NestedField::optional(
-                16,
+                18,
                 "value_int",
                 Type::Primitive(PrimitiveType::Long),
             )),
-            // Common histogram fields (for histogram, exponential_histogram, and summary)
-            Arc::new(NestedField::optional(17, "count", Type::Primitive(PrimitiveType::Long))),
-            Arc::new(NestedField::optional(18, "sum", Type::Primitive(PrimitiveType::Double))),
-            Arc::new(NestedField::optional(19, "min", Type::Primitive(PrimitiveType::Double))),
-            Arc::new(NestedField::optional(20, "max", Type::Primitive(PrimitiveType::Double))),
-            // Standard histogram fields
+            // 19-22: Common histogram fields
+            Arc::new(NestedField::optional(19, "count", Type::Primitive(PrimitiveType::Long))),
+            Arc::new(NestedField::optional(20, "sum", Type::Primitive(PrimitiveType::Double))),
+            Arc::new(NestedField::optional(21, "min", Type::Primitive(PrimitiveType::Double))),
+            Arc::new(NestedField::optional(22, "max", Type::Primitive(PrimitiveType::Double))),
+            // 23-24: Standard histogram bucket_counts
             Arc::new(NestedField::optional(
-                21,
+                23,
                 "bucket_counts",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    46,
+                    24,
                     Type::Primitive(PrimitiveType::Long),
                     true,
                 )))),
             )),
+            // 25-26: Standard histogram explicit_bounds
             Arc::new(NestedField::optional(
-                22,
+                25,
                 "explicit_bounds",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    47,
+                    26,
                     Type::Primitive(PrimitiveType::Double),
                     true,
                 )))),
             )),
-            // Exponential histogram fields
-            Arc::new(NestedField::optional(23, "scale", Type::Primitive(PrimitiveType::Int))),
+            // 27-35: Exponential histogram fields
+            Arc::new(NestedField::optional(27, "scale", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::optional(
-                24,
+                28,
                 "zero_count",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
-                25,
+                29,
                 "zero_threshold",
                 Type::Primitive(PrimitiveType::Double),
             )),
             Arc::new(NestedField::optional(
-                26,
+                30,
                 "positive_offset",
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
-                27,
+                31,
                 "positive_bucket_counts",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    48,
+                    32,
                     Type::Primitive(PrimitiveType::Long),
                     true,
                 )))),
             )),
             Arc::new(NestedField::optional(
-                28,
+                33,
                 "negative_offset",
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
-                29,
+                34,
                 "negative_bucket_counts",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    49,
+                    35,
                     Type::Primitive(PrimitiveType::Long),
                     true,
                 )))),
             )),
-            // Summary fields
+            // 36-39: Summary quantile_values List<Struct{quantile, value}>
             Arc::new(NestedField::optional(
-                30,
+                36,
                 "quantile_values",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    50,
-                    quantile_struct,
+                    37,
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::required(
+                            38,
+                            "quantile",
+                            Type::Primitive(PrimitiveType::Double),
+                        )),
+                        Arc::new(NestedField::required(
+                            39,
+                            "value",
+                            Type::Primitive(PrimitiveType::Double),
+                        )),
+                    ])),
                     true,
                 )))),
             )),
-            // Flags and exemplars
-            Arc::new(NestedField::optional(31, "flags", Type::Primitive(PrimitiveType::Int))),
+            // 40: Flags
+            Arc::new(NestedField::optional(40, "flags", Type::Primitive(PrimitiveType::Int))),
+            // 41-50: Exemplars List<Struct{timestamp, value_double, value_int, span_id, trace_id, attributes}>
             Arc::new(NestedField::optional(
-                32,
+                41,
                 "exemplars",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    51,
-                    exemplar_struct,
+                    42,
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::optional(
+                            43,
+                            "timestamp",
+                            Type::Primitive(PrimitiveType::Timestamp),
+                        )),
+                        Arc::new(NestedField::optional(
+                            44,
+                            "value_double",
+                            Type::Primitive(PrimitiveType::Double),
+                        )),
+                        Arc::new(NestedField::optional(
+                            45,
+                            "value_int",
+                            Type::Primitive(PrimitiveType::Long),
+                        )),
+                        Arc::new(NestedField::optional(
+                            46,
+                            "span_id",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            47,
+                            "trace_id",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::required(
+                            48,
+                            "attributes",
+                            Type::Map(MapType::new(
+                                Arc::new(NestedField::required(49, "key", Type::Primitive(PrimitiveType::String))),
+                                Arc::new(NestedField::required(
+                                    50,
+                                    "value",
+                                    Type::Primitive(PrimitiveType::String),
+                                )),
+                            )),
+                        )),
+                    ])),
                     true,
                 )))),
             )),
@@ -1035,5 +1082,92 @@ mod tests {
         assert!(schema.field_by_name("value_double").is_some());
         assert!(schema.field_by_name("bucket_counts").is_some());
         assert!(schema.field_by_name("exemplars").is_some());
+    }
+
+    /// Collects all field IDs from an Iceberg schema by walking the type tree.
+    ///
+    /// Complex types (Map, List, Struct) have sub-field IDs that must also
+    /// be sequential. This helper extracts every ID in depth-first order.
+    fn collect_field_ids(fields: &[Arc<NestedField>]) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for field in fields {
+            ids.push(field.id);
+            collect_type_ids(&field.field_type, &mut ids);
+        }
+        ids
+    }
+
+    /// Recursively collects field IDs from a nested Iceberg type.
+    fn collect_type_ids(ty: &Type, ids: &mut Vec<i32>) {
+        match ty {
+            Type::Primitive(_) => {}
+            Type::Map(map) => {
+                ids.push(map.key_field.id);
+                collect_type_ids(&map.key_field.field_type, ids);
+                ids.push(map.value_field.id);
+                collect_type_ids(&map.value_field.field_type, ids);
+            }
+            Type::List(list) => {
+                ids.push(list.element_field.id);
+                collect_type_ids(&list.element_field.field_type, ids);
+            }
+            Type::Struct(s) => {
+                for field in s.fields() {
+                    ids.push(field.id);
+                    collect_type_ids(&field.field_type, ids);
+                }
+            }
+        }
+    }
+
+    /// Verifies that a schema has strictly sequential field IDs (1, 2, 3, ...).
+    ///
+    /// Iceberg catalogs (Nessie, REST) assign field IDs sequentially in
+    /// depth-first order when creating tables. If our code-defined schemas
+    /// use different IDs, the Iceberg writer fails with field-not-found
+    /// errors because it matches by field ID.
+    fn assert_sequential_field_ids(schema: &Schema, schema_name: &str) {
+        let ids = collect_field_ids(schema.as_struct().fields());
+
+        assert!(!ids.is_empty(), "{schema_name}: schema has no fields");
+
+        // IDs must start at 1
+        assert_eq!(ids[0], 1, "{schema_name}: first field ID should be 1, got {}", ids[0]);
+
+        // IDs must be strictly sequential (each = previous + 1)
+        for window in ids.windows(2) {
+            assert_eq!(
+                window[1],
+                window[0] + 1,
+                "{schema_name}: field IDs are not sequential — got {} after {} (expected {}). Full IDs: {ids:?}",
+                window[1],
+                window[0],
+                window[0] + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn test_logs_schema_sequential_ids() {
+        let schema = logs_schema().expect("Failed to create logs schema");
+        assert_sequential_field_ids(&schema, "logs");
+    }
+
+    #[test]
+    fn test_spans_schema_sequential_ids() {
+        let schema = spans_schema().expect("Failed to create spans schema");
+        assert_sequential_field_ids(&schema, "spans");
+    }
+
+    #[test]
+    fn test_events_schema_sequential_ids() {
+        let schema = events_schema().expect("Failed to create events schema");
+        assert_sequential_field_ids(&schema, "events");
+    }
+
+    #[test]
+    fn test_metrics_schema_sequential_ids() {
+        let schema = metrics_schema().expect("Failed to create metrics schema");
+        assert_sequential_field_ids(&schema, "metrics");
     }
 }

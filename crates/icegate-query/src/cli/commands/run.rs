@@ -150,7 +150,8 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         let engine = Arc::clone(&query_engine);
         let prom_config = config.prometheus.clone();
         let token = cancel_token.clone();
-        let handle = tokio::spawn(async move { crate::prometheus::run(engine, prom_config, token).await });
+        let m = Arc::clone(&query_metrics);
+        let handle = tokio::spawn(async move { crate::prometheus::run(engine, prom_config, token, m).await });
         handles.push(handle);
     }
 

@@ -1,7 +1,8 @@
 //! Custom schema provider for the IceGate namespace.
 //!
-//! Routes the "logs" table to [`IcegateTableProvider`] (merged Iceberg + WAL)
-//! while delegating other tables to standard `IcebergStaticTableProvider`.
+//! Routes WAL-backed tables (logs, metrics) to [`IcegateTableProvider`]
+//! (merged Iceberg + WAL) while delegating other tables to standard
+//! `IcebergStaticTableProvider`.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -18,8 +19,9 @@ use icegate_queue::ParquetQueueReader;
 
 use super::table::IcegateTableProvider;
 
-/// Schema provider that substitutes `IcegateTableProvider` for the "logs" table
-/// while using standard Iceberg providers for all other tables.
+/// Schema provider that substitutes `IcegateTableProvider` for WAL-backed
+/// tables (logs, metrics) while using standard Iceberg providers for all
+/// other tables.
 pub(super) struct IcegateSchemaProvider {
     /// All tables in the namespace, keyed by name.
     tables: HashMap<String, Arc<dyn TableProvider>>,
@@ -36,8 +38,9 @@ impl std::fmt::Debug for IcegateSchemaProvider {
 impl IcegateSchemaProvider {
     /// Creates a new schema provider for the given namespace.
     ///
-    /// For the "logs" table, creates an `IcegateTableProvider` that merges
-    /// Iceberg + WAL data. All other tables use `IcebergStaticTableProvider`.
+    /// For WAL-backed tables (logs, metrics), creates an
+    /// `IcegateTableProvider` that merges Iceberg + WAL data. All other
+    /// tables use `IcebergStaticTableProvider`.
     ///
     /// # Errors
     ///
@@ -59,10 +62,13 @@ impl IcegateSchemaProvider {
             let namespace = namespace.clone();
             let wal_reader = Arc::clone(&wal_reader);
             async move {
-                let provider: Arc<dyn TableProvider> = if name == icegate_common::LOGS_TOPIC {
-                    // Logs table: use our merged provider
+                // WAL-backed tables get the merged provider (Iceberg + WAL).
+                // The table name doubles as the WAL topic name.
+                let wal_topic = wal_topic_for_table(&name);
+                let provider: Arc<dyn TableProvider> = if let Some(topic) = wal_topic {
                     let table_ident = iceberg::TableIdent::new(namespace, name.clone());
-                    let provider = IcegateTableProvider::try_new(catalog, table_ident, wal_reader).await?;
+                    let provider =
+                        IcegateTableProvider::try_new(catalog, table_ident, topic, wal_reader).await?;
                     Arc::new(provider)
                 } else {
                     // Other tables: standard Iceberg static provider
@@ -98,5 +104,17 @@ impl SchemaProvider for IcegateSchemaProvider {
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         Ok(self.tables.get(name).cloned())
+    }
+}
+
+/// Returns the WAL topic name for tables that are backed by a WAL queue,
+/// or `None` for tables that are Iceberg-only.
+///
+/// Currently, `logs` and `metrics` are ingested through the WAL and need
+/// the merged Iceberg + WAL provider for low-latency queries.
+fn wal_topic_for_table(table_name: &str) -> Option<String> {
+    match table_name {
+        icegate_common::LOGS_TOPIC | icegate_common::METRICS_TOPIC => Some(table_name.to_string()),
+        _ => None,
     }
 }

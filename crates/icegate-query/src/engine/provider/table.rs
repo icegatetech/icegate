@@ -39,6 +39,8 @@ use crate::engine::core::WAL_STORE_URL;
 pub(super) struct IcegateTableProvider {
     /// Table identifier in the catalog (namespace + name).
     table_ident: TableIdent,
+    /// WAL topic name for this table (e.g., "logs", "metrics").
+    topic: String,
     /// Arrow schema for the table.
     schema: ArrowSchemaRef,
     /// Shared WAL queue reader for segment listing.
@@ -66,10 +68,11 @@ impl IcegateTableProvider {
     ///
     /// Returns an error if the table cannot be loaded from the catalog or if
     /// the schema cannot be converted.
-    #[tracing::instrument(skip(catalog, wal_reader), fields(%table_ident))]
+    #[tracing::instrument(skip(catalog, wal_reader), fields(%table_ident, %topic))]
     pub(super) async fn try_new(
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
+        topic: String,
         wal_reader: Arc<ParquetQueueReader>,
     ) -> Result<Self, iceberg::Error> {
         let table = catalog.load_table(&table_ident).await?;
@@ -79,6 +82,7 @@ impl IcegateTableProvider {
 
         Ok(Self {
             table_ident,
+            topic,
             schema,
             wal_reader,
             table,
@@ -262,7 +266,7 @@ impl IcegateTableProvider {
         // Intentionally uncancellable: WAL segment listing is a short metadata
         // operation during query planning that must run to completion.
         let uncancellable_token = CancellationToken::new();
-        let topic: String = icegate_common::LOGS_TOPIC.to_string();
+        let topic: String = self.topic.clone();
         let segment_files = self
             .wal_reader
             .list_segment_files(&topic, start_offset, &uncancellable_token)
