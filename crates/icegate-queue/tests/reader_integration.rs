@@ -917,9 +917,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metada
 
     for _ in 0..4 {
         // Build exactly 64 input row groups (2 rows each) to force blocking metadata path.
-        let batches = (0..64)
-            .map(|_| common::test_batch(2, 1))
-            .collect::<Result<Vec<_>, _>>()?;
+        let batches = (0..64).map(|_| common::test_batch(2, 1)).collect::<Result<Vec<_>, _>>()?;
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
