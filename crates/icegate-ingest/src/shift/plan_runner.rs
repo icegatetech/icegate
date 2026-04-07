@@ -11,6 +11,7 @@ use super::{
     SHIFT_TASK_CODE, SegmentToRead, ShiftConfig, ShiftInput, executor::TaskStatus, iceberg_storage::Storage,
     timeout::TimeoutEstimator,
 };
+use crate::wal::deserialize_row_group_metadata;
 
 /// Result of executing a plan task.
 pub struct PlanTaskResult {
@@ -69,6 +70,112 @@ where
             timeouts,
             topic: topic.into(),
         }
+    }
+
+    fn schedule_shift_tasks(
+        &self,
+        manager: &dyn JobManager,
+        plan: SegmentsPlan,
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<uuid::Uuid>, Error> {
+        let cancelled_err = || Error::TaskExecution("plan task cancelled during shift task scheduling".to_string());
+
+        if cancel_token.is_cancelled() {
+            return Err(cancelled_err());
+        }
+
+        let mut shift_task_ids = Vec::new();
+        for group in plan.groups {
+            if cancel_token.is_cancelled() {
+                return Err(cancelled_err());
+            }
+
+            let mut segments = Vec::with_capacity(group.segments.len());
+            for segment in group.segments {
+                if cancel_token.is_cancelled() {
+                    return Err(cancelled_err());
+                }
+
+                let row_groups = segment
+                    .row_groups
+                    .into_iter()
+                    .map(|row_group| {
+                        if cancel_token.is_cancelled() {
+                            return Err(cancelled_err());
+                        }
+                        let metadata = row_group.row_group_metadata.as_deref().ok_or_else(|| {
+                            Error::TaskExecution(format!(
+                                "missing logs row-group metadata for WAL segment {} row group {}",
+                                segment.segment_offset, row_group.row_group_idx
+                            ))
+                        })?;
+                        let boundary_range = deserialize_row_group_metadata(metadata)
+                            .map_err(|e| Error::TaskExecution(e.to_string()))?;
+                        Ok(super::PlannedRowGroup {
+                            row_group_idx: row_group.row_group_idx,
+                            row_group_bytes: row_group.row_group_bytes,
+                            boundary_range,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                segments.push(SegmentToRead {
+                    segment_offset: segment.segment_offset,
+                    row_groups,
+                });
+            }
+
+            if segments.is_empty() {
+                continue;
+            }
+
+            if cancel_token.is_cancelled() {
+                return Err(cancelled_err());
+            }
+            let task_id = self.create_shift_task(
+                manager,
+                &group.group_col_val,
+                segments,
+                group.segments_count,
+                group.record_batches_total,
+            )?;
+            shift_task_ids.push(task_id);
+        }
+
+        if shift_task_ids.is_empty() {
+            return Err(Error::TaskExecution("no tenant segments to schedule".to_string()));
+        }
+
+        Ok(shift_task_ids)
+    }
+
+    fn create_shift_task(
+        &self,
+        manager: &dyn JobManager,
+        tenant_id: &str,
+        segments: Vec<SegmentToRead>,
+        segments_count: usize,
+        record_batches_total: usize,
+    ) -> Result<uuid::Uuid, Error> {
+        let trace_context = icegate_common::extract_current_trace_context();
+
+        let shift_input = ShiftInput {
+            tenant_id: tenant_id.to_string(),
+            segments,
+            trace_context,
+        };
+
+        let shift_timeout = self
+            .timeouts
+            .shift_timeout(segments_count, record_batches_total)
+            .map_err(|e| Error::TaskExecution(e.to_string()))?;
+        let shift_task = TaskDefinition::new(
+            TaskCode::new(SHIFT_TASK_CODE),
+            serde_json::to_vec(&shift_input)
+                .map_err(|e| Error::TaskExecution(format!("failed to serialize shift input: {e}")))?,
+            shift_timeout,
+        )?;
+
+        manager.add_task(shift_task)
     }
 }
 
@@ -138,7 +245,7 @@ where
         let segments_count = plan.segments_count;
         let record_batches_total = plan.record_batches_total;
         let last_offset = plan.last_segment_offset;
-        let shift_task_ids = schedule_shift_tasks(manager, plan, &self.timeouts)?;
+        let shift_task_ids = self.schedule_shift_tasks(manager, plan, cancel_token)?;
 
         let last_offset_value = last_offset.unwrap_or(0);
         info!(
@@ -177,69 +284,374 @@ where
     }
 }
 
-fn schedule_shift_tasks(
-    manager: &dyn JobManager,
-    plan: SegmentsPlan,
-    timeouts: &TimeoutEstimator,
-) -> Result<Vec<uuid::Uuid>, Error> {
-    let mut shift_task_ids = Vec::new();
-    for group in plan.groups {
-        let segments = group
-            .segments
-            .into_iter()
-            .map(|segment| SegmentToRead {
-                segment_offset: segment.segment_offset,
-                record_batch_idxs: segment.record_batch_idxs,
-            })
-            .collect::<Vec<_>>();
-
-        if segments.is_empty() {
-            continue;
-        }
-
-        let task_id = create_shift_task(
-            manager,
-            &group.group_col_val,
-            segments,
-            group.segments_count,
-            group.record_batches_total,
-            timeouts,
-        )?;
-        shift_task_ids.push(task_id);
-    }
-
-    if shift_task_ids.is_empty() {
-        return Err(Error::TaskExecution("no tenant segments to schedule".to_string()));
-    }
-
-    Ok(shift_task_ids)
-}
-
-fn create_shift_task(
-    manager: &dyn JobManager,
-    tenant_id: &str,
-    segments: Vec<SegmentToRead>,
-    segments_count: usize,
-    record_batches_total: usize,
-    timeouts: &TimeoutEstimator,
-) -> Result<uuid::Uuid, Error> {
-    let trace_context = icegate_common::extract_current_trace_context();
-
-    let shift_input = ShiftInput {
-        tenant_id: tenant_id.to_string(),
-        segments,
-        trace_context,
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
-    let shift_timeout = timeouts
-        .shift_timeout(segments_count, record_batches_total)
-        .map_err(|e| Error::TaskExecution(e.to_string()))?;
-    let shift_task = TaskDefinition::new(
-        TaskCode::new(SHIFT_TASK_CODE),
-        serde_json::to_vec(&shift_input)
-            .map_err(|e| Error::TaskExecution(format!("failed to serialize shift input: {e}")))?,
-        shift_timeout,
-    )?;
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use iceberg::spec::DataFile;
+    use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
-    manager.add_task(shift_task)
+    use super::PlanTaskRunnerImpl;
+    use crate::{
+        error::Result as IngestResult,
+        shift::{
+            ShiftConfig,
+            iceberg_storage::{BoxRecordBatchStream, Storage, WrittenDataFiles},
+            timeout::TimeoutEstimator,
+        },
+        wal::serialize_row_group_metadata,
+    };
+
+    struct RecordingManager {
+        task_ids: std::sync::Mutex<Vec<Uuid>>,
+    }
+
+    impl RecordingManager {
+        fn new() -> Self {
+            Self {
+                task_ids: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl JobManager for RecordingManager {
+        fn add_task(&self, _task_def: TaskDefinition) -> std::result::Result<Uuid, icegate_jobmanager::Error> {
+            let task_id = Uuid::new_v4();
+            self.task_ids.lock().expect("task ids lock").push(task_id);
+            Ok(task_id)
+        }
+
+        fn complete_task(
+            &self,
+            _task_id: &Uuid,
+            _output: Vec<u8>,
+        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("complete_task is not expected in plan runner tests");
+        }
+
+        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("fail_task is not expected in plan runner tests");
+        }
+
+        fn set_next_start_at(
+            &self,
+            _next_start_at: DateTime<Utc>,
+        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+            panic!("set_next_start_at is not expected in plan runner tests");
+        }
+
+        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
+            panic!("get_task is not expected in plan runner tests");
+        }
+
+        fn get_tasks_by_code(
+            &self,
+            _code: &TaskCode,
+        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, icegate_jobmanager::Error> {
+            panic!("get_tasks_by_code is not expected in plan runner tests");
+        }
+    }
+
+    struct FakeQueueReader {
+        metadata_by_segment: HashMap<u64, HashMap<usize, String>>,
+        read_segment_row_group_metadata_calls: AtomicUsize,
+    }
+
+    struct FakeStorage;
+
+    #[async_trait]
+    impl Storage for FakeStorage {
+        async fn get_last_offset(&self, _cancel_token: &CancellationToken) -> IngestResult<Option<u64>> {
+            panic!("get_last_offset is not expected in plan runner tests");
+        }
+
+        async fn write_record_batches(
+            &self,
+            _batches: BoxRecordBatchStream,
+            _cancel_token: &CancellationToken,
+        ) -> IngestResult<WrittenDataFiles> {
+            panic!("write_record_batches is not expected in plan runner tests");
+        }
+
+        async fn get_data_files(
+            &self,
+            _parquet_paths: &[String],
+            _cancel_token: &CancellationToken,
+        ) -> IngestResult<Vec<DataFile>> {
+            panic!("get_data_files is not expected in plan runner tests");
+        }
+
+        async fn commit(
+            &self,
+            _data_files: Vec<DataFile>,
+            _record_type: &str,
+            _last_offset: u64,
+            _cancel_token: &CancellationToken,
+        ) -> IngestResult<usize> {
+            panic!("commit is not expected in plan runner tests");
+        }
+    }
+
+    #[async_trait]
+    impl icegate_queue::QueueReader for FakeQueueReader {
+        async fn plan_segments(
+            &self,
+            _topic: &icegate_queue::Topic,
+            _start_offset: u64,
+            _group_by_column_name: &str,
+            _max_record_batches_per_task: usize,
+            _max_input_bytes_per_task: u64,
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<icegate_queue::SegmentsPlan> {
+            panic!("plan_segments is not expected in plan runner tests");
+        }
+
+        async fn read_segment(
+            &self,
+            _topic: &icegate_queue::Topic,
+            _offset: u64,
+            _record_batch_idxs: &[usize],
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<icegate_queue::RecordBatchStream> {
+            panic!("read_segment is not expected in plan runner tests");
+        }
+
+        async fn read_segment_row_group_metadata(
+            &self,
+            _topic: &icegate_queue::Topic,
+            offset: u64,
+            _cancel_token: &CancellationToken,
+        ) -> icegate_queue::Result<HashMap<usize, String>> {
+            self.read_segment_row_group_metadata_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.metadata_by_segment.get(&offset).cloned().unwrap_or_default())
+        }
+    }
+
+    fn test_timeouts() -> TimeoutEstimator {
+        TimeoutEstimator::new(&crate::shift::config::ShiftTimeoutsConfig {
+            plan_base_ms: 1,
+            shift_base_ms: 1,
+            shift_per_record_batch_ms: 1,
+            shift_per_segment_ms: 1,
+            commit_base_ms: 1,
+            commit_per_parquet_file_ms: 1,
+        })
+        .expect("timeouts")
+    }
+
+    fn test_runner(queue_reader: FakeQueueReader) -> PlanTaskRunnerImpl<FakeQueueReader, FakeStorage> {
+        PlanTaskRunnerImpl::new(
+            Arc::new(queue_reader),
+            Arc::new(FakeStorage),
+            Arc::new(ShiftConfig::default()),
+            test_timeouts(),
+            "logs",
+        )
+    }
+
+    fn single_row_group_plan() -> icegate_queue::SegmentsPlan {
+        icegate_queue::SegmentsPlan {
+            groups: vec![icegate_queue::GroupedSegmentsPlan {
+                group_col_val: "tenant-a".to_string(),
+                segments: vec![icegate_queue::SegmentRecordBatchIdxs {
+                    segment_offset: 7,
+                    row_groups: vec![icegate_queue::PlannedRowGroup {
+                        row_group_idx: 0,
+                        row_group_bytes: 1,
+                        row_group_metadata: None,
+                    }],
+                }],
+                segments_count: 1,
+                record_batches_total: 1,
+                input_bytes_total: 1,
+            }],
+            last_segment_offset: Some(7),
+            segments_count: 1,
+            record_batches_total: 1,
+            input_bytes_total: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_shift_tasks_stops_immediately_when_cancelled() {
+        let queue_reader = FakeQueueReader {
+            metadata_by_segment: HashMap::new(),
+            read_segment_row_group_metadata_calls: AtomicUsize::new(0),
+        };
+        let runner = test_runner(queue_reader);
+        let manager = RecordingManager::new();
+        let plan = single_row_group_plan();
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let err = runner
+            .schedule_shift_tasks(&manager, plan, &cancel_token)
+            .expect_err("cancelled token must stop scheduling");
+
+        assert!(err.to_string().contains("cancelled"));
+        assert!(manager.task_ids.lock().expect("task ids lock").is_empty());
+        assert_eq!(
+            runner.queue_reader.read_segment_row_group_metadata_calls.load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_shift_tasks_rejects_placeholder_boundary_metadata() {
+        let queue_reader = FakeQueueReader {
+            metadata_by_segment: HashMap::from([(7, HashMap::from([(0, "{}".to_string())]))]),
+            read_segment_row_group_metadata_calls: AtomicUsize::new(0),
+        };
+        let runner = test_runner(queue_reader);
+        let manager = RecordingManager::new();
+        let mut plan = single_row_group_plan();
+        plan.groups[0].segments[0].row_groups[0].row_group_metadata = Some("{}".to_string());
+
+        let err = runner
+            .schedule_shift_tasks(&manager, plan, &CancellationToken::new())
+            .expect_err("placeholder metadata must be rejected");
+
+        assert!(err.to_string().contains("missing field"));
+    }
+
+    #[tokio::test]
+    async fn schedule_shift_tasks_accepts_boundary_metadata_serialized_by_wal_sort() {
+        let queue_reader = FakeQueueReader {
+            metadata_by_segment: HashMap::from([(
+                7,
+                HashMap::from([(
+                    0,
+                    serialize_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
+                        min_key: crate::wal::RowGroupBoundaryKey {
+                            components: vec![
+                                crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
+                                crate::wal::RowGroupBoundaryComponent::string(Some("svc-2".to_string()), false, true),
+                                crate::wal::RowGroupBoundaryComponent::timestamp_micros(Some(30), true, true),
+                            ],
+                        },
+                        max_key: crate::wal::RowGroupBoundaryKey {
+                            components: vec![
+                                crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
+                                crate::wal::RowGroupBoundaryComponent::string(Some("svc-2".to_string()), false, true),
+                                crate::wal::RowGroupBoundaryComponent::timestamp_micros(Some(30), true, true),
+                            ],
+                        },
+                    })
+                    .expect("serialize metadata"),
+                )]),
+            )]),
+            read_segment_row_group_metadata_calls: AtomicUsize::new(0),
+        };
+        let runner = test_runner(queue_reader);
+        let manager = RecordingManager::new();
+        let mut plan = single_row_group_plan();
+        plan.groups[0].segments[0].row_groups[0].row_group_metadata = Some(
+            serialize_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
+                min_key: crate::wal::RowGroupBoundaryKey {
+                    components: vec![
+                        crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
+                        crate::wal::RowGroupBoundaryComponent::string(Some("svc-2".to_string()), false, true),
+                        crate::wal::RowGroupBoundaryComponent::timestamp_micros(Some(30), true, true),
+                    ],
+                },
+                max_key: crate::wal::RowGroupBoundaryKey {
+                    components: vec![
+                        crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
+                        crate::wal::RowGroupBoundaryComponent::string(Some("svc-2".to_string()), false, true),
+                        crate::wal::RowGroupBoundaryComponent::timestamp_micros(Some(30), true, true),
+                    ],
+                },
+            })
+            .expect("serialize metadata"),
+        );
+
+        let task_ids = runner
+            .schedule_shift_tasks(&manager, plan, &CancellationToken::new())
+            .expect("serialized metadata must be accepted");
+
+        assert_eq!(task_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn schedule_shift_tasks_does_not_reread_segment_metadata_for_mixed_tenant_plan() {
+        let queue_reader = FakeQueueReader {
+            metadata_by_segment: HashMap::new(),
+            read_segment_row_group_metadata_calls: AtomicUsize::new(0),
+        };
+        let runner = test_runner(queue_reader);
+        let manager = RecordingManager::new();
+        let row_group_metadata = serialize_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
+            min_key: crate::wal::RowGroupBoundaryKey {
+                components: vec![
+                    crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
+                    crate::wal::RowGroupBoundaryComponent::string(Some("svc-1".to_string()), false, true),
+                    crate::wal::RowGroupBoundaryComponent::timestamp_micros(Some(10), true, true),
+                ],
+            },
+            max_key: crate::wal::RowGroupBoundaryKey {
+                components: vec![
+                    crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
+                    crate::wal::RowGroupBoundaryComponent::string(Some("svc-1".to_string()), false, true),
+                    crate::wal::RowGroupBoundaryComponent::timestamp_micros(Some(10), true, true),
+                ],
+            },
+        })
+        .expect("serialize metadata");
+        let plan = icegate_queue::SegmentsPlan {
+            groups: vec![
+                icegate_queue::GroupedSegmentsPlan {
+                    group_col_val: "tenant-a".to_string(),
+                    segments: vec![icegate_queue::SegmentRecordBatchIdxs {
+                        segment_offset: 7,
+                        row_groups: vec![icegate_queue::PlannedRowGroup {
+                            row_group_idx: 0,
+                            row_group_bytes: 1,
+                            row_group_metadata: Some(row_group_metadata.clone()),
+                        }],
+                    }],
+                    segments_count: 1,
+                    record_batches_total: 1,
+                    input_bytes_total: 1,
+                },
+                icegate_queue::GroupedSegmentsPlan {
+                    group_col_val: "tenant-b".to_string(),
+                    segments: vec![icegate_queue::SegmentRecordBatchIdxs {
+                        segment_offset: 7,
+                        row_groups: vec![icegate_queue::PlannedRowGroup {
+                            row_group_idx: 1,
+                            row_group_bytes: 1,
+                            row_group_metadata: Some(row_group_metadata),
+                        }],
+                    }],
+                    segments_count: 1,
+                    record_batches_total: 1,
+                    input_bytes_total: 1,
+                },
+            ],
+            last_segment_offset: Some(7),
+            segments_count: 1,
+            record_batches_total: 2,
+            input_bytes_total: 2,
+        };
+
+        let task_ids = runner
+            .schedule_shift_tasks(&manager, plan, &CancellationToken::new())
+            .expect("mixed-tenant plan must schedule successfully");
+
+        assert_eq!(task_ids.len(), 2);
+        assert_eq!(
+            runner.queue_reader.read_segment_row_group_metadata_calls.load(Ordering::SeqCst),
+            0
+        );
+    }
 }

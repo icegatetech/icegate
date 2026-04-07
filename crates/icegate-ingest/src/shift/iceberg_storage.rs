@@ -1,16 +1,18 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use arrow::{compute::SortOptions, record_batch::RecordBatch};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use iceberg::spec::TableMetadata;
+use futures::{Stream, TryStreamExt};
 use iceberg::{
     Catalog, NamespaceIdent, TableIdent,
     arrow::RecordBatchPartitionSplitter,
+    io::FileIO,
     spec::{DataFile, DataFileFormat},
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
@@ -18,7 +20,7 @@ use iceberg::{
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
             ParquetWriterBuilder,
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator},
             rolling_writer::RollingFileWriterBuilder,
         },
         partitioning::{PartitioningWriter, fanout_writer::FanoutWriter},
@@ -32,11 +34,42 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
 use super::{config::ShiftConfig, parquet_meta_reader::data_files_from_parquet_paths};
 use crate::error::{IngestError, Result};
+
+/// Wrapper around the default Iceberg location generator that records every
+/// generated output path.
+///
+/// Parquet files may already be created in object storage before the write
+/// pipeline finishes successfully. If the write later fails, the shift task
+/// must remove those orphaned files. This wrapper keeps the generated paths so
+/// cleanup can delete everything that was allocated during the failed write.
+#[derive(Clone, Debug)]
+struct TrackingLocationGenerator {
+    inner: DefaultLocationGenerator,
+    generated_paths: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl TrackingLocationGenerator {
+    const fn new(inner: DefaultLocationGenerator, generated_paths: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        Self { inner, generated_paths }
+    }
+}
+
+impl LocationGenerator for TrackingLocationGenerator {
+    fn generate_location(&self, partition_key: Option<&iceberg::spec::PartitionKey>, file_name: &str) -> String {
+        let path = self.inner.generate_location(partition_key, file_name);
+        let mut generated_paths = match self.generated_paths.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        generated_paths.push(path.clone());
+        path
+    }
+}
 
 /// Result of writing batches into parquet data files.
 pub struct WrittenDataFiles {
@@ -45,6 +78,9 @@ pub struct WrittenDataFiles {
     /// Total rows written across all data files.
     pub rows_written: usize,
 }
+
+/// Stream of merge-ordered record batches written to Iceberg.
+pub type BoxRecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
 
 /// Iceberg storage dependency surface for shift executors.
 #[async_trait]
@@ -55,7 +91,7 @@ pub trait Storage: Send + Sync {
     /// Write parquet files from record batches without committing.
     async fn write_record_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles>;
 
@@ -126,70 +162,84 @@ impl IcebergStorage {
 
     /// Writes record batches into parquet data files without committing to Iceberg.
     /// This method:
-    /// 1. Sorts the batches by the table's sort order
-    /// 2. Splits data by partition using `RecordBatchPartitionSplitter`
-    /// 3. Writes each partition's data using `FanoutWriter`
+    /// 1. Reads merge-ordered batches from the input stream
+    /// 2. Splits every batch by partition using `RecordBatchPartitionSplitter`
+    /// 3. Writes partition batches immediately via `FanoutWriter`
     pub async fn write_record_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        let batches = Arc::new(batches);
-        self.retry(cancel_token, || {
-            let batches = Arc::clone(&batches);
-            async move { self.write_parquet_files_once(batches.as_ref().clone(), cancel_token).await }
+        // Move the entire Parquet write pipeline off the tokio async-worker
+        // threads.  `write_parquet_files_once` performs CPU-heavy Arrow →
+        // Parquet encoding (column encoding, ZSTD compression, statistics)
+        // synchronously inside `AsyncArrowWriter::write`, which starves the
+        // ingest hot-path (GRPC handler / WAL flush) when both share the
+        // same tokio runtime.
+        //
+        // `spawn_blocking` runs on a dedicated thread-pool.  Inside it we
+        // re-enter the runtime via `Handle::block_on` so that async S3 I/O
+        // still resolves normally.
+        let handle = tokio::runtime::Handle::current();
+        let row_group_size = self.row_group_size;
+        let max_file_size_mb = self.max_file_size_mb;
+        let cancel = cancel_token.clone();
+        let table = self.load_table(cancel_token).await?;
+
+        // Capture the current tracing span so that `write_parquet_files_once`
+        // remains a child of the caller (e.g. `shift_run`) even though it
+        // executes on a different thread.
+        let span = tracing::Span::current();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
+            handle.block_on(Self::write_parquet_files_once(
+                table,
+                row_group_size,
+                max_file_size_mb,
+                batches,
+                &cancel,
+            ))
         })
         .await
+        .map_err(|e| IngestError::Shift(format!("shift write task panicked: {e}")))?
     }
 
-    #[tracing::instrument(skip(self, batches, cancel_token))]
+    #[tracing::instrument(skip(table, batches, cancel_token))]
     async fn write_parquet_files_once(
-        &self,
-        batches: Vec<RecordBatch>,
+        table: Table,
+        row_group_size: usize,
+        max_file_size_mb: usize,
+        mut batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        if batches.is_empty() {
-            return Ok(WrittenDataFiles {
-                data_files: Vec::new(),
-                rows_written: 0,
-            });
-        }
-
-        tracing::info!("Start preparing parquet file. Batches: {}", batches.len());
-        let queue_schema = batches[0].schema();
-        let combined_batch = arrow::compute::concat_batches(&queue_schema, &batches)?;
-        let table = self.load_table(cancel_token).await?;
         let table_metadata = table.metadata().clone();
         let table_file_io = table.file_io().clone();
-        let metadata_for_sort = table_metadata.clone();
-        tracing::debug!("Sorting batch");
-        let span = tracing::Span::current();
-        let sorted_batch = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| sort_by_table_order(&metadata_for_sort, combined_batch))
-        })
-        .await??;
-        tracing::debug!("Sorted batch has {} rows", sorted_batch.num_rows());
 
-        let location_generator = DefaultLocationGenerator::new(table_metadata.clone())
-            .map_err(|e| IngestError::Shift(format!("failed to create location generator: {e}")))?;
+        let generated_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let location_generator = TrackingLocationGenerator::new(
+            DefaultLocationGenerator::new(table_metadata.clone()).map_err(IngestError::Iceberg)?,
+            Arc::clone(&generated_paths),
+        );
 
         // Generate unique file prefix with UUID to avoid conflicts
         let write_id = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(write_id.to_string(), None, DataFileFormat::Parquet);
 
+        // TODO(med): Issue #101. Add semaphore/CPU budget. The limit should protect ingest from ZSTD spikes during multiple shift tasks.
         let writer_props = WriterProperties::builder()
             .set_statistics_enabled(EnabledStatistics::Page)
-            .set_data_page_row_count_limit(self.row_group_size / 10)
+            .set_data_page_row_count_limit((row_group_size / 10).max(1))
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .set_max_row_group_size(self.row_group_size)
+            .set_max_row_group_size(row_group_size)
             .build();
 
         let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table_metadata.current_schema().clone());
 
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
-            self.max_file_size_mb * 1024 * 1024,
-            table_file_io,
+            max_file_size_mb * 1024 * 1024,
+            table_file_io.clone(),
             location_generator,
             file_name_generator,
         );
@@ -204,46 +254,65 @@ impl IcebergStorage {
             table_metadata.current_schema().clone(),
             table_metadata.default_partition_spec().clone(),
         )
-        .map_err(|e| IngestError::Shift(format!("failed to create partition splitter: {e}")))?;
+        .map_err(IngestError::Iceberg)?;
 
-        // Split batch by partition and write each partition
-        let partitioned_batches = splitter
-            .split(&sorted_batch)
-            .map_err(|e| IngestError::Shift(format!("failed to split batch by partition: {e}")))?;
-        let partitioned_batches_len = partitioned_batches.len();
+        let write_result = async {
+            let mut rows_written = 0usize;
+            let mut partitioned_batches_total = 0usize;
+            while let Some(batch) = batches.try_next().await? {
+                if cancel_token.is_cancelled() {
+                    return Err(IngestError::Shift(
+                        "shift task cancelled during parquet write".to_string(),
+                    ));
+                }
+                rows_written = rows_written
+                    .checked_add(batch.num_rows())
+                    .ok_or_else(|| IngestError::Shift("rows written overflow".to_string()))?;
+                let partitioned_batches = splitter
+                    .split(&batch)
+                    .map_err(|e| IngestError::Shift(format!("failed to split batch by partition: {e}")))?;
+                partitioned_batches_total = partitioned_batches_total
+                    .checked_add(partitioned_batches.len())
+                    .ok_or_else(|| IngestError::Shift("partitioned batch count overflow".to_string()))?;
 
-        for (partition_key, partition_batch) in partitioned_batches {
-            let partition_path = partition_key.to_path();
-            let span = tracing::info_span!(
-                "iceberg_partition_write",
-                partition_key = %partition_path,
-                rows = partition_batch.num_rows()
+                for (partition_key, partition_batch) in partitioned_batches {
+                    let partition_path = partition_key.to_path();
+                    let span = tracing::info_span!(
+                        "iceberg_partition_write",
+                        partition_key = %partition_path,
+                        rows = partition_batch.num_rows()
+                    );
+                    fanout_writer
+                        .write(partition_key, partition_batch)
+                        .instrument(span)
+                        .await
+                        .map_err(IngestError::Iceberg)?;
+                }
+            }
+
+            // Close writer and get data files
+            let span = tracing::info_span!("iceberg_write_close");
+            let data_files: Vec<DataFile> =
+                fanout_writer.close().instrument(span).await.map_err(IngestError::Iceberg)?;
+
+            tracing::info!(
+                "Complete write {} parquet files for {} partitions",
+                data_files.len(),
+                partitioned_batches_total
             );
-            fanout_writer
-                .write(partition_key, partition_batch)
-                .instrument(span)
-                .await
-                .map_err(|e| IngestError::Shift(format!("failed to write partition batch: {e}")))?;
+
+            Ok(WrittenDataFiles {
+                data_files,
+                rows_written,
+            })
+        }
+        .await;
+
+        if write_result.is_err() {
+            cleanup_generated_data_files(&table_file_io, &generated_paths).await;
         }
 
-        // Close writer and get data files
-        let span = tracing::info_span!("iceberg_write_close");
-        let data_files: Vec<DataFile> = fanout_writer
-            .close()
-            .instrument(span)
-            .await
-            .map_err(|e| IngestError::Shift(format!("failed to close fanout writer: {e}")))?;
-
-        tracing::info!(
-            "Complete write {} parquet files for {} partitions",
-            data_files.len(),
-            partitioned_batches_len
-        );
-
-        Ok(WrittenDataFiles {
-            data_files,
-            rows_written: sorted_batch.num_rows(),
-        })
+        write_result
     }
 
     /// Commits parquet data files to Iceberg with offset tracking.
@@ -362,6 +431,31 @@ impl IcebergStorage {
     }
 }
 
+async fn cleanup_generated_data_files(file_io: &FileIO, generated_paths: &Arc<std::sync::Mutex<Vec<String>>>) {
+    let generated = match generated_paths.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let mut unique_paths = HashSet::with_capacity(generated.len());
+
+    for path in generated {
+        if !unique_paths.insert(path.clone()) {
+            continue;
+        }
+        match file_io.exists(&path).await {
+            Ok(true) => {
+                if let Err(err) = file_io.delete(&path).await {
+                    warn!(path = %path, error = %err, "failed to cleanup uncommitted parquet file");
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(path = %path, error = %err, "failed to check uncommitted parquet file existence");
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Storage for IcebergStorage {
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
@@ -370,7 +464,7 @@ impl Storage for IcebergStorage {
 
     async fn write_record_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
         self.write_record_batches(batches, cancel_token).await
@@ -393,63 +487,6 @@ impl Storage for IcebergStorage {
     ) -> Result<usize> {
         self.commit(data_files, record_type, last_offset, cancel_token).await
     }
-}
-
-/// Sorts a record batch by the table's sort order.
-fn sort_by_table_order(table_metadata: &TableMetadata, batch: RecordBatch) -> Result<RecordBatch> {
-    let sort_order = table_metadata.default_sort_order();
-
-    if sort_order.fields.is_empty() {
-        // No sort order defined, return as-is
-        return Ok(batch);
-    }
-
-    let schema = table_metadata.current_schema();
-    let batch_schema = batch.schema();
-
-    // Build sort columns from Iceberg sort order
-    let mut sort_columns = Vec::with_capacity(sort_order.fields.len());
-
-    for sort_field in &sort_order.fields {
-        // Get field name from schema using source_id
-        let field = schema.field_by_id(sort_field.source_id).ok_or_else(|| {
-            IngestError::Shift(format!(
-                "sort field with id {} not found in schema",
-                sort_field.source_id
-            ))
-        })?;
-
-        // Find column index in batch
-        let col_idx = batch_schema
-            .index_of(&field.name)
-            .map_err(|e| IngestError::Shift(format!("sort column '{}' not in batch: {e}", field.name)))?;
-
-        let descending = matches!(sort_field.direction, iceberg::spec::SortDirection::Descending);
-
-        let nulls_first = matches!(sort_field.null_order, iceberg::spec::NullOrder::First);
-
-        sort_columns.push(arrow::compute::SortColumn {
-            values: batch.column(col_idx).clone(),
-            options: Some(SortOptions {
-                descending,
-                nulls_first,
-            }),
-        });
-    }
-
-    // Compute sort indices
-    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)?;
-
-    // Reorder all columns
-    let sorted_columns: Vec<_> = batch
-        .columns()
-        .iter()
-        .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let sorted_batch = RecordBatch::try_new(batch_schema, sorted_columns)?;
-
-    Ok(sorted_batch)
 }
 
 // Table loader with caching
@@ -502,5 +539,46 @@ impl TableLoader {
         });
 
         Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use iceberg::io::FileIO;
+
+    use super::cleanup_generated_data_files;
+
+    #[tokio::test]
+    async fn cleanup_generated_data_files_deletes_existing_paths() {
+        let file_io = FileIO::new_with_memory();
+        let path_1 = "memory://cleanup/test-1.parquet";
+        let path_2 = "memory://cleanup/test-2.parquet";
+
+        file_io
+            .new_output(path_1)
+            .expect("output path_1")
+            .write("one".into())
+            .await
+            .expect("write path_1");
+        file_io
+            .new_output(path_2)
+            .expect("output path_2")
+            .write("two".into())
+            .await
+            .expect("write path_2");
+
+        let generated_paths = Arc::new(std::sync::Mutex::new(vec![
+            path_1.to_string(),
+            path_1.to_string(),
+            path_2.to_string(),
+            "memory://cleanup/missing.parquet".to_string(),
+        ]));
+
+        cleanup_generated_data_files(&file_io, &generated_paths).await;
+
+        assert!(!file_io.exists(path_1).await.expect("exists path_1"));
+        assert!(!file_io.exists(path_2).await.expect("exists path_2"));
     }
 }

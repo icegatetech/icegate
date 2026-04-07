@@ -755,6 +755,7 @@ pub struct OtlpMetrics {
     decode_errors_total: Counter<u64>,
     transform_duration: Histogram<f64>,
     records_per_request: Histogram<f64>,
+    wal_sorting_duration: Histogram<f64>,
     wal_enqueue_duration: Histogram<f64>,
     wal_ack_duration: Histogram<f64>,
     wal_queue_unavailable_total: Counter<u64>,
@@ -774,6 +775,7 @@ impl OtlpMetrics {
             decode_duration: meter.f64_histogram("icegate_ingest_otlp_decode_duration").build(),
             decode_errors_total: meter.u64_counter("icegate_ingest_otlp_decode_errors").build(),
             transform_duration: meter.f64_histogram("icegate_ingest_otlp_transform_duration").build(),
+            wal_sorting_duration: meter.f64_histogram("icegate_ingest_otlp_wal_sorting_duration").build(),
             records_per_request: meter.f64_histogram("icegate_ingest_otlp_records_per_request").build(),
             wal_enqueue_duration: meter.f64_histogram("icegate_ingest_wal_enqueue_duration").build(),
             wal_ack_duration: meter.f64_histogram("icegate_ingest_wal_ack_duration").build(),
@@ -811,6 +813,11 @@ impl OtlpMetrics {
             .with_description("OTLP transform duration")
             .with_unit("s")
             .build();
+        let pre_wal_prepare_duration = meter
+            .f64_histogram("icegate_ingest_otlp_wal_sorting_duration")
+            .with_description("OTLP WAL sorting duration")
+            .with_unit("s")
+            .build();
         let records_per_request = meter
             .f64_histogram("icegate_ingest_otlp_records_per_request")
             .with_description("Records per OTLP request")
@@ -838,6 +845,7 @@ impl OtlpMetrics {
             decode_duration,
             decode_errors_total,
             transform_duration,
+            wal_sorting_duration: pre_wal_prepare_duration,
             records_per_request,
             wal_enqueue_duration,
             wal_ack_duration,
@@ -928,6 +936,20 @@ impl OtlpMetrics {
             return;
         }
         self.transform_duration.record(
+            duration.as_secs_f64(),
+            &[
+                KeyValue::new("signal", signal.to_string()),
+                KeyValue::new("status", status.to_string()),
+            ],
+        );
+    }
+
+    /// Record WAL sorting duration.
+    pub fn record_wal_sorting_duration(&self, duration: Duration, signal: &str, status: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.wal_sorting_duration.record(
             duration.as_secs_f64(),
             &[
                 KeyValue::new("signal", signal.to_string()),
@@ -1061,6 +1083,16 @@ impl<'a> OtlpRequestRecorder<'a> {
     /// Record records per request.
     pub fn record_records_per_request(&self, count: usize) {
         self.metrics.record_records_per_request(count, self.signal);
+    }
+
+    /// Record transform duration.
+    pub fn record_transform_duration(&self, duration: Duration, signal: &str, status: &str) {
+        self.metrics.record_transform_duration(duration, signal, status);
+    }
+
+    /// Record WAL sorting duration.
+    pub fn record_wal_sorting_duration(&self, duration: Duration, signal: &str, status: &str) {
+        self.metrics.record_wal_sorting_duration(duration, signal, status);
     }
 
     /// Record WAL enqueue duration.
@@ -1532,6 +1564,36 @@ mod tests {
                 &exporter,
                 "icegate_ingest_shift_queue_reader_s3_request_duration",
                 get_range_labels,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn otlp_request_recorder_tracks_transform_and_pre_wal_prepare_separately() {
+        let (provider, exporter) = build_meter_provider();
+        let meter = provider.meter("test_otlp_metrics");
+        let metrics = OtlpMetrics::new(&meter);
+        let recorder = OtlpRequestRecorder::new(&metrics, "http", "logs", "protobuf");
+
+        recorder.record_transform_duration(Duration::from_millis(2), "logs", "ok");
+        recorder.record_wal_sorting_duration(Duration::from_millis(3), "logs", "ok");
+
+        provider.force_flush().expect("failed to flush metrics");
+
+        assert_eq!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_otlp_transform_duration",
+                &[("signal", "logs"), ("status", "ok")],
+            ),
+            1
+        );
+        assert_eq!(
+            find_histogram_count(
+                &exporter,
+                "icegate_ingest_otlp_wal_sorting_duration",
+                &[("signal", "logs"), ("status", "ok")],
             ),
             1
         );

@@ -14,6 +14,7 @@ pub mod instrumentation;
 pub mod parquet_meta_reader;
 /// Plan task runner for shift operations.
 pub mod plan_runner;
+mod row_groups_merger;
 /// Shift task runner for shift operations.
 pub mod shift_runner;
 /// Task timeout estimation utilities.
@@ -23,12 +24,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
 use commit_runner::CommitTaskRunnerImpl;
-pub use config::ShiftConfig;
-pub use executor::{
-    COMMIT_TASK_CODE, CommitInput, Executor, PLAN_TASK_CODE, SHIFT_TASK_CODE, SegmentToRead, ShiftInput, ShiftOutput,
+pub(crate) use config::ShiftConfig;
+pub(crate) use executor::{
+    COMMIT_TASK_CODE, CommitInput, Executor, PLAN_TASK_CODE, PlannedRowGroup, SHIFT_TASK_CODE, SegmentToRead,
+    ShiftInput, ShiftOutput,
 };
 use iceberg::Catalog;
-pub use iceberg_storage::{IcebergStorage, WrittenDataFiles};
+pub(crate) use iceberg_storage::IcebergStorage;
 use icegate_common::{LOGS_TABLE, LOGS_TOPIC};
 use icegate_jobmanager::{
     CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
@@ -39,7 +41,6 @@ use instrumentation::{
     CommitTaskRunnerWithMetrics, PlanTaskRunnerWithMetrics, QueueReaderWithMetrics, ShiftTaskRunnerWithMetrics,
     StorageWithMetrics,
 };
-pub use parquet_meta_reader::data_files_from_parquet_paths;
 use plan_runner::PlanTaskRunnerImpl;
 use shift_runner::ShiftTaskRunnerImpl;
 use timeout::TimeoutEstimator;
@@ -94,8 +95,13 @@ impl Shifter {
         let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), LOGS_TOPIC));
         let shift_storage_for_runner = Arc::clone(&shift_storage);
         let shift_runner = Arc::new(
-            ShiftTaskRunnerImpl::new(queue_reader, shift_storage_for_runner, LOGS_TOPIC)
-                .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
+            ShiftTaskRunnerImpl::new(
+                queue_reader,
+                shift_storage_for_runner,
+                LOGS_TOPIC,
+                shift_config.write.row_group_size,
+            )?
+            .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
         );
         let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(
             shift_runner,

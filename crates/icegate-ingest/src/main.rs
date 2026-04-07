@@ -6,6 +6,10 @@ use clap::Parser;
 use icegate_ingest::{cli::Cli, error::Result};
 use tokio::runtime::Builder;
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 

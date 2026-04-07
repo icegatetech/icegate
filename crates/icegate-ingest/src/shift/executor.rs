@@ -8,6 +8,7 @@ use icegate_jobmanager::{ImmutableTask, JobManager, registry::TaskExecutorFn};
 use serde::{Deserialize, Serialize};
 
 use super::{commit_runner::CommitTaskRunner, plan_runner::PlanTaskRunner, shift_runner::ShiftTaskRunner};
+use crate::wal::RowGroupBoundaryRange;
 
 /// Task code for plan segments.
 pub const PLAN_TASK_CODE: &str = "plan";
@@ -24,6 +25,7 @@ pub enum TaskStatus {
     /// Task failed with an error.
     Error,
     /// Task exceeded its timeout.
+    #[allow(dead_code)]
     Timeout,
     /// Task was cancelled.
     Cancelled,
@@ -44,13 +46,24 @@ impl TaskStatus {
     }
 }
 
+/// Planned row group to read from WAL.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlannedRowGroup {
+    /// Row group index inside the WAL segment.
+    pub row_group_idx: usize,
+    /// Compressed row group size in bytes.
+    pub row_group_bytes: u64,
+    /// Inclusive merge-key boundary range for this row group.
+    pub boundary_range: RowGroupBoundaryRange,
+}
+
 /// Segment metadata used for shift input. Segments are WAL files.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SegmentToRead {
     /// segment offset.
     pub segment_offset: u64,
-    /// Batch offsets for this tenant inside the segment. Batches are grouped by column.
-    pub record_batch_idxs: Vec<usize>,
+    /// Planned row groups for this tenant inside the segment.
+    pub row_groups: Vec<PlannedRowGroup>,
 }
 
 /// Input for the shift task.

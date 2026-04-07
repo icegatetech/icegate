@@ -14,7 +14,7 @@ A generic WAL-based data queue with Parquet on object storage.
 ## Usage
 
 ```rust
-use icegate_queue::{QueueConfig, QueueWriter, WriteRequest, channel};
+use icegate_queue::{PreparedWalRowGroup, QueueConfig, QueueWriter, WriteRequest, channel};
 use arrow::record_batch::RecordBatch;
 use tokio::sync::oneshot;
 use std::sync::Arc;
@@ -32,8 +32,9 @@ let _handle = writer.start(rx);
 let (response_tx, response_rx) = oneshot::channel();
 tx.send(WriteRequest {
     topic: "logs".to_string(),
-    batch: record_batch,
+    row_groups: vec![PreparedWalRowGroup::new(record_batch)],
     response_tx,
+    trace_context: None,
 }).await?;
 
 // Wait for result

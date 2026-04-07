@@ -13,6 +13,8 @@ use crate::infra::metrics::OtlpMetrics;
 pub struct OtlpHttpState {
     /// Write channel for sending batches to the WAL queue.
     pub write_channel: WriteChannel,
+    /// Maximum number of rows per WAL row group.
+    pub wal_row_group_size: usize,
     /// Metrics recorder for OTLP intake.
     pub metrics: OtlpMetrics,
 }
@@ -24,13 +26,18 @@ pub struct OtlpHttpState {
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
     write_channel: WriteChannel,
+    wal_row_group_size: usize,
     metrics: OtlpMetrics,
     config: OtlpHttpConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = OtlpHttpState { write_channel, metrics };
+    let state = OtlpHttpState {
+        write_channel,
+        wal_row_group_size,
+        metrics,
+    };
 
     let app = super::routes::routes(state);
 

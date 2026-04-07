@@ -1,6 +1,9 @@
 //! AWS S3 client helpers for testing with MinIO.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
@@ -33,8 +36,28 @@ pub async fn create_s3_bucket(endpoint: &str, bucket_name: &str) -> Result<(), B
 
     let client = Client::new(&shared_config);
 
-    // Create bucket
-    client.create_bucket().bucket(bucket_name).send().await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.create_bucket().bucket(bucket_name).send().await {
+            Ok(_) => break,
+            Err(aws_sdk_s3::error::SdkError::DispatchFailure(_) | aws_sdk_s3::error::SdkError::TimeoutError(_))
+                if Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(aws_sdk_s3::error::SdkError::ServiceError(service_error))
+                if service_error.raw().status().as_u16() == 409 =>
+            {
+                break;
+            }
+            Err(aws_sdk_s3::error::SdkError::ServiceError(service_error))
+                if service_error.raw().status().as_u16() == 503 && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 
     tracing::info!("S3 bucket created: {}", bucket_name);
     Ok(())

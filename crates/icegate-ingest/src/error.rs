@@ -48,6 +48,10 @@ pub enum IngestError {
     #[error("shift error: {0}")]
     Shift(String),
 
+    /// Shift queue-read operation error.
+    #[error("shift queue read error: {0}")]
+    ShiftQueueRead(String),
+
     /// Operation cancelled.
     #[error("operation cancelled")]
     Cancelled,
@@ -96,7 +100,8 @@ impl IngestError {
             | Self::MaxAttemptsReached
             | Self::Arrow(_)
             | Self::Join(_)
-            | Self::Shift(_) => false,
+            | Self::Shift(_)
+            | Self::ShiftQueueRead(_) => false,
         }
     }
 }

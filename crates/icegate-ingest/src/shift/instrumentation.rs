@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use icegate_jobmanager::{Error, JobManager};
-use icegate_queue::{QueueReader, SegmentsPlan, Topic};
+use icegate_queue::{QueueReader, RecordBatchStream, SegmentsPlan, Topic};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -286,7 +286,7 @@ where
         offset: u64,
         record_batch_idxs: &[usize],
         cancel_token: &CancellationToken,
-    ) -> icegate_queue::Result<Vec<arrow::record_batch::RecordBatch>> {
+    ) -> icegate_queue::Result<RecordBatchStream> {
         let start = Instant::now();
         let result = self.inner.read_segment(topic, offset, record_batch_idxs, cancel_token).await;
         match &result {
@@ -302,6 +302,15 @@ where
             ),
         }
         result
+    }
+
+    async fn read_segment_row_group_metadata(
+        &self,
+        topic: &Topic,
+        offset: u64,
+        cancel_token: &CancellationToken,
+    ) -> icegate_queue::Result<std::collections::HashMap<usize, String>> {
+        self.inner.read_segment_row_group_metadata(topic, offset, cancel_token).await
     }
 }
 
@@ -346,7 +355,7 @@ where
 
     async fn write_record_batches(
         &self,
-        batches: Vec<arrow::record_batch::RecordBatch>,
+        batches: super::iceberg_storage::BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> crate::error::Result<WrittenDataFiles> {
         let start = Instant::now();

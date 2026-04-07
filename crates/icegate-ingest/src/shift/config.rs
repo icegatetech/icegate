@@ -270,7 +270,7 @@ pub struct ShiftConfig {
 impl ShiftConfig {
     /// Validates configuration values.
     pub fn validate(&self) -> Result<(), IngestError> {
-        if self.write.row_group_size == 0 {
+        if self.write.row_group_size < 128 {
             return Err(IngestError::Config(
                 "row_group_size must be greater than zero".to_string(),
             ));
@@ -330,6 +330,7 @@ impl ShiftConfig {
 /// Timeout settings for shift-related tasks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(clippy::struct_field_names)]
 pub struct ShiftTimeoutsConfig {
     /// Base timeout for plan task in milliseconds.
     pub plan_base_ms: u64,

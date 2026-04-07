@@ -1,6 +1,7 @@
 //! Ingest component - OTLP receivers for logs, traces, and metrics
 
 mod config;
+mod wal;
 
 /// Error types for ingest operations.
 pub mod error;
@@ -21,7 +22,7 @@ pub mod otlp_http;
 pub mod transform;
 
 /// Shift operations: moving data from WAL to Iceberg
-pub mod shift;
+pub(crate) mod shift;
 
 /// Runtime thread planning helpers.
 pub mod runtime_threads;

@@ -2,10 +2,40 @@
 
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{Array, ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
+    datatypes::{DataType, Field, Schema, TimeUnit},
+    record_batch::RecordBatch,
+};
 use icegate_common::testing::{MinIOContainer, create_s3_bucket, create_s3_object_store};
+use icegate_queue::PreparedWalRowGroup;
 use object_store::ObjectStore;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RowGroupBoundaryValue {
+    String(String),
+    TimestampMicros(i64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RowGroupBoundaryComponent {
+    pub value: Option<RowGroupBoundaryValue>,
+    pub descending: bool,
+    pub nulls_first: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RowGroupBoundaryKey {
+    pub components: Vec<RowGroupBoundaryComponent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RowGroupBoundaryRange {
+    pub min_key: RowGroupBoundaryKey,
+    pub max_key: RowGroupBoundaryKey,
+}
 
 /// Sets up `MinIO` container, creates a unique S3 bucket, and returns an `ObjectStore`.
 ///
@@ -36,8 +66,7 @@ pub async fn setup_queue_test() -> Result<(MinIOContainer, Arc<dyn ObjectStore>,
 ///
 /// Returns an error if `RecordBatch` creation fails.
 pub fn test_batch(rows: usize, tenant_cardinality: usize) -> Result<RecordBatch, arrow::error::ArrowError> {
-    use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::array::{Float64Array, TimestampNanosecondArray};
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("tenant_id", DataType::Utf8, false),
@@ -79,4 +108,123 @@ pub fn test_batch(rows: usize, tenant_cardinality: usize) -> Result<RecordBatch,
             Arc::new(StringArray::from(messages)) as ArrayRef,
         ],
     )
+}
+
+pub fn prepared_row_groups(batches: Vec<RecordBatch>) -> Vec<PreparedWalRowGroup> {
+    batches.into_iter().map(PreparedWalRowGroup::new).collect()
+}
+
+#[allow(dead_code)]
+pub fn logs_batch(rows: &[(Option<&str>, Option<&str>, Option<i64>, i64)]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("cloud_account_id", DataType::Utf8, true),
+        Field::new("service_name", DataType::Utf8, true),
+        Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(cloud_account_id, _, _, _)| *cloud_account_id)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, service_name, _, _)| *service_name).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(
+                rows.iter().map(|(_, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, _, value)| *value).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap_or_else(|err| panic!("logs batch: {err}"))
+}
+
+#[allow(dead_code)]
+pub fn logs_row_group_boundary_range(batch: &RecordBatch) -> RowGroupBoundaryRange {
+    assert!(
+        batch.num_rows() > 0,
+        "logs_row_group_boundary_range requires a non-empty batch"
+    );
+
+    let cloud_account_id = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap_or_else(|| panic!("cloud_account_id"));
+    let service_name = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap_or_else(|| panic!("service_name"));
+    let timestamp = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap_or_else(|| panic!("timestamp"));
+
+    let first_row_idx = 0usize;
+    let last_row_idx = batch.num_rows() - 1;
+    RowGroupBoundaryRange {
+        min_key: RowGroupBoundaryKey {
+            components: vec![
+                RowGroupBoundaryComponent {
+                    value: (!cloud_account_id.is_null(first_row_idx))
+                        .then(|| RowGroupBoundaryValue::String(cloud_account_id.value(first_row_idx).to_string())),
+                    descending: false,
+                    nulls_first: true,
+                },
+                RowGroupBoundaryComponent {
+                    value: (!service_name.is_null(first_row_idx))
+                        .then(|| RowGroupBoundaryValue::String(service_name.value(first_row_idx).to_string())),
+                    descending: false,
+                    nulls_first: true,
+                },
+                RowGroupBoundaryComponent {
+                    value: (!timestamp.is_null(first_row_idx))
+                        .then(|| RowGroupBoundaryValue::TimestampMicros(timestamp.value(first_row_idx))),
+                    descending: true,
+                    nulls_first: true,
+                },
+            ],
+        },
+        max_key: RowGroupBoundaryKey {
+            components: vec![
+                RowGroupBoundaryComponent {
+                    value: (!cloud_account_id.is_null(last_row_idx))
+                        .then(|| RowGroupBoundaryValue::String(cloud_account_id.value(last_row_idx).to_string())),
+                    descending: false,
+                    nulls_first: true,
+                },
+                RowGroupBoundaryComponent {
+                    value: (!service_name.is_null(last_row_idx))
+                        .then(|| RowGroupBoundaryValue::String(service_name.value(last_row_idx).to_string())),
+                    descending: false,
+                    nulls_first: true,
+                },
+                RowGroupBoundaryComponent {
+                    value: (!timestamp.is_null(last_row_idx))
+                        .then(|| RowGroupBoundaryValue::TimestampMicros(timestamp.value(last_row_idx))),
+                    descending: true,
+                    nulls_first: true,
+                },
+            ],
+        },
+    }
+}
+
+#[allow(dead_code)]
+pub fn prepared_logs_row_groups(batches: Vec<RecordBatch>) -> Vec<PreparedWalRowGroup> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let metadata = serde_json::to_string(&logs_row_group_boundary_range(&batch))
+                .unwrap_or_else(|err| panic!("serialize boundary range: {err}"));
+            PreparedWalRowGroup::new(batch).with_metadata(metadata)
+        })
+        .collect()
 }

@@ -12,14 +12,49 @@ pub type WriteChannel = mpsc::Sender<WriteRequest>;
 /// Receiver end of the write channel.
 pub type WriteReceiver = mpsc::Receiver<WriteRequest>;
 
+/// Prepared WAL row group with optional opaque metadata.
+#[derive(Debug, Clone)]
+pub struct PreparedWalRowGroup {
+    /// Batch to write as a single parquet row group.
+    pub batch: RecordBatch,
+    /// Optional opaque metadata payload for this row group.
+    ///
+    /// The queue persists this payload alongside the row group but does not
+    /// interpret its contents.
+    pub metadata: Option<String>,
+}
+
+impl PreparedWalRowGroup {
+    /// Create a row group without metadata.
+    #[must_use]
+    pub const fn new(batch: RecordBatch) -> Self {
+        Self { batch, metadata: None }
+    }
+
+    /// Attach opaque metadata to the row group.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: String) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+}
+
+impl From<RecordBatch> for PreparedWalRowGroup {
+    fn from(batch: RecordBatch) -> Self {
+        Self::new(batch)
+    }
+}
+
 /// Message sent to the queue writer.
 #[derive(Debug)]
 pub struct WriteRequest {
-    /// Topic name for this batch.
+    /// Topic name for this logical write request.
     pub topic: Topic,
 
-    /// Arrow `RecordBatch` to write.
-    pub batch: RecordBatch,
+    /// Prepared row groups to write as a single logical request.
+    ///
+    /// Each batch becomes a separate Parquet row group in the flushed segment.
+    pub row_groups: Vec<PreparedWalRowGroup>,
 
     /// Channel to send the write result back to the caller.
     pub response_tx: oneshot::Sender<WriteResult>,
@@ -38,7 +73,7 @@ pub enum WriteResult {
     Success {
         /// Offset of the written segment.
         offset: u64,
-        /// Number of records written.
+        /// Number of records written by this logical request.
         records: usize,
         /// W3C trace context for distributed tracing (traceparent header format).
         trace_context: Option<String>,
