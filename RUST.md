@@ -101,7 +101,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 
 - **MUST** keep types focused on a single responsibility
 - **MUST** derive common traits: `Debug`, `Clone`, `PartialEq` where appropriate
-- **MUST** group the declaring of the structure and its implementation
+- **MUST** group the declaration of the structure and its implementation
 - Use `#[derive(Default)]` when a sensible default exists
 - Prefer composition to inheritance-like patterns
 - Use builder pattern for complex struct construction

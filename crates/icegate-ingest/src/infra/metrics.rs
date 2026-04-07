@@ -815,7 +815,7 @@ impl OtlpMetrics {
             .build();
         let pre_wal_prepare_duration = meter
             .f64_histogram("icegate_ingest_otlp_wal_sorting_duration")
-            .with_description("OTLP WAL soring duration")
+            .with_description("OTLP WAL sorting duration")
             .with_unit("s")
             .build();
         let records_per_request = meter

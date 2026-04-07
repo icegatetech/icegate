@@ -46,6 +46,11 @@ pub async fn create_s3_bucket(endpoint: &str, bucket_name: &str) -> Result<(), B
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(aws_sdk_s3::error::SdkError::ServiceError(service_error))
+                if service_error.raw().status().as_u16() == 409 =>
+            {
+                break;
+            }
+            Err(aws_sdk_s3::error::SdkError::ServiceError(service_error))
                 if service_error.raw().status().as_u16() == 503 && Instant::now() < deadline =>
             {
                 tokio::time::sleep(Duration::from_millis(100)).await;

@@ -24,6 +24,7 @@ pub(crate) struct SortColumnsDescriptor {
     columns: Vec<SortColumnDescriptor>,
 }
 
+// TODO(high): make a generic solution without binding to logs
 impl SortColumnsDescriptor {
     pub(crate) fn logs() -> Result<&'static Self> {
         match LOGS_SORT_DESCRIPTOR.get_or_init(|| Self::try_from_logs_sort_order().map_err(|err| err.to_string())) {

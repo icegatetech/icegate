@@ -1,12 +1,12 @@
 use super::RowGroupBoundaryRange;
 use crate::error::{IngestError, Result};
 
-pub(crate) fn serialize_logs_row_group_metadata(boundary_range: &RowGroupBoundaryRange) -> Result<String> {
+pub(crate) fn serialize_row_group_metadata(boundary_range: &RowGroupBoundaryRange) -> Result<String> {
     serde_json::to_string(boundary_range)
         .map_err(|err| IngestError::Shift(format!("failed to serialize WAL row-group metadata: {err}")))
 }
 
-pub(crate) fn deserialize_logs_row_group_metadata(metadata: &str) -> Result<RowGroupBoundaryRange> {
+pub(crate) fn deserialize_row_group_metadata(metadata: &str) -> Result<RowGroupBoundaryRange> {
     let value: serde_json::Value = serde_json::from_str(metadata)
         .map_err(|err| IngestError::Shift(format!("failed to deserialize WAL row-group metadata: {err}")))?;
     let object = value.as_object().ok_or_else(|| {

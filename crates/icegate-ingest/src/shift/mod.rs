@@ -100,7 +100,7 @@ impl Shifter {
                 shift_storage_for_runner,
                 LOGS_TOPIC,
                 shift_config.write.row_group_size,
-            )
+            )?
             .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
         );
         let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(

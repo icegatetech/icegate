@@ -9,7 +9,7 @@ use icegate_common::LOGS_TOPIC;
 use icegate_queue::{PreparedWalRowGroup, WriteRequest};
 
 use super::{
-    RowGroupBoundaryRange, SortColumnCache, SortColumnsDescriptor, metadata::serialize_logs_row_group_metadata,
+    RowGroupBoundaryRange, SortColumnCache, SortColumnsDescriptor, metadata::serialize_row_group_metadata,
     writer::PreparedWalWrite,
 };
 use crate::error::{IngestError, Result};
@@ -27,6 +27,7 @@ impl WalSorter {
 
     /// Sort logs for WAL so that each output batch contains exactly one tenant.
     fn sort_logs(&self, batch: &RecordBatch) -> Result<Vec<PreparedWalRowGroup>> {
+        // TODO(high): make a generic solution without binding to logs. Need to parameterize SortColumnsDescriptor.
         struct TenantGroup {
             row_indices: Vec<usize>,
         }
@@ -81,7 +82,7 @@ impl WalSorter {
                     IngestError::Shift("cannot build boundary range from empty WAL row group".to_string())
                 })?;
                 let boundary_range =
-                    logs_row_group_boundary_range_from_cached_columns(&sort_columns, first_row_idx, last_row_idx)?;
+                    row_group_boundary_range_from_cached_columns(&sort_columns, first_row_idx, last_row_idx)?;
                 let row_indices = row_indices
                     .iter()
                     .copied()
@@ -90,7 +91,7 @@ impl WalSorter {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let row_group_batch = Self::take_rows(batch, UInt32Array::from(row_indices))?;
-                let metadata = serialize_logs_row_group_metadata(&boundary_range)?;
+                let metadata = serialize_row_group_metadata(&boundary_range)?;
                 output.push(PreparedWalRowGroup::new(row_group_batch).with_metadata(metadata));
             }
         }
@@ -134,7 +135,7 @@ pub(crate) fn sort_logs(
     }))
 }
 
-fn logs_row_group_boundary_range_from_cached_columns(
+fn row_group_boundary_range_from_cached_columns(
     columns: &SortColumnCache,
     first_row_idx: usize,
     last_row_idx: usize,
@@ -159,7 +160,7 @@ pub(crate) fn logs_row_group_boundary_range_from_batch(batch: &RecordBatch) -> R
     }
     let sort_columns = SortColumnCache::try_new(batch, SortColumnsDescriptor::logs()?, "WAL sorting")?;
     let last_row_idx = batch.num_rows() - 1;
-    logs_row_group_boundary_range_from_cached_columns(&sort_columns, 0, last_row_idx)
+    row_group_boundary_range_from_cached_columns(&sort_columns, 0, last_row_idx)
 }
 
 #[cfg(test)]
@@ -177,7 +178,7 @@ mod tests {
     use crate::error::IngestError;
     use crate::wal::{
         RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue, WalAckOutcome,
-        deserialize_logs_row_group_metadata, serialize_logs_row_group_metadata, submit_sorted_logs_to_wal,
+        deserialize_row_group_metadata, serialize_row_group_metadata, submit_sorted_logs_to_wal,
     };
 
     fn logs_batch() -> RecordBatch {
@@ -380,7 +381,7 @@ mod tests {
             .iter()
             .map(|row_group| {
                 let metadata = row_group.metadata.as_deref().expect("metadata");
-                deserialize_logs_row_group_metadata(metadata).expect("deserialize metadata")
+                deserialize_row_group_metadata(metadata).expect("deserialize metadata")
             })
             .collect::<Vec<_>>();
 
@@ -432,8 +433,8 @@ mod tests {
         };
 
         let range = logs_row_group_boundary_range_from_batch(&batch).expect("boundary range");
-        let metadata = serialize_logs_row_group_metadata(&range).expect("serialize metadata");
-        let restored = deserialize_logs_row_group_metadata(&metadata).expect("deserialize metadata");
+        let metadata = serialize_row_group_metadata(&range).expect("serialize metadata");
+        let restored = deserialize_row_group_metadata(&metadata).expect("deserialize metadata");
 
         assert_eq!(range, expected);
         assert_eq!(restored, expected);
@@ -521,13 +522,13 @@ mod tests {
 
     #[test]
     fn deserialize_logs_row_group_metadata_rejects_missing_boundary_fields() {
-        let err = deserialize_logs_row_group_metadata("{}").expect_err("metadata must be rejected");
+        let err = deserialize_row_group_metadata("{}").expect_err("metadata must be rejected");
         assert!(err.to_string().contains("missing field"));
     }
 
     #[test]
     fn deserialize_logs_row_group_metadata_rejects_different_component_count() {
-        let err = deserialize_logs_row_group_metadata(
+        let err = deserialize_row_group_metadata(
             r#"{
                 "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
                 "max_key": {"components":[
@@ -543,7 +544,7 @@ mod tests {
 
     #[test]
     fn deserialize_logs_row_group_metadata_rejects_different_component_flags() {
-        let err = deserialize_logs_row_group_metadata(
+        let err = deserialize_row_group_metadata(
             r#"{
                 "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
                 "max_key": {"components":[{"value":{"String":"acc-2"},"descending":true,"nulls_first":true}]}
@@ -556,7 +557,7 @@ mod tests {
 
     #[test]
     fn deserialize_logs_row_group_metadata_rejects_different_component_types() {
-        let err = deserialize_logs_row_group_metadata(
+        let err = deserialize_row_group_metadata(
             r#"{
                 "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
                 "max_key": {"components":[{"value":{"TimestampMicros":10},"descending":false,"nulls_first":true}]}

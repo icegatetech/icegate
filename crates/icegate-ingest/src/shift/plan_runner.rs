@@ -11,7 +11,7 @@ use super::{
     SHIFT_TASK_CODE, SegmentToRead, ShiftConfig, ShiftInput, executor::TaskStatus, iceberg_storage::Storage,
     timeout::TimeoutEstimator,
 };
-use crate::wal::deserialize_logs_row_group_metadata;
+use crate::wal::deserialize_row_group_metadata;
 
 /// Result of executing a plan task.
 pub struct PlanTaskResult {
@@ -76,23 +76,40 @@ where
         &self,
         manager: &dyn JobManager,
         plan: SegmentsPlan,
-        _cancel_token: &CancellationToken,
+        cancel_token: &CancellationToken,
     ) -> Result<Vec<uuid::Uuid>, Error> {
+        let cancelled_err = || Error::TaskExecution("plan task cancelled during shift task scheduling".to_string());
+
+        if cancel_token.is_cancelled() {
+            return Err(cancelled_err());
+        }
+
         let mut shift_task_ids = Vec::new();
         for group in plan.groups {
+            if cancel_token.is_cancelled() {
+                return Err(cancelled_err());
+            }
+
             let mut segments = Vec::with_capacity(group.segments.len());
             for segment in group.segments {
+                if cancel_token.is_cancelled() {
+                    return Err(cancelled_err());
+                }
+
                 let row_groups = segment
                     .row_groups
                     .into_iter()
                     .map(|row_group| {
+                        if cancel_token.is_cancelled() {
+                            return Err(cancelled_err());
+                        }
                         let metadata = row_group.row_group_metadata.as_deref().ok_or_else(|| {
                             Error::TaskExecution(format!(
                                 "missing logs row-group metadata for WAL segment {} row group {}",
                                 segment.segment_offset, row_group.row_group_idx
                             ))
                         })?;
-                        let boundary_range = deserialize_logs_row_group_metadata(metadata)
+                        let boundary_range = deserialize_row_group_metadata(metadata)
                             .map_err(|e| Error::TaskExecution(e.to_string()))?;
                         Ok(super::PlannedRowGroup {
                             row_group_idx: row_group.row_group_idx,
@@ -111,6 +128,9 @@ where
                 continue;
             }
 
+            if cancel_token.is_cancelled() {
+                return Err(cancelled_err());
+            }
             let task_id = self.create_shift_task(
                 manager,
                 &group.group_col_val,
@@ -289,7 +309,7 @@ mod tests {
             iceberg_storage::{BoxRecordBatchStream, Storage, WrittenDataFiles},
             timeout::TimeoutEstimator,
         },
-        wal::serialize_logs_row_group_metadata,
+        wal::serialize_row_group_metadata,
     };
 
     struct RecordingManager {
@@ -463,6 +483,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_shift_tasks_stops_immediately_when_cancelled() {
+        let queue_reader = FakeQueueReader {
+            metadata_by_segment: HashMap::new(),
+            read_segment_row_group_metadata_calls: AtomicUsize::new(0),
+        };
+        let runner = test_runner(queue_reader);
+        let manager = RecordingManager::new();
+        let plan = single_row_group_plan();
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let err = runner
+            .schedule_shift_tasks(&manager, plan, &cancel_token)
+            .expect_err("cancelled token must stop scheduling");
+
+        assert!(err.to_string().contains("cancelled"));
+        assert!(manager.task_ids.lock().expect("task ids lock").is_empty());
+        assert_eq!(
+            runner.queue_reader.read_segment_row_group_metadata_calls.load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn schedule_shift_tasks_rejects_placeholder_boundary_metadata() {
         let queue_reader = FakeQueueReader {
             metadata_by_segment: HashMap::from([(7, HashMap::from([(0, "{}".to_string())]))]),
@@ -487,7 +531,7 @@ mod tests {
                 7,
                 HashMap::from([(
                     0,
-                    serialize_logs_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
+                    serialize_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
                         min_key: crate::wal::RowGroupBoundaryKey {
                             components: vec![
                                 crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
@@ -512,7 +556,7 @@ mod tests {
         let manager = RecordingManager::new();
         let mut plan = single_row_group_plan();
         plan.groups[0].segments[0].row_groups[0].row_group_metadata = Some(
-            serialize_logs_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
+            serialize_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
                 min_key: crate::wal::RowGroupBoundaryKey {
                     components: vec![
                         crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
@@ -546,7 +590,7 @@ mod tests {
         };
         let runner = test_runner(queue_reader);
         let manager = RecordingManager::new();
-        let row_group_metadata = serialize_logs_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
+        let row_group_metadata = serialize_row_group_metadata(&crate::wal::RowGroupBoundaryRange {
             min_key: crate::wal::RowGroupBoundaryKey {
                 components: vec![
                     crate::wal::RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),

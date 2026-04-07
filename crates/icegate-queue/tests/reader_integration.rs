@@ -916,19 +916,25 @@ async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metada
     let handle = writer.start(rx);
 
     for _ in 0..4 {
-        // 128 rows with row_group_size=2 => >=64 row groups per segment (spawn_blocking path).
-        let batch = common::test_batch(128, 1)?;
+        // Build exactly 64 input row groups (2 rows each) to force blocking metadata path.
+        let batches = (0..64)
+            .map(|_| common::test_batch(2, 1))
+            .collect::<Result<Vec<_>, _>>()?;
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(WriteRequest {
             topic: "logs".to_string(),
-            row_groups: common::prepared_row_groups(vec![batch]),
+            row_groups: common::prepared_row_groups(batches),
 
             response_tx,
             trace_context: None,
         })
         .await
         .unwrap();
-        response_rx.await.unwrap();
+        let write_result = response_rx.await.unwrap();
+        assert!(
+            write_result.is_success(),
+            "write request failed while preparing blocking metadata path: {write_result:?}"
+        );
     }
 
     drop(tx);

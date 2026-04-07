@@ -360,7 +360,7 @@ where
 
         Ok(Self {
             config,
-            sort_descriptor: SortColumnsDescriptor::logs()?,
+            sort_descriptor: SortColumnsDescriptor::logs()?, // TODO(high): make a generic solution without binding to logs
             schema: SchemaRef::new(arrow::datatypes::Schema::empty()),
             queue_reader,
             pending_row_groups: read_plan.into_iter().map(PendingRowGroupWithOrder::new).collect(),

@@ -295,6 +295,7 @@ impl QueueWriter {
             debug!("Empty batches, skipping write");
             return Ok(self.get_current_offset(topic).await);
         }
+        self.validate_row_group_sizes(&row_groups)?;
 
         // Convert to Parquet bytes — each batch becomes a row group
         let row_group_count = row_groups.len();
@@ -326,6 +327,19 @@ impl QueueWriter {
         );
 
         Ok(offset)
+    }
+
+    fn validate_row_group_sizes(&self, row_groups: &[PreparedWalRowGroup]) -> Result<()> {
+        let max_row_group_size = self.config.common.max_row_group_size;
+        for (row_group_idx, row_group) in row_groups.iter().enumerate() {
+            let row_count = row_group.batch.num_rows();
+            if row_count > max_row_group_size {
+                return Err(QueueError::Config(format!(
+                    "row group {row_group_idx} has {row_count} rows, exceeds common.max_row_group_size={max_row_group_size}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Converts record batches to Parquet bytes.
@@ -815,6 +829,13 @@ mod tests {
         }
     }
 
+    fn prepared_batch_slice(offset: usize, length: usize) -> PreparedWalRowGroup {
+        PreparedWalRowGroup {
+            batch: test_batch().slice(offset, length),
+            metadata: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_write_batch_success() {
         let store = Arc::new(InMemory::new());
@@ -875,7 +896,12 @@ mod tests {
     #[tokio::test]
     async fn test_channel_write_acknowledges_only_request_records() {
         let store = Arc::new(InMemory::new());
-        let config = QueueConfig::new("queue").with_max_row_group_size(16).with_flush_interval_ms(50);
+        // Keep the first request buffered (8 rows), then trigger deterministic
+        // flush when the second request arrives (total 12 rows reaches limit).
+        // A large flush interval avoids timing-based flush races in the test.
+        let config = QueueConfig::new("queue")
+            .with_max_row_group_size(12)
+            .with_flush_interval_ms(60_000);
         let writer = QueueWriter::new(config, store);
 
         let (tx, rx) = channel(10);
@@ -919,7 +945,13 @@ mod tests {
         let config = QueueConfig::new("queue").with_max_row_group_size(2);
         let writer = QueueWriter::new(config, store.clone());
 
-        writer.write_batches(&"logs".to_string(), vec![prepared_batch()]).await.unwrap();
+        writer
+            .write_batches(
+                &"logs".to_string(),
+                vec![prepared_batch_slice(0, 2), prepared_batch_slice(2, 2)],
+            )
+            .await
+            .unwrap();
 
         let reader = ParquetQueueReader::new("queue", store, 2).unwrap();
         let cancel = CancellationToken::new();
@@ -934,6 +966,25 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].num_rows(), 2);
         assert_eq!(batches[1].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_write_batches_rejects_oversized_row_group() {
+        let store = Arc::new(InMemory::new());
+        let config = QueueConfig::new("queue").with_max_row_group_size(2);
+        let writer = QueueWriter::new(config, store);
+
+        let err = writer
+            .write_batches(&"logs".to_string(), vec![prepared_batch()])
+            .await
+            .expect_err("oversized row group must be rejected");
+
+        match err {
+            QueueError::Config(message) => {
+                assert!(message.contains("exceeds common.max_row_group_size=2"));
+            }
+            other => panic!("expected config error, got: {other}"),
+        }
     }
 
     #[tokio::test]

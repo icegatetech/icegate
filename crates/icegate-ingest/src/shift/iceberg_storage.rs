@@ -226,10 +226,10 @@ impl IcebergStorage {
         let write_id = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(write_id.to_string(), None, DataFileFormat::Parquet);
 
-        // TODO(med): add semaphore/CPU budget. The limit should protect ingest from ZSTD spikes during multiple shift tasks.
+        // TODO(med): Issue #101. Add semaphore/CPU budget. The limit should protect ingest from ZSTD spikes during multiple shift tasks.
         let writer_props = WriterProperties::builder()
             .set_statistics_enabled(EnabledStatistics::Page)
-            .set_data_page_row_count_limit(row_group_size / 10)
+            .set_data_page_row_count_limit((row_group_size / 10).max(1))
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_max_row_group_size(row_group_size)
             .build();

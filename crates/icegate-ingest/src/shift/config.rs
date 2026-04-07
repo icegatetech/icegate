@@ -270,7 +270,7 @@ pub struct ShiftConfig {
 impl ShiftConfig {
     /// Validates configuration values.
     pub fn validate(&self) -> Result<(), IngestError> {
-        if self.write.row_group_size == 0 {
+        if self.write.row_group_size < 128 {
             return Err(IngestError::Config(
                 "row_group_size must be greater than zero".to_string(),
             ));
