@@ -8,7 +8,9 @@
 use chrono::{DateTime, Utc};
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::Datum;
-use icegate_common::schema::LOG_INDEXED_ATTRIBUTE_COLUMNS;
+use icegate_common::schema::{
+    COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_TENANT_ID, COL_TIMESTAMP, LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS,
+};
 
 use crate::logql::common::MatchOp;
 use crate::logql::log::Selector;
@@ -16,9 +18,10 @@ use crate::logql::log::Selector;
 /// Always-AND'ed base predicate: `tenant_id` equality and timestamp range.
 #[must_use]
 pub fn base_predicate(tenant_id: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> Predicate {
-    let tenant = Reference::new("tenant_id").equal_to(Datum::string(tenant_id.to_string()));
-    let ts_lo = Reference::new("timestamp").greater_than_or_equal_to(Datum::timestamp_micros(start.timestamp_micros()));
-    let ts_hi = Reference::new("timestamp").less_than_or_equal_to(Datum::timestamp_micros(end.timestamp_micros()));
+    let tenant = Reference::new(COL_TENANT_ID).equal_to(Datum::string(tenant_id.to_string()));
+    let ts_lo =
+        Reference::new(COL_TIMESTAMP).greater_than_or_equal_to(Datum::timestamp_micros(start.timestamp_micros()));
+    let ts_hi = Reference::new(COL_TIMESTAMP).less_than_or_equal_to(Datum::timestamp_micros(end.timestamp_micros()));
     tenant.and(ts_lo).and(ts_hi)
 }
 
@@ -57,13 +60,17 @@ pub fn full_predicate(tenant_id: &str, start: DateTime<Utc>, end: DateTime<Utc>,
     }
 }
 
-/// Map a label name to its underlying indexed column name (handles the
-/// `level` → `severity_text` alias).
+/// Map a label name to its underlying indexed column name.
+///
+/// Handles Loki/Grafana aliases consistently with
+/// `LogQLPlanner::map_label_to_internal_name`:
+/// - `level`, `detected_level` → `severity_text`
+/// - `service` → `service_name`
 pub(super) fn indexed_column_name(label: &str) -> String {
-    if label == "level" {
-        "severity_text".to_string()
-    } else {
-        label.to_string()
+    match label {
+        LEVEL_ALIAS | "detected_level" => COL_SEVERITY_TEXT.to_string(),
+        "service" => COL_SERVICE_NAME.to_string(),
+        _ => label.to_string(),
     }
 }
 
@@ -158,5 +165,31 @@ mod tests {
         assert!(is_indexed_column("service_name"));
         assert!(is_indexed_column("level"));
         assert!(!is_indexed_column("pod"));
+    }
+
+    #[test]
+    fn is_indexed_column_knows_detected_level_alias() {
+        assert!(is_indexed_column("detected_level"));
+    }
+
+    #[test]
+    fn is_indexed_column_knows_service_alias() {
+        assert!(is_indexed_column("service"));
+    }
+
+    #[test]
+    fn selector_predicate_translates_detected_level_to_severity_text() {
+        let sel = Selector::new(vec![LabelMatcher::eq("detected_level", "warn")]);
+        let p = selector_predicate(&sel).expect("should translate");
+        let s = format!("{p:?}");
+        assert!(s.contains("severity_text"));
+    }
+
+    #[test]
+    fn selector_predicate_translates_service_to_service_name() {
+        let sel = Selector::new(vec![LabelMatcher::eq("service", "api")]);
+        let p = selector_predicate(&sel).expect("should translate");
+        let s = format!("{p:?}");
+        assert!(s.contains("service_name"));
     }
 }

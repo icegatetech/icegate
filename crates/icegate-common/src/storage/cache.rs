@@ -14,6 +14,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use foyer::{DeviceBuilder as _, HybridCache};
 use futures::future::try_join_all;
@@ -245,10 +246,38 @@ pub struct CacheKey {
 /// their start offset. Segments are always kept sorted and
 /// non-overlapping; adjacent/overlapping segments are merged on
 /// insertion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CacheValue {
     /// Sorted, non-overlapping segments: start-offset -> bytes.
-    segments: BTreeMap<u64, Vec<u8>>,
+    ///
+    /// Uses `Bytes` (reference-counted) so that cloning a `CacheValue`
+    /// is O(1) instead of deep-copying every segment buffer.
+    segments: BTreeMap<u64, Bytes>,
+}
+
+// Custom serde impls: `Bytes` does not implement serde traits, so we
+// serialize each segment as `&[u8]` and deserialize via `Vec<u8>` →
+// `Bytes::from()`.  The on-wire format is identical to the previous
+// `BTreeMap<u64, Vec<u8>>`, so existing disk-cached entries remain
+// readable.
+
+impl Serialize for CacheValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.segments.len()))?;
+        for (k, v) in &self.segments {
+            map.serialize_entry(k, v.as_ref())?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let raw: BTreeMap<u64, Vec<u8>> = BTreeMap::deserialize(deserializer)?;
+        let segments = raw.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect();
+        Ok(Self { segments })
+    }
 }
 
 /// Helper to convert `u64` to `usize` safely.
@@ -279,7 +308,7 @@ impl CacheValue {
         // Collect all segments that overlap or are adjacent to [offset, new_end).
         // A segment at `seg_start` with length `seg_len` overlaps/touches if:
         //   seg_start <= new_end  AND  seg_start + seg_len >= offset
-        let overlapping: Vec<(u64, Vec<u8>)> = self
+        let overlapping: Vec<(u64, Bytes)> = self
             .segments
             .range(..=new_end)
             .rev()
@@ -313,7 +342,7 @@ impl CacheValue {
         for (seg_start, _) in &overlapping {
             self.segments.remove(seg_start);
         }
-        self.segments.insert(union_start, merged);
+        self.segments.insert(union_start, Bytes::from(merged));
     }
 
     /// Find gaps within `[start, end)` that are not covered by segments.
@@ -426,7 +455,7 @@ impl CacheValue {
 
     /// Total number of cached bytes across all segments.
     fn size_bytes(&self) -> usize {
-        self.segments.values().map(Vec::len).sum()
+        self.segments.values().map(Bytes::len).sum()
     }
 }
 
@@ -881,12 +910,13 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
 
                 // Re-read the current cache state — another task may have
                 // updated it while we were fetching.
-                let existing: Option<CacheValue> = inner
-                    .cache
-                    .get(&key)
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
-                    .map(|entry| entry.value().clone());
+                let existing: Option<CacheValue> = match inner.cache.get(&key).await {
+                    Ok(entry) => entry.map(|e| e.value().clone()),
+                    Err(e) => {
+                        tracing::warn!(key = ?key, error = %e, "cache get failed during merge phase");
+                        return Err(Error::new(ErrorKind::Unexpected, e.to_string()));
+                    }
+                };
 
                 let mut merged = existing.unwrap_or_else(CacheValue::new);
                 for (offset, data) in &fetched {
@@ -900,6 +930,12 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             // Phase 4: Read from the now-warm cache without the lock.
             // Fall back to reconstructing from fetched data if the cache
             // entry was evicted between Phase 3 and this read.
+            //
+            // Staleness is not a concern here: the cache entry was just
+            // merged from freshly-fetched backend data (Phase 2-3). The
+            // only risk is eviction (entry removed by LRU pressure), not
+            // staleness (serving old data). The fallback reconstructs from
+            // the same fresh data (`existing` snapshot + `fetched` gaps).
             let data = match inner.cache.get(&key).await {
                 Ok(Some(entry)) => entry.value().read_range(range_start, range_end),
                 _ => None,
@@ -1353,6 +1389,88 @@ mod tests {
             .expect("memory operator")
             .layer(CacheLayer::new(cache, metrics, stat_ttl, None))
             .finish()
+    }
+
+    #[test]
+    fn test_covers_partial_range_returns_false() {
+        let mut v = CacheValue::new();
+        v.insert_range(10, &[1, 2, 3, 4, 5]); // [10..15)
+        // Fully inside → true
+        assert!(v.covers(10, 15));
+        // Extends beyond → false
+        assert!(!v.covers(10, 20));
+        // Starts before → false
+        assert!(!v.covers(5, 15));
+        // Completely outside → false
+        assert!(!v.covers(20, 25));
+    }
+
+    #[test]
+    fn test_find_gaps_with_partial_coverage() {
+        let mut v = CacheValue::new();
+        v.insert_range(5, &[0; 5]); // [5..10)
+        v.insert_range(15, &[0; 5]); // [15..20)
+        v.insert_range(25, &[0; 3]); // [25..28)
+
+        let gaps = v.find_gaps(0, 30);
+        assert_eq!(gaps, vec![0..5, 10..15, 20..25, 28..30]);
+    }
+
+    #[test]
+    fn test_insert_range_overwrites_overlap() {
+        let mut v = CacheValue::new();
+        v.insert_range(0, &[1, 2, 3, 4, 5]);
+        // Overwrite middle with new data
+        v.insert_range(2, &[10, 11, 12]);
+        // Result should be [1, 2, 10, 11, 12] at offset 0
+        assert_eq!(v.read_range(0, 5), Some(vec![1, 2, 10, 11, 12]));
+        assert_eq!(v.segments.len(), 1);
+    }
+
+    #[test]
+    fn test_read_range_spanning_multiple_merged_segments() {
+        let mut v = CacheValue::new();
+        v.insert_range(0, &[1, 2, 3]);
+        v.insert_range(3, &[4, 5]);
+        v.insert_range(5, &[6, 7, 8]);
+        // All adjacent → should merge into one segment
+        assert_eq!(v.read_range(0, 8), Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(v.segments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_cache_miss_populates_cache() {
+        let op = build_test_operator(None).await;
+
+        op.write("data.bin", "hello world").await.expect("write");
+
+        // First read — cache miss, populates cache.
+        let data1 = op.read("data.bin").await.expect("read1");
+        assert_eq!(data1.to_vec(), b"hello world");
+
+        // Second read — should be served from cache.
+        let data2 = op.read("data.bin").await.expect("read2");
+        assert_eq!(data2.to_vec(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_same_key() {
+        let op = build_test_operator(None).await;
+
+        let content = "concurrent test data";
+        op.write("concurrent.bin", content).await.expect("write");
+
+        // Spawn multiple concurrent reads of the same key.
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let op = op.clone();
+            handles.push(tokio::spawn(async move { op.read("concurrent.bin").await }));
+        }
+
+        for handle in handles {
+            let data = handle.await.expect("join").expect("read");
+            assert_eq!(data.to_vec(), content.as_bytes());
+        }
     }
 
     #[tokio::test]

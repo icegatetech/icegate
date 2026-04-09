@@ -20,7 +20,13 @@ use datafusion::{
     prelude::*,
     scalar::ScalarValue,
 };
-use icegate_common::{LOGS_TABLE_FQN, schema::LOG_INDEXED_ATTRIBUTE_COLUMNS};
+use icegate_common::{
+    LOGS_TABLE_FQN,
+    schema::{
+        COL_ATTRIBUTES, COL_BODY, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP,
+        COL_TRACE_ID, LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS, LOG_SERIES_LABEL_COLUMNS,
+    },
+};
 
 use crate::{
     error::{QueryError, Result},
@@ -75,7 +81,7 @@ impl Planner for DataFusionPlanner {
                 // Sort by timestamp (ascending for forward, descending for backward)
                 // Must apply sort BEFORE limit to get correct N oldest/newest entries
                 let ascending = self.query_ctx.direction == SortDirection::Forward;
-                let df = df.sort(vec![col("timestamp").sort(ascending, true)])?;
+                let df = df.sort(vec![col(COL_TIMESTAMP).sort(ascending, true)])?;
 
                 // Apply limit only for log queries (not metrics)
                 // Uses context limit or Loki default of 100 entries
@@ -102,12 +108,12 @@ impl DataFusionPlanner {
         // This filter is applied FIRST and cannot be bypassed by user queries.
         // Since tenant_id is the leading partition key, Iceberg will prune
         // non-matching partitions for efficient query execution.
-        let df = df.filter(col("tenant_id").eq(lit(&self.query_ctx.tenant_id)))?;
+        let df = df.filter(col(COL_TENANT_ID).eq(lit(&self.query_ctx.tenant_id)))?;
 
         // 3. Apply time range filter
         // The timestamp column is Timestamp(Microsecond)
         // Convert DateTime<Utc> to microseconds for comparison
-        let ts_col = col("timestamp");
+        let ts_col = col(COL_TIMESTAMP);
         let start_micros = start.timestamp_micros();
         let end_micros = end.timestamp_micros();
         let start_literal = lit(ScalarValue::TimestampMicrosecond(Some(start_micros), None));
@@ -123,67 +129,129 @@ impl DataFusionPlanner {
 
     /// Plan a query for distinct series (unique label combinations).
     ///
-    /// Returns a `DataFrame` with indexed columns and attributes MAP for all
-    /// distinct series matching any of the provided selectors.
+    /// Returns a `DataFrame` with indexed columns and serialized attribute
+    /// strings for all distinct series matching any of the provided selectors.
     ///
-    /// The approach:
-    /// 1. Serialize MAP keys/values to strings (MAP doesn't support GROUP BY)
-    /// 2. Convert binary columns (`trace_id`, `span_id`) to hex strings
-    /// 3. Group by indexed columns + serialized attributes
-    /// 4. Keep one representative attributes MAP using `first_value()`
+    /// Optimized approach (avoids reading `body` and carrying MAP through
+    /// aggregation):
+    /// 1. Scan only indexed columns + attributes MAP (skip body, timestamps)
+    /// 2. Serialize MAP keys/values to `"|||"`-delimited strings
+    /// 3. SELECT DISTINCT on indexed columns + serialized attributes
+    /// 4. Formatter reconstructs label maps from the serialized strings
+    ///
+    /// Safety limit: caps output at [`MAX_SERIES_RESULTS`] to prevent OOM on
+    /// high-cardinality queries.
     #[tracing::instrument(skip(self, selectors))]
     #[allow(clippy::items_after_statements)]
     pub async fn plan_series(&self, selectors: &[Selector]) -> Result<DataFrame> {
-        use datafusion::{
-            functions_aggregate::first_last::first_value,
-            functions_nested::{map_keys::map_keys, map_values::map_values, string::array_to_string},
-        };
+        use datafusion::functions_nested::{map_keys::map_keys, string::array_to_string};
+
+        /// Maximum number of distinct series returned to prevent unbounded
+        /// memory growth on high-cardinality queries.
+        const MAX_SERIES_RESULTS: usize = 10_000;
+
+        /// High-cardinality attribute MAP keys excluded from series grouping.
+        const SERIES_EXCLUDED_MAP_KEYS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
 
         if selectors.is_empty() {
             return Err(QueryError::Plan("At least one selector is required".to_string()));
         }
 
-        // Plan each selector independently and UNION the results
-        // This ensures correct semantics: rows matching ANY selector are returned
+        // Plan each selector with a targeted scan that reads only the columns
+        // needed for series identification (skips body, timestamps, etc.)
         let mut dataframes: Vec<DataFrame> = Vec::with_capacity(selectors.len());
         for selector in selectors {
-            let log_expr = LogExpr::new(selector.clone());
-            let df = self.plan_log(log_expr, self.query_ctx.start, self.query_ctx.end).await?;
+            let df = self.plan_series_scan(selector.clone()).await?;
             dataframes.push(df);
         }
 
-        // UNION all DataFrames (the aggregation step below will deduplicate)
+        // UNION all DataFrames (DISTINCT below will deduplicate)
         let mut df = dataframes.remove(0);
         for other_df in dataframes {
             df = df.union(other_df)?;
         }
 
-        // Build select with serialized attributes for grouping
-        // All indexed columns are now strings - direct references
-        let mut select_cols: Vec<Expr> = LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|&c| col(c)).collect();
+        // Project series-visible indexed columns + serialized attributes as flat
+        // strings. High-cardinality columns (trace_id, span_id) are excluded via
+        // LOG_SERIES_LABEL_COLUMNS.
+        let mut select_cols: Vec<Expr> = LOG_SERIES_LABEL_COLUMNS.iter().map(|&c| col(c)).collect();
         // Add `level` as alias of `severity_text` for Grafana compatibility
-        select_cols.push(col("severity_text").alias("level"));
-        select_cols.push(col("attributes"));
-        // Serialize map keys and values for grouping.
-        // Use "|||" delimiter instead of "," to avoid ambiguity when keys/values
-        // contain commas.
-        select_cols.push(array_to_string(map_keys(col("attributes")), lit("|||")).alias(COL_ATTR_KEYS));
-        select_cols.push(array_to_string(map_values(col("attributes")), lit("|||")).alias(COL_ATTR_VALS));
+        select_cols.push(col(COL_SEVERITY_TEXT).alias(LEVEL_ALIAS));
+
+        // Strip high-cardinality keys (trace_id, span_id) from the attributes
+        // MAP before serialization. Without this, per-request unique values
+        // inside the MAP would make every row appear as a distinct series.
+        //
+        // DataFusion lacks map_filter/map_remove, so we use array_except on
+        // the keys array and serialize only the filtered keys for grouping.
+        // The full MAP is carried separately via first_value for the formatter.
+        let attrs = col(COL_ATTRIBUTES);
+
+        use datafusion::functions_nested::except::array_except;
+        let excluded_arr = make_array(SERIES_EXCLUDED_MAP_KEYS.iter().map(|&k| lit(k)).collect());
+        let clean_keys = array_except(map_keys(attrs.clone()), excluded_arr);
+
+        // Serialize filtered keys for grouping. Values for non-excluded keys
+        // are consistent within a series, so grouping by keys alone is
+        // sufficient for deduplication.
+        select_cols.push(array_to_string(clean_keys, lit("|||")).alias(COL_ATTR_KEYS));
+        // Keep the full MAP for value extraction in the formatter.
+        select_cols.push(attrs);
 
         let df = df.select(select_cols)?;
 
-        // Group by indexed columns + level + serialized attributes
-        let mut group_cols: Vec<Expr> = LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)).collect();
-        group_cols.push(col("level"));
+        // GROUP BY indexed columns + filtered attr keys. Use first_value to
+        // keep one representative attributes MAP per group for the formatter.
+        use datafusion::functions_aggregate::first_last::first_value;
+        let mut group_cols: Vec<Expr> = LOG_SERIES_LABEL_COLUMNS.iter().map(|c| col(*c)).collect();
+        group_cols.push(col(LEVEL_ALIAS));
         group_cols.push(col(COL_ATTR_KEYS));
-        group_cols.push(col(COL_ATTR_VALS));
 
         let df = df.aggregate(
             group_cols,
-            vec![first_value(col("attributes"), vec![]).alias("attributes")],
+            vec![first_value(col(COL_ATTRIBUTES), vec![]).alias(COL_ATTRIBUTES)],
         )?;
 
+        // Safety cap to prevent OOM on high-cardinality results
+        let df = df.limit(0, Some(MAX_SERIES_RESULTS))?;
+
         Ok(df)
+    }
+
+    /// Scan only the columns needed for series identification.
+    ///
+    /// Unlike [`plan_log`] which reads all columns (including `body`), this
+    /// method projects only indexed attribute columns and the attributes MAP.
+    /// This allows DataFusion/Iceberg to skip reading large columns from
+    /// Parquet, significantly reducing memory usage.
+    async fn plan_series_scan(&self, selector: Selector) -> Result<DataFrame> {
+        let df = self.session_ctx.table(LOGS_TABLE_FQN).await?;
+        let df = strip_schema_metadata(df)?;
+
+        // Mandatory tenant isolation filter (partition pruning)
+        let df = df.filter(col(COL_TENANT_ID).eq(lit(&self.query_ctx.tenant_id)))?;
+
+        // Time range filter for partition pruning
+        let ts_col = col(COL_TIMESTAMP);
+        let start_micros = self.query_ctx.start.timestamp_micros();
+        let end_micros = self.query_ctx.end.timestamp_micros();
+        let start_literal = lit(ScalarValue::TimestampMicrosecond(Some(start_micros), None));
+        let end_literal = lit(ScalarValue::TimestampMicrosecond(Some(end_micros), None));
+        let df = df.filter(ts_col.clone().gt_eq(start_literal).and(ts_col.lt_eq(end_literal)))?;
+
+        // Apply selector label matchers (operates on indexed columns + attributes)
+        let df = Self::apply_selector(df, selector)?;
+
+        // Project ONLY the columns needed for series identification.
+        // This is the key optimization: body, observed_timestamp,
+        // ingested_timestamp, and high-cardinality columns are never carried
+        // through the UNION/DISTINCT pipeline.
+        // Note: trace_id/span_id may still be read for selector filters above,
+        // but DataFusion's optimizer handles that — they are dropped from output.
+        let mut series_cols: Vec<Expr> = LOG_SERIES_LABEL_COLUMNS.iter().map(|&c| col(c)).collect();
+        series_cols.push(col(COL_ATTRIBUTES));
+
+        Ok(df.select(series_cols)?)
     }
 
     // Note: #[tracing::instrument] cannot be applied to methods returning Pin<Box<dyn Future>>
@@ -360,8 +428,8 @@ impl DataFusionPlanner {
             grouping_exprs.push(col("grid_timestamp"));
         }
         grouping_exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
-        grouping_exprs.push(array_to_string(map_keys(col("attributes")), lit("|||")).alias(COL_ATTR_KEYS));
-        grouping_exprs.push(array_to_string(map_values(col("attributes")), lit("|||")).alias(COL_ATTR_VALS));
+        grouping_exprs.push(array_to_string(map_keys(col(COL_ATTRIBUTES)), lit("|||")).alias(COL_ATTR_KEYS));
+        grouping_exprs.push(array_to_string(map_values(col(COL_ATTRIBUTES)), lit("|||")).alias(COL_ATTR_VALS));
         grouping_exprs
     }
 
@@ -443,7 +511,7 @@ impl DataFusionPlanner {
                     make_array(vec![lit(ScalarValue::Utf8(None)); attr_labels.len()])
                 };
 
-                let filtered_attrs = udf.call(vec![col("attributes"), label_array, null_values, null_ops]);
+                let filtered_attrs = udf.call(vec![col(COL_ATTRIBUTES), label_array, null_values, null_ops]);
 
                 if attr_labels.is_empty() {
                     // No attributes to group by - use empty MAP serialization
@@ -483,7 +551,7 @@ impl DataFusionPlanner {
                 // Filter attributes MAP to drop specified labels
                 let filtered_attrs = if excluded_attr_labels.is_empty() {
                     // No attributes to exclude - keep full MAP
-                    col("attributes")
+                    col(COL_ATTRIBUTES)
                 } else {
                     let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
                     let label_array = make_array(excluded_attr_labels.iter().map(|l| lit(*l)).collect());
@@ -493,14 +561,15 @@ impl DataFusionPlanner {
                     let null_values = make_array(vec![lit(ScalarValue::Utf8(None)); excluded_attr_labels.len()]);
                     let null_ops = make_array(vec![lit(ScalarValue::Utf8(None)); excluded_attr_labels.len()]);
 
-                    udf.call(vec![col("attributes"), label_array, null_values, null_ops])
+                    udf.call(vec![col(COL_ATTRIBUTES), label_array, null_values, null_ops])
                 };
 
                 if excluded_attr_labels.is_empty() {
                     // No attributes to exclude - use full MAP serialization
-                    grouping_exprs.push(array_to_string(map_keys(col("attributes")), lit("|||")).alias(COL_ATTR_KEYS));
                     grouping_exprs
-                        .push(array_to_string(map_values(col("attributes")), lit("|||")).alias(COL_ATTR_VALS));
+                        .push(array_to_string(map_keys(col(COL_ATTRIBUTES)), lit("|||")).alias(COL_ATTR_KEYS));
+                    grouping_exprs
+                        .push(array_to_string(map_values(col(COL_ATTRIBUTES)), lit("|||")).alias(COL_ATTR_VALS));
                 } else {
                     // Serialize filtered MAP for grouping
                     grouping_exprs
@@ -518,7 +587,7 @@ impl DataFusionPlanner {
     ///
     /// Uses `last_value()` to preserve one representative attributes MAP.
     fn preserve_attributes_column() -> Expr {
-        last_value(col("attributes"), vec![]).alias("attributes")
+        last_value(col(COL_ATTRIBUTES), vec![]).alias(COL_ATTRIBUTES)
     }
 
     /// Plans unwrap-based range aggregations.
@@ -629,7 +698,7 @@ impl DataFusionPlanner {
         // 9. Build label grouping with pushdown support (no grid_timestamp — UDAF handles it)
         let grouping_exprs = if let Some(ref grouping) = agg.grouping {
             let (grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
-            df = df.with_column("attributes", filtered_attrs_expr)?;
+            df = df.with_column(COL_ATTRIBUTES, filtered_attrs_expr)?;
             grouping_exprs
         } else {
             Self::build_label_grouping_exprs(false) // false = no grid_timestamp (UDAF handles it)
@@ -640,7 +709,7 @@ impl DataFusionPlanner {
             grouping_exprs,
             vec![
                 grid_agg_udaf
-                    .call(vec![col("timestamp"), col("unwrapped_value")])
+                    .call(vec![col(COL_TIMESTAMP), col("unwrapped_value")])
                     .alias("_grid_values"),
                 Self::preserve_attributes_column(),
                 // Track if ANY sample had conversion error
@@ -651,12 +720,12 @@ impl DataFusionPlanner {
         // 11. Add __error__ label for groups with conversion errors
         let map_insert_udf = ScalarUDF::from(super::udf::MapInsert::new());
         df = df.with_column(
-            "attributes",
+            COL_ATTRIBUTES,
             when(
                 col("_group_has_error"),
-                map_insert_udf.call(vec![col("attributes"), lit("__error__"), lit("true")]),
+                map_insert_udf.call(vec![col(COL_ATTRIBUTES), lit("__error__"), lit("true")]),
             )
-            .otherwise(col("attributes"))?,
+            .otherwise(col(COL_ATTRIBUTES))?,
         )?;
 
         // 12. Add literal _grid_timestamps column, unnest both, filter NULLs
@@ -740,7 +809,7 @@ impl DataFusionPlanner {
             self.query_ctx.max_grid_points,
         ));
         let date_grid_args = vec![
-            col("timestamp"),
+            col(COL_TIMESTAMP),
             start_arg,
             end_arg,
             step_arg,
@@ -774,9 +843,9 @@ impl DataFusionPlanner {
         df = df.with_column("value", lit(1.0))?;
 
         // 10. Select final output columns (match other range aggregations)
-        let mut select_exprs = vec![col("timestamp"), col("value")];
+        let mut select_exprs = vec![col(COL_TIMESTAMP), col("value")];
         select_exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
-        select_exprs.push(col("attributes"));
+        select_exprs.push(col(COL_ATTRIBUTES));
 
         Ok(df.select(select_exprs)?)
     }
@@ -817,7 +886,7 @@ impl DataFusionPlanner {
             let schema = df.schema().clone();
             df = df.with_column(
                 "_body_bytes",
-                octet_length().call(vec![col("body")]).cast_to(&DataType::Float64, &schema)?,
+                octet_length().call(vec![col(COL_BODY)]).cast_to(&DataType::Float64, &schema)?,
             )?;
         }
 
@@ -846,15 +915,15 @@ impl DataFusionPlanner {
 
         // 5. Build UDAF call arguments
         let udaf_args = if is_bytes_op {
-            vec![col("timestamp"), col("_body_bytes")]
+            vec![col(COL_TIMESTAMP), col("_body_bytes")]
         } else {
-            vec![col("timestamp")]
+            vec![col(COL_TIMESTAMP)]
         };
 
         // 6. Build label grouping with pushdown support
         let grouping_exprs = if let Some(ref grouping) = agg.grouping {
             let (grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
-            df = df.with_column("attributes", filtered_attrs_expr)?;
+            df = df.with_column(COL_ATTRIBUTES, filtered_attrs_expr)?;
             grouping_exprs
         } else {
             Self::build_label_grouping_exprs(false) // false = no grid_timestamp (UDAF handles it)
@@ -916,7 +985,7 @@ impl DataFusionPlanner {
         LOG_INDEXED_ATTRIBUTE_COLUMNS
             .iter()
             .copied()
-            .chain(std::iter::once("attributes"))
+            .chain(std::iter::once(COL_ATTRIBUTES))
             .chain(with.iter().copied())
             .filter(|c| !without.contains(c))
             .map(ToString::to_string)
@@ -948,7 +1017,7 @@ impl DataFusionPlanner {
                         seen.push(mapped);
                     }
                 }
-                exprs.push(col("attributes"));
+                exprs.push(col(COL_ATTRIBUTES));
                 exprs
             }
             Some(Grouping::Without(labels)) => {
@@ -1065,11 +1134,11 @@ impl DataFusionPlanner {
             // Get both grouping expressions and filtered attributes in one call
             // This avoids duplicate computation of indexed columns and attribute labels
             let (mut grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
-            grouping_exprs.push(col("timestamp"));
+            grouping_exprs.push(col(COL_TIMESTAMP));
 
             // Replace attributes column with filtered version BEFORE aggregation
             // This ensures last_value preserves the filtered attributes
-            df = df.with_column("attributes", filtered_attrs_expr)?;
+            df = df.with_column(COL_ATTRIBUTES, filtered_attrs_expr)?;
 
             // Return the grouping expressions and flag to preserve attributes
             (grouping_exprs, true)
@@ -1079,7 +1148,7 @@ impl DataFusionPlanner {
             // Do not reference COL_ATTR_KEYS or COL_ATTR_VALS as they may not exist
             // from the inner range aggregation
             // Also don't preserve attributes since we're collapsing all labels
-            (vec![col("timestamp")], false)
+            (vec![col(COL_TIMESTAMP)], false)
         };
 
         // Identify aggregation function
@@ -1148,7 +1217,7 @@ impl DataFusionPlanner {
         } else {
             // Access attribute from the "attributes" map
             // using get_field for map access
-            datafusion::functions::core::get_field().call(vec![col("attributes"), lit(matcher.label.as_str())])
+            datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(matcher.label.as_str())])
         };
 
         // All columns are strings now - no binary decoding
@@ -1176,8 +1245,8 @@ impl DataFusionPlanner {
     /// - `service` -> `service_name` (alternative name)
     pub fn map_label_to_internal_name(name: &str) -> &str {
         match name {
-            "level" | "detected_level" => "severity_text",
-            "service" => "service_name",
+            "level" | "detected_level" => COL_SEVERITY_TEXT,
+            "service" => COL_SERVICE_NAME,
             _ => name,
         }
     }
@@ -1188,7 +1257,7 @@ impl DataFusionPlanner {
     /// while other labels are stored in the `attributes` MAP column.
     pub fn is_top_level_field(name: &str) -> bool {
         let mapped = Self::map_label_to_internal_name(name);
-        LOG_INDEXED_ATTRIBUTE_COLUMNS.contains(&mapped) || matches!(mapped, "tenant_id" | "timestamp")
+        LOG_INDEXED_ATTRIBUTE_COLUMNS.contains(&mapped) || matches!(mapped, COL_TENANT_ID | COL_TIMESTAMP)
     }
 
     /// Extract label value as Float64 with optional conversion.
@@ -1215,7 +1284,7 @@ impl DataFusionPlanner {
             let internal_name = Self::map_label_to_internal_name(label);
             col(internal_name)
         } else {
-            datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
+            datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(label)])
         };
 
         // 2. Apply conversion UDF (returns Float64 or NULL on error)
@@ -1259,7 +1328,7 @@ impl DataFusionPlanner {
     fn apply_line_filter(&self, df: DataFrame, filter: crate::logql::log::LineFilter) -> Result<DataFrame> {
         use crate::logql::log::{LineFilterOp, LineFilterValue};
 
-        let body_col = col("body");
+        let body_col = col(COL_BODY);
         let mut combined_expr: Option<Expr> = None;
 
         for filter_value in filter.filters {
@@ -1312,7 +1381,7 @@ impl DataFusionPlanner {
         // invoke the UDF and project the result as "attributes" (merging is complex).
         // A real implementation would likely use a specific "extract_and_merge" UDF.
 
-        let _body_col = col("body");
+        let _body_col = col(COL_BODY);
 
         match parser {
             LogParser::Json(_fields) => {
@@ -1362,8 +1431,8 @@ impl DataFusionPlanner {
     const fn apply_decolorize(&self, df: DataFrame) -> Result<DataFrame> {
         // Call decolorize UDF on body
         // let udf = self.session_ctx.udf("decolorize")?;
-        // let expr = udf.call(vec![col("body")]);
-        // df.select(vec![expr.alias("body"), col("timestamp"), ...])
+        // let expr = udf.call(vec![col(COL_BODY)]);
+        // df.select(vec![expr.alias("body"), col(COL_TIMESTAMP), ...])
         // TODO: Implement decolorize
         Ok(df)
     }
@@ -1405,8 +1474,8 @@ impl DataFusionPlanner {
             .fields()
             .iter()
             .map(|field| {
-                if field.name() == "attributes" {
-                    filtered_attrs.clone().alias("attributes")
+                if field.name() == COL_ATTRIBUTES {
+                    filtered_attrs.clone().alias(COL_ATTRIBUTES)
                 } else {
                     col(field.name().as_str())
                 }
@@ -1429,7 +1498,7 @@ impl DataFusionPlanner {
         let (keys, values, ops) = Self::build_drop_keep_arrays(labels);
         let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
         let filtered_attrs = udf.call(vec![
-            col("attributes"),
+            col(COL_ATTRIBUTES),
             make_array(keys),
             make_array(values),
             make_array(ops),
@@ -1451,7 +1520,7 @@ impl DataFusionPlanner {
         let (keys, values, ops) = Self::build_drop_keep_arrays(labels);
         let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
         let filtered_attrs = udf.call(vec![
-            col("attributes"),
+            col(COL_ATTRIBUTES),
             make_array(keys),
             make_array(values),
             make_array(ops),
@@ -1487,7 +1556,7 @@ impl DataFusionPlanner {
                 let col_expr = if Self::is_top_level_field(internal_name) {
                     col(internal_name)
                 } else {
-                    datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
+                    datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(label)])
                 };
 
                 use crate::logql::common::ComparisonOp;
@@ -1507,7 +1576,7 @@ impl DataFusionPlanner {
                 let col_expr = if Self::is_top_level_field(internal_name) {
                     col(internal_name)
                 } else {
-                    datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
+                    datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(label)])
                 };
 
                 use crate::logql::common::ComparisonOp;
@@ -1530,7 +1599,7 @@ impl DataFusionPlanner {
                 let col_expr = if Self::is_top_level_field(internal_name) {
                     col(internal_name)
                 } else {
-                    datafusion::functions::core::get_field().call(vec![col("attributes"), lit(label)])
+                    datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(label)])
                 };
 
                 use crate::logql::common::ComparisonOp;

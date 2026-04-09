@@ -177,6 +177,17 @@ pub async fn read_column_dictionaries(
     span.record("num_row_groups_no_dict", no_dict);
     span.record("num_chunks_fetched", ranges.len());
 
+    if no_dict > 0 {
+        // Our ingest writer always emits dictionaries for string columns, so
+        // this path should only trigger for externally-produced files. Labels
+        // from these row groups will be missing (acceptable under
+        // over-approximation semantics).
+        tracing::warn!(
+            no_dict,
+            "skipped row groups without dictionary page; label results may be incomplete"
+        );
+    }
+
     if ranges.is_empty() {
         return Ok(());
     }
@@ -227,7 +238,7 @@ fn decode_dictionary_from_chunk(
     // column chunk, so one `get_next_page()` gives us exactly the dict
     // page. Drop without touching data pages.
     if let Some(Page::DictionaryPage { buf, num_values, .. }) = page_reader.get_next_page()? {
-        decode_plain_byte_array_values(&buf, num_values as usize, out);
+        decode_plain_byte_array_values(&buf, num_values as usize, out)?;
     }
 
     Ok(())
@@ -314,14 +325,23 @@ fn eval_range_ord<T: ?Sized + Ord>(op: PredicateOperator, min: Option<&T>, max: 
 /// `[len: u32 LE][bytes]` repeated. Non-UTF-8 entries are silently
 /// skipped (attribute keys and string column values are always UTF-8 in
 /// our schema).
-fn decode_plain_byte_array_values(buf: &[u8], num_values: usize, out: &mut BTreeSet<String>) {
+fn decode_plain_byte_array_values(
+    buf: &[u8],
+    num_values: usize,
+    out: &mut BTreeSet<String>,
+) -> Result<(), ParquetError> {
     let mut i: usize = 0;
     let mut decoded: usize = 0;
     while decoded < num_values && i + 4 <= buf.len() {
         let len = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
         i += 4;
         if i + len > buf.len() {
-            break;
+            return Err(ParquetError::General(format!(
+                "truncated PLAIN BYTE_ARRAY dictionary page: value {decoded} declares \
+                 length {len} at offset {} but only {} bytes remain",
+                i - 4,
+                buf.len() - i,
+            )));
         }
         if let Ok(s) = std::str::from_utf8(&buf[i..i + len]) {
             if !out.contains(s) {
@@ -331,6 +351,16 @@ fn decode_plain_byte_array_values(buf: &[u8], num_values: usize, out: &mut BTree
         i += len;
         decoded += 1;
     }
+
+    if decoded < num_values {
+        return Err(ParquetError::General(format!(
+            "truncated PLAIN BYTE_ARRAY dictionary page: expected {num_values} values \
+             but buffer exhausted after {decoded} (buffer length: {})",
+            buf.len(),
+        )));
+    }
+
+    Ok(())
 }
 
 /// A [`ChunkReader`] that serves a sub-slice of a file from an in-memory

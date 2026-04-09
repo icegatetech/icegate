@@ -17,11 +17,14 @@
 //!    requested indexed column, or the `attributes` MAP) and values are
 //!    collected in-process.
 //!
+//! **Limitation:** this module scans only committed Iceberg data. WAL
+//! (Write-Ahead Log) segments are excluded — recent writes that have not yet
+//! been shifted to Iceberg will not appear in label discovery results.
+//!
 //! Semantics: over-approximation is permitted. `LogQL` matchers that cannot be
 //! translated to an iceberg predicate (regex matchers, matchers on MAP-only
 //! labels) are silently omitted — this only widens the set of row groups
-//! considered, never narrows it. See
-//! `docs/superpowers/specs/2026-04-08-label-metadata-scan-design.md`.
+//! considered, never narrows it.
 
 mod error;
 mod labels;

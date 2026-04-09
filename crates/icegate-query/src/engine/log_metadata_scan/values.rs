@@ -17,6 +17,7 @@ use datafusion::arrow::array::{Array, MapArray, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
 use iceberg::expr::Predicate;
+use icegate_common::schema::COL_ATTRIBUTES;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
@@ -93,8 +94,14 @@ pub async fn stream_map_values(
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
     let schema_descr = builder.parquet_schema();
-    let has_attributes = (0..schema_descr.num_columns())
-        .any(|i| schema_descr.column(i).path().parts().first().is_some_and(|s| s == "attributes"));
+    let has_attributes = (0..schema_descr.num_columns()).any(|i| {
+        schema_descr
+            .column(i)
+            .path()
+            .parts()
+            .first()
+            .is_some_and(|s| s == COL_ATTRIBUTES)
+    });
     if !has_attributes {
         return Ok(());
     }
@@ -109,7 +116,7 @@ pub async fn stream_map_values(
     let pruned = total_rgs - surviving.len();
     tracing::Span::current().record("pruned_rgs", pruned);
 
-    let mask = ProjectionMask::columns(schema_descr, ["attributes"]);
+    let mask = ProjectionMask::columns(schema_descr, [COL_ATTRIBUTES]);
     let mut stream = builder.with_projection(mask).with_row_groups(surviving).build()?;
 
     let mut num_batches: usize = 0;
@@ -129,7 +136,7 @@ fn collect_map_values_from_batch(
 ) -> Result<(), MetadataScanError> {
     let attr_idx = batch
         .schema()
-        .index_of("attributes")
+        .index_of(COL_ATTRIBUTES)
         .map_err(|_| MetadataScanError::Schema("batch missing 'attributes' column".to_string()))?;
     let map_arr = batch
         .column(attr_idx)

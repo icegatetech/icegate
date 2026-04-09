@@ -12,7 +12,10 @@ use datafusion::arrow::{
     },
     datatypes::Schema,
 };
-use icegate_common::schema::LOG_INDEXED_ATTRIBUTE_COLUMNS;
+use icegate_common::schema::{
+    COL_ATTRIBUTES, COL_BODY, COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TIMESTAMP,
+    COL_TRACE_ID, LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS, LOG_SERIES_LABEL_COLUMNS,
+};
 
 use super::models::{MetricSeries, QueryResult, QueryStats, ResultType, Stream};
 
@@ -110,15 +113,15 @@ impl BatchColumns {
     /// Extract column indices from schema.
     pub fn from_schema(schema: &Schema) -> Self {
         Self {
-            timestamp: schema.index_of("timestamp").ok(),
-            body: schema.index_of("body").ok(),
-            cloud_account_id: schema.index_of("cloud_account_id").ok(),
-            service_name: schema.index_of("service_name").ok(),
-            severity_text: schema.index_of("severity_text").ok(),
-            level: schema.index_of("level").ok(),
-            trace_id: schema.index_of("trace_id").ok(),
-            span_id: schema.index_of("span_id").ok(),
-            attributes: schema.index_of("attributes").ok(),
+            timestamp: schema.index_of(COL_TIMESTAMP).ok(),
+            body: schema.index_of(COL_BODY).ok(),
+            cloud_account_id: schema.index_of(COL_CLOUD_ACCOUNT_ID).ok(),
+            service_name: schema.index_of(COL_SERVICE_NAME).ok(),
+            severity_text: schema.index_of(COL_SEVERITY_TEXT).ok(),
+            level: schema.index_of(LEVEL_ALIAS).ok(),
+            trace_id: schema.index_of(COL_TRACE_ID).ok(),
+            span_id: schema.index_of(COL_SPAN_ID).ok(),
+            attributes: schema.index_of(COL_ATTRIBUTES).ok(),
         }
     }
 }
@@ -137,9 +140,9 @@ impl MetricBatchColumns {
     /// Extract column indices from schema.
     pub fn from_schema(schema: &Schema) -> Self {
         Self {
-            timestamp: schema.index_of("timestamp").ok(),
+            timestamp: schema.index_of(COL_TIMESTAMP).ok(),
             value: schema.index_of("value").ok(),
-            attributes: schema.index_of("attributes").ok(),
+            attributes: schema.index_of(COL_ATTRIBUTES).ok(),
         }
     }
 
@@ -207,37 +210,37 @@ fn extract_labels(
 
     if let Some(idx) = cols.cloud_account_id {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("cloud_account_id"), interner.intern(val));
+            labels.insert(interner.intern(COL_CLOUD_ACCOUNT_ID), interner.intern(val));
         }
     }
 
     if let Some(idx) = cols.service_name {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("service_name"), interner.intern(val));
+            labels.insert(interner.intern(COL_SERVICE_NAME), interner.intern(val));
         }
     }
 
     if let Some(idx) = cols.severity_text {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("severity_text"), interner.intern(val));
+            labels.insert(interner.intern(COL_SEVERITY_TEXT), interner.intern(val));
         }
     }
 
     if let Some(idx) = cols.level {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("level"), interner.intern(val));
+            labels.insert(interner.intern(LEVEL_ALIAS), interner.intern(val));
         }
     }
 
     if let Some(idx) = cols.trace_id {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("trace_id"), interner.intern(val));
+            labels.insert(interner.intern(COL_TRACE_ID), interner.intern(val));
         }
     }
 
     if let Some(idx) = cols.span_id {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern("span_id"), interner.intern(val));
+            labels.insert(interner.intern(COL_SPAN_ID), interner.intern(val));
         }
     }
 
@@ -399,8 +402,8 @@ fn extract_metric_value(batch: &RecordBatch, cols: &MetricBatchColumns, row: usi
 /// Maps `OTel` column names to Loki label names for output.
 fn map_column_to_label(name: &str) -> &str {
     match name {
-        "severity_text" => "level",
-        "service_name" => "service",
+        COL_SEVERITY_TEXT => LEVEL_ALIAS,
+        COL_SERVICE_NAME => "service",
         _ => name,
     }
 }
@@ -483,24 +486,91 @@ pub fn batches_to_loki_matrix(batches: &[RecordBatch]) -> FormattedResult {
 // Series Format (Metadata Queries)
 // ============================================================================
 
-/// Convert record batches to series list (array of label maps).
+/// High-cardinality attribute keys excluded from series label output.
+const SERIES_EXCLUDED_ATTR_KEYS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
+
+/// Convert record batches from `plan_series` to a series list (array of label
+/// maps).
 ///
-/// Each series is a map of label name -> value for all indexed columns
-/// and attributes.
+/// The input batches contain indexed columns, `level`, and an `attributes`
+/// MAP column (via `first_value`). High-cardinality keys (`trace_id`,
+/// `span_id`) are filtered out during extraction.
 pub fn batches_to_series_list(batches: &[RecordBatch]) -> Vec<HashMap<String, String>> {
     let mut series_list = Vec::new();
     let mut interner = StringInterner::new();
 
     for batch in batches {
-        let cols = BatchColumns::from_schema(batch.schema().as_ref());
+        let schema = batch.schema();
+
+        // Resolve column indices once per batch
+        let indexed_indices: Vec<(&str, usize)> = LOG_SERIES_LABEL_COLUMNS
+            .iter()
+            .chain(std::iter::once(&LEVEL_ALIAS))
+            .filter_map(|&name| schema.index_of(name).ok().map(|idx| (name, idx)))
+            .collect();
+        let attr_idx = schema.index_of(COL_ATTRIBUTES).ok();
 
         for row in 0..batch.num_rows() {
-            let labels = extract_labels(batch, &cols, row, &mut interner);
-            let label_map: HashMap<String, String> =
-                labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let mut label_map = HashMap::with_capacity(indexed_indices.len() + 8);
+
+            // Extract indexed columns
+            for &(name, idx) in &indexed_indices {
+                if let Some(arr) = batch.column(idx).as_any().downcast_ref::<StringArray>() {
+                    if !arr.is_null(row) {
+                        let val = arr.value(row);
+                        if !val.is_empty() {
+                            label_map.insert(name.to_string(), val.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Extract attributes from MAP, skipping excluded keys
+            if let Some(idx) = attr_idx {
+                extract_series_attributes(batch, idx, row, &mut label_map, &mut interner);
+            }
+
             series_list.push(label_map);
         }
     }
 
     series_list
+}
+
+/// Extract key-value pairs from the `attributes` `MapArray`, skipping
+/// high-cardinality keys defined in [`SERIES_EXCLUDED_ATTR_KEYS`].
+fn extract_series_attributes(
+    batch: &RecordBatch,
+    attr_idx: usize,
+    row: usize,
+    labels: &mut HashMap<String, String>,
+    interner: &mut StringInterner,
+) {
+    if let Some(map_arr) = batch.column(attr_idx).as_any().downcast_ref::<MapArray>() {
+        if !map_arr.is_null(row) {
+            let offsets = map_arr.offsets();
+            #[allow(clippy::cast_sign_loss)]
+            let start = offsets[row] as usize;
+            #[allow(clippy::cast_sign_loss)]
+            let end = offsets[row + 1] as usize;
+
+            let keys = map_arr.keys().as_any().downcast_ref::<StringArray>();
+            let values = map_arr.values().as_any().downcast_ref::<StringArray>();
+
+            if let (Some(keys), Some(values)) = (keys, values) {
+                for i in start..end {
+                    if !keys.is_null(i) && !values.is_null(i) {
+                        let k = keys.value(i);
+                        if SERIES_EXCLUDED_ATTR_KEYS.contains(&k) {
+                            continue;
+                        }
+                        // Use interner for deduplication, then convert to owned
+                        // String for the output HashMap.
+                        let _ = interner.intern(k);
+                        labels.insert(k.to_string(), values.value(i).to_string());
+                    }
+                }
+            }
+        }
+    }
 }
