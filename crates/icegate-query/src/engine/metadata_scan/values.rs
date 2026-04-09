@@ -2,9 +2,9 @@
 //!
 //! Two cases, selected by [`classify_label`]:
 //!
-//! 1. The label is the `level` alias — resolved against the indexed
-//!    `severity_text` column by reading only its dictionary page. No
-//!    row data is decoded.
+//! 1. The label maps to an indexed top-level column (e.g. `service_name`,
+//!    `trace_id`, or the `level` alias for `severity_text`) — resolved by
+//!    reading only its dictionary page. No row data is decoded.
 //! 2. Any other label — routed through the `attributes` MAP lookup.
 //!    This case needs correlated key/value access (so we can return the
 //!    value for the rows where `key == label_name`) and is implemented
@@ -22,23 +22,27 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 
 use super::error::MetadataScanError;
-use super::parquet_reader;
+use super::{parquet_reader, predicate};
 
 /// Which code path to use for a given label name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LabelKind {
-    /// Indexed top-level column (only the `level` alias today). Read via
-    /// dictionary page only.
+    /// Indexed top-level column (e.g. `service_name`, `trace_id`, `level`).
+    /// Read via dictionary page only.
     Indexed,
     /// Label stored in the `attributes` MAP. Read via projected record
     /// batches over the `attributes` column.
     MapAttribute,
 }
 
-/// Classify a label name.
+/// Classify a label name as indexed or MAP-stored.
+///
+/// Delegates to [`predicate::is_indexed_column`] which checks
+/// [`LOG_INDEXED_ATTRIBUTE_COLUMNS`](icegate_common::schema::LOG_INDEXED_ATTRIBUTE_COLUMNS)
+/// and handles the `level` → `severity_text` alias.
 #[must_use]
 pub fn classify_label(name: &str) -> LabelKind {
-    if name == "level" {
+    if predicate::is_indexed_column(name) {
         LabelKind::Indexed
     } else {
         LabelKind::MapAttribute
@@ -137,7 +141,17 @@ mod tests {
     }
 
     #[test]
-    fn classify_service_name_routes_through_map() {
-        assert_eq!(classify_label("service_name"), LabelKind::MapAttribute);
+    fn classify_indexed_columns_are_indexed() {
+        assert_eq!(classify_label("service_name"), LabelKind::Indexed);
+        assert_eq!(classify_label("trace_id"), LabelKind::Indexed);
+        assert_eq!(classify_label("span_id"), LabelKind::Indexed);
+        assert_eq!(classify_label("severity_text"), LabelKind::Indexed);
+        assert_eq!(classify_label("cloud_account_id"), LabelKind::Indexed);
+    }
+
+    #[test]
+    fn classify_map_attribute_for_non_indexed() {
+        assert_eq!(classify_label("pod"), LabelKind::MapAttribute);
+        assert_eq!(classify_label("namespace"), LabelKind::MapAttribute);
     }
 }

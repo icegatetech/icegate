@@ -108,12 +108,8 @@ pub async fn scan_label_values(
     tracing::Span::current().record("num_files", files.len());
     let file_io = table.file_io().clone();
 
-    // `level` is a Grafana alias for the indexed `severity_text` column.
-    let indexed_column: String = if label_name == "level" {
-        "severity_text".to_string()
-    } else {
-        label_name.to_string()
-    };
+    // Map label name to its underlying column (e.g. `level` → `severity_text`).
+    let indexed_column = predicate::indexed_column_name(label_name);
 
     let label_name = label_name.to_string();
     let mut stream = stream::iter(files)
@@ -122,9 +118,7 @@ pub async fn scan_label_values(
             let label = label_name.clone();
             let indexed_column = indexed_column.clone();
             let predicate = predicate.clone();
-            async move {
-                scan_label_values_for_file(&file_io, task, &predicate, kind, &label, &indexed_column).await
-            }
+            async move { scan_label_values_for_file(&file_io, task, &predicate, kind, &label, &indexed_column).await }
         })
         .buffer_unordered(METADATA_SCAN_CONCURRENCY);
 
@@ -180,9 +174,9 @@ async fn scan_labels_for_file(
 
 /// Process one Parquet file for a `/label_values` request.
 ///
-/// - Indexed case (`level`): open the file directly and read the
-///   `severity_text` column's dictionary page. No row batches.
-/// - MAP case (every other label): open the file via the record-batch
+/// - Indexed case (e.g. `service_name`, `level`): open the file directly
+///   and read the column's dictionary page. No row batches.
+/// - MAP case (non-indexed labels): open the file via the record-batch
 ///   stream builder and project the `attributes` column, so we can
 ///   correlate `key == label_name` rows with their values.
 #[tracing::instrument(skip_all, fields(file = %task.data_file_path, kind = ?kind))]

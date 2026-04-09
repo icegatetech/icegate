@@ -59,7 +59,7 @@ pub fn full_predicate(tenant_id: &str, start: DateTime<Utc>, end: DateTime<Utc>,
 
 /// Map a label name to its underlying indexed column name (handles the
 /// `level` → `severity_text` alias).
-fn indexed_column_name(label: &str) -> String {
+pub(super) fn indexed_column_name(label: &str) -> String {
     if label == "level" {
         "severity_text".to_string()
     } else {
