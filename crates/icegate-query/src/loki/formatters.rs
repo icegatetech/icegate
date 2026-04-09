@@ -504,18 +504,3 @@ pub fn batches_to_series_list(batches: &[RecordBatch]) -> Vec<HashMap<String, St
 
     series_list
 }
-
-/// Extract string values from a column in record batches.
-pub fn extract_string_column(batches: &[RecordBatch], col_idx: usize) -> Vec<String> {
-    let mut values = Vec::new();
-    for batch in batches {
-        if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>() {
-            for i in 0..arr.len() {
-                if !arr.is_null(i) {
-                    values.push(arr.value(i).to_string());
-                }
-            }
-        }
-    }
-    values
-}

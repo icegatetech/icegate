@@ -13,7 +13,7 @@ use datafusion::{
 
 use super::{
     error::{LokiError, LokiResult},
-    formatters::{batches_to_loki_matrix, batches_to_loki_streams, batches_to_series_list, extract_string_column},
+    formatters::{batches_to_loki_matrix, batches_to_loki_streams, batches_to_series_list},
     models::{QueryResultData, RangeQueryParams},
 };
 use crate::engine::{SourceMetrics, extract_source_metrics};
@@ -319,6 +319,10 @@ impl QueryExecutor {
     }
 
     /// Execute a labels metadata query.
+    ///
+    /// Dispatches to `crate::engine::metadata_scan`, which reads only
+    /// Parquet row-group statistics and the `attributes` MAP column — no
+    /// full-row scans.
     #[tracing::instrument(skip(self, params), fields(tenant_id))]
     pub async fn execute_labels(
         &self,
@@ -332,28 +336,14 @@ impl QueryExecutor {
             params.since.as_ref(),
         );
 
-        // Parse optional selector (CPU-bound, offloaded to blocking thread)
         let selector = self.parse_selector_opt(params.query.clone()).await?;
 
-        let session_ctx = self.create_session().await?;
-        let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
-        let (batches, _source_metrics) = self
-            .plan_and_execute(&session_ctx, "labels", planner.plan_labels(selector))
-            .await?;
+        let table = self.load_logs_table().await?;
+        let labels = crate::engine::metadata_scan::scan_labels(&table, &query_ctx, &selector)
+            .await
+            .map_err(|e| LokiError(QueryError::from(e)))?;
 
-        // Dedup and sort labels via BTreeSet (CPU-bound, offloaded to blocking thread)
-        let span = tracing::Span::current();
-        let result = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| {
-                let labels: std::collections::BTreeSet<String> =
-                    extract_string_column(&batches, 0).into_iter().collect();
-                labels.into_iter().collect()
-            })
-        })
-        .await
-        .map_err(join_error)?;
-
-        Ok(result)
+        Ok(labels.into_iter().collect())
     }
 
     /// Execute a label values metadata query.
@@ -371,26 +361,25 @@ impl QueryExecutor {
             params.since.as_ref(),
         );
 
-        // Parse optional selector (CPU-bound, offloaded to blocking thread)
         let selector = self.parse_selector_opt(params.query.clone()).await?;
 
-        let session_ctx = self.create_session().await?;
-        let planner = DataFusionPlanner::new(session_ctx.clone(), query_ctx);
-        let (batches, _source_metrics) = self
-            .plan_and_execute(
-                &session_ctx,
-                "label_values",
-                planner.plan_label_values(selector, label_name),
-            )
-            .await?;
-
-        // CPU-bound column extraction offloaded to blocking thread
-        let span = tracing::Span::current();
-        let result = tokio::task::spawn_blocking(move || span.in_scope(|| extract_string_column(&batches, 0)))
+        let table = self.load_logs_table().await?;
+        let values = crate::engine::metadata_scan::scan_label_values(&table, &query_ctx, &selector, label_name)
             .await
-            .map_err(join_error)?;
+            .map_err(|e| LokiError(QueryError::from(e)))?;
 
-        Ok(result)
+        Ok(values.into_iter().collect())
+    }
+
+    /// Load the `logs` iceberg table via the engine catalog.
+    async fn load_logs_table(&self) -> LokiResult<iceberg::table::Table> {
+        let ident = iceberg::TableIdent::from_strs([icegate_common::ICEGATE_NAMESPACE, icegate_common::LOGS_TABLE])
+            .map_err(|e| LokiError(QueryError::Iceberg(e)))?;
+        self.engine
+            .catalog()
+            .load_table(&ident)
+            .await
+            .map_err(|e| LokiError(QueryError::Iceberg(e)))
     }
 
     /// Execute a series metadata query.

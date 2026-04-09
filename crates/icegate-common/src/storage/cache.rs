@@ -800,7 +800,12 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             }
 
             // Phase 1: Acquire lock briefly to check cache and compute gaps.
-            let gaps = {
+            // We return both the gaps (what we need to fetch) and the
+            // pre-existing partial entry — the latter is kept alive all the
+            // way into the Phase 4 fallback so that, if the cache is evicted
+            // between merge and final read, we can still satisfy the request
+            // from (existing ∪ fetched) instead of only the fetched gaps.
+            let (gaps, existing) = {
                 let lock = inner.locks.lock(&key);
                 let _guard = lock.lock().await;
 
@@ -846,7 +851,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                 );
 
                 inner.metrics.record_miss(gaps.len(), gap_bytes);
-                gaps
+                (gaps, existing)
                 // _guard dropped here — lock released before S3 fetch
             };
 
@@ -898,9 +903,13 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                 Some(d) => d,
                 None => {
                     // Cache evicted between merge and read — reconstruct from
-                    // the fetched buffers we still hold.
+                    // (phase1_existing ∪ fetched). We MUST seed the fallback
+                    // with the Phase 1 snapshot: `fetched` only covers the
+                    // `gaps` we computed relative to that snapshot, so on its
+                    // own it cannot satisfy the full range whenever the
+                    // request was a partial cache hit.
                     tracing::debug!("Cache miss after merge, using fetched data as fallback");
-                    let mut fallback = CacheValue::new();
+                    let mut fallback = existing.unwrap_or_else(CacheValue::new);
                     for (offset, buf) in &fetched {
                         fallback.insert_range(*offset, &buf.to_bytes());
                     }
