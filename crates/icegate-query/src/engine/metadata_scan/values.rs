@@ -75,15 +75,20 @@ pub async fn collect_indexed_values_via_dict(
 }
 
 /// Project the `attributes` MAP column and collect distinct values for a
-/// single label key across all row groups. Consumes the builder.
+/// single label key across surviving row groups. Consumes the builder.
+///
+/// Row groups whose statistics are incompatible with the given
+/// `predicate` (tenant, time range, etc.) are pruned before scanning.
 ///
 /// # Errors
 ///
 /// Returns `MetadataScanError::Parquet` if projected record-batch reads
-/// fail.
-#[tracing::instrument(skip_all, fields(label_name = label_name, num_batches = tracing::field::Empty))]
+/// fail, or `MetadataScanError::Schema` if the `attributes` column has
+/// an unexpected type.
+#[tracing::instrument(skip_all, fields(label_name = label_name, num_batches = tracing::field::Empty, pruned_rgs = tracing::field::Empty))]
 pub async fn stream_map_values(
     builder: ParquetRecordBatchStreamBuilder<ArrowFileReader>,
+    predicate: &Predicate,
     label_name: &str,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
@@ -94,32 +99,53 @@ pub async fn stream_map_values(
         return Ok(());
     }
 
+    // Row-group pruning: only scan row groups whose statistics
+    // are compatible with the predicate (tenant_id, time range, etc.).
+    let metadata = builder.metadata();
+    let total_rgs = metadata.num_row_groups();
+    let surviving: Vec<usize> = (0..total_rgs)
+        .filter(|&i| parquet_reader::row_group_can_match(metadata.row_group(i), predicate))
+        .collect();
+    let pruned = total_rgs - surviving.len();
+    tracing::Span::current().record("pruned_rgs", pruned);
+
     let mask = ProjectionMask::columns(schema_descr, ["attributes"]);
-    let mut stream = builder.with_projection(mask).build()?;
+    let mut stream = builder.with_projection(mask).with_row_groups(surviving).build()?;
 
     let mut num_batches: usize = 0;
     while let Some(batch) = stream.try_next().await? {
         num_batches += 1;
-        collect_map_values_from_batch(&batch, label_name, out);
+        collect_map_values_from_batch(&batch, label_name, out)?;
     }
     tracing::Span::current().record("num_batches", num_batches);
 
     Ok(())
 }
 
-fn collect_map_values_from_batch(batch: &RecordBatch, label_name: &str, out: &mut BTreeSet<String>) {
-    let Ok(attr_idx) = batch.schema().index_of("attributes") else {
-        return;
-    };
-    let Some(map_arr) = batch.column(attr_idx).as_any().downcast_ref::<MapArray>() else {
-        return;
-    };
-    let Some(keys) = map_arr.keys().as_any().downcast_ref::<StringArray>() else {
-        return;
-    };
-    let Some(values) = map_arr.values().as_any().downcast_ref::<StringArray>() else {
-        return;
-    };
+fn collect_map_values_from_batch(
+    batch: &RecordBatch,
+    label_name: &str,
+    out: &mut BTreeSet<String>,
+) -> Result<(), MetadataScanError> {
+    let attr_idx = batch
+        .schema()
+        .index_of("attributes")
+        .map_err(|_| MetadataScanError::Schema("batch missing 'attributes' column".to_string()))?;
+    let map_arr = batch
+        .column(attr_idx)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| MetadataScanError::Schema("'attributes' column is not a MapArray".to_string()))?;
+    let keys = map_arr
+        .keys()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| MetadataScanError::Schema("'attributes' map keys are not StringArray".to_string()))?;
+    let values = map_arr
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| MetadataScanError::Schema("'attributes' map values are not StringArray".to_string()))?;
 
     for i in 0..keys.len() {
         if keys.is_valid(i) && keys.value(i) == label_name && values.is_valid(i) {
@@ -129,6 +155,8 @@ fn collect_map_values_from_batch(batch: &RecordBatch, label_name: &str, out: &mu
             }
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -244,7 +244,7 @@ fn decode_dictionary_from_chunk(
 /// Handles the narrow set of predicate shapes produced by
 /// [`super::predicate::full_predicate`]: `tenant_id` equality, timestamp
 /// `>=` / `<=`, indexed-column `=` / `!=`, and AND composition of those.
-fn row_group_can_match(rg: &RowGroupMetaData, predicate: &Predicate) -> bool {
+pub(super) fn row_group_can_match(rg: &RowGroupMetaData, predicate: &Predicate) -> bool {
     match predicate {
         Predicate::AlwaysFalse => false,
         Predicate::And(expr) => {

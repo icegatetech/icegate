@@ -749,7 +749,9 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             // the entire CacheValue. The foyer CacheEntry holds a
             // ref-counted handle, so `.value()` is a cheap borrow.
             if let Some(size) = range_size {
-                let range_end = range_start + size;
+                let range_end = range_start
+                    .checked_add(size)
+                    .ok_or_else(|| Error::new(ErrorKind::Unexpected, "range offset + size overflows u64"))?;
                 if range_start < range_end {
                     if let Some(entry) = inner
                         .cache
@@ -788,7 +790,10 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             // (HEAD) call entirely — it was only needed to resolve
             // open-ended ranges and to fill the Content-Range total.
             let (range_end, total_size) = if let Some(size) = range_size {
-                (range_start + size, None)
+                let end = range_start
+                    .checked_add(size)
+                    .ok_or_else(|| Error::new(ErrorKind::Unexpected, "range offset + size overflows u64"))?;
+                (end, None)
             } else {
                 let total = inner.cached_stat(&path).await?.content_length();
                 (total, Some(total))

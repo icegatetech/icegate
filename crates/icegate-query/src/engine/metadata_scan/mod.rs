@@ -198,7 +198,7 @@ async fn scan_label_values_for_file(
         }
         values::LabelKind::MapAttribute => {
             let builder = parquet_reader::open_builder(file_io, &task).await?;
-            values::stream_map_values(builder, label_name, &mut out).await?;
+            values::stream_map_values(builder, predicate, label_name, &mut out).await?;
         }
     }
 

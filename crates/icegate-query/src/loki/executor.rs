@@ -323,6 +323,10 @@ impl QueryExecutor {
     /// Dispatches to `crate::engine::metadata_scan`, which reads only
     /// Parquet row-group statistics and the `attributes` MAP column — no
     /// full-row scans.
+    ///
+    /// NOTE: This intentionally bypasses WAL and scans only committed
+    /// Iceberg data. Label discovery from uncommitted WAL segments is
+    /// not supported.
     #[tracing::instrument(skip(self, params), fields(tenant_id))]
     pub async fn execute_labels(
         &self,
@@ -347,6 +351,10 @@ impl QueryExecutor {
     }
 
     /// Execute a label values metadata query.
+    ///
+    /// NOTE: This intentionally bypasses WAL and scans only committed
+    /// Iceberg data. Label value discovery from uncommitted WAL segments
+    /// is not supported.
     #[tracing::instrument(skip(self, params), fields(tenant_id, label_name))]
     pub async fn execute_label_values(
         &self,
