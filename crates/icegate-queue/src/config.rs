@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{QueueError, Result};
 
 /// Default capacity (number of files) for the Parquet metadata LRU cache.
-const DEFAULT_METADATA_CACHE_CAPACITY: usize = 2048;
+const DEFAULT_METADATA_ENTRIES_CACHE_CAPACITY: usize = 2048;
 
 /// Queue read settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,13 +17,13 @@ pub struct QueueReadConfig {
     /// WAL files are immutable, so cached metadata never goes stale. The LRU
     /// eviction naturally drops entries for old files that have been shifted
     /// to Iceberg. Set to 0 to disable caching.
-    pub metadata_cache_capacity: usize,
+    pub metadata_entries_cache_capacity: usize,
 }
 
 impl Default for QueueReadConfig {
     fn default() -> Self {
         Self {
-            metadata_cache_capacity: DEFAULT_METADATA_CACHE_CAPACITY,
+            metadata_entries_cache_capacity: DEFAULT_METADATA_ENTRIES_CACHE_CAPACITY,
         }
     }
 }

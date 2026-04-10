@@ -243,30 +243,30 @@ impl ParquetQueueReader {
         store: Arc<dyn ObjectStore>,
         record_batch_size_rows: usize,
     ) -> Result<Self> {
-        Self::with_metadata_cache_capacity(base_path, store, record_batch_size_rows, 0)
+        Self::with_metadata_entries_cache_capacity(base_path, store, record_batch_size_rows, 0)
     }
 
     /// Creates a new queue reader with a Parquet metadata cache.
     ///
-    /// When `metadata_cache_capacity` is non-zero, parsed `ParquetMetaData`
-    /// from WAL files is cached in a bounded LRU cache. Since WAL files are
-    /// immutable, cached entries never go stale.
+    /// When `metadata_entries_cache_capacity` is non-zero, parsed
+    /// `ParquetMetaData` from WAL files is cached in a bounded LRU cache.
+    /// Since WAL files are immutable, cached entries never go stale.
     ///
     /// # Arguments
     ///
     /// * `base_path` - Base path for queue segments in object storage
     /// * `store` - Object store backend
     /// * `record_batch_size_rows` - Maximum rows per emitted `RecordBatch`
-    /// * `metadata_cache_capacity` - LRU cache capacity (0 to disable)
+    /// * `metadata_entries_cache_capacity` - LRU cache capacity (0 to disable)
     ///
     /// # Errors
     ///
     /// Returns an error if `record_batch_size_rows` is zero.
-    pub fn with_metadata_cache_capacity(
+    pub fn with_metadata_entries_cache_capacity(
         base_path: impl Into<String>,
         store: Arc<dyn ObjectStore>,
         record_batch_size_rows: usize,
-        metadata_cache_capacity: usize,
+        metadata_entries_cache_capacity: usize,
     ) -> Result<Self> {
         if record_batch_size_rows == 0 {
             return Err(QueueError::Config(
@@ -274,7 +274,7 @@ impl ParquetQueueReader {
             ));
         }
         let metadata_cache =
-            NonZeroUsize::new(metadata_cache_capacity).map(|cap| Arc::new(Mutex::new(LruCache::new(cap))));
+            NonZeroUsize::new(metadata_entries_cache_capacity).map(|cap| Arc::new(Mutex::new(LruCache::new(cap))));
         Ok(Self {
             base_path: base_path.into(),
             store,

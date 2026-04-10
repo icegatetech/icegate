@@ -132,6 +132,10 @@ pub async fn read_column_dictionaries(
     let mut ranges: Vec<Range<u64>> = Vec::new();
     let mut selected_rgs: Vec<usize> = Vec::new();
     let mut pruned: usize = 0;
+    // Row groups where the Parquet writer fell back to plain encoding
+    // (no dictionary page). This typically indicates high-cardinality
+    // data. We intentionally skip these: reading full data pages would
+    // be expensive and the over-approximation semantics allow it.
     let mut no_dict: usize = 0;
 
     for rg_idx in 0..metadata.num_row_groups() {
@@ -144,6 +148,7 @@ pub async fn read_column_dictionaries(
 
         let col_chunk = rg.column(leaf_idx);
         let Some(dict_offset) = col_chunk.dictionary_page_offset() else {
+            // No dictionary — likely high-cardinality; skip intentionally.
             no_dict += 1;
             continue;
         };

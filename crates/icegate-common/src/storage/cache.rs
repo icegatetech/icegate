@@ -834,12 +834,12 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             }
 
             // Phase 1: Acquire lock briefly to check cache and compute gaps.
-            // We return both the gaps (what we need to fetch) and the
-            // pre-existing partial entry — the latter is kept alive all the
+            // We return both the gaps (what we need to fetch) and a snapshot
+            // of the current cache entry — the snapshot is kept alive all the
             // way into the Phase 4 fallback so that, if the cache is evicted
             // between merge and final read, we can still satisfy the request
-            // from (existing ∪ fetched) instead of only the fetched gaps.
-            let (gaps, existing) = {
+            // from (snapshot ∪ fetched) instead of only the fetched gaps.
+            let (gaps, snapshot) = {
                 let lock = inner.locks.lock(&key);
                 let _guard = lock.lock().await;
 
@@ -935,22 +935,26 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             // merged from freshly-fetched backend data (Phase 2-3). The
             // only risk is eviction (entry removed by LRU pressure), not
             // staleness (serving old data). The fallback reconstructs from
-            // the same fresh data (`existing` snapshot + `fetched` gaps).
+            // the same fresh data (`snapshot` + `fetched` gaps).
             let data = match inner.cache.get(&key).await {
                 Ok(Some(entry)) => entry.value().read_range(range_start, range_end),
-                _ => None,
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(key = ?key, error = %e, "cache get failed during final read phase");
+                    None
+                }
             };
             let data = match data {
                 Some(d) => d,
                 None => {
                     // Cache evicted between merge and read — reconstruct from
-                    // (phase1_existing ∪ fetched). We MUST seed the fallback
-                    // with the Phase 1 snapshot: `fetched` only covers the
-                    // `gaps` we computed relative to that snapshot, so on its
-                    // own it cannot satisfy the full range whenever the
-                    // request was a partial cache hit.
+                    // (snapshot ∪ fetched). We MUST seed the fallback with the
+                    // Phase 1 snapshot: `fetched` only covers the `gaps` we
+                    // computed relative to that snapshot, so on its own it
+                    // cannot satisfy the full range whenever the request was
+                    // a partial cache hit.
                     tracing::debug!("Cache miss after merge, using fetched data as fallback");
-                    let mut fallback = existing.unwrap_or_else(CacheValue::new);
+                    let mut fallback = snapshot.unwrap_or_else(CacheValue::new);
                     for (offset, buf) in &fetched {
                         fallback.insert_range(*offset, &buf.to_bytes());
                     }

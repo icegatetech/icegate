@@ -69,6 +69,11 @@ pub struct QueryEngineConfig {
     ///
     /// When `false` (default), queries only read committed Iceberg data.
     /// Enable this to query data that has not yet been shifted to Iceberg.
+    ///
+    /// **Note:** This setting only affects DataFusion query plans (log/trace
+    /// queries). The `/labels`, `/label_values`, and `/series` metadata scan
+    /// endpoints always read from Iceberg only and are not affected by this
+    /// flag.
     pub wal_query_enabled: bool,
 
     /// Parquet metadata size hint in bytes for WAL file footer reads.

@@ -95,11 +95,11 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     )?;
 
     // Build the shared WAL queue reader with metadata caching
-    let wal_reader = ParquetQueueReader::with_metadata_cache_capacity(
+    let wal_reader = ParquetQueueReader::with_metadata_entries_cache_capacity(
         prefix,
         Arc::clone(&store),
         config.engine.batch_size,
-        config.queue.read.metadata_cache_capacity,
+        config.queue.read.metadata_entries_cache_capacity,
     )
     .map_err(|e| QueryError::Config(format!("Failed to create WAL reader: {e}")))?;
 
