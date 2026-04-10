@@ -1,5 +1,8 @@
 //! OTLP gRPC server implementation.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+
 use icegate_queue::WriteChannel;
 use opentelemetry_proto::tonic::collector::{
     logs::v1::logs_service_server::LogsServiceServer, metrics::v1::metrics_service_server::MetricsServiceServer,
@@ -32,11 +35,12 @@ pub async fn run(
     write_channel: WriteChannel,
     wal_row_group_size: usize,
     metrics: OtlpMetrics,
+    rejection_probability: Arc<AtomicU32>,
     config: OtlpGrpcConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", config.host, config.port).parse()?;
-    let service = OtlpGrpcService::new(write_channel, wal_row_group_size, metrics);
+    let service = OtlpGrpcService::new(write_channel, wal_row_group_size, metrics, rejection_probability);
 
     tracing::info!("Starting OTLP gRPC server on {}", addr);
 

@@ -5,6 +5,7 @@ use std::time::Duration;
 use icegate_jobmanager::s3_storage::{JobStateCodecKind, S3StorageConfig};
 use serde::{Deserialize, Serialize};
 
+use super::backpressure::BackpressureConfig;
 use crate::error::IngestError;
 
 /// Job state serialization format.
@@ -265,6 +266,8 @@ pub struct ShiftConfig {
     pub timeouts: ShiftTimeoutsConfig,
     /// Jobs manager settings.
     pub jobsmanager: ShiftJobsManagerConfig,
+    /// Backpressure controller settings.
+    pub backpressure: BackpressureConfig,
 }
 
 impl ShiftConfig {
@@ -320,6 +323,7 @@ impl ShiftConfig {
                 "jobsmanager.iteration_interval_millisecs must be greater than zero".to_string(),
             ));
         }
+        self.backpressure.validate()?;
         self.timeouts.validate()?;
         self.jobsmanager.storage.validate()?;
 

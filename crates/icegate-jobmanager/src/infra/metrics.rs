@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use opentelemetry::{
@@ -8,7 +9,10 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 
 use crate::{JobCode, JobStatus, TaskCode, TaskStatus};
 
-#[derive(Clone)]
+/// Callback invoked when a job iteration completes.
+pub type IterationCompleteCallback = Arc<dyn Fn(&JobCode, Duration) + Send + Sync>;
+
+/// Metrics collector for job manager operations.
 pub struct Metrics {
     enabled: bool,
     job_duration: Histogram<f64>,
@@ -18,6 +22,25 @@ pub struct Metrics {
     cache_misses: Counter<u64>,
     task_stolen: Counter<u64>,
     save_conflict_retries: Counter<u64>,
+    on_iteration_complete: Option<IterationCompleteCallback>,
+}
+
+// Manual `Clone` implementation because `Arc<dyn Fn>` does not derive `Clone`
+// automatically, but `Arc::clone` is available.
+impl Clone for Metrics {
+    fn clone(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            job_duration: self.job_duration.clone(),
+            task_duration: self.task_duration.clone(),
+            s3_latency: self.s3_latency.clone(),
+            cache_hits: self.cache_hits.clone(),
+            cache_misses: self.cache_misses.clone(),
+            task_stolen: self.task_stolen.clone(),
+            save_conflict_retries: self.save_conflict_retries.clone(),
+            on_iteration_complete: self.on_iteration_complete.clone(),
+        }
+    }
 }
 
 impl Metrics {
@@ -34,6 +57,7 @@ impl Metrics {
             cache_misses: meter.u64_counter("icegate_jobmanager_storage_cache_misses").build(),
             task_stolen: meter.u64_counter("icegate_jobmanager_task_stolen").build(),
             save_conflict_retries: meter.u64_counter("icegate_jobmanager_save_conflict_retry").build(),
+            on_iteration_complete: None,
         }
     }
 
@@ -89,20 +113,33 @@ impl Metrics {
             cache_misses,
             task_stolen,
             save_conflict_retries,
+            on_iteration_complete: None,
         }
     }
 
+    /// Set a callback to be invoked when a job iteration completes.
+    pub fn set_on_iteration_complete(&mut self, callback: IterationCompleteCallback) {
+        self.on_iteration_complete = Some(callback);
+    }
+
+    /// Record the completion of a job iteration, emitting metrics and invoking
+    /// the iteration-complete callback (if set).
+    ///
+    /// The callback fires regardless of the `enabled` flag because backpressure
+    /// is a functional concern, not an observability concern.
     pub fn record_job_iteration_complete(&self, code: &JobCode, status: &JobStatus, duration: Duration) {
-        if !self.enabled {
-            return;
+        if self.enabled {
+            self.job_duration.record(
+                duration.as_secs_f64(),
+                &[
+                    KeyValue::new("code", code.to_string()),
+                    KeyValue::new("status", format!("{status:?}")),
+                ],
+            );
         }
-        self.job_duration.record(
-            duration.as_secs_f64(),
-            &[
-                KeyValue::new("code", code.to_string()),
-                KeyValue::new("status", format!("{status:?}")),
-            ],
-        );
+        if let Some(ref callback) = self.on_iteration_complete {
+            callback(code, duration);
+        }
     }
 
     pub fn record_task_processed(
@@ -177,5 +214,37 @@ impl Metrics {
                 KeyValue::new("phase", phase),
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn iteration_callback_is_called_on_job_complete() {
+        let called = Arc::new(AtomicU64::new(0));
+        let called_clone = Arc::clone(&called);
+
+        let mut metrics = Metrics::new_disabled();
+        metrics.set_on_iteration_complete(Arc::new(move |_code, duration| {
+            assert!(duration.as_millis() > 0 || duration.is_zero());
+            called_clone.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let code = JobCode::from("test_job");
+        metrics.record_job_iteration_complete(&code, &JobStatus::Completed, Duration::from_millis(500));
+
+        assert_eq!(called.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn iteration_callback_not_called_when_unset() {
+        let metrics = Metrics::new_disabled();
+        let code = JobCode::from("test_job");
+        // Should not panic
+        metrics.record_job_iteration_complete(&code, &JobStatus::Completed, Duration::from_millis(100));
     }
 }

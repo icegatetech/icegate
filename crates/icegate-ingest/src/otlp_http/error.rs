@@ -5,7 +5,10 @@
 
 use axum::{
     Json,
-    http::StatusCode,
+    http::{
+        StatusCode,
+        header::{HeaderValue, RETRY_AFTER},
+    },
     response::{IntoResponse, Response},
 };
 
@@ -35,6 +38,19 @@ impl From<tokio::task::JoinError> for OtlpError {
 
 impl IntoResponse for OtlpError {
     fn into_response(self) -> Response {
+        // Backpressure gets a 429 with Retry-After header.
+        if let IngestError::Backpressure(retry_after_secs) = &self.0 {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse::new(ErrorType::Internal, self.0.to_string())),
+            )
+                .into_response();
+            if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, val);
+            }
+            return response;
+        }
+
         let (status, error_type) = match &self.0 {
             // 400 Bad Request
             IngestError::Decode(_) | IngestError::Validation(_) => (StatusCode::BAD_REQUEST, ErrorType::BadData),
@@ -57,6 +73,9 @@ impl IntoResponse for OtlpError {
             IngestError::Cancelled => (StatusCode::REQUEST_TIMEOUT, ErrorType::Internal),
 
             IngestError::MaxAttemptsReached => (StatusCode::SERVICE_UNAVAILABLE, ErrorType::Internal),
+
+            // Handled by early return above; included for exhaustiveness.
+            IngestError::Backpressure(_) => unreachable!(),
         };
 
         (status, Json(ErrorResponse::new(error_type, self.0.to_string()))).into_response()

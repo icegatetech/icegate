@@ -40,6 +40,9 @@ tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Random number generation
+rand = { workspace = true }
+
 # Utilities
 hex = { workspace = true }
 uuid = { workspace = true }

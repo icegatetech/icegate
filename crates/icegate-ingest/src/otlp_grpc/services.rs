@@ -3,6 +3,8 @@
 //! Implements the `OpenTelemetry` Protocol service traits for logs, traces, and
 //! metrics ingestion via gRPC.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use icegate_common::{LOGS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
@@ -15,9 +17,11 @@ use opentelemetry_proto::tonic::collector::{
     trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse, trace_service_server::TraceService},
 };
 use prost::Message;
+use rand::Rng;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
+use crate::shift::backpressure::decode_probability;
 use crate::transform;
 use crate::{
     infra::metrics::{OtlpMetrics, OtlpRequestRecorder},
@@ -57,16 +61,39 @@ pub struct OtlpGrpcService {
     wal_row_group_size: usize,
     /// Metrics recorder for OTLP intake.
     metrics: OtlpMetrics,
+    /// Shared rejection probability from the backpressure controller.
+    rejection_probability: Arc<AtomicU32>,
 }
 
 impl OtlpGrpcService {
     /// Create a new OTLP gRPC service.
-    pub const fn new(write_channel: WriteChannel, wal_row_group_size: usize, metrics: OtlpMetrics) -> Self {
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(
+        write_channel: WriteChannel,
+        wal_row_group_size: usize,
+        metrics: OtlpMetrics,
+        rejection_probability: Arc<AtomicU32>,
+    ) -> Self {
         Self {
             write_channel,
             wal_row_group_size,
             metrics,
+            rejection_probability,
         }
+    }
+
+    /// Check backpressure and return gRPC `RESOURCE_EXHAUSTED` if rejected.
+    fn check_backpressure(&self) -> Result<(), Status> {
+        let encoded = self.rejection_probability.load(Ordering::Relaxed);
+        if encoded == 0 {
+            return Ok(());
+        }
+        let p = decode_probability(encoded);
+        #[allow(clippy::cast_possible_truncation)]
+        if rand::rng().random::<f32>() < p as f32 {
+            return Err(Status::resource_exhausted("backpressure: shift overloaded"));
+        }
+        Ok(())
     }
 }
 
@@ -83,6 +110,7 @@ impl LogsService for OtlpGrpcService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+        self.check_backpressure()?;
         debug!("Start handle OTLP GRPC request");
         let request_size = request.get_ref().encoded_len();
         let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_LOGS, ENCODING_PROTOBUF);
@@ -196,6 +224,7 @@ impl TraceService for OtlpGrpcService {
         &self,
         _request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        self.check_backpressure()?;
         Err(Status::unimplemented(
             "OTLP traces ingestion: Parse OTLP → transform → write to Iceberg",
         ))
@@ -221,6 +250,7 @@ impl MetricsService for OtlpGrpcService {
         &self,
         _request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
+        self.check_backpressure()?;
         Err(Status::unimplemented(
             "OTLP metrics ingestion: Parse OTLP → transform → write to Iceberg",
         ))
@@ -276,7 +306,12 @@ mod tests {
     }
 
     fn test_service(write_channel: icegate_queue::WriteChannel) -> OtlpGrpcService {
-        OtlpGrpcService::new(write_channel, 4, OtlpMetrics::new_disabled())
+        OtlpGrpcService::new(
+            write_channel,
+            4,
+            OtlpMetrics::new_disabled(),
+            Arc::new(AtomicU32::new(0)),
+        )
     }
 
     #[tokio::test]
@@ -343,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn export_logs_returns_internal_when_wal_prepare_fails_in_blocking_worker() {
         let (tx, mut rx) = channel(1);
-        let service = OtlpGrpcService::new(tx, 0, OtlpMetrics::new_disabled());
+        let service = OtlpGrpcService::new(tx, 0, OtlpMetrics::new_disabled(), Arc::new(AtomicU32::new(0)));
 
         let status = LogsService::export(&service, Request::new(create_test_request()))
             .await

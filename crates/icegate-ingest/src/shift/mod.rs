@@ -1,5 +1,7 @@
 //! Shift operations: moving data from WAL to Iceberg.
 
+/// Backpressure controller for shift overload protection.
+pub mod backpressure;
 /// Commit task runner for shift operations.
 pub mod commit_runner;
 /// Configuration for shift operations.
@@ -20,8 +22,11 @@ pub mod shift_runner;
 /// Task timeout estimation utilities.
 mod timeout;
 
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use backpressure::BackpressureController;
 use chrono::Duration as ChronoDuration;
 use commit_runner::CommitTaskRunnerImpl;
 pub(crate) use config::ShiftConfig;
@@ -53,6 +58,7 @@ use crate::{
 /// Runs shift jobs inside the ingest process.
 pub struct Shifter {
     manager: JobsManager,
+    rejection_probability: Arc<AtomicU32>,
 }
 
 /// Handle for stopping a running shifter.
@@ -68,7 +74,7 @@ impl Shifter {
         shift_config: Arc<ShiftConfig>,
         jobs_storage: S3StorageConfig,
         shift_metrics: ShiftMetrics,
-        jobs_manager_metrics: JobMetrics,
+        mut jobs_manager_metrics: JobMetrics,
     ) -> Result<Self> {
         shift_config.validate()?;
         let storage = Arc::new(IcebergStorage::new(
@@ -108,6 +114,7 @@ impl Shifter {
             shift_metrics.clone(),
             LOGS_TOPIC,
         ));
+        let shift_metrics_for_bp = shift_metrics.clone();
         let commit_runner = Arc::new(CommitTaskRunnerImpl::new(Arc::clone(&shift_storage), LOGS_TOPIC));
         let commit_runner = Arc::new(CommitTaskRunnerWithMetrics::new(
             commit_runner,
@@ -153,6 +160,54 @@ impl Shifter {
             },
         };
 
+        let controller = Arc::new(Mutex::new(BackpressureController::new(
+            shift_config.backpressure.clone(),
+            shift_config.jobsmanager.iteration_interval_millisecs,
+        )));
+        // Lock is safe here: freshly created, no contention possible.
+        #[allow(clippy::expect_used)]
+        let rejection_probability = controller
+            .lock()
+            .expect("backpressure controller lock poisoned")
+            .rejection_probability_atomic();
+
+        jobs_manager_metrics.set_on_iteration_complete(Arc::new(move |_code, duration| {
+            // Panic on poisoned lock is intentional: if the controller panicked,
+            // the shift process is in an unrecoverable state.
+            #[allow(clippy::expect_used)]
+            let mut ctrl = controller.lock().expect("backpressure controller lock poisoned");
+            let was_zero = ctrl.rejection_probability() == 0.0;
+            ctrl.update(duration);
+            let p = ctrl.rejection_probability();
+
+            #[allow(clippy::cast_precision_loss)]
+            let duration_ms = duration.as_millis() as f64;
+            shift_metrics_for_bp.record_backpressure(
+                p,
+                ctrl.last_load_ratio(),
+                ctrl.last_error(),
+                ctrl.integral(),
+                duration_ms,
+            );
+
+            tracing::debug!(
+                rejection_probability = p,
+                load_ratio = ctrl.last_load_ratio(),
+                error = ctrl.last_error(),
+                integral = ctrl.integral(),
+                "Shift backpressure update"
+            );
+
+            if was_zero && p > 0.0 {
+                tracing::info!(rejection_probability = p, "Shift backpressure activated");
+            } else if !was_zero && p == 0.0 {
+                tracing::info!("Shift backpressure deactivated");
+            }
+            if p > 0.5 {
+                tracing::warn!(rejection_probability = p, "Shift backpressure high");
+            }
+        }));
+
         let manager = JobsManager::new(
             cached_storage,
             manager_config,
@@ -161,13 +216,21 @@ impl Shifter {
         )
         .map_err(map_shift_error)?;
 
-        Ok(Self { manager })
+        Ok(Self {
+            manager,
+            rejection_probability,
+        })
     }
 
     /// Start shifter workers and return a handle for shutdown.
     pub fn start(&self) -> Result<ShifterHandle> {
         let handle = self.manager.start().map_err(map_shift_error)?;
         Ok(ShifterHandle { handle })
+    }
+
+    /// Get the shared rejection probability atomic for OTLP handlers.
+    pub fn rejection_probability(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.rejection_probability)
     }
 }
 

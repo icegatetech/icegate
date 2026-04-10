@@ -41,6 +41,9 @@ impl From<GrpcError> for Status {
             | IngestError::Other(_)
             | IngestError::Multiple(_) => (Code::Internal, err.0.to_string()),
 
+            // ResourceExhausted - backpressure rejection
+            IngestError::Backpressure(_) => (Code::ResourceExhausted, err.0.to_string()),
+
             IngestError::Cancelled => (Code::Cancelled, err.0.to_string()),
 
             IngestError::MaxAttemptsReached => (Code::Unavailable, err.0.to_string()),

@@ -52,6 +52,10 @@ pub enum IngestError {
     #[error("shift queue read error: {0}")]
     ShiftQueueRead(String),
 
+    /// Request rejected due to shift backpressure.
+    #[error("backpressure: shift overloaded (retry after {0}s)")]
+    Backpressure(u64),
+
     /// Operation cancelled.
     #[error("operation cancelled")]
     Cancelled,
@@ -101,7 +105,8 @@ impl IngestError {
             | Self::Arrow(_)
             | Self::Join(_)
             | Self::Shift(_)
-            | Self::ShiftQueueRead(_) => false,
+            | Self::ShiftQueueRead(_)
+            | Self::Backpressure(_) => false,
         }
     }
 }

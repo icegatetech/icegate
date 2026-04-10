@@ -445,6 +445,7 @@ async fn run_services(
         shift_runtime_threads = runtime_plan.shift_threads,
         "Runtime thread allocation resolved"
     );
+    let rejection_probability = shifter.rejection_probability();
     let shift_runtime = spawn_shift_runtime(shifter, runtime_plan.shift_threads)?;
     tracing::info!("Shifter started successfully on dedicated runtime");
 
@@ -473,8 +474,9 @@ async fn run_services(
         let http_config = config.otlp_http.clone();
         let token = cancel_token.clone();
         let metrics = otlp_metrics.clone();
+        let rp = Arc::clone(&rejection_probability);
         let handle = tokio::spawn(async move {
-            crate::otlp_http::run(write_channel, wal_row_group_size, metrics, http_config, token).await
+            crate::otlp_http::run(write_channel, wal_row_group_size, metrics, rp, http_config, token).await
         });
         handles.push(handle);
     }
@@ -486,8 +488,9 @@ async fn run_services(
         let grpc_config = config.otlp_grpc.clone();
         let token = cancel_token.clone();
         let metrics = otlp_metrics.clone();
+        let rp = Arc::clone(&rejection_probability);
         let handle = tokio::spawn(async move {
-            crate::otlp_grpc::run(write_channel, wal_row_group_size, metrics, grpc_config, token).await
+            crate::otlp_grpc::run(write_channel, wal_row_group_size, metrics, rp, grpc_config, token).await
         });
         handles.push(handle);
     }

@@ -1,5 +1,6 @@
 //! OTLP HTTP request handlers
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use axum::{
@@ -12,6 +13,7 @@ use axum::{
 use icegate_common::{LOGS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
+use rand::Rng;
 use tracing::debug;
 
 use super::{
@@ -22,7 +24,9 @@ use super::{
     },
     server::OtlpHttpState,
 };
-use crate::{error::IngestError, infra::metrics::OtlpRequestRecorder, transform};
+use crate::{
+    error::IngestError, infra::metrics::OtlpRequestRecorder, shift::backpressure::decode_probability, transform,
+};
 
 /// Content type for protobuf.
 const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
@@ -49,6 +53,23 @@ fn extract_tenant_id(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
+/// Check backpressure and return an error if the request should be rejected.
+///
+/// Reads the current rejection probability from the shared atomic.
+/// When probability is zero (common case), only performs a single atomic load.
+fn check_backpressure(rejection_probability: &AtomicU32, retry_after_secs: u64) -> Result<(), IngestError> {
+    let encoded = rejection_probability.load(Ordering::Relaxed);
+    if encoded == 0 {
+        return Ok(());
+    }
+    let p = decode_probability(encoded);
+    #[allow(clippy::cast_possible_truncation)]
+    if rand::rng().random::<f32>() < p as f32 {
+        return Err(IngestError::Backpressure(retry_after_secs));
+    }
+    Ok(())
+}
+
 /// Handle OTLP logs ingestion.
 ///
 /// Supports both Content-Types:
@@ -64,6 +85,8 @@ pub async fn ingest_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> OtlpResult<Json<ExportLogsResponse>> {
+    check_backpressure(&state.rejection_probability, 5).map_err(OtlpError::from)?;
+
     // Determine content type (default to protobuf per OTLP spec)
     let content_type = headers
         .get(CONTENT_TYPE)
@@ -188,7 +211,9 @@ fn parse_logs_request(content_type: &str, body: &Bytes) -> Result<ExportLogsServ
 /// - Write spans to Iceberg spans table via catalog
 /// - Handle batching and backpressure
 /// - Return OTLP `ExportTracesServiceResponse`
-pub async fn ingest_traces(State(_state): State<OtlpHttpState>) -> OtlpResult<Json<ExportTracesResponse>> {
+pub async fn ingest_traces(State(state): State<OtlpHttpState>) -> OtlpResult<Json<ExportTracesResponse>> {
+    check_backpressure(&state.rejection_probability, 5).map_err(OtlpError::from)?;
+
     Err(OtlpError(IngestError::NotImplemented(
         "OTLP traces ingestion: Parse OTLP → transform → write to Iceberg".to_string(),
     )))
@@ -204,7 +229,9 @@ pub async fn ingest_traces(State(_state): State<OtlpHttpState>) -> OtlpResult<Js
 /// - Write metrics to Iceberg metrics table via catalog
 /// - Handle batching and backpressure
 /// - Return OTLP `ExportMetricsServiceResponse`
-pub async fn ingest_metrics(State(_state): State<OtlpHttpState>) -> OtlpResult<Json<ExportMetricsResponse>> {
+pub async fn ingest_metrics(State(state): State<OtlpHttpState>) -> OtlpResult<Json<ExportMetricsResponse>> {
+    check_backpressure(&state.rejection_probability, 5).map_err(OtlpError::from)?;
+
     Err(OtlpError(IngestError::NotImplemented(
         "OTLP metrics ingestion: Parse OTLP → transform → write to Iceberg".to_string(),
     )))
@@ -230,6 +257,8 @@ fn otlp_encoding_from_content_type(content_type: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::body::Bytes;
     use icegate_queue::{WriteResult, channel};
     use opentelemetry_proto::tonic::{
@@ -288,6 +317,7 @@ mod tests {
             write_channel,
             wal_row_group_size: 4,
             metrics: OtlpMetrics::new_disabled(),
+            rejection_probability: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -414,6 +444,7 @@ mod tests {
             write_channel: tx,
             wal_row_group_size: 0,
             metrics: OtlpMetrics::new_disabled(),
+            rejection_probability: Arc::new(AtomicU32::new(0)),
         };
 
         let result = ingest_logs(State(state), HeaderMap::new(), encode_protobuf_request()).await;

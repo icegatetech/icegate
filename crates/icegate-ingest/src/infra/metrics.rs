@@ -47,6 +47,11 @@ pub struct ShiftMetrics {
     already_committed_total: Counter<u64>,
     task_failures_total: Counter<u64>,
     task_success_total: Counter<u64>,
+    backpressure_rejection_probability: Gauge<f64>,
+    backpressure_load_ratio: Gauge<f64>,
+    backpressure_error: Gauge<f64>,
+    backpressure_integral: Gauge<f64>,
+    shift_iteration_duration_ms: Gauge<f64>,
 }
 
 impl ShiftMetrics {
@@ -82,6 +87,13 @@ impl ShiftMetrics {
             already_committed_total: meter.u64_counter("icegate_ingest_shift_already_committed").build(),
             task_failures_total: meter.u64_counter("icegate_ingest_shift_task_failures").build(),
             task_success_total: meter.u64_counter("icegate_ingest_shift_task_success").build(),
+            backpressure_rejection_probability: meter
+                .f64_gauge("icegate_ingest_shift_backpressure_rejection_probability")
+                .build(),
+            backpressure_load_ratio: meter.f64_gauge("icegate_ingest_shift_backpressure_load_ratio").build(),
+            backpressure_error: meter.f64_gauge("icegate_ingest_shift_backpressure_error").build(),
+            backpressure_integral: meter.f64_gauge("icegate_ingest_shift_backpressure_integral").build(),
+            shift_iteration_duration_ms: meter.f64_gauge("icegate_ingest_shift_iteration_duration_ms").build(),
         }
     }
 
@@ -172,6 +184,26 @@ impl ShiftMetrics {
             .u64_counter("icegate_ingest_shift_task_success")
             .with_description("Number of shift task successes")
             .build();
+        let backpressure_rejection_probability = meter
+            .f64_gauge("icegate_ingest_shift_backpressure_rejection_probability")
+            .with_description("Current backpressure rejection probability (0.0 - 1.0)")
+            .build();
+        let backpressure_load_ratio = meter
+            .f64_gauge("icegate_ingest_shift_backpressure_load_ratio")
+            .with_description("Last shift iteration load ratio (duration / interval)")
+            .build();
+        let backpressure_error = meter
+            .f64_gauge("icegate_ingest_shift_backpressure_error")
+            .with_description("Current PI error signal")
+            .build();
+        let backpressure_integral = meter
+            .f64_gauge("icegate_ingest_shift_backpressure_integral")
+            .with_description("Current PI integral accumulator value")
+            .build();
+        let shift_iteration_duration_ms = meter
+            .f64_gauge("icegate_ingest_shift_iteration_duration_ms")
+            .with_description("Last shift iteration wall-clock time in milliseconds")
+            .build();
 
         Self {
             enabled: true,
@@ -194,6 +226,11 @@ impl ShiftMetrics {
             already_committed_total,
             task_failures_total,
             task_success_total,
+            backpressure_rejection_probability,
+            backpressure_load_ratio,
+            backpressure_error,
+            backpressure_integral,
+            shift_iteration_duration_ms,
         }
     }
 
@@ -415,6 +452,25 @@ impl ShiftMetrics {
                 KeyValue::new("topic", topic.to_string()),
             ],
         );
+    }
+
+    /// Record backpressure controller state after a shift iteration.
+    pub fn record_backpressure(
+        &self,
+        rejection_probability: f64,
+        load_ratio: f64,
+        error: f64,
+        integral: f64,
+        iteration_duration_ms: f64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.backpressure_rejection_probability.record(rejection_probability, &[]);
+        self.backpressure_load_ratio.record(load_ratio, &[]);
+        self.backpressure_error.record(error, &[]);
+        self.backpressure_integral.record(integral, &[]);
+        self.shift_iteration_duration_ms.record(iteration_duration_ms, &[]);
     }
 }
 

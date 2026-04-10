@@ -1,6 +1,8 @@
 //! OTLP HTTP server implementation
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use icegate_queue::WriteChannel;
 use tokio_util::sync::CancellationToken;
@@ -17,6 +19,8 @@ pub struct OtlpHttpState {
     pub wal_row_group_size: usize,
     /// Metrics recorder for OTLP intake.
     pub metrics: OtlpMetrics,
+    /// Shared rejection probability from the backpressure controller.
+    pub rejection_probability: Arc<AtomicU32>,
 }
 
 /// Run the OTLP HTTP server
@@ -28,6 +32,7 @@ pub async fn run(
     write_channel: WriteChannel,
     wal_row_group_size: usize,
     metrics: OtlpMetrics,
+    rejection_probability: Arc<AtomicU32>,
     config: OtlpHttpConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -37,6 +42,7 @@ pub async fn run(
         write_channel,
         wal_row_group_size,
         metrics,
+        rejection_probability,
     };
 
     let app = super::routes::routes(state);
