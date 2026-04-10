@@ -14,6 +14,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use foyer::{DeviceBuilder as _, HybridCache};
 use futures::future::try_join_all;
@@ -245,10 +246,38 @@ pub struct CacheKey {
 /// their start offset. Segments are always kept sorted and
 /// non-overlapping; adjacent/overlapping segments are merged on
 /// insertion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CacheValue {
     /// Sorted, non-overlapping segments: start-offset -> bytes.
-    segments: BTreeMap<u64, Vec<u8>>,
+    ///
+    /// Uses `Bytes` (reference-counted) so that cloning a `CacheValue`
+    /// is O(1) instead of deep-copying every segment buffer.
+    segments: BTreeMap<u64, Bytes>,
+}
+
+// Custom serde impls: `Bytes` does not implement serde traits, so we
+// serialize each segment as `&[u8]` and deserialize via `Vec<u8>` →
+// `Bytes::from()`.  The on-wire format is identical to the previous
+// `BTreeMap<u64, Vec<u8>>`, so existing disk-cached entries remain
+// readable.
+
+impl Serialize for CacheValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.segments.len()))?;
+        for (k, v) in &self.segments {
+            map.serialize_entry(k, v.as_ref())?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let raw: BTreeMap<u64, Vec<u8>> = BTreeMap::deserialize(deserializer)?;
+        let segments = raw.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect();
+        Ok(Self { segments })
+    }
 }
 
 /// Helper to convert `u64` to `usize` safely.
@@ -279,7 +308,7 @@ impl CacheValue {
         // Collect all segments that overlap or are adjacent to [offset, new_end).
         // A segment at `seg_start` with length `seg_len` overlaps/touches if:
         //   seg_start <= new_end  AND  seg_start + seg_len >= offset
-        let overlapping: Vec<(u64, Vec<u8>)> = self
+        let overlapping: Vec<(u64, Bytes)> = self
             .segments
             .range(..=new_end)
             .rev()
@@ -313,7 +342,7 @@ impl CacheValue {
         for (seg_start, _) in &overlapping {
             self.segments.remove(seg_start);
         }
-        self.segments.insert(union_start, merged);
+        self.segments.insert(union_start, Bytes::from(merged));
     }
 
     /// Find gaps within `[start, end)` that are not covered by segments.
@@ -426,7 +455,7 @@ impl CacheValue {
 
     /// Total number of cached bytes across all segments.
     fn size_bytes(&self) -> usize {
-        self.segments.values().map(Vec::len).sum()
+        self.segments.values().map(Bytes::len).sum()
     }
 }
 
@@ -749,7 +778,9 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             // the entire CacheValue. The foyer CacheEntry holds a
             // ref-counted handle, so `.value()` is a cheap borrow.
             if let Some(size) = range_size {
-                let range_end = range_start + size;
+                let range_end = range_start
+                    .checked_add(size)
+                    .ok_or_else(|| Error::new(ErrorKind::Unexpected, "range offset + size overflows u64"))?;
                 if range_start < range_end {
                     if let Some(entry) = inner
                         .cache
@@ -775,74 +806,90 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                 }
             }
 
-            // --- Slow path: need to fetch gaps, requires per-key lock ---
-
-            // Get total object size from stat cache for Content-Range header.
-            let total_size = inner.cached_stat(&path).await?.content_length();
+            // --- Slow path: need to fetch gaps ---
+            //
+            // The per-key lock is held only for brief cache
+            // inspection/merge, NEVER across S3 fetches. This prevents
+            // lock convoys where prefetch and query reads for the same
+            // file serialize behind a single slow S3 round-trip.
 
             // Determine the end of the requested range.
-            let range_end = range_size.map_or(total_size, |size| range_start + size);
+            //
+            // When the caller supplies a size we can skip the stat
+            // (HEAD) call entirely — it was only needed to resolve
+            // open-ended ranges and to fill the Content-Range total.
+            let (range_end, total_size) = if let Some(size) = range_size {
+                let end = range_start
+                    .checked_add(size)
+                    .ok_or_else(|| Error::new(ErrorKind::Unexpected, "range offset + size overflows u64"))?;
+                (end, None)
+            } else {
+                let total = inner.cached_stat(&path).await?.content_length();
+                (total, Some(total))
+            };
 
             if range_start >= range_end {
                 inner.metrics.record_read_duration(start);
                 return Ok((RpRead::new(), Buffer::new()));
             }
 
-            // Per-key lock to serialize cache updates.
-            let lock = inner.locks.lock(&key);
-            let _guard = lock.lock().await;
+            // Phase 1: Acquire lock briefly to check cache and compute gaps.
+            // We return both the gaps (what we need to fetch) and a snapshot
+            // of the current cache entry — the snapshot is kept alive all the
+            // way into the Phase 4 fallback so that, if the cache is evicted
+            // between merge and final read, we can still satisfy the request
+            // from (snapshot ∪ fetched) instead of only the fetched gaps.
+            let (gaps, snapshot) = {
+                let lock = inner.locks.lock(&key);
+                let _guard = lock.lock().await;
 
-            // Re-check cache under lock — another task may have filled
-            // the gaps while we waited.
-            if let Some(entry) = inner
-                .cache
-                .get(&key)
-                .await
-                .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
-            {
-                let cached = entry.value();
-                if cached.covers(range_start, range_end) {
-                    tracing::debug!(
-                        offset = range_start,
-                        length = range_end - range_start,
-                        "Cache hit (after lock)"
-                    );
-                    let data = cached
-                        .read_range(range_start, range_end)
-                        .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
-                    inner.metrics.record_hit("lock_path", range_end - range_start);
-                    inner.metrics.record_read_duration(start);
-                    return Ok(make_read_response(data, range_start, range_end, Some(total_size)));
+                // Re-check cache under lock — another task may have filled
+                // the gaps while we waited.
+                let existing: Option<CacheValue> = inner
+                    .cache
+                    .get(&key)
+                    .await
+                    .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
+                    .map(|entry| entry.value().clone());
+
+                if let Some(ref cached) = existing {
+                    if cached.covers(range_start, range_end) {
+                        tracing::debug!(
+                            offset = range_start,
+                            length = range_end - range_start,
+                            "Cache hit (after lock)"
+                        );
+                        let data = cached
+                            .read_range(range_start, range_end)
+                            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
+                        inner.metrics.record_hit("lock_path", range_end - range_start);
+                        inner.metrics.record_read_duration(start);
+                        return Ok(make_read_response(data, range_start, range_end, total_size));
+                    }
                 }
-            }
 
-            // Find uncached gaps. We need to clone the value here since
-            // we must mutate it to merge fetched data.
-            let existing: Option<CacheValue> = inner
-                .cache
-                .get(&key)
-                .await
-                .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
-                .map(|entry| entry.value().clone());
+                // Find uncached gaps using the already-fetched entry.
+                #[allow(clippy::single_range_in_vec_init)]
+                let gaps = existing
+                    .as_ref()
+                    .map_or_else(|| vec![range_start..range_end], |v| v.find_gaps(range_start, range_end));
 
-            #[allow(clippy::single_range_in_vec_init)]
-            let gaps = existing
-                .as_ref()
-                .map_or_else(|| vec![range_start..range_end], |v| v.find_gaps(range_start, range_end));
+                let gap_bytes: u64 = gaps.iter().map(|g| g.end - g.start).sum();
+                tracing::debug!(
+                    offset = range_start,
+                    length = range_end - range_start,
+                    gaps = gaps.len(),
+                    gap_bytes = gap_bytes,
+                    partial = existing.is_some(),
+                    "Cache miss"
+                );
 
-            let gap_bytes: u64 = gaps.iter().map(|g| g.end - g.start).sum();
-            tracing::debug!(
-                offset = range_start,
-                length = range_end - range_start,
-                gaps = gaps.len(),
-                gap_bytes = gap_bytes,
-                partial = existing.is_some(),
-                "Cache miss"
-            );
+                inner.metrics.record_miss(gaps.len(), gap_bytes);
+                (gaps, existing)
+                // _guard dropped here — lock released before S3 fetch
+            };
 
-            inner.metrics.record_miss(gaps.len(), gap_bytes);
-
-            // Fetch all gaps concurrently from the backend.
+            // Phase 2: Fetch all gaps concurrently WITHOUT holding the lock.
             let fetch_futures = gaps.iter().map(|gap| {
                 let gap_range = BytesRange::new(gap.start, Some(gap.end - gap.start));
                 let gap_start = gap.start;
@@ -856,21 +903,67 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
             });
             let fetched = try_join_all(fetch_futures).await?;
 
-            // Merge into cache value.
-            let mut merged = existing.unwrap_or_else(CacheValue::new);
-            for (offset, data) in &fetched {
-                merged.insert_range(*offset, &data.to_bytes());
+            // Phase 3: Re-acquire lock briefly to merge fetched data.
+            {
+                let lock = inner.locks.lock(&key);
+                let _guard = lock.lock().await;
+
+                // Re-read the current cache state — another task may have
+                // updated it while we were fetching.
+                let existing: Option<CacheValue> = match inner.cache.get(&key).await {
+                    Ok(entry) => entry.map(|e| e.value().clone()),
+                    Err(e) => {
+                        tracing::warn!(key = ?key, error = %e, "cache get failed during merge phase");
+                        return Err(Error::new(ErrorKind::Unexpected, e.to_string()));
+                    }
+                };
+
+                let mut merged = existing.unwrap_or_else(CacheValue::new);
+                for (offset, data) in &fetched {
+                    merged.insert_range(*offset, &data.to_bytes());
+                }
+
+                // Update cache.
+                inner.cache.insert(key.clone(), merged);
             }
 
-            // Extract requested range before inserting into cache (avoids
-            // cloning `merged` — we move it into the cache after).
-            let data = merged
-                .read_range(range_start, range_end)
-                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache merge failed to cover range"))?;
-            let response = make_read_response(data, range_start, range_end, Some(total_size));
-
-            // Update cache.
-            inner.cache.insert(key, merged);
+            // Phase 4: Read from the now-warm cache without the lock.
+            // Fall back to reconstructing from fetched data if the cache
+            // entry was evicted between Phase 3 and this read.
+            //
+            // Staleness is not a concern here: the cache entry was just
+            // merged from freshly-fetched backend data (Phase 2-3). The
+            // only risk is eviction (entry removed by LRU pressure), not
+            // staleness (serving old data). The fallback reconstructs from
+            // the same fresh data (`snapshot` + `fetched` gaps).
+            let data = match inner.cache.get(&key).await {
+                Ok(Some(entry)) => entry.value().read_range(range_start, range_end),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(key = ?key, error = %e, "cache get failed during final read phase");
+                    None
+                }
+            };
+            let data = match data {
+                Some(d) => d,
+                None => {
+                    // Cache evicted between merge and read — reconstruct from
+                    // (snapshot ∪ fetched). We MUST seed the fallback with the
+                    // Phase 1 snapshot: `fetched` only covers the `gaps` we
+                    // computed relative to that snapshot, so on its own it
+                    // cannot satisfy the full range whenever the request was
+                    // a partial cache hit.
+                    tracing::debug!("Cache miss after merge, using fetched data as fallback");
+                    let mut fallback = snapshot.unwrap_or_else(CacheValue::new);
+                    for (offset, buf) in &fetched {
+                        fallback.insert_range(*offset, &buf.to_bytes());
+                    }
+                    fallback.read_range(range_start, range_end).ok_or_else(|| {
+                        Error::new(ErrorKind::Unexpected, "fetched data does not cover requested range")
+                    })?
+                }
+            };
+            let response = make_read_response(data, range_start, range_end, total_size);
 
             inner.metrics.record_read_duration(start);
             Ok(response)
@@ -1300,6 +1393,88 @@ mod tests {
             .expect("memory operator")
             .layer(CacheLayer::new(cache, metrics, stat_ttl, None))
             .finish()
+    }
+
+    #[test]
+    fn test_covers_partial_range_returns_false() {
+        let mut v = CacheValue::new();
+        v.insert_range(10, &[1, 2, 3, 4, 5]); // [10..15)
+        // Fully inside → true
+        assert!(v.covers(10, 15));
+        // Extends beyond → false
+        assert!(!v.covers(10, 20));
+        // Starts before → false
+        assert!(!v.covers(5, 15));
+        // Completely outside → false
+        assert!(!v.covers(20, 25));
+    }
+
+    #[test]
+    fn test_find_gaps_with_partial_coverage() {
+        let mut v = CacheValue::new();
+        v.insert_range(5, &[0; 5]); // [5..10)
+        v.insert_range(15, &[0; 5]); // [15..20)
+        v.insert_range(25, &[0; 3]); // [25..28)
+
+        let gaps = v.find_gaps(0, 30);
+        assert_eq!(gaps, vec![0..5, 10..15, 20..25, 28..30]);
+    }
+
+    #[test]
+    fn test_insert_range_overwrites_overlap() {
+        let mut v = CacheValue::new();
+        v.insert_range(0, &[1, 2, 3, 4, 5]);
+        // Overwrite middle with new data
+        v.insert_range(2, &[10, 11, 12]);
+        // Result should be [1, 2, 10, 11, 12] at offset 0
+        assert_eq!(v.read_range(0, 5), Some(vec![1, 2, 10, 11, 12]));
+        assert_eq!(v.segments.len(), 1);
+    }
+
+    #[test]
+    fn test_read_range_spanning_multiple_merged_segments() {
+        let mut v = CacheValue::new();
+        v.insert_range(0, &[1, 2, 3]);
+        v.insert_range(3, &[4, 5]);
+        v.insert_range(5, &[6, 7, 8]);
+        // All adjacent → should merge into one segment
+        assert_eq!(v.read_range(0, 8), Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(v.segments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_cache_miss_populates_cache() {
+        let op = build_test_operator(None).await;
+
+        op.write("data.bin", "hello world").await.expect("write");
+
+        // First read — cache miss, populates cache.
+        let data1 = op.read("data.bin").await.expect("read1");
+        assert_eq!(data1.to_vec(), b"hello world");
+
+        // Second read — should be served from cache.
+        let data2 = op.read("data.bin").await.expect("read2");
+        assert_eq!(data2.to_vec(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_same_key() {
+        let op = build_test_operator(None).await;
+
+        let content = "concurrent test data";
+        op.write("concurrent.bin", content).await.expect("write");
+
+        // Spawn multiple concurrent reads of the same key.
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let op = op.clone();
+            handles.push(tokio::spawn(async move { op.read("concurrent.bin").await }));
+        }
+
+        for handle in handles {
+            let data = handle.await.expect("join").expect("read");
+            assert_eq!(data.to_vec(), content.as_bytes());
+        }
     }
 
     #[tokio::test]

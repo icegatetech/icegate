@@ -51,6 +51,10 @@ queue:
     basePath: "s3://queue/"
     channelCapacity: 1024
     maxRowGroupSize: 16384
+  read:
+    ## LRU cache capacity for parsed Parquet metadata (default: 2048).
+    ## Set to 0 to disable caching.
+    metadataEntriesCacheCapacity: 2048
   write:
     writeRetries: 3
     compression: zstd
@@ -86,6 +90,13 @@ query:
     # refreshIntervalSecs: 15
     ## Max age (seconds) before cached provider is considered stale (default: 30)
     # maxAgeSecs: 30
+    ## Include WAL (hot) segments in query results (default: false).
+    ## When false, queries only read committed Iceberg data.
+    ## Note: does not affect /labels, /label_values, or /series — those are Iceberg-only.
+    walQueryEnabled: false
+    ## Parquet metadata size hint (bytes) for WAL footer reads (default: 65536).
+    ## Reduces S3 round-trips for small WAL files. Omit to use DataFusion default.
+    walMetadataSizeHint: 65536
 
   ## FileIO cache configuration (optional)
   cache:

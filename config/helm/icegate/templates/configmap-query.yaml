@@ -43,12 +43,18 @@ data:
       {{- with .Values.query.engine.maxAgeSecs }}
       max_age_secs: {{ . }}
       {{- end }}
+      # WAL query settings (affects DataFusion queries only, not /labels /label_values /series).
+      wal_query_enabled: {{ .Values.query.engine.walQueryEnabled }}
+      {{- with .Values.query.engine.walMetadataSizeHint }}
+      wal_metadata_size_hint: {{ . }}
+      {{- end }}
     queue:
       common:
         base_path: {{ .Values.queue.common.basePath | quote }}
         channel_capacity: {{ .Values.queue.common.channelCapacity }}
         max_row_group_size: {{ .Values.queue.common.maxRowGroupSize }}
-      read: {}
+      read:
+        metadata_entries_cache_capacity: {{ .Values.queue.read.metadataEntriesCacheCapacity }}
     storage:
       {{- include "icegate.storageYaml" . | nindent 6 }}
     loki:

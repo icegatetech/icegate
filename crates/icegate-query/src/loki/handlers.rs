@@ -64,7 +64,7 @@ pub async fn query(
 }
 
 /// Handle range query requests.
-#[tracing::instrument(skip_all, fields(tenant_id, query = %params.query))]
+#[tracing::instrument(skip_all, fields(tenant_id, query = %params.query, error = tracing::field::Empty))]
 pub async fn query_range(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
@@ -83,6 +83,7 @@ pub async fn query_range(
         }
         Err(e) => {
             recorder.finish("error");
+            record_handler_error("query_range", &e);
             Err(e)
         }
     }
@@ -95,7 +96,7 @@ pub async fn query_range(
 /// Handle label names request.
 ///
 /// Loki API: `GET /loki/api/v1/labels`
-#[tracing::instrument(skip_all, fields(tenant_id))]
+#[tracing::instrument(skip_all, fields(tenant_id, error = tracing::field::Empty))]
 pub async fn labels(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
@@ -114,6 +115,7 @@ pub async fn labels(
         }
         Err(e) => {
             recorder.finish("error");
+            record_handler_error("labels", &e);
             Err(e)
         }
     }
@@ -122,7 +124,7 @@ pub async fn labels(
 /// Handle label values request.
 ///
 /// Loki API: `GET /loki/api/v1/label/:name/values`
-#[tracing::instrument(skip_all, fields(tenant_id, label_name = %label_name))]
+#[tracing::instrument(skip_all, fields(tenant_id, label_name = %label_name, error = tracing::field::Empty))]
 pub async fn label_values(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
@@ -142,6 +144,7 @@ pub async fn label_values(
         }
         Err(e) => {
             recorder.finish("error");
+            record_handler_error("label_values", &e);
             Err(e)
         }
     }
@@ -150,7 +153,7 @@ pub async fn label_values(
 /// Handle series request.
 ///
 /// Loki API: `GET /loki/api/v1/series`
-#[tracing::instrument(skip_all, fields(tenant_id))]
+#[tracing::instrument(skip_all, fields(tenant_id, error = tracing::field::Empty))]
 pub async fn series(
     State(loki_state): State<LokiState>,
     headers: HeaderMap,
@@ -169,9 +172,16 @@ pub async fn series(
         }
         Err(e) => {
             recorder.finish("error");
+            record_handler_error("series", &e);
             Err(e)
         }
     }
+}
+
+/// Record a handler error onto the current tracing span and emit an error event.
+fn record_handler_error(handler: &'static str, err: &LokiError) {
+    tracing::Span::current().record("error", tracing::field::display(&err.0));
+    tracing::error!(handler, error = %err.0, error.debug = ?err.0, "loki handler failed");
 }
 
 // ============================================================================

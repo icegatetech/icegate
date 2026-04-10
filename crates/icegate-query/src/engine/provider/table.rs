@@ -26,6 +26,7 @@ use icegate_common::WAL_OFFSET_PROPERTY;
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
+use super::WalQueryConfig;
 use super::scan::IcegateIcebergScan;
 use crate::engine::core::WAL_STORE_URL;
 
@@ -45,6 +46,8 @@ pub(super) struct IcegateTableProvider {
     wal_reader: Arc<ParquetQueueReader>,
     /// Iceberg table loaded at provider construction time.
     table: Table,
+    /// WAL query configuration (enabled flag, metadata size hint).
+    wal_config: WalQueryConfig,
 }
 
 impl std::fmt::Debug for IcegateTableProvider {
@@ -71,6 +74,7 @@ impl IcegateTableProvider {
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
         wal_reader: Arc<ParquetQueueReader>,
+        wal_config: WalQueryConfig,
     ) -> Result<Self, iceberg::Error> {
         let table = catalog.load_table(&table_ident).await?;
         let schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
@@ -82,6 +86,7 @@ impl IcegateTableProvider {
             schema,
             wal_reader,
             table,
+            wal_config,
         })
     }
 }
@@ -118,9 +123,16 @@ impl TableProvider for IcegateTableProvider {
         // 1. Clone table (cheap: inner data is Arc-wrapped)
         let table = self.table.clone();
 
-        // 2. Extract WAL offset from snapshot history
-        let wal_offset = extract_wal_offset(&table)?;
-        tracing::debug!(wal_offset = ?wal_offset, "Resolved WAL boundary offset");
+        // 2. Early exit when WAL is disabled — skip snapshot history walk
+        let wal_enabled = self.wal_config.enabled;
+        let wal_offset = if wal_enabled {
+            let offset = extract_wal_offset(&table)?;
+            tracing::debug!(wal_offset = ?offset, "Resolved WAL boundary offset");
+            offset
+        } else {
+            tracing::debug!("WAL query disabled, skipping WAL offset extraction");
+            None
+        };
 
         // 3. Build Iceberg scan plan (our reimplemented scan with metrics)
         let has_snapshot = table.metadata().current_snapshot().is_some();
@@ -141,8 +153,12 @@ impl TableProvider for IcegateTableProvider {
 
         // 4. Build WAL scan plan
         // Start from offset + 1 (or 0 if no offset found = fresh system)
-        let wal_start = wal_offset.map_or(0, |o| o.saturating_add(1));
-        let wal_plan = self.build_wal_plan(state, projection, filters, wal_start).await?;
+        let wal_plan = if wal_enabled {
+            let wal_start = wal_offset.map_or(0, |o| o.saturating_add(1));
+            self.build_wal_plan(state, projection, filters, wal_start).await?
+        } else {
+            None
+        };
         if wal_plan.is_some() {
             tracing::debug!("WAL scan plan created");
         } else {
@@ -192,6 +208,11 @@ impl IcegateTableProvider {
         filters: &[Expr],
         start_offset: u64,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        if !self.wal_config.enabled {
+            tracing::debug!("WAL query disabled, skipping WAL scan");
+            return Ok(None);
+        }
+
         // List WAL segments via the shared reader
         let files = self.list_wal_files(start_offset).await?;
         if files.is_empty() {
@@ -231,13 +252,15 @@ impl IcegateTableProvider {
             }
         };
 
-        // Build ParquetSource with predicate pushdown
+        // Build ParquetSource with predicate pushdown and metadata size hint
         let mut parquet_source = ParquetSource::new(self.schema.clone());
         if let Some(pred) = physical_predicate {
             parquet_source = parquet_source.with_predicate(pred);
         }
+        if let Some(hint) = self.wal_config.metadata_size_hint {
+            parquet_source = parquet_source.with_metadata_size_hint(hint);
+        }
         // TODO(low): Add reverse order to optimize ORDER BY time desc
-        // TODO(medium):: metadata_size_hint
 
         // Build file scan config
         let wal_url = ObjectStoreUrl::parse(WAL_STORE_URL)

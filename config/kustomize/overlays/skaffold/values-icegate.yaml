@@ -35,6 +35,8 @@ queue:
 query:
   enabled: true
   replicaCount: 1
+  engine:
+    walQueryEnabled: true
   cache:
     enabled: true
     memorySizeMb: 1024
@@ -44,7 +46,7 @@ query:
     ## emptyDir sizeLimit for the disk cache volume
     volumeSizeLimit: 5Gi
     prefetch:
-      enabled: true
+      enabled: false
   waitForDependencies:
     enabled: true
     endpoints:

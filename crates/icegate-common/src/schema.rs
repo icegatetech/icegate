@@ -978,17 +978,50 @@ pub fn metrics_sort_order(schema: &Schema) -> Result<SortOrder> {
     Ok(sort_order)
 }
 
+// ── Log table column name constants ──────────────────────────────────
+
+/// Multi-tenancy partition column.
+pub const COL_TENANT_ID: &str = "tenant_id";
+/// Primary event timestamp (microsecond precision).
+pub const COL_TIMESTAMP: &str = "timestamp";
+/// Log message body.
+pub const COL_BODY: &str = "body";
+/// Merged `MAP<String, String>` of resource/scope/log attributes.
+pub const COL_ATTRIBUTES: &str = "attributes";
+/// `OpenTelemetry` severity text (e.g. `"ERROR"`, `"INFO"`).
+pub const COL_SEVERITY_TEXT: &str = "severity_text";
+/// Service name extracted from resource attributes.
+pub const COL_SERVICE_NAME: &str = "service_name";
+/// Cloud account identifier for multi-account tenancy.
+pub const COL_CLOUD_ACCOUNT_ID: &str = "cloud_account_id";
+/// W3C Trace Context trace identifier.
+pub const COL_TRACE_ID: &str = "trace_id";
+/// W3C Trace Context span identifier.
+pub const COL_SPAN_ID: &str = "span_id";
+/// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
+pub const LEVEL_ALIAS: &str = "level";
+
 /// Indexed attribute columns for log label extraction.
 ///
 /// These columns are extracted as top-level fields from log query results.
 /// Used by planner (for grouping) and handlers (for output).
 pub const LOG_INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &[
-    "cloud_account_id",
-    "service_name",
-    "trace_id",
-    "span_id",
-    "severity_text",
+    COL_CLOUD_ACCOUNT_ID,
+    COL_SERVICE_NAME,
+    COL_TRACE_ID,
+    COL_SPAN_ID,
+    COL_SEVERITY_TEXT,
 ];
+
+/// Indexed columns visible in label discovery and series identification.
+///
+/// Excludes high-cardinality columns (`trace_id`, `span_id`) that have
+/// per-request uniqueness — including them would explode the number of
+/// distinct series and make `/labels` output noisy. These columns are still
+/// readable via `/label_values` when explicitly requested.
+///
+/// Used by `/labels`, `/label_values` discovery, and `/series` endpoints.
+pub const LOG_SERIES_LABEL_COLUMNS: &[&str] = &[COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_SEVERITY_TEXT];
 
 #[cfg(test)]
 mod tests {

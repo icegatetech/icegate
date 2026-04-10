@@ -46,7 +46,7 @@ thiserror = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
-rand = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

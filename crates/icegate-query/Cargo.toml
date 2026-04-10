@@ -21,6 +21,7 @@ path = "src/main.rs"
 icegate-common = { workspace = true }
 icegate-queue = { workspace = true }
 parquet = { workspace = true }
+bytes = { workspace = true }
 
 # ANTLR parser
 antlr4rust = { workspace = true }
@@ -73,6 +74,7 @@ chrono = { workspace = true }
 
 # Utilities
 itoa = { workspace = true }
+tikv-jemallocator = { workspace = true }
 
 [[bench]]
 name = "loki_queries"
