@@ -8,17 +8,17 @@ namespace:
 catalog:
   backend: rest
   rest:
-    uri: http://nessie.infra:19120/iceberg
-  warehouse: "s3://icegatedogfooding/warehouse/"
+    uri: http://nessie.infra.svc.cluster.local.:19120/iceberg
+  warehouse: "s3://<S3_BUCKET>/warehouse/"
   properties:
     prefix: main
 
 ## Storage configuration
 storage:
   s3:
-    bucket: icegatedogfooding
+    bucket: <S3_BUCKET>
     region: eu-central
-    endpoint: https://hel1.your-objectstorage.com
+    endpoint: https://<S3_ENDPOINT>
 
 ## AWS credentials from existing Secret
 ## Secret keys: aws-access-key-id, aws-secret-access-key (per _helpers.tpl:152-162)
@@ -29,16 +29,26 @@ aws:
 ## Queue (WAL) configuration
 queue:
   common:
-    basePath: s3://icegatedogfooding/queue
+    basePath: s3://<S3_BUCKET>/queue
 
 ## Query component
 query:
   enabled: true
   replicaCount: 1
+  cache:
+    enabled: true
+    memorySizeMb: 1024
+    diskDir: /tmp/icegate/cache
+    diskSizeMb: 4096
+    statTtlSecs: 300
+    ## emptyDir sizeLimit for the disk cache volume
+    volumeSizeLimit: 5Gi
+    prefetch:
+      enabled: false
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra:19120/api/v2/config
+      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
   loki:
     enabled: true
     port: 3100
@@ -50,16 +60,16 @@ query:
     port: 3200
   tracing:
     enabled: true
-    otlpEndpoint: http://jaeger-collector.observability:4317
+    otlpEndpoint: http://jaeger-collector.observability.svc.cluster.local.:4317
     sampleRatio: 1.0
   rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
-      cpu: "1"
+      cpu: "2"
       memory: 2Gi
     limits:
-      cpu: "4"
-      memory: 4Gi
+      cpu: "2"
+      memory: 2Gi
 
 ## Ingest component
 ingest:
@@ -68,7 +78,7 @@ ingest:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra:19120/api/v2/config
+      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
   otlpHttp:
     enabled: true
     port: 4318
@@ -77,13 +87,13 @@ ingest:
     port: 4317
   tracing:
     enabled: true
-    otlpEndpoint: http://jaeger-collector.observability:4317
+    otlpEndpoint: http://jaeger-collector.observability.svc.cluster.local.:4317
     sampleRatio: 1.0
   shift:
     jobsmanager:
       storage:
-        endpoint: https://hel1.your-objectstorage.com
-        bucket: icegatedogfooding
+        endpoint: https://<S3_ENDPOINT>
+        bucket: <S3_BUCKET>
         prefix: jobs/shifter
         useSsl: true
         jobStateCodec: json
@@ -91,8 +101,8 @@ ingest:
   rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
-      cpu: 500m
-      memory: 1Gi
+      cpu: "2"
+      memory: 2Gi
     limits:
       cpu: "2"
       memory: 2Gi
@@ -111,4 +121,4 @@ migrate:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra:19120/api/v2/config
+      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config

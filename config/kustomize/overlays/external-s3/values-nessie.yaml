@@ -13,13 +13,13 @@ catalog:
     defaultWarehouse: warehouse
     warehouses:
       - name: warehouse
-        location: s3://icegatedogfooding/warehouse/
+        location: s3://<S3_BUCKET>/warehouse/
 
   storage:
     s3:
       defaultOptions:
         region: eu-central
-        endpoint: "https://hel1.your-objectstorage.com" # this endpoint has to be acceptable to icegate services.
+        endpoint: "https://<S3_ENDPOINT>" # this endpoint has to be acceptable to icegate services.
         pathStyleAccess: true
         authType: STATIC
         accessKeySecret:

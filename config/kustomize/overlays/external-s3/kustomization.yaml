@@ -19,7 +19,7 @@ helmCharts:
 
   - name: icegate
     repo: oci://ghcr.io/icegatetech/charts
-    version: 0.1.0-rc3
+    version: 0.1.0
     releaseName: icegate
     namespace: icegate
     valuesFile: values-icegate.yaml
@@ -32,6 +32,9 @@ patches:
       kind: Service
     patch: |
       - op: add
+        path: /metadata/annotations
+        value: {}
+      - op: add
         path: /metadata/annotations/tailscale.com~1expose
         value: "true"
   # Tailscale expose → Ingest (icegate)
@@ -39,6 +42,9 @@ patches:
       name: icegate-ingest
       kind: Service
     patch: |
+      - op: add
+        path: /metadata/annotations
+        value: {}
       - op: add
         path: /metadata/annotations/tailscale.com~1expose
         value: "true"
