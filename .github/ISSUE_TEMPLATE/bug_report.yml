@@ -39,7 +39,7 @@ body:
     id: actual
     attributes:
       label: Actual Behavior
-      description: What actually happened. Include error messages, logs, or stack traces if available.
+      description: What actually happened. Include error messages, logs, or stack traces if available. Please remove or mask any secrets, tokens, keys, endpoints, or PII before submitting.
     validations:
       required: true
 
