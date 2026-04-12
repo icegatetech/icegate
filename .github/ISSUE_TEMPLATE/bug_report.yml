@@ -1,0 +1,93 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the sections below to help us reproduce and fix the issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Configure IceGate with ...
+        2. Send request to ...
+        3. Observe error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened. Include error messages, logs, or stack traces if available.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of IceGate is affected?
+      options:
+        - Query Engine
+        - Ingest (OTLP gRPC)
+        - Ingest (OTLP HTTP)
+        - Loki API
+        - Prometheus API
+        - Tempo API
+        - LogQL Parser/Planner
+        - Iceberg Catalog
+        - Storage (S3)
+        - Maintenance
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: IceGate Version
+      description: Output of the binary `--version` flag or commit SHA.
+      placeholder: "e.g., 0.1.0 or commit abc1234"
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Any relevant environment details.
+      placeholder: |
+        - OS: Linux x86_64
+        - Rust: 1.78
+        - Deployment: Docker / Kubernetes / Local
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other context, screenshots, or configuration snippets.
+    validations:
+      required: false
