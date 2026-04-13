@@ -1,34 +1,26 @@
-# syntax=docker/dockerfile:1.7
-FROM rust:bookworm AS builder
+FROM rust:bookworm AS chef
+RUN cargo install cargo-chef
 WORKDIR /app
 
-ARG PROFILE=release
-ARG BINARY
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY ./crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
 
+FROM chef AS builder
+ARG PROFILE=release
+COPY --from=planner /app/recipe.json recipe.json
+ENV RUSTFLAGS="--cfg tokio_unstable"
+RUN cargo chef cook $([ "$PROFILE" = "release" ] && echo "--release") --recipe-path recipe.json
 COPY ./crates ./crates
 COPY Cargo.toml Cargo.lock ./
-
-ENV RUSTFLAGS="--cfg tokio_unstable"
-ENV CARGO_TARGET_DIR=/app/target
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git/db \
-    --mount=type=cache,target=/usr/local/cargo/git/checkouts \
-    --mount=type=cache,target=/app/target \
-    test -n "${BINARY}" && \
-    cargo build \
-      $([ "$PROFILE" = "release" ] && echo "--release") \
-      --bin "${BINARY}" && \
-    case "${PROFILE}" in \
-      release) CARGO_PROFILE_DIR=release ;; \
-      *) CARGO_PROFILE_DIR=debug ;; \
-    esac && \
-    mkdir -p /app/output && \
-    cp /app/target/${CARGO_PROFILE_DIR}/${BINARY} /app/output/${BINARY}
+RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") --workspace --bins
 
 FROM debian:bookworm-slim
-ARG BINARY
+ARG PROFILE=release
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN test -n "$BINARY" || { echo "ERROR: BINARY build-arg is required"; exit 1; }
-COPY --from=builder /app/output/${BINARY} /usr/local/bin/${BINARY}
+COPY --from=builder /app/target/${PROFILE}/query    /usr/local/bin/query
+COPY --from=builder /app/target/${PROFILE}/ingest   /usr/local/bin/ingest
+COPY --from=builder /app/target/${PROFILE}/maintain  /usr/local/bin/maintain
 USER nobody
 ENTRYPOINT ["/bin/sh", "-c", "exec \"$@\"", "--"]

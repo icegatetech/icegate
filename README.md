@@ -76,9 +76,14 @@ The system consists of five core components for handling observability data (met
    cd icegate
    ```
 
-2. Start the core services:
+2.a Start the core services in docker compose:
    ```bash
-   make run-monitoring-release
+   make run-core-release
+   ```
+
+2.b Start the core services in Kubernetes on Orbstack (Mac):
+   ```bash
+   kustomize  build --enable-helm config/kustomize/overlays/orbstack | kubectl apply --server-side --force-conflicts -f -
    ```
 
    This command builds and runs all core services in Docker containers. The first run will take a few minutes to build the images and start all services.
