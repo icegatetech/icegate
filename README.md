@@ -78,12 +78,12 @@ The system consists of five core components for handling observability data (met
 
 2.a Start the core services in docker compose:
    ```bash
-   make run-core-release
+   make run-docker-core-release
    ```
 
 2.b Start the core services in Kubernetes on Orbstack (Mac):
    ```bash
-   kustomize  build --enable-helm config/kustomize/overlays/orbstack | kubectl apply --server-side --force-conflicts -f -
+   make run-kubernetes-core-release
    ```
 
    This command builds and runs all core services in Docker containers. The first run will take a few minutes to build the images and start all services.
@@ -116,13 +116,13 @@ Run with additional services for testing and monitoring:
 
 ```bash
 # Include load generator for testing
-make run-load-release
+make run-docker-load-release
 
 # Pure runtime services
-make run-core-release
+make run-docker-core-release
 
 # Include analytics tools (Trino SQL query engine at http://localhost:8082)
-make run-analytics-release
+make run-docker-analytics-release
 ```
 
 ### Next Steps

@@ -1,17 +1,24 @@
 .PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench down \
        helm-lint helm-template
 
-run-core-release:
+run-docker-core-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml up --build
 
-run-load-release:
+# Run core services with otlp ingestion via otelgen
+run-docker-load-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile load up --build
 
-run-monitoring-release:
+# Run core services with monitoring
+run-docker-monitoring-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile monitoring up --build --force-recreate
 
-run-analytics-release:
+# Run core services with Trino
+run-docker-analytics-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile analytics up --build
+
+run-kubernetes-core-release:
+	kustomize  build --enable-helm config/kustomize/overlays/orbstack | kubectl apply --server-side --force-conflicts -f - || true
+	kustomize  build --enable-helm config/kustomize/overlays/orbstack | kubectl apply --server-side --force-conflicts -f -
 
 dev:
 	PROFILE=debug docker build --build-arg PROFILE=debug -f config/docker/Dockerfile .
