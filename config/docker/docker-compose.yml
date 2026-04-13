@@ -107,8 +107,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4g
-          cpus: 4
+          memory: 2g
+          cpus: 2
     ports:
       - "3100:3100"
       - "9090:9090"
