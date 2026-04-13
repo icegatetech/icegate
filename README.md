@@ -63,12 +63,14 @@ The system consists of five core components for handling observability data (met
 
 ## Getting Started
 
-### Prerequisites
+### Docker compose
+
+#### Prerequisites
 
 - **Docker** and **Docker Compose** - for running the application
 - **Git** - for cloning the repository
 
-### Quick Start
+#### Quick Start
 
 1. Clone the repository:
    ```bash
@@ -76,12 +78,34 @@ The system consists of five core components for handling observability data (met
    cd icegate
    ```
 
-2. Start the core services:
+2. Start the core services in docker compose:
    ```bash
-   make run-monitoring-release
+   make run-docker-core-release
    ```
 
    This command builds and runs all core services in Docker containers. The first run will take a few minutes to build the images and start all services.
+
+### Kubernetes
+
+#### Prerequisites
+
+- **Orbstack**, **kubectl** and **Kustomize** - for running the application
+- **Git** - for cloning the repository
+
+#### Quick Start
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/icegatetech/icegate.git
+   cd icegate
+   ```
+
+2. Start the core services in Kubernetes on Orbstack (Mac):
+   ```bash
+   make run-kubernetes-core-release
+   ```
+
+This command builds and runs all core services in Kubernetes. The first run will take a few minutes to build the images and start all services.
 
 ### Available Services
 
@@ -111,13 +135,13 @@ Run with additional services for testing and monitoring:
 
 ```bash
 # Include load generator for testing
-make run-load-release
+make run-docker-load-release
 
 # Pure runtime services
-make run-core-release
+make run-docker-core-release
 
 # Include analytics tools (Trino SQL query engine at http://localhost:8082)
-make run-analytics-release
+make run-docker-analytics-release
 ```
 
 ### Next Steps
