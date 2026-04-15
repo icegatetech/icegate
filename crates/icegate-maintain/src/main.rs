@@ -9,8 +9,10 @@ use icegate_maintain::cli::Cli;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing subscriber for logging
+    // Initialize tracing subscriber for logging (JSON format for structured log collection)
     tracing_subscriber::fmt()
+        .json()
+        .with_span_list(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),

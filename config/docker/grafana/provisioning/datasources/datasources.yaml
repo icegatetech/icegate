@@ -19,3 +19,13 @@ datasources:
     url: http://jaeger:16686
     isDefault: false
     editable: false
+  - name: Loki (demo)
+    type: loki
+    access: proxy
+    url: http://query:3100
+    isDefault: false
+    editable: false
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+    secureJsonData:
+      httpHeaderValue1: demo

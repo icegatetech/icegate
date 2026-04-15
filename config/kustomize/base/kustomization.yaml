@@ -12,6 +12,7 @@ configMapGenerator:
 resources:
   - namespace-infra.yaml
   - namespace-observability.yaml
+  - otel-collector
 
 helmCharts:
   - name: kube-prometheus-stack
