@@ -190,9 +190,10 @@ services:
       - "8006:8006"
     volumes:
       - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
-    depends_on:
-      ingest:
-        condition: service_healthy
+    # No depends_on: ingest — collector must bind port 8006 immediately so
+    # short-lived services (minio-init, nessie-init, migrate) can send startup
+    # logs. Retry and queue settings in config.yaml handle ingest unavailability.
+    #
     # Use default json-file logging driver to avoid circular dependency
     # (collector cannot forward its own logs to itself).
     logging:

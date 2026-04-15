@@ -78,6 +78,14 @@ exporters:
     compression: none
     headers:
       X-Scope-OrgID: demo
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      queue_size: 1000
 
 service:
   pipelines:

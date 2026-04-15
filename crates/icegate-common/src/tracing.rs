@@ -217,7 +217,13 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
 
     // Initialize tracing subscriber with OpenTelemetry layer
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().json().with_span_list(false).with_thread_ids(true).with_thread_names(true))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_span_list(false)
+                .with_thread_ids(true)
+                .with_thread_names(true),
+        )
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
