@@ -14,7 +14,9 @@ use super::{
     SegmentToRead, ShiftInput, ShiftOutput,
     executor::{TaskStatus, parse_task_input},
     iceberg_storage::Storage,
-    row_groups_merger::{RowGroupsMerger, SortedBatchMergerConfig},
+    row_groups_merger::{
+        NoopRowGroupsMergerObserver, RowGroupsMerger, RowGroupsMergerObserver, SortedBatchMergerConfig,
+    },
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -106,6 +108,7 @@ pub struct ShiftTaskRunnerImpl<Q, S> {
     output_batch_size: usize,
     segment_read_parallelism: usize,
     retrier: Retrier,
+    row_groups_merger_observer: Arc<dyn RowGroupsMergerObserver>,
 }
 
 impl<Q, S> ShiftTaskRunnerImpl<Q, S>
@@ -139,6 +142,7 @@ where
             output_batch_size,
             segment_read_parallelism: Self::DEFAULT_SEGMENT_READ_PARALLELISM,
             retrier: Retrier::new(RetrierConfig::default()),
+            row_groups_merger_observer: Arc::new(NoopRowGroupsMergerObserver),
         })
     }
 
@@ -158,6 +162,13 @@ where
         }
         self.segment_read_parallelism = segment_read_parallelism;
         Ok(self)
+    }
+
+    /// Set merger observer for row group lifecycle and merge timing.
+    #[must_use]
+    pub fn with_row_groups_merger_observer(mut self, observer: Arc<dyn RowGroupsMergerObserver>) -> Self {
+        self.row_groups_merger_observer = observer;
+        self
     }
 }
 
@@ -312,7 +323,7 @@ where
         segments: &[SegmentToRead],
         cancel_token: &CancellationToken,
     ) -> Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError> {
-        let mut merger = RowGroupsMerger::try_new_from_segments(
+        let mut merger = RowGroupsMerger::new(
             Arc::clone(&self.queue_reader),
             segments,
             SortedBatchMergerConfig {
@@ -322,7 +333,8 @@ where
                 cancel_token: cancel_token.clone(),
             },
         )
-        .map_err(ShiftWriteError::queue_read)?;
+        .map_err(ShiftWriteError::queue_read)?
+        .with_observer(Arc::clone(&self.row_groups_merger_observer));
         merger.prefetch_first_group().await.map_err(ShiftWriteError::queue_read)?;
         let merged_stream = merger.into_stream();
         self.storage
