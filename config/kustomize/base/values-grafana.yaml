@@ -19,7 +19,7 @@ datasources:
         type: loki
         access: proxy
         url: http://icegate-query.icegate.svc.cluster.local.:3100
-        isDefault: true
+        isDefault: false
         editable: false
       - name: Tempo
         type: tempo
@@ -39,6 +39,16 @@ datasources:
         url: http://prometheus-kube-prometheus-prometheus.observability.svc.cluster.local.:9090
         isDefault: false
         editable: false
+      - name: Loki (demo)
+        type: loki
+        access: proxy
+        url: http://icegate-query.icegate.svc.cluster.local.:3100
+        isDefault: true
+        editable: false
+        jsonData:
+          httpHeaderName1: X-Scope-OrgID
+        secureJsonData:
+          httpHeaderValue1: demo
 
 dashboardProviders:
   dashboardproviders.yaml:

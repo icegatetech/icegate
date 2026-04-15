@@ -5,17 +5,16 @@
 #![allow(clippy::print_stderr)]
 
 use clap::Parser;
+use icegate_common::{TracingConfig, init_tracing};
 use icegate_maintain::cli::Cli;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing subscriber for logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Initialize tracing via the shared initializer (JSON format, no OTEL export)
+    let _guard = init_tracing(&TracingConfig {
+        enabled: false,
+        ..TracingConfig::default()
+    })?;
 
     // Parse CLI arguments
     let cli = Cli::parse();

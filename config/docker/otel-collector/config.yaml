@@ -1,0 +1,95 @@
+# OTEL Collector pipeline for Docker Compose demo log source.
+# Receives logs from Docker's fluentd logging driver, enriches with
+# service.name and static attributes, exports to IceGate Ingest
+# under the "demo" tenant.
+#
+# NOTE: The K8s config uses stanza operators inside the file_log receiver
+# for JSON parsing. The fluentforward receiver does not support stanza
+# operators, so we use the OTTL transform processor instead.
+# The parsing logic mirrors the K8s operator chain:
+#   json_parser → severity_parser → extract message/target → cleanup.
+
+receivers:
+  fluentforward:
+    endpoint: 0.0.0.0:8006
+
+processors:
+  # Extract service.name from fluent.tag attribute.
+  # Docker fluentd driver tag format: "docker.icegate-<service>-<replica>"
+  # (project name "icegate" comes from docker-compose.yml `name:` field).
+  transform/service_name:
+    log_statements:
+      - context: log
+        statements:
+          - set(resource.attributes["service.name"], attributes["fluent.tag"])
+          - replace_pattern(resource.attributes["service.name"], "^docker\\.icegate-", "")
+          - replace_pattern(resource.attributes["service.name"], "-\\d+$", "")
+
+  # Parse JSON log bodies from Rust tracing-subscriber fmt().json().
+  # Equivalent to the K8s file_log stanza operator chain but using OTTL
+  # (fluentforward receiver does not support stanza operators).
+  # Non-JSON bodies pass through unchanged.
+  transform/parse_json:
+    log_statements:
+      - context: log
+        conditions:
+          - IsMatch(body, "^\\{")
+        statements:
+          # Parse JSON body into a map
+          - set(cache, ParseJSON(body))
+          # Set severity from level field (mirrors K8s severity_parser mapping)
+          - set(severity_text, cache["level"]) where cache["level"] != nil
+          - set(severity_number, SEVERITY_NUMBER_TRACE) where IsMatch(severity_text, "TRACE")
+          - set(severity_number, SEVERITY_NUMBER_DEBUG) where IsMatch(severity_text, "DEBUG")
+          - set(severity_number, SEVERITY_NUMBER_INFO) where IsMatch(severity_text, "INFO")
+          - set(severity_number, SEVERITY_NUMBER_WARN) where IsMatch(severity_text, "WARN")
+          - set(severity_number, SEVERITY_NUMBER_ERROR) where IsMatch(severity_text, "ERROR")
+          # Extract body from fields: use fields.message if non-empty,
+          # otherwise use the entire fields object (e.g. name, error keys).
+          - set(body, cache["fields"]["message"]) where cache["fields"]["message"] != nil and cache["fields"]["message"] != ""
+          - set(body, cache["fields"]) where cache["fields"]["message"] == nil or cache["fields"]["message"] == ""
+          # Move target to code.namespace (mirrors K8s: move target → code.namespace)
+          - set(attributes["code.namespace"], cache["target"]) where cache["target"] != nil
+          # Extract span name and topic from innermost span
+          - set(attributes["span_name"], cache["span"]["name"]) where cache["span"]["name"] != nil
+          - set(attributes["span_topic"], cache["span"]["topic"]) where cache["span"]["topic"] != nil
+          # Extract threadId
+          - set(attributes["threadId"], cache["threadId"]) where cache["threadId"] != nil
+          # Redundant fields (level, timestamp, fields) are not set on
+          # attributes because we read from cache, not from parsed attributes.
+
+  batch: {}
+
+  resource:
+    attributes:
+      - key: service.namespace
+        value: icegate
+        action: upsert
+      - key: deployment.environment
+        value: docker-compose
+        action: upsert
+      - key: demo.source
+        value: docker-compose
+        action: upsert
+
+exporters:
+  otlphttp:
+    endpoint: http://ingest:4318
+    compression: none
+    headers:
+      X-Scope-OrgID: demo
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+
+service:
+  pipelines:
+    logs:
+      receivers: [fluentforward]
+      processors: [transform/service_name, transform/parse_json, batch, resource]
+      exporters: [otlphttp]
