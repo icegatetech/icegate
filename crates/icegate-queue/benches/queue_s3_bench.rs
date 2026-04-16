@@ -5,11 +5,12 @@
 //! 2. Read performance (list segments, read single segment, plan segments)
 //! 3. End-to-end (write then read)
 //!
-//! A single MinIO container is shared across all benchmark groups to avoid
+//! A single `MinIO` container is shared across all benchmark groups to avoid
 //! repeated container startup overhead.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout, missing_docs)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{sync::Arc, time::Duration};
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -60,8 +61,11 @@ async fn write_batch(tx: &icegate_queue::WriteChannel, topic: &str, batch: arrow
     response_rx.await.expect("Failed to receive write result");
 }
 
-/// All queue benchmarks sharing a single MinIO container.
+/// All queue benchmarks sharing a single `MinIO` container.
 fn queue_benchmarks(c: &mut Criterion) {
+    /// Counter for unique e2e topic names across iterations.
+    static E2E_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // Single MinIO container for all benchmark groups
@@ -193,31 +197,32 @@ fn queue_benchmarks(c: &mut Criterion) {
         group.sample_size(10);
         group.measurement_time(Duration::from_secs(30));
 
-        // Benchmark 7: Write then read - write 5 batches, read back via plan+read
+        // Benchmark 7: Write then read - write 5 batches, read back via plan+read.
+        // Each iteration uses a unique topic to avoid accumulating segments
+        // across iterations, which would make later iterations progressively slower.
         group.bench_function("write_then_read", |b| {
             b.iter(|| {
+                let topic = format!("e2e_{}", E2E_COUNTER.fetch_add(1, Ordering::Relaxed));
                 rt.block_on(async {
                     // Write phase
                     let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
                     let batches = generate_batches_with_grouping(5, 100, 5);
                     for batch in batches {
-                        write_batch(&tx, "e2e", batch).await;
+                        write_batch(&tx, &topic, batch).await;
                     }
                     drop(tx);
                     writer_handle.await.unwrap().unwrap();
 
                     // Read phase
-                    let reader =
-                        ParquetQueueReader::new("queue".to_string(), Arc::clone(&store), 8192).unwrap();
+                    let reader = ParquetQueueReader::new("queue".to_string(), Arc::clone(&store), 8192).unwrap();
                     let cancel = CancellationToken::new();
-                    let topic_e2e = "e2e".to_string();
 
                     // List and read segments directly
-                    let segments = reader.list_segments(&topic_e2e, 0, &cancel).await.unwrap();
+                    let segments = reader.list_segments(&topic, 0, &cancel).await.unwrap();
                     for segment in segments {
                         // Read first row group from each segment
                         let _ = reader
-                            .read_segment(&topic_e2e, segment.id.offset, &[0], &cancel)
+                            .read_segment(&topic, segment.id.offset, &[0], &cancel)
                             .await
                             .unwrap()
                             .try_collect::<Vec<_>>()

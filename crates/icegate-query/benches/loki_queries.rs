@@ -5,8 +5,10 @@
 //! 2. Range aggregations (`count_over_time`, rate, unwrap operations)
 //! 3. Vector aggregations (sum, avg with grouping)
 //!
-//! A single TestServer is shared across all benchmark groups, with all data
+//! A single `TestServer` is shared across all benchmark groups, with all data
 //! variants written once during setup to avoid repeated server startup overhead.
+//! Each dataset is tagged with a `dataset` attribute so queries only hit the
+//! intended 500-row corpus.
 
 #![allow(
     clippy::unwrap_used,
@@ -26,10 +28,11 @@ use common::harness::{
     TestServer, write_benchmark_logs, write_benchmark_logs_with_numeric_attrs, write_benchmark_logs_with_varied_labels,
 };
 
-/// All Loki query benchmarks sharing a single TestServer.
+/// All Loki query benchmarks sharing a single `TestServer`.
 ///
 /// Writing all data variants once and reusing the server across groups avoids
 /// 3 extra server startups + data writes, saving ~30-60 seconds.
+#[allow(clippy::too_many_lines)]
 fn loki_benchmarks(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -44,13 +47,15 @@ fn loki_benchmarks(c: &mut Criterion) {
     });
 
     rt.block_on(async {
-        // Write all data variants to the same table
+        // Write all data variants to the same table.
+        // Each helper tags rows with dataset="baseline"/"numeric"/"varied"
+        // so queries only hit the intended 500-row corpus.
         write_benchmark_logs(&table, &catalog, 500).await.unwrap();
         write_benchmark_logs_with_numeric_attrs(&table, &catalog, 500).await.unwrap();
         write_benchmark_logs_with_varied_labels(&table, &catalog, 500).await.unwrap();
     });
 
-    // --- Group 1: Log Stream Queries ---
+    // --- Group 1: Log Stream Queries (dataset=baseline) ---
     {
         let mut group = c.benchmark_group("log_stream_queries");
         group.sample_size(10);
@@ -63,7 +68,7 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .client
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
-                        .query(&[("query", "{service_name=\"api\"}")])
+                        .query(&[("query", "{service_name=\"api\", dataset=\"baseline\"}")])
                         .send()
                         .await
                         .unwrap();
@@ -79,7 +84,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .client
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
-                        .query(&[("query", "{service_name=\"api\", severity_text!=\"ERROR\"}")])
+                        .query(&[(
+                            "query",
+                            "{service_name=\"api\", dataset=\"baseline\", severity_text!=\"ERROR\"}",
+                        )])
                         .send()
                         .await
                         .unwrap();
@@ -95,7 +103,7 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .client
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
-                        .query(&[("query", "{env=\"prod\"}")])
+                        .query(&[("query", "{dataset=\"baseline\", env=\"prod\"}")])
                         .send()
                         .await
                         .unwrap();
@@ -111,7 +119,7 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .client
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
-                        .query(&[("query", "{service_name=\"api\"} |= \"processed\"")])
+                        .query(&[("query", "{service_name=\"api\", dataset=\"baseline\"} |= \"processed\"")])
                         .send()
                         .await
                         .unwrap();
@@ -127,7 +135,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .client
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
-                        .query(&[("query", "{service_name=\"api\"} |~ \"processed.*\"")])
+                        .query(&[(
+                            "query",
+                            "{service_name=\"api\", dataset=\"baseline\"} |~ \"processed.*\"",
+                        )])
                         .send()
                         .await
                         .unwrap();
@@ -138,7 +149,7 @@ fn loki_benchmarks(c: &mut Criterion) {
         drop(group);
     }
 
-    // --- Group 2: Range Aggregations ---
+    // --- Group 2: Range Aggregations (dataset=baseline) ---
     {
         let mut group = c.benchmark_group("range_aggregations");
         group.sample_size(10);
@@ -153,7 +164,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
                         .query(&[
-                            ("query", "count_over_time({service_name=\"api\"}[5m])"),
+                            (
+                                "query",
+                                "count_over_time({service_name=\"api\", dataset=\"baseline\"}[5m])",
+                            ),
                             ("step", "60s"),
                         ])
                         .send()
@@ -171,7 +185,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .client
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
-                        .query(&[("query", "rate({service_name=\"api\"}[5m])"), ("step", "60s")])
+                        .query(&[
+                            ("query", "rate({service_name=\"api\", dataset=\"baseline\"}[5m])"),
+                            ("step", "60s"),
+                        ])
                         .send()
                         .await
                         .unwrap();
@@ -188,7 +205,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
                         .query(&[
-                            ("query", "bytes_over_time({service_name=\"api\"}[5m])"),
+                            (
+                                "query",
+                                "bytes_over_time({service_name=\"api\", dataset=\"baseline\"}[5m])",
+                            ),
                             ("step", "60s"),
                         ])
                         .send()
@@ -201,7 +221,7 @@ fn loki_benchmarks(c: &mut Criterion) {
         drop(group);
     }
 
-    // --- Group 3: Range Aggregations with Unwrap ---
+    // --- Group 3: Range Aggregations with Unwrap (dataset=numeric) ---
     {
         let mut group = c.benchmark_group("range_aggregations_unwrap");
         group.sample_size(10);
@@ -218,7 +238,7 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .query(&[
                             (
                                 "query",
-                                "sum_over_time({service_name=\"api\"} | unwrap request_time [5m])",
+                                "sum_over_time({service_name=\"api\", dataset=\"numeric\"} | unwrap request_time [5m])",
                             ),
                             ("step", "60s"),
                         ])
@@ -238,7 +258,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
                         .query(&[
-                            ("query", "avg_over_time({service_name=\"api\"} | unwrap latency [5m])"),
+                            (
+                                "query",
+                                "avg_over_time({service_name=\"api\", dataset=\"numeric\"} | unwrap latency [5m])",
+                            ),
                             ("step", "60s"),
                         ])
                         .send()
@@ -259,7 +282,7 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .query(&[
                             (
                                 "query",
-                                "quantile_over_time(0.95, {service_name=\"api\"} | unwrap latency [5m])",
+                                "quantile_over_time(0.95, {service_name=\"api\", dataset=\"numeric\"} | unwrap latency [5m])",
                             ),
                             ("step", "60s"),
                         ])
@@ -273,7 +296,7 @@ fn loki_benchmarks(c: &mut Criterion) {
         drop(group);
     }
 
-    // --- Group 4: Vector Aggregations ---
+    // --- Group 4: Vector Aggregations (dataset=varied) ---
     {
         let mut group = c.benchmark_group("vector_aggregations");
         group.sample_size(10);
@@ -287,7 +310,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .client
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
-                        .query(&[("query", "sum(rate({service_name=\"api\"}[5m]))"), ("step", "60s")])
+                        .query(&[
+                            ("query", "sum(rate({service_name=\"api\", dataset=\"varied\"}[5m]))"),
+                            ("step", "60s"),
+                        ])
                         .send()
                         .await
                         .unwrap();
@@ -304,7 +330,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
                         .query(&[
-                            ("query", "sum by (pod) (rate({service_name=\"api\"}[5m]))"),
+                            (
+                                "query",
+                                "sum by (pod) (rate({service_name=\"api\", dataset=\"varied\"}[5m]))",
+                            ),
                             ("step", "60s"),
                         ])
                         .send()
@@ -325,7 +354,7 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .query(&[
                             (
                                 "query",
-                                "avg by (namespace, pod) (count_over_time({service_name=\"api\"}[5m]))",
+                                "avg by (namespace, pod) (count_over_time({service_name=\"api\", dataset=\"varied\"}[5m]))",
                             ),
                             ("step", "60s"),
                         ])
@@ -345,7 +374,10 @@ fn loki_benchmarks(c: &mut Criterion) {
                         .get(format!("{}/loki/api/v1/query_range", server.base_url))
                         .header("X-Scope-OrgID", "test-tenant")
                         .query(&[
-                            ("query", "sum without (pod) (rate({service_name=\"api\"}[5m]))"),
+                            (
+                                "query",
+                                "sum without (pod) (rate({service_name=\"api\", dataset=\"varied\"}[5m]))",
+                            ),
                             ("step", "60s"),
                         ])
                         .send()
