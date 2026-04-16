@@ -2,9 +2,11 @@
 //!
 //! Benchmarks cover:
 //! 1. Write performance (small batches, large batches, concurrent topics)
-//! 2. Write performance with multi-tenant batches
-//! 3. Read performance (list segments, read single segment, plan segments)
-//! 4. End-to-end (write then read)
+//! 2. Read performance (list segments, read single segment, plan segments)
+//! 3. End-to-end (write then read)
+//!
+//! A single MinIO container is shared across all benchmark groups to avoid
+//! repeated container startup overhead.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout, missing_docs)]
 
@@ -58,199 +60,182 @@ async fn write_batch(tx: &icegate_queue::WriteChannel, topic: &str, batch: arrow
     response_rx.await.expect("Failed to receive write result");
 }
 
-/// Benchmark Group 1: Write Performance
-fn write_performance(c: &mut Criterion) {
-    let mut group = c.benchmark_group("write_performance");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(400));
-
+/// All queue benchmarks sharing a single MinIO container.
+fn queue_benchmarks(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Setup: Shared MinIO for all benchmarks in this group
-    let (minio, store) = rt.block_on(async { setup_minio_and_bucket("write-perf").await });
+    // Single MinIO container for all benchmark groups
+    let (minio, store) = rt.block_on(async { setup_minio_and_bucket("bench").await });
 
-    // Benchmark 1: Small batches - 10 batches × 100 records
-    group.bench_function("small_batches", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
-                let batches = generate_batches_for_throughput(10, 100);
-                for batch in batches {
-                    write_batch(&tx, "small", batch).await;
-                }
-                drop(tx);
-                writer_handle.await.unwrap().unwrap();
+    // --- Group 1: Write Performance ---
+    {
+        let mut group = c.benchmark_group("write_performance");
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(30));
+
+        // Benchmark 1: Small batches - 10 batches x 100 records
+        group.bench_function("small_batches", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+                    let batches = generate_batches_for_throughput(10, 100);
+                    for batch in batches {
+                        write_batch(&tx, "small", batch).await;
+                    }
+                    drop(tx);
+                    writer_handle.await.unwrap().unwrap();
+                });
             });
         });
-    });
 
-    // Benchmark 2: Large batches - 10 batches × 10,000 records
-    group.bench_function("large_batches", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
-                let batches = generate_batches_for_throughput(10, 10_000);
-                for batch in batches {
-                    write_batch(&tx, "large", batch).await;
-                }
-                drop(tx);
-                writer_handle.await.unwrap().unwrap();
+        // Benchmark 2: Large batches - 10 batches x 10,000 records
+        group.bench_function("large_batches", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+                    let batches = generate_batches_for_throughput(10, 10_000);
+                    for batch in batches {
+                        write_batch(&tx, "large", batch).await;
+                    }
+                    drop(tx);
+                    writer_handle.await.unwrap().unwrap();
+                });
             });
         });
-    });
 
-    // Benchmark 3: Concurrent topics - 3 topics in parallel
-    group.bench_function("concurrent_topics", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
-                let batches_topic1 = generate_batches_for_throughput(10, 100);
-                let batches_topic2 = generate_batches_for_throughput(10, 100);
-                let batches_topic3 = generate_batches_for_throughput(10, 100);
+        // Benchmark 3: Concurrent topics - 3 topics in parallel
+        group.bench_function("concurrent_topics", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+                    let batches_topic1 = generate_batches_for_throughput(10, 100);
+                    let batches_topic2 = generate_batches_for_throughput(10, 100);
+                    let batches_topic3 = generate_batches_for_throughput(10, 100);
 
-                // Interleave writes from 3 topics
-                for i in 0..10 {
-                    write_batch(&tx, "topic1", batches_topic1[i].clone()).await;
-                    write_batch(&tx, "topic2", batches_topic2[i].clone()).await;
-                    write_batch(&tx, "topic3", batches_topic3[i].clone()).await;
-                }
-                drop(tx);
-                writer_handle.await.unwrap().unwrap();
+                    // Interleave writes from 3 topics
+                    for i in 0..10 {
+                        write_batch(&tx, "topic1", batches_topic1[i].clone()).await;
+                        write_batch(&tx, "topic2", batches_topic2[i].clone()).await;
+                        write_batch(&tx, "topic3", batches_topic3[i].clone()).await;
+                    }
+                    drop(tx);
+                    writer_handle.await.unwrap().unwrap();
+                });
             });
         });
-    });
 
-    drop(group);
-    // Explicitly drop MinIO within the runtime context
-    rt.block_on(async {
-        drop(minio);
-    });
-}
+        drop(group);
+    }
 
-/// Benchmark Group 2: Read Performance
-fn read_performance(c: &mut Criterion) {
-    let mut group = c.benchmark_group("read_performance");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(110));
+    // --- Group 2: Read Performance ---
+    {
+        // Pre-write segments for read benchmarks
+        rt.block_on(async {
+            let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+            let batches = generate_batches_for_throughput(10, 100);
+            for batch in batches {
+                write_batch(&tx, "reads", batch).await;
+            }
+            drop(tx);
+            writer_handle.await.unwrap().unwrap();
+        });
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
+        let reader = ParquetQueueReader::new("queue".to_string(), Arc::clone(&store), 8192).unwrap();
+        let topic = "reads".to_string();
 
-    // Setup: Create MinIO and pre-write segments
-    let (minio, store) = rt.block_on(async {
-        let (minio, store) = setup_minio_and_bucket("read-perf").await;
-        let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+        let mut group = c.benchmark_group("read_performance");
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(15));
 
-        // Pre-write 10 segments for listing test (without grouping)
-        let batches = generate_batches_for_throughput(10, 100);
-        for batch in batches {
-            write_batch(&tx, "reads", batch).await;
-        }
-        drop(tx);
-        writer_handle.await.unwrap().unwrap();
-
-        (minio, store)
-    });
-
-    let reader = ParquetQueueReader::new("queue".to_string(), Arc::clone(&store), 8192).unwrap();
-    let topic = "reads".to_string();
-
-    // Benchmark 6: List segments - list 10 pre-written segments
-    group.bench_function("list_segments", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let cancel = CancellationToken::new();
-                let _ = reader.list_segments(&topic, 0, &cancel).await.unwrap();
+        // Benchmark 4: List segments
+        group.bench_function("list_segments", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let cancel = CancellationToken::new();
+                    let _ = reader.list_segments(&topic, 0, &cancel).await.unwrap();
+                });
             });
         });
-    });
 
-    // Benchmark 7: Read single segment - read 1 segment with row groups
-    group.bench_function("read_single_segment", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let cancel = CancellationToken::new();
-                // Read row group 0 from segment 0
-                let _ = reader
-                    .read_segment(&topic, 0, &[0], &cancel)
-                    .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap();
-            });
-        });
-    });
-
-    // Benchmark 8: List and count segments
-    group.bench_function("list_segments_count", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let cancel = CancellationToken::new();
-                // Note: Planning without grouping since pre-written data isn't grouped
-                let segments = reader.list_segments(&topic, 0, &cancel).await.unwrap();
-                let _ = segments.len();
-            });
-        });
-    });
-
-    drop(group);
-    // Explicitly drop MinIO within the runtime context
-    rt.block_on(async {
-        drop(minio);
-    });
-}
-
-/// Benchmark Group 4: End-to-End
-fn end_to_end(c: &mut Criterion) {
-    let mut group = c.benchmark_group("end_to_end");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(120));
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    // Setup: Shared MinIO for all benchmarks in this group
-    let (minio, store) = rt.block_on(async { setup_minio_and_bucket("e2e").await });
-
-    // Benchmark 9: Write then read - write 5 batches, read back via plan+read
-    group.bench_function("write_then_read", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                // Write phase
-                let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
-                let batches = generate_batches_with_grouping(5, 100, 5);
-                for batch in batches {
-                    write_batch(&tx, "e2e", batch).await;
-                }
-                drop(tx);
-                writer_handle.await.unwrap().unwrap();
-
-                // Read phase
-                let reader = ParquetQueueReader::new("queue".to_string(), Arc::clone(&store), 8192).unwrap();
-                let cancel = CancellationToken::new();
-                let topic_e2e = "e2e".to_string();
-
-                // List and read segments directly
-                let segments = reader.list_segments(&topic_e2e, 0, &cancel).await.unwrap();
-                for segment in segments {
-                    // Read first row group from each segment
+        // Benchmark 5: Read single segment
+        group.bench_function("read_single_segment", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let cancel = CancellationToken::new();
                     let _ = reader
-                        .read_segment(&topic_e2e, segment.id.offset, &[0], &cancel)
+                        .read_segment(&topic, 0, &[0], &cancel)
                         .await
                         .unwrap()
                         .try_collect::<Vec<_>>()
                         .await
                         .unwrap();
-                }
+                });
             });
         });
-    });
 
-    drop(group);
-    // Explicitly drop MinIO within the runtime context
+        // Benchmark 6: List and count segments
+        group.bench_function("list_segments_count", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let cancel = CancellationToken::new();
+                    let segments = reader.list_segments(&topic, 0, &cancel).await.unwrap();
+                    let _ = segments.len();
+                });
+            });
+        });
+
+        drop(group);
+    }
+
+    // --- Group 3: End-to-End ---
+    {
+        let mut group = c.benchmark_group("end_to_end");
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(30));
+
+        // Benchmark 7: Write then read - write 5 batches, read back via plan+read
+        group.bench_function("write_then_read", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    // Write phase
+                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+                    let batches = generate_batches_with_grouping(5, 100, 5);
+                    for batch in batches {
+                        write_batch(&tx, "e2e", batch).await;
+                    }
+                    drop(tx);
+                    writer_handle.await.unwrap().unwrap();
+
+                    // Read phase
+                    let reader =
+                        ParquetQueueReader::new("queue".to_string(), Arc::clone(&store), 8192).unwrap();
+                    let cancel = CancellationToken::new();
+                    let topic_e2e = "e2e".to_string();
+
+                    // List and read segments directly
+                    let segments = reader.list_segments(&topic_e2e, 0, &cancel).await.unwrap();
+                    for segment in segments {
+                        // Read first row group from each segment
+                        let _ = reader
+                            .read_segment(&topic_e2e, segment.id.offset, &[0], &cancel)
+                            .await
+                            .unwrap()
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap();
+                    }
+                });
+            });
+        });
+
+        drop(group);
+    }
+
+    // Cleanup: drop MinIO within the runtime context
     rt.block_on(async {
         drop(minio);
     });
 }
 
-criterion_group!(benches, write_performance, read_performance, end_to_end);
+criterion_group!(benches, queue_benchmarks);
 criterion_main!(benches);
