@@ -121,7 +121,7 @@ impl IceGateStorage {
                     Err(_) => {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
-                            format!("Path {absolute} is outside root {root}",),
+                            format!("Path {absolute} is outside root {root}"),
                         ));
                     }
                 };
