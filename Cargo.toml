@@ -102,7 +102,7 @@ toml = "1.0.6"
 # HTTP server
 axum = "0.8.8"
 axum-extra = { version = "0.12.5", features = ["query"] }
-tower-http = { version = "0.6.8", features = ["trace"] }
+tower-http = { version = "0.6.8", features = ["trace", "decompression-gzip", "decompression-zstd"] }
 
 # gRPC server
 tonic = "0.14"
