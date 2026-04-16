@@ -39,11 +39,7 @@ use crate::{
 /// Parse time string (nanoseconds or RFC3339).
 pub fn parse_time(s: &str) -> DateTime<Utc> {
     s.parse::<i64>().map_or_else(
-        |_| {
-            DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or(DateTime::UNIX_EPOCH)
-        },
+        |_| DateTime::parse_from_rfc3339(s).map_or(DateTime::UNIX_EPOCH, |dt| dt.with_timezone(&Utc)),
         DateTime::from_timestamp_nanos,
     )
 }
