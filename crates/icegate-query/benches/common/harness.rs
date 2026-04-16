@@ -86,7 +86,15 @@ impl TestServer {
         // which is correct for benchmarks that only write to Iceberg.
         let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let wal_reader = Arc::new(icegate_queue::ParquetQueueReader::new("", Arc::clone(&wal_store), 8192).unwrap());
-        let engine_config = QueryEngineConfig::default();
+        // Use very long refresh interval to prevent the background refresh task
+        // from firing during benchmarks. The rebuild_lock contention between
+        // background refresh and get_provider causes deadlocks with
+        // criterion's block_on loop.
+        let engine_config = QueryEngineConfig {
+            refresh_interval_secs: 86400,
+            max_age_secs: 86400,
+            ..QueryEngineConfig::default()
+        };
         let query_engine = Arc::new(QueryEngine::new(
             Arc::clone(&catalog),
             engine_config,
@@ -224,6 +232,8 @@ pub async fn write_benchmark_logs(
         .with_values_field(value_field);
 
     for _ in 0..count {
+        attributes_builder.keys().append_value("dataset");
+        attributes_builder.values().append_value("baseline");
         attributes_builder.keys().append_value("env");
         attributes_builder.values().append_value("prod");
         attributes_builder.append(true)?;
@@ -351,6 +361,8 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
         .with_values_field(value_field);
 
     for (latency, request_time, response_size) in &random_values {
+        attributes_builder.keys().append_value("dataset");
+        attributes_builder.values().append_value("numeric");
         attributes_builder.keys().append_value("latency");
         attributes_builder.values().append_value(latency.to_string());
         attributes_builder.keys().append_value("request_time");
@@ -474,6 +486,8 @@ pub async fn write_benchmark_logs_with_varied_labels(
         let namespace = namespaces[i % namespaces.len()];
         let pod = pods[i % pods.len()];
 
+        attributes_builder.keys().append_value("dataset");
+        attributes_builder.values().append_value("varied");
         attributes_builder.keys().append_value("namespace");
         attributes_builder.values().append_value(namespace);
         attributes_builder.keys().append_value("pod");
