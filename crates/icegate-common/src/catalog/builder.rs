@@ -4,14 +4,16 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use iceberg::{
     Catalog, CatalogBuilder as IcebergCatalogBuilder,
+    io::FileIOBuilder,
     memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder},
 };
 use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
+use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
 
 use super::{CacheConfig, CatalogBackend, CatalogConfig};
-use crate::error::Result;
+use crate::error::{CommonError, Result};
 use crate::storage::PrefetchConfig;
 use crate::storage::cache::{StorageCache, build_storage_cache};
 use crate::storage::icegate_storage::IceGateStorageFactory;
@@ -167,6 +169,7 @@ impl CatalogBuilder {
             CatalogBackend::Glue { catalog_id } => {
                 Self::create_glue_catalog(config, catalog_id.as_deref(), io_cache).await
             }
+            CatalogBackend::S3 { warehouse } => Self::create_s3_catalog(config, warehouse, io_cache).await,
         }
     }
 
@@ -278,6 +281,63 @@ impl CatalogBuilder {
             uri = %uri,
             warehouse = %config.warehouse,
             "Created REST catalog"
+        );
+
+        Ok(Arc::new(catalog))
+    }
+
+    /// Create an S3-backed catalog.
+    async fn create_s3_catalog(
+        config: &CatalogConfig,
+        warehouse: &str,
+        io_cache: &IoHandle,
+    ) -> Result<Arc<dyn Catalog>> {
+        let bucket = config
+            .properties
+            .get("bucket")
+            .cloned()
+            .ok_or_else(|| CommonError::Config("S3 catalog requires `catalog.properties.bucket`".to_string()))?;
+        let region = config
+            .properties
+            .get("region")
+            .cloned()
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let endpoint = config.properties.get("endpoint").cloned();
+        let access_key_id = config.properties.get("access_key_id").cloned();
+        let secret_access_key = config.properties.get("secret_access_key").cloned();
+
+        let mut file_io_props = config.properties.clone();
+        file_io_props.insert("warehouse".to_string(), format!("s3://{bucket}"));
+        if let Some(ref endpoint_value) = endpoint {
+            file_io_props
+                .entry("s3.endpoint".to_string())
+                .or_insert_with(|| endpoint_value.clone());
+            file_io_props
+                .entry("s3.path-style-access".to_string())
+                .or_insert_with(|| "true".to_string());
+        }
+        file_io_props.entry("s3.region".to_string()).or_insert_with(|| region.clone());
+
+        let file_io = FileIOBuilder::new(io_cache.storage_factory()).with_props(file_io_props).build();
+
+        let catalog = S3Catalog::new(
+            S3CatalogConfig {
+                bucket,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                warehouse: warehouse.to_string(),
+                codec: CatalogCodecKind::Json, // TODO(crit): to config
+            },
+            file_io,
+        )
+        .await
+        .map_err(|e| CommonError::Config(format!("failed to create s3 catalog: {e}")))?;
+
+        tracing::info!(
+            warehouse = %warehouse,
+            "Created S3 catalog"
         );
 
         Ok(Arc::new(catalog))

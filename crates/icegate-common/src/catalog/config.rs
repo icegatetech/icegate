@@ -90,6 +90,11 @@ pub enum CatalogBackend {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         catalog_id: Option<String>,
     },
+    /// S3-backed catalog with `root.json` state.
+    S3 {
+        /// S3 key prefix used for catalog state (e.g. `catalog`).
+        warehouse: String,
+    },
 }
 
 impl CatalogConfig {
@@ -137,6 +142,11 @@ impl CatalogConfig {
                             "Glue catalog_id must be a 12-digit AWS account ID".into(),
                         ));
                     }
+                }
+            }
+            CatalogBackend::S3 { warehouse } => {
+                if warehouse.trim().is_empty() {
+                    return Err(CommonError::Config("S3 catalog warehouse cannot be empty".into()));
                 }
             }
         }

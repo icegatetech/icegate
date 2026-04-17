@@ -3861,6 +3861,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "icegate-catalog-s3"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "bytes",
+ "dashmap",
+ "futures",
+ "iceberg",
+ "object_store",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "icegate-common"
 version = "0.1.0"
 dependencies = [
@@ -3876,6 +3898,7 @@ dependencies = [
  "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-catalog-s3tables",
+ "icegate-catalog-s3",
  "object_store",
  "object_store_opendal",
  "opendal",
