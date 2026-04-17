@@ -13,6 +13,7 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: trino
+      app.kubernetes.io/component: coordinator
   template:
     metadata:
       labels:

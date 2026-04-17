@@ -199,6 +199,7 @@ data:
 
       batch: {}
 
+      # Shared environment/demo labels. Added to both logs and traces.
       resource:
         attributes:
           - key: deployment.environment
@@ -207,14 +208,24 @@ data:
           - key: demo.source
             value: kubernetes
             action: upsert
-          # Align log `service.name` with the value traces carry.
-          # icegate's OTel SDK emits `service.name = icegate-ingest` /
-          # `icegate-query`, which matches the Deployment name k8s_attributes
-          # already extracted. Overriding the label-derived value (`icegate`)
-          # with `k8s.deployment.name` unifies logs and traces under one
-          # service identity. Pods not managed by a Deployment lack
-          # `k8s.deployment.name`; upsert+from_attribute becomes a no-op in
-          # that case so the label fallback survives.
+
+      # Logs-only override: align `service.name` with what traces carry.
+      # k8s_attributes extracts `service.name` from the `app.kubernetes.io/name`
+      # label, which is the coarser "icegate" identity. The Deployment name
+      # (`icegate-ingest`, `icegate-query`) matches what the OTel SDK emits
+      # on traces, so using `k8s.deployment.name` here unifies both signals.
+      #
+      # We explicitly do NOT apply this override on the traces pipeline:
+      # traces always carry an SDK-set `service.name`, and third-party
+      # traces routed through the collector must keep their original
+      # service identity. Keeping the override logs-only avoids clobbering
+      # it.
+      #
+      # Pods not managed by a Deployment (e.g. the otel-collector DaemonSet
+      # itself) lack `k8s.deployment.name`; upsert+from_attribute is a no-op
+      # in that case so the label-derived fallback survives.
+      resource/logs_service_name:
+        attributes:
           - key: service.name
             from_attribute: k8s.deployment.name
             action: upsert
@@ -230,9 +241,10 @@ data:
       pipelines:
         logs:
           receivers: [file_log]
-          processors: [k8s_attributes, batch, resource]
+          processors: [k8s_attributes, batch, resource, resource/logs_service_name]
           exporters: [otlp_http]
         traces:
+          # Traces keep the SDK-set service.name; no logs_service_name override.
           receivers: [otlp]
           processors: [k8s_attributes, batch, resource]
           exporters: [otlp_http]

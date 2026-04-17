@@ -189,7 +189,6 @@ fn parse_logs_request(content_type: &str, body: &Bytes) -> Result<ExportLogsServ
 /// Transforms OTLP spans to Arrow `RecordBatch` and writes to the WAL queue.
 /// Transform-time drops (invalid `trace_id`/`span_id`) surface as
 /// `partial_success.rejected_spans`.
-#[allow(clippy::cast_possible_wrap)]
 #[allow(clippy::too_many_lines)]
 #[tracing::instrument(skip(state, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_TRACES))]
 pub async fn ingest_traces(
@@ -295,14 +294,20 @@ pub async fn ingest_traces(
             }
             request_metrics.record_wal_ack_duration(ack_start.elapsed(), icegate_common::SPANS_TOPIC, STATUS_ERROR);
             request_metrics.finish_partial();
-            let rejected = drops
-                .checked_add(partial.rejected_records)
-                .and_then(|n| i64::try_from(n).ok())
-                .ok_or_else(|| OtlpError(IngestError::Validation("Rejected spans count exceeds i64".to_string())))?;
+            let combined = drops.checked_add(partial.rejected_records).ok_or_else(|| {
+                OtlpError(IngestError::Validation(
+                    "Rejected spans count exceeds usize::MAX".to_string(),
+                ))
+            })?;
+            let rejected = i64::try_from(combined)
+                .map_err(|_| OtlpError(IngestError::Validation("Rejected spans count exceeds i64".to_string())))?;
             Ok(Json(ExportTracesResponse {
                 partial_success: Some(TracesPartialSuccess {
                     rejected_spans: rejected,
-                    error_message: Some(partial.reason),
+                    error_message: Some(crate::otlp_traces_partial::compose_partial_reason(
+                        &partial.reason,
+                        drops,
+                    )),
                 }),
             }))
         }
@@ -311,14 +316,12 @@ pub async fn ingest_traces(
 
 /// Build a `TracesPartialSuccess` from transform-time drops, or `None` if there were none.
 fn partial_success_from_drops(drops: usize) -> OtlpResult<Option<TracesPartialSuccess>> {
-    if drops == 0 {
+    let Some(rejected) = crate::otlp_traces_partial::rejected_spans_from_drops(drops).map_err(OtlpError)? else {
         return Ok(None);
-    }
-    let rejected = i64::try_from(drops)
-        .map_err(|_| OtlpError(IngestError::Validation("Rejected spans count exceeds i64".to_string())))?;
+    };
     Ok(Some(TracesPartialSuccess {
         rejected_spans: rejected,
-        error_message: Some("invalid trace_id or span_id".to_string()),
+        error_message: Some(crate::otlp_traces_partial::INVALID_TRACE_MSG.to_string()),
     }))
 }
 

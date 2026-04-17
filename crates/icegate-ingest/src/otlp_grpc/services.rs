@@ -20,7 +20,6 @@ use tracing::debug;
 
 use crate::transform;
 use crate::{
-    error::IngestError,
     infra::metrics::{OtlpMetrics, OtlpRequestRecorder},
     otlp_grpc::error::GrpcError,
 };
@@ -187,7 +186,6 @@ impl TraceService for OtlpGrpcService {
     /// Transforms OTLP spans to Arrow `RecordBatch` and writes to the WAL
     /// queue. Transform-time drops (invalid `trace_id`/`span_id`) surface as
     /// `ExportTracePartialSuccess.rejected_spans`.
-    #[allow(clippy::cast_possible_wrap)]
     #[allow(clippy::too_many_lines)]
     #[tracing::instrument(name = "export_traces", skip(self, request))]
     async fn export(
@@ -287,14 +285,16 @@ impl TraceService for OtlpGrpcService {
                 }
                 request_metrics.record_wal_ack_duration(ack_start.elapsed(), icegate_common::SPANS_TOPIC, STATUS_ERROR);
                 request_metrics.finish_partial();
-                let rejected = drops
+                let combined = drops
                     .checked_add(partial.rejected_records)
-                    .and_then(|n| i64::try_from(n).ok())
-                    .ok_or_else(|| Status::internal("Rejected spans count exceeds i64"))?;
+                    .ok_or_else(|| Status::internal("Rejected spans count exceeds usize::MAX"))?;
+                let rejected =
+                    i64::try_from(combined).map_err(|_| Status::internal("Rejected spans count exceeds i64"))?;
+                let error_message = crate::otlp_traces_partial::compose_partial_reason(&partial.reason, drops);
                 Ok(Response::new(ExportTraceServiceResponse {
                     partial_success: Some(ExportTracePartialSuccess {
                         rejected_spans: rejected,
-                        error_message: partial.reason,
+                        error_message,
                     }),
                 }))
             }
@@ -303,18 +303,19 @@ impl TraceService for OtlpGrpcService {
 }
 
 /// Build an `ExportTracePartialSuccess` from transform-time drops, or `None` if there were none.
+///
+/// Delegates to the shared `otlp_traces_partial::rejected_spans_from_drops` helper so
+/// the HTTP and gRPC handlers report identical rejected counts and messages.
 fn grpc_partial_success_from_drops(
     drops: usize,
 ) -> Result<Option<opentelemetry_proto::tonic::collector::trace::v1::ExportTracePartialSuccess>, GrpcError> {
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTracePartialSuccess;
-    if drops == 0 {
+    let Some(rejected) = crate::otlp_traces_partial::rejected_spans_from_drops(drops).map_err(GrpcError)? else {
         return Ok(None);
-    }
-    let rejected = i64::try_from(drops)
-        .map_err(|_| GrpcError(IngestError::Validation("Rejected spans count exceeds i64".to_string())))?;
+    };
     Ok(Some(ExportTracePartialSuccess {
         rejected_spans: rejected,
-        error_message: "invalid trace_id or span_id".to_string(),
+        error_message: crate::otlp_traces_partial::INVALID_TRACE_MSG.to_string(),
     }))
 }
 

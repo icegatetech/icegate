@@ -246,9 +246,11 @@ pub fn logs_to_record_batch(
 /// dropped silently and counted in the second return value so the caller
 /// can surface partial-success metrics.
 ///
-/// Top-level columns are populated here. Attributes map, nested events,
-/// and nested links are placeholder null values; subsequent tasks fill
-/// them in.
+/// Produces every column in the spans schema: top-level fields, the merged
+/// attributes map (resource + scope + span attributes plus indexed-column
+/// duplicates), and the nested `events` / `links` `List<Struct>` arrays.
+/// Links with invalid `trace_id` / `span_id` are dropped from the list and
+/// counted into the parent span's `dropped_links_count`.
 ///
 /// # Arguments
 ///
@@ -549,7 +551,10 @@ pub fn spans_to_record_batch(
                         struct_builder
                             .field_builder::<Int32Builder>(3)
                             .expect("event dropped count builder")
-                            .append_value(event.dropped_attributes_count as i32);
+                            .append_value(u32_count_to_i32(
+                                event.dropped_attributes_count,
+                                "event.dropped_attributes_count",
+                            )?);
                         struct_builder.append(true);
                     }
                     events_builder.append(true);
@@ -596,12 +601,15 @@ pub fn spans_to_record_batch(
                         struct_builder
                             .field_builder::<Int32Builder>(4)
                             .expect("link dropped count builder")
-                            .append_value(link.dropped_attributes_count as i32);
+                            .append_value(u32_count_to_i32(
+                                link.dropped_attributes_count,
+                                "link.dropped_attributes_count",
+                            )?);
                         let flags_b = struct_builder.field_builder::<Int32Builder>(5).expect("link flags builder");
                         if link.flags == 0 {
                             flags_b.append_null();
                         } else {
-                            flags_b.append_value(link.flags as i32);
+                            flags_b.append_value(u32_count_to_i32(link.flags, "link.flags")?);
                         }
                         struct_builder.append(true);
                     }
@@ -611,19 +619,32 @@ pub fn spans_to_record_batch(
                 if span.flags == 0 {
                     flags_builder.append_null();
                 } else {
-                    flags_builder.append_value(span.flags as i32);
+                    flags_builder.append_value(u32_count_to_i32(span.flags, "span.flags")?);
                 }
                 if span.dropped_attributes_count == 0 {
                     dropped_attributes_count_builder.append_null();
                 } else {
-                    dropped_attributes_count_builder.append_value(span.dropped_attributes_count as i32);
+                    dropped_attributes_count_builder.append_value(u32_count_to_i32(
+                        span.dropped_attributes_count,
+                        "span.dropped_attributes_count",
+                    )?);
                 }
                 if span.dropped_events_count == 0 {
                     dropped_events_count_builder.append_null();
                 } else {
-                    dropped_events_count_builder.append_value(span.dropped_events_count as i32);
+                    dropped_events_count_builder.append_value(u32_count_to_i32(
+                        span.dropped_events_count,
+                        "span.dropped_events_count",
+                    )?);
                 }
-                let total_dropped_links = span.dropped_links_count as i32 + extra_dropped_links;
+                // Sum u32 and per-transform i32 counter in i64, then narrow:
+                // avoids wrapping at the i32 boundary if they happen to add up.
+                let total_dropped_links_i64 = i64::from(span.dropped_links_count) + i64::from(extra_dropped_links);
+                let total_dropped_links = i32::try_from(total_dropped_links_i64).map_err(|_| {
+                    crate::error::IngestError::Validation(format!(
+                        "dropped_links_count total exceeds i32::MAX: {total_dropped_links_i64}"
+                    ))
+                })?;
                 if total_dropped_links == 0 {
                     dropped_links_count_builder.append_null();
                 } else {
@@ -783,6 +804,19 @@ fn any_value_to_json(value: &AnyValue) -> Option<serde_json::Value> {
 /// Checks if a byte slice is all zeros.
 fn is_zero_bytes(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == 0)
+}
+
+/// Convert an OTLP `u32` counter into the schema's signed `i32` field.
+///
+/// OTLP represents `flags` and `dropped_*_count` as `u32`. Iceberg stores
+/// them as `Int` (i32). Realistic telemetry values sit far below `i32::MAX`,
+/// but `as i32` silently wraps for anything above `2^31 - 1`, producing a
+/// negative count that later readers would see as "-2 billion dropped
+/// events". Fail the transform instead so the caller can surface the
+/// malformed span via `partial_success`.
+fn u32_count_to_i32(value: u32, context: &'static str) -> crate::error::Result<i32> {
+    i32::try_from(value)
+        .map_err(|_| crate::error::IngestError::Validation(format!("{context} exceeds i32::MAX: {value}")))
 }
 
 /// Extracts map field metadata from the Arrow schema for attributes field.

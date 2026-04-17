@@ -218,6 +218,9 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
     let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
     let definitions = build_table_definitions()?;
     let mut operations = Vec::new();
+    // Collect every mismatched table instead of bailing on the first one so
+    // operators see the full remediation list in a single run.
+    let mut differing_tables: Vec<String> = Vec::new();
 
     for def in definitions {
         let table_ident = TableIdent::new(namespace.clone(), def.name.to_string());
@@ -243,32 +246,38 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
         let needs_upgrade = schemas_differ(current_schema, target_schema);
 
         if needs_upgrade {
+            log_schema_differences(def.name, current_schema, target_schema);
             if dry_run {
                 tracing::info!("[dry-run] Would require manual migration for table: {}", def.name);
-                log_schema_differences(def.name, current_schema, target_schema);
                 operations.push(MigrationOperation::Upgrade {
                     table_name: def.name.to_string(),
                 });
             } else {
-                log_schema_differences(def.name, current_schema, target_schema);
-                return Err(crate::error::MaintainError::Migration(format_upgrade_required_message(
-                    def.name,
-                )));
+                differing_tables.push(def.name.to_string());
             }
         } else {
             tracing::info!("Table {} schema is up to date", def.name);
         }
     }
 
+    if !dry_run && !differing_tables.is_empty() {
+        return Err(crate::error::MaintainError::Migration(
+            format_upgrade_required_message_multi(&differing_tables),
+        ));
+    }
+
     Ok(operations)
 }
 
-/// Build the operator-facing error message when a table schema in the
-/// catalog differs from the code and automatic evolution is not supported.
-fn format_upgrade_required_message(table_name: &str) -> String {
+/// Build the operator-facing error message when a set of tables' schemas in
+/// the catalog differ from the code and automatic evolution is not supported.
+/// Accepts one or more table names and joins them into a single actionable
+/// message so the operator can see the full remediation list in one run.
+fn format_upgrade_required_message_multi(table_names: &[String]) -> String {
+    let list = table_names.join(", ");
     format!(
-        "Table `{table_name}` schema in catalog differs from code. Automatic evolution \
-         is not supported; drop the table manually and re-run `icegate-maintain migrate create`."
+        "Tables [{list}] schema in catalog differs from code. Automatic evolution \
+         is not supported; drop the tables manually and re-run `icegate-maintain migrate create`."
     )
 }
 
@@ -393,11 +402,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_upgrade_error_message_names_table_and_recovery() {
-        let msg = format_upgrade_required_message("spans");
+    fn format_upgrade_error_message_names_single_table_and_recovery() {
+        let msg = format_upgrade_required_message_multi(&["spans".to_string()]);
         assert!(msg.contains("spans"));
-        assert!(msg.contains("drop the table manually"));
+        assert!(msg.contains("drop the tables manually"));
         assert!(msg.contains("icegate-maintain migrate create"));
+    }
+
+    #[test]
+    fn format_upgrade_error_message_lists_all_differing_tables() {
+        let msg = format_upgrade_required_message_multi(&["logs".to_string(), "spans".to_string()]);
+        assert!(msg.contains("logs"));
+        assert!(msg.contains("spans"));
+        assert!(msg.contains("drop the tables manually"));
     }
 
     #[test]

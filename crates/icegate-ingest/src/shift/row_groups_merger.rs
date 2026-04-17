@@ -317,10 +317,11 @@ pub struct SortedBatchMergerConfig {
 /// row groups whose key ranges intersect, performs k-way merge across them, and
 /// then moves to the next cluster.
 pub struct RowGroupsMerger<Q: QueueReader + ?Sized + 'static> {
-    /// Immutable read/output settings.
+    /// Immutable read/output settings. The sort descriptor lives inside
+    /// `config.sort_descriptor`; there is no separate cached copy on the
+    /// merger itself — every read goes through the config to keep a single
+    /// source of truth.
     config: SortedBatchMergerConfig,
-    /// Immutable logs sort descriptor shared by all per-batch column caches.
-    sort_descriptor: &'static SortColumnsDescriptor,
     /// Schema shared by all opened batches. Filled from the first batch.
     schema: SchemaRef,
     /// Queue reader used to open WAL row groups as Arrow streams.
@@ -389,10 +390,8 @@ where
         validate_boundary_ranges(&read_plan)?;
         validate_unique_row_group_positions(&read_plan)?;
 
-        let sort_descriptor = config.sort_descriptor;
         Ok(Self {
             config,
-            sort_descriptor,
             schema: SchemaRef::new(arrow::datatypes::Schema::empty()),
             queue_reader,
             observer,
@@ -847,7 +846,7 @@ where
             )));
         }
 
-        let cache = SortColumnCache::try_new(&opened.row_group, self.sort_descriptor, "merge input")?;
+        let cache = SortColumnCache::try_new(&opened.row_group, self.config.sort_descriptor, "merge input")?;
         let stream_idx = self.active_cluster_streams.len();
         self.active_cluster_streams.push(ActiveClusterState {
             source: opened.source,
@@ -967,7 +966,7 @@ where
             .ok_or_else(|| IngestError::Shift("batch generation overflow".to_string()))?;
         stream_state.cache = Some(SortColumnCache::try_new(
             &next_batch,
-            self.sort_descriptor,
+            self.config.sort_descriptor,
             "merge input",
         )?);
         stream_state.current_batch = Some(next_batch);
@@ -1311,7 +1310,6 @@ mod tests {
                 cancel_token: CancellationToken::new(),
                 sort_descriptor,
             },
-            sort_descriptor,
             schema: Arc::new(Schema::empty()),
             queue_reader: Arc::new(FakeQueueReader {
                 batches: HashMap::new(),
