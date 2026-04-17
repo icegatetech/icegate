@@ -44,8 +44,8 @@ pub(crate) struct PendingWalWrite {
     records: usize,
 }
 
-/// Submit a prepared WAL request into the queue.
-pub(crate) async fn submit_sorted_logs_to_wal(
+/// Submit a prepared WAL request (logs or spans) into the queue.
+pub(crate) async fn submit_sorted_rows_to_wal(
     write_channel: &WriteChannel,
     prepared: PreparedWalWrite,
 ) -> Result<PendingWalWrite> {

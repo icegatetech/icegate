@@ -244,28 +244,32 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
 
         if needs_upgrade {
             if dry_run {
-                tracing::info!("[dry-run] Would upgrade table schema: {}", def.name);
+                tracing::info!("[dry-run] Would require manual migration for table: {}", def.name);
                 log_schema_differences(def.name, current_schema, target_schema);
+                operations.push(MigrationOperation::Upgrade {
+                    table_name: def.name.to_string(),
+                });
             } else {
-                tracing::info!("Upgrading table schema: {}", def.name);
-                // Note: Full schema evolution would require iceberg's update_schema API
-                // For now, we log what would need to change
                 log_schema_differences(def.name, current_schema, target_schema);
-                tracing::warn!(
-                    "Automatic schema evolution not yet implemented. Please update {} manually.",
-                    def.name
-                );
+                return Err(crate::error::MaintainError::Migration(format_upgrade_required_message(
+                    def.name,
+                )));
             }
-
-            operations.push(MigrationOperation::Upgrade {
-                table_name: def.name.to_string(),
-            });
         } else {
             tracing::info!("Table {} schema is up to date", def.name);
         }
     }
 
     Ok(operations)
+}
+
+/// Build the operator-facing error message when a table schema in the
+/// catalog differs from the code and automatic evolution is not supported.
+fn format_upgrade_required_message(table_name: &str) -> String {
+    format!(
+        "Table `{table_name}` schema in catalog differs from code. Automatic evolution \
+         is not supported; drop the table manually and re-run `icegate-maintain migrate create`."
+    )
 }
 
 /// Check if two schemas differ
@@ -381,5 +385,57 @@ fn log_schema_differences(table_name: &str, current: &iceberg::spec::Schema, tar
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_upgrade_error_message_names_table_and_recovery() {
+        let msg = format_upgrade_required_message("spans");
+        assert!(msg.contains("spans"));
+        assert!(msg.contains("drop the table manually"));
+        assert!(msg.contains("icegate-maintain migrate create"));
+    }
+
+    #[test]
+    fn schemas_differ_detects_modified_nested_types() {
+        use std::sync::Arc;
+
+        use iceberg::spec::{MapType, NestedField, PrimitiveType, Type};
+
+        let current = iceberg::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "tenant_id", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(
+                    2,
+                    "attributes",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::required(3, "key", Type::Primitive(PrimitiveType::String))),
+                        Arc::new(NestedField::required(
+                            4,
+                            "value",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("current schema");
+
+        let target = iceberg::spec::Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![
+                NestedField::required(1, "tenant_id", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "attributes", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("target schema");
+
+        assert!(schemas_differ(&current, &target));
     }
 }

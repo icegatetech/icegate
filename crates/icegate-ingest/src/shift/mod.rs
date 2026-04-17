@@ -31,7 +31,6 @@ pub(crate) use executor::{
 };
 use iceberg::Catalog;
 pub(crate) use iceberg_storage::IcebergStorage;
-use icegate_common::{LOGS_TABLE, LOGS_TOPIC};
 use icegate_jobmanager::{
     CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
     Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
@@ -48,7 +47,21 @@ use timeout::TimeoutEstimator;
 use crate::{
     error::{IngestError, Result},
     infra::metrics::ShiftMetrics,
+    wal::SortColumnsDescriptor,
 };
+
+/// Specification for one per-signal shift job.
+#[derive(Clone, Copy)]
+pub struct ShiftJobSpec {
+    /// Stable job name used in job registry and logs (e.g. `shift_logs`).
+    pub job_name: &'static str,
+    /// WAL topic to read from (e.g. `LOGS_TOPIC`).
+    pub topic: &'static str,
+    /// Iceberg table name to commit to (e.g. `LOGS_TABLE`).
+    pub table: &'static str,
+    /// Sort descriptor shared with the WAL sorter for this topic.
+    pub descriptor: &'static SortColumnsDescriptor,
+}
 
 /// Runs shift jobs inside the ingest process.
 pub struct Shifter {
@@ -69,79 +82,92 @@ impl Shifter {
         jobs_storage: S3StorageConfig,
         shift_metrics: ShiftMetrics,
         jobs_manager_metrics: JobMetrics,
+        jobs: &[ShiftJobSpec],
     ) -> Result<Self> {
         shift_config.validate()?;
-        let storage = Arc::new(IcebergStorage::new(
-            Arc::clone(&catalog),
-            LOGS_TABLE,
-            shift_config.as_ref(),
-        ));
+        if jobs.is_empty() {
+            return Err(IngestError::Shift("no shift jobs configured".to_string()));
+        }
+
+        let queue_reader = Arc::new(QueueReaderWithMetrics::new(queue_reader, shift_metrics.clone()));
         let timeouts = TimeoutEstimator::new(&shift_config.timeouts)?;
         let plan_timeout = timeouts.plan_timeout();
-        let queue_reader = Arc::new(QueueReaderWithMetrics::new(queue_reader, shift_metrics.clone()));
-        let plan_runner = Arc::new(PlanTaskRunnerImpl::new(
-            Arc::clone(&queue_reader),
-            Arc::clone(&storage),
-            shift_config.clone(),
-            timeouts,
-            LOGS_TOPIC,
-        ));
-        let plan_runner = Arc::new(PlanTaskRunnerWithMetrics::new(
-            plan_runner,
-            shift_metrics.clone(),
-            LOGS_TOPIC,
-        ));
 
-        let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), LOGS_TOPIC));
-        let shift_storage_for_runner = Arc::clone(&shift_storage);
-        let row_groups_merger_observer = Arc::new(RowGroupsMergerObserverWithMetrics::new(
-            shift_metrics.clone(),
-            LOGS_TOPIC,
-        ));
-        let shift_runner = Arc::new(
-            ShiftTaskRunnerImpl::new(
-                queue_reader,
-                shift_storage_for_runner,
-                LOGS_TOPIC,
-                shift_config.write.row_group_size,
-            )?
-            .with_row_groups_merger_observer(row_groups_merger_observer)
-            .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
-        );
-        let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(
-            shift_runner,
-            shift_metrics.clone(),
-            LOGS_TOPIC,
-        ));
-        let commit_runner = Arc::new(CommitTaskRunnerImpl::new(Arc::clone(&shift_storage), LOGS_TOPIC));
-        let commit_runner = Arc::new(CommitTaskRunnerWithMetrics::new(
-            commit_runner,
-            shift_metrics,
-            LOGS_TOPIC,
-        ));
+        let mut job_defs: Vec<JobDefinition> = Vec::with_capacity(jobs.len());
 
-        let executor = Arc::new(Executor::new(plan_runner, shift_runner, commit_runner));
+        for spec in jobs {
+            let storage = Arc::new(IcebergStorage::new(
+                Arc::clone(&catalog),
+                spec.table,
+                shift_config.as_ref(),
+            ));
+            let plan_runner = Arc::new(PlanTaskRunnerImpl::new(
+                Arc::clone(&queue_reader),
+                Arc::clone(&storage),
+                shift_config.clone(),
+                timeouts.clone(),
+                spec.topic,
+            ));
+            let plan_runner = Arc::new(PlanTaskRunnerWithMetrics::new(
+                plan_runner,
+                shift_metrics.clone(),
+                spec.topic,
+            ));
 
-        let initial_task =
-            TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), vec![], plan_timeout).map_err(map_shift_error)?;
+            let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), spec.topic));
+            let shift_storage_for_runner = Arc::clone(&shift_storage);
+            let row_groups_merger_observer = Arc::new(RowGroupsMergerObserverWithMetrics::new(
+                shift_metrics.clone(),
+                spec.topic,
+            ));
+            let shift_runner = Arc::new(
+                ShiftTaskRunnerImpl::new(
+                    Arc::clone(&queue_reader),
+                    shift_storage_for_runner,
+                    spec.topic,
+                    shift_config.write.row_group_size,
+                    spec.descriptor,
+                )?
+                .with_row_groups_merger_observer(row_groups_merger_observer)
+                .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
+            );
+            let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(
+                shift_runner,
+                shift_metrics.clone(),
+                spec.topic,
+            ));
+            let commit_runner = Arc::new(CommitTaskRunnerImpl::new(Arc::clone(&shift_storage), spec.topic));
+            let commit_runner = Arc::new(CommitTaskRunnerWithMetrics::new(
+                commit_runner,
+                shift_metrics.clone(),
+                spec.topic,
+            ));
 
-        let mut executors = HashMap::new();
-        executors.insert(TaskCode::new(PLAN_TASK_CODE), Arc::clone(&executor).plan_executor());
-        executors.insert(TaskCode::new(SHIFT_TASK_CODE), Arc::clone(&executor).shift_executor());
-        executors.insert(TaskCode::new(COMMIT_TASK_CODE), Arc::clone(&executor).commit_executor());
+            let executor = Arc::new(Executor::new(plan_runner, shift_runner, commit_runner));
 
-        let iteration_interval_ms =
-            i64::try_from(shift_config.jobsmanager.iteration_interval_millisecs).map_err(|_| {
-                IngestError::Shift(format!(
-                    "jobsmanager.iteration_interval_millisecs {} exceeds i64",
-                    shift_config.jobsmanager.iteration_interval_millisecs
-                ))
-            })?;
-        let job_def = JobDefinition::new("shift_logs".into(), vec![initial_task], executors)
-            .map_err(map_shift_error)?
-            .with_iteration_interval(ChronoDuration::milliseconds(iteration_interval_ms))
-            .map_err(map_shift_error)?;
-        let job_registry = Arc::new(JobRegistry::new(vec![job_def]).map_err(map_shift_error)?);
+            let initial_task =
+                TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), vec![], plan_timeout).map_err(map_shift_error)?;
+
+            let mut executors = HashMap::new();
+            executors.insert(TaskCode::new(PLAN_TASK_CODE), Arc::clone(&executor).plan_executor());
+            executors.insert(TaskCode::new(SHIFT_TASK_CODE), Arc::clone(&executor).shift_executor());
+            executors.insert(TaskCode::new(COMMIT_TASK_CODE), Arc::clone(&executor).commit_executor());
+
+            let iteration_interval_ms =
+                i64::try_from(shift_config.jobsmanager.iteration_interval_millisecs).map_err(|_| {
+                    IngestError::Shift(format!(
+                        "jobsmanager.iteration_interval_millisecs {} exceeds i64",
+                        shift_config.jobsmanager.iteration_interval_millisecs
+                    ))
+                })?;
+            let job_def = JobDefinition::new(spec.job_name.into(), vec![initial_task], executors)
+                .map_err(map_shift_error)?
+                .with_iteration_interval(ChronoDuration::milliseconds(iteration_interval_ms))
+                .map_err(map_shift_error)?;
+            job_defs.push(job_def);
+        }
+
+        let job_registry = Arc::new(JobRegistry::new(job_defs).map_err(map_shift_error)?);
 
         let s3_storage = Arc::new(
             S3Storage::new(jobs_storage, job_registry.clone(), jobs_manager_metrics.clone())

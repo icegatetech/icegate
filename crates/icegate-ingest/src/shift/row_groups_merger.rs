@@ -307,6 +307,8 @@ pub struct SortedBatchMergerConfig {
     pub topic: Topic,
     /// Shared cancellation token for all queue reads.
     pub cancel_token: CancellationToken,
+    /// Sort descriptor used to compare rows across WAL row groups.
+    pub sort_descriptor: &'static SortColumnsDescriptor,
 }
 
 /// Streams sorted row groups from WAL and merges them into one sorted output stream.
@@ -387,9 +389,10 @@ where
         validate_boundary_ranges(&read_plan)?;
         validate_unique_row_group_positions(&read_plan)?;
 
+        let sort_descriptor = config.sort_descriptor;
         Ok(Self {
             config,
-            sort_descriptor: SortColumnsDescriptor::logs()?, // TODO(high): make a generic solution without binding to logs
+            sort_descriptor,
             schema: SchemaRef::new(arrow::datatypes::Schema::empty()),
             queue_reader,
             observer,
@@ -1299,14 +1302,16 @@ mod tests {
 
     fn cluster_sizes_from_metadata(segments: impl AsRef<[SegmentToRead]>) -> Vec<usize> {
         let segments = segments.as_ref();
+        let sort_descriptor = SortColumnsDescriptor::logs().expect("sort descriptor");
         let mut merger = RowGroupsMerger::<FakeQueueReader> {
             config: SortedBatchMergerConfig {
                 row_group_size: 8,
                 read_parallelism: 1,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor,
             },
-            sort_descriptor: SortColumnsDescriptor::logs().expect("sort descriptor"),
+            sort_descriptor,
             schema: Arc::new(Schema::empty()),
             queue_reader: Arc::new(FakeQueueReader {
                 batches: HashMap::new(),
@@ -1352,6 +1357,7 @@ mod tests {
                 read_parallelism: 2,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger");
@@ -1382,6 +1388,7 @@ mod tests {
                 read_parallelism: 2,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger");
@@ -1443,6 +1450,7 @@ mod tests {
                 read_parallelism: 2,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger");
@@ -1535,6 +1543,7 @@ mod tests {
                 read_parallelism: 2,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger");
@@ -1576,6 +1585,7 @@ mod tests {
                 read_parallelism: 2,
                 topic: "logs".to_string(),
                 cancel_token: cancel_token.clone(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger");
@@ -1617,6 +1627,7 @@ mod tests {
                 read_parallelism: 1,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger");
@@ -2030,6 +2041,7 @@ mod tests {
                 read_parallelism: 1,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
             Arc::new(NoopRowGroupsMergerObserver),
         ) else {
@@ -2068,6 +2080,7 @@ mod tests {
                 read_parallelism: 1,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
             Arc::new(NoopRowGroupsMergerObserver),
         ) else {

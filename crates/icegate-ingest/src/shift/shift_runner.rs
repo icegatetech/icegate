@@ -18,6 +18,7 @@ use super::{
         NoopRowGroupsMergerObserver, RowGroupsMerger, RowGroupsMergerObserver, SortedBatchMergerConfig,
     },
 };
+use crate::wal::SortColumnsDescriptor;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 /// Reason for shift task failure.
@@ -107,6 +108,7 @@ pub struct ShiftTaskRunnerImpl<Q, S> {
     topic: Topic,
     output_batch_size: usize,
     segment_read_parallelism: usize,
+    sort_descriptor: &'static SortColumnsDescriptor,
     retrier: Retrier,
     row_groups_merger_observer: Arc<dyn RowGroupsMergerObserver>,
 }
@@ -128,6 +130,7 @@ where
         storage: Arc<S>,
         topic: impl Into<String>,
         output_batch_size: usize,
+        sort_descriptor: &'static SortColumnsDescriptor,
     ) -> std::result::Result<Self, crate::error::IngestError> {
         if output_batch_size == 0 {
             return Err(crate::error::IngestError::Config(
@@ -141,6 +144,7 @@ where
             topic: topic.into(),
             output_batch_size,
             segment_read_parallelism: Self::DEFAULT_SEGMENT_READ_PARALLELISM,
+            sort_descriptor,
             retrier: Retrier::new(RetrierConfig::default()),
             row_groups_merger_observer: Arc::new(NoopRowGroupsMergerObserver),
         })
@@ -331,6 +335,7 @@ where
                 read_parallelism: self.segment_read_parallelism,
                 topic: self.topic.clone(),
                 cancel_token: cancel_token.clone(),
+                sort_descriptor: self.sort_descriptor,
             },
         )
         .map_err(ShiftWriteError::queue_read)?
@@ -455,7 +460,7 @@ mod tests {
             plan_runner::{PlanTaskRunner, PlanTaskRunnerImpl},
             timeout::TimeoutEstimator,
         },
-        wal::{logs_row_group_boundary_range_from_batch, sort_logs},
+        wal::{SortColumnsDescriptor, logs_row_group_boundary_range_from_batch, sort_logs},
     };
 
     struct TestTask {
@@ -1325,10 +1330,16 @@ mod tests {
             concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::always_fail());
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
-            .expect("non-zero output_batch_size must be accepted")
-            .with_segment_read_parallelism(3)
-            .expect("non-zero segment read parallelism must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+        .with_segment_read_parallelism(3)
+        .expect("non-zero segment read parallelism must be accepted");
         let segment_1 = vec![test_batch(1)];
         let segment_2 = vec![test_batch(2)];
         let segment_3 = vec![test_batch(3)];
@@ -1389,8 +1400,14 @@ mod tests {
             concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::always_fail());
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 4)
-            .expect("non-zero output_batch_size must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            4,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted");
         let segment_1 = vec![
             logs_batch_for_shift(vec![
                 (Some("acc-1"), Some("svc-3"), Some(30), 1),
@@ -1448,8 +1465,14 @@ mod tests {
             concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::always_fail());
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 2)
-            .expect("non-zero output_batch_size must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            2,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted");
         let segment_1 = vec![
             logs_batch_for_shift(vec![
                 (Some("acc-1"), Some("svc-3"), Some(30), 1),
@@ -1511,10 +1534,16 @@ mod tests {
             1,
             vec![test_data_file("s3://warehouse/logs/part-00001.parquet", 3)],
         ));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 2)
-            .expect("non-zero output_batch_size must be accepted")
-            .with_segment_read_parallelism(3)
-            .expect("non-zero segment read parallelism must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            2,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+        .with_segment_read_parallelism(3)
+        .expect("non-zero segment read parallelism must be accepted");
         let segment_1 = vec![test_batch(1)];
         let segment_2 = vec![test_batch(2)];
         let segment_3 = vec![test_batch(3)];
@@ -1580,10 +1609,16 @@ mod tests {
             concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
-            .expect("non-zero output_batch_size must be accepted")
-            .with_segment_read_parallelism(3)
-            .expect("non-zero segment read parallelism must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+        .with_segment_read_parallelism(3)
+        .expect("non-zero segment read parallelism must be accepted");
         let segment_1 = vec![test_batch(1)];
         let segment_2 = vec![test_batch(2)];
         let segment_3 = vec![test_batch(3)];
@@ -1634,8 +1669,14 @@ mod tests {
             fail_after_batch_offset: Some((1, 2)),
         });
         let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
-            .expect("non-zero output_batch_size must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted");
         let segment_1 = vec![
             ordered_single_row_batch("svc", 30, 1),
             ordered_single_row_batch("svc", 20, 2),
@@ -1719,10 +1760,16 @@ mod tests {
             concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::always_fail());
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
-            .expect("non-zero output_batch_size must be accepted")
-            .with_segment_read_parallelism(2)
-            .expect("non-zero segment read parallelism must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+        .with_segment_read_parallelism(2)
+        .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![
@@ -1799,10 +1846,16 @@ mod tests {
             concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::always_fail());
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
-            .expect("non-zero output_batch_size must be accepted")
-            .with_segment_read_parallelism(1)
-            .expect("non-zero segment read parallelism must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+        .with_segment_read_parallelism(1)
+        .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![
@@ -1850,7 +1903,13 @@ mod tests {
         });
         let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
 
-        let result = ShiftTaskRunnerImpl::new(queue_reader, storage, "logs", 0);
+        let result = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            storage,
+            "logs",
+            0,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        );
 
         match result {
             Ok(_) => panic!("zero row_group_size must be rejected"),
@@ -1872,9 +1931,15 @@ mod tests {
         });
         let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
 
-        let result = ShiftTaskRunnerImpl::new(queue_reader, storage, "logs", 1)
-            .expect("non-zero output_batch_size must be accepted")
-            .with_segment_read_parallelism(0);
+        let result = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            storage,
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+        .with_segment_read_parallelism(0);
 
         match result {
             Ok(_) => panic!("zero shift_segment_read_parallelism must be rejected"),
@@ -1910,10 +1975,16 @@ mod tests {
             concurrency_gate: None,
         });
         let storage = Arc::new(FakeStorage::always_fail());
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
-            .expect("non-zero output_batch_size must be accepted")
-            .with_segment_read_parallelism(2)
-            .expect("non-zero segment read parallelism must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+        .with_segment_read_parallelism(2)
+        .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
             segments: vec![
@@ -1983,10 +2054,16 @@ mod tests {
             concurrency_gate: Some(Arc::new(ReadConcurrencyGate::new(2, Duration::from_secs(2)))),
         });
         let storage = Arc::new(FakeStorage::fail_then_succeed(0, Vec::new()));
-        let runner = ShiftTaskRunnerImpl::new(queue_reader, Arc::clone(&storage), "logs", 1)
-            .expect("non-zero output_batch_size must be accepted")
-            .with_segment_read_parallelism(2)
-            .expect("non-zero segment read parallelism must be accepted");
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+        .with_segment_read_parallelism(2)
+        .expect("non-zero segment read parallelism must be accepted");
         let segments = (1..=4).map(test_batch).map(|batch| vec![batch]).collect::<Vec<_>>();
         let input = ShiftInput {
             tenant_id: "tenant-a".to_string(),
@@ -2129,10 +2206,16 @@ mod tests {
                     1,
                 )],
             ));
-            let shift_runner = ShiftTaskRunnerImpl::new(Arc::clone(&queue_reader), Arc::clone(&storage), "logs", 2)
-                .expect("non-zero output_batch_size must be accepted")
-                .with_segment_read_parallelism(2)
-                .expect("valid read parallelism");
+            let shift_runner = ShiftTaskRunnerImpl::new(
+                Arc::clone(&queue_reader),
+                Arc::clone(&storage),
+                "logs",
+                2,
+                SortColumnsDescriptor::logs().expect("logs descriptor"),
+            )
+            .expect("non-zero output_batch_size must be accepted")
+            .with_segment_read_parallelism(2)
+            .expect("valid read parallelism");
             let manager = RecordingJobManager::new();
             let task = Arc::new(TestTask {
                 id: task_id,

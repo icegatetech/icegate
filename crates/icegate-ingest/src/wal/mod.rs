@@ -15,5 +15,6 @@ pub(crate) use metadata::serialize_row_group_metadata;
 #[cfg(test)]
 pub(crate) use sorter::logs_row_group_boundary_range_from_batch;
 pub(crate) use sorter::sort_logs;
+pub(crate) use sorter::sort_spans;
 pub(crate) use writer::WalAckOutcome;
-pub(crate) use writer::submit_sorted_logs_to_wal;
+pub(crate) use writer::submit_sorted_rows_to_wal;
