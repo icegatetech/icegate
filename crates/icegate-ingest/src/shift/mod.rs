@@ -38,8 +38,8 @@ use icegate_jobmanager::{
 };
 use icegate_queue::ParquetQueueReader;
 use instrumentation::{
-    CommitTaskRunnerWithMetrics, PlanTaskRunnerWithMetrics, QueueReaderWithMetrics, ShiftTaskRunnerWithMetrics,
-    StorageWithMetrics,
+    CommitTaskRunnerWithMetrics, PlanTaskRunnerWithMetrics, QueueReaderWithMetrics, RowGroupsMergerObserverWithMetrics,
+    ShiftTaskRunnerWithMetrics, StorageWithMetrics,
 };
 use plan_runner::PlanTaskRunnerImpl;
 use shift_runner::ShiftTaskRunnerImpl;
@@ -94,6 +94,10 @@ impl Shifter {
 
         let shift_storage = Arc::new(StorageWithMetrics::new(storage, shift_metrics.clone(), LOGS_TOPIC));
         let shift_storage_for_runner = Arc::clone(&shift_storage);
+        let row_groups_merger_observer = Arc::new(RowGroupsMergerObserverWithMetrics::new(
+            shift_metrics.clone(),
+            LOGS_TOPIC,
+        ));
         let shift_runner = Arc::new(
             ShiftTaskRunnerImpl::new(
                 queue_reader,
@@ -101,6 +105,7 @@ impl Shifter {
                 LOGS_TOPIC,
                 shift_config.write.row_group_size,
             )?
+            .with_row_groups_merger_observer(row_groups_merger_observer)
             .with_segment_read_parallelism(shift_config.read.shift_segment_read_parallelism)?,
         );
         let shift_runner = Arc::new(ShiftTaskRunnerWithMetrics::new(

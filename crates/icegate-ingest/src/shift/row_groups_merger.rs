@@ -18,6 +18,25 @@ use crate::{
 
 const MERGE_CANCEL_CHECK_INTERVAL_ROWS: usize = 1024;
 
+/// Observer for merger lifecycle events.
+pub(crate) trait RowGroupsMergerObserver: Send + Sync {
+    /// Called when a row group starts participating in an active merge cluster.
+    fn on_row_group_opened(&self, segment_offset: u64, row_group_idx: usize, bytes: u64);
+
+    /// Called when a previously opened row group is fully drained or cleaned up.
+    fn on_row_group_closed(&self, segment_offset: u64, row_group_idx: usize, bytes: u64);
+}
+
+/// No-op merger observer used by default.
+#[derive(Default)]
+pub(crate) struct NoopRowGroupsMergerObserver;
+
+impl RowGroupsMergerObserver for NoopRowGroupsMergerObserver {
+    fn on_row_group_opened(&self, _segment_offset: u64, _row_group_idx: usize, _bytes: u64) {}
+
+    fn on_row_group_closed(&self, _segment_offset: u64, _row_group_idx: usize, _bytes: u64) {}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BatchScratch {
     batch_generation: u64,
@@ -105,6 +124,7 @@ struct ActiveClusterState {
     batch_generation: u64,
     cache: Option<SortColumnCache>,
     rows_consumed_total: u64,
+    open_in_observer: bool,
 }
 
 struct RowComparator<'a> {
@@ -294,7 +314,7 @@ pub struct SortedBatchMergerConfig {
 /// The merger only keeps one overlap cluster in memory at a time: it opens the
 /// row groups whose key ranges intersect, performs k-way merge across them, and
 /// then moves to the next cluster.
-pub struct RowGroupsMerger<Q: QueueReader + ?Sized> {
+pub struct RowGroupsMerger<Q: QueueReader + ?Sized + 'static> {
     /// Immutable read/output settings.
     config: SortedBatchMergerConfig,
     /// Immutable logs sort descriptor shared by all per-batch column caches.
@@ -303,6 +323,8 @@ pub struct RowGroupsMerger<Q: QueueReader + ?Sized> {
     schema: SchemaRef,
     /// Queue reader used to open WAL row groups as Arrow streams.
     queue_reader: Arc<Q>,
+    /// Optional observer for merger lifecycle and timings.
+    observer: Arc<dyn RowGroupsMergerObserver>,
     /// Row groups that are not opened yet, ordered by their lower boundary.
     pending_row_groups: BTreeSet<PendingRowGroupWithOrder>,
     /// Streams that belong to the current overlap cluster.
@@ -325,25 +347,32 @@ impl<Q> RowGroupsMerger<Q>
 where
     Q: QueueReader + 'static + ?Sized,
 {
-    /// Build merger state from shift segments by flattening their row groups into
-    /// one validated read plan.
-    pub fn try_new_from_segments(
+    /// Build merger state from shift segments by flattening their row groups into one validated read plan.
+    pub fn new(
         queue_reader: Arc<Q>,
         segments: &[super::SegmentToRead],
         config: SortedBatchMergerConfig,
     ) -> Result<Self> {
         let read_plan = PlannedRowGroupRead::from_segments(segments);
-        Self::try_new_with_plan(queue_reader, read_plan, config)
+        Self::new_with_plan(queue_reader, read_plan, config, Arc::new(NoopRowGroupsMergerObserver))
+    }
+
+    /// Attach merger lifecycle observer.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn RowGroupsMergerObserver>) -> Self {
+        self.observer = observer;
+        self
     }
 
     /// Create a merger from an already flattened read plan.
     ///
     /// At this point no WAL data is opened yet. The method only validates the
     /// plan and initializes the pending set ordered by lower boundary.
-    fn try_new_with_plan(
+    fn new_with_plan(
         queue_reader: Arc<Q>,
         read_plan: Vec<PlannedRowGroupRead>,
         config: SortedBatchMergerConfig,
+        observer: Arc<dyn RowGroupsMergerObserver>,
     ) -> Result<Self> {
         if config.row_group_size == 0 {
             return Err(IngestError::Config(
@@ -363,6 +392,7 @@ where
             sort_descriptor: SortColumnsDescriptor::logs()?, // TODO(high): make a generic solution without binding to logs
             schema: SchemaRef::new(arrow::datatypes::Schema::empty()),
             queue_reader,
+            observer,
             pending_row_groups: read_plan.into_iter().map(PendingRowGroupWithOrder::new).collect(),
             active_cluster_streams: Vec::new(),
             heap: MergeHeap::new(),
@@ -766,6 +796,16 @@ where
     /// Drop all state associated with the current cluster after it has been
     /// fully drained or found empty.
     fn complete_active_cluster(&mut self) {
+        for stream_state in &mut self.active_cluster_streams {
+            if stream_state.open_in_observer {
+                self.observer.on_row_group_closed(
+                    stream_state.source.segment_offset,
+                    stream_state.source.row_group_idx,
+                    stream_state.source.row_group_bytes,
+                );
+                stream_state.open_in_observer = false;
+            }
+        }
         if let Some(stats) = self.active_cluster.take() {
             debug!(
                 cluster_row_groups = stats.row_groups,
@@ -794,6 +834,7 @@ where
     /// Register one opened WAL source in the active cluster and seed the heap
     /// with the first row from its first non-empty batch.
     fn push_opened_source(&mut self, opened: OpenedSource) -> Result<()> {
+        let opened_bytes = opened.source.row_group_bytes;
         if self.schema.fields().is_empty() {
             self.schema = opened.row_group.schema();
         } else if opened.row_group.schema() != self.schema {
@@ -813,6 +854,7 @@ where
             batch_generation: 1,
             cache: Some(cache),
             rows_consumed_total: 0,
+            open_in_observer: false,
         });
         let comparator = RowComparator::new(&self.active_cluster_streams);
         self.heap.push(
@@ -824,6 +866,18 @@ where
             },
             &comparator,
         )?;
+        // Set the flag first so Drop can always balance opened/closed callbacks
+        // even if observer implementation panics.
+        let stream_state = self
+            .active_cluster_streams
+            .get_mut(stream_idx)
+            .ok_or_else(|| IngestError::Shift("cannot access merger stream state after push".to_string()))?;
+        stream_state.open_in_observer = true;
+        self.observer.on_row_group_opened(
+            stream_state.source.segment_offset,
+            stream_state.source.row_group_idx,
+            opened_bytes,
+        );
         Ok(())
     }
 
@@ -883,6 +937,14 @@ where
             )
         })?
         else {
+            if stream_state.open_in_observer {
+                self.observer.on_row_group_closed(
+                    stream_state.source.segment_offset,
+                    stream_state.source.row_group_idx,
+                    stream_state.source.row_group_bytes,
+                );
+                stream_state.open_in_observer = false;
+            }
             stream_state.current_batch = None;
             stream_state.cache = None;
             stream_state.stream = None;
@@ -913,6 +975,15 @@ where
             row_idx: 0,
             segment_row_idx: stream_state.current_batch_start_row,
         }))
+    }
+}
+
+impl<Q> Drop for RowGroupsMerger<Q>
+where
+    Q: QueueReader + ?Sized + 'static,
+{
+    fn drop(&mut self) {
+        self.complete_active_cluster();
     }
 }
 
@@ -982,7 +1053,13 @@ async fn next_non_empty_batch(stream: &mut RecordBatchStream) -> Result<Option<R
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicI64, AtomicUsize, Ordering},
+        },
+    };
 
     use arrow::{
         array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
@@ -994,7 +1071,10 @@ mod tests {
     use tokio::time::{Duration, sleep};
     use tokio_util::sync::CancellationToken;
 
-    use super::{PlannedRowGroupRead, RowGroupsMerger, SortedBatchMergerConfig};
+    use super::{
+        NoopRowGroupsMergerObserver, PlannedRowGroupRead, RowGroupsMerger, RowGroupsMergerObserver,
+        SortedBatchMergerConfig,
+    };
     use crate::{
         error::IngestError,
         shift::executor::{PlannedRowGroup, SegmentToRead},
@@ -1004,10 +1084,81 @@ mod tests {
         },
     };
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct FakeQueueReader {
         batches: HashMap<(u64, usize), Vec<RecordBatch>>,
         open_delays: HashMap<(u64, usize), Duration>,
+        error_after_n_reads: Option<usize>,
+        read_segment_calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct FakeObserver {
+        open_row_groups: AtomicI64,
+        open_row_group_bytes: AtomicI64,
+        opened_calls: AtomicUsize,
+        closed_calls: AtomicUsize,
+        lifetime_calls: AtomicUsize,
+        opened_at: Mutex<HashMap<(u64, usize), std::time::Instant>>,
+        lifetimes: Mutex<Vec<Duration>>,
+    }
+
+    impl FakeObserver {
+        fn open_row_groups(&self) -> i64 {
+            self.open_row_groups.load(Ordering::SeqCst)
+        }
+
+        fn open_row_group_bytes(&self) -> i64 {
+            self.open_row_group_bytes.load(Ordering::SeqCst)
+        }
+
+        fn lifetime_calls(&self) -> usize {
+            self.lifetime_calls.load(Ordering::SeqCst)
+        }
+
+        fn lifetimes(&self) -> Vec<Duration> {
+            self.lifetimes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        }
+
+        fn opened_calls(&self) -> usize {
+            self.opened_calls.load(Ordering::SeqCst)
+        }
+
+        fn closed_calls(&self) -> usize {
+            self.closed_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RowGroupsMergerObserver for FakeObserver {
+        fn on_row_group_opened(&self, segment_offset: u64, row_group_idx: usize, bytes: u64) {
+            let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+            self.opened_calls.fetch_add(1, Ordering::SeqCst);
+            self.open_row_groups.fetch_add(1, Ordering::SeqCst);
+            self.open_row_group_bytes.fetch_add(bytes, Ordering::SeqCst);
+            self.opened_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((segment_offset, row_group_idx), std::time::Instant::now());
+        }
+
+        fn on_row_group_closed(&self, segment_offset: u64, row_group_idx: usize, bytes: u64) {
+            let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+            self.closed_calls.fetch_add(1, Ordering::SeqCst);
+            self.open_row_groups.fetch_sub(1, Ordering::SeqCst);
+            self.open_row_group_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            let opened_at = self
+                .opened_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(segment_offset, row_group_idx));
+            if let Some(opened_at) = opened_at {
+                self.lifetime_calls.fetch_add(1, Ordering::SeqCst);
+                self.lifetimes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(opened_at.elapsed());
+            }
+        }
     }
 
     #[async_trait]
@@ -1026,12 +1177,29 @@ mod tests {
 
         async fn read_segment(
             &self,
-            _topic: &icegate_queue::Topic,
+            topic: &icegate_queue::Topic,
             offset: u64,
             record_batch_idxs: &[usize],
             _cancel_token: &CancellationToken,
         ) -> icegate_queue::Result<icegate_queue::RecordBatchStream> {
-            let row_group_idx = *record_batch_idxs.first().expect("row group idx");
+            let read_segment_call = self.read_segment_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.error_after_n_reads.is_some_and(|limit| read_segment_call >= limit) {
+                return Err(icegate_queue::QueueError::Read {
+                    topic: topic.as_str().to_string(),
+                    offset,
+                    source: Box::new(std::io::Error::other("injected read_segment error in tests")),
+                });
+            }
+            let Some(&row_group_idx) = record_batch_idxs.first() else {
+                return Err(icegate_queue::QueueError::Read {
+                    topic: topic.as_str().to_string(),
+                    offset,
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "record_batch_idxs is empty",
+                    )),
+                });
+            };
             if let Some(delay) = self.open_delays.get(&(offset, row_group_idx)) {
                 sleep(*delay).await;
             }
@@ -1080,11 +1248,20 @@ mod tests {
     }
 
     fn plan(segment_offset: u64, row_group_idx: usize, batch: &RecordBatch) -> SegmentToRead {
+        plan_with_bytes(segment_offset, row_group_idx, batch, 1)
+    }
+
+    fn plan_with_bytes(
+        segment_offset: u64,
+        row_group_idx: usize,
+        batch: &RecordBatch,
+        row_group_bytes: u64,
+    ) -> SegmentToRead {
         SegmentToRead {
             segment_offset,
             row_groups: vec![PlannedRowGroup {
                 row_group_idx,
-                row_group_bytes: 1,
+                row_group_bytes,
                 boundary_range: logs_row_group_boundary_range_from_batch(batch).expect("boundary range"),
             }],
         }
@@ -1134,7 +1311,9 @@ mod tests {
             queue_reader: Arc::new(FakeQueueReader {
                 batches: HashMap::new(),
                 open_delays: HashMap::new(),
+                ..FakeQueueReader::default()
             }),
+            observer: Arc::new(NoopRowGroupsMergerObserver),
             pending_row_groups: PlannedRowGroupRead::from_segments(segments)
                 .into_iter()
                 .map(super::PendingRowGroupWithOrder::new)
@@ -1165,7 +1344,7 @@ mod tests {
         segments: Vec<SegmentToRead>,
         row_group_size: usize,
     ) -> Vec<i64> {
-        let merger = RowGroupsMerger::try_new_from_segments(
+        let merger = RowGroupsMerger::new(
             queue_reader,
             &segments,
             SortedBatchMergerConfig {
@@ -1195,7 +1374,7 @@ mod tests {
         segments: Vec<SegmentToRead>,
         row_group_size: usize,
     ) -> Vec<RecordBatch> {
-        let merger = RowGroupsMerger::try_new_from_segments(
+        let merger = RowGroupsMerger::new(
             queue_reader,
             &segments,
             SortedBatchMergerConfig {
@@ -1210,6 +1389,37 @@ mod tests {
         merger.into_stream().try_collect::<Vec<_>>().await.expect("merged")
     }
 
+    async fn merged_values_with_observer(
+        queue_reader: Arc<FakeQueueReader>,
+        segments: Vec<SegmentToRead>,
+        observer: Arc<dyn RowGroupsMergerObserver>,
+    ) -> Vec<i64> {
+        let merger = RowGroupsMerger::new(
+            queue_reader,
+            &segments,
+            SortedBatchMergerConfig {
+                row_group_size: 8,
+                read_parallelism: 2,
+                topic: "logs".to_string(),
+                cancel_token: CancellationToken::new(),
+            },
+        )
+        .expect("merger")
+        .with_observer(observer);
+
+        merger
+            .into_stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("merged")
+            .into_iter()
+            .flat_map(|batch| {
+                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
+                (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn merger_preserves_global_order_across_non_overlapping_clusters() {
         let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 1)]);
@@ -1222,9 +1432,10 @@ mod tests {
                 ((3, 0), vec![batch_3.clone()]),
             ]),
             open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
         });
         let segments = vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2), plan(3, 0, &batch_3)];
-        let merger = RowGroupsMerger::try_new_from_segments(
+        let merger = RowGroupsMerger::new(
             queue_reader,
             &segments,
             SortedBatchMergerConfig {
@@ -1257,6 +1468,7 @@ mod tests {
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch.clone()])]),
             open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
         });
 
         let batches = merged_batches_with_row_group_size(queue_reader, vec![plan(1, 0, &batch)], 2).await;
@@ -1288,6 +1500,7 @@ mod tests {
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
             open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
         });
 
         let values =
@@ -1309,11 +1522,12 @@ mod tests {
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
             open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
         });
         let batch_1_value_column = Arc::clone(batch_1.column(3));
         let batch_2_value_column = Arc::clone(batch_2.column(3));
 
-        let merger = RowGroupsMerger::try_new_from_segments(
+        let merger = RowGroupsMerger::new(
             queue_reader,
             &[plan(1, 0, &batch_1), plan(2, 0, &batch_2)],
             SortedBatchMergerConfig {
@@ -1351,9 +1565,10 @@ mod tests {
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
             open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
         });
         let cancel_token = CancellationToken::new();
-        let merger = RowGroupsMerger::try_new_from_segments(
+        let merger = RowGroupsMerger::new(
             queue_reader,
             &[plan(1, 0, &batch_1), plan(2, 0, &batch_2)],
             SortedBatchMergerConfig {
@@ -1390,10 +1605,11 @@ mod tests {
                 ((3, 0), vec![batch_3.clone()]),
             ]),
             open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
         });
         let segments = vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2), plan(3, 0, &batch_3)];
 
-        let merger = RowGroupsMerger::try_new_from_segments(
+        let merger = RowGroupsMerger::new(
             queue_reader,
             &segments,
             SortedBatchMergerConfig {
@@ -1434,6 +1650,7 @@ mod tests {
                 ((12, 0), vec![batch_3.clone()]),
             ]),
             open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
         });
         let values = merged_values(
             queue_reader,
@@ -1457,6 +1674,7 @@ mod tests {
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((7, 0), vec![row_group_0.clone()]), ((7, 1), vec![row_group_1.clone()])]),
             open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
         });
         let values = merged_values(queue_reader, vec![plan(7, 0, &row_group_0), plan(7, 1, &row_group_1)]).await;
 
@@ -1479,6 +1697,7 @@ mod tests {
                 ((11, 0), Duration::from_millis(10)),
                 ((12, 0), Duration::from_millis(0)),
             ]),
+            ..FakeQueueReader::default()
         });
         let values = merged_values(
             queue_reader,
@@ -1487,6 +1706,208 @@ mod tests {
         .await;
 
         assert_eq!(values, vec![11, 21, 31]);
+    }
+
+    #[tokio::test]
+    async fn merger_observer_tracks_opened_and_closed_row_groups() {
+        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(40), 1)]);
+        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 2)]);
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
+            open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
+        });
+        let observer = Arc::new(FakeObserver::default());
+        let merger = RowGroupsMerger::new(
+            queue_reader,
+            &[plan_with_bytes(1, 0, &batch_1, 10), plan_with_bytes(2, 0, &batch_2, 20)],
+            SortedBatchMergerConfig {
+                row_group_size: 1,
+                read_parallelism: 2,
+                topic: "logs".to_string(),
+                cancel_token: CancellationToken::new(),
+            },
+        )
+        .expect("merger")
+        .with_observer(Arc::clone(&observer) as Arc<dyn RowGroupsMergerObserver>);
+        let mut stream = merger.into_stream();
+
+        let _ = stream.try_next().await.expect("first batch").expect("first batch");
+        assert!(observer.opened_calls() >= 1);
+        assert!(observer.closed_calls() <= observer.opened_calls());
+
+        let _remaining = stream.try_collect::<Vec<_>>().await.expect("remaining batches");
+        assert_eq!(observer.opened_calls(), 2);
+        assert_eq!(observer.closed_calls(), 2);
+        assert_eq!(observer.open_row_groups(), 0);
+        assert_eq!(observer.open_row_group_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn merger_observer_resets_open_counts_on_cancel() {
+        let batch_1 = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(60), 1),
+            (Some("acc-1"), Some("svc-1"), Some(40), 3),
+            (Some("acc-1"), Some("svc-1"), Some(20), 5),
+        ]);
+        let batch_2 = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(50), 2),
+            (Some("acc-1"), Some("svc-1"), Some(30), 4),
+            (Some("acc-1"), Some("svc-1"), Some(10), 6),
+        ]);
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
+            open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
+        });
+        let observer = Arc::new(FakeObserver::default());
+        let cancel_token = CancellationToken::new();
+        let merger = RowGroupsMerger::new(
+            queue_reader,
+            &[plan_with_bytes(1, 0, &batch_1, 10), plan_with_bytes(2, 0, &batch_2, 20)],
+            SortedBatchMergerConfig {
+                row_group_size: 2,
+                read_parallelism: 2,
+                topic: "logs".to_string(),
+                cancel_token: cancel_token.clone(),
+            },
+        )
+        .expect("merger")
+        .with_observer(Arc::clone(&observer) as Arc<dyn RowGroupsMergerObserver>);
+
+        let mut stream = merger.into_stream();
+        let _ = stream.try_next().await.expect("first batch").expect("first batch");
+        assert!(observer.open_row_groups() > 0);
+        cancel_token.cancel();
+        let _ = stream.try_next().await.expect_err("cancelled");
+        drop(stream);
+
+        assert_eq!(observer.open_row_groups(), 0);
+        assert_eq!(observer.open_row_group_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn merger_observer_keeps_balanced_counts_when_bootstrap_fails() {
+        let batch = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(40), 1)]);
+        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(40), 2)]);
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches: HashMap::from([((1, 0), vec![batch.clone()]), ((2, 0), vec![batch_2.clone()])]),
+            open_delays: HashMap::new(),
+            error_after_n_reads: Some(2),
+            ..FakeQueueReader::default()
+        });
+        let observer = Arc::new(FakeObserver::default());
+        let merger = RowGroupsMerger::new(
+            queue_reader,
+            &[plan_with_bytes(1, 0, &batch, 10), plan_with_bytes(2, 0, &batch_2, 20)],
+            SortedBatchMergerConfig {
+                row_group_size: 1,
+                read_parallelism: 1,
+                topic: "logs".to_string(),
+                cancel_token: CancellationToken::new(),
+            },
+        )
+        .expect("merger")
+        .with_observer(Arc::clone(&observer) as Arc<dyn RowGroupsMergerObserver>);
+
+        let mut stream = merger.into_stream();
+        let err = stream.try_next().await.expect_err("bootstrap must fail");
+        assert!(matches!(err, IngestError::ShiftQueueRead(_)));
+        drop(stream);
+
+        assert_eq!(observer.opened_calls(), 1);
+        assert_eq!(observer.closed_calls(), 1);
+        assert_eq!(observer.open_row_groups(), 0);
+        assert_eq!(observer.open_row_group_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn merger_output_is_unchanged_with_observer_enabled() {
+        let batch_1 = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(40), 1),
+            (Some("acc-1"), Some("svc-1"), Some(20), 3),
+        ]);
+        let batch_2 = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(30), 2),
+            (Some("acc-1"), Some("svc-1"), Some(10), 4),
+        ]);
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
+            open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
+        });
+        let expected = merged_values(
+            Arc::clone(&queue_reader),
+            vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2)],
+        )
+        .await;
+        let actual = merged_values_with_observer(
+            queue_reader,
+            vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2)],
+            Arc::new(FakeObserver::default()) as Arc<dyn RowGroupsMergerObserver>,
+        )
+        .await;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn merger_observer_records_row_group_lifetime_for_multi_stream_merge() {
+        let batch_1 = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(40), 1),
+            (Some("acc-1"), Some("svc-1"), Some(20), 3),
+        ]);
+        let batch_2 = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(30), 2),
+            (Some("acc-1"), Some("svc-1"), Some(10), 4),
+        ]);
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
+            open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
+        });
+        let observer = Arc::new(FakeObserver::default());
+        let _values = merged_values_with_observer(
+            queue_reader,
+            vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2)],
+            Arc::clone(&observer) as Arc<dyn RowGroupsMergerObserver>,
+        )
+        .await;
+
+        assert_eq!(observer.lifetime_calls(), 2);
+        assert_eq!(observer.lifetimes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn merger_observer_records_row_group_lifetime_for_single_stream_merge() {
+        let batch = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(30), 1),
+            (Some("acc-1"), Some("svc-1"), Some(20), 2),
+            (Some("acc-1"), Some("svc-1"), Some(10), 3),
+        ]);
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches: HashMap::from([((1, 0), vec![batch.clone()])]),
+            open_delays: HashMap::new(),
+            ..FakeQueueReader::default()
+        });
+        let observer = Arc::new(FakeObserver::default());
+        let merger = RowGroupsMerger::new(
+            queue_reader,
+            &[plan(1, 0, &batch)],
+            SortedBatchMergerConfig {
+                row_group_size: 1,
+                read_parallelism: 1,
+                topic: "logs".to_string(),
+                cancel_token: CancellationToken::new(),
+            },
+        )
+        .expect("merger")
+        .with_observer(Arc::clone(&observer) as Arc<dyn RowGroupsMergerObserver>);
+
+        let _batches = merger.into_stream().try_collect::<Vec<_>>().await.expect("merged");
+
+        assert_eq!(observer.lifetime_calls(), 1);
+        assert_eq!(observer.lifetimes().len(), 1);
     }
 
     #[test]
@@ -1597,10 +2018,11 @@ mod tests {
             ),
         ]);
 
-        let Err(err) = RowGroupsMerger::try_new_with_plan(
+        let Err(err) = RowGroupsMerger::new_with_plan(
             Arc::new(FakeQueueReader {
                 batches: HashMap::new(),
                 open_delays: HashMap::new(),
+                ..FakeQueueReader::default()
             }),
             plan,
             SortedBatchMergerConfig {
@@ -1609,6 +2031,7 @@ mod tests {
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
             },
+            Arc::new(NoopRowGroupsMergerObserver),
         ) else {
             panic!("incompatible boundary keys must be rejected");
         };
@@ -1633,10 +2056,11 @@ mod tests {
             ),
         ]);
 
-        let Err(err) = RowGroupsMerger::try_new_with_plan(
+        let Err(err) = RowGroupsMerger::new_with_plan(
             Arc::new(FakeQueueReader {
                 batches: HashMap::new(),
                 open_delays: HashMap::new(),
+                ..FakeQueueReader::default()
             }),
             plan,
             SortedBatchMergerConfig {
@@ -1645,6 +2069,7 @@ mod tests {
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
             },
+            Arc::new(NoopRowGroupsMergerObserver),
         ) else {
             panic!("duplicate row groups must be rejected");
         };

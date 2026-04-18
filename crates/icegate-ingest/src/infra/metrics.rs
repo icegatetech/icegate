@@ -16,7 +16,7 @@ use object_store::{
 };
 use opentelemetry::{
     KeyValue,
-    metrics::{Counter, Gauge, Histogram, Meter, MeterProvider as _},
+    metrics::{Counter, Gauge, Histogram, Meter, MeterProvider as _, UpDownCounter},
 };
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 
@@ -47,6 +47,9 @@ pub struct ShiftMetrics {
     already_committed_total: Counter<u64>,
     task_failures_total: Counter<u64>,
     task_success_total: Counter<u64>,
+    row_groups_merger_open_row_groups: UpDownCounter<i64>,
+    row_groups_merger_open_row_group_bytes: UpDownCounter<i64>,
+    row_groups_merger_row_group_lifetime_duration: Histogram<f64>,
 }
 
 impl ShiftMetrics {
@@ -82,6 +85,15 @@ impl ShiftMetrics {
             already_committed_total: meter.u64_counter("icegate_ingest_shift_already_committed").build(),
             task_failures_total: meter.u64_counter("icegate_ingest_shift_task_failures").build(),
             task_success_total: meter.u64_counter("icegate_ingest_shift_task_success").build(),
+            row_groups_merger_open_row_groups: meter
+                .i64_up_down_counter("icegate_ingest_shift_row_groups_merger_open_row_groups")
+                .build(),
+            row_groups_merger_open_row_group_bytes: meter
+                .i64_up_down_counter("icegate_ingest_shift_row_groups_merger_open_row_group_bytes")
+                .build(),
+            row_groups_merger_row_group_lifetime_duration: meter
+                .f64_histogram("icegate_ingest_shift_row_groups_merger_row_group_lifetime_duration")
+                .build(),
         }
     }
 
@@ -172,6 +184,20 @@ impl ShiftMetrics {
             .u64_counter("icegate_ingest_shift_task_success")
             .with_description("Number of shift task successes")
             .build();
+        let row_groups_merger_open_row_groups = meter
+            .i64_up_down_counter("icegate_ingest_shift_row_groups_merger_open_row_groups")
+            .with_description("Number of row groups currently open in row groups merger")
+            .build();
+        let row_groups_merger_open_row_group_bytes = meter
+            .i64_up_down_counter("icegate_ingest_shift_row_groups_merger_open_row_group_bytes")
+            .with_description("Bytes of row groups currently open in row groups merger")
+            .with_unit("By")
+            .build();
+        let row_groups_merger_row_group_lifetime_duration = meter
+            .f64_histogram("icegate_ingest_shift_row_groups_merger_row_group_lifetime_duration")
+            .with_description("Lifetime of one row group while it stays open in row groups merger")
+            .with_unit("s")
+            .build();
 
         Self {
             enabled: true,
@@ -194,6 +220,9 @@ impl ShiftMetrics {
             already_committed_total,
             task_failures_total,
             task_success_total,
+            row_groups_merger_open_row_groups,
+            row_groups_merger_open_row_group_bytes,
+            row_groups_merger_row_group_lifetime_duration,
         }
     }
 
@@ -415,6 +444,33 @@ impl ShiftMetrics {
                 KeyValue::new("topic", topic.to_string()),
             ],
         );
+    }
+
+    /// Add delta to currently open row groups in merger.
+    pub fn add_row_groups_merger_open_row_groups(&self, delta: i64, topic: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.row_groups_merger_open_row_groups
+            .add(delta, &[KeyValue::new("topic", topic.to_string())]);
+    }
+
+    /// Add delta to currently open row group bytes in merger.
+    pub fn add_row_groups_merger_open_row_group_bytes(&self, delta: i64, topic: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.row_groups_merger_open_row_group_bytes
+            .add(delta, &[KeyValue::new("topic", topic.to_string())]);
+    }
+
+    /// Record lifetime of one row group while it stays open in merger.
+    pub fn record_row_groups_merger_row_group_lifetime_duration(&self, duration: Duration, topic: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.row_groups_merger_row_group_lifetime_duration
+            .record(duration.as_secs_f64(), &[KeyValue::new("topic", topic.to_string())]);
     }
 }
 
