@@ -893,7 +893,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 7
+        "y": 82
       },
       "id": 26,
       "maxDataPoints": 500,
@@ -2153,7 +2153,7 @@
           "datasource": "Prometheus",
           "editorMode": "code",
           "expr": "sum by (protocol, signal) (rate(icegate_ingest_wal_queue_unavailable_total{job=\"ingest\"}[1m]))",
-          "legendFormat": "{{protocol}} - {{signal}} - {{status}}",
+          "legendFormat": "{{protocol}} - {{signal}}",
           "range": true,
           "refId": "A"
         }
@@ -5502,7 +5502,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "Open row groups and open row group bytes in row groups merger.\nIf value <=1:\n- there are no overlap clusters;\n- there are intersections, but the subsequent ones row group are empty and do not fall into active streams;\n- the intersections are very short.",
+      "description": "Open row groups in row groups merger.\nIf value <=1:\n- there are no overlap clusters;\n- there are intersections, but the subsequent ones row group are empty and do not fall into active streams;\n- the intersections are very short.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6720,7 +6720,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 82
+        "y": 7
       },
       "id": 75,
       "maxDataPoints": 500,

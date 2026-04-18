@@ -122,9 +122,17 @@ impl RowGroupsMergerObserverWithMetrics {
 impl RowGroupsMergerObserver for RowGroupsMergerObserverWithMetrics {
     fn on_row_group_opened(&self, segment_offset: u64, row_group_idx: usize, bytes: u64) {
         let bytes_i64 = i64::try_from(bytes).unwrap_or(i64::MAX);
-        {
-            let mut opened_at = self.opened_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            opened_at.insert((segment_offset, row_group_idx), Instant::now());
+        let previous = self
+            .opened_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((segment_offset, row_group_idx), Instant::now());
+        if previous.is_some() {
+            tracing::error!(
+                segment_offset,
+                row_group_idx,
+                "row group opened twice without close; replacing previous open timestamp"
+            );
         }
         self.metrics.add_row_groups_merger_open_row_groups(1, self.topic.as_str());
         self.metrics
@@ -145,6 +153,12 @@ impl RowGroupsMergerObserver for RowGroupsMergerObserverWithMetrics {
         if let Some(opened_at) = opened_at {
             self.metrics
                 .record_row_groups_merger_row_group_lifetime_duration(opened_at.elapsed(), self.topic.as_str());
+        } else {
+            tracing::error!(
+                segment_offset,
+                row_group_idx,
+                "row group closed without open; skipping lifetime metric"
+            );
         }
     }
 }
