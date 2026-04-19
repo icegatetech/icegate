@@ -216,7 +216,7 @@ impl TraceService for OtlpGrpcService {
         let Some(batch) = batch_opt else {
             // No valid spans - return success with any transform-time drops as rejected.
             request_metrics.record_records_per_request(0);
-            request_metrics.finish_ok();
+            crate::otlp_traces_partial::finish_metrics_with_drops(&request_metrics, drops);
             return Ok(Response::new(ExportTraceServiceResponse {
                 partial_success: grpc_partial_success_from_drops(drops).map_err(Status::from)?,
             }));
@@ -235,7 +235,7 @@ impl TraceService for OtlpGrpcService {
         })?;
         request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_TRACES, STATUS_OK);
         let Some(prepared) = prepared else {
-            request_metrics.finish_ok();
+            crate::otlp_traces_partial::finish_metrics_with_drops(&request_metrics, drops);
             return Ok(Response::new(ExportTraceServiceResponse {
                 partial_success: grpc_partial_success_from_drops(drops).map_err(Status::from)?,
             }));
@@ -274,7 +274,7 @@ impl TraceService for OtlpGrpcService {
                     "OTLP GRPC traces request ended successfully"
                 );
                 request_metrics.record_wal_ack_duration(ack_start.elapsed(), icegate_common::SPANS_TOPIC, STATUS_OK);
-                request_metrics.finish_ok();
+                crate::otlp_traces_partial::finish_metrics_with_drops(&request_metrics, drops);
                 Ok(Response::new(ExportTraceServiceResponse {
                     partial_success: grpc_partial_success_from_drops(drops).map_err(Status::from)?,
                 }))

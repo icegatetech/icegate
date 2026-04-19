@@ -20,18 +20,42 @@ spec:
         app.kubernetes.io/name: trino
         app.kubernetes.io/component: coordinator
     spec:
+      # Trino's coordinator image runs as the `trino` user (UID/GID 1000) by
+      # default. `runAsNonRoot: true` requires a numeric UID so the kubelet
+      # can verify the user is non-root without resolving names inside the
+      # image, hence the explicit 1000s. Trino writes its working state to
+      # /data/trino, so we can't set readOnlyRootFilesystem: true without
+      # adding an emptyDir volume; that's a follow-up if stricter hardening
+      # is needed.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: trino
           image: trinodb/trino:479
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http
               containerPort: 8080
               protocol: TCP
           env:
             - name: AWS_ACCESS_KEY_ID
-              value: minioadmin
+              valueFrom:
+                secretKeyRef:
+                  name: trino-s3-credentials
+                  key: AWS_ACCESS_KEY_ID
             - name: AWS_SECRET_ACCESS_KEY
-              value: minioadmin
+              valueFrom:
+                secretKeyRef:
+                  name: trino-s3-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            # Region is not sensitive — keep inline.
             - name: AWS_REGION
               value: us-east-1
           volumeMounts:

@@ -184,34 +184,37 @@ async fn create_table(catalog: &dyn Catalog, namespace: &NamespaceIdent, def: &T
     Ok(())
 }
 
-/// Upgrade existing table schemas
+/// Report schema differences between the catalog and the code.
 ///
-/// Checks each observability table for schema differences and applies
-/// necessary evolution operations.
+/// Checks each observability table for schema differences. **Automatic
+/// evolution is not performed.** When a difference is detected, operators
+/// must drop and re-create the affected table(s) to apply the code's
+/// schema; no in-place schema evolution is attempted.
 ///
-/// # Schema Evolution Support
+/// # Behavior
 ///
-/// Currently supports:
-/// - Adding new optional columns
-/// - Updating partition specs
-/// - Updating sort orders
-///
-/// Does NOT support (requires manual intervention):
-/// - Removing columns
-/// - Changing column types to incompatible types
-/// - Changing required columns to optional or vice versa
+/// - **Dry-run mode**: logs differences for every mismatched table and
+///   returns `Ok(operations)` containing one `MigrationOperation::Upgrade`
+///   entry per mismatch so the operator can preview the full list.
+/// - **Non-dry-run mode**: logs differences for every mismatched table
+///   discovered during the scan, then returns
+///   `Err(MaintainError::Migration)` with an aggregated message naming
+///   all tables that must be dropped and re-created. Tables that match the
+///   code's schema pass silently; missing tables log a warning and are
+///   skipped (operator must run `migrate create` first).
 ///
 /// # Return Value
 ///
-/// Returns a list of operations. In dry-run mode, operations represent what
-/// *would* happen, not what actually occurred.
+/// `Ok(Vec<MigrationOperation>)` only in dry-run mode (or when every
+/// table is up to date). Non-dry-run with at least one mismatch always
+/// returns `Err(MaintainError::Migration(..))`.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - Table loading fails
-/// - Schema comparison fails
-/// - Schema evolution fails
+/// - The catalog rejects a `table_exists` or `load_table` call.
+/// - One or more tables have schemas that differ from the code and we're
+///   not in dry-run mode (see `MaintainError::Migration`).
 #[allow(clippy::cognitive_complexity)]
 pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Result<Vec<MigrationOperation>> {
     let catalog_ref = catalog.as_ref();
@@ -261,23 +264,29 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
     }
 
     if !dry_run && !differing_tables.is_empty() {
-        return Err(crate::error::MaintainError::Migration(
-            format_upgrade_required_message_multi(&differing_tables),
-        ));
+        return Err(crate::error::MaintainError::Migration(format_upgrade_required_message(
+            &differing_tables,
+        )));
     }
 
     Ok(operations)
 }
 
-/// Build the operator-facing error message when a set of tables' schemas in
-/// the catalog differ from the code and automatic evolution is not supported.
-/// Accepts one or more table names and joins them into a single actionable
-/// message so the operator can see the full remediation list in one run.
-fn format_upgrade_required_message_multi(table_names: &[String]) -> String {
+/// Build the operator-facing error message when one or more tables' schemas
+/// in the catalog differ from the code and automatic evolution is not
+/// supported. Accepts one or more table names, uses singular/plural wording
+/// based on the count, and joins names with `, ` for the bracketed list so
+/// the operator sees the full remediation list in one run.
+fn format_upgrade_required_message(table_names: &[String]) -> String {
+    let (subject, remediation) = if table_names.len() == 1 {
+        ("Table", "the table")
+    } else {
+        ("Tables", "the tables")
+    };
     let list = table_names.join(", ");
     format!(
-        "Tables [{list}] schema in catalog differs from code. Automatic evolution \
-         is not supported; drop the tables manually and re-run `icegate-maintain migrate create`."
+        "{subject} [{list}] schema in catalog differs from code. Automatic evolution \
+         is not supported; drop {remediation} manually and re-run `icegate-maintain migrate create`."
     )
 }
 
@@ -402,16 +411,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_upgrade_error_message_names_single_table_and_recovery() {
-        let msg = format_upgrade_required_message_multi(&["spans".to_string()]);
+    fn format_upgrade_error_message_single_table_uses_singular_wording() {
+        let msg = format_upgrade_required_message(&["spans".to_string()]);
+        assert!(msg.starts_with("Table ["));
         assert!(msg.contains("spans"));
-        assert!(msg.contains("drop the tables manually"));
+        assert!(msg.contains("drop the table manually"));
         assert!(msg.contains("icegate-maintain migrate create"));
     }
 
     #[test]
-    fn format_upgrade_error_message_lists_all_differing_tables() {
-        let msg = format_upgrade_required_message_multi(&["logs".to_string(), "spans".to_string()]);
+    fn format_upgrade_error_message_multiple_tables_uses_plural_wording() {
+        let msg = format_upgrade_required_message(&["logs".to_string(), "spans".to_string()]);
+        assert!(msg.starts_with("Tables ["));
         assert!(msg.contains("logs"));
         assert!(msg.contains("spans"));
         assert!(msg.contains("drop the tables manually"));

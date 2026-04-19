@@ -6,6 +6,7 @@
 //! protocols stay in lockstep.
 
 use crate::error::IngestError;
+use crate::infra::metrics::OtlpRequestRecorder;
 
 /// Message reported when spans are dropped at transform time because their
 /// `trace_id` or `span_id` failed validation.
@@ -24,6 +25,20 @@ pub fn rejected_spans_from_drops(drops: usize) -> Result<Option<i64>, IngestErro
     i64::try_from(drops)
         .map(Some)
         .map_err(|_| IngestError::Validation("Rejected spans count exceeds i64".to_string()))
+}
+
+/// Finish request metrics with status "partial" when there are transform-time
+/// drops, otherwise with status "ok".
+///
+/// Shared by the HTTP and gRPC trace handlers: both report partial success
+/// on any drop count > 0 so Grafana panels for `status="partial"` reflect
+/// every path where some spans failed validation.
+pub fn finish_metrics_with_drops(request_metrics: &OtlpRequestRecorder, drops: usize) {
+    if drops > 0 {
+        request_metrics.finish_partial();
+    } else {
+        request_metrics.finish_ok();
+    }
 }
 
 /// Compose a combined error message when both transform-time drops and a
