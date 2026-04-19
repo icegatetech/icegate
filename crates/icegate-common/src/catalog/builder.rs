@@ -306,6 +306,7 @@ impl CatalogBuilder {
         let access_key_id = config.properties.get("access_key_id").cloned();
         let secret_access_key = config.properties.get("secret_access_key").cloned();
 
+        // TODO(high): move to custom config and build fileio from custom config
         let mut file_io_props = config.properties.clone();
         file_io_props.insert("warehouse".to_string(), format!("s3://{bucket}"));
         if let Some(ref endpoint_value) = endpoint {
@@ -316,30 +317,148 @@ impl CatalogBuilder {
                 .entry("s3.path-style-access".to_string())
                 .or_insert_with(|| "true".to_string());
         }
+        if let Some(ref key) = access_key_id {
+            file_io_props
+                .entry("s3.access-key-id".to_string())
+                .or_insert_with(|| key.clone());
+        }
+        if let Some(ref key) = secret_access_key {
+            file_io_props
+                .entry("s3.secret-access-key".to_string())
+                .or_insert_with(|| key.clone());
+        }
         file_io_props.entry("s3.region".to_string()).or_insert_with(|| region.clone());
 
         let file_io = FileIOBuilder::new(io_cache.storage_factory()).with_props(file_io_props).build();
 
+        let codec = config
+            .properties
+            .get("codec")
+            .map_or(Ok(CatalogCodecKind::Json), |value| value.parse())
+            .map_err(|e: icegate_catalog_s3::Error| CommonError::Config(format!("invalid s3 catalog codec: {e}")))?;
+
         let catalog = S3Catalog::new(
             S3CatalogConfig {
-                bucket,
-                region,
-                endpoint,
+                bucket: bucket.clone(),
+                region: region.clone(),
+                endpoint: endpoint.clone(),
                 access_key_id,
                 secret_access_key,
                 warehouse: warehouse.to_string(),
-                codec: CatalogCodecKind::Json, // TODO(crit): to config
+                codec,
             },
             file_io,
         )
         .await
         .map_err(|e| CommonError::Config(format!("failed to create s3 catalog: {e}")))?;
 
-        tracing::info!(
-            warehouse = %warehouse,
-            "Created S3 catalog"
-        );
+        if let Some(endpoint) = endpoint.as_deref() {
+            tracing::info!(
+                bucket = %bucket,
+                region = %region,
+                warehouse = %warehouse,
+                endpoint = %endpoint,
+                "Created S3 catalog"
+            );
+        } else {
+            tracing::info!(
+                bucket = %bucket,
+                region = %region,
+                warehouse = %warehouse,
+                "Created S3 catalog"
+            );
+        }
 
         Ok(Arc::new(catalog))
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use bytes::Bytes;
+    use iceberg::{NamespaceIdent, TableCreation};
+
+    use super::*;
+    use crate::error::CommonError;
+    use crate::testing::{MinIOContainer, create_s3_bucket};
+
+    fn test_catalog_config(endpoint: &str, bucket: &str) -> CatalogConfig {
+        CatalogConfig {
+            backend: CatalogBackend::S3 {
+                warehouse: "catalog".to_string(),
+            },
+            warehouse: "warehouse".to_string(),
+            properties: HashMap::from([
+                ("bucket".to_string(), bucket.to_string()),
+                ("region".to_string(), "us-east-1".to_string()),
+                ("endpoint".to_string(), endpoint.to_string()),
+                ("access_key_id".to_string(), "minioadmin".to_string()),
+                ("secret_access_key".to_string(), "minioadmin".to_string()),
+            ]),
+            cache: None,
+        }
+    }
+
+    fn test_schema() -> iceberg::spec::Schema {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        Schema::builder()
+            .with_schema_id(0)
+            .with_identifier_field_ids(vec![1])
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema")
+    }
+
+    #[tokio::test]
+    async fn s3_catalog_file_io_reads_with_explicit_credentials() {
+        let minio = MinIOContainer::start().await.expect("start minio");
+        let bucket = format!("catalog-{}", rand::random::<u64>());
+        create_s3_bucket(minio.endpoint(), &bucket).await.expect("create bucket");
+
+        let catalog = CatalogBuilder::from_config(&test_catalog_config(minio.endpoint(), &bucket), &IoHandle::noop())
+            .await
+            .expect("build catalog");
+        let namespace = NamespaceIdent::new("ns1".to_string());
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder().name("tbl".to_string()).schema(test_schema()).build(),
+            )
+            .await
+            .expect("create table");
+
+        let data_path = format!("s3://{bucket}/warehouse/data/smoke.txt");
+        let output = table.file_io().new_output(&data_path).expect("create output");
+        output.write(Bytes::from_static(b"ok")).await.expect("write data file");
+
+        let input = table.file_io().new_input(&data_path).expect("create input");
+        let metadata = input.metadata().await.expect("stat data file");
+        let bytes = input.read().await.expect("read data file");
+
+        assert_eq!(metadata.size, 2);
+        assert_eq!(bytes, Bytes::from_static(b"ok"));
+    }
+
+    #[test]
+    fn s3_catalog_creation_requires_bucket_at_validation_time() {
+        let config = CatalogConfig {
+            backend: CatalogBackend::S3 {
+                warehouse: "catalog".to_string(),
+            },
+            warehouse: "warehouse".to_string(),
+            properties: HashMap::new(),
+            cache: None,
+        };
+
+        let error = config.validate().expect_err("missing bucket must fail validation");
+        let CommonError::Config(message) = error else {
+            panic!("unexpected error type");
+        };
+        assert_eq!(message, "S3 catalog requires `catalog.properties.bucket`");
     }
 }

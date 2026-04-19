@@ -7,7 +7,9 @@ mod error;
 mod model;
 mod storage;
 
-pub use catalog::{CommitTableRequest, CommitTableResponse, S3Catalog};
-pub use codec::CatalogCodecKind;
-pub use config::S3CatalogConfig;
+#[cfg(test)]
+mod tests;
+
+pub use catalog::S3Catalog;
+pub use config::{CatalogCodecKind, S3CatalogConfig};
 pub use error::{Error, Result};

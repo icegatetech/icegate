@@ -148,6 +148,11 @@ impl CatalogConfig {
                 if warehouse.trim().is_empty() {
                     return Err(CommonError::Config("S3 catalog warehouse cannot be empty".into()));
                 }
+                if self.properties.get("bucket").is_none_or(|bucket| bucket.trim().is_empty()) {
+                    return Err(CommonError::Config(
+                        "S3 catalog requires `catalog.properties.bucket`".into(),
+                    ));
+                }
             }
         }
 
@@ -195,5 +200,42 @@ impl Default for CatalogConfig {
             properties: HashMap::new(),
             cache: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn validate_rejects_missing_s3_bucket() {
+        let config = CatalogConfig {
+            backend: CatalogBackend::S3 {
+                warehouse: "catalog".to_string(),
+            },
+            warehouse: "warehouse".to_string(),
+            properties: HashMap::new(),
+            cache: None,
+        };
+
+        let error = config.validate().expect_err("validation must fail");
+        assert!(matches!(error, CommonError::Config(_)));
+    }
+
+    #[test]
+    fn validate_rejects_empty_s3_bucket() {
+        let config = CatalogConfig {
+            backend: CatalogBackend::S3 {
+                warehouse: "catalog".to_string(),
+            },
+            warehouse: "warehouse".to_string(),
+            properties: HashMap::from([("bucket".to_string(), "   ".to_string())]),
+            cache: None,
+        };
+
+        let error = config.validate().expect_err("validation must fail");
+        assert!(matches!(error, CommonError::Config(_)));
     }
 }
