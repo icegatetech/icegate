@@ -1407,6 +1407,7 @@ mod tests {
                 read_parallelism: 2,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger")
@@ -1735,6 +1736,7 @@ mod tests {
                 read_parallelism: 2,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger")
@@ -1779,6 +1781,7 @@ mod tests {
                 read_parallelism: 2,
                 topic: "logs".to_string(),
                 cancel_token: cancel_token.clone(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger")
@@ -1814,6 +1817,7 @@ mod tests {
                 read_parallelism: 1,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger")
@@ -1908,6 +1912,7 @@ mod tests {
                 read_parallelism: 1,
                 topic: "logs".to_string(),
                 cancel_token: CancellationToken::new(),
+                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
             },
         )
         .expect("merger")
