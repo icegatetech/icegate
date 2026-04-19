@@ -42,5 +42,5 @@ pub use common::{ComparisonOp, FieldRef, IntrinsicField, LiteralValue, Scope};
 pub use expr::TraceQLExpr;
 pub use metric::{AggregationOp, GroupingKeys, MetricsFunction, PipelineExpr, PipelineStage};
 pub use parser::Parser;
-pub use planner::{DEFAULT_SEARCH_LIMIT, Planner, QueryContext};
+pub use planner::{DEFAULT_SEARCH_LIMIT, DEFAULT_SPANS_PER_SPANSET, Planner, QueryContext};
 pub use spanset::{SpanFilter, SpanSelector, SpansetExpr, SpansetOp};

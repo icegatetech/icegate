@@ -14,6 +14,7 @@ use crate::{
     engine::QueryEngine,
     error::QueryError,
     traceql::{
+        DEFAULT_SPANS_PER_SPANSET,
         antlr::AntlrParser,
         datafusion::DataFusionPlanner,
         duration::parse_duration_opt,
@@ -45,11 +46,22 @@ pub async fn execute(
     let start = params.start.as_deref().map_or(now - Duration::hours(1), parse_time);
     let end = params.end.as_deref().map_or(now, parse_time);
 
+    // `spss=0` disables the per-trace span cap (matches upstream Tempo).
+    // Anything else — including the absent case — clamps to the
+    // server-side default so we never let a single pathological trace
+    // blow up stage 2's working set.
+    let spans_per_spanset = match params.spss {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(DEFAULT_SPANS_PER_SPANSET),
+    };
+
     let qctx = QueryContext {
         tenant_id,
         start,
         end,
         limit: params.limit,
+        spans_per_spanset,
         min_duration: params.min_duration.as_deref().and_then(parse_duration_opt),
         max_duration: params.max_duration.as_deref().and_then(parse_duration_opt),
         step: None,

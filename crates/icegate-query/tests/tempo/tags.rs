@@ -83,7 +83,8 @@ async fn v2_tags_groups_by_scope() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    // Resource scope must include the k8s.* key and the service_name column.
+    // Resource scope must include the k8s.* key and the OTel-dotted
+    // service.name tag (NOT the physical service_name column name).
     let resource = by_name.get("resource").expect("resource scope present");
     assert!(
         resource.contains(&"k8s.namespace.name"),
@@ -91,12 +92,18 @@ async fn v2_tags_groups_by_scope() -> Result<(), Box<dyn std::error::Error>> {
         resource
     );
     assert!(
-        resource.contains(&"service_name"),
-        "expected service_name in resource scope: {:?}",
+        resource.contains(&"service.name"),
+        "expected OTel-dotted service.name in resource scope: {:?}",
+        resource
+    );
+    assert!(
+        !resource.contains(&"service_name"),
+        "physical column name service_name leaked into resource scope: {:?}",
         resource
     );
 
-    // Span scope must include http.method and NOT include k8s.* keys.
+    // Span scope must include http.method and NOT include k8s.* keys nor
+    // any physical resource-column names.
     let span = by_name.get("span").expect("span scope present");
     assert!(
         span.contains(&"http.method"),
@@ -106,6 +113,11 @@ async fn v2_tags_groups_by_scope() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         !span.contains(&"k8s.namespace.name"),
         "did not expect k8s.namespace.name in span scope: {:?}",
+        span
+    );
+    assert!(
+        !span.contains(&"service_name") && !span.contains(&"cloud_account_id") && !span.contains(&"name"),
+        "physical resource/intrinsic column names leaked into span scope: {:?}",
         span
     );
 
@@ -259,6 +271,142 @@ async fn tag_values_for_span_attribute() -> Result<(), Box<dyn std::error::Error
         .filter_map(|v| v.as_str())
         .collect();
     assert!(values.contains(&"GET"), "expected GET in tagValues: {:?}", values);
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// `/api/v2/search/tag/{name}/values` must respond with the typed
+/// `{tagValues: [{type, value}], metrics: {inspectedBytes}}` payload that
+/// Grafana's query-builder UI expects. Without the v2 route the explore
+/// tab renders 404 and value pickers stay empty.
+#[tokio::test]
+async fn v2_tag_values_for_resource_service_name_returns_typed_string() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+    write_test_spans(&table, &catalog, "tempo-tenant").await?;
+
+    let resp = server
+        .client
+        .get(format!(
+            "{}/api/v2/search/tag/resource.service.name/values",
+            server.base_url
+        ))
+        .header("X-Scope-OrgID", "tempo-tenant")
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+    assert_eq!(status, 200, "Response body: {}", body);
+
+    let entries = body["tagValues"].as_array().expect("tagValues array");
+    let pairs: Vec<(&str, &str)> = entries
+        .iter()
+        .filter_map(|v| Some((v["type"].as_str()?, v["value"].as_str()?)))
+        .collect();
+    assert!(
+        pairs.contains(&("string", "frontend")),
+        "expected (string, frontend) in {:?}",
+        pairs
+    );
+    assert!(
+        pairs.contains(&("string", "backend")),
+        "expected (string, backend) in {:?}",
+        pairs
+    );
+    assert!(
+        body["metrics"]["inspectedBytes"].is_string(),
+        "metrics.inspectedBytes must serialise as a string per the Tempo v2 contract"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// The closed-enum intrinsics (`status`, `kind`) return their canonical
+/// `{type: "keyword"}` value lists irrespective of which codes appear
+/// in the data — Grafana renders these as a fixed dropdown. Without
+/// this, Grafana shows 404 for the value picker and the user cannot
+/// build `{ status = error }` filters from the UI.
+#[tokio::test]
+async fn v2_tag_values_for_status_intrinsic_returns_keyword_enum() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+    write_test_spans(&table, &catalog, "tempo-tenant").await?;
+
+    let resp = server
+        .client
+        .get(format!(
+            "{}/api/v2/search/tag/status/values?q=%7Bresource.service.name%3Dicegate-ingest%7D",
+            server.base_url
+        ))
+        .header("X-Scope-OrgID", "tempo-tenant")
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+    assert_eq!(status, 200, "Response body: {}", body);
+
+    let entries = body["tagValues"].as_array().expect("tagValues array");
+    let pairs: Vec<(&str, &str)> = entries
+        .iter()
+        .filter_map(|v| Some((v["type"].as_str()?, v["value"].as_str()?)))
+        .collect();
+    for code in ["error", "ok", "unset"] {
+        assert!(
+            pairs.contains(&("keyword", code)),
+            "expected (keyword, {}) in status enum: {:?}",
+            code,
+            pairs
+        );
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// `name` intrinsic must enumerate distinct span names through the v2
+/// route as well — Grafana hits the v2 path for the span-name picker.
+#[tokio::test]
+async fn v2_tag_values_for_name_intrinsic_returns_typed_strings() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+    write_test_spans(&table, &catalog, "tempo-tenant").await?;
+
+    let resp = server
+        .client
+        .get(format!("{}/api/v2/search/tag/name/values", server.base_url))
+        .header("X-Scope-OrgID", "tempo-tenant")
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+    assert_eq!(status, 200, "Response body: {}", body);
+
+    let entries = body["tagValues"].as_array().expect("tagValues array");
+    let pairs: Vec<(&str, &str)> = entries
+        .iter()
+        .filter_map(|v| Some((v["type"].as_str()?, v["value"].as_str()?)))
+        .collect();
+    assert!(
+        pairs.contains(&("string", "GET /api/health")),
+        "expected (string, 'GET /api/health') in {:?}",
+        pairs
+    );
+    assert!(
+        pairs.contains(&("string", "query users")),
+        "expected (string, 'query users') in {:?}",
+        pairs
+    );
 
     server.shutdown().await;
     Ok(())

@@ -23,25 +23,56 @@ use chrono::{DateTime, TimeZone, Utc};
 use iceberg::expr::Predicate;
 use icegate_common::schema::{
     COL_CLOUD_ACCOUNT_ID, COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES,
-    COL_SPAN_ID, COL_TRACE_ID, SPAN_INDEXED_ATTRIBUTE_COLUMNS, SPAN_SERIES_LABEL_COLUMNS, TRACEQL_INTRINSIC_TAGS,
+    COL_SPAN_ID, COL_TRACE_ID, SPAN_INDEXED_ATTRIBUTE_COLUMNS, TRACEQL_INTRINSIC_TAGS,
 };
 use icegate_common::{ICEGATE_NAMESPACE, SPANS_TABLE};
 
 use super::error::{TempoError, TempoResult};
-use super::models::{Scope, ScopeGroup, TagRef};
+use super::models::{Scope, ScopeGroup, TagRef, TagValueV2};
 use super::server::TempoState;
 use crate::engine::metadata_scan::{self, MetadataScanConfig};
 use crate::error::QueryError;
 
-/// Top-level columns whose presence contributes to the `resource` scope
-/// (regardless of whether they also appear in the attribute map).
-const RESOURCE_TOP_LEVEL_COLUMNS: &[&str] = &[COL_SERVICE_NAME, COL_CLOUD_ACCOUNT_ID];
+/// Type token applied to free-form string attribute values in the v2
+/// tag-values response.
+const VALUE_TYPE_STRING: &str = "string";
+/// Type token applied to closed-set enum values (`status`, `kind`) in the
+/// v2 tag-values response. Grafana renders `keyword`-typed values as a
+/// fixed dropdown rather than a free-text input.
+const VALUE_TYPE_KEYWORD: &str = "keyword";
+
+/// Canonical `TraceQL` `status` enum values, ordered as Tempo emits them.
+/// Returned regardless of whether each code actually appears in the data
+/// — the closed enum is small enough that the static list is more useful
+/// than a dynamic scan would be.
+const STATUS_ENUM_VALUES: &[&str] = &["error", "ok", "unset"];
+
+/// Canonical `TraceQL` `kind` enum values matching the OTLP `SpanKind`
+/// definitions. Returned as a static list for the same reason as
+/// [`STATUS_ENUM_VALUES`].
+const KIND_ENUM_VALUES: &[&str] = &["client", "consumer", "internal", "producer", "server", "unspecified"];
+
+/// Top-level resource columns surfaced under the `resource` scope as
+/// `OTel`-dotted tag names. Each entry maps the user-facing `TraceQL` /
+/// `OTel` attribute name to the underlying physical column. Only entries
+/// whose column is present in the table schema are emitted.
+///
+/// This is what makes `service.name` appear in tag discovery rather than
+/// the physical column name `service_name`. The reverse mapping
+/// (`OTel` name → column) used by tag-value lookup lives in
+/// [`map_attribute_to_column`].
+const RESOURCE_TOP_LEVEL_TAGS: &[(&str, &str)] = &[
+    ("service.name", COL_SERVICE_NAME),
+    ("cloud.account.id", COL_CLOUD_ACCOUNT_ID),
+];
 
 /// Metadata-scan config for the `resource_attributes` map.
 ///
 /// `indexed_columns` is empty here — resource-scope top-level columns are
-/// handled separately in `list_tags_v2` so we can emit them under the
-/// `resource` group without duplicating them in `span`.
+/// handled separately in `list_tags_v2` so we can emit them under their
+/// `OTel`-dotted names ([`RESOURCE_TOP_LEVEL_TAGS`]) instead of the
+/// physical `snake_case` column names that the metadata-scan layer would
+/// otherwise surface.
 const SPANS_RESOURCE_CONFIG: MetadataScanConfig = MetadataScanConfig {
     indexed_columns: &[],
     label_aliases: &[],
@@ -50,8 +81,13 @@ const SPANS_RESOURCE_CONFIG: MetadataScanConfig = MetadataScanConfig {
 };
 
 /// Metadata-scan config for the `span_attributes` map.
+///
+/// `indexed_columns` is empty by design: the only top-level string columns
+/// on the spans table (`cloud_account_id`, `service_name`, `name`) belong
+/// to the `resource` scope or are exposed as `TraceQL` intrinsics — they
+/// must not leak into `span` scope under their physical column names.
 const SPANS_SPAN_CONFIG: MetadataScanConfig = MetadataScanConfig {
-    indexed_columns: SPAN_SERIES_LABEL_COLUMNS,
+    indexed_columns: &[],
     label_aliases: &[],
     excluded_map_keys: &[],
     map_column: COL_SPAN_ATTRIBUTES,
@@ -138,9 +174,9 @@ pub async fn list_tags_v2(
         )
         .await
         .map_err(|e| TempoError(QueryError::from(e)))?;
-        for col in RESOURCE_TOP_LEVEL_COLUMNS {
+        for (otel_name, col) in RESOURCE_TOP_LEVEL_TAGS {
             if table_has_column(&table, col) {
-                tags.insert((*col).to_string());
+                tags.insert((*otel_name).to_string());
             }
         }
         groups.push(ScopeGroup {
@@ -314,6 +350,67 @@ pub async fn list_tag_values(
     let mut out: Vec<String> = values.into_iter().collect();
     out.truncate(limit);
     Ok(out)
+}
+
+/// Enumerate distinct values for a single tag and return them in the
+/// `v2` typed shape (`{type, value}` per entry).
+///
+/// Reuses [`list_tag_values`] for string-typed lookups and adds typed
+/// handling for the closed-enum intrinsics (`status`, `kind`). Numeric
+/// and derived intrinsics still return an empty list — they require
+/// reading non-string columns which the metadata-scan layer doesn't
+/// support today.
+///
+/// # Errors
+///
+/// Returns a [`TempoError`] wrapping the underlying metadata-scan or
+/// iceberg error.
+pub async fn list_tag_values_v2(
+    state: &TempoState,
+    tenant_id: &str,
+    tag_name: &str,
+    start: Option<i64>,
+    end: Option<i64>,
+    limit: usize,
+) -> TempoResult<Vec<TagValueV2>> {
+    // The closed enum intrinsics are answered without touching the
+    // catalog: their canonical value sets are fixed by the OTLP spec,
+    // and Grafana renders them as a dropdown regardless of which codes
+    // actually appear in the data.
+    if let TagRef::Intrinsic(name) = TagRef::parse(tag_name) {
+        if let Some(values) = enum_intrinsic_values(name) {
+            return Ok(values.into_iter().take(limit).collect());
+        }
+    }
+
+    let strings = list_tag_values(state, tenant_id, tag_name, start, end, limit).await?;
+    Ok(strings
+        .into_iter()
+        .map(|value| TagValueV2 {
+            value_type: VALUE_TYPE_STRING,
+            value,
+        })
+        .collect())
+}
+
+/// Static value set for the closed-enum `TraceQL` intrinsics
+/// (`status`, `kind`). Returns `None` for any other intrinsic so callers
+/// can fall through to the dynamic string-value path.
+fn enum_intrinsic_values(name: &str) -> Option<Vec<TagValueV2>> {
+    let codes: &'static [&'static str] = match name {
+        "status" => STATUS_ENUM_VALUES,
+        "kind" => KIND_ENUM_VALUES,
+        _ => return None,
+    };
+    Some(
+        codes
+            .iter()
+            .map(|code| TagValueV2 {
+                value_type: VALUE_TYPE_KEYWORD,
+                value: (*code).to_string(),
+            })
+            .collect(),
+    )
 }
 
 /// Enumerate distinct values for an indexed top-level column. The column

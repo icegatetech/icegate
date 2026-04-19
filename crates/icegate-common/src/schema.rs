@@ -1077,21 +1077,15 @@ pub const LOG_SERIES_LABEL_COLUMNS: &[&str] = &[COL_CLOUD_ACCOUNT_ID, COL_SERVIC
 
 // ── Span tag-discovery lists ─────────────────────────────────────────
 
-/// Indexed top-level string-ish columns for the `spans` table, surfaced via
-/// tag discovery endpoints.
-///
-/// Excludes high-cardinality identifiers (`trace_id`, `span_id`,
-/// `parent_span_id`) and numeric-only columns (`duration_micros`, `kind`,
-/// `status_code` — these are exposed separately as `TraceQL` intrinsics).
-/// Only columns whose values are reasonable to enumerate as distinct strings
-/// are listed here.
-pub const SPAN_SERIES_LABEL_COLUMNS: &[&str] = &[COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_NAME];
-
 /// Indexed top-level columns on the `spans` table whose distinct values can
 /// be enumerated via the tag-values endpoint.
 ///
-/// Superset of [`SPAN_SERIES_LABEL_COLUMNS`] — includes high-cardinality
-/// identifiers that are useful as filter values (`trace_id`, `span_id`).
+/// Combines low-cardinality columns (`cloud_account_id`, `service_name`,
+/// `name`) useful for label-style discovery with high-cardinality
+/// identifiers (`trace_id`, `span_id`, `parent_span_id`) that are useful
+/// as explicit filter values. Numeric-only columns (`duration_micros`,
+/// `kind`, `status_code`) are excluded — they are exposed separately as
+/// `TraceQL` intrinsics.
 pub const SPAN_INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &[
     COL_CLOUD_ACCOUNT_ID,
     COL_SERVICE_NAME,

@@ -27,8 +27,14 @@ pub struct SearchParams {
     pub start: Option<String>,
     /// End time (Unix epoch nanoseconds OR seconds).
     pub end: Option<String>,
-    /// Maximum traces to return.
+    /// Maximum **traces** to return (Tempo `limit`, *not* spans). The
+    /// per-trace span cap is governed by [`Self::spss`].
     pub limit: Option<usize>,
+    /// Spans Per Span Set — Tempo's per-trace cap on the number of spans
+    /// returned for each matched trace. When absent, falls back to the
+    /// server default ([`crate::traceql::DEFAULT_SPANS_PER_SPANSET`]);
+    /// `spss=0` disables the cap entirely (matches upstream Tempo).
+    pub spss: Option<usize>,
     /// Minimum trace duration filter (e.g., "100ms").
     #[serde(rename = "minDuration")]
     pub min_duration: Option<String>,
@@ -60,7 +66,7 @@ pub struct TagsQueryParams {
     pub scope: Option<String>,
 }
 
-/// Query parameters for `/api/search/tag/{name}/values`.
+/// Query parameters for `/api/search/tag/{name}/values` and the v2 variant.
 #[derive(Debug, Deserialize)]
 pub struct TagValuesQueryParams {
     /// Unix epoch seconds — start of time window (optional).
@@ -70,6 +76,13 @@ pub struct TagValuesQueryParams {
     /// Maximum number of distinct values to return. Defaults to
     /// [`TagValuesQueryParams::DEFAULT_LIMIT`] when unspecified.
     pub limit: Option<usize>,
+    /// Optional `TraceQL` filter restricting the row set before tag-value
+    /// discovery. Accepted on both `v1` and `v2`. Currently parsed but
+    /// **not** pushed into the metadata-scan path — kept here so Grafana-
+    /// supplied values don't trigger deserialisation errors.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub q: Option<String>,
     /// Accepted for Grafana compatibility but currently ignored.
     #[serde(rename = "maxStaleValues", default)]
     #[allow(dead_code)]
@@ -112,6 +125,67 @@ pub struct TraceSummary {
     /// Total trace duration in milliseconds.
     #[serde(rename = "durationMs")]
     pub duration_ms: u64,
+    /// Per-trace matched-span groups. Tempo's contract: at least one
+    /// entry per trace summary; Grafana's inline-trace renderer crashes
+    /// with `Cannot read properties of undefined (reading 'reduce')`
+    /// when this field is absent or `null`. Always serialised — even an
+    /// empty array protects the renderer.
+    #[serde(rename = "spanSets")]
+    pub span_sets: Vec<SpanSet>,
+}
+
+/// A group of matched spans within one trace, as expected by Grafana's
+/// Tempo data source under the `spanSets` field of each trace summary.
+#[derive(Debug, Serialize)]
+pub struct SpanSet {
+    /// The matched span entries surfaced to the UI. Capped by the
+    /// search-time `spss` parameter.
+    pub spans: Vec<MatchedSpan>,
+    /// Number of spans in this set. Equal to `spans.len()` because we
+    /// don't support a separate "matched but truncated" distinction
+    /// today.
+    pub matched: usize,
+}
+
+/// One matched span surfaced inside a [`SpanSet`]. Only the fields
+/// Grafana's inline summary actually reads are populated; richer span
+/// data is reachable via the trace-by-id endpoint.
+#[derive(Debug, Serialize)]
+pub struct MatchedSpan {
+    /// Hex-encoded span identifier (8 bytes → 16 hex chars).
+    #[serde(rename = "spanID")]
+    pub span_id: String,
+    /// Span start time as Unix epoch nanoseconds, serialised as a
+    /// string per Tempo's contract.
+    #[serde(rename = "startTimeUnixNano")]
+    pub start_time_unix_nano: String,
+    /// Span duration in nanoseconds, serialised as a string per
+    /// Tempo's contract.
+    #[serde(rename = "durationNanos")]
+    pub duration_nanos: String,
+    /// Free-form attributes attached to the span. Surfaced as
+    /// `[{key, value: {stringValue}}]` so Grafana renders them in the
+    /// matched-spans tooltip without further translation.
+    pub attributes: Vec<MatchedSpanAttribute>,
+}
+
+/// One attribute on a [`MatchedSpan`]. Always emitted as a string-typed
+/// value — we don't promote numeric or boolean attributes today.
+#[derive(Debug, Serialize)]
+pub struct MatchedSpanAttribute {
+    /// Attribute key.
+    pub key: String,
+    /// String-typed attribute value, wrapped in `{ stringValue: ... }`
+    /// to match the `OTel` `AnyValue` JSON envelope Tempo uses here.
+    pub value: AttributeValue,
+}
+
+/// `OTel`-style `AnyValue` envelope restricted to the string variant.
+#[derive(Debug, Serialize)]
+pub struct AttributeValue {
+    /// String payload.
+    #[serde(rename = "stringValue")]
+    pub string_value: String,
 }
 
 /// Metrics summary returned with search results.
@@ -157,6 +231,47 @@ pub struct TagValuesResponse {
     /// Distinct values for the requested tag.
     #[serde(rename = "tagValues")]
     pub tag_values: Vec<String>,
+}
+
+/// One typed entry in [`TagValuesV2Response`].
+///
+/// `OTel` / `TraceQL` value types: `string` for free-form attribute values,
+/// `keyword` for the closed-set enums (`status`, `kind`), `int` / `float` /
+/// `duration` / `bool` for typed intrinsics. We only emit `string` and
+/// `keyword` today — others fall back to empty.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TagValueV2 {
+    /// Value type token as defined by Tempo's v2 contract.
+    #[serde(rename = "type")]
+    pub value_type: &'static str,
+    /// String-form value (Grafana renders this directly in the dropdown).
+    pub value: String,
+}
+
+/// Response body for `GET /api/v2/search/tag/{name}/values`.
+///
+/// Differs from the v1 [`TagValuesResponse`] by wrapping each value with
+/// its `TraceQL` value type. Grafana's query-builder UI uses the typed
+/// payload to show enum dropdowns vs. free-text inputs and to filter
+/// invalid completions.
+#[derive(Debug, Serialize)]
+pub struct TagValuesV2Response {
+    /// Distinct typed values for the requested tag.
+    #[serde(rename = "tagValues")]
+    pub tag_values: Vec<TagValueV2>,
+    /// Search-time metrics surfaced to clients. Tempo reports
+    /// `inspectedBytes` here; we always report `0` because the
+    /// metadata-scan path bypasses the byte-tracking layer.
+    pub metrics: TagValuesV2Metrics,
+}
+
+/// Search-time metrics block emitted alongside [`TagValuesV2Response`].
+#[derive(Debug, Serialize, Default)]
+pub struct TagValuesV2Metrics {
+    /// Bytes inspected during the scan. Reported as a string per the
+    /// upstream Tempo contract.
+    #[serde(rename = "inspectedBytes")]
+    pub inspected_bytes: String,
 }
 
 // ============================================================================

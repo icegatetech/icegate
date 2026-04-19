@@ -10,6 +10,18 @@ use crate::error::Result;
 /// Matches Tempo's default per the search API spec.
 pub const DEFAULT_SEARCH_LIMIT: usize = 20;
 
+/// Default per-trace span cap (Tempo's `spss`) when the client doesn't
+/// supply one — matches the URL-parameter default documented at
+/// <https://grafana.com/docs/tempo/latest/api_docs/#search>.
+///
+/// This is what Grafana sends by default and what the search-result
+/// table renders as "Spans Limit". It is *not* the same as Tempo's
+/// server-side `default_spans_per_span_set` config knob (100 by
+/// default); the two are layered defaults in upstream Tempo and we
+/// collapse them to one because we don't have a separate server config
+/// layer yet. Setting `spss=0` on the URL disables the cap entirely.
+pub const DEFAULT_SPANS_PER_SPANSET: usize = 3;
+
 /// Context for `TraceQL` query planning.
 #[derive(Debug, Clone)]
 pub struct QueryContext {
@@ -22,6 +34,12 @@ pub struct QueryContext {
     pub end: DateTime<Utc>,
     /// Max number of traces to return for search-mode queries.
     pub limit: Option<usize>,
+    /// Per-trace span cap applied in stage 2 of the search planner.
+    /// `None` disables the cap (Tempo's `spss=0` semantics); `Some(n)`
+    /// keeps at most `n` spans per matched trace, ranking root spans
+    /// first so the search-response formatter always has the data it
+    /// needs to populate `rootServiceName` / `rootTraceName`.
+    pub spans_per_spanset: Option<usize>,
     /// Optional minimum trace duration filter.
     pub min_duration: Option<TimeDelta>,
     /// Optional maximum trace duration filter.

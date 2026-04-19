@@ -21,8 +21,8 @@ use super::{
     formatters::{spans_to_otlp_json, spans_to_otlp_proto},
     metadata,
     models::{
-        Scope, SearchParams, TagValuesQueryParams, TagValuesResponse, TagsQueryParams, TagsV1Response, TagsV2Response,
-        TraceLookupParams,
+        Scope, SearchParams, TagValuesQueryParams, TagValuesResponse, TagValuesV2Metrics, TagValuesV2Response,
+        TagsQueryParams, TagsV1Response, TagsV2Response, TraceLookupParams,
     },
     server::TempoState,
     trace_by_id::{default_window, fetch},
@@ -201,6 +201,40 @@ pub async fn tag_values(
     Ok((StatusCode::OK, Json(TagValuesResponse { tag_values })))
 }
 
+/// Handle `GET /api/v2/search/tag/{name}/values` — typed distinct values
+/// for a single `TraceQL` identifier. Mirrors [`tag_values`] but wraps
+/// each value with its `TraceQL` value type and includes a `metrics`
+/// block so Grafana's query-builder UI can render the right input
+/// widget (free-text vs. dropdown vs. duration picker).
+///
+/// Without this v2 route Grafana renders a 404 in the explore tab and
+/// the value pickers for `name`, `status`, `kind`, `resource.service.name`,
+/// etc. all fail with no completion suggestions, even though the v1
+/// endpoint serves the same data.
+#[tracing::instrument(skip_all, fields(tenant_id, tag_name = %tag_name, error = tracing::field::Empty))]
+pub async fn tag_values_v2(
+    State(state): State<TempoState>,
+    headers: HeaderMap,
+    Path(tag_name): Path<String>,
+    Query(params): Query<TagValuesQueryParams>,
+) -> TempoResult<impl IntoResponse> {
+    let tenant_id = extract_tenant_id(&headers);
+    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    let limit = params.limit.unwrap_or(TagValuesQueryParams::DEFAULT_LIMIT);
+
+    let tag_values =
+        metadata::list_tag_values_v2(&state, &tenant_id, &tag_name, params.start, params.end, limit).await?;
+    Ok((
+        StatusCode::OK,
+        Json(TagValuesV2Response {
+            tag_values,
+            metrics: TagValuesV2Metrics {
+                inspected_bytes: "0".to_string(),
+            },
+        }),
+    ))
+}
+
 // ============================================================================
 // Health
 // ============================================================================
@@ -208,4 +242,19 @@ pub async fn tag_values(
 /// Health/ready check endpoint.
 pub async fn ready() -> Response {
     (StatusCode::OK, "ready").into_response()
+}
+
+/// Tempo `/api/echo` query-frontend liveness probe.
+///
+/// Grafana's Tempo data source uses this endpoint to verify that the
+/// search backend is reachable. When it is missing, Grafana renders the
+/// banner *"Unable to connect to Tempo search. Please ensure that Tempo
+/// is configured with search enabled."* even though the search endpoints
+/// themselves work — disabling the in-builder hints, value pickers, and
+/// streaming progress UI in the explore view.
+///
+/// Per the Tempo API spec the response must be HTTP 200 with the literal
+/// body `echo`.
+pub async fn echo() -> Response {
+    (StatusCode::OK, "echo").into_response()
 }
