@@ -184,40 +184,46 @@ async fn create_table(catalog: &dyn Catalog, namespace: &NamespaceIdent, def: &T
     Ok(())
 }
 
-/// Upgrade existing table schemas
+/// Report schema differences between the catalog and the code.
 ///
-/// Checks each observability table for schema differences and applies
-/// necessary evolution operations.
+/// Checks each observability table for schema differences. **Automatic
+/// evolution is not performed.** When a difference is detected, operators
+/// must drop and re-create the affected table(s) to apply the code's
+/// schema; no in-place schema evolution is attempted.
 ///
-/// # Schema Evolution Support
+/// # Behavior
 ///
-/// Currently supports:
-/// - Adding new optional columns
-/// - Updating partition specs
-/// - Updating sort orders
-///
-/// Does NOT support (requires manual intervention):
-/// - Removing columns
-/// - Changing column types to incompatible types
-/// - Changing required columns to optional or vice versa
+/// - **Dry-run mode**: logs differences for every mismatched table and
+///   returns `Ok(operations)` containing one `MigrationOperation::Upgrade`
+///   entry per mismatch so the operator can preview the full list.
+/// - **Non-dry-run mode**: logs differences for every mismatched table
+///   discovered during the scan, then returns
+///   `Err(MaintainError::Migration)` with an aggregated message naming
+///   all tables that must be dropped and re-created. Tables that match the
+///   code's schema pass silently; missing tables log a warning and are
+///   skipped (operator must run `migrate create` first).
 ///
 /// # Return Value
 ///
-/// Returns a list of operations. In dry-run mode, operations represent what
-/// *would* happen, not what actually occurred.
+/// `Ok(Vec<MigrationOperation>)` only in dry-run mode (or when every
+/// table is up to date). Non-dry-run with at least one mismatch always
+/// returns `Err(MaintainError::Migration(..))`.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - Table loading fails
-/// - Schema comparison fails
-/// - Schema evolution fails
+/// - The catalog rejects a `table_exists` or `load_table` call.
+/// - One or more tables have schemas that differ from the code and we're
+///   not in dry-run mode (see `MaintainError::Migration`).
 #[allow(clippy::cognitive_complexity)]
 pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Result<Vec<MigrationOperation>> {
     let catalog_ref = catalog.as_ref();
     let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
     let definitions = build_table_definitions()?;
     let mut operations = Vec::new();
+    // Collect every mismatched table instead of bailing on the first one so
+    // operators see the full remediation list in a single run.
+    let mut differing_tables: Vec<String> = Vec::new();
 
     for def in definitions {
         let table_ident = TableIdent::new(namespace.clone(), def.name.to_string());
@@ -243,29 +249,45 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
         let needs_upgrade = schemas_differ(current_schema, target_schema);
 
         if needs_upgrade {
+            log_schema_differences(def.name, current_schema, target_schema);
             if dry_run {
-                tracing::info!("[dry-run] Would upgrade table schema: {}", def.name);
-                log_schema_differences(def.name, current_schema, target_schema);
+                tracing::info!("[dry-run] Would require manual migration for table: {}", def.name);
+                operations.push(MigrationOperation::Upgrade {
+                    table_name: def.name.to_string(),
+                });
             } else {
-                tracing::info!("Upgrading table schema: {}", def.name);
-                // Note: Full schema evolution would require iceberg's update_schema API
-                // For now, we log what would need to change
-                log_schema_differences(def.name, current_schema, target_schema);
-                tracing::warn!(
-                    "Automatic schema evolution not yet implemented. Please update {} manually.",
-                    def.name
-                );
+                differing_tables.push(def.name.to_string());
             }
-
-            operations.push(MigrationOperation::Upgrade {
-                table_name: def.name.to_string(),
-            });
         } else {
             tracing::info!("Table {} schema is up to date", def.name);
         }
     }
 
+    if !dry_run && !differing_tables.is_empty() {
+        return Err(crate::error::MaintainError::Migration(format_upgrade_required_message(
+            &differing_tables,
+        )));
+    }
+
     Ok(operations)
+}
+
+/// Build the operator-facing error message when one or more tables' schemas
+/// in the catalog differ from the code and automatic evolution is not
+/// supported. Accepts one or more table names, uses singular/plural wording
+/// based on the count, and joins names with `, ` for the bracketed list so
+/// the operator sees the full remediation list in one run.
+fn format_upgrade_required_message(table_names: &[String]) -> String {
+    let (subject, remediation) = if table_names.len() == 1 {
+        ("Table", "the table")
+    } else {
+        ("Tables", "the tables")
+    };
+    let list = table_names.join(", ");
+    format!(
+        "{subject} [{list}] schema in catalog differs from code. Automatic evolution \
+         is not supported; drop {remediation} manually and re-run `icegate-maintain migrate create`."
+    )
 }
 
 /// Check if two schemas differ
@@ -381,5 +403,67 @@ fn log_schema_differences(table_name: &str, current: &iceberg::spec::Schema, tar
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_upgrade_error_message_single_table_uses_singular_wording() {
+        let msg = format_upgrade_required_message(&["spans".to_string()]);
+        assert!(msg.starts_with("Table ["));
+        assert!(msg.contains("spans"));
+        assert!(msg.contains("drop the table manually"));
+        assert!(msg.contains("icegate-maintain migrate create"));
+    }
+
+    #[test]
+    fn format_upgrade_error_message_multiple_tables_uses_plural_wording() {
+        let msg = format_upgrade_required_message(&["logs".to_string(), "spans".to_string()]);
+        assert!(msg.starts_with("Tables ["));
+        assert!(msg.contains("logs"));
+        assert!(msg.contains("spans"));
+        assert!(msg.contains("drop the tables manually"));
+    }
+
+    #[test]
+    fn schemas_differ_detects_modified_nested_types() {
+        use std::sync::Arc;
+
+        use iceberg::spec::{MapType, NestedField, PrimitiveType, Type};
+
+        let current = iceberg::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "tenant_id", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(
+                    2,
+                    "attributes",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::required(3, "key", Type::Primitive(PrimitiveType::String))),
+                        Arc::new(NestedField::required(
+                            4,
+                            "value",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("current schema");
+
+        let target = iceberg::spec::Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![
+                NestedField::required(1, "tenant_id", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "attributes", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("target schema");
+
+        assert!(schemas_differ(&current, &target));
     }
 }

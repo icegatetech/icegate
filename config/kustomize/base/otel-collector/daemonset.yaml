@@ -28,6 +28,15 @@ spec:
           image: otel/opentelemetry-collector-contrib:0.149.0
           args:
             - --config=/etc/otelcol-contrib/config.yaml
+          ports:
+            # OTLP gRPC receiver for traces from in-cluster workloads.
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            # OTLP HTTP receiver.
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

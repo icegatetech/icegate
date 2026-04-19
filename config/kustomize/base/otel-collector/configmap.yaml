@@ -9,6 +9,15 @@ metadata:
 data:
   config.yaml: |
     receivers:
+      # OTLP receiver accepts traces (and future signals) from in-cluster
+      # workloads. Traces are forwarded to icegate-ingest via the traces
+      # pipeline defined below.
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
       file_log:
         include:
           - /var/log/pods/*/*/*.log
@@ -95,21 +104,18 @@ data:
               - output: use-message
                 expr: 'attributes.fields.message != nil and attributes.fields.message != ""'
             default: use-fields
+          # Both branches converge at cleanup-level. The target→code.namespace
+          # move happens exactly once, on the common path below, so we never
+          # try to move an already-moved attribute.
           - type: move
             id: use-message
             from: attributes.fields.message
             to: body
-            output: cleanup-fields
+            output: cleanup-level
           - type: move
             id: use-fields
             from: attributes.fields
             to: body
-            output: cleanup-level
-          # Move target to attribute
-          - type: move
-            id: cleanup-fields
-            from: attributes.target
-            to: attributes["code.namespace"]
             output: cleanup-level
           # Remove parsed JSON fields that are now redundant
           - type: remove
@@ -124,14 +130,16 @@ data:
           - type: remove
             id: cleanup-fields-obj
             field: attributes.fields
-            on_error: send
+            on_error: send_quiet
             output: cleanup-target
-          # Move target if still present (use-fields path skipped earlier move)
+          # Move target → code.namespace. Some JSON logs (non-Rust producers)
+          # don't carry a target field; send_quiet swallows the missing-source
+          # error without spamming the collector's own log stream.
           - type: move
             id: cleanup-target
             from: attributes.target
             to: attributes["code.namespace"]
-            on_error: send
+            on_error: send_quiet
             output: rename-attributes
           # Rename attributes to semantic conventions
           - id: rename-attributes
@@ -191,6 +199,7 @@ data:
 
       batch: {}
 
+      # Shared environment/demo labels. Added to both logs and traces.
       resource:
         attributes:
           - key: deployment.environment
@@ -198,6 +207,27 @@ data:
             action: upsert
           - key: demo.source
             value: kubernetes
+            action: upsert
+
+      # Logs-only override: align `service.name` with what traces carry.
+      # k8s_attributes extracts `service.name` from the `app.kubernetes.io/name`
+      # label, which is the coarser "icegate" identity. The Deployment name
+      # (`icegate-ingest`, `icegate-query`) matches what the OTel SDK emits
+      # on traces, so using `k8s.deployment.name` here unifies both signals.
+      #
+      # We explicitly do NOT apply this override on the traces pipeline:
+      # traces always carry an SDK-set `service.name`, and third-party
+      # traces routed through the collector must keep their original
+      # service identity. Keeping the override logs-only avoids clobbering
+      # it.
+      #
+      # Pods not managed by a Deployment (e.g. the otel-collector DaemonSet
+      # itself) lack `k8s.deployment.name`; upsert+from_attribute is a no-op
+      # in that case so the label-derived fallback survives.
+      resource/logs_service_name:
+        attributes:
+          - key: service.name
+            from_attribute: k8s.deployment.name
             action: upsert
 
     exporters:
@@ -211,5 +241,10 @@ data:
       pipelines:
         logs:
           receivers: [file_log]
+          processors: [k8s_attributes, batch, resource, resource/logs_service_name]
+          exporters: [otlp_http]
+        traces:
+          # Traces keep the SDK-set service.name; no logs_service_name override.
+          receivers: [otlp]
           processors: [k8s_attributes, batch, resource]
           exporters: [otlp_http]

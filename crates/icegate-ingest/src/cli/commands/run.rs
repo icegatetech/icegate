@@ -9,7 +9,10 @@ use std::{
 };
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use icegate_common::{IoHandle, MetricsRuntime, catalog::CatalogBuilder, create_object_store, run_metrics_server};
+use icegate_common::{
+    IoHandle, LOGS_TABLE, LOGS_TOPIC, MetricsRuntime, SPANS_TABLE, SPANS_TOPIC, catalog::CatalogBuilder,
+    create_object_store, run_metrics_server,
+};
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use object_store::ObjectStore;
 use tokio::runtime::Builder;
@@ -24,7 +27,8 @@ use crate::{
         WalWriterMetrics,
     },
     runtime_threads::compute_runtime_threads,
-    shift::Shifter,
+    shift::{ShiftJobSpec, Shifter},
+    wal::SortColumnsDescriptor,
 };
 
 struct ShiftRuntimeHandle {
@@ -429,6 +433,21 @@ async fn run_services(
     let otlp_metrics = metrics_runtime
         .as_ref()
         .map_or_else(OtlpMetrics::new_disabled, |runtime| OtlpMetrics::new(&runtime.meter()));
+    let jobs: &[ShiftJobSpec] = &[
+        ShiftJobSpec {
+            job_name: "shift_logs",
+            topic: LOGS_TOPIC,
+            table: LOGS_TABLE,
+            descriptor: SortColumnsDescriptor::logs()?,
+        },
+        ShiftJobSpec {
+            job_name: "shift_spans",
+            topic: SPANS_TOPIC,
+            table: SPANS_TABLE,
+            descriptor: SortColumnsDescriptor::spans()?,
+        },
+    ];
+
     let shifter = Shifter::new(
         catalog,
         queue_reader,
@@ -436,6 +455,7 @@ async fn run_services(
         jobs_storage,
         shift_metrics,
         jobsmanager_metrics,
+        jobs,
     )
     .await?;
     let runtime_plan = compute_runtime_threads();
