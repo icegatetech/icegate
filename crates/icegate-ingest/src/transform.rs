@@ -294,7 +294,10 @@ pub fn spans_to_record_batch(
     }
 
     let schema = spans_arrow_schema();
-    let (attr_key_field, attr_value_field) = extract_map_fields_from_schema_named(&schema, "attributes")?;
+    let (resource_attr_key_field, resource_attr_value_field) =
+        extract_map_fields_from_schema_named(&schema, icegate_common::schema::COL_RESOURCE_ATTRIBUTES)?;
+    let (span_attr_key_field, span_attr_value_field) =
+        extract_map_fields_from_schema_named(&schema, icegate_common::schema::COL_SPAN_ATTRIBUTES)?;
 
     // Top-level column builders. Events and links are written as all-null
     // placeholders; Tasks 14 and 15 replace these with real list builders.
@@ -313,7 +316,7 @@ pub fn spans_to_record_batch(
     let mut kind_builder = Int32Builder::with_capacity(total_spans);
     let mut status_code_builder = Int32Builder::with_capacity(total_spans);
     let mut status_message_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
-    let mut attributes_builder = MapBuilder::new(
+    let mut resource_attrs_builder = MapBuilder::new(
         Some(MapFieldNames {
             entry: "key_value".to_string(),
             key: "key".to_string(),
@@ -322,8 +325,20 @@ pub fn spans_to_record_batch(
         StringBuilder::new(),
         StringBuilder::new(),
     )
-    .with_keys_field(attr_key_field)
-    .with_values_field(attr_value_field);
+    .with_keys_field(resource_attr_key_field)
+    .with_values_field(resource_attr_value_field);
+
+    let mut span_attrs_builder = MapBuilder::new(
+        Some(MapFieldNames {
+            entry: "key_value".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        }),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    )
+    .with_keys_field(span_attr_key_field)
+    .with_values_field(span_attr_value_field);
     let mut flags_builder = Int32Builder::with_capacity(total_spans);
     let mut dropped_attributes_count_builder = Int32Builder::with_capacity(total_spans);
     let mut dropped_events_count_builder = Int32Builder::with_capacity(total_spans);
@@ -505,26 +520,22 @@ pub fn spans_to_record_batch(
                     }
                 }
 
-                // Resource + scope + span-level attributes, flattened with dot separator.
-                add_flattened_attributes_dotted(resource_attrs, &mut attributes_builder);
+                // Resource attributes go to `resource_attributes`.
+                add_flattened_attributes_dotted(resource_attrs, &mut resource_attrs_builder);
+
+                // Scope + span attributes fold into `span_attributes`. Arrow
+                // `MapBuilder` preserves insertion order and downstream readers
+                // resolve duplicate keys within a row as last-write-wins, so
+                // writing scope first and span second makes span.* shadow
+                // scope.* on any key collision — the spec-mandated behaviour.
                 let scope_attrs = scope_spans.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
-                add_flattened_attributes_dotted(scope_attrs, &mut attributes_builder);
-                add_flattened_attributes_dotted(&span.attributes, &mut attributes_builder);
+                add_flattened_attributes_dotted(scope_attrs, &mut span_attrs_builder);
+                add_flattened_attributes_dotted(&span.attributes, &mut span_attrs_builder);
 
-                // Indexed column duplication — schema-column-name keys (underscore form).
-                duplicate_span_indexed_columns(
-                    &mut attributes_builder,
-                    service_name.as_deref(),
-                    cloud_account_id.as_deref(),
-                    &span.trace_id,
-                    &span.span_id,
-                    &span.parent_span_id,
-                    span.kind,
-                    span.status.as_ref().map(|s| s.code),
-                    &span.name,
-                );
-
-                attributes_builder.append(true).expect("append attributes map entry");
+                resource_attrs_builder
+                    .append(true)
+                    .expect("append resource_attributes map entry");
+                span_attrs_builder.append(true).expect("append span_attributes map entry");
 
                 // Events list<struct>: one row per parent span.
                 {
@@ -680,13 +691,14 @@ pub fn spans_to_record_batch(
         Arc::new(kind_builder.finish()),
         Arc::new(status_code_builder.finish()),
         Arc::new(status_message_builder.finish()),
-        Arc::new(attributes_builder.finish()),
+        Arc::new(resource_attrs_builder.finish()),
         Arc::new(flags_builder.finish()),
         Arc::new(dropped_attributes_count_builder.finish()),
         Arc::new(dropped_events_count_builder.finish()),
         Arc::new(dropped_links_count_builder.finish()),
         events_array,
         links_array,
+        Arc::new(span_attrs_builder.finish()),
     ];
 
     let batch = RecordBatch::try_new(Arc::new(schema), columns).map_err(|e| {
@@ -928,60 +940,6 @@ fn add_flattened_attributes_dotted(
             attributes_builder.keys().append_value(&key);
             attributes_builder.values().append_value(value);
         }
-    }
-}
-
-/// Duplicates span indexed columns into the attributes map for UI/query parity.
-///
-/// Matches the logs pipeline's behaviour: indexed top-level columns are
-/// mirrored into the attributes map under schema-column-name keys
-/// (underscore form), which is how downstream consumers (Tempo eventually,
-/// but Grafana panels today) surface these values.
-#[allow(clippy::too_many_arguments)]
-fn duplicate_span_indexed_columns(
-    attributes_builder: &mut MapBuilder<StringBuilder, StringBuilder>,
-    service_name: Option<&str>,
-    cloud_account_id: Option<&str>,
-    trace_id: &[u8],
-    span_id: &[u8],
-    parent_span_id: &[u8],
-    kind: i32,
-    status_code: Option<i32>,
-    name: &str,
-) {
-    if let Some(svc) = service_name {
-        attributes_builder.keys().append_value("service_name");
-        attributes_builder.values().append_value(svc);
-    }
-    if let Some(acc) = cloud_account_id {
-        attributes_builder.keys().append_value("cloud_account_id");
-        attributes_builder.values().append_value(acc);
-    }
-    if trace_id.len() == 16 && !is_zero_bytes(trace_id) {
-        attributes_builder.keys().append_value("trace_id");
-        attributes_builder.values().append_value(hex::encode(trace_id));
-    }
-    if span_id.len() == 8 && !is_zero_bytes(span_id) {
-        attributes_builder.keys().append_value("span_id");
-        attributes_builder.values().append_value(hex::encode(span_id));
-    }
-    if parent_span_id.len() == 8 && !is_zero_bytes(parent_span_id) {
-        attributes_builder.keys().append_value("parent_span_id");
-        attributes_builder.values().append_value(hex::encode(parent_span_id));
-    }
-    if kind != 0 {
-        attributes_builder.keys().append_value("kind");
-        attributes_builder.values().append_value(kind.to_string());
-    }
-    if let Some(code) = status_code {
-        if code != 0 {
-            attributes_builder.keys().append_value("status_code");
-            attributes_builder.values().append_value(code.to_string());
-        }
-    }
-    if !name.is_empty() {
-        attributes_builder.keys().append_value("name");
-        attributes_builder.values().append_value(name);
     }
 }
 
@@ -1640,13 +1598,24 @@ mod tests {
     }
 
     #[test]
-    fn spans_attributes_preserve_dots_and_duplicate_indexed_columns() {
+    fn spans_attributes_preserve_dots_and_route_to_correct_map() {
         use arrow::array::{Array, MapArray, StringArray};
         use opentelemetry_proto::tonic::{
             collector::trace::v1::ExportTraceServiceRequest,
             resource::v1::Resource,
             trace::v1::{ResourceSpans, ScopeSpans, Span},
         };
+
+        // Helper to pull (key, value) pairs from a MapArray at row 0.
+        fn pairs_for_row_0(map: &MapArray) -> std::collections::BTreeMap<String, String> {
+            let entries = map.value(0);
+            let entries_struct = entries.as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
+            let keys = entries_struct.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+            let values = entries_struct.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+            (0..keys.len())
+                .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+                .collect()
+        }
 
         let request = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
@@ -1701,34 +1670,51 @@ mod tests {
 
         let (batch, _) = spans_to_record_batch(&request, Some("tenant-1")).expect("ok");
         let batch = batch.expect("batch");
-        let attrs = batch
-            .column_by_name("attributes")
-            .expect("attributes")
+
+        let resource_attrs = batch
+            .column_by_name("resource_attributes")
+            .expect("resource_attributes")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map");
+        let span_attrs = batch
+            .column_by_name("span_attributes")
+            .expect("span_attributes")
             .as_any()
             .downcast_ref::<MapArray>()
             .expect("map");
 
-        let entries = attrs.value(0);
-        let entries_struct = entries.as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
-        let keys = entries_struct.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
-        let values = entries_struct.column(1).as_any().downcast_ref::<StringArray>().expect("values");
-        let pairs: std::collections::BTreeMap<String, String> = (0..keys.len())
-            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
-            .collect();
+        let resource_pairs = pairs_for_row_0(resource_attrs);
+        let span_pairs = pairs_for_row_0(span_attrs);
 
-        // User attribute preserves OTel dotted keys.
-        assert_eq!(pairs.get("http.method"), Some(&"GET".to_string()));
-        // Resource-derived attributes preserve dots.
-        assert_eq!(pairs.get("service.name"), Some(&"svc".to_string()));
-        assert_eq!(pairs.get("cloud.account.id"), Some(&"acc-1".to_string()));
-        // Indexed-column duplication: schema column names copied into attributes using underscore keys.
-        assert_eq!(pairs.get("service_name"), Some(&"svc".to_string()));
-        assert_eq!(pairs.get("cloud_account_id"), Some(&"acc-1".to_string()));
-        assert_eq!(pairs.get("trace_id"), Some(&hex::encode(vec![1u8; 16])));
-        assert_eq!(pairs.get("span_id"), Some(&hex::encode(vec![2u8; 8])));
-        assert_eq!(pairs.get("parent_span_id"), Some(&hex::encode(vec![3u8; 8])));
-        assert_eq!(pairs.get("kind"), Some(&"2".to_string()));
-        assert_eq!(pairs.get("name"), Some(&"op".to_string()));
+        // Resource-originated keys land in resource_attributes, preserving dots.
+        assert_eq!(resource_pairs.get("service.name"), Some(&"svc".to_string()));
+        assert_eq!(resource_pairs.get("cloud.account.id"), Some(&"acc-1".to_string()));
+
+        // Span-level attributes land in span_attributes with dotted keys.
+        assert_eq!(span_pairs.get("http.method"), Some(&"GET".to_string()));
+
+        // Post-split invariant: indexed-column mirror keys (underscore form) must
+        // NOT leak into either attribute map. Consumers read from the top-level
+        // schema columns (service_name, trace_id, ...) instead.
+        for mirror in [
+            "service_name",
+            "cloud_account_id",
+            "trace_id",
+            "span_id",
+            "parent_span_id",
+            "kind",
+            "name",
+        ] {
+            assert!(
+                !resource_pairs.contains_key(mirror),
+                "mirror `{mirror}` must not appear in resource_attributes"
+            );
+            assert!(
+                !span_pairs.contains_key(mirror),
+                "mirror `{mirror}` must not appear in span_attributes"
+            );
+        }
     }
 
     #[test]
@@ -1907,5 +1893,146 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("i32");
         assert_eq!(dropped_links.value(0), 1);
+    }
+
+    #[test]
+    fn spans_split_attributes_into_resource_and_span_columns() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        fn kv(k: &str, v: &str) -> KeyValue {
+            KeyValue {
+                key: k.to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue(v.to_string())),
+                }),
+            }
+        }
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", "ingest-test"), kv("k8s.namespace.name", "icegate")],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "scope-a".to_string(),
+                        version: "1.0".to_string(),
+                        attributes: vec![kv("scope.only.key", "SV")],
+                        dropped_attributes_count: 0,
+                    }),
+                    spans: vec![Span {
+                        trace_id: vec![1u8; 16],
+                        span_id: vec![2u8; 8],
+                        parent_span_id: vec![],
+                        trace_state: String::new(),
+                        flags: 0,
+                        name: "op".to_string(),
+                        kind: 2,
+                        start_time_unix_nano: 1_000_000_000,
+                        end_time_unix_nano: 1_000_010_000,
+                        attributes: vec![kv("http.method", "GET"), kv("span.only.key", "SVAL")],
+                        dropped_attributes_count: 0,
+                        events: vec![],
+                        dropped_events_count: 0,
+                        links: vec![],
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (maybe_batch, drops) = super::spans_to_record_batch(&request, None).expect("spans transform");
+        assert_eq!(drops, 0);
+        let batch = maybe_batch.expect("batch produced");
+        assert_eq!(batch.num_rows(), 1);
+
+        // Collect the two attribute maps into (key, value) vecs for row 0.
+        let resource_attrs_col = batch
+            .column_by_name("resource_attributes")
+            .expect("resource_attributes column")
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .expect("MapArray");
+        let span_attrs_col = batch
+            .column_by_name("span_attributes")
+            .expect("span_attributes column")
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .expect("MapArray");
+
+        let resource_row = map_row_as_pairs(resource_attrs_col, 0);
+        let span_row = map_row_as_pairs(span_attrs_col, 0);
+
+        // Resource-only keys land in resource_attributes.
+        assert!(resource_row.iter().any(|(k, v)| k == "service.name" && v == "ingest-test"));
+        assert!(resource_row.iter().any(|(k, v)| k == "k8s.namespace.name" && v == "icegate"));
+
+        // Span + scope keys land in span_attributes. No resource-level keys leak.
+        assert!(span_row.iter().any(|(k, v)| k == "http.method" && v == "GET"));
+        assert!(span_row.iter().any(|(k, v)| k == "span.only.key" && v == "SVAL"));
+        assert!(span_row.iter().any(|(k, v)| k == "scope.only.key" && v == "SV"));
+
+        // Regression: indexed-column mirror keys must NOT appear in either map.
+        for mirror in &[
+            "service_name",
+            "trace_id",
+            "span_id",
+            "parent_span_id",
+            "kind",
+            "status_code",
+            "name",
+            "cloud_account_id",
+        ] {
+            assert!(
+                !resource_row.iter().any(|(k, _)| k == mirror),
+                "mirror key `{mirror}` leaked into resource_attributes"
+            );
+            assert!(
+                !span_row.iter().any(|(k, _)| k == mirror),
+                "mirror key `{mirror}` leaked into span_attributes"
+            );
+        }
+
+        // The indexed top-level columns themselves must still be populated.
+        let service_name_col = batch
+            .column_by_name("service_name")
+            .expect("service_name column")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("StringArray");
+        assert_eq!(service_name_col.value(0), "ingest-test");
+    }
+
+    /// Convert row `row` of a `MapArray` into a plain `Vec<(String, String)>`.
+    fn map_row_as_pairs(map: &arrow::array::MapArray, row: usize) -> Vec<(String, String)> {
+        use arrow::array::Array;
+        let entries = map.value(row);
+        let entries_struct = entries
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("map entries struct");
+        let keys = entries_struct
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("keys StringArray");
+        let values = entries_struct
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("values StringArray");
+        (0..keys.len())
+            .filter(|i| !values.is_null(*i))
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect()
     }
 }

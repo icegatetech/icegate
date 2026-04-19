@@ -236,6 +236,8 @@ data:
         compression: none
         headers:
           X-Scope-OrgID: demo
+      otlp_http/jaeger:
+        endpoint: http://jaeger-collector.observability.svc.cluster.local.:4318
 
     service:
       pipelines:
@@ -247,4 +249,4 @@ data:
           # Traces keep the SDK-set service.name; no logs_service_name override.
           receivers: [otlp]
           processors: [k8s_attributes, batch, resource]
-          exporters: [otlp_http]
+          exporters: [otlp_http, otlp_http/jaeger]

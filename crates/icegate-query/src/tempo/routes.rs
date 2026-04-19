@@ -1,22 +1,21 @@
 //! Tempo API routes
 
-use axum::{
-    Router,
-    routing::{get, post},
-};
+use axum::{Router, routing::get};
 
 use super::{handlers, server::TempoState};
 
-/// Create Tempo API router
+/// Build the Tempo HTTP router.
 pub fn routes(state: TempoState) -> Router {
     Router::new()
-        // Trace endpoints
         .route("/api/traces/{trace_id}", get(handlers::get_trace))
-        .route("/api/search", post(handlers::search_traces))
-        // Metadata endpoints
+        .route("/api/v2/traces/{trace_id}", get(handlers::get_trace))
+        .route(
+            "/api/search",
+            get(handlers::search_traces).post(handlers::search_traces),
+        )
         .route("/api/search/tags", get(handlers::search_tags))
+        .route("/api/v2/search/tags", get(handlers::search_tags))
         .route("/api/search/tag/{name}/values", get(handlers::tag_values))
-        // Health check
         .route("/ready", get(handlers::ready))
         .with_state(state)
 }

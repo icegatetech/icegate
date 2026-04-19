@@ -49,6 +49,16 @@ datasources:
           httpHeaderName1: X-Scope-OrgID
         secureJsonData:
           httpHeaderValue1: demo
+      - name: Tempo (demo)
+        type: tempo
+        access: proxy
+        url: http://icegate-query.icegate.svc.cluster.local.:3200
+        isDefault: false
+        editable: false
+        jsonData:
+          httpHeaderName1: X-Scope-OrgID
+        secureJsonData:
+          httpHeaderValue1: demo
 
 dashboardProviders:
   dashboardproviders.yaml:

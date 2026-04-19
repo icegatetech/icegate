@@ -26,4 +26,7 @@ pub mod prometheus;
 /// Tempo API server (TraceQL)
 pub mod tempo;
 
+/// TraceQL query language implementation
+pub mod traceql;
+
 pub use config::QueryConfig;

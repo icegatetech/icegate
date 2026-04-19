@@ -29,3 +29,13 @@ datasources:
       httpHeaderName1: X-Scope-OrgID
     secureJsonData:
       httpHeaderValue1: demo
+  - name: Tempo (demo)
+    type: tempo
+    access: proxy
+    url: http://query:3200
+    isDefault: false
+    editable: false
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+    secureJsonData:
+      httpHeaderValue1: demo
