@@ -7,37 +7,34 @@
 //!    fetched.
 //! 2. Attribute MAP keys — derived by pulling only the dictionary page of
 //!    the `attributes.*.key` sub-column for every row group via
-//!    [`crate::engine::log_metadata_scan::parquet_reader::read_column_dictionaries`].
+//!    [`crate::engine::metadata_scan::parquet_reader::read_column_dictionaries`].
 
 use std::collections::BTreeSet;
 
 use iceberg::arrow::ArrowFileReader;
 use iceberg::expr::Predicate;
-use icegate_common::schema::{
-    COL_ATTRIBUTES, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TRACE_ID, LEVEL_ALIAS, LOG_SERIES_LABEL_COLUMNS,
-};
 use parquet::file::metadata::ParquetMetaData;
 
+use super::MetadataScanConfig;
 use super::error::MetadataScanError;
 use super::parquet_reader;
 
-/// High-cardinality attribute MAP keys excluded from `/labels` discovery.
-const LABELS_EXCLUDED_MAP_KEYS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
-
-/// Walk row-group statistics and add every series-visible indexed column
-/// that has at least one non-null value to `out`. Also inserts `"level"`
-/// whenever `severity_text` is present (Grafana compatibility alias).
-///
-/// Uses [`LOG_SERIES_LABEL_COLUMNS`] which excludes high-cardinality
-/// columns (`trace_id`, `span_id`).
+/// Walk row-group statistics and add every indexed column listed in
+/// `config.indexed_columns` that has at least one non-null value to `out`.
+/// Any alias mapping to a present column is also inserted (e.g. logs' `level`
+/// alias for `severity_text`).
 ///
 /// Pure metadata: no data pages are read.
-pub fn collect_indexed_from_metadata(metadata: &ParquetMetaData, out: &mut BTreeSet<String>) {
+pub fn collect_indexed_from_metadata(
+    metadata: &ParquetMetaData,
+    config: &MetadataScanConfig,
+    out: &mut BTreeSet<String>,
+) {
     let schema = metadata.file_metadata().schema_descr();
 
     // Map indexed column name -> leaf column index. Done once per file.
     let mut name_to_leaf: Vec<(&'static str, usize)> = Vec::new();
-    for &name in LOG_SERIES_LABEL_COLUMNS {
+    for &name in config.indexed_columns {
         if let Some(idx) = (0..schema.num_columns()).find(|&i| schema.column(i).name() == name) {
             name_to_leaf.push((name, idx));
         }
@@ -48,11 +45,10 @@ pub fn collect_indexed_from_metadata(metadata: &ParquetMetaData, out: &mut BTree
         let num_rows = rg.num_rows();
 
         for &(name, leaf_idx) in &name_to_leaf {
-            // Fast path: label already recorded. Exception: when we've
-            // seen `severity_text` but not yet the `level` alias, keep
-            // going so we can add `level` on the first row-group stats
-            // check that finds a non-null `severity_text`.
-            if out.contains(name) && (name != COL_SEVERITY_TEXT || out.contains(LEVEL_ALIAS)) {
+            // Fast path: the column AND every alias for it are already
+            // recorded. Otherwise we keep going so later row groups can
+            // still flip an alias on.
+            if out.contains(name) && config.aliases_for(name).all(|a| out.contains(a)) {
                 continue;
             }
 
@@ -69,8 +65,8 @@ pub fn collect_indexed_from_metadata(metadata: &ParquetMetaData, out: &mut BTree
 
             if has_values {
                 out.insert(name.to_string());
-                if name == COL_SEVERITY_TEXT {
-                    out.insert(LEVEL_ALIAS.to_string());
+                for alias in config.aliases_for(name) {
+                    out.insert(alias.to_string());
                 }
             }
         }
@@ -89,29 +85,30 @@ pub async fn collect_map_keys_via_dict(
     reader: &mut ArrowFileReader,
     metadata: &ParquetMetaData,
     predicate: &Predicate,
+    config: &MetadataScanConfig,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
     let schema = metadata.file_metadata().schema_descr();
 
-    // Find the `attributes.*.key` leaf. Arrow's MAP<Utf8,Utf8> may
-    // serialize as `attributes.key_value.key` or `attributes.entries.key`
+    // Find the `<map_column>.*.key` leaf. Arrow's MAP<Utf8,Utf8> may
+    // serialize as `<map_column>.key_value.key` or `<map_column>.entries.key`
     // depending on writer version — match on the top-level column + the
     // leaf name rather than a hard-coded path.
     let key_leaf_idx = (0..schema.num_columns()).find(|&i| {
         let col = schema.column(i);
         let parts = col.path().parts();
-        parts.first().is_some_and(|s| s == COL_ATTRIBUTES) && parts.last().is_some_and(|s| s == "key")
+        parts.first().is_some_and(|s| s == config.map_column) && parts.last().is_some_and(|s| s == "key")
     });
     let Some(key_leaf_idx) = key_leaf_idx else {
-        // No attributes MAP — nothing to do. Defensive; should not happen
-        // for the logs table.
+        // Map column not present in this file — nothing to do. Not an error
+        // under over-approximation semantics.
         return Ok(());
     };
 
     parquet_reader::read_column_dictionaries(reader, metadata, predicate, key_leaf_idx, out).await?;
 
-    // Remove high-cardinality keys that are not useful for label discovery.
-    for &key in LABELS_EXCLUDED_MAP_KEYS {
+    // Remove caller-configured keys that are not useful for label discovery.
+    for &key in config.excluded_map_keys {
         out.remove(key);
     }
     Ok(())

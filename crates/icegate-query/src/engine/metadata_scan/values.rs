@@ -17,13 +17,13 @@ use datafusion::arrow::array::{Array, MapArray, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
 use iceberg::expr::Predicate;
-use icegate_common::schema::COL_ATTRIBUTES;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 
+use super::MetadataScanConfig;
 use super::error::MetadataScanError;
-use super::{parquet_reader, predicate};
+use super::parquet_reader;
 
 /// Which code path to use for a given label name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,14 +36,12 @@ pub enum LabelKind {
     MapAttribute,
 }
 
-/// Classify a label name as indexed or MAP-stored.
-///
-/// Delegates to [`predicate::is_indexed_column`] which checks
-/// [`LOG_INDEXED_ATTRIBUTE_COLUMNS`](icegate_common::schema::LOG_INDEXED_ATTRIBUTE_COLUMNS)
-/// and handles the `level` → `severity_text` alias.
+/// Classify a label name as indexed or MAP-stored, using the supplied
+/// per-table config. Aliases in `config.label_aliases` are resolved to their
+/// underlying column before the indexed-column check.
 #[must_use]
-pub fn classify_label(name: &str) -> LabelKind {
-    if predicate::is_indexed_column(name) {
+pub fn classify_label(name: &str, config: &MetadataScanConfig) -> LabelKind {
+    if config.is_indexed(name) {
         LabelKind::Indexed
     } else {
         LabelKind::MapAttribute
@@ -75,7 +73,7 @@ pub async fn collect_indexed_values_via_dict(
     parquet_reader::read_column_dictionaries(reader, metadata, predicate, leaf_idx, out).await
 }
 
-/// Project the `attributes` MAP column and collect distinct values for a
+/// Project the configured MAP column and collect distinct values for a
 /// single label key across surviving row groups. Consumes the builder.
 ///
 /// Row groups whose statistics are incompatible with the given
@@ -84,25 +82,26 @@ pub async fn collect_indexed_values_via_dict(
 /// # Errors
 ///
 /// Returns `MetadataScanError::Parquet` if projected record-batch reads
-/// fail, or `MetadataScanError::Schema` if the `attributes` column has
-/// an unexpected type.
-#[tracing::instrument(skip_all, fields(label_name = label_name, num_batches = tracing::field::Empty, pruned_rgs = tracing::field::Empty))]
+/// fail, or `MetadataScanError::Schema` if the map column has an unexpected
+/// type.
+#[tracing::instrument(skip_all, fields(map_column = config.map_column, label_name = label_name, num_batches = tracing::field::Empty, pruned_rgs = tracing::field::Empty))]
 pub async fn stream_map_values(
     builder: ParquetRecordBatchStreamBuilder<ArrowFileReader>,
     predicate: &Predicate,
+    config: &MetadataScanConfig,
     label_name: &str,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
     let schema_descr = builder.parquet_schema();
-    let has_attributes = (0..schema_descr.num_columns()).any(|i| {
+    let has_map = (0..schema_descr.num_columns()).any(|i| {
         schema_descr
             .column(i)
             .path()
             .parts()
             .first()
-            .is_some_and(|s| s == COL_ATTRIBUTES)
+            .is_some_and(|s| s == config.map_column)
     });
-    if !has_attributes {
+    if !has_map {
         return Ok(());
     }
 
@@ -116,13 +115,13 @@ pub async fn stream_map_values(
     let pruned = total_rgs - surviving.len();
     tracing::Span::current().record("pruned_rgs", pruned);
 
-    let mask = ProjectionMask::columns(schema_descr, [COL_ATTRIBUTES]);
+    let mask = ProjectionMask::columns(schema_descr, [config.map_column]);
     let mut stream = builder.with_projection(mask).with_row_groups(surviving).build()?;
 
     let mut num_batches: usize = 0;
     while let Some(batch) = stream.try_next().await? {
         num_batches += 1;
-        collect_map_values_from_batch(&batch, label_name, out)?;
+        collect_map_values_from_batch(&batch, config.map_column, label_name, out)?;
     }
     tracing::Span::current().record("num_batches", num_batches);
 
@@ -131,28 +130,29 @@ pub async fn stream_map_values(
 
 fn collect_map_values_from_batch(
     batch: &RecordBatch,
+    map_column: &str,
     label_name: &str,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
     let attr_idx = batch
         .schema()
-        .index_of(COL_ATTRIBUTES)
-        .map_err(|_| MetadataScanError::Schema("batch missing 'attributes' column".to_string()))?;
+        .index_of(map_column)
+        .map_err(|_| MetadataScanError::Schema(format!("batch missing '{map_column}' column")))?;
     let map_arr = batch
         .column(attr_idx)
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| MetadataScanError::Schema("'attributes' column is not a MapArray".to_string()))?;
+        .ok_or_else(|| MetadataScanError::Schema(format!("'{map_column}' column is not a MapArray")))?;
     let keys = map_arr
         .keys()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| MetadataScanError::Schema("'attributes' map keys are not StringArray".to_string()))?;
+        .ok_or_else(|| MetadataScanError::Schema(format!("'{map_column}' map keys are not StringArray")))?;
     let values = map_arr
         .values()
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| MetadataScanError::Schema("'attributes' map values are not StringArray".to_string()))?;
+        .ok_or_else(|| MetadataScanError::Schema(format!("'{map_column}' map values are not StringArray")))?;
 
     for i in 0..keys.len() {
         if keys.is_valid(i) && keys.value(i) == label_name && values.is_valid(i) {
@@ -169,24 +169,38 @@ fn collect_map_values_from_batch(
 #[cfg(test)]
 mod tests {
     use super::{LabelKind, classify_label};
+    use crate::engine::metadata_scan::MetadataScanConfig;
+
+    const LOG_CFG: MetadataScanConfig = MetadataScanConfig {
+        indexed_columns: &[
+            "service_name",
+            "severity_text",
+            "trace_id",
+            "span_id",
+            "cloud_account_id",
+        ],
+        label_aliases: &[("level", "severity_text"), ("service", "service_name")],
+        excluded_map_keys: &[],
+        map_column: "attributes",
+    };
 
     #[test]
     fn classify_level_is_indexed() {
-        assert_eq!(classify_label("level"), LabelKind::Indexed);
+        assert_eq!(classify_label("level", &LOG_CFG), LabelKind::Indexed);
     }
 
     #[test]
     fn classify_indexed_columns_are_indexed() {
-        assert_eq!(classify_label("service_name"), LabelKind::Indexed);
-        assert_eq!(classify_label("trace_id"), LabelKind::Indexed);
-        assert_eq!(classify_label("span_id"), LabelKind::Indexed);
-        assert_eq!(classify_label("severity_text"), LabelKind::Indexed);
-        assert_eq!(classify_label("cloud_account_id"), LabelKind::Indexed);
+        assert_eq!(classify_label("service_name", &LOG_CFG), LabelKind::Indexed);
+        assert_eq!(classify_label("trace_id", &LOG_CFG), LabelKind::Indexed);
+        assert_eq!(classify_label("span_id", &LOG_CFG), LabelKind::Indexed);
+        assert_eq!(classify_label("severity_text", &LOG_CFG), LabelKind::Indexed);
+        assert_eq!(classify_label("cloud_account_id", &LOG_CFG), LabelKind::Indexed);
     }
 
     #[test]
     fn classify_map_attribute_for_non_indexed() {
-        assert_eq!(classify_label("pod"), LabelKind::MapAttribute);
-        assert_eq!(classify_label("namespace"), LabelKind::MapAttribute);
+        assert_eq!(classify_label("pod", &LOG_CFG), LabelKind::MapAttribute);
+        assert_eq!(classify_label("namespace", &LOG_CFG), LabelKind::MapAttribute);
     }
 }

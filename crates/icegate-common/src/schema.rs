@@ -1075,6 +1075,50 @@ pub const LOG_INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &[
 /// Used by `/labels`, `/label_values` discovery, and `/series` endpoints.
 pub const LOG_SERIES_LABEL_COLUMNS: &[&str] = &[COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_SEVERITY_TEXT];
 
+// ── Span tag-discovery lists ─────────────────────────────────────────
+
+/// Indexed top-level string-ish columns for the `spans` table, surfaced via
+/// tag discovery endpoints.
+///
+/// Excludes high-cardinality identifiers (`trace_id`, `span_id`,
+/// `parent_span_id`) and numeric-only columns (`duration_micros`, `kind`,
+/// `status_code` — these are exposed separately as `TraceQL` intrinsics).
+/// Only columns whose values are reasonable to enumerate as distinct strings
+/// are listed here.
+pub const SPAN_SERIES_LABEL_COLUMNS: &[&str] = &[COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_NAME];
+
+/// Indexed top-level columns on the `spans` table whose distinct values can
+/// be enumerated via the tag-values endpoint.
+///
+/// Superset of [`SPAN_SERIES_LABEL_COLUMNS`] — includes high-cardinality
+/// identifiers that are useful as filter values (`trace_id`, `span_id`).
+pub const SPAN_INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &[
+    COL_CLOUD_ACCOUNT_ID,
+    COL_SERVICE_NAME,
+    COL_NAME,
+    COL_TRACE_ID,
+    COL_SPAN_ID,
+    COL_PARENT_SPAN_ID,
+];
+
+/// `TraceQL` intrinsic tag names exposed on `/api/v2/search/tags` with
+/// `scope=intrinsic`.
+///
+/// These are not literal column names — they are the user-facing tag names
+/// Grafana expects. Internal mapping to underlying columns happens in the
+/// tempo metadata layer.
+pub const TRACEQL_INTRINSIC_TAGS: &[&str] = &[
+    "name",
+    "status",
+    "kind",
+    "duration",
+    "traceDuration",
+    "rootName",
+    "rootServiceName",
+    "traceID",
+    "spanID",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

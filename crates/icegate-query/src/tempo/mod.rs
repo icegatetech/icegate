@@ -7,6 +7,7 @@ pub mod error;
 pub mod executor;
 pub mod formatters;
 mod handlers;
+mod metadata;
 pub mod models;
 mod routes;
 mod server;

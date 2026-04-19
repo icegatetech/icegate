@@ -5,6 +5,15 @@ use axum::{Router, routing::get};
 use super::{handlers, server::TempoState};
 
 /// Build the Tempo HTTP router.
+///
+/// Endpoint mapping:
+/// - `GET  /api/traces/{trace_id}`          — trace lookup by id.
+/// - `GET  /api/v2/traces/{trace_id}`       — v2 alias of trace lookup.
+/// - `GET  / POST /api/search`              — `TraceQL` search.
+/// - `GET  /api/search/tags`                — v1 flat tag list.
+/// - `GET  /api/v2/search/tags`             — v2 scoped tag list (Grafana).
+/// - `GET  /api/search/tag/{name}/values`   — tag-value enumeration.
+/// - `GET  /ready`                          — health check.
 pub fn routes(state: TempoState) -> Router {
     Router::new()
         .route("/api/traces/{trace_id}", get(handlers::get_trace))
@@ -13,8 +22,9 @@ pub fn routes(state: TempoState) -> Router {
             "/api/search",
             get(handlers::search_traces).post(handlers::search_traces),
         )
-        .route("/api/search/tags", get(handlers::search_tags))
-        .route("/api/v2/search/tags", get(handlers::search_tags))
+        // Metadata endpoints — v1 and v2 have different response shapes.
+        .route("/api/search/tags", get(handlers::search_tags_v1))
+        .route("/api/v2/search/tags", get(handlers::search_tags_v2))
         .route("/api/search/tag/{name}/values", get(handlers::tag_values))
         .route("/ready", get(handlers::ready))
         .with_state(state)

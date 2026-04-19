@@ -316,7 +316,7 @@ impl QueryExecutor {
 
     /// Execute a labels metadata query.
     ///
-    /// Dispatches to `crate::engine::log_metadata_scan`, which reads only
+    /// Dispatches to `crate::engine::metadata_scan`, which reads only
     /// Parquet row-group statistics and the `attributes` MAP column — no
     /// full-row scans.
     ///
@@ -337,11 +337,19 @@ impl QueryExecutor {
         );
 
         let selector = self.parse_selector_opt(params.query.clone()).await?;
+        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_METADATA_CONFIG);
 
         let table = self.load_logs_table().await?;
-        let labels = crate::engine::log_metadata_scan::scan_labels(&table, &query_ctx, &selector)
-            .await
-            .map_err(|e| LokiError(QueryError::from(e)))?;
+        let labels = crate::engine::metadata_scan::scan_labels(
+            &table,
+            &query_ctx.tenant_id,
+            query_ctx.start,
+            query_ctx.end,
+            &super::LOGS_METADATA_CONFIG,
+            extra,
+        )
+        .await
+        .map_err(|e| LokiError(QueryError::from(e)))?;
 
         Ok(labels.into_iter().collect())
     }
@@ -366,11 +374,22 @@ impl QueryExecutor {
         );
 
         let selector = self.parse_selector_opt(params.query.clone()).await?;
+        // `/label_values` uses the superset config so high-cardinality ids
+        // (`trace_id`, `span_id`) can still be enumerated explicitly.
+        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_VALUES_METADATA_CONFIG);
 
         let table = self.load_logs_table().await?;
-        let values = crate::engine::log_metadata_scan::scan_label_values(&table, &query_ctx, &selector, label_name)
-            .await
-            .map_err(|e| LokiError(QueryError::from(e)))?;
+        let values = crate::engine::metadata_scan::scan_label_values(
+            &table,
+            &query_ctx.tenant_id,
+            query_ctx.start,
+            query_ctx.end,
+            &super::LOGS_VALUES_METADATA_CONFIG,
+            label_name,
+            extra,
+        )
+        .await
+        .map_err(|e| LokiError(QueryError::from(e)))?;
 
         Ok(values.into_iter().collect())
     }

@@ -10,8 +10,8 @@ use crate::engine::QueryEngine;
 /// Shared application state for Tempo server
 #[derive(Clone)]
 pub struct TempoState {
-    /// Query engine for creating `DataFusion` sessions
-    #[allow(dead_code)]
+    /// Query engine — primarily used to access the iceberg catalog for
+    /// span table loads.
     pub engine: Arc<QueryEngine>,
 }
 

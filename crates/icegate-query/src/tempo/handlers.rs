@@ -1,4 +1,9 @@
 //! Tempo API request handlers.
+//!
+//! Thin route handlers that extract the tenant from the `x-scope-orgid`
+//! header, parse query parameters and delegate to [`super::executor`]
+//! for `TraceQL` search, [`super::trace_by_id`] for trace lookup, and
+//! [`super::metadata`] for tag/tag-value discovery.
 
 use axum::{
     Json,
@@ -14,7 +19,11 @@ use super::{
     error::TempoResult,
     executor,
     formatters::{spans_to_otlp_json, spans_to_otlp_proto},
-    models::{SearchParams, TraceLookupParams},
+    metadata,
+    models::{
+        Scope, SearchParams, TagValuesQueryParams, TagValuesResponse, TagsQueryParams, TagsV1Response, TagsV2Response,
+        TraceLookupParams,
+    },
     server::TempoState,
     trace_by_id::{default_window, fetch},
 };
@@ -112,7 +121,7 @@ pub async fn get_trace(
 }
 
 // ============================================================================
-// Stubs (Phase 7 / out-of-scope per spec)
+// TraceQL search
 // ============================================================================
 
 /// Handle `GET`/`POST /api/search` (and the `/api/v2/...` alias).
@@ -137,37 +146,64 @@ pub async fn search_traces(
     Ok((StatusCode::OK, Json(resp)).into_response())
 }
 
-/// Handle search tags request (tag names/keys).
-///
-/// # TODO
-/// - Query Iceberg spans table for distinct tag/attribute names
-/// - Filter by time range if provided
-/// - Return list of tag names in Tempo format
-pub async fn search_tags(State(_state): State<TempoState>) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "Search tags endpoint not yet implemented. TODO: Query distinct tags from Iceberg"
-        })),
-    )
-        .into_response()
+// ============================================================================
+// Tag discovery
+// ============================================================================
+
+/// Handle `GET /api/search/tags` — flat list of all distinct tag names.
+#[tracing::instrument(skip_all, fields(tenant_id, error = tracing::field::Empty))]
+pub async fn search_tags_v1(
+    State(state): State<TempoState>,
+    headers: HeaderMap,
+    Query(params): Query<TagsQueryParams>,
+) -> TempoResult<impl IntoResponse> {
+    let tenant_id = extract_tenant_id(&headers);
+    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+
+    let tag_names = metadata::list_tags_v1(&state, &tenant_id, params.start, params.end).await?;
+    Ok((StatusCode::OK, Json(TagsV1Response { tag_names })))
 }
 
-/// Handle tag values request.
-///
-/// # TODO
-/// - Query Iceberg spans table for distinct values of specified tag
-/// - Filter by time range if provided
-/// - Return list of tag values in Tempo format
-pub async fn tag_values(State(_state): State<TempoState>, Path(_tag_name): Path<String>) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "Tag values endpoint not yet implemented. TODO: Query tag values from Iceberg"
-        })),
-    )
-        .into_response()
+/// Handle `GET /api/v2/search/tags` — scoped tag list used by Grafana's
+/// query builder.
+#[tracing::instrument(skip_all, fields(tenant_id, scope = tracing::field::Empty, error = tracing::field::Empty))]
+pub async fn search_tags_v2(
+    State(state): State<TempoState>,
+    headers: HeaderMap,
+    Query(params): Query<TagsQueryParams>,
+) -> TempoResult<impl IntoResponse> {
+    let tenant_id = extract_tenant_id(&headers);
+    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    let scope_filter = params.scope.as_deref().and_then(Scope::parse);
+    if let Some(s) = scope_filter {
+        tracing::Span::current().record("scope", s.as_str());
+    }
+
+    let response: TagsV2Response =
+        metadata::list_tags_v2(&state, &tenant_id, params.start, params.end, scope_filter).await?;
+    Ok((StatusCode::OK, Json(response)))
 }
+
+/// Handle `GET /api/search/tag/{name}/values` — distinct values for a
+/// single tag.
+#[tracing::instrument(skip_all, fields(tenant_id, tag_name = %tag_name, error = tracing::field::Empty))]
+pub async fn tag_values(
+    State(state): State<TempoState>,
+    headers: HeaderMap,
+    Path(tag_name): Path<String>,
+    Query(params): Query<TagValuesQueryParams>,
+) -> TempoResult<impl IntoResponse> {
+    let tenant_id = extract_tenant_id(&headers);
+    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    let limit = params.limit.unwrap_or(TagValuesQueryParams::DEFAULT_LIMIT);
+
+    let tag_values = metadata::list_tag_values(&state, &tenant_id, &tag_name, params.start, params.end, limit).await?;
+    Ok((StatusCode::OK, Json(TagValuesResponse { tag_values })))
+}
+
+// ============================================================================
+// Health
+// ============================================================================
 
 /// Health/ready check endpoint.
 pub async fn ready() -> Response {
