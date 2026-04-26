@@ -1081,8 +1081,9 @@ mod tests {
         error::IngestError,
         shift::executor::{PlannedRowGroup, SegmentToRead},
         wal::{
-            RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, SortColumnsDescriptor,
+            RowGroupBoundaryKey, RowGroupBoundaryRange, SortColumnsDescriptor,
             logs_row_group_boundary_range_from_batch,
+            test_utils::{boundary_component_string, boundary_component_timestamp_micros},
         },
     };
 
@@ -1169,9 +1170,7 @@ mod tests {
             &self,
             _topic: &icegate_queue::Topic,
             _start_offset: u64,
-            _group_by_column_name: &str,
-            _max_record_batches_per_task: usize,
-            _max_input_bytes_per_task: u64,
+            _fields: &[icegate_queue::ExtractField],
             _cancel_token: &CancellationToken,
         ) -> icegate_queue::Result<icegate_queue::SegmentsPlan> {
             panic!("unused in merger tests");
@@ -1207,15 +1206,6 @@ mod tests {
             }
             let batches = self.batches.get(&(offset, row_group_idx)).cloned().unwrap_or_default();
             Ok(Box::pin(futures::stream::iter(batches.into_iter().map(Ok))))
-        }
-
-        async fn read_segment_row_group_metadata(
-            &self,
-            _topic: &icegate_queue::Topic,
-            _offset: u64,
-            _cancel_token: &CancellationToken,
-        ) -> icegate_queue::Result<std::collections::HashMap<usize, String>> {
-            panic!("unused in merger tests");
         }
     }
 
@@ -1280,7 +1270,15 @@ mod tests {
             row_groups: vec![PlannedRowGroup {
                 row_group_idx,
                 row_group_bytes: 1,
-                boundary_range: RowGroupBoundaryRange { min_key, max_key },
+                boundary_range: RowGroupBoundaryRange {
+                    names: Arc::from([
+                        "cloud_account_id".to_string(),
+                        "service_name".to_string(),
+                        "timestamp".to_string(),
+                    ]),
+                    min_key,
+                    max_key,
+                },
             }],
         }
     }
@@ -1290,13 +1288,11 @@ mod tests {
         service_name: Option<&str>,
         timestamp_micros: Option<i64>,
     ) -> RowGroupBoundaryKey {
-        RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(cloud_account_id.map(str::to_string), false, true),
-                RowGroupBoundaryComponent::string(service_name.map(str::to_string), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(timestamp_micros, true, true),
-            ],
-        }
+        RowGroupBoundaryKey::new(vec![
+            boundary_component_string(cloud_account_id.map(str::to_string), false, true),
+            boundary_component_string(service_name.map(str::to_string), false, true),
+            boundary_component_timestamp_micros(timestamp_micros, true, true),
+        ])
     }
 
     fn cluster_sizes_from_metadata(segments: impl AsRef<[SegmentToRead]>) -> Vec<usize> {
@@ -2017,18 +2013,14 @@ mod tests {
             plan_with_range(
                 2,
                 0,
-                RowGroupBoundaryKey {
-                    components: vec![
-                        RowGroupBoundaryComponent::string(Some("acc-2".to_string()), false, true),
-                        RowGroupBoundaryComponent::string(Some("svc-2".to_string()), false, true),
-                    ],
-                },
-                RowGroupBoundaryKey {
-                    components: vec![
-                        RowGroupBoundaryComponent::string(Some("acc-2".to_string()), false, true),
-                        RowGroupBoundaryComponent::string(Some("svc-2".to_string()), false, true),
-                    ],
-                },
+                RowGroupBoundaryKey::new(vec![
+                    boundary_component_string(Some("acc-2".to_string()), false, true),
+                    boundary_component_string(Some("svc-2".to_string()), false, true),
+                ]),
+                RowGroupBoundaryKey::new(vec![
+                    boundary_component_string(Some("acc-2".to_string()), false, true),
+                    boundary_component_string(Some("svc-2".to_string()), false, true),
+                ]),
             ),
         ]);
 
@@ -2051,7 +2043,7 @@ mod tests {
             panic!("incompatible boundary keys must be rejected");
         };
 
-        assert!(err.to_string().contains("component count differs"));
+        assert!(err.to_string().contains("arity mismatch"));
     }
 
     #[tokio::test]

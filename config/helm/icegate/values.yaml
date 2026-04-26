@@ -231,12 +231,12 @@ ingest:
   shift:
     read:
       maxRecordBatchesPerTask: 128
-      maxInputBytesPerTask: 67108864
+      lowerBoundInputBytesPerTask: 67108864   # 64 MiB — soft target / tail-merge cutoff
+      upperBoundInputBytesPerTask: 134217728  # 128 MiB — hard per-task cap
       planSegmentReadParallelism: 8
       shiftSegmentReadParallelism: 8
     write:
       rowGroupSize: 8192
-      maxFileSizeMb: 64
       tableCacheTtlSecs: 60
     timeouts:
       planBaseMs: 10000

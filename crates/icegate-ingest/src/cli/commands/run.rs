@@ -439,12 +439,14 @@ async fn run_services(
             topic: LOGS_TOPIC,
             table: LOGS_TABLE,
             descriptor: SortColumnsDescriptor::logs()?,
+            planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
         },
         ShiftJobSpec {
             job_name: "shift_spans",
             topic: SPANS_TOPIC,
             table: SPANS_TABLE,
             descriptor: SortColumnsDescriptor::spans()?,
+            planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
         },
     ];
 

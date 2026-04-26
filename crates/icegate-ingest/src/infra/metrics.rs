@@ -50,6 +50,7 @@ pub struct ShiftMetrics {
     row_groups_merger_open_row_groups: UpDownCounter<i64>,
     row_groups_merger_open_row_group_bytes: UpDownCounter<i64>,
     row_groups_merger_row_group_lifetime_duration: Histogram<f64>,
+    planner_oversized_clusters_total: Counter<u64>,
 }
 
 impl ShiftMetrics {
@@ -93,6 +94,9 @@ impl ShiftMetrics {
                 .build(),
             row_groups_merger_row_group_lifetime_duration: meter
                 .f64_histogram("icegate_ingest_shift_row_groups_merger_row_group_lifetime_duration")
+                .build(),
+            planner_oversized_clusters_total: meter
+                .u64_counter("icegate_ingest_shift_planner_oversized_clusters")
                 .build(),
         }
     }
@@ -198,6 +202,12 @@ impl ShiftMetrics {
             .with_description("Lifetime of one row group while it stays open in row groups merger")
             .with_unit("s")
             .build();
+        let planner_oversized_clusters_total = meter
+            .u64_counter("icegate_ingest_shift_planner_oversized_clusters")
+            .with_description(
+                "Number of overlap clusters that exceeded the planner hard cap and were split (disjointness loss)",
+            )
+            .build();
 
         Self {
             enabled: true,
@@ -223,7 +233,18 @@ impl ShiftMetrics {
             row_groups_merger_open_row_groups,
             row_groups_merger_open_row_group_bytes,
             row_groups_merger_row_group_lifetime_duration,
+            planner_oversized_clusters_total,
         }
+    }
+
+    /// Increment the oversized-cluster counter (one per cluster that exceeded
+    /// the planner hard cap and had to be split, losing disjointness).
+    pub fn record_planner_oversized_clusters(&self, count: u64, topic: &str) {
+        if !self.enabled || count == 0 {
+            return;
+        }
+        self.planner_oversized_clusters_total
+            .add(count, &[KeyValue::new("topic", topic.to_string())]);
     }
 
     /// Record the plan task duration.

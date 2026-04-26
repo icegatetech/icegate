@@ -62,15 +62,13 @@ pub struct PlannedRowGroup {
 pub struct SegmentToRead {
     /// segment offset.
     pub segment_offset: u64,
-    /// Planned row groups for this tenant inside the segment.
+    /// Planned row groups inside the segment.
     pub row_groups: Vec<PlannedRowGroup>,
 }
 
 /// Input for the shift task.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ShiftInput {
-    /// Tenant identifier handled by this task.
-    pub tenant_id: String,
     /// segments to read and shift.
     pub segments: Vec<SegmentToRead>,
     /// W3C trace context from parent plan span
