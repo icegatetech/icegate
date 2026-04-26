@@ -33,6 +33,7 @@ pub struct RowGroupBoundaryKey {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RowGroupBoundaryRange {
+    pub names: Vec<String>,
     pub min_key: RowGroupBoundaryKey,
     pub max_key: RowGroupBoundaryKey,
 }
@@ -170,6 +171,11 @@ pub fn logs_row_group_boundary_range(batch: &RecordBatch) -> RowGroupBoundaryRan
     let first_row_idx = 0usize;
     let last_row_idx = batch.num_rows() - 1;
     RowGroupBoundaryRange {
+        names: vec![
+            "cloud_account_id".to_string(),
+            "service_name".to_string(),
+            "timestamp".to_string(),
+        ],
         min_key: RowGroupBoundaryKey {
             components: vec![
                 RowGroupBoundaryComponent {

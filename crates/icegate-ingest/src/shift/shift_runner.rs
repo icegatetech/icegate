@@ -414,7 +414,7 @@ impl std::fmt::Display for ShiftWriteError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::HashMap,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -432,9 +432,7 @@ mod tests {
     use futures::TryStreamExt;
     use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Struct};
     use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
-    use icegate_queue::{
-        GroupedSegmentsPlan, PlannedRowGroup as QueuePlannedRowGroup, SegmentRecordBatchIdxs, SegmentsPlan,
-    };
+    use icegate_queue::{RowGroupPlanEntry, SegmentsPlan};
     use parquet::{
         arrow::arrow_writer::ArrowWriter,
         file::{
@@ -680,9 +678,7 @@ mod tests {
             &self,
             _topic: &icegate_queue::Topic,
             _start_offset: u64,
-            _group_by_column_name: &str,
-            _max_record_batches_per_task: usize,
-            _max_input_bytes_per_task: u64,
+            _fields: &[icegate_queue::ExtractField],
             _cancel_token: &CancellationToken,
         ) -> icegate_queue::Result<icegate_queue::SegmentsPlan> {
             panic!("plan_segments is not expected in shift runner tests");
@@ -731,15 +727,6 @@ mod tests {
                     .map(Ok),
             )))
         }
-
-        async fn read_segment_row_group_metadata(
-            &self,
-            _topic: &icegate_queue::Topic,
-            _offset: u64,
-            _cancel_token: &CancellationToken,
-        ) -> icegate_queue::Result<std::collections::HashMap<usize, String>> {
-            panic!("read_segment_row_group_metadata is not expected in shift runner tests");
-        }
     }
 
     struct StreamFailingQueueReader {
@@ -753,9 +740,7 @@ mod tests {
             &self,
             _topic: &icegate_queue::Topic,
             _start_offset: u64,
-            _group_by_column_name: &str,
-            _max_record_batches_per_task: usize,
-            _max_input_bytes_per_task: u64,
+            _fields: &[icegate_queue::ExtractField],
             _cancel_token: &CancellationToken,
         ) -> icegate_queue::Result<icegate_queue::SegmentsPlan> {
             panic!("plan_segments is not expected in shift runner tests");
@@ -790,15 +775,6 @@ mod tests {
                 }
             }
             Ok(Box::pin(futures::stream::iter(outputs)))
-        }
-
-        async fn read_segment_row_group_metadata(
-            &self,
-            _topic: &icegate_queue::Topic,
-            _offset: u64,
-            _cancel_token: &CancellationToken,
-        ) -> icegate_queue::Result<std::collections::HashMap<usize, String>> {
-            panic!("read_segment_row_group_metadata is not expected in shift runner tests");
         }
     }
 
@@ -1102,9 +1078,7 @@ mod tests {
             &self,
             _topic: &icegate_queue::Topic,
             _start_offset: u64,
-            _group_by_column_name: &str,
-            _max_record_batches_per_task: usize,
-            _max_input_bytes_per_task: u64,
+            _fields: &[icegate_queue::ExtractField],
             _cancel_token: &CancellationToken,
         ) -> icegate_queue::Result<SegmentsPlan> {
             Ok(self.plan.clone())
@@ -1126,20 +1100,6 @@ mod tests {
                 .map(Ok)
                 .collect::<Vec<_>>();
             Ok(Box::pin(futures::stream::iter(batches)))
-        }
-
-        async fn read_segment_row_group_metadata(
-            &self,
-            _topic: &icegate_queue::Topic,
-            offset: u64,
-            _cancel_token: &CancellationToken,
-        ) -> icegate_queue::Result<HashMap<usize, String>> {
-            let row_groups = self.segments.get(&offset).cloned().unwrap_or_default();
-            Ok(row_groups
-                .into_iter()
-                .enumerate()
-                .filter_map(|(row_group_idx, row_group)| row_group.metadata.map(|metadata| (row_group_idx, metadata)))
-                .collect())
         }
     }
 
@@ -1243,8 +1203,7 @@ mod tests {
     }
 
     fn build_segments_plan(segments: &[E2eWalSegment]) -> SegmentsPlan {
-        let mut groups: BTreeMap<String, BTreeMap<u64, Vec<QueuePlannedRowGroup>>> = BTreeMap::new();
-        let mut total_row_groups = 0usize;
+        let mut entries: Vec<RowGroupPlanEntry> = Vec::new();
         for segment in segments {
             for (row_group_idx, row_group) in segment.row_groups.iter().enumerate() {
                 let tenant_ids = row_group
@@ -1254,47 +1213,33 @@ mod tests {
                     .downcast_ref::<StringArray>()
                     .expect("tenant_id");
                 let tenant_id = tenant_ids.value(0).to_string();
-                groups
-                    .entry(tenant_id)
-                    .or_default()
-                    .entry(segment.offset)
-                    .or_default()
-                    .push(QueuePlannedRowGroup {
-                        row_group_idx,
-                        row_group_bytes: 1,
-                        row_group_metadata: row_group.metadata.clone(),
-                    });
-                total_row_groups = total_row_groups.saturating_add(1);
+                let mut extracted = HashMap::new();
+                extracted.insert(
+                    crate::shift::plan_runner::PLAN_FIELD_TENANT_ID.to_string(),
+                    icegate_queue::ExtractedValue::Utf8(tenant_id),
+                );
+                if let Some(payload) = row_group.metadata.clone() {
+                    extracted.insert(
+                        crate::shift::plan_runner::PLAN_FIELD_BOUNDARY_RANGE.to_string(),
+                        icegate_queue::ExtractedValue::Utf8(payload),
+                    );
+                }
+                entries.push(RowGroupPlanEntry {
+                    wal_offset: segment.offset,
+                    row_group_idx,
+                    row_group_bytes: 1,
+                    extracted,
+                });
             }
         }
 
-        let grouped = groups
-            .into_iter()
-            .map(|(tenant_id, by_segment)| {
-                let segments = by_segment
-                    .into_iter()
-                    .map(|(segment_offset, row_groups)| SegmentRecordBatchIdxs {
-                        segment_offset,
-                        row_groups,
-                    })
-                    .collect::<Vec<_>>();
-                let record_batches_total = segments.iter().map(|segment| segment.row_groups.len()).sum::<usize>();
-                GroupedSegmentsPlan {
-                    group_col_val: tenant_id,
-                    segments_count: segments.len(),
-                    record_batches_total,
-                    input_bytes_total: record_batches_total as u64,
-                    segments,
-                }
-            })
-            .collect::<Vec<_>>();
-
+        let row_groups_total = entries.len();
         SegmentsPlan {
-            groups: grouped,
+            entries,
             last_segment_offset: segments.iter().map(|segment| segment.offset).max(),
             segments_count: segments.len(),
-            record_batches_total: total_row_groups,
-            input_bytes_total: total_row_groups as u64,
+            row_groups_total,
+            input_bytes_total: row_groups_total as u64,
         }
     }
 
@@ -1344,7 +1289,6 @@ mod tests {
         let segment_2 = vec![test_batch(2)];
         let segment_3 = vec![test_batch(3)];
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
@@ -1419,7 +1363,6 @@ mod tests {
             ]),
         ];
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![SegmentToRead {
                 segment_offset: 1,
                 row_groups: planned_row_groups(&segment_1, &[0, 1]),
@@ -1484,7 +1427,6 @@ mod tests {
             ]),
         ];
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![SegmentToRead {
                 segment_offset: 1,
                 row_groups: planned_row_groups(&segment_1, &[0, 1]),
@@ -1548,7 +1490,6 @@ mod tests {
         let segment_2 = vec![test_batch(2)];
         let segment_3 = vec![test_batch(3)];
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
@@ -1623,7 +1564,6 @@ mod tests {
         let segment_2 = vec![test_batch(2)];
         let segment_3 = vec![test_batch(3)];
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
@@ -1683,7 +1623,6 @@ mod tests {
             ordered_single_row_batch("svc", 10, 3),
         ];
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![SegmentToRead {
                 segment_offset: 1,
                 row_groups: planned_row_groups(&segment_1, &[0, 1, 2]),
@@ -1771,7 +1710,6 @@ mod tests {
         .with_segment_read_parallelism(2)
         .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
@@ -1857,7 +1795,6 @@ mod tests {
         .with_segment_read_parallelism(1)
         .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
@@ -1986,7 +1923,6 @@ mod tests {
         .with_segment_read_parallelism(2)
         .expect("non-zero segment read parallelism must be accepted");
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
@@ -2066,7 +2002,6 @@ mod tests {
         .expect("non-zero segment read parallelism must be accepted");
         let segments = (1..=4).map(test_batch).map(|batch| vec![batch]).collect::<Vec<_>>();
         let input = ShiftInput {
-            tenant_id: "tenant-a".to_string(),
             segments: vec![
                 SegmentToRead {
                     segment_offset: 1,
@@ -2118,7 +2053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_end_to_end_mixed_tenant_planning_and_shift_merge_preserves_boundaries_and_order() {
+    async fn run_end_to_end_mixed_partition_planning_and_shift_merge_preserves_boundaries_and_order() {
         let ingest_segment_100 = logs_ingest_batch(vec![
             ("tenant-b", Some("acc-2"), Some("svc-z"), Some(10), 900),
             ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 101),
@@ -2166,6 +2101,7 @@ mod tests {
             Arc::new(ShiftConfig::default()),
             test_timeouts(),
             "logs",
+            &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
         );
         let manager = E2eManager::new();
         let cancel = CancellationToken::new();
@@ -2178,11 +2114,11 @@ mod tests {
         assert_eq!(
             plan_result.shift_task_ids.len(),
             2,
-            "two tenants must produce two shift tasks"
+            "two partition buckets must produce two shift tasks"
         );
 
         let added_tasks = manager.added_tasks.lock().expect("added tasks lock").clone();
-        let mut shift_inputs = added_tasks
+        let shift_inputs = added_tasks
             .iter()
             .filter(|task| task.code == TaskCode::new(SHIFT_TASK_CODE))
             .map(|task| {
@@ -2190,10 +2126,9 @@ mod tests {
                 (task.id, input)
             })
             .collect::<Vec<_>>();
-        shift_inputs.sort_by(|left, right| left.1.tenant_id.cmp(&right.1.tenant_id));
         assert_eq!(shift_inputs.len(), 2);
 
-        let expected_row_ids_by_tenant = HashMap::from([
+        let expected_row_ids_by_partition_value = HashMap::from([
             ("tenant-a".to_string(), vec![103, 101, 102, 201, 203, 202, 104]),
             ("tenant-b".to_string(), vec![903, 902, 901, 900]),
         ]);
@@ -2202,7 +2137,7 @@ mod tests {
             let storage = Arc::new(FakeStorage::fail_then_succeed(
                 0,
                 vec![test_data_file(
-                    &format!("s3://warehouse/logs/{}/part-0001.parquet", shift_input.tenant_id),
+                    &format!("s3://warehouse/logs/{task_id}/part-0001.parquet"),
                     1,
                 )],
             ));
@@ -2233,18 +2168,18 @@ mod tests {
             assert_eq!(writes.len(), 1, "shift task must write one merged stream");
 
             let tenant_ids = tenant_ids_from_batches(&writes[0]);
+            let first_tenant = tenant_ids.first().expect("written tenant ids").clone();
             assert!(
-                tenant_ids.iter().all(|tenant_id| tenant_id == &shift_input.tenant_id),
-                "tenant boundary violated: expected only {}, got {:?}",
-                shift_input.tenant_id,
+                tenant_ids.iter().all(|tenant_id| tenant_id == &first_tenant),
+                "partition bucket boundary violated: expected one tenant per output, got {:?}",
                 tenant_ids
             );
 
             let actual_row_ids = row_ids_from_batches(&writes[0]);
             drop(writes);
-            let expected_row_ids = expected_row_ids_by_tenant
-                .get(&shift_input.tenant_id)
-                .expect("expected rows by tenant");
+            let expected_row_ids = expected_row_ids_by_partition_value
+                .get(&first_tenant)
+                .expect("expected rows by partition value");
             assert_eq!(
                 &actual_row_ids, expected_row_ids,
                 "merged order must match sort order and WAL-stable tie-breakers"

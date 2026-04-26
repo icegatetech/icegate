@@ -50,12 +50,12 @@ data:
     shift:
       read:
         max_record_batches_per_task: {{ .Values.ingest.shift.read.maxRecordBatchesPerTask }}
-        max_input_bytes_per_task: {{ .Values.ingest.shift.read.maxInputBytesPerTask | int }}
+        lower_bound_input_bytes_per_task: {{ .Values.ingest.shift.read.lowerBoundInputBytesPerTask | int }}
+        upper_bound_input_bytes_per_task: {{ .Values.ingest.shift.read.upperBoundInputBytesPerTask | int }}
         plan_segment_read_parallelism: {{ .Values.ingest.shift.read.planSegmentReadParallelism }}
         shift_segment_read_parallelism: {{ .Values.ingest.shift.read.shiftSegmentReadParallelism }}
       write:
         row_group_size: {{ .Values.ingest.shift.write.rowGroupSize }}
-        max_file_size_mb: {{ .Values.ingest.shift.write.maxFileSizeMb }}
         table_cache_ttl_secs: {{ .Values.ingest.shift.write.tableCacheTtlSecs }}
       timeouts:
         plan_base_ms: {{ .Values.ingest.shift.timeouts.planBaseMs }}

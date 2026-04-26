@@ -109,11 +109,19 @@ pub trait Storage: Send + Sync {
     ) -> Result<usize>;
 }
 
+/// Failover multiplier on top of the planner's upper bound. The writer flips
+/// to a new file only when actual encoded parquet bytes overshoot
+/// `upper_bound_input_bytes_per_task * factor` — i.e., parquet overhead
+/// (footers, statistics, padding) plus a safety margin. In normal operation
+/// the planner already shapes one chunk per shift task, so rollover should
+/// not fire.
+const WRITER_FILE_SIZE_FAILOVER_FACTOR: u64 = 2;
+
 /// Iceberg storage for shift operations.
 pub struct IcebergStorage {
     loader: TableLoader,
     row_group_size: usize,
-    max_file_size_mb: usize,
+    max_file_size_bytes: u64,
     retrier: Retrier,
 }
 
@@ -121,10 +129,14 @@ impl IcebergStorage {
     /// Creates a new Iceberg storage for the provided table and catalog.
     pub fn new(catalog: Arc<dyn Catalog>, table: impl Into<String>, shift_config: &ShiftConfig) -> Self {
         let table_ident = TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.into());
+        let max_file_size_bytes = shift_config
+            .read
+            .upper_bound_input_bytes_per_task
+            .saturating_mul(WRITER_FILE_SIZE_FAILOVER_FACTOR);
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,
-            max_file_size_mb: shift_config.write.max_file_size_mb,
+            max_file_size_bytes,
             retrier: Retrier::new(RetrierConfig::default()),
         }
     }
@@ -182,7 +194,7 @@ impl IcebergStorage {
         // still resolves normally.
         let handle = tokio::runtime::Handle::current();
         let row_group_size = self.row_group_size;
-        let max_file_size_mb = self.max_file_size_mb;
+        let max_file_size_bytes = self.max_file_size_bytes;
         let cancel = cancel_token.clone();
         let table = self.load_table(cancel_token).await?;
 
@@ -196,7 +208,7 @@ impl IcebergStorage {
             handle.block_on(Self::write_parquet_files_once(
                 table,
                 row_group_size,
-                max_file_size_mb,
+                max_file_size_bytes,
                 batches,
                 &cancel,
             ))
@@ -209,7 +221,7 @@ impl IcebergStorage {
     async fn write_parquet_files_once(
         table: Table,
         row_group_size: usize,
-        max_file_size_mb: usize,
+        max_file_size_bytes: u64,
         mut batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
@@ -236,9 +248,12 @@ impl IcebergStorage {
 
         let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table_metadata.current_schema().clone());
 
+        // Convert to `usize` for the iceberg writer API. On 64-bit targets `u64`
+        // never overflows `usize`; saturate on 32-bit targets.
+        let target_file_size = usize::try_from(max_file_size_bytes).unwrap_or(usize::MAX);
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
-            max_file_size_mb * 1024 * 1024,
+            target_file_size,
             table_file_io.clone(),
             location_generator,
             file_name_generator,

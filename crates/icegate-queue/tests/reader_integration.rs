@@ -14,7 +14,10 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{TryStreamExt, stream::BoxStream};
-use icegate_queue::{ParquetQueueReader, QueueConfig, QueueWriter, SegmentsPlan, WriteRequest, channel};
+use icegate_queue::{
+    ExtractField, ExtractedValue, FieldExtractor, ParquetQueueReader, QueueConfig, QueueWriter, SegmentsPlan,
+    WriteRequest, channel,
+};
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
     PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
@@ -25,32 +28,56 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Normalize a flat plan into a tenant-bucketed shape for stable assertions:
+/// `(tenant, sorted [(wal_offset, [row_group_idx, ...])], row_groups_total, input_bytes_total)`.
+/// Field name used by integration tests for the `tenant_id` column-stats
+/// singleton extraction.
+const TEST_TENANT_FIELD: &str = "tenant_id";
+
+fn tenant_fields() -> Vec<ExtractField> {
+    vec![ExtractField {
+        name: TEST_TENANT_FIELD.to_string(),
+        extractor: FieldExtractor::ColumnStatsUtf8Singleton {
+            column_name: "tenant_id".to_string(),
+        },
+    }]
+}
+
+fn entry_tenant(entry: &icegate_queue::RowGroupPlanEntry) -> String {
+    let Some(value) = entry.extracted.get(TEST_TENANT_FIELD) else {
+        panic!("tenant_id field must be present in plan entry");
+    };
+    match value {
+        ExtractedValue::Utf8(s) => s.clone(),
+        ExtractedValue::TimestampMicrosRange(_, _) => panic!("tenant_id field must be utf8"),
+    }
+}
+
 fn normalize_plan(plan: &SegmentsPlan) -> Vec<(String, Vec<(u64, Vec<usize>)>, usize, u64)> {
-    let mut normalized = plan
-        .groups
-        .iter()
-        .map(|group| {
-            let mut segments = group
-                .segments
-                .iter()
-                .map(|segment| {
-                    (
-                        segment.segment_offset,
-                        segment.row_groups.iter().map(|row_group| row_group.row_group_idx).collect(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            segments.sort_by_key(|(offset, _)| *offset);
-            (
-                group.group_col_val.clone(),
-                segments,
-                group.record_batches_total,
-                group.input_bytes_total,
-            )
+    use std::collections::BTreeMap;
+    let mut by_tenant: BTreeMap<String, BTreeMap<u64, Vec<usize>>> = BTreeMap::new();
+    let mut rg_count: BTreeMap<String, usize> = BTreeMap::new();
+    let mut byte_count: BTreeMap<String, u64> = BTreeMap::new();
+    for entry in &plan.entries {
+        let tenant = entry_tenant(entry);
+        by_tenant
+            .entry(tenant.clone())
+            .or_default()
+            .entry(entry.wal_offset)
+            .or_default()
+            .push(entry.row_group_idx);
+        *rg_count.entry(tenant.clone()).or_default() += 1;
+        *byte_count.entry(tenant).or_default() += entry.row_group_bytes;
+    }
+    by_tenant
+        .into_iter()
+        .map(|(tenant, by_segment)| {
+            let segments: Vec<(u64, Vec<usize>)> = by_segment.into_iter().collect();
+            let total_rg = rg_count.get(&tenant).copied().unwrap_or_default();
+            let total_bytes = byte_count.get(&tenant).copied().unwrap_or_default();
+            (tenant, segments, total_rg, total_bytes)
         })
-        .collect::<Vec<_>>();
-    normalized.sort();
-    normalized
+        .collect()
 }
 
 fn assert_is_forced_metadata_failure(err: &icegate_queue::QueueError) {
@@ -606,112 +633,28 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
     let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
     let plan = reader
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 100, 64 * 1024 * 1024, &cancel)
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel)
         .await
         .unwrap();
 
     assert_eq!(plan.segments_count, 3, "Should scan 3 segments");
     assert_eq!(plan.last_segment_offset, Some(2), "Last segment should be offset 2");
-    assert!(plan.record_batches_total > 0, "Should have row groups");
-    assert!(!plan.groups.is_empty(), "Should have grouped plans");
+    assert!(plan.row_groups_total > 0, "Should have row groups");
+    assert!(!plan.entries.is_empty(), "Should have plan entries");
 
-    // Verify groups
-    for group in &plan.groups {
-        assert!(!group.group_col_val.is_empty(), "Group key should not be empty");
-        assert!(!group.segments.is_empty(), "Group should have segments");
-        assert!(group.record_batches_total > 0, "Group should have row groups");
+    for entry in &plan.entries {
+        assert!(!entry_tenant(entry).is_empty(), "tenant value must not be empty");
+        assert!(entry.wal_offset <= 2, "wal_offset must point to a written segment");
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_plan_max_row_groups_limit() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
-
-    // Write 5 segments with single tenant per batch
-    let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.common.channel_capacity);
-    let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
-
-    for _ in 0..5 {
-        let batch = common::test_batch(20, 1)?;
-        let (response_tx, response_rx) = oneshot::channel();
-        tx.send(WriteRequest {
-            topic: "logs".to_string(),
-            row_groups: common::prepared_row_groups(vec![batch]),
-
-            response_tx,
-            trace_context: None,
-        })
-        .await
-        .unwrap();
-        response_rx.await.unwrap();
+    // Entries must be ordered deterministically by `(wal_offset, row_group_idx)`.
+    let mut prev: Option<(u64, usize)> = None;
+    for entry in &plan.entries {
+        let key = (entry.wal_offset, entry.row_group_idx);
+        if let Some(prev_key) = prev {
+            assert!(prev_key <= key, "entries must be ordered: {prev_key:?} > {key:?}");
+        }
+        prev = Some(key);
     }
-
-    drop(tx);
-    handle.await.unwrap().unwrap();
-
-    // Plan with small max_row_groups limit
-    let reader = ParquetQueueReader::new("queue", store, 8192)?;
-    let cancel = CancellationToken::new();
-    let plan = reader
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 2, 64 * 1024 * 1024, &cancel)
-        .await
-        .unwrap();
-
-    // Verify that groups respect the limit
-    for group in &plan.groups {
-        assert!(
-            group.record_batches_total <= 2,
-            "Group should respect max_row_groups limit of 2, got {}",
-            group.record_batches_total
-        );
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_plan_segments_with_small_input_bytes_limit() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
-
-    let config = QueueConfig::new("queue");
-    let (tx, rx) = channel(config.common.channel_capacity);
-    let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
-
-    for _ in 0..3 {
-        let batch = common::test_batch(20, 1)?;
-        let (response_tx, response_rx) = oneshot::channel();
-        tx.send(WriteRequest {
-            topic: "logs".to_string(),
-            row_groups: common::prepared_row_groups(vec![batch]),
-
-            response_tx,
-            trace_context: None,
-        })
-        .await
-        .unwrap();
-        response_rx.await.unwrap();
-    }
-
-    drop(tx);
-    handle.await.unwrap().unwrap();
-
-    let reader = ParquetQueueReader::new("queue", store, 8192)?;
-    let cancel = CancellationToken::new();
-    let plan = reader
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 100, 1, &cancel)
-        .await
-        .unwrap();
-
-    for group in &plan.groups {
-        assert_eq!(
-            group.record_batches_total, 1,
-            "Each task should contain exactly one row group when byte limit is tiny"
-        );
-    }
-
     Ok(())
 }
 
@@ -784,17 +727,17 @@ async fn test_plan_segments_parallelism_preserves_plan_result() -> Result<(), Bo
     let cancel = CancellationToken::new();
 
     let serial_plan = reader_serial
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel)
         .await
         .unwrap();
     let parallel_plan = reader_parallel
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel)
         .await
         .unwrap();
 
     assert_eq!(serial_plan.last_segment_offset, parallel_plan.last_segment_offset);
     assert_eq!(serial_plan.segments_count, parallel_plan.segments_count);
-    assert_eq!(serial_plan.record_batches_total, parallel_plan.record_batches_total);
+    assert_eq!(serial_plan.row_groups_total, parallel_plan.row_groups_total);
     assert_eq!(serial_plan.input_bytes_total, parallel_plan.input_bytes_total);
     assert_eq!(normalize_plan(&serial_plan), normalize_plan(&parallel_plan));
     assert_eq!(
@@ -877,17 +820,17 @@ async fn test_plan_segments_parallelism_preserves_plan_result_with_skewed_metada
     let cancel = CancellationToken::new();
 
     let serial_plan = reader_serial
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel)
         .await
         .unwrap();
     let parallel_plan = reader_parallel
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel)
         .await
         .unwrap();
 
     assert_eq!(serial_plan.last_segment_offset, parallel_plan.last_segment_offset);
     assert_eq!(serial_plan.segments_count, parallel_plan.segments_count);
-    assert_eq!(serial_plan.record_batches_total, parallel_plan.record_batches_total);
+    assert_eq!(serial_plan.row_groups_total, parallel_plan.row_groups_total);
     assert_eq!(serial_plan.input_bytes_total, parallel_plan.input_bytes_total);
     assert_eq!(normalize_plan(&serial_plan), normalize_plan(&parallel_plan));
     assert_eq!(
@@ -968,21 +911,21 @@ async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metada
     let cancel = CancellationToken::new();
 
     let serial_plan = reader_serial
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 1024, 64 * 1024 * 1024, &cancel)
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel)
         .await
         .unwrap();
     let parallel_plan = reader_parallel
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 1024, 64 * 1024 * 1024, &cancel)
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel)
         .await
         .unwrap();
 
     assert!(
-        serial_plan.record_batches_total >= 64 * 4,
+        serial_plan.row_groups_total >= 64 * 4,
         "expected >=64 row groups per segment to force spawn_blocking path"
     );
     assert_eq!(serial_plan.last_segment_offset, parallel_plan.last_segment_offset);
     assert_eq!(serial_plan.segments_count, parallel_plan.segments_count);
-    assert_eq!(serial_plan.record_batches_total, parallel_plan.record_batches_total);
+    assert_eq!(serial_plan.row_groups_total, parallel_plan.row_groups_total);
     assert_eq!(serial_plan.input_bytes_total, parallel_plan.input_bytes_total);
     assert_eq!(normalize_plan(&serial_plan), normalize_plan(&parallel_plan));
     assert_eq!(
@@ -1037,10 +980,7 @@ async fn test_plan_segments_parallel_fails_fast_on_metadata_error_without_partia
     let cancel = CancellationToken::new();
     let start = Instant::now();
 
-    let Err(err) = reader
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
-        .await
-    else {
+    let Err(err) = reader.plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel).await else {
         panic!("planning must fail when metadata read fails for one segment");
     };
 
@@ -1091,10 +1031,7 @@ async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_with
     let cancel = CancellationToken::new();
     let start = Instant::now();
 
-    let Err(err) = reader
-        .plan_segments(&"logs".to_string(), 0, "tenant_id", 64, 64 * 1024 * 1024, &cancel)
-        .await
-    else {
+    let Err(err) = reader.plan_segments(&"logs".to_string(), 0, &tenant_fields(), &cancel).await else {
         panic!("planning must fail when metadata read fails for one segment");
     };
 

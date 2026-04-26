@@ -17,7 +17,6 @@ use parquet::{
     arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     errors::ParquetError,
     file::metadata::{ParquetMetaData, ParquetMetaDataReader},
-    file::statistics::Statistics,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +25,7 @@ use tracing::debug;
 use crate::{
     Topic,
     error::{QueueError, Result},
+    extract::{ExtractField, ExtractedValue, ResolvedField},
     segment::SegmentId,
 };
 
@@ -51,120 +51,48 @@ pub struct SegmentFile {
     pub size: u64,
 }
 
-// Reference to record batches (row groups) inside a WAL segment.
-//
-// Schema:
-// `SegmentsPlan`
-//   groups: [`GroupedSegmentsPlan`]
-//   row_groups_total: usize
-//     segments: [`SegmentRecordBatchIdxs`]
-//     row_groups_total: usize
-//       row_groups: [`PlannedRowGroup`]
-
 /// Result of planning segments record batches for processing.
+///
+/// The plan is a flat list of row-group entries, ordered deterministically
+/// by `(segment_idx, row_group_idx)`. Higher-level grouping (per-tenant
+/// bucketing, sort-key clustering, bin-packing) is the responsibility of the
+/// caller (see `icegate-ingest::shift::planner_algorithm`).
 #[derive(Debug, Clone)]
 pub struct SegmentsPlan {
-    /// Grouped record batches in segments keyed by a column value.
-    pub groups: Vec<GroupedSegmentsPlan>,
+    /// Row-group entries across all planned segments, deterministically
+    /// ordered by `(segment_idx, row_group_idx)`.
+    pub entries: Vec<RowGroupPlanEntry>,
     /// Last segment offset observed in the planned segments.
     pub last_segment_offset: Option<u64>,
     /// Number of segments scanned in the plan.
     pub segments_count: usize,
     /// Total number of row groups across all planned segments.
-    pub record_batches_total: usize,
-    /// Total planned input size (compressed bytes) across all grouped segments.
+    pub row_groups_total: usize,
+    /// Total planned input size (compressed bytes) across all entries.
     pub input_bytes_total: u64,
 }
 
-/// Grouped record batches in segments keyed by a column value.
+/// One row-group entry in a flat segments plan.
 #[derive(Debug, Clone)]
-pub struct GroupedSegmentsPlan {
-    /// Grouping key from the requested column.
-    pub group_col_val: String,
-    /// WAL segment references for the group.
-    pub segments: Vec<SegmentRecordBatchIdxs>,
-    /// Number of segments in the group.
-    pub segments_count: usize,
-    /// Total number of row groups in the grouped segments.
-    pub record_batches_total: usize,
-    /// Total planned input size (compressed bytes) for this grouped segments.
-    pub input_bytes_total: u64,
-}
-
-/// Planned row group inside a WAL segment.
-#[derive(Debug, Clone)]
-pub struct PlannedRowGroup {
+pub struct RowGroupPlanEntry {
+    /// WAL segment offset.
+    pub wal_offset: u64,
     /// Row group index inside the segment.
     pub row_group_idx: usize,
-    /// Compressed row group size in bytes.
+    /// Compressed row-group size in bytes.
     pub row_group_bytes: u64,
-    /// Optional opaque row-group metadata captured from the parquet footer.
-    pub row_group_metadata: Option<String>,
+    /// Caller-requested field extractions, keyed by [`ExtractField::name`].
+    ///
+    /// Only fields whose extractor produced a value for this row group are
+    /// present (e.g. `FileKeyValueRowGroupPayload` is absent when the WAL
+    /// footer carries no entry for that row group).
+    pub extracted: HashMap<String, ExtractedValue>,
 }
 
-/// Planned row groups inside a WAL segment.
-#[derive(Debug, Clone)]
-pub struct SegmentRecordBatchIdxs {
-    /// WAL segment offset.
-    pub segment_offset: u64,
-    /// Planned row groups inside the segment.
-    pub row_groups: Vec<PlannedRowGroup>,
-}
-
-struct RowGroupsInSegments {
-    segments: BTreeMap<u64, Vec<PlannedRowGroup>>,
-    row_group_count: usize,
-    input_bytes: u64,
-}
-
-struct SegmentRowGroup {
-    group_key: String,
-    plan: PlannedRowGroup,
-}
-
-/// Used as buffer in separate spawn
+/// Buffered row-group entries for a single WAL segment, used while reading
+/// segment metadata in parallel.
 struct SegmentRowGroups {
-    wal_offset: u64,
-    entries: Vec<SegmentRowGroup>,
-}
-
-impl RowGroupsInSegments {
-    const fn new() -> Self {
-        Self {
-            segments: BTreeMap::new(),
-            row_group_count: 0,
-            input_bytes: 0,
-        }
-    }
-
-    fn push(&mut self, offset: u64, row_group: PlannedRowGroup) -> Result<()> {
-        self.row_group_count = self
-            .row_group_count
-            .checked_add(1)
-            .ok_or_else(|| QueueError::Metadata("row group count overflow".to_string()))?;
-        self.input_bytes = self
-            .input_bytes
-            .checked_add(row_group.row_group_bytes)
-            .ok_or_else(|| QueueError::Metadata("row group bytes overflow".to_string()))?;
-        self.segments.entry(offset).or_default().push(row_group);
-        Ok(())
-    }
-
-    fn take(&mut self) -> (Vec<SegmentRecordBatchIdxs>, usize, u64) {
-        let row_group_count = self.row_group_count;
-        let input_bytes = self.input_bytes;
-        self.row_group_count = 0;
-        self.input_bytes = 0;
-        let segments = std::mem::take(&mut self.segments);
-        let segments = segments
-            .into_iter()
-            .map(|(offset, row_groups)| SegmentRecordBatchIdxs {
-                segment_offset: offset,
-                row_groups,
-            })
-            .collect();
-        (segments, row_group_count, input_bytes)
-    }
+    entries: Vec<RowGroupPlanEntry>,
 }
 
 /// Queue reader dependency surface for shift executors.
@@ -173,14 +101,20 @@ pub type RecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Se
 /// Queue reader dependency surface for shift executors.
 #[async_trait]
 pub trait QueueReader: Send + Sync {
-    /// Build a plan of record batches to process.
+    /// Build a flat plan of row-group entries to process.
+    ///
+    /// `fields` describes which per-row-group facts should be extracted from
+    /// the parquet footer; values land in [`RowGroupPlanEntry::extracted`]
+    /// keyed by [`ExtractField::name`].
+    ///
+    /// The returned `SegmentsPlan` does not perform any grouping or
+    /// bin-packing: callers are expected to implement their own
+    /// scheduling/clustering on top of the flat list.
     async fn plan_segments(
         &self,
         topic: &Topic,
         start_offset: u64,
-        group_by_column_name: &str,
-        max_record_batches_per_task: usize,
-        max_input_bytes_per_task: u64,
+        fields: &[ExtractField],
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan>;
 
@@ -192,14 +126,6 @@ pub trait QueueReader: Send + Sync {
         record_batch_idxs: &[usize],
         cancel_token: &CancellationToken,
     ) -> Result<RecordBatchStream>;
-
-    /// Read optional opaque (raw) row-group metadata for a segment.
-    async fn read_segment_row_group_metadata(
-        &self,
-        topic: &Topic,
-        offset: u64,
-        cancel_token: &CancellationToken,
-    ) -> Result<HashMap<usize, String>>;
 }
 
 /// Queue reader for reading Parquet segments from object storage.
@@ -429,44 +355,38 @@ impl ParquetQueueReader {
         Ok(files)
     }
 
-    /// Lists segments and plans row groups grouped by column value.
+    /// Lists segments and returns a flat plan of row-group entries.
+    ///
+    /// Entries are ordered deterministically by `(segment_idx, row_group_idx)`
+    /// where `segment_idx` matches the listing order (sorted by WAL offset).
     pub async fn plan_segments(
         &self,
         topic: &Topic,
         start_offset: u64,
-        group_by_column_name: &str,
-        max_row_groups_per_grouped_batch: usize,
-        max_input_bytes_per_grouped_batch: u64,
+        fields: &[ExtractField],
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan> {
         let listed = self.list_segments(topic, start_offset, cancel_token).await?;
         if listed.is_empty() {
             return Ok(SegmentsPlan {
-                groups: Vec::new(),
+                entries: Vec::new(),
                 last_segment_offset: None,
                 segments_count: 0,
-                record_batches_total: 0,
+                row_groups_total: 0,
                 input_bytes_total: 0,
             });
         }
 
         let last_offset = listed.last().map(|s| s.id.offset);
         let segments: Vec<SegmentId> = listed.into_iter().map(|s| s.id).collect();
-        let (groups, row_groups_total, input_bytes_total) = self
-            .plan_record_batches(
-                segments.as_slice(),
-                group_by_column_name,
-                max_row_groups_per_grouped_batch,
-                max_input_bytes_per_grouped_batch,
-                cancel_token,
-            )
-            .await?;
+        let (entries, row_groups_total, input_bytes_total) =
+            self.plan_record_batches(segments.as_slice(), fields, cancel_token).await?;
 
         Ok(SegmentsPlan {
-            groups,
+            entries,
             last_segment_offset: last_offset,
             segments_count: segments.len(),
-            record_batches_total: row_groups_total,
+            row_groups_total,
             input_bytes_total,
         })
     }
@@ -505,49 +425,23 @@ impl ParquetQueueReader {
         Ok(Box::pin(stream.map_err(QueueError::from)))
     }
 
-    /// Read optional opaque row-group metadata for a segment.
-    pub async fn read_segment_row_group_metadata(
-        &self,
-        topic: &Topic,
-        offset: u64,
-        cancel_token: &CancellationToken,
-    ) -> Result<HashMap<usize, String>> {
-        let parquet_meta = self.read_parquet_metadata(topic, offset, cancel_token).await?;
-        Self::row_group_metadata_from_parquet(&parquet_meta, offset)
-    }
-
-    /// Plan to read record batches grouped by column value across a list of segments.
+    /// Read row-group metadata for each segment in parallel and assemble a
+    /// flat list of `RowGroupPlanEntry` ordered by `(segment_idx, row_group_idx)`.
     async fn plan_record_batches(
         &self,
         segments: &[SegmentId],
-        group_by_column_name: &str,
-        max_row_groups_per_grouped_batch: usize,
-        max_input_bytes_per_grouped_batch: u64,
+        fields: &[ExtractField],
         cancel_token: &CancellationToken,
-    ) -> Result<(Vec<GroupedSegmentsPlan>, usize, u64)> {
-        if max_row_groups_per_grouped_batch == 0 {
-            return Err(QueueError::Config(
-                "max_row_groups_per_grouped_batch must be greater than zero".to_string(),
-            ));
-        }
-        if max_input_bytes_per_grouped_batch == 0 {
-            return Err(QueueError::Config(
-                "max_input_bytes_per_grouped_batch must be greater than zero".to_string(),
-            ));
-        }
-
-        // grouped row group chunks by group key for all segments
-        let mut grouped_chunks: HashMap<String, RowGroupsInSegments> = HashMap::new();
-        let mut plan = Vec::new();
-        let mut row_groups_total = 0usize;
-        let mut input_bytes_total = 0u64;
-        let group_by_column_name = group_by_column_name.to_string();
+    ) -> Result<(Vec<RowGroupPlanEntry>, usize, u64)> {
+        // Clone once per call so async closures can move into spawn_blocking
+        // without sharing the caller-owned slice.
+        let fields: Arc<[ExtractField]> = Arc::from(fields.to_vec());
         let mut inline_segments = 0usize;
         let mut blocking_segments = 0usize;
         let mut stream = futures::stream::iter(segments.iter().cloned().enumerate().map(|(segment_idx, segment)| {
             let segment_topic = segment.topic;
             let wal_offset = segment.offset;
-            let group_by_column_name = group_by_column_name.clone();
+            let fields = Arc::clone(&fields);
             let cancel_token = cancel_token.clone();
             async move {
                 let parquet_meta = self.read_parquet_metadata(&segment_topic, wal_offset, &cancel_token).await?;
@@ -556,21 +450,23 @@ impl ParquetQueueReader {
                 let segment_entries = if uses_blocking {
                     let span = tracing::Span::current();
                     tokio::task::spawn_blocking(move || {
-                        span.in_scope(|| {
-                            Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &group_by_column_name)
-                        })
+                        span.in_scope(|| Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &fields))
                     })
                     .await??
                 } else {
-                    Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &group_by_column_name)?
+                    Self::collect_segment_plan_entries(&parquet_meta, wal_offset, &fields)?
                 };
                 Ok::<(usize, bool, SegmentRowGroups), QueueError>((segment_idx, uses_blocking, segment_entries))
             }
         }))
         .buffer_unordered(self.plan_segment_read_parallelism);
 
+        // Reassemble entries in deterministic `(segment_idx, row_group_idx)` order.
         let mut next_expected_idx = 0usize;
         let mut pending_segment_plans: BTreeMap<usize, (bool, SegmentRowGroups)> = BTreeMap::new();
+        let mut entries: Vec<RowGroupPlanEntry> = Vec::new();
+        let mut row_groups_total = 0usize;
+        let mut input_bytes_total = 0u64;
         while let Some(result) = stream.next().await {
             let (segment_idx, uses_blocking, segment_entries) = result?;
             pending_segment_plans.insert(segment_idx, (uses_blocking, segment_entries));
@@ -580,18 +476,17 @@ impl ParquetQueueReader {
                 } else {
                     inline_segments += 1;
                 }
-                let SegmentRowGroups { wal_offset, entries } = segment_entries;
-                for entry in entries {
-                    Self::apply_segment_plan_entry(
-                        &mut grouped_chunks,
-                        &mut plan,
-                        wal_offset,
-                        entry,
-                        max_row_groups_per_grouped_batch,
-                        max_input_bytes_per_grouped_batch,
-                        &mut row_groups_total,
-                        &mut input_bytes_total,
-                    )?;
+                let SegmentRowGroups {
+                    entries: segment_entries,
+                } = segment_entries;
+                for entry in segment_entries {
+                    row_groups_total = row_groups_total
+                        .checked_add(1)
+                        .ok_or_else(|| QueueError::Metadata("row group total overflow".to_string()))?;
+                    input_bytes_total = input_bytes_total
+                        .checked_add(entry.row_group_bytes)
+                        .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
+                    entries.push(entry);
                 }
                 next_expected_idx = next_expected_idx.checked_add(1).ok_or_else(|| {
                     QueueError::Metadata("segment index overflow while assembling plan entries".to_string())
@@ -606,46 +501,40 @@ impl ParquetQueueReader {
             blocking_segments
         );
 
-        Self::flush_remaining_chunks(grouped_chunks, &mut plan, &mut input_bytes_total)?;
-
-        Ok((plan, row_groups_total, input_bytes_total))
+        Ok((entries, row_groups_total, input_bytes_total))
     }
 
-    #[tracing::instrument(
-        level = "debug",
-        skip(parquet_meta, group_by_column_name),
-        fields(wal_offset, group_by_column_name = %group_by_column_name)
-    )]
+    #[tracing::instrument(level = "debug", skip(parquet_meta, fields), fields(wal_offset, n_fields = fields.len()))]
     fn collect_segment_plan_entries(
         parquet_meta: &ParquetMetaData,
         wal_offset: u64,
-        group_by_column_name: &str,
+        fields: &[ExtractField],
     ) -> Result<SegmentRowGroups> {
-        // it is necessary to return the temp buffer (SegmentRowGroups), because the function is used in spawn
+        // The temp buffer (`SegmentRowGroups`) is returned because the function
+        // runs inside `spawn_blocking` for large segments.
 
-        let metadata_by_row_group = Self::row_group_metadata_from_parquet(parquet_meta, wal_offset)?;
-        let schema = parquet_meta.file_metadata().schema_descr();
-        let column_idx = schema
-            .columns()
+        // Pre-resolve per-field state once per segment (column indices, parsed
+        // KV-metadata payloads), so the per-row-group loop is O(R*F) without
+        // repeated parquet schema scans or JSON parses.
+        let resolved_fields: Vec<ResolvedField<'_>> = fields
             .iter()
-            .position(|col| col.name() == group_by_column_name)
-            .ok_or_else(|| {
-                QueueError::Metadata(format!(
-                    "column '{group_by_column_name}' not found in parquet schema for segment {wal_offset}"
-                ))
-            })?;
+            .map(|field| ResolvedField::resolve(field, parquet_meta, wal_offset))
+            .collect::<Result<_>>()?;
 
         let mut entries = Vec::with_capacity(parquet_meta.row_groups().len());
         for (row_group_idx, row_group) in parquet_meta.row_groups().iter().enumerate() {
-            let group_key = Self::group_key_from_row_group(row_group, column_idx, group_by_column_name, row_group_idx)?;
             let row_group_bytes = Self::row_group_compressed_bytes(row_group, row_group_idx)?;
-            entries.push(SegmentRowGroup {
-                group_key,
-                plan: PlannedRowGroup {
-                    row_group_idx,
-                    row_group_bytes,
-                    row_group_metadata: metadata_by_row_group.get(&row_group_idx).cloned(),
-                },
+            let mut extracted = HashMap::with_capacity(resolved_fields.len());
+            for resolved in &resolved_fields {
+                if let Some(value) = resolved.extract(row_group, row_group_idx, wal_offset)? {
+                    extracted.insert(resolved.name().to_string(), value);
+                }
+            }
+            entries.push(RowGroupPlanEntry {
+                wal_offset,
+                row_group_idx,
+                row_group_bytes,
+                extracted,
             });
         }
 
@@ -655,88 +544,7 @@ impl ParquetQueueReader {
             )));
         }
 
-        Ok(SegmentRowGroups { wal_offset, entries })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn apply_segment_plan_entry(
-        grouped_chunks: &mut HashMap<String, RowGroupsInSegments>,
-        plan: &mut Vec<GroupedSegmentsPlan>,
-        wal_offset: u64,
-        entry: SegmentRowGroup,
-        max_row_groups_per_grouped_batch: usize,
-        max_input_bytes_per_grouped_batch: u64,
-        row_groups_total: &mut usize,
-        input_bytes_total: &mut u64,
-    ) -> Result<()> {
-        let SegmentRowGroup {
-            group_key,
-            plan: row_group_plan,
-        } = entry;
-        let chunk = grouped_chunks.entry(group_key.clone()).or_insert_with(RowGroupsInSegments::new);
-        let next_row_group_count = chunk
-            .row_group_count
-            .checked_add(1)
-            .ok_or_else(|| QueueError::Metadata("row group count overflow".to_string()))?;
-        let next_input_bytes = chunk
-            .input_bytes
-            .checked_add(row_group_plan.row_group_bytes)
-            .ok_or_else(|| QueueError::Metadata("row group bytes overflow".to_string()))?;
-        if chunk.row_group_count > 0
-            && (next_row_group_count > max_row_groups_per_grouped_batch
-                || next_input_bytes > max_input_bytes_per_grouped_batch)
-        {
-            Self::flush_group_chunk(&group_key, chunk, plan, input_bytes_total)?;
-        }
-
-        *row_groups_total = row_groups_total
-            .checked_add(1)
-            .ok_or_else(|| QueueError::Metadata("row group total overflow".to_string()))?;
-        chunk.push(wal_offset, row_group_plan)?;
-        // We've reached the row group or input bytes limit, so we flush the chunk.
-        if chunk.row_group_count >= max_row_groups_per_grouped_batch
-            || chunk.input_bytes >= max_input_bytes_per_grouped_batch
-        {
-            Self::flush_group_chunk(&group_key, chunk, plan, input_bytes_total)?;
-        }
-
-        Ok(())
-    }
-
-    fn flush_group_chunk(
-        group_key: &str,
-        chunk: &mut RowGroupsInSegments,
-        plan: &mut Vec<GroupedSegmentsPlan>,
-        input_bytes_total: &mut u64,
-    ) -> Result<()> {
-        let (segments, row_groups_total, input_bytes) = chunk.take();
-        if segments.is_empty() {
-            return Ok(());
-        }
-        let segments_count = segments.len();
-        *input_bytes_total = input_bytes_total
-            .checked_add(input_bytes)
-            .ok_or_else(|| QueueError::Metadata("input bytes total overflow".to_string()))?;
-        plan.push(GroupedSegmentsPlan {
-            group_col_val: group_key.to_string(),
-            segments,
-            segments_count,
-            record_batches_total: row_groups_total,
-            input_bytes_total: input_bytes,
-        });
-        Ok(())
-    }
-
-    fn flush_remaining_chunks(
-        grouped_chunks: HashMap<String, RowGroupsInSegments>,
-        plan: &mut Vec<GroupedSegmentsPlan>,
-        input_bytes_total: &mut u64,
-    ) -> Result<()> {
-        // Collecting the remaining records.
-        for (group_key, mut chunk) in grouped_chunks {
-            Self::flush_group_chunk(&group_key, &mut chunk, plan, input_bytes_total)?;
-        }
-        Ok(())
+        Ok(SegmentRowGroups { entries })
     }
 
     fn row_group_compressed_bytes(
@@ -889,95 +697,6 @@ impl ParquetQueueReader {
             Err(err) => Err(err),
         }
     }
-
-    fn group_key_from_row_group(
-        row_group: &parquet::file::metadata::RowGroupMetaData,
-        column_idx: usize,
-        column_name: &str,
-        row_group_idx: usize,
-    ) -> Result<String> {
-        let column = row_group.column(column_idx);
-        let stats = column.statistics().ok_or_else(|| {
-            QueueError::Metadata(format!(
-                "missing statistics for '{column_name}' in row group {row_group_idx}"
-            ))
-        })?;
-
-        match stats {
-            Statistics::ByteArray(byte_stats) => {
-                let min = byte_stats.min_bytes_opt().ok_or_else(|| {
-                    QueueError::Metadata(format!(
-                        "missing min statistic for '{column_name}' in row group {row_group_idx}"
-                    ))
-                })?;
-                let max = byte_stats.max_bytes_opt().ok_or_else(|| {
-                    QueueError::Metadata(format!(
-                        "missing max statistic for '{column_name}' in row group {row_group_idx}"
-                    ))
-                })?;
-
-                if min != max {
-                    return Err(QueueError::Metadata(format!(
-                        "row group {row_group_idx} contains multiple values for '{column_name}'"
-                    )));
-                }
-
-                let value = std::str::from_utf8(min).map_err(|e| {
-                    QueueError::Metadata(format!(
-                        "invalid utf8 in '{column_name}' stats for row group {row_group_idx}: {e}"
-                    ))
-                })?;
-
-                if value.is_empty() {
-                    return Err(QueueError::Metadata(format!(
-                        "empty value in stats for '{column_name}' row group {row_group_idx}"
-                    )));
-                }
-
-                Ok(value.to_string())
-            }
-            _ => Err(QueueError::Metadata(format!(
-                "unsupported stats type for '{column_name}' in row group {row_group_idx}"
-            ))),
-        }
-    }
-
-    fn row_group_metadata_from_parquet(
-        parquet_meta: &ParquetMetaData,
-        wal_offset: u64,
-    ) -> Result<HashMap<usize, String>> {
-        let Some(key_value_metadata) = parquet_meta.file_metadata().key_value_metadata() else {
-            return Ok(HashMap::new());
-        };
-        let Some(metadata_value) = key_value_metadata
-            .iter()
-            .find(|entry| entry.key == ROW_GROUP_METADATA_KEY)
-            .and_then(|entry| entry.value.as_ref())
-        else {
-            return Ok(HashMap::new());
-        };
-        let entries: Vec<RowGroupMetadataEntry> = serde_json::from_str(metadata_value).map_err(|err| {
-            QueueError::Metadata(format!("invalid row-group metadata in WAL segment {wal_offset}: {err}"))
-        })?;
-        let row_group_count = parquet_meta.row_groups().len();
-        let mut row_group_metadata = HashMap::with_capacity(entries.len());
-        for entry in entries {
-            if entry.row_group_idx >= row_group_count {
-                return Err(QueueError::Metadata(format!(
-                    "row-group metadata row_group_idx {} is out of range for WAL segment {wal_offset}",
-                    entry.row_group_idx
-                )));
-            }
-            if row_group_metadata.insert(entry.row_group_idx, entry.payload).is_some() {
-                return Err(QueueError::Metadata(format!(
-                    "duplicate row-group metadata for row group {} in WAL segment {wal_offset}",
-                    entry.row_group_idx
-                )));
-            }
-        }
-
-        Ok(row_group_metadata)
-    }
 }
 
 #[async_trait]
@@ -986,21 +705,10 @@ impl QueueReader for ParquetQueueReader {
         &self,
         topic: &Topic,
         start_offset: u64,
-        group_by_column_name: &str,
-        max_record_batches_per_task: usize,
-        max_input_bytes_per_task: u64,
+        fields: &[ExtractField],
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan> {
-        Self::plan_segments(
-            self,
-            topic,
-            start_offset,
-            group_by_column_name,
-            max_record_batches_per_task,
-            max_input_bytes_per_task,
-            cancel_token,
-        )
-        .await
+        Self::plan_segments(self, topic, start_offset, fields, cancel_token).await
     }
 
     async fn read_segment(
@@ -1012,20 +720,4 @@ impl QueueReader for ParquetQueueReader {
     ) -> Result<RecordBatchStream> {
         Self::read_segment(self, topic, offset, record_batch_idxs, cancel_token).await
     }
-
-    async fn read_segment_row_group_metadata(
-        &self,
-        topic: &Topic,
-        offset: u64,
-        cancel_token: &CancellationToken,
-    ) -> Result<HashMap<usize, String>> {
-        Self::read_segment_row_group_metadata(self, topic, offset, cancel_token).await
-    }
-}
-const ROW_GROUP_METADATA_KEY: &str = "icegate.queue.row_group_metadata.v1";
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct RowGroupMetadataEntry {
-    row_group_idx: usize,
-    payload: String,
 }

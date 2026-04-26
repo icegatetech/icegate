@@ -14,6 +14,8 @@ pub mod instrumentation;
 pub mod parquet_meta_reader;
 /// Plan task runner for shift operations.
 pub mod plan_runner;
+mod planner;
+mod planner_partitioning;
 mod row_groups_merger;
 /// Shift task runner for shift operations.
 pub mod shift_runner;
@@ -41,6 +43,7 @@ use instrumentation::{
     ShiftTaskRunnerWithMetrics, StorageWithMetrics,
 };
 use plan_runner::PlanTaskRunnerImpl;
+pub use planner_partitioning::{CURRENT_PLANNER_PARTITION_SPEC, PlannerPartitionSpec};
 use shift_runner::ShiftTaskRunnerImpl;
 use timeout::TimeoutEstimator;
 
@@ -61,6 +64,8 @@ pub struct ShiftJobSpec {
     pub table: &'static str,
     /// Sort descriptor shared with the WAL sorter for this topic.
     pub descriptor: &'static SortColumnsDescriptor,
+    /// Explicit limited partition spec used by the shift planner adapter.
+    pub planner_partition_spec: &'static PlannerPartitionSpec,
 }
 
 /// Runs shift jobs inside the ingest process.
@@ -107,6 +112,7 @@ impl Shifter {
                 shift_config.clone(),
                 timeouts.clone(),
                 spec.topic,
+                spec.planner_partition_spec,
             ));
             let plan_runner = Arc::new(PlanTaskRunnerWithMetrics::new(
                 plan_runner,

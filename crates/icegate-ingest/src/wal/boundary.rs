@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,8 @@ pub(crate) enum RowGroupBoundaryValue {
 /// Inclusive boundary range for one sorted row group.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RowGroupBoundaryRange {
+    /// Sort-field column names, parallel to `min_key.components` / `max_key.components`.
+    pub(crate) names: Arc<[String]>,
     /// First key in the row group.
     pub(crate) min_key: RowGroupBoundaryKey,
     /// Last key in the row group.
@@ -23,8 +25,22 @@ pub(crate) struct RowGroupBoundaryRange {
 }
 
 impl RowGroupBoundaryRange {
-    /// Validate that both boundary keys use the same structure and define a non-decreasing range.
+    /// Validate that boundary keys and `names` share the same arity and that the range is
+    /// non-decreasing.
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.names.is_empty() {
+            return Err(IngestError::Shift(
+                "row group boundary range names must not be empty".to_string(),
+            ));
+        }
+        if self.names.len() != self.min_key.components().len() || self.names.len() != self.max_key.components().len() {
+            return Err(IngestError::Shift(format!(
+                "row group boundary range arity mismatch: names={}, min_key={}, max_key={}",
+                self.names.len(),
+                self.min_key.components().len(),
+                self.max_key.components().len()
+            )));
+        }
         self.min_key.validate_compatible_structure(&self.max_key)?;
         if self.min_key.compare_checked(&self.max_key)? == Ordering::Greater {
             return Err(IngestError::Shift("min_key must be <= max_key".to_string()));
@@ -37,10 +53,20 @@ impl RowGroupBoundaryRange {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RowGroupBoundaryKey {
     /// Sort-field components in Iceberg sort-order order.
-    pub(crate) components: Vec<RowGroupBoundaryComponent>,
+    components: Vec<RowGroupBoundaryComponent>,
 }
 
 impl RowGroupBoundaryKey {
+    /// Create a new boundary key from the given components.
+    pub(crate) const fn new(components: Vec<RowGroupBoundaryComponent>) -> Self {
+        Self { components }
+    }
+
+    /// Return all sort-field components as a slice.
+    pub(crate) fn components(&self) -> &[RowGroupBoundaryComponent] {
+        &self.components
+    }
+
     /// Validate that both keys use identical component structure.
     pub(crate) fn validate_compatible_structure(&self, other: &Self) -> Result<()> {
         if self.components.len() != other.components.len() {
@@ -87,27 +113,6 @@ pub(crate) struct RowGroupBoundaryComponent {
 }
 
 impl RowGroupBoundaryComponent {
-    #[cfg(test)]
-    pub(crate) fn string(value: Option<String>, descending: bool, nulls_first: bool) -> Self {
-        Self {
-            value: value.map(RowGroupBoundaryValue::String),
-            descending,
-            nulls_first,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn timestamp_micros(value: Option<i64>, descending: bool, nulls_first: bool) -> Self {
-        Self {
-            value: match value {
-                Some(value) => Some(RowGroupBoundaryValue::TimestampMicros(value)),
-                None => None,
-            },
-            descending,
-            nulls_first,
-        }
-    }
-
     fn validate_compatible_structure(&self, other: &Self, index: usize) -> Result<()> {
         if self.descending != other.descending {
             return Err(IngestError::Shift(format!(
@@ -170,7 +175,7 @@ impl RowGroupBoundaryComponent {
 }
 
 impl RowGroupBoundaryValue {
-    const fn type_name(&self) -> &'static str {
+    pub(crate) const fn type_name(&self) -> &'static str {
         match self {
             Self::String(_) => "string",
             Self::TimestampMicros(_) => "timestamp_micros",
@@ -216,9 +221,10 @@ const fn boundary_value_discriminant(value: &RowGroupBoundaryValue) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::cmp::Ordering;
+    use std::{cmp::Ordering, sync::Arc};
 
-    use super::{RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, compare_option_ord};
+    use super::{RowGroupBoundaryKey, RowGroupBoundaryRange, compare_option_ord};
+    use crate::wal::test_utils::{boundary_component_string, boundary_component_timestamp_micros};
 
     #[test]
     fn compare_option_ord_handles_desc_nulls_first() {
@@ -229,27 +235,21 @@ mod tests {
 
     #[test]
     fn row_group_boundary_key_matches_logs_order() {
-        let lower = RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::string(Some("svc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(Some(20), true, true),
-            ],
-        };
-        let higher = RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::string(Some("svc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(Some(30), true, true),
-            ],
-        };
-        let null_cloud = RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(None, false, true),
-                RowGroupBoundaryComponent::string(Some("svc-9".to_string()), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(Some(1), true, true),
-            ],
-        };
+        let lower = RowGroupBoundaryKey::new(vec![
+            boundary_component_string(Some("acc-1".to_string()), false, true),
+            boundary_component_string(Some("svc-1".to_string()), false, true),
+            boundary_component_timestamp_micros(Some(20), true, true),
+        ]);
+        let higher = RowGroupBoundaryKey::new(vec![
+            boundary_component_string(Some("acc-1".to_string()), false, true),
+            boundary_component_string(Some("svc-1".to_string()), false, true),
+            boundary_component_timestamp_micros(Some(30), true, true),
+        ]);
+        let null_cloud = RowGroupBoundaryKey::new(vec![
+            boundary_component_string(None, false, true),
+            boundary_component_string(Some("svc-9".to_string()), false, true),
+            boundary_component_timestamp_micros(Some(1), true, true),
+        ]);
 
         assert_eq!(
             null_cloud.compare_checked(&lower).expect("compatible keys"),
@@ -262,23 +262,31 @@ mod tests {
         );
     }
 
+    fn names() -> Arc<[String]> {
+        Arc::from([
+            "cloud_account_id".to_string(),
+            "service_name".to_string(),
+            "timestamp".to_string(),
+        ])
+    }
+
     #[test]
     fn row_group_boundary_range_preserves_key_order() {
-        let min_key = RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::string(Some("svc-a".to_string()), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(Some(50), true, true),
-            ],
+        let min_key = RowGroupBoundaryKey::new(vec![
+            boundary_component_string(Some("acc-1".to_string()), false, true),
+            boundary_component_string(Some("svc-a".to_string()), false, true),
+            boundary_component_timestamp_micros(Some(50), true, true),
+        ]);
+        let max_key = RowGroupBoundaryKey::new(vec![
+            boundary_component_string(Some("acc-1".to_string()), false, true),
+            boundary_component_string(Some("svc-b".to_string()), false, true),
+            boundary_component_timestamp_micros(Some(10), true, true),
+        ]);
+        let range = RowGroupBoundaryRange {
+            names: names(),
+            min_key,
+            max_key,
         };
-        let max_key = RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::string(Some("svc-b".to_string()), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(Some(10), true, true),
-            ],
-        };
-        let range = RowGroupBoundaryRange { min_key, max_key };
 
         assert_eq!(
             range.min_key.compare_checked(&range.max_key).expect("compatible keys"),
@@ -287,21 +295,45 @@ mod tests {
     }
 
     #[test]
+    fn row_group_boundary_range_rejects_names_arity_mismatch() {
+        let range = RowGroupBoundaryRange {
+            names: Arc::from(["timestamp".to_string()]),
+            min_key: RowGroupBoundaryKey::new(vec![
+                boundary_component_string(Some("acc-1".to_string()), false, true),
+                boundary_component_timestamp_micros(Some(10), true, true),
+            ]),
+            max_key: RowGroupBoundaryKey::new(vec![
+                boundary_component_string(Some("acc-1".to_string()), false, true),
+                boundary_component_timestamp_micros(Some(20), true, true),
+            ]),
+        };
+        let err = range.validate().expect_err("arity mismatch must be rejected");
+        assert!(err.to_string().contains("arity mismatch"));
+    }
+
+    #[test]
+    fn row_group_boundary_range_rejects_empty_names() {
+        let range = RowGroupBoundaryRange {
+            names: Arc::from([]),
+            min_key: RowGroupBoundaryKey::new(Vec::new()),
+            max_key: RowGroupBoundaryKey::new(Vec::new()),
+        };
+        let err = range.validate().expect_err("empty names must be rejected");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
     fn row_group_boundary_range_handles_equal_prefix_and_timestamp_desc() {
-        let min_key = RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::string(Some("svc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(Some(30), true, true),
-            ],
-        };
-        let max_key = RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::string(Some("svc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(Some(10), true, true),
-            ],
-        };
+        let min_key = RowGroupBoundaryKey::new(vec![
+            boundary_component_string(Some("acc-1".to_string()), false, true),
+            boundary_component_string(Some("svc-1".to_string()), false, true),
+            boundary_component_timestamp_micros(Some(30), true, true),
+        ]);
+        let max_key = RowGroupBoundaryKey::new(vec![
+            boundary_component_string(Some("acc-1".to_string()), false, true),
+            boundary_component_string(Some("svc-1".to_string()), false, true),
+            boundary_component_timestamp_micros(Some(10), true, true),
+        ]);
 
         assert_eq!(
             min_key.compare_checked(&max_key).expect("compatible keys"),
@@ -311,19 +343,11 @@ mod tests {
 
     #[test]
     fn row_group_boundary_key_rejects_different_component_count() {
-        let shorter = RowGroupBoundaryKey {
-            components: vec![RowGroupBoundaryComponent::string(
-                Some("acc-1".to_string()),
-                false,
-                true,
-            )],
-        };
-        let longer = RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
-                RowGroupBoundaryComponent::string(Some("svc-1".to_string()), false, true),
-            ],
-        };
+        let shorter = RowGroupBoundaryKey::new(vec![boundary_component_string(Some("acc-1".to_string()), false, true)]);
+        let longer = RowGroupBoundaryKey::new(vec![
+            boundary_component_string(Some("acc-1".to_string()), false, true),
+            boundary_component_string(Some("svc-1".to_string()), false, true),
+        ]);
 
         let err = shorter
             .compare_checked(&longer)
@@ -333,16 +357,10 @@ mod tests {
 
     #[test]
     fn row_group_boundary_key_rejects_different_component_flags() {
-        let ascending = RowGroupBoundaryKey {
-            components: vec![RowGroupBoundaryComponent::string(
-                Some("acc-1".to_string()),
-                false,
-                true,
-            )],
-        };
-        let descending = RowGroupBoundaryKey {
-            components: vec![RowGroupBoundaryComponent::string(Some("acc-1".to_string()), true, true)],
-        };
+        let ascending =
+            RowGroupBoundaryKey::new(vec![boundary_component_string(Some("acc-1".to_string()), false, true)]);
+        let descending =
+            RowGroupBoundaryKey::new(vec![boundary_component_string(Some("acc-1".to_string()), true, true)]);
 
         let err = ascending
             .compare_checked(&descending)
@@ -352,16 +370,9 @@ mod tests {
 
     #[test]
     fn row_group_boundary_key_rejects_different_component_types() {
-        let string_key = RowGroupBoundaryKey {
-            components: vec![RowGroupBoundaryComponent::string(
-                Some("acc-1".to_string()),
-                false,
-                true,
-            )],
-        };
-        let timestamp_key = RowGroupBoundaryKey {
-            components: vec![RowGroupBoundaryComponent::timestamp_micros(Some(10), false, true)],
-        };
+        let string_key =
+            RowGroupBoundaryKey::new(vec![boundary_component_string(Some("acc-1".to_string()), false, true)]);
+        let timestamp_key = RowGroupBoundaryKey::new(vec![boundary_component_timestamp_micros(Some(10), false, true)]);
 
         let err = string_key
             .compare_checked(&timestamp_key)
