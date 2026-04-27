@@ -125,6 +125,11 @@ impl S3CatalogStorage {
                 "Metadata bucket mismatch: expected {expected_bucket}, got {bucket}"
             )));
         }
+        if key.is_empty() {
+            return Err(Error::InvalidMetadata(format!(
+                "Invalid metadata location: object key is empty in {location}"
+            )));
+        }
         Ok(Path::from(key))
     }
 

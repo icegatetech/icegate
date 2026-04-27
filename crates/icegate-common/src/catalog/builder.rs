@@ -306,9 +306,29 @@ impl CatalogBuilder {
         let access_key_id = config.properties.get("access_key_id").cloned();
         let secret_access_key = config.properties.get("secret_access_key").cloned();
 
+        match (&access_key_id, &secret_access_key) {
+            (Some(_), None) => {
+                return Err(CommonError::Config(
+                    "S3 catalog: `access_key_id` is set but `secret_access_key` is missing".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(CommonError::Config(
+                    "S3 catalog: `secret_access_key` is set but `access_key_id` is missing".to_string(),
+                ));
+            }
+            _ => {}
+        }
+
         // TODO(high): move to custom config and build fileio from custom config
         let mut file_io_props = config.properties.clone();
-        file_io_props.insert("warehouse".to_string(), format!("s3://{bucket}"));
+        let warehouse_trimmed = warehouse.trim_matches('/');
+        let file_io_warehouse = if warehouse_trimmed.is_empty() {
+            format!("s3://{bucket}")
+        } else {
+            format!("s3://{bucket}/{warehouse_trimmed}")
+        };
+        file_io_props.insert("warehouse".to_string(), file_io_warehouse);
         if let Some(ref endpoint_value) = endpoint {
             file_io_props
                 .entry("s3.endpoint".to_string())
@@ -317,15 +337,13 @@ impl CatalogBuilder {
                 .entry("s3.path-style-access".to_string())
                 .or_insert_with(|| "true".to_string());
         }
-        if let Some(ref key) = access_key_id {
+        if let (Some(key), Some(secret)) = (&access_key_id, &secret_access_key) {
             file_io_props
                 .entry("s3.access-key-id".to_string())
                 .or_insert_with(|| key.clone());
-        }
-        if let Some(ref key) = secret_access_key {
             file_io_props
                 .entry("s3.secret-access-key".to_string())
-                .or_insert_with(|| key.clone());
+                .or_insert_with(|| secret.clone());
         }
         file_io_props.entry("s3.region".to_string()).or_insert_with(|| region.clone());
 

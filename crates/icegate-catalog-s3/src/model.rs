@@ -366,14 +366,16 @@ impl CatalogRoot {
     /// Returns [`Error::NamespaceNotEmpty`] if the namespace has active tables or descendant namespaces.
     /// Returns [`Error::NamespaceNotFound`] if the namespace does not exist.
     pub(crate) fn drop_namespace(&mut self, namespace: &NamespaceIdent) -> Result<(), Error> {
+        let key = NamespaceKey::from_ident(namespace);
+        if !self.namespaces.contains_key(&key) {
+            return Err(Error::NamespaceNotFound(namespace.clone()));
+        }
+
         if self.has_active_tables_in_namespace_tree(namespace) || self.has_namespace_descendants(namespace) {
             return Err(Error::NamespaceNotEmpty(namespace.clone()));
         }
 
-        if self.namespaces.remove(&NamespaceKey::from_ident(namespace)).is_none() {
-            return Err(Error::NamespaceNotFound(namespace.clone()));
-        }
-
+        self.namespaces.remove(&key);
         Ok(())
     }
 

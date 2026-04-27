@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +29,7 @@ pub(crate) struct TestEnv {
     pub(crate) tables_uri_prefix: String,
 }
 
+#[allow(clippy::expect_used)]
 pub(crate) async fn make_catalog() -> TestEnv {
     let minio = MinIO::default().start().await.expect("start minio");
     let port = minio.get_host_port_ipv4(9000).await.expect("minio port");
@@ -85,6 +84,7 @@ pub(crate) fn make_in_memory_catalog_with_storage() -> (S3Catalog, Arc<InMemoryC
     (catalog, storage)
 }
 
+#[allow(clippy::expect_used)]
 pub(crate) fn test_schema() -> Schema {
     Schema::builder()
         .with_schema_id(0)
@@ -96,6 +96,7 @@ pub(crate) fn test_schema() -> Schema {
         .expect("schema")
 }
 
+#[allow(clippy::expect_used)]
 pub(crate) async fn create_table(catalog: &S3Catalog, namespace: &NamespaceIdent, name: &str) -> Table {
     if !catalog.namespace_exists(namespace).await.expect("check namespace") {
         catalog
@@ -126,6 +127,7 @@ impl CapturingCatalog {
         }
     }
 
+    #[allow(clippy::expect_used)]
     fn take_commit(self) -> TableCommit {
         self.captured_commit
             .into_inner()
@@ -196,12 +198,14 @@ impl Catalog for CapturingCatalog {
         unreachable!("not used in commit capture")
     }
 
+    #[allow(clippy::expect_used)]
     async fn update_table(&self, commit: TableCommit) -> IcebergResult<Table> {
         *self.captured_commit.lock().expect("captured commit lock") = Some(commit);
         Ok(self.table.clone())
     }
 }
 
+#[allow(clippy::expect_used)]
 pub(crate) async fn update_request(table: &Table, key: &str, value: &str) -> TableCommit {
     let tx = Transaction::new(table);
     let tx = tx

@@ -10,7 +10,7 @@ Used through `icegate-common`: `CatalogBackend::S3` in configuration -> `Catalog
 
 ## S3 Layout
 
-```
+```text
 {warehouse}/catalog/
 ├── root.json                                  # catalog: all tables, statuses, metadata_location
 └── tables/{table-id}/metadata/
