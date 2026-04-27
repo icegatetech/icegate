@@ -166,9 +166,12 @@ pub fn validate_tag_name(name: &str) -> Result<()> {
         )));
     }
     // Block direct enumeration of the tenant column under any spelling.
+    // `last_segment` already covers both the unscoped (`tenant_id`) and
+    // scoped (`resource.tenant_id`, `.tenant_id`) cases — `rsplit('.').next()`
+    // on a string with no dot returns the whole string.
     let trimmed = name.trim_start_matches('.');
     let last_segment = trimmed.rsplit('.').next().unwrap_or(trimmed);
-    if last_segment.eq_ignore_ascii_case("tenant_id") || trimmed.eq_ignore_ascii_case("tenant_id") {
+    if last_segment.eq_ignore_ascii_case("tenant_id") {
         return Err(QueryError::Validation("tag name 'tenant_id' is reserved".into()));
     }
     for c in name.chars() {

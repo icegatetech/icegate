@@ -58,31 +58,40 @@ pub trait TraceQLParserVisitor<'input>: ParseTreeVisitor<'input,TraceQLParserCon
 	fn visit_metricsFunction(&mut self, ctx: &MetricsFunctionContext<'input>) { self.visit_children(ctx) }
 
 	/**
-	 * Visit a parse tree produced by the {@code SpansetParen}
-	 * labeled alternative in {@link TraceQLParser#spansetExpr}.
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetExpr}.
 	 * @param ctx the parse tree
 	 */
-	fn visit_SpansetParen(&mut self, ctx: &SpansetParenContext<'input>) { self.visit_children(ctx) }
+	fn visit_spansetExpr(&mut self, ctx: &SpansetExprContext<'input>) { self.visit_children(ctx) }
 
 	/**
-	 * Visit a parse tree produced by the {@code SpansetLeaf}
-	 * labeled alternative in {@link TraceQLParser#spansetExpr}.
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetOr}.
 	 * @param ctx the parse tree
 	 */
-	fn visit_SpansetLeaf(&mut self, ctx: &SpansetLeafContext<'input>) { self.visit_children(ctx) }
+	fn visit_spansetOr(&mut self, ctx: &SpansetOrContext<'input>) { self.visit_children(ctx) }
 
 	/**
-	 * Visit a parse tree produced by the {@code SpansetBinary}
-	 * labeled alternative in {@link TraceQLParser#spansetExpr}.
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetAnd}.
 	 * @param ctx the parse tree
 	 */
-	fn visit_SpansetBinary(&mut self, ctx: &SpansetBinaryContext<'input>) { self.visit_children(ctx) }
+	fn visit_spansetAnd(&mut self, ctx: &SpansetAndContext<'input>) { self.visit_children(ctx) }
 
 	/**
-	 * Visit a parse tree produced by {@link TraceQLParser#spansetOp}.
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetRel}.
 	 * @param ctx the parse tree
 	 */
-	fn visit_spansetOp(&mut self, ctx: &SpansetOpContext<'input>) { self.visit_children(ctx) }
+	fn visit_spansetRel(&mut self, ctx: &SpansetRelContext<'input>) { self.visit_children(ctx) }
+
+	/**
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetPrimary}.
+	 * @param ctx the parse tree
+	 */
+	fn visit_spansetPrimary(&mut self, ctx: &SpansetPrimaryContext<'input>) { self.visit_children(ctx) }
+
+	/**
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetRelOp}.
+	 * @param ctx the parse tree
+	 */
+	fn visit_spansetRelOp(&mut self, ctx: &SpansetRelOpContext<'input>) { self.visit_children(ctx) }
 
 	/**
 	 * Visit a parse tree produced by {@link TraceQLParser#spanSelector}.
@@ -250,37 +259,50 @@ pub trait TraceQLParserVisitorCompat<'input>:ParseTreeVisitorCompat<'input, Node
 		}
 
 	/**
-	 * Visit a parse tree produced by the {@code SpansetParen}
-	 * labeled alternative in {@link TraceQLParser#spansetExpr}.
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetExpr}.
 	 * @param ctx the parse tree
 	 */
-		fn visit_SpansetParen(&mut self, ctx: &SpansetParenContext<'input>) -> Self::Return {
+		fn visit_spansetExpr(&mut self, ctx: &SpansetExprContext<'input>) -> Self::Return {
 			self.visit_children(ctx)
 		}
 
 	/**
-	 * Visit a parse tree produced by the {@code SpansetLeaf}
-	 * labeled alternative in {@link TraceQLParser#spansetExpr}.
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetOr}.
 	 * @param ctx the parse tree
 	 */
-		fn visit_SpansetLeaf(&mut self, ctx: &SpansetLeafContext<'input>) -> Self::Return {
+		fn visit_spansetOr(&mut self, ctx: &SpansetOrContext<'input>) -> Self::Return {
 			self.visit_children(ctx)
 		}
 
 	/**
-	 * Visit a parse tree produced by the {@code SpansetBinary}
-	 * labeled alternative in {@link TraceQLParser#spansetExpr}.
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetAnd}.
 	 * @param ctx the parse tree
 	 */
-		fn visit_SpansetBinary(&mut self, ctx: &SpansetBinaryContext<'input>) -> Self::Return {
+		fn visit_spansetAnd(&mut self, ctx: &SpansetAndContext<'input>) -> Self::Return {
 			self.visit_children(ctx)
 		}
 
 	/**
-	 * Visit a parse tree produced by {@link TraceQLParser#spansetOp}.
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetRel}.
 	 * @param ctx the parse tree
 	 */
-		fn visit_spansetOp(&mut self, ctx: &SpansetOpContext<'input>) -> Self::Return {
+		fn visit_spansetRel(&mut self, ctx: &SpansetRelContext<'input>) -> Self::Return {
+			self.visit_children(ctx)
+		}
+
+	/**
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetPrimary}.
+	 * @param ctx the parse tree
+	 */
+		fn visit_spansetPrimary(&mut self, ctx: &SpansetPrimaryContext<'input>) -> Self::Return {
+			self.visit_children(ctx)
+		}
+
+	/**
+	 * Visit a parse tree produced by {@link TraceQLParser#spansetRelOp}.
+	 * @param ctx the parse tree
+	 */
+		fn visit_spansetRelOp(&mut self, ctx: &SpansetRelOpContext<'input>) -> Self::Return {
 			self.visit_children(ctx)
 		}
 
@@ -458,23 +480,33 @@ where
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
 	}
 
-	fn visit_SpansetParen(&mut self, ctx: &SpansetParenContext<'input>){
-		let result = <Self as TraceQLParserVisitorCompat>::visit_SpansetParen(self, ctx);
+	fn visit_spansetExpr(&mut self, ctx: &SpansetExprContext<'input>){
+		let result = <Self as TraceQLParserVisitorCompat>::visit_spansetExpr(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
 	}
 
-	fn visit_SpansetLeaf(&mut self, ctx: &SpansetLeafContext<'input>){
-		let result = <Self as TraceQLParserVisitorCompat>::visit_SpansetLeaf(self, ctx);
+	fn visit_spansetOr(&mut self, ctx: &SpansetOrContext<'input>){
+		let result = <Self as TraceQLParserVisitorCompat>::visit_spansetOr(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
 	}
 
-	fn visit_SpansetBinary(&mut self, ctx: &SpansetBinaryContext<'input>){
-		let result = <Self as TraceQLParserVisitorCompat>::visit_SpansetBinary(self, ctx);
+	fn visit_spansetAnd(&mut self, ctx: &SpansetAndContext<'input>){
+		let result = <Self as TraceQLParserVisitorCompat>::visit_spansetAnd(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
 	}
 
-	fn visit_spansetOp(&mut self, ctx: &SpansetOpContext<'input>){
-		let result = <Self as TraceQLParserVisitorCompat>::visit_spansetOp(self, ctx);
+	fn visit_spansetRel(&mut self, ctx: &SpansetRelContext<'input>){
+		let result = <Self as TraceQLParserVisitorCompat>::visit_spansetRel(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+	}
+
+	fn visit_spansetPrimary(&mut self, ctx: &SpansetPrimaryContext<'input>){
+		let result = <Self as TraceQLParserVisitorCompat>::visit_spansetPrimary(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+	}
+
+	fn visit_spansetRelOp(&mut self, ctx: &SpansetRelOpContext<'input>){
+		let result = <Self as TraceQLParserVisitorCompat>::visit_spansetRelOp(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
 	}
 

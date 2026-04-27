@@ -1,4 +1,4 @@
-#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::unwrap_used)]
+#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::unwrap_used, unused_parens)]
 // Generated from antlr/TraceQLParser.g4 by ANTLR 4.13.2
 #![allow(dead_code)]
 #![allow(non_snake_case)]
@@ -63,60 +63,59 @@ use std::any::{Any,TypeId};
 		pub const TraceQLParser_NOT_ANC:i32=21; 
 		pub const TraceQLParser_NOT_CHILD:i32=22; 
 		pub const TraceQLParser_NOT_PARENT:i32=23; 
-		pub const TraceQLParser_NOT_SIBLING:i32=24; 
-		pub const TraceQLParser_AND:i32=25; 
-		pub const TraceQLParser_OR:i32=26; 
-		pub const TraceQLParser_NOT:i32=27; 
-		pub const TraceQLParser_PLUS:i32=28; 
-		pub const TraceQLParser_MINUS:i32=29; 
-		pub const TraceQLParser_STAR:i32=30; 
-		pub const TraceQLParser_SLASH:i32=31; 
-		pub const TraceQLParser_PERCENT:i32=32; 
-		pub const TraceQLParser_SCOPE_SPAN:i32=33; 
-		pub const TraceQLParser_SCOPE_RESOURCE:i32=34; 
-		pub const TraceQLParser_SCOPE_EVENT:i32=35; 
-		pub const TraceQLParser_SCOPE_LINK:i32=36; 
-		pub const TraceQLParser_SCOPE_PARENT:i32=37; 
-		pub const TraceQLParser_SCOPE_TRACE:i32=38; 
-		pub const TraceQLParser_INTR_NAME:i32=39; 
-		pub const TraceQLParser_INTR_STATUS:i32=40; 
-		pub const TraceQLParser_INTR_STATUS_MESSAGE:i32=41; 
-		pub const TraceQLParser_INTR_KIND:i32=42; 
-		pub const TraceQLParser_INTR_DURATION:i32=43; 
-		pub const TraceQLParser_INTR_TRACE_DURATION:i32=44; 
-		pub const TraceQLParser_INTR_ROOT_NAME:i32=45; 
-		pub const TraceQLParser_INTR_ROOT_SVC:i32=46; 
-		pub const TraceQLParser_INTR_TRACE_ID:i32=47; 
-		pub const TraceQLParser_INTR_SPAN_ID:i32=48; 
-		pub const TraceQLParser_STATUS_OK:i32=49; 
-		pub const TraceQLParser_STATUS_ERROR:i32=50; 
-		pub const TraceQLParser_STATUS_UNSET:i32=51; 
-		pub const TraceQLParser_KIND_SERVER:i32=52; 
-		pub const TraceQLParser_KIND_CLIENT:i32=53; 
-		pub const TraceQLParser_KIND_PRODUCER:i32=54; 
-		pub const TraceQLParser_KIND_CONSUMER:i32=55; 
-		pub const TraceQLParser_KIND_INTERNAL:i32=56; 
-		pub const TraceQLParser_FN_COUNT:i32=57; 
-		pub const TraceQLParser_FN_SUM:i32=58; 
-		pub const TraceQLParser_FN_AVG:i32=59; 
-		pub const TraceQLParser_FN_MIN:i32=60; 
-		pub const TraceQLParser_FN_MAX:i32=61; 
-		pub const TraceQLParser_FN_QUANTILE:i32=62; 
-		pub const TraceQLParser_FN_RATE:i32=63; 
-		pub const TraceQLParser_FN_COUNT_OVER_TIME:i32=64; 
-		pub const TraceQLParser_FN_HISTOGRAM_OVER_TIME:i32=65; 
-		pub const TraceQLParser_KW_BY:i32=66; 
-		pub const TraceQLParser_KW_TRUE:i32=67; 
-		pub const TraceQLParser_KW_FALSE:i32=68; 
-		pub const TraceQLParser_KW_NIL:i32=69; 
-		pub const TraceQLParser_DURATION:i32=70; 
-		pub const TraceQLParser_BYTES:i32=71; 
-		pub const TraceQLParser_FLOAT:i32=72; 
-		pub const TraceQLParser_INT:i32=73; 
-		pub const TraceQLParser_STRING:i32=74; 
-		pub const TraceQLParser_IDENT:i32=75; 
-		pub const TraceQLParser_WS:i32=76; 
-		pub const TraceQLParser_COMMENT:i32=77;
+		pub const TraceQLParser_AND:i32=24; 
+		pub const TraceQLParser_OR:i32=25; 
+		pub const TraceQLParser_NOT:i32=26; 
+		pub const TraceQLParser_PLUS:i32=27; 
+		pub const TraceQLParser_MINUS:i32=28; 
+		pub const TraceQLParser_STAR:i32=29; 
+		pub const TraceQLParser_SLASH:i32=30; 
+		pub const TraceQLParser_PERCENT:i32=31; 
+		pub const TraceQLParser_SCOPE_SPAN:i32=32; 
+		pub const TraceQLParser_SCOPE_RESOURCE:i32=33; 
+		pub const TraceQLParser_SCOPE_EVENT:i32=34; 
+		pub const TraceQLParser_SCOPE_LINK:i32=35; 
+		pub const TraceQLParser_SCOPE_PARENT:i32=36; 
+		pub const TraceQLParser_SCOPE_TRACE:i32=37; 
+		pub const TraceQLParser_INTR_NAME:i32=38; 
+		pub const TraceQLParser_INTR_STATUS:i32=39; 
+		pub const TraceQLParser_INTR_STATUS_MESSAGE:i32=40; 
+		pub const TraceQLParser_INTR_KIND:i32=41; 
+		pub const TraceQLParser_INTR_DURATION:i32=42; 
+		pub const TraceQLParser_INTR_TRACE_DURATION:i32=43; 
+		pub const TraceQLParser_INTR_ROOT_NAME:i32=44; 
+		pub const TraceQLParser_INTR_ROOT_SVC:i32=45; 
+		pub const TraceQLParser_INTR_TRACE_ID:i32=46; 
+		pub const TraceQLParser_INTR_SPAN_ID:i32=47; 
+		pub const TraceQLParser_STATUS_OK:i32=48; 
+		pub const TraceQLParser_STATUS_ERROR:i32=49; 
+		pub const TraceQLParser_STATUS_UNSET:i32=50; 
+		pub const TraceQLParser_KIND_SERVER:i32=51; 
+		pub const TraceQLParser_KIND_CLIENT:i32=52; 
+		pub const TraceQLParser_KIND_PRODUCER:i32=53; 
+		pub const TraceQLParser_KIND_CONSUMER:i32=54; 
+		pub const TraceQLParser_KIND_INTERNAL:i32=55; 
+		pub const TraceQLParser_FN_COUNT:i32=56; 
+		pub const TraceQLParser_FN_SUM:i32=57; 
+		pub const TraceQLParser_FN_AVG:i32=58; 
+		pub const TraceQLParser_FN_MIN:i32=59; 
+		pub const TraceQLParser_FN_MAX:i32=60; 
+		pub const TraceQLParser_FN_QUANTILE:i32=61; 
+		pub const TraceQLParser_FN_RATE:i32=62; 
+		pub const TraceQLParser_FN_COUNT_OVER_TIME:i32=63; 
+		pub const TraceQLParser_FN_HISTOGRAM_OVER_TIME:i32=64; 
+		pub const TraceQLParser_KW_BY:i32=65; 
+		pub const TraceQLParser_KW_TRUE:i32=66; 
+		pub const TraceQLParser_KW_FALSE:i32=67; 
+		pub const TraceQLParser_KW_NIL:i32=68; 
+		pub const TraceQLParser_DURATION:i32=69; 
+		pub const TraceQLParser_BYTES:i32=70; 
+		pub const TraceQLParser_FLOAT:i32=71; 
+		pub const TraceQLParser_INT:i32=72; 
+		pub const TraceQLParser_STRING:i32=73; 
+		pub const TraceQLParser_IDENT:i32=74; 
+		pub const TraceQLParser_WS:i32=75; 
+		pub const TraceQLParser_COMMENT:i32=76;
 	pub const TraceQLParser_EOF:i32=EOF;
 	pub const RULE_root:usize = 0; 
 	pub const RULE_pipelineExpr:usize = 1; 
@@ -127,31 +126,36 @@ use std::any::{Any,TypeId};
 	pub const RULE_aggregateOp:usize = 6; 
 	pub const RULE_metricsFunction:usize = 7; 
 	pub const RULE_spansetExpr:usize = 8; 
-	pub const RULE_spansetOp:usize = 9; 
-	pub const RULE_spanSelector:usize = 10; 
-	pub const RULE_spanFilter:usize = 11; 
-	pub const RULE_comparisonOp:usize = 12; 
-	pub const RULE_fieldRef:usize = 13; 
-	pub const RULE_scopedAttribute:usize = 14; 
-	pub const RULE_identChain:usize = 15; 
-	pub const RULE_identPart:usize = 16; 
-	pub const RULE_intrinsic:usize = 17; 
-	pub const RULE_literal:usize = 18;
-	pub const ruleNames: [&'static str; 19] =  [
+	pub const RULE_spansetOr:usize = 9; 
+	pub const RULE_spansetAnd:usize = 10; 
+	pub const RULE_spansetRel:usize = 11; 
+	pub const RULE_spansetPrimary:usize = 12; 
+	pub const RULE_spansetRelOp:usize = 13; 
+	pub const RULE_spanSelector:usize = 14; 
+	pub const RULE_spanFilter:usize = 15; 
+	pub const RULE_comparisonOp:usize = 16; 
+	pub const RULE_fieldRef:usize = 17; 
+	pub const RULE_scopedAttribute:usize = 18; 
+	pub const RULE_identChain:usize = 19; 
+	pub const RULE_identPart:usize = 20; 
+	pub const RULE_intrinsic:usize = 21; 
+	pub const RULE_literal:usize = 22;
+	pub const ruleNames: [&'static str; 23] =  [
 		"root", "pipelineExpr", "pipelineStage", "byClause", "aggregate", "aggregateFilter", 
-		"aggregateOp", "metricsFunction", "spansetExpr", "spansetOp", "spanSelector", 
-		"spanFilter", "comparisonOp", "fieldRef", "scopedAttribute", "identChain", 
-		"identPart", "intrinsic", "literal"
+		"aggregateOp", "metricsFunction", "spansetExpr", "spansetOr", "spansetAnd", 
+		"spansetRel", "spansetPrimary", "spansetRelOp", "spanSelector", "spanFilter", 
+		"comparisonOp", "fieldRef", "scopedAttribute", "identChain", "identPart", 
+		"intrinsic", "literal"
 	];
 
 
-	pub const _LITERAL_NAMES: [Option<&'static str>;70] = [
+	pub const _LITERAL_NAMES: [Option<&'static str>;69] = [
 		None, Some("'{'"), Some("'}'"), Some("'('"), Some("')'"), Some("','"), 
-		Some("'.'"), Some("':'"), Some("'|'"), Some("'=~'"), None, Some("'>='"), 
+		Some("'.'"), Some("':'"), Some("'|'"), Some("'=~'"), Some("'!~'"), Some("'>='"), 
 		Some("'<='"), Some("'!='"), Some("'='"), Some("'>'"), Some("'<'"), Some("'>>'"), 
 		Some("'<<'"), Some("'~'"), Some("'!>>'"), Some("'!<<'"), Some("'!>'"), 
-		Some("'!<'"), None, Some("'&&'"), Some("'||'"), Some("'!'"), Some("'+'"), 
-		Some("'-'"), Some("'*'"), Some("'/'"), Some("'%'"), Some("'span'"), Some("'resource'"), 
+		Some("'!<'"), Some("'&&'"), Some("'||'"), Some("'!'"), Some("'+'"), Some("'-'"), 
+		Some("'*'"), Some("'/'"), Some("'%'"), Some("'span'"), Some("'resource'"), 
 		Some("'event'"), Some("'link'"), Some("'parent'"), Some("'trace'"), Some("'name'"), 
 		Some("'status'"), Some("'statusMessage'"), Some("'kind'"), Some("'duration'"), 
 		Some("'traceDuration'"), Some("'rootName'"), Some("'rootServiceName'"), 
@@ -162,25 +166,25 @@ use std::any::{Any,TypeId};
 		Some("'histogram_over_time'"), Some("'by'"), Some("'true'"), Some("'false'"), 
 		Some("'nil'")
 	];
-	pub const _SYMBOLIC_NAMES: [Option<&'static str>;78]  = [
+	pub const _SYMBOLIC_NAMES: [Option<&'static str>;77]  = [
 		None, Some("LBRACE"), Some("RBRACE"), Some("LPAREN"), Some("RPAREN"), 
 		Some("COMMA"), Some("DOT"), Some("COLON"), Some("PIPE"), Some("EQ_RE"), 
 		Some("NEQ_RE"), Some("GE"), Some("LE"), Some("NEQ"), Some("EQ"), Some("GT"), 
 		Some("LT"), Some("DESC"), Some("ANC"), Some("SIBLING"), Some("NOT_DESC"), 
-		Some("NOT_ANC"), Some("NOT_CHILD"), Some("NOT_PARENT"), Some("NOT_SIBLING"), 
-		Some("AND"), Some("OR"), Some("NOT"), Some("PLUS"), Some("MINUS"), Some("STAR"), 
-		Some("SLASH"), Some("PERCENT"), Some("SCOPE_SPAN"), Some("SCOPE_RESOURCE"), 
-		Some("SCOPE_EVENT"), Some("SCOPE_LINK"), Some("SCOPE_PARENT"), Some("SCOPE_TRACE"), 
-		Some("INTR_NAME"), Some("INTR_STATUS"), Some("INTR_STATUS_MESSAGE"), Some("INTR_KIND"), 
-		Some("INTR_DURATION"), Some("INTR_TRACE_DURATION"), Some("INTR_ROOT_NAME"), 
-		Some("INTR_ROOT_SVC"), Some("INTR_TRACE_ID"), Some("INTR_SPAN_ID"), Some("STATUS_OK"), 
-		Some("STATUS_ERROR"), Some("STATUS_UNSET"), Some("KIND_SERVER"), Some("KIND_CLIENT"), 
-		Some("KIND_PRODUCER"), Some("KIND_CONSUMER"), Some("KIND_INTERNAL"), Some("FN_COUNT"), 
-		Some("FN_SUM"), Some("FN_AVG"), Some("FN_MIN"), Some("FN_MAX"), Some("FN_QUANTILE"), 
-		Some("FN_RATE"), Some("FN_COUNT_OVER_TIME"), Some("FN_HISTOGRAM_OVER_TIME"), 
-		Some("KW_BY"), Some("KW_TRUE"), Some("KW_FALSE"), Some("KW_NIL"), Some("DURATION"), 
-		Some("BYTES"), Some("FLOAT"), Some("INT"), Some("STRING"), Some("IDENT"), 
-		Some("WS"), Some("COMMENT")
+		Some("NOT_ANC"), Some("NOT_CHILD"), Some("NOT_PARENT"), Some("AND"), Some("OR"), 
+		Some("NOT"), Some("PLUS"), Some("MINUS"), Some("STAR"), Some("SLASH"), 
+		Some("PERCENT"), Some("SCOPE_SPAN"), Some("SCOPE_RESOURCE"), Some("SCOPE_EVENT"), 
+		Some("SCOPE_LINK"), Some("SCOPE_PARENT"), Some("SCOPE_TRACE"), Some("INTR_NAME"), 
+		Some("INTR_STATUS"), Some("INTR_STATUS_MESSAGE"), Some("INTR_KIND"), Some("INTR_DURATION"), 
+		Some("INTR_TRACE_DURATION"), Some("INTR_ROOT_NAME"), Some("INTR_ROOT_SVC"), 
+		Some("INTR_TRACE_ID"), Some("INTR_SPAN_ID"), Some("STATUS_OK"), Some("STATUS_ERROR"), 
+		Some("STATUS_UNSET"), Some("KIND_SERVER"), Some("KIND_CLIENT"), Some("KIND_PRODUCER"), 
+		Some("KIND_CONSUMER"), Some("KIND_INTERNAL"), Some("FN_COUNT"), Some("FN_SUM"), 
+		Some("FN_AVG"), Some("FN_MIN"), Some("FN_MAX"), Some("FN_QUANTILE"), Some("FN_RATE"), 
+		Some("FN_COUNT_OVER_TIME"), Some("FN_HISTOGRAM_OVER_TIME"), Some("KW_BY"), 
+		Some("KW_TRUE"), Some("KW_FALSE"), Some("KW_NIL"), Some("DURATION"), Some("BYTES"), 
+		Some("FLOAT"), Some("INT"), Some("STRING"), Some("IDENT"), Some("WS"), 
+		Some("COMMENT")
 	];
 	lazy_static!{
 	    static ref _shared_context_cache: Arc<PredictionContextCache> = Arc::new(PredictionContextCache::new());
@@ -336,8 +340,7 @@ impl<'input,I: TokenStream<'input, TF = LocalTokenFactory<'input> > + TidAble<'i
 			   recog:&mut BaseParserType<'input,I>
 	)->bool{
 		match rule_index {
-					8 => TraceQLParser::<'input,I>::spansetExpr_sempred(_localctx.and_then(|x|x.downcast_ref()), pred_index, recog),
-					11 => TraceQLParser::<'input,I>::spanFilter_sempred(_localctx.and_then(|x|x.downcast_ref()), pred_index, recog),
+					15 => TraceQLParser::<'input,I>::spanFilter_sempred(_localctx.and_then(|x|x.downcast_ref()), pred_index, recog),
 			_ => true
 		}
 	}
@@ -347,24 +350,14 @@ impl<'input, I> TraceQLParser<'input, I>
 where
     I: TokenStream<'input, TF = LocalTokenFactory<'input> > + TidAble<'input>,
 {
-	fn spansetExpr_sempred(_localctx: Option<&SpansetExprContext<'input>>, pred_index:i32,
+	fn spanFilter_sempred(_localctx: Option<&SpanFilterContext<'input>>, pred_index:i32,
 						recog:&mut <Self as Deref>::Target
 		) -> bool {
 		match pred_index {
 				0=>{
 					recog.precpred(None, 3)
 				}
-			_ => true
-		}
-	}
-	fn spanFilter_sempred(_localctx: Option<&SpanFilterContext<'input>>, pred_index:i32,
-						recog:&mut <Self as Deref>::Target
-		) -> bool {
-		match pred_index {
 				1=>{
-					recog.precpred(None, 3)
-				}
-				2=>{
 					recog.precpred(None, 2)
 				}
 			_ => true
@@ -453,7 +446,7 @@ where
         let mut _localctx: Rc<RootContextAll> = _localctx;
 		let result: Result<(), ANTLRError> = (|| {
 
-			recog.base.set_state(44);
+			recog.base.set_state(52);
 			recog.err_handler.sync(&mut recog.base)?;
 			match  recog.interpreter.adaptive_predict(0,&mut recog.base)? {
 				1 =>{
@@ -461,10 +454,10 @@ where
 					recog.base.enter_outer_alt(None, 1)?;
 					{
 					/*InvokeRule pipelineExpr*/
-					recog.base.set_state(38);
+					recog.base.set_state(46);
 					recog.pipelineExpr()?;
 
-					recog.base.set_state(39);
+					recog.base.set_state(47);
 					recog.base.match_token(TraceQLParser_EOF,&mut recog.err_handler)?;
 
 					}
@@ -475,10 +468,10 @@ where
 					recog.base.enter_outer_alt(None, 2)?;
 					{
 					/*InvokeRule spansetExpr*/
-					recog.base.set_state(41);
-					recog.spansetExpr_rec(0)?;
+					recog.base.set_state(49);
+					recog.spansetExpr()?;
 
-					recog.base.set_state(42);
+					recog.base.set_state(50);
 					recog.base.match_token(TraceQLParser_EOF,&mut recog.err_handler)?;
 
 					}
@@ -596,25 +589,25 @@ where
 			recog.base.enter_outer_alt(None, 1)?;
 			{
 			/*InvokeRule spansetExpr*/
-			recog.base.set_state(46);
-			recog.spansetExpr_rec(0)?;
+			recog.base.set_state(54);
+			recog.spansetExpr()?;
 
-			recog.base.set_state(49); 
+			recog.base.set_state(57); 
 			recog.err_handler.sync(&mut recog.base)?;
 			_la = recog.base.input.la(1);
 			loop {
 				{
 				{
-				recog.base.set_state(47);
+				recog.base.set_state(55);
 				recog.base.match_token(TraceQLParser_PIPE,&mut recog.err_handler)?;
 
 				/*InvokeRule pipelineStage*/
-				recog.base.set_state(48);
+				recog.base.set_state(56);
 				recog.pipelineStage()?;
 
 				}
 				}
-				recog.base.set_state(51); 
+				recog.base.set_state(59); 
 				recog.err_handler.sync(&mut recog.base)?;
 				_la = recog.base.input.la(1);
 				if !(_la==TraceQLParser_PIPE) {break}
@@ -720,7 +713,7 @@ where
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
 
-			recog.base.set_state(60);
+			recog.base.set_state(68);
 			recog.err_handler.sync(&mut recog.base)?;
 			match  recog.interpreter.adaptive_predict(3,&mut recog.base)? {
 				1 =>{
@@ -728,7 +721,7 @@ where
 					recog.base.enter_outer_alt(None, 1)?;
 					{
 					/*InvokeRule byClause*/
-					recog.base.set_state(53);
+					recog.base.set_state(61);
 					recog.byClause()?;
 
 					}
@@ -739,7 +732,7 @@ where
 					recog.base.enter_outer_alt(None, 2)?;
 					{
 					/*InvokeRule aggregateFilter*/
-					recog.base.set_state(54);
+					recog.base.set_state(62);
 					recog.aggregateFilter()?;
 
 					}
@@ -750,7 +743,7 @@ where
 					recog.base.enter_outer_alt(None, 3)?;
 					{
 					/*InvokeRule aggregate*/
-					recog.base.set_state(55);
+					recog.base.set_state(63);
 					recog.aggregate()?;
 
 					}
@@ -761,16 +754,16 @@ where
 					recog.base.enter_outer_alt(None, 4)?;
 					{
 					/*InvokeRule metricsFunction*/
-					recog.base.set_state(56);
+					recog.base.set_state(64);
 					recog.metricsFunction()?;
 
-					recog.base.set_state(58);
+					recog.base.set_state(66);
 					recog.err_handler.sync(&mut recog.base)?;
 					_la = recog.base.input.la(1);
 					if _la==TraceQLParser_KW_BY {
 						{
 						/*InvokeRule byClause*/
-						recog.base.set_state(57);
+						recog.base.set_state(65);
 						recog.byClause()?;
 
 						}
@@ -902,36 +895,36 @@ where
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(62);
+			recog.base.set_state(70);
 			recog.base.match_token(TraceQLParser_KW_BY,&mut recog.err_handler)?;
 
-			recog.base.set_state(63);
+			recog.base.set_state(71);
 			recog.base.match_token(TraceQLParser_LPAREN,&mut recog.err_handler)?;
 
 			/*InvokeRule fieldRef*/
-			recog.base.set_state(64);
+			recog.base.set_state(72);
 			recog.fieldRef()?;
 
-			recog.base.set_state(69);
+			recog.base.set_state(77);
 			recog.err_handler.sync(&mut recog.base)?;
 			_la = recog.base.input.la(1);
 			while _la==TraceQLParser_COMMA {
 				{
 				{
-				recog.base.set_state(65);
+				recog.base.set_state(73);
 				recog.base.match_token(TraceQLParser_COMMA,&mut recog.err_handler)?;
 
 				/*InvokeRule fieldRef*/
-				recog.base.set_state(66);
+				recog.base.set_state(74);
 				recog.fieldRef()?;
 
 				}
 				}
-				recog.base.set_state(71);
+				recog.base.set_state(79);
 				recog.err_handler.sync(&mut recog.base)?;
 				_la = recog.base.input.la(1);
 			}
-			recog.base.set_state(72);
+			recog.base.set_state(80);
 			recog.base.match_token(TraceQLParser_RPAREN,&mut recog.err_handler)?;
 
 			}
@@ -1020,6 +1013,14 @@ fn RPAREN(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> wh
 fn fieldRef(&self) -> Option<Rc<FieldRefContextAll<'input>>> where Self:Sized{
 	self.child_of_type(0)
 }
+/// Retrieves first TerminalNode corresponding to token COMMA
+/// Returns `None` if there is no child corresponding to token COMMA
+fn COMMA(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
+	self.get_token(TraceQLParser_COMMA, 0)
+}
+fn literal(&self) -> Option<Rc<LiteralContextAll<'input>>> where Self:Sized{
+	self.child_of_type(0)
+}
 
 }
 
@@ -1043,25 +1044,40 @@ where
 			recog.base.enter_outer_alt(None, 1)?;
 			{
 			/*InvokeRule aggregateOp*/
-			recog.base.set_state(74);
+			recog.base.set_state(82);
 			recog.aggregateOp()?;
 
-			recog.base.set_state(75);
+			recog.base.set_state(83);
 			recog.base.match_token(TraceQLParser_LPAREN,&mut recog.err_handler)?;
 
-			recog.base.set_state(77);
+			recog.base.set_state(85);
 			recog.err_handler.sync(&mut recog.base)?;
 			_la = recog.base.input.la(1);
-			if _la==TraceQLParser_DOT || ((((_la - 33)) & !0x3f) == 0 && ((1usize << (_la - 33)) & 65503) != 0) {
+			if _la==TraceQLParser_DOT || ((((_la - 32)) & !0x3f) == 0 && ((1usize << (_la - 32)) & 65503) != 0) {
 				{
 				/*InvokeRule fieldRef*/
-				recog.base.set_state(76);
+				recog.base.set_state(84);
 				recog.fieldRef()?;
 
 				}
 			}
 
-			recog.base.set_state(79);
+			recog.base.set_state(89);
+			recog.err_handler.sync(&mut recog.base)?;
+			_la = recog.base.input.la(1);
+			if _la==TraceQLParser_COMMA {
+				{
+				recog.base.set_state(87);
+				recog.base.match_token(TraceQLParser_COMMA,&mut recog.err_handler)?;
+
+				/*InvokeRule literal*/
+				recog.base.set_state(88);
+				recog.literal()?;
+
+				}
+			}
+
+			recog.base.set_state(91);
 			recog.base.match_token(TraceQLParser_RPAREN,&mut recog.err_handler)?;
 
 			}
@@ -1150,11 +1166,19 @@ fn RPAREN(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> wh
 fn comparisonOp(&self) -> Option<Rc<ComparisonOpContextAll<'input>>> where Self:Sized{
 	self.child_of_type(0)
 }
-fn literal(&self) -> Option<Rc<LiteralContextAll<'input>>> where Self:Sized{
-	self.child_of_type(0)
+fn literal_all(&self) ->  Vec<Rc<LiteralContextAll<'input>>> where Self:Sized{
+	self.children_of_type()
+}
+fn literal(&self, i: usize) -> Option<Rc<LiteralContextAll<'input>>> where Self:Sized{
+	self.child_of_type(i)
 }
 fn fieldRef(&self) -> Option<Rc<FieldRefContextAll<'input>>> where Self:Sized{
 	self.child_of_type(0)
+}
+/// Retrieves first TerminalNode corresponding to token COMMA
+/// Returns `None` if there is no child corresponding to token COMMA
+fn COMMA(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
+	self.get_token(TraceQLParser_COMMA, 0)
 }
 
 }
@@ -1179,33 +1203,48 @@ where
 			recog.base.enter_outer_alt(None, 1)?;
 			{
 			/*InvokeRule aggregateOp*/
-			recog.base.set_state(81);
+			recog.base.set_state(93);
 			recog.aggregateOp()?;
 
-			recog.base.set_state(82);
+			recog.base.set_state(94);
 			recog.base.match_token(TraceQLParser_LPAREN,&mut recog.err_handler)?;
 
-			recog.base.set_state(84);
+			recog.base.set_state(96);
 			recog.err_handler.sync(&mut recog.base)?;
 			_la = recog.base.input.la(1);
-			if _la==TraceQLParser_DOT || ((((_la - 33)) & !0x3f) == 0 && ((1usize << (_la - 33)) & 65503) != 0) {
+			if _la==TraceQLParser_DOT || ((((_la - 32)) & !0x3f) == 0 && ((1usize << (_la - 32)) & 65503) != 0) {
 				{
 				/*InvokeRule fieldRef*/
-				recog.base.set_state(83);
+				recog.base.set_state(95);
 				recog.fieldRef()?;
 
 				}
 			}
 
-			recog.base.set_state(86);
+			recog.base.set_state(100);
+			recog.err_handler.sync(&mut recog.base)?;
+			_la = recog.base.input.la(1);
+			if _la==TraceQLParser_COMMA {
+				{
+				recog.base.set_state(98);
+				recog.base.match_token(TraceQLParser_COMMA,&mut recog.err_handler)?;
+
+				/*InvokeRule literal*/
+				recog.base.set_state(99);
+				recog.literal()?;
+
+				}
+			}
+
+			recog.base.set_state(102);
 			recog.base.match_token(TraceQLParser_RPAREN,&mut recog.err_handler)?;
 
 			/*InvokeRule comparisonOp*/
-			recog.base.set_state(87);
+			recog.base.set_state(103);
 			recog.comparisonOp()?;
 
 			/*InvokeRule literal*/
-			recog.base.set_state(88);
+			recog.base.set_state(104);
 			recog.literal()?;
 
 			}
@@ -1330,9 +1369,9 @@ where
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(90);
+			recog.base.set_state(106);
 			_la = recog.base.input.la(1);
-			if { !(((((_la - 57)) & !0x3f) == 0 && ((1usize << (_la - 57)) & 63) != 0)) } {
+			if { !(((((_la - 56)) & !0x3f) == 0 && ((1usize << (_la - 56)) & 63) != 0)) } {
 				recog.err_handler.recover_inline(&mut recog.base)?;
 
 			}
@@ -1457,7 +1496,7 @@ where
         let mut _localctx: Rc<MetricsFunctionContextAll> = _localctx;
 		let result: Result<(), ANTLRError> = (|| {
 
-			recog.base.set_state(103);
+			recog.base.set_state(119);
 			recog.err_handler.sync(&mut recog.base)?;
 			match recog.base.input.la(1) {
 			TraceQLParser_FN_RATE 
@@ -1465,13 +1504,13 @@ where
 					//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 					recog.base.enter_outer_alt(None, 1)?;
 					{
-					recog.base.set_state(92);
+					recog.base.set_state(108);
 					recog.base.match_token(TraceQLParser_FN_RATE,&mut recog.err_handler)?;
 
-					recog.base.set_state(93);
+					recog.base.set_state(109);
 					recog.base.match_token(TraceQLParser_LPAREN,&mut recog.err_handler)?;
 
-					recog.base.set_state(94);
+					recog.base.set_state(110);
 					recog.base.match_token(TraceQLParser_RPAREN,&mut recog.err_handler)?;
 
 					}
@@ -1482,13 +1521,13 @@ where
 					//recog.base.enter_outer_alt(_localctx.clone(), 2)?;
 					recog.base.enter_outer_alt(None, 2)?;
 					{
-					recog.base.set_state(95);
+					recog.base.set_state(111);
 					recog.base.match_token(TraceQLParser_FN_COUNT_OVER_TIME,&mut recog.err_handler)?;
 
-					recog.base.set_state(96);
+					recog.base.set_state(112);
 					recog.base.match_token(TraceQLParser_LPAREN,&mut recog.err_handler)?;
 
-					recog.base.set_state(97);
+					recog.base.set_state(113);
 					recog.base.match_token(TraceQLParser_RPAREN,&mut recog.err_handler)?;
 
 					}
@@ -1499,17 +1538,17 @@ where
 					//recog.base.enter_outer_alt(_localctx.clone(), 3)?;
 					recog.base.enter_outer_alt(None, 3)?;
 					{
-					recog.base.set_state(98);
+					recog.base.set_state(114);
 					recog.base.match_token(TraceQLParser_FN_HISTOGRAM_OVER_TIME,&mut recog.err_handler)?;
 
-					recog.base.set_state(99);
+					recog.base.set_state(115);
 					recog.base.match_token(TraceQLParser_LPAREN,&mut recog.err_handler)?;
 
 					/*InvokeRule fieldRef*/
-					recog.base.set_state(100);
+					recog.base.set_state(116);
 					recog.fieldRef()?;
 
-					recog.base.set_state(101);
+					recog.base.set_state(117);
 					recog.base.match_token(TraceQLParser_RPAREN,&mut recog.err_handler)?;
 
 					}
@@ -1534,39 +1573,7 @@ where
 	}
 }
 //------------------- spansetExpr ----------------
-#[derive(Debug)]
-pub enum SpansetExprContextAll<'input>{
-	SpansetParenContext(SpansetParenContext<'input>),
-	SpansetLeafContext(SpansetLeafContext<'input>),
-	SpansetBinaryContext(SpansetBinaryContext<'input>),
-Error(SpansetExprContext<'input>)
-}
-antlr4rust::tid!{SpansetExprContextAll<'a>}
-
-impl<'input> antlr4rust::parser_rule_context::DerefSeal for SpansetExprContextAll<'input>{}
-
-impl<'input> TraceQLParserContext<'input> for SpansetExprContextAll<'input>{}
-
-impl<'input> Deref for SpansetExprContextAll<'input>{
-	type Target = dyn SpansetExprContextAttrs<'input> + 'input;
-	fn deref(&self) -> &Self::Target{
-		use SpansetExprContextAll::*;
-		match self{
-			SpansetParenContext(inner) => inner,
-			SpansetLeafContext(inner) => inner,
-			SpansetBinaryContext(inner) => inner,
-Error(inner) => inner
-		}
-	}
-}
-impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetExprContextAll<'input>{
-	fn accept(&self, visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) { self.deref().accept(visitor) }
-}
-impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetExprContextAll<'input>{
-    fn enter(&self, listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> { self.deref().enter(listener) }
-    fn exit(&self, listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> { self.deref().exit(listener) }
-}
-
+pub type SpansetExprContextAll<'input> = SpansetExprContext<'input>;
 
 
 pub type SpansetExprContext<'input> = BaseParserRuleContext<'input,SpansetExprContextExt<'input>>;
@@ -1579,9 +1586,22 @@ ph:PhantomData<&'input str>
 impl<'input> TraceQLParserContext<'input> for SpansetExprContext<'input>{}
 
 impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetExprContext<'input>{
+		fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.enter_every_rule(self)?;
+			listener.enter_spansetExpr(self);
+			Ok(())
+		}
+		fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.exit_spansetExpr(self);
+			listener.exit_every_rule(self)?;
+			Ok(())
+		}
 }
 
 impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetExprContext<'input>{
+	fn accept(&self,visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) {
+		visitor.visit_spansetExpr(self);
+	}
 }
 
 impl<'input> CustomRuleContext<'input> for SpansetExprContextExt<'input>{
@@ -1595,283 +1615,552 @@ antlr4rust::tid!{SpansetExprContextExt<'a>}
 impl<'input> SpansetExprContextExt<'input>{
 	fn new(parent: Option<Rc<dyn TraceQLParserContext<'input> + 'input > >, invoking_state: i32) -> Rc<SpansetExprContextAll<'input>> {
 		Rc::new(
-		SpansetExprContextAll::Error(
 			BaseParserRuleContext::new_parser_ctx(parent, invoking_state,SpansetExprContextExt{
 
 				ph:PhantomData
 			}),
-		)
 		)
 	}
 }
 
 pub trait SpansetExprContextAttrs<'input>: TraceQLParserContext<'input> + BorrowMut<SpansetExprContextExt<'input>>{
 
+fn spansetOr(&self) -> Option<Rc<SpansetOrContextAll<'input>>> where Self:Sized{
+	self.child_of_type(0)
+}
 
 }
 
 impl<'input> SpansetExprContextAttrs<'input> for SpansetExprContext<'input>{}
 
-pub type SpansetParenContext<'input> = BaseParserRuleContext<'input,SpansetParenContextExt<'input>>;
+impl<'input, I> TraceQLParser<'input, I>
+where
+    I: TokenStream<'input, TF = LocalTokenFactory<'input> > + TidAble<'input>,
+{
+	pub fn spansetExpr(&mut self,)
+	-> Result<Rc<SpansetExprContextAll<'input>>,ANTLRError> {
+		let mut recog = self;
+		let _parentctx = recog.ctx.take();
+		let mut _localctx = SpansetExprContextExt::new(_parentctx.clone(), recog.base.get_state());
+        recog.base.enter_rule(_localctx.clone(), 16, RULE_spansetExpr);
+        let mut _localctx: Rc<SpansetExprContextAll> = _localctx;
+		let result: Result<(), ANTLRError> = (|| {
 
-pub trait SpansetParenContextAttrs<'input>: TraceQLParserContext<'input>{
-	/// Retrieves first TerminalNode corresponding to token LPAREN
-	/// Returns `None` if there is no child corresponding to token LPAREN
-	fn LPAREN(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
-		self.get_token(TraceQLParser_LPAREN, 0)
-	}
-	fn spansetExpr(&self) -> Option<Rc<SpansetExprContextAll<'input>>> where Self:Sized{
-		self.child_of_type(0)
-	}
-	/// Retrieves first TerminalNode corresponding to token RPAREN
-	/// Returns `None` if there is no child corresponding to token RPAREN
-	fn RPAREN(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
-		self.get_token(TraceQLParser_RPAREN, 0)
-	}
-}
+			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
+			recog.base.enter_outer_alt(None, 1)?;
+			{
+			/*InvokeRule spansetOr*/
+			recog.base.set_state(121);
+			recog.spansetOr()?;
 
-impl<'input> SpansetParenContextAttrs<'input> for SpansetParenContext<'input>{}
+			}
+			Ok(())
+		})();
+		match result {
+		Ok(_)=>{},
+        Err(e @ ANTLRError::FallThrough(_)) => return Err(e),
+		Err(ref re) => {
+				//_localctx.exception = re;
+				recog.err_handler.report_error(&mut recog.base, re);
+				recog.err_handler.recover(&mut recog.base, re)?;
+			}
+		}
+		recog.base.exit_rule()?;
 
-pub struct SpansetParenContextExt<'input>{
-	base:SpansetExprContextExt<'input>,
-	ph:PhantomData<&'input str>
-}
-
-antlr4rust::tid!{SpansetParenContextExt<'a>}
-
-impl<'input> TraceQLParserContext<'input> for SpansetParenContext<'input>{}
-
-impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetParenContext<'input>{
-	fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
-		listener.enter_every_rule(self)?;
-		listener.enter_SpansetParen(self);
-		Ok(())
-	}
-	fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
-		listener.exit_SpansetParen(self);
-		listener.exit_every_rule(self)?;
-		Ok(())
+		Ok(_localctx)
 	}
 }
+//------------------- spansetOr ----------------
+pub type SpansetOrContextAll<'input> = SpansetOrContext<'input>;
 
-impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetParenContext<'input>{
+
+pub type SpansetOrContext<'input> = BaseParserRuleContext<'input,SpansetOrContextExt<'input>>;
+
+#[derive(Clone)]
+pub struct SpansetOrContextExt<'input>{
+ph:PhantomData<&'input str>
+}
+
+impl<'input> TraceQLParserContext<'input> for SpansetOrContext<'input>{}
+
+impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetOrContext<'input>{
+		fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.enter_every_rule(self)?;
+			listener.enter_spansetOr(self);
+			Ok(())
+		}
+		fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.exit_spansetOr(self);
+			listener.exit_every_rule(self)?;
+			Ok(())
+		}
+}
+
+impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetOrContext<'input>{
 	fn accept(&self,visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) {
-		visitor.visit_SpansetParen(self);
+		visitor.visit_spansetOr(self);
 	}
 }
 
-impl<'input> CustomRuleContext<'input> for SpansetParenContextExt<'input>{
+impl<'input> CustomRuleContext<'input> for SpansetOrContextExt<'input>{
 	type TF = LocalTokenFactory<'input>;
 	type Ctx = TraceQLParserContextType;
-	fn get_rule_index(&self) -> usize { RULE_spansetExpr }
-	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetExpr }
+	fn get_rule_index(&self) -> usize { RULE_spansetOr }
+	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetOr }
 }
+antlr4rust::tid!{SpansetOrContextExt<'a>}
 
-impl<'input> Borrow<SpansetExprContextExt<'input>> for SpansetParenContext<'input>{
-	fn borrow(&self) -> &SpansetExprContextExt<'input> { &self.base }
-}
-impl<'input> BorrowMut<SpansetExprContextExt<'input>> for SpansetParenContext<'input>{
-	fn borrow_mut(&mut self) -> &mut SpansetExprContextExt<'input> { &mut self.base }
-}
-
-impl<'input> SpansetExprContextAttrs<'input> for SpansetParenContext<'input> {}
-
-impl<'input> SpansetParenContextExt<'input>{
-	fn new(ctx: &dyn SpansetExprContextAttrs<'input>) -> Rc<SpansetExprContextAll<'input>>  {
+impl<'input> SpansetOrContextExt<'input>{
+	fn new(parent: Option<Rc<dyn TraceQLParserContext<'input> + 'input > >, invoking_state: i32) -> Rc<SpansetOrContextAll<'input>> {
 		Rc::new(
-			SpansetExprContextAll::SpansetParenContext(
-				BaseParserRuleContext::copy_from(ctx,SpansetParenContextExt{
-        			base: ctx.borrow().clone(),
-        			ph:PhantomData
-				})
-			)
+			BaseParserRuleContext::new_parser_ctx(parent, invoking_state,SpansetOrContextExt{
+
+				ph:PhantomData
+			}),
 		)
 	}
 }
 
-pub type SpansetLeafContext<'input> = BaseParserRuleContext<'input,SpansetLeafContextExt<'input>>;
+pub trait SpansetOrContextAttrs<'input>: TraceQLParserContext<'input> + BorrowMut<SpansetOrContextExt<'input>>{
 
-pub trait SpansetLeafContextAttrs<'input>: TraceQLParserContext<'input>{
-	fn spanSelector(&self) -> Option<Rc<SpanSelectorContextAll<'input>>> where Self:Sized{
-		self.child_of_type(0)
-	}
+fn spansetAnd_all(&self) ->  Vec<Rc<SpansetAndContextAll<'input>>> where Self:Sized{
+	self.children_of_type()
+}
+fn spansetAnd(&self, i: usize) -> Option<Rc<SpansetAndContextAll<'input>>> where Self:Sized{
+	self.child_of_type(i)
+}
+/// Retrieves all `TerminalNode`s corresponding to token OR in current rule
+fn OR_all(&self) -> Vec<Rc<TerminalNode<'input,TraceQLParserContextType>>>  where Self:Sized{
+	self.children_of_type()
+}
+/// Retrieves 'i's TerminalNode corresponding to token OR, starting from 0.
+/// Returns `None` if number of children corresponding to token OR is less or equal than `i`.
+fn OR(&self, i: usize) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
+	self.get_token(TraceQLParser_OR, i)
 }
 
-impl<'input> SpansetLeafContextAttrs<'input> for SpansetLeafContext<'input>{}
-
-pub struct SpansetLeafContextExt<'input>{
-	base:SpansetExprContextExt<'input>,
-	ph:PhantomData<&'input str>
 }
 
-antlr4rust::tid!{SpansetLeafContextExt<'a>}
-
-impl<'input> TraceQLParserContext<'input> for SpansetLeafContext<'input>{}
-
-impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetLeafContext<'input>{
-	fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
-		listener.enter_every_rule(self)?;
-		listener.enter_SpansetLeaf(self);
-		Ok(())
-	}
-	fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
-		listener.exit_SpansetLeaf(self);
-		listener.exit_every_rule(self)?;
-		Ok(())
-	}
-}
-
-impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetLeafContext<'input>{
-	fn accept(&self,visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) {
-		visitor.visit_SpansetLeaf(self);
-	}
-}
-
-impl<'input> CustomRuleContext<'input> for SpansetLeafContextExt<'input>{
-	type TF = LocalTokenFactory<'input>;
-	type Ctx = TraceQLParserContextType;
-	fn get_rule_index(&self) -> usize { RULE_spansetExpr }
-	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetExpr }
-}
-
-impl<'input> Borrow<SpansetExprContextExt<'input>> for SpansetLeafContext<'input>{
-	fn borrow(&self) -> &SpansetExprContextExt<'input> { &self.base }
-}
-impl<'input> BorrowMut<SpansetExprContextExt<'input>> for SpansetLeafContext<'input>{
-	fn borrow_mut(&mut self) -> &mut SpansetExprContextExt<'input> { &mut self.base }
-}
-
-impl<'input> SpansetExprContextAttrs<'input> for SpansetLeafContext<'input> {}
-
-impl<'input> SpansetLeafContextExt<'input>{
-	fn new(ctx: &dyn SpansetExprContextAttrs<'input>) -> Rc<SpansetExprContextAll<'input>>  {
-		Rc::new(
-			SpansetExprContextAll::SpansetLeafContext(
-				BaseParserRuleContext::copy_from(ctx,SpansetLeafContextExt{
-        			base: ctx.borrow().clone(),
-        			ph:PhantomData
-				})
-			)
-		)
-	}
-}
-
-pub type SpansetBinaryContext<'input> = BaseParserRuleContext<'input,SpansetBinaryContextExt<'input>>;
-
-pub trait SpansetBinaryContextAttrs<'input>: TraceQLParserContext<'input>{
-	fn spansetExpr_all(&self) ->  Vec<Rc<SpansetExprContextAll<'input>>> where Self:Sized{
-		self.children_of_type()
-	}
-	fn spansetExpr(&self, i: usize) -> Option<Rc<SpansetExprContextAll<'input>>> where Self:Sized{
-		self.child_of_type(i)
-	}
-	fn spansetOp(&self) -> Option<Rc<SpansetOpContextAll<'input>>> where Self:Sized{
-		self.child_of_type(0)
-	}
-}
-
-impl<'input> SpansetBinaryContextAttrs<'input> for SpansetBinaryContext<'input>{}
-
-pub struct SpansetBinaryContextExt<'input>{
-	base:SpansetExprContextExt<'input>,
-	ph:PhantomData<&'input str>
-}
-
-antlr4rust::tid!{SpansetBinaryContextExt<'a>}
-
-impl<'input> TraceQLParserContext<'input> for SpansetBinaryContext<'input>{}
-
-impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetBinaryContext<'input>{
-	fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
-		listener.enter_every_rule(self)?;
-		listener.enter_SpansetBinary(self);
-		Ok(())
-	}
-	fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
-		listener.exit_SpansetBinary(self);
-		listener.exit_every_rule(self)?;
-		Ok(())
-	}
-}
-
-impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetBinaryContext<'input>{
-	fn accept(&self,visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) {
-		visitor.visit_SpansetBinary(self);
-	}
-}
-
-impl<'input> CustomRuleContext<'input> for SpansetBinaryContextExt<'input>{
-	type TF = LocalTokenFactory<'input>;
-	type Ctx = TraceQLParserContextType;
-	fn get_rule_index(&self) -> usize { RULE_spansetExpr }
-	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetExpr }
-}
-
-impl<'input> Borrow<SpansetExprContextExt<'input>> for SpansetBinaryContext<'input>{
-	fn borrow(&self) -> &SpansetExprContextExt<'input> { &self.base }
-}
-impl<'input> BorrowMut<SpansetExprContextExt<'input>> for SpansetBinaryContext<'input>{
-	fn borrow_mut(&mut self) -> &mut SpansetExprContextExt<'input> { &mut self.base }
-}
-
-impl<'input> SpansetExprContextAttrs<'input> for SpansetBinaryContext<'input> {}
-
-impl<'input> SpansetBinaryContextExt<'input>{
-	fn new(ctx: &dyn SpansetExprContextAttrs<'input>) -> Rc<SpansetExprContextAll<'input>>  {
-		Rc::new(
-			SpansetExprContextAll::SpansetBinaryContext(
-				BaseParserRuleContext::copy_from(ctx,SpansetBinaryContextExt{
-        			base: ctx.borrow().clone(),
-        			ph:PhantomData
-				})
-			)
-		)
-	}
-}
+impl<'input> SpansetOrContextAttrs<'input> for SpansetOrContext<'input>{}
 
 impl<'input, I> TraceQLParser<'input, I>
 where
     I: TokenStream<'input, TF = LocalTokenFactory<'input> > + TidAble<'input>,
 {
-	pub fn  spansetExpr(&mut self,)
-	-> Result<Rc<SpansetExprContextAll<'input>>,ANTLRError> {
-		self.spansetExpr_rec(0)
-	}
-
-	fn spansetExpr_rec(&mut self, _p: i32)
-	-> Result<Rc<SpansetExprContextAll<'input>>,ANTLRError> {
-		let recog = self;
+	pub fn spansetOr(&mut self,)
+	-> Result<Rc<SpansetOrContextAll<'input>>,ANTLRError> {
+		let mut recog = self;
 		let _parentctx = recog.ctx.take();
-		let _parentState = recog.base.get_state();
-		let mut _localctx = SpansetExprContextExt::new(_parentctx.clone(), recog.base.get_state());
-		recog.base.enter_recursion_rule(_localctx.clone(), 16, RULE_spansetExpr, _p);
-	    let mut _localctx: Rc<SpansetExprContextAll> = _localctx;
-        let mut _prevctx = _localctx.clone();
-		let _startState = 16;
+		let mut _localctx = SpansetOrContextExt::new(_parentctx.clone(), recog.base.get_state());
+        recog.base.enter_rule(_localctx.clone(), 18, RULE_spansetOr);
+        let mut _localctx: Rc<SpansetOrContextAll> = _localctx;
+		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
-			let mut _alt: i32;
+
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(111);
+			/*InvokeRule spansetAnd*/
+			recog.base.set_state(123);
+			recog.spansetAnd()?;
+
+			recog.base.set_state(128);
+			recog.err_handler.sync(&mut recog.base)?;
+			_la = recog.base.input.la(1);
+			while _la==TraceQLParser_OR {
+				{
+				{
+				recog.base.set_state(124);
+				recog.base.match_token(TraceQLParser_OR,&mut recog.err_handler)?;
+
+				/*InvokeRule spansetAnd*/
+				recog.base.set_state(125);
+				recog.spansetAnd()?;
+
+				}
+				}
+				recog.base.set_state(130);
+				recog.err_handler.sync(&mut recog.base)?;
+				_la = recog.base.input.la(1);
+			}
+			}
+			Ok(())
+		})();
+		match result {
+		Ok(_)=>{},
+        Err(e @ ANTLRError::FallThrough(_)) => return Err(e),
+		Err(ref re) => {
+				//_localctx.exception = re;
+				recog.err_handler.report_error(&mut recog.base, re);
+				recog.err_handler.recover(&mut recog.base, re)?;
+			}
+		}
+		recog.base.exit_rule()?;
+
+		Ok(_localctx)
+	}
+}
+//------------------- spansetAnd ----------------
+pub type SpansetAndContextAll<'input> = SpansetAndContext<'input>;
+
+
+pub type SpansetAndContext<'input> = BaseParserRuleContext<'input,SpansetAndContextExt<'input>>;
+
+#[derive(Clone)]
+pub struct SpansetAndContextExt<'input>{
+ph:PhantomData<&'input str>
+}
+
+impl<'input> TraceQLParserContext<'input> for SpansetAndContext<'input>{}
+
+impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetAndContext<'input>{
+		fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.enter_every_rule(self)?;
+			listener.enter_spansetAnd(self);
+			Ok(())
+		}
+		fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.exit_spansetAnd(self);
+			listener.exit_every_rule(self)?;
+			Ok(())
+		}
+}
+
+impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetAndContext<'input>{
+	fn accept(&self,visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) {
+		visitor.visit_spansetAnd(self);
+	}
+}
+
+impl<'input> CustomRuleContext<'input> for SpansetAndContextExt<'input>{
+	type TF = LocalTokenFactory<'input>;
+	type Ctx = TraceQLParserContextType;
+	fn get_rule_index(&self) -> usize { RULE_spansetAnd }
+	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetAnd }
+}
+antlr4rust::tid!{SpansetAndContextExt<'a>}
+
+impl<'input> SpansetAndContextExt<'input>{
+	fn new(parent: Option<Rc<dyn TraceQLParserContext<'input> + 'input > >, invoking_state: i32) -> Rc<SpansetAndContextAll<'input>> {
+		Rc::new(
+			BaseParserRuleContext::new_parser_ctx(parent, invoking_state,SpansetAndContextExt{
+
+				ph:PhantomData
+			}),
+		)
+	}
+}
+
+pub trait SpansetAndContextAttrs<'input>: TraceQLParserContext<'input> + BorrowMut<SpansetAndContextExt<'input>>{
+
+fn spansetRel_all(&self) ->  Vec<Rc<SpansetRelContextAll<'input>>> where Self:Sized{
+	self.children_of_type()
+}
+fn spansetRel(&self, i: usize) -> Option<Rc<SpansetRelContextAll<'input>>> where Self:Sized{
+	self.child_of_type(i)
+}
+/// Retrieves all `TerminalNode`s corresponding to token AND in current rule
+fn AND_all(&self) -> Vec<Rc<TerminalNode<'input,TraceQLParserContextType>>>  where Self:Sized{
+	self.children_of_type()
+}
+/// Retrieves 'i's TerminalNode corresponding to token AND, starting from 0.
+/// Returns `None` if number of children corresponding to token AND is less or equal than `i`.
+fn AND(&self, i: usize) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
+	self.get_token(TraceQLParser_AND, i)
+}
+
+}
+
+impl<'input> SpansetAndContextAttrs<'input> for SpansetAndContext<'input>{}
+
+impl<'input, I> TraceQLParser<'input, I>
+where
+    I: TokenStream<'input, TF = LocalTokenFactory<'input> > + TidAble<'input>,
+{
+	pub fn spansetAnd(&mut self,)
+	-> Result<Rc<SpansetAndContextAll<'input>>,ANTLRError> {
+		let mut recog = self;
+		let _parentctx = recog.ctx.take();
+		let mut _localctx = SpansetAndContextExt::new(_parentctx.clone(), recog.base.get_state());
+        recog.base.enter_rule(_localctx.clone(), 20, RULE_spansetAnd);
+        let mut _localctx: Rc<SpansetAndContextAll> = _localctx;
+		let mut _la: i32 = -1;
+		let result: Result<(), ANTLRError> = (|| {
+
+			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
+			recog.base.enter_outer_alt(None, 1)?;
+			{
+			/*InvokeRule spansetRel*/
+			recog.base.set_state(131);
+			recog.spansetRel()?;
+
+			recog.base.set_state(136);
+			recog.err_handler.sync(&mut recog.base)?;
+			_la = recog.base.input.la(1);
+			while _la==TraceQLParser_AND {
+				{
+				{
+				recog.base.set_state(132);
+				recog.base.match_token(TraceQLParser_AND,&mut recog.err_handler)?;
+
+				/*InvokeRule spansetRel*/
+				recog.base.set_state(133);
+				recog.spansetRel()?;
+
+				}
+				}
+				recog.base.set_state(138);
+				recog.err_handler.sync(&mut recog.base)?;
+				_la = recog.base.input.la(1);
+			}
+			}
+			Ok(())
+		})();
+		match result {
+		Ok(_)=>{},
+        Err(e @ ANTLRError::FallThrough(_)) => return Err(e),
+		Err(ref re) => {
+				//_localctx.exception = re;
+				recog.err_handler.report_error(&mut recog.base, re);
+				recog.err_handler.recover(&mut recog.base, re)?;
+			}
+		}
+		recog.base.exit_rule()?;
+
+		Ok(_localctx)
+	}
+}
+//------------------- spansetRel ----------------
+pub type SpansetRelContextAll<'input> = SpansetRelContext<'input>;
+
+
+pub type SpansetRelContext<'input> = BaseParserRuleContext<'input,SpansetRelContextExt<'input>>;
+
+#[derive(Clone)]
+pub struct SpansetRelContextExt<'input>{
+ph:PhantomData<&'input str>
+}
+
+impl<'input> TraceQLParserContext<'input> for SpansetRelContext<'input>{}
+
+impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetRelContext<'input>{
+		fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.enter_every_rule(self)?;
+			listener.enter_spansetRel(self);
+			Ok(())
+		}
+		fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.exit_spansetRel(self);
+			listener.exit_every_rule(self)?;
+			Ok(())
+		}
+}
+
+impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetRelContext<'input>{
+	fn accept(&self,visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) {
+		visitor.visit_spansetRel(self);
+	}
+}
+
+impl<'input> CustomRuleContext<'input> for SpansetRelContextExt<'input>{
+	type TF = LocalTokenFactory<'input>;
+	type Ctx = TraceQLParserContextType;
+	fn get_rule_index(&self) -> usize { RULE_spansetRel }
+	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetRel }
+}
+antlr4rust::tid!{SpansetRelContextExt<'a>}
+
+impl<'input> SpansetRelContextExt<'input>{
+	fn new(parent: Option<Rc<dyn TraceQLParserContext<'input> + 'input > >, invoking_state: i32) -> Rc<SpansetRelContextAll<'input>> {
+		Rc::new(
+			BaseParserRuleContext::new_parser_ctx(parent, invoking_state,SpansetRelContextExt{
+
+				ph:PhantomData
+			}),
+		)
+	}
+}
+
+pub trait SpansetRelContextAttrs<'input>: TraceQLParserContext<'input> + BorrowMut<SpansetRelContextExt<'input>>{
+
+fn spansetPrimary_all(&self) ->  Vec<Rc<SpansetPrimaryContextAll<'input>>> where Self:Sized{
+	self.children_of_type()
+}
+fn spansetPrimary(&self, i: usize) -> Option<Rc<SpansetPrimaryContextAll<'input>>> where Self:Sized{
+	self.child_of_type(i)
+}
+fn spansetRelOp_all(&self) ->  Vec<Rc<SpansetRelOpContextAll<'input>>> where Self:Sized{
+	self.children_of_type()
+}
+fn spansetRelOp(&self, i: usize) -> Option<Rc<SpansetRelOpContextAll<'input>>> where Self:Sized{
+	self.child_of_type(i)
+}
+
+}
+
+impl<'input> SpansetRelContextAttrs<'input> for SpansetRelContext<'input>{}
+
+impl<'input, I> TraceQLParser<'input, I>
+where
+    I: TokenStream<'input, TF = LocalTokenFactory<'input> > + TidAble<'input>,
+{
+	pub fn spansetRel(&mut self,)
+	-> Result<Rc<SpansetRelContextAll<'input>>,ANTLRError> {
+		let mut recog = self;
+		let _parentctx = recog.ctx.take();
+		let mut _localctx = SpansetRelContextExt::new(_parentctx.clone(), recog.base.get_state());
+        recog.base.enter_rule(_localctx.clone(), 22, RULE_spansetRel);
+        let mut _localctx: Rc<SpansetRelContextAll> = _localctx;
+		let mut _la: i32 = -1;
+		let result: Result<(), ANTLRError> = (|| {
+
+			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
+			recog.base.enter_outer_alt(None, 1)?;
+			{
+			/*InvokeRule spansetPrimary*/
+			recog.base.set_state(139);
+			recog.spansetPrimary()?;
+
+			recog.base.set_state(145);
+			recog.err_handler.sync(&mut recog.base)?;
+			_la = recog.base.input.la(1);
+			while (((_la) & !0x3f) == 0 && ((1usize << _la) & 16745472) != 0) {
+				{
+				{
+				/*InvokeRule spansetRelOp*/
+				recog.base.set_state(140);
+				recog.spansetRelOp()?;
+
+				/*InvokeRule spansetPrimary*/
+				recog.base.set_state(141);
+				recog.spansetPrimary()?;
+
+				}
+				}
+				recog.base.set_state(147);
+				recog.err_handler.sync(&mut recog.base)?;
+				_la = recog.base.input.la(1);
+			}
+			}
+			Ok(())
+		})();
+		match result {
+		Ok(_)=>{},
+        Err(e @ ANTLRError::FallThrough(_)) => return Err(e),
+		Err(ref re) => {
+				//_localctx.exception = re;
+				recog.err_handler.report_error(&mut recog.base, re);
+				recog.err_handler.recover(&mut recog.base, re)?;
+			}
+		}
+		recog.base.exit_rule()?;
+
+		Ok(_localctx)
+	}
+}
+//------------------- spansetPrimary ----------------
+pub type SpansetPrimaryContextAll<'input> = SpansetPrimaryContext<'input>;
+
+
+pub type SpansetPrimaryContext<'input> = BaseParserRuleContext<'input,SpansetPrimaryContextExt<'input>>;
+
+#[derive(Clone)]
+pub struct SpansetPrimaryContextExt<'input>{
+ph:PhantomData<&'input str>
+}
+
+impl<'input> TraceQLParserContext<'input> for SpansetPrimaryContext<'input>{}
+
+impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetPrimaryContext<'input>{
+		fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.enter_every_rule(self)?;
+			listener.enter_spansetPrimary(self);
+			Ok(())
+		}
+		fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
+			listener.exit_spansetPrimary(self);
+			listener.exit_every_rule(self)?;
+			Ok(())
+		}
+}
+
+impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetPrimaryContext<'input>{
+	fn accept(&self,visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) {
+		visitor.visit_spansetPrimary(self);
+	}
+}
+
+impl<'input> CustomRuleContext<'input> for SpansetPrimaryContextExt<'input>{
+	type TF = LocalTokenFactory<'input>;
+	type Ctx = TraceQLParserContextType;
+	fn get_rule_index(&self) -> usize { RULE_spansetPrimary }
+	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetPrimary }
+}
+antlr4rust::tid!{SpansetPrimaryContextExt<'a>}
+
+impl<'input> SpansetPrimaryContextExt<'input>{
+	fn new(parent: Option<Rc<dyn TraceQLParserContext<'input> + 'input > >, invoking_state: i32) -> Rc<SpansetPrimaryContextAll<'input>> {
+		Rc::new(
+			BaseParserRuleContext::new_parser_ctx(parent, invoking_state,SpansetPrimaryContextExt{
+
+				ph:PhantomData
+			}),
+		)
+	}
+}
+
+pub trait SpansetPrimaryContextAttrs<'input>: TraceQLParserContext<'input> + BorrowMut<SpansetPrimaryContextExt<'input>>{
+
+/// Retrieves first TerminalNode corresponding to token LPAREN
+/// Returns `None` if there is no child corresponding to token LPAREN
+fn LPAREN(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
+	self.get_token(TraceQLParser_LPAREN, 0)
+}
+fn spansetExpr(&self) -> Option<Rc<SpansetExprContextAll<'input>>> where Self:Sized{
+	self.child_of_type(0)
+}
+/// Retrieves first TerminalNode corresponding to token RPAREN
+/// Returns `None` if there is no child corresponding to token RPAREN
+fn RPAREN(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
+	self.get_token(TraceQLParser_RPAREN, 0)
+}
+fn spanSelector(&self) -> Option<Rc<SpanSelectorContextAll<'input>>> where Self:Sized{
+	self.child_of_type(0)
+}
+
+}
+
+impl<'input> SpansetPrimaryContextAttrs<'input> for SpansetPrimaryContext<'input>{}
+
+impl<'input, I> TraceQLParser<'input, I>
+where
+    I: TokenStream<'input, TF = LocalTokenFactory<'input> > + TidAble<'input>,
+{
+	pub fn spansetPrimary(&mut self,)
+	-> Result<Rc<SpansetPrimaryContextAll<'input>>,ANTLRError> {
+		let mut recog = self;
+		let _parentctx = recog.ctx.take();
+		let mut _localctx = SpansetPrimaryContextExt::new(_parentctx.clone(), recog.base.get_state());
+        recog.base.enter_rule(_localctx.clone(), 24, RULE_spansetPrimary);
+        let mut _localctx: Rc<SpansetPrimaryContextAll> = _localctx;
+		let result: Result<(), ANTLRError> = (|| {
+
+			recog.base.set_state(153);
 			recog.err_handler.sync(&mut recog.base)?;
 			match recog.base.input.la(1) {
 			TraceQLParser_LPAREN 
 				=> {
+					//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
+					recog.base.enter_outer_alt(None, 1)?;
 					{
-					let mut tmp = SpansetParenContextExt::new(&**_localctx);
-					recog.ctx = Some(tmp.clone());
-					_localctx = tmp;
-					_prevctx = _localctx.clone();
-
-					recog.base.set_state(106);
+					recog.base.set_state(148);
 					recog.base.match_token(TraceQLParser_LPAREN,&mut recog.err_handler)?;
 
 					/*InvokeRule spansetExpr*/
-					recog.base.set_state(107);
-					recog.spansetExpr_rec(0)?;
+					recog.base.set_state(149);
+					recog.spansetExpr()?;
 
-					recog.base.set_state(108);
+					recog.base.set_state(150);
 					recog.base.match_token(TraceQLParser_RPAREN,&mut recog.err_handler)?;
 
 					}
@@ -1879,13 +2168,11 @@ where
 
 			TraceQLParser_LBRACE 
 				=> {
+					//recog.base.enter_outer_alt(_localctx.clone(), 2)?;
+					recog.base.enter_outer_alt(None, 2)?;
 					{
-					let mut tmp = SpansetLeafContextExt::new(&**_localctx);
-					recog.ctx = Some(tmp.clone());
-					_localctx = tmp;
-					_prevctx = _localctx.clone();
 					/*InvokeRule spanSelector*/
-					recog.base.set_state(110);
+					recog.base.set_state(152);
 					recog.spanSelector()?;
 
 					}
@@ -1893,101 +2180,66 @@ where
 
 				_ => Err(ANTLRError::NoAltError(NoViableAltError::new(&mut recog.base)))?
 			}
-			let tmp = recog.input.lt(-1).cloned();
-			recog.ctx.as_ref().unwrap().set_stop(tmp);
-			recog.base.set_state(119);
-			recog.err_handler.sync(&mut recog.base)?;
-			_alt = recog.interpreter.adaptive_predict(9,&mut recog.base)?;
-			while { _alt!=2 && _alt!=INVALID_ALT } {
-				if _alt==1 {
-					recog.trigger_exit_rule_event()?;
-					_prevctx = _localctx.clone();
-					{
-					{
-					/*recRuleLabeledAltStartAction*/
-					let mut tmp = SpansetBinaryContextExt::new(&**SpansetExprContextExt::new(_parentctx.clone(), _parentState));
-					recog.push_new_recursion_context(tmp.clone(), _startState, RULE_spansetExpr)?;
-					_localctx = tmp;
-					recog.base.set_state(113);
-					if !({let _localctx = Some(_localctx.clone());
-					recog.precpred(None, 3)}) {
-						Err(FailedPredicateError::new(&mut recog.base, Some("recog.precpred(None, 3)".to_owned()), None))?;
-					}
-					/*InvokeRule spansetOp*/
-					recog.base.set_state(114);
-					recog.spansetOp()?;
-
-					/*InvokeRule spansetExpr*/
-					recog.base.set_state(115);
-					recog.spansetExpr_rec(4)?;
-
-					}
-					} 
-				}
-				recog.base.set_state(121);
-				recog.err_handler.sync(&mut recog.base)?;
-				_alt = recog.interpreter.adaptive_predict(9,&mut recog.base)?;
-			}
-			}
 			Ok(())
 		})();
 		match result {
-		Ok(_) => {},
+		Ok(_)=>{},
         Err(e @ ANTLRError::FallThrough(_)) => return Err(e),
-		Err(ref re)=>{
-			//_localctx.exception = re;
-			recog.err_handler.report_error(&mut recog.base, re);
-	        recog.err_handler.recover(&mut recog.base, re)?;}
+		Err(ref re) => {
+				//_localctx.exception = re;
+				recog.err_handler.report_error(&mut recog.base, re);
+				recog.err_handler.recover(&mut recog.base, re)?;
+			}
 		}
-		recog.base.unroll_recursion_context(_parentctx)?;
+		recog.base.exit_rule()?;
 
 		Ok(_localctx)
 	}
 }
-//------------------- spansetOp ----------------
-pub type SpansetOpContextAll<'input> = SpansetOpContext<'input>;
+//------------------- spansetRelOp ----------------
+pub type SpansetRelOpContextAll<'input> = SpansetRelOpContext<'input>;
 
 
-pub type SpansetOpContext<'input> = BaseParserRuleContext<'input,SpansetOpContextExt<'input>>;
+pub type SpansetRelOpContext<'input> = BaseParserRuleContext<'input,SpansetRelOpContextExt<'input>>;
 
 #[derive(Clone)]
-pub struct SpansetOpContextExt<'input>{
+pub struct SpansetRelOpContextExt<'input>{
 ph:PhantomData<&'input str>
 }
 
-impl<'input> TraceQLParserContext<'input> for SpansetOpContext<'input>{}
+impl<'input> TraceQLParserContext<'input> for SpansetRelOpContext<'input>{}
 
-impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetOpContext<'input>{
+impl<'input,'a> Listenable<dyn TraceQLParserListener<'input> + 'a> for SpansetRelOpContext<'input>{
 		fn enter(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
 			listener.enter_every_rule(self)?;
-			listener.enter_spansetOp(self);
+			listener.enter_spansetRelOp(self);
 			Ok(())
 		}
 		fn exit(&self,listener: &mut (dyn TraceQLParserListener<'input> + 'a)) -> Result<(), ANTLRError> {
-			listener.exit_spansetOp(self);
+			listener.exit_spansetRelOp(self);
 			listener.exit_every_rule(self)?;
 			Ok(())
 		}
 }
 
-impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetOpContext<'input>{
+impl<'input,'a> Visitable<dyn TraceQLParserVisitor<'input> + 'a> for SpansetRelOpContext<'input>{
 	fn accept(&self,visitor: &mut (dyn TraceQLParserVisitor<'input> + 'a)) {
-		visitor.visit_spansetOp(self);
+		visitor.visit_spansetRelOp(self);
 	}
 }
 
-impl<'input> CustomRuleContext<'input> for SpansetOpContextExt<'input>{
+impl<'input> CustomRuleContext<'input> for SpansetRelOpContextExt<'input>{
 	type TF = LocalTokenFactory<'input>;
 	type Ctx = TraceQLParserContextType;
-	fn get_rule_index(&self) -> usize { RULE_spansetOp }
-	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetOp }
+	fn get_rule_index(&self) -> usize { RULE_spansetRelOp }
+	//fn type_rule_index() -> usize where Self: Sized { RULE_spansetRelOp }
 }
-antlr4rust::tid!{SpansetOpContextExt<'a>}
+antlr4rust::tid!{SpansetRelOpContextExt<'a>}
 
-impl<'input> SpansetOpContextExt<'input>{
-	fn new(parent: Option<Rc<dyn TraceQLParserContext<'input> + 'input > >, invoking_state: i32) -> Rc<SpansetOpContextAll<'input>> {
+impl<'input> SpansetRelOpContextExt<'input>{
+	fn new(parent: Option<Rc<dyn TraceQLParserContext<'input> + 'input > >, invoking_state: i32) -> Rc<SpansetRelOpContextAll<'input>> {
 		Rc::new(
-			BaseParserRuleContext::new_parser_ctx(parent, invoking_state,SpansetOpContextExt{
+			BaseParserRuleContext::new_parser_ctx(parent, invoking_state,SpansetRelOpContextExt{
 
 				ph:PhantomData
 			}),
@@ -1995,18 +2247,8 @@ impl<'input> SpansetOpContextExt<'input>{
 	}
 }
 
-pub trait SpansetOpContextAttrs<'input>: TraceQLParserContext<'input> + BorrowMut<SpansetOpContextExt<'input>>{
+pub trait SpansetRelOpContextAttrs<'input>: TraceQLParserContext<'input> + BorrowMut<SpansetRelOpContextExt<'input>>{
 
-/// Retrieves first TerminalNode corresponding to token AND
-/// Returns `None` if there is no child corresponding to token AND
-fn AND(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
-	self.get_token(TraceQLParser_AND, 0)
-}
-/// Retrieves first TerminalNode corresponding to token OR
-/// Returns `None` if there is no child corresponding to token OR
-fn OR(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
-	self.get_token(TraceQLParser_OR, 0)
-}
 /// Retrieves first TerminalNode corresponding to token DESC
 /// Returns `None` if there is no child corresponding to token DESC
 fn DESC(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
@@ -2052,36 +2294,36 @@ fn NOT_ANC(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> w
 fn NOT_PARENT(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
 	self.get_token(TraceQLParser_NOT_PARENT, 0)
 }
-/// Retrieves first TerminalNode corresponding to token NOT_SIBLING
-/// Returns `None` if there is no child corresponding to token NOT_SIBLING
-fn NOT_SIBLING(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
-	self.get_token(TraceQLParser_NOT_SIBLING, 0)
+/// Retrieves first TerminalNode corresponding to token NEQ_RE
+/// Returns `None` if there is no child corresponding to token NEQ_RE
+fn NEQ_RE(&self) -> Option<Rc<TerminalNode<'input,TraceQLParserContextType>>> where Self:Sized{
+	self.get_token(TraceQLParser_NEQ_RE, 0)
 }
 
 }
 
-impl<'input> SpansetOpContextAttrs<'input> for SpansetOpContext<'input>{}
+impl<'input> SpansetRelOpContextAttrs<'input> for SpansetRelOpContext<'input>{}
 
 impl<'input, I> TraceQLParser<'input, I>
 where
     I: TokenStream<'input, TF = LocalTokenFactory<'input> > + TidAble<'input>,
 {
-	pub fn spansetOp(&mut self,)
-	-> Result<Rc<SpansetOpContextAll<'input>>,ANTLRError> {
+	pub fn spansetRelOp(&mut self,)
+	-> Result<Rc<SpansetRelOpContextAll<'input>>,ANTLRError> {
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
-		let mut _localctx = SpansetOpContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 18, RULE_spansetOp);
-        let mut _localctx: Rc<SpansetOpContextAll> = _localctx;
+		let mut _localctx = SpansetRelOpContextExt::new(_parentctx.clone(), recog.base.get_state());
+        recog.base.enter_rule(_localctx.clone(), 26, RULE_spansetRelOp);
+        let mut _localctx: Rc<SpansetRelOpContextAll> = _localctx;
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
 
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(122);
+			recog.base.set_state(155);
 			_la = recog.base.input.la(1);
-			if { !((((_la) & !0x3f) == 0 && ((1usize << _la) & 134184960) != 0)) } {
+			if { !((((_la) & !0x3f) == 0 && ((1usize << _la) & 16745472) != 0)) } {
 				recog.err_handler.recover_inline(&mut recog.base)?;
 
 			}
@@ -2187,7 +2429,7 @@ where
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
 		let mut _localctx = SpanSelectorContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 20, RULE_spanSelector);
+        recog.base.enter_rule(_localctx.clone(), 28, RULE_spanSelector);
         let mut _localctx: Rc<SpanSelectorContextAll> = _localctx;
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
@@ -2195,22 +2437,22 @@ where
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(124);
+			recog.base.set_state(157);
 			recog.base.match_token(TraceQLParser_LBRACE,&mut recog.err_handler)?;
 
-			recog.base.set_state(126);
+			recog.base.set_state(159);
 			recog.err_handler.sync(&mut recog.base)?;
 			_la = recog.base.input.la(1);
-			if (((_la) & !0x3f) == 0 && ((1usize << _la) & 134217800) != 0) || ((((_la - 33)) & !0x3f) == 0 && ((1usize << (_la - 33)) & 65503) != 0) {
+			if (((_la) & !0x3f) == 0 && ((1usize << _la) & 67108936) != 0) || ((((_la - 32)) & !0x3f) == 0 && ((1usize << (_la - 32)) & 65503) != 0) {
 				{
 				/*InvokeRule spanFilter*/
-				recog.base.set_state(125);
+				recog.base.set_state(158);
 				recog.spanFilter_rec(0)?;
 
 				}
 			}
 
-			recog.base.set_state(128);
+			recog.base.set_state(161);
 			recog.base.match_token(TraceQLParser_RBRACE,&mut recog.err_handler)?;
 
 			}
@@ -2700,16 +2942,16 @@ where
 		let _parentctx = recog.ctx.take();
 		let _parentState = recog.base.get_state();
 		let mut _localctx = SpanFilterContextExt::new(_parentctx.clone(), recog.base.get_state());
-		recog.base.enter_recursion_rule(_localctx.clone(), 22, RULE_spanFilter, _p);
+		recog.base.enter_recursion_rule(_localctx.clone(), 30, RULE_spanFilter, _p);
 	    let mut _localctx: Rc<SpanFilterContextAll> = _localctx;
         let mut _prevctx = _localctx.clone();
-		let _startState = 22;
+		let _startState = 30;
 		let result: Result<(), ANTLRError> = (|| {
 			let mut _alt: i32;
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(141);
+			recog.base.set_state(174);
 			recog.err_handler.sync(&mut recog.base)?;
 			match recog.base.input.la(1) {
 			TraceQLParser_NOT 
@@ -2720,11 +2962,11 @@ where
 					_localctx = tmp;
 					_prevctx = _localctx.clone();
 
-					recog.base.set_state(131);
+					recog.base.set_state(164);
 					recog.base.match_token(TraceQLParser_NOT,&mut recog.err_handler)?;
 
 					/*InvokeRule spanFilter*/
-					recog.base.set_state(132);
+					recog.base.set_state(165);
 					recog.spanFilter_rec(5)?;
 
 					}
@@ -2737,14 +2979,14 @@ where
 					recog.ctx = Some(tmp.clone());
 					_localctx = tmp;
 					_prevctx = _localctx.clone();
-					recog.base.set_state(133);
+					recog.base.set_state(166);
 					recog.base.match_token(TraceQLParser_LPAREN,&mut recog.err_handler)?;
 
 					/*InvokeRule spanFilter*/
-					recog.base.set_state(134);
+					recog.base.set_state(167);
 					recog.spanFilter_rec(0)?;
 
-					recog.base.set_state(135);
+					recog.base.set_state(168);
 					recog.base.match_token(TraceQLParser_RPAREN,&mut recog.err_handler)?;
 
 					}
@@ -2763,15 +3005,15 @@ where
 					_localctx = tmp;
 					_prevctx = _localctx.clone();
 					/*InvokeRule fieldRef*/
-					recog.base.set_state(137);
+					recog.base.set_state(170);
 					recog.fieldRef()?;
 
 					/*InvokeRule comparisonOp*/
-					recog.base.set_state(138);
+					recog.base.set_state(171);
 					recog.comparisonOp()?;
 
 					/*InvokeRule literal*/
-					recog.base.set_state(139);
+					recog.base.set_state(172);
 					recog.literal()?;
 
 					}
@@ -2781,33 +3023,33 @@ where
 			}
 			let tmp = recog.input.lt(-1).cloned();
 			recog.ctx.as_ref().unwrap().set_stop(tmp);
-			recog.base.set_state(151);
+			recog.base.set_state(184);
 			recog.err_handler.sync(&mut recog.base)?;
-			_alt = recog.interpreter.adaptive_predict(13,&mut recog.base)?;
+			_alt = recog.interpreter.adaptive_predict(17,&mut recog.base)?;
 			while { _alt!=2 && _alt!=INVALID_ALT } {
 				if _alt==1 {
 					recog.trigger_exit_rule_event()?;
 					_prevctx = _localctx.clone();
 					{
-					recog.base.set_state(149);
+					recog.base.set_state(182);
 					recog.err_handler.sync(&mut recog.base)?;
-					match  recog.interpreter.adaptive_predict(12,&mut recog.base)? {
+					match  recog.interpreter.adaptive_predict(16,&mut recog.base)? {
 						1 =>{
 							{
 							/*recRuleLabeledAltStartAction*/
 							let mut tmp = FilterAndContextExt::new(&**SpanFilterContextExt::new(_parentctx.clone(), _parentState));
 							recog.push_new_recursion_context(tmp.clone(), _startState, RULE_spanFilter)?;
 							_localctx = tmp;
-							recog.base.set_state(143);
+							recog.base.set_state(176);
 							if !({let _localctx = Some(_localctx.clone());
 							recog.precpred(None, 3)}) {
 								Err(FailedPredicateError::new(&mut recog.base, Some("recog.precpred(None, 3)".to_owned()), None))?;
 							}
-							recog.base.set_state(144);
+							recog.base.set_state(177);
 							recog.base.match_token(TraceQLParser_AND,&mut recog.err_handler)?;
 
 							/*InvokeRule spanFilter*/
-							recog.base.set_state(145);
+							recog.base.set_state(178);
 							recog.spanFilter_rec(4)?;
 
 							}
@@ -2819,16 +3061,16 @@ where
 							let mut tmp = FilterOrContextExt::new(&**SpanFilterContextExt::new(_parentctx.clone(), _parentState));
 							recog.push_new_recursion_context(tmp.clone(), _startState, RULE_spanFilter)?;
 							_localctx = tmp;
-							recog.base.set_state(146);
+							recog.base.set_state(179);
 							if !({let _localctx = Some(_localctx.clone());
 							recog.precpred(None, 2)}) {
 								Err(FailedPredicateError::new(&mut recog.base, Some("recog.precpred(None, 2)".to_owned()), None))?;
 							}
-							recog.base.set_state(147);
+							recog.base.set_state(180);
 							recog.base.match_token(TraceQLParser_OR,&mut recog.err_handler)?;
 
 							/*InvokeRule spanFilter*/
-							recog.base.set_state(148);
+							recog.base.set_state(181);
 							recog.spanFilter_rec(3)?;
 
 							}
@@ -2838,9 +3080,9 @@ where
 					}
 					} 
 				}
-				recog.base.set_state(153);
+				recog.base.set_state(186);
 				recog.err_handler.sync(&mut recog.base)?;
-				_alt = recog.interpreter.adaptive_predict(13,&mut recog.base)?;
+				_alt = recog.interpreter.adaptive_predict(17,&mut recog.base)?;
 			}
 			}
 			Ok(())
@@ -2965,7 +3207,7 @@ where
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
 		let mut _localctx = ComparisonOpContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 24, RULE_comparisonOp);
+        recog.base.enter_rule(_localctx.clone(), 32, RULE_comparisonOp);
         let mut _localctx: Rc<ComparisonOpContextAll> = _localctx;
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
@@ -2973,7 +3215,7 @@ where
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(154);
+			recog.base.set_state(187);
 			_la = recog.base.input.la(1);
 			if { !((((_la) & !0x3f) == 0 && ((1usize << _la) & 130560) != 0)) } {
 				recog.err_handler.recover_inline(&mut recog.base)?;
@@ -3295,11 +3537,11 @@ where
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
 		let mut _localctx = FieldRefContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 26, RULE_fieldRef);
+        recog.base.enter_rule(_localctx.clone(), 34, RULE_fieldRef);
         let mut _localctx: Rc<FieldRefContextAll> = _localctx;
 		let result: Result<(), ANTLRError> = (|| {
 
-			recog.base.set_state(160);
+			recog.base.set_state(193);
 			recog.err_handler.sync(&mut recog.base)?;
 			match recog.base.input.la(1) {
 			TraceQLParser_INTR_NAME |TraceQLParser_INTR_STATUS |TraceQLParser_INTR_STATUS_MESSAGE |
@@ -3312,7 +3554,7 @@ where
 					_localctx = tmp;
 					{
 					/*InvokeRule intrinsic*/
-					recog.base.set_state(156);
+					recog.base.set_state(189);
 					recog.intrinsic()?;
 
 					}
@@ -3326,7 +3568,7 @@ where
 					_localctx = tmp;
 					{
 					/*InvokeRule scopedAttribute*/
-					recog.base.set_state(157);
+					recog.base.set_state(190);
 					recog.scopedAttribute()?;
 
 					}
@@ -3338,11 +3580,11 @@ where
 					recog.base.enter_outer_alt(Some(tmp.clone()), 3)?;
 					_localctx = tmp;
 					{
-					recog.base.set_state(158);
+					recog.base.set_state(191);
 					recog.base.match_token(TraceQLParser_DOT,&mut recog.err_handler)?;
 
 					/*InvokeRule identChain*/
-					recog.base.set_state(159);
+					recog.base.set_state(192);
 					recog.identChain()?;
 
 					}
@@ -3470,12 +3712,12 @@ where
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
 		let mut _localctx = ScopedAttributeContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 28, RULE_scopedAttribute);
+        recog.base.enter_rule(_localctx.clone(), 36, RULE_scopedAttribute);
         let mut _localctx: Rc<ScopedAttributeContextAll> = _localctx;
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
 
-			recog.base.set_state(179);
+			recog.base.set_state(212);
 			recog.err_handler.sync(&mut recog.base)?;
 			match recog.base.input.la(1) {
 			TraceQLParser_SCOPE_SPAN 
@@ -3483,14 +3725,14 @@ where
 					//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 					recog.base.enter_outer_alt(None, 1)?;
 					{
-					recog.base.set_state(162);
+					recog.base.set_state(195);
 					recog.base.match_token(TraceQLParser_SCOPE_SPAN,&mut recog.err_handler)?;
 
-					recog.base.set_state(163);
+					recog.base.set_state(196);
 					recog.base.match_token(TraceQLParser_DOT,&mut recog.err_handler)?;
 
 					/*InvokeRule identChain*/
-					recog.base.set_state(164);
+					recog.base.set_state(197);
 					recog.identChain()?;
 
 					}
@@ -3501,14 +3743,14 @@ where
 					//recog.base.enter_outer_alt(_localctx.clone(), 2)?;
 					recog.base.enter_outer_alt(None, 2)?;
 					{
-					recog.base.set_state(165);
+					recog.base.set_state(198);
 					recog.base.match_token(TraceQLParser_SCOPE_RESOURCE,&mut recog.err_handler)?;
 
-					recog.base.set_state(166);
+					recog.base.set_state(199);
 					recog.base.match_token(TraceQLParser_DOT,&mut recog.err_handler)?;
 
 					/*InvokeRule identChain*/
-					recog.base.set_state(167);
+					recog.base.set_state(200);
 					recog.identChain()?;
 
 					}
@@ -3519,14 +3761,14 @@ where
 					//recog.base.enter_outer_alt(_localctx.clone(), 3)?;
 					recog.base.enter_outer_alt(None, 3)?;
 					{
-					recog.base.set_state(168);
+					recog.base.set_state(201);
 					recog.base.match_token(TraceQLParser_SCOPE_EVENT,&mut recog.err_handler)?;
 
-					recog.base.set_state(169);
+					recog.base.set_state(202);
 					recog.base.match_token(TraceQLParser_DOT,&mut recog.err_handler)?;
 
 					/*InvokeRule identChain*/
-					recog.base.set_state(170);
+					recog.base.set_state(203);
 					recog.identChain()?;
 
 					}
@@ -3537,14 +3779,14 @@ where
 					//recog.base.enter_outer_alt(_localctx.clone(), 4)?;
 					recog.base.enter_outer_alt(None, 4)?;
 					{
-					recog.base.set_state(171);
+					recog.base.set_state(204);
 					recog.base.match_token(TraceQLParser_SCOPE_LINK,&mut recog.err_handler)?;
 
-					recog.base.set_state(172);
+					recog.base.set_state(205);
 					recog.base.match_token(TraceQLParser_DOT,&mut recog.err_handler)?;
 
 					/*InvokeRule identChain*/
-					recog.base.set_state(173);
+					recog.base.set_state(206);
 					recog.identChain()?;
 
 					}
@@ -3555,13 +3797,13 @@ where
 					//recog.base.enter_outer_alt(_localctx.clone(), 5)?;
 					recog.base.enter_outer_alt(None, 5)?;
 					{
-					recog.base.set_state(174);
+					recog.base.set_state(207);
 					recog.base.match_token(TraceQLParser_SCOPE_PARENT,&mut recog.err_handler)?;
 
-					recog.base.set_state(175);
+					recog.base.set_state(208);
 					recog.base.match_token(TraceQLParser_DOT,&mut recog.err_handler)?;
 
-					recog.base.set_state(176);
+					recog.base.set_state(209);
 					_la = recog.base.input.la(1);
 					if { !(_la==TraceQLParser_SCOPE_SPAN || _la==TraceQLParser_SCOPE_RESOURCE) } {
 						recog.err_handler.recover_inline(&mut recog.base)?;
@@ -3572,11 +3814,11 @@ where
 						recog.err_handler.report_match(&mut recog.base);
 						recog.base.consume(&mut recog.err_handler);
 					}
-					recog.base.set_state(177);
+					recog.base.set_state(210);
 					recog.base.match_token(TraceQLParser_DOT,&mut recog.err_handler)?;
 
 					/*InvokeRule identChain*/
-					recog.base.set_state(178);
+					recog.base.set_state(211);
 					recog.identChain()?;
 
 					}
@@ -3682,7 +3924,7 @@ where
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
 		let mut _localctx = IdentChainContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 30, RULE_identChain);
+        recog.base.enter_rule(_localctx.clone(), 38, RULE_identChain);
         let mut _localctx: Rc<IdentChainContextAll> = _localctx;
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
@@ -3691,25 +3933,25 @@ where
 			recog.base.enter_outer_alt(None, 1)?;
 			{
 			/*InvokeRule identPart*/
-			recog.base.set_state(181);
+			recog.base.set_state(214);
 			recog.identPart()?;
 
-			recog.base.set_state(186);
+			recog.base.set_state(219);
 			recog.err_handler.sync(&mut recog.base)?;
 			_la = recog.base.input.la(1);
 			while _la==TraceQLParser_DOT {
 				{
 				{
-				recog.base.set_state(182);
+				recog.base.set_state(215);
 				recog.base.match_token(TraceQLParser_DOT,&mut recog.err_handler)?;
 
 				/*InvokeRule identPart*/
-				recog.base.set_state(183);
+				recog.base.set_state(216);
 				recog.identPart()?;
 
 				}
 				}
-				recog.base.set_state(188);
+				recog.base.set_state(221);
 				recog.err_handler.sync(&mut recog.base)?;
 				_la = recog.base.input.la(1);
 			}
@@ -3987,7 +4229,7 @@ where
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
 		let mut _localctx = IdentPartContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 32, RULE_identPart);
+        recog.base.enter_rule(_localctx.clone(), 40, RULE_identPart);
         let mut _localctx: Rc<IdentPartContextAll> = _localctx;
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
@@ -3995,9 +4237,9 @@ where
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(189);
+			recog.base.set_state(222);
 			_la = recog.base.input.la(1);
-			if { !(((((_la - 33)) & !0x3f) == 0 && ((1usize << (_la - 33)) & 4294967295) != 0) || ((((_la - 65)) & !0x3f) == 0 && ((1usize << (_la - 65)) & 1055) != 0)) } {
+			if { !(((((_la - 32)) & !0x3f) == 0 && ((1usize << (_la - 32)) & 4294967295) != 0) || ((((_la - 64)) & !0x3f) == 0 && ((1usize << (_la - 64)) & 1055) != 0)) } {
 				recog.err_handler.recover_inline(&mut recog.base)?;
 
 			}
@@ -4140,7 +4382,7 @@ where
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
 		let mut _localctx = IntrinsicContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 34, RULE_intrinsic);
+        recog.base.enter_rule(_localctx.clone(), 42, RULE_intrinsic);
         let mut _localctx: Rc<IntrinsicContextAll> = _localctx;
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
@@ -4148,9 +4390,9 @@ where
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(191);
+			recog.base.set_state(224);
 			_la = recog.base.input.la(1);
-			if { !(((((_la - 39)) & !0x3f) == 0 && ((1usize << (_la - 39)) & 1023) != 0)) } {
+			if { !(((((_la - 38)) & !0x3f) == 0 && ((1usize << (_la - 38)) & 1023) != 0)) } {
 				recog.err_handler.recover_inline(&mut recog.base)?;
 
 			}
@@ -4328,7 +4570,7 @@ where
 		let mut recog = self;
 		let _parentctx = recog.ctx.take();
 		let mut _localctx = LiteralContextExt::new(_parentctx.clone(), recog.base.get_state());
-        recog.base.enter_rule(_localctx.clone(), 36, RULE_literal);
+        recog.base.enter_rule(_localctx.clone(), 44, RULE_literal);
         let mut _localctx: Rc<LiteralContextAll> = _localctx;
 		let mut _la: i32 = -1;
 		let result: Result<(), ANTLRError> = (|| {
@@ -4336,9 +4578,9 @@ where
 			//recog.base.enter_outer_alt(_localctx.clone(), 1)?;
 			recog.base.enter_outer_alt(None, 1)?;
 			{
-			recog.base.set_state(193);
+			recog.base.set_state(226);
 			_la = recog.base.input.la(1);
-			if { !(((((_la - 49)) & !0x3f) == 0 && ((1usize << (_la - 49)) & 133955839) != 0)) } {
+			if { !(((((_la - 48)) & !0x3f) == 0 && ((1usize << (_la - 48)) & 133955839) != 0)) } {
 				recog.err_handler.recover_inline(&mut recog.base)?;
 
 			}
@@ -4380,90 +4622,104 @@ where
         Arc::new(dfa)
     };
 	static ref _serializedATN: Vec<i32> = vec![
-		4, 1, 77, 196, 2, 0, 7, 0, 2, 1, 7, 1, 2, 2, 7, 2, 2, 3, 7, 3, 2, 4, 7, 
+		4, 1, 76, 229, 2, 0, 7, 0, 2, 1, 7, 1, 2, 2, 7, 2, 2, 3, 7, 3, 2, 4, 7, 
 		4, 2, 5, 7, 5, 2, 6, 7, 6, 2, 7, 7, 7, 2, 8, 7, 8, 2, 9, 7, 9, 2, 10, 
 		7, 10, 2, 11, 7, 11, 2, 12, 7, 12, 2, 13, 7, 13, 2, 14, 7, 14, 2, 15, 
-		7, 15, 2, 16, 7, 16, 2, 17, 7, 17, 2, 18, 7, 18, 1, 0, 1, 0, 1, 0, 1, 
-		0, 1, 0, 1, 0, 3, 0, 45, 8, 0, 1, 1, 1, 1, 1, 1, 4, 1, 50, 8, 1, 11, 1, 
-		12, 1, 51, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 3, 2, 59, 8, 2, 3, 2, 61, 8, 
-		2, 1, 3, 1, 3, 1, 3, 1, 3, 1, 3, 5, 3, 68, 8, 3, 10, 3, 12, 3, 71, 9, 
-		3, 1, 3, 1, 3, 1, 4, 1, 4, 1, 4, 3, 4, 78, 8, 4, 1, 4, 1, 4, 1, 5, 1, 
-		5, 1, 5, 3, 5, 85, 8, 5, 1, 5, 1, 5, 1, 5, 1, 5, 1, 6, 1, 6, 1, 7, 1, 
-		7, 1, 7, 1, 7, 1, 7, 1, 7, 1, 7, 1, 7, 1, 7, 1, 7, 1, 7, 3, 7, 104, 8, 
-		7, 1, 8, 1, 8, 1, 8, 1, 8, 1, 8, 1, 8, 3, 8, 112, 8, 8, 1, 8, 1, 8, 1, 
-		8, 1, 8, 5, 8, 118, 8, 8, 10, 8, 12, 8, 121, 9, 8, 1, 9, 1, 9, 1, 10, 
-		1, 10, 3, 10, 127, 8, 10, 1, 10, 1, 10, 1, 11, 1, 11, 1, 11, 1, 11, 1, 
-		11, 1, 11, 1, 11, 1, 11, 1, 11, 1, 11, 1, 11, 3, 11, 142, 8, 11, 1, 11, 
-		1, 11, 1, 11, 1, 11, 1, 11, 1, 11, 5, 11, 150, 8, 11, 10, 11, 12, 11, 
-		153, 9, 11, 1, 12, 1, 12, 1, 13, 1, 13, 1, 13, 1, 13, 3, 13, 161, 8, 13, 
-		1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 
-		1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 1, 14, 3, 14, 180, 8, 14, 1, 
-		15, 1, 15, 1, 15, 5, 15, 185, 8, 15, 10, 15, 12, 15, 188, 9, 15, 1, 16, 
-		1, 16, 1, 17, 1, 17, 1, 18, 1, 18, 1, 18, 0, 2, 16, 22, 19, 0, 2, 4, 6, 
-		8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 0, 7, 1, 0, 
-		57, 62, 1, 0, 15, 26, 1, 0, 9, 16, 1, 0, 33, 34, 2, 0, 33, 69, 75, 75, 
-		1, 0, 39, 48, 2, 0, 49, 56, 67, 75, 201, 0, 44, 1, 0, 0, 0, 2, 46, 1, 
-		0, 0, 0, 4, 60, 1, 0, 0, 0, 6, 62, 1, 0, 0, 0, 8, 74, 1, 0, 0, 0, 10, 
-		81, 1, 0, 0, 0, 12, 90, 1, 0, 0, 0, 14, 103, 1, 0, 0, 0, 16, 111, 1, 0, 
-		0, 0, 18, 122, 1, 0, 0, 0, 20, 124, 1, 0, 0, 0, 22, 141, 1, 0, 0, 0, 24, 
-		154, 1, 0, 0, 0, 26, 160, 1, 0, 0, 0, 28, 179, 1, 0, 0, 0, 30, 181, 1, 
-		0, 0, 0, 32, 189, 1, 0, 0, 0, 34, 191, 1, 0, 0, 0, 36, 193, 1, 0, 0, 0, 
-		38, 39, 3, 2, 1, 0, 39, 40, 5, 0, 0, 1, 40, 45, 1, 0, 0, 0, 41, 42, 3, 
-		16, 8, 0, 42, 43, 5, 0, 0, 1, 43, 45, 1, 0, 0, 0, 44, 38, 1, 0, 0, 0, 
-		44, 41, 1, 0, 0, 0, 45, 1, 1, 0, 0, 0, 46, 49, 3, 16, 8, 0, 47, 48, 5, 
-		8, 0, 0, 48, 50, 3, 4, 2, 0, 49, 47, 1, 0, 0, 0, 50, 51, 1, 0, 0, 0, 51, 
-		49, 1, 0, 0, 0, 51, 52, 1, 0, 0, 0, 52, 3, 1, 0, 0, 0, 53, 61, 3, 6, 3, 
-		0, 54, 61, 3, 10, 5, 0, 55, 61, 3, 8, 4, 0, 56, 58, 3, 14, 7, 0, 57, 59, 
-		3, 6, 3, 0, 58, 57, 1, 0, 0, 0, 58, 59, 1, 0, 0, 0, 59, 61, 1, 0, 0, 0, 
-		60, 53, 1, 0, 0, 0, 60, 54, 1, 0, 0, 0, 60, 55, 1, 0, 0, 0, 60, 56, 1, 
-		0, 0, 0, 61, 5, 1, 0, 0, 0, 62, 63, 5, 66, 0, 0, 63, 64, 5, 3, 0, 0, 64, 
-		69, 3, 26, 13, 0, 65, 66, 5, 5, 0, 0, 66, 68, 3, 26, 13, 0, 67, 65, 1, 
-		0, 0, 0, 68, 71, 1, 0, 0, 0, 69, 67, 1, 0, 0, 0, 69, 70, 1, 0, 0, 0, 70, 
-		72, 1, 0, 0, 0, 71, 69, 1, 0, 0, 0, 72, 73, 5, 4, 0, 0, 73, 7, 1, 0, 0, 
-		0, 74, 75, 3, 12, 6, 0, 75, 77, 5, 3, 0, 0, 76, 78, 3, 26, 13, 0, 77, 
-		76, 1, 0, 0, 0, 77, 78, 1, 0, 0, 0, 78, 79, 1, 0, 0, 0, 79, 80, 5, 4, 
-		0, 0, 80, 9, 1, 0, 0, 0, 81, 82, 3, 12, 6, 0, 82, 84, 5, 3, 0, 0, 83, 
-		85, 3, 26, 13, 0, 84, 83, 1, 0, 0, 0, 84, 85, 1, 0, 0, 0, 85, 86, 1, 0, 
-		0, 0, 86, 87, 5, 4, 0, 0, 87, 88, 3, 24, 12, 0, 88, 89, 3, 36, 18, 0, 
-		89, 11, 1, 0, 0, 0, 90, 91, 7, 0, 0, 0, 91, 13, 1, 0, 0, 0, 92, 93, 5, 
-		63, 0, 0, 93, 94, 5, 3, 0, 0, 94, 104, 5, 4, 0, 0, 95, 96, 5, 64, 0, 0, 
-		96, 97, 5, 3, 0, 0, 97, 104, 5, 4, 0, 0, 98, 99, 5, 65, 0, 0, 99, 100, 
-		5, 3, 0, 0, 100, 101, 3, 26, 13, 0, 101, 102, 5, 4, 0, 0, 102, 104, 1, 
-		0, 0, 0, 103, 92, 1, 0, 0, 0, 103, 95, 1, 0, 0, 0, 103, 98, 1, 0, 0, 0, 
-		104, 15, 1, 0, 0, 0, 105, 106, 6, 8, -1, 0, 106, 107, 5, 3, 0, 0, 107, 
-		108, 3, 16, 8, 0, 108, 109, 5, 4, 0, 0, 109, 112, 1, 0, 0, 0, 110, 112, 
-		3, 20, 10, 0, 111, 105, 1, 0, 0, 0, 111, 110, 1, 0, 0, 0, 112, 119, 1, 
-		0, 0, 0, 113, 114, 10, 3, 0, 0, 114, 115, 3, 18, 9, 0, 115, 116, 3, 16, 
-		8, 4, 116, 118, 1, 0, 0, 0, 117, 113, 1, 0, 0, 0, 118, 121, 1, 0, 0, 0, 
-		119, 117, 1, 0, 0, 0, 119, 120, 1, 0, 0, 0, 120, 17, 1, 0, 0, 0, 121, 
-		119, 1, 0, 0, 0, 122, 123, 7, 1, 0, 0, 123, 19, 1, 0, 0, 0, 124, 126, 
-		5, 1, 0, 0, 125, 127, 3, 22, 11, 0, 126, 125, 1, 0, 0, 0, 126, 127, 1, 
-		0, 0, 0, 127, 128, 1, 0, 0, 0, 128, 129, 5, 2, 0, 0, 129, 21, 1, 0, 0, 
-		0, 130, 131, 6, 11, -1, 0, 131, 132, 5, 27, 0, 0, 132, 142, 3, 22, 11, 
-		5, 133, 134, 5, 3, 0, 0, 134, 135, 3, 22, 11, 0, 135, 136, 5, 4, 0, 0, 
-		136, 142, 1, 0, 0, 0, 137, 138, 3, 26, 13, 0, 138, 139, 3, 24, 12, 0, 
-		139, 140, 3, 36, 18, 0, 140, 142, 1, 0, 0, 0, 141, 130, 1, 0, 0, 0, 141, 
-		133, 1, 0, 0, 0, 141, 137, 1, 0, 0, 0, 142, 151, 1, 0, 0, 0, 143, 144, 
-		10, 3, 0, 0, 144, 145, 5, 25, 0, 0, 145, 150, 3, 22, 11, 4, 146, 147, 
-		10, 2, 0, 0, 147, 148, 5, 26, 0, 0, 148, 150, 3, 22, 11, 3, 149, 143, 
-		1, 0, 0, 0, 149, 146, 1, 0, 0, 0, 150, 153, 1, 0, 0, 0, 151, 149, 1, 0, 
-		0, 0, 151, 152, 1, 0, 0, 0, 152, 23, 1, 0, 0, 0, 153, 151, 1, 0, 0, 0, 
-		154, 155, 7, 2, 0, 0, 155, 25, 1, 0, 0, 0, 156, 161, 3, 34, 17, 0, 157, 
-		161, 3, 28, 14, 0, 158, 159, 5, 6, 0, 0, 159, 161, 3, 30, 15, 0, 160, 
-		156, 1, 0, 0, 0, 160, 157, 1, 0, 0, 0, 160, 158, 1, 0, 0, 0, 161, 27, 
-		1, 0, 0, 0, 162, 163, 5, 33, 0, 0, 163, 164, 5, 6, 0, 0, 164, 180, 3, 
-		30, 15, 0, 165, 166, 5, 34, 0, 0, 166, 167, 5, 6, 0, 0, 167, 180, 3, 30, 
-		15, 0, 168, 169, 5, 35, 0, 0, 169, 170, 5, 6, 0, 0, 170, 180, 3, 30, 15, 
-		0, 171, 172, 5, 36, 0, 0, 172, 173, 5, 6, 0, 0, 173, 180, 3, 30, 15, 0, 
-		174, 175, 5, 37, 0, 0, 175, 176, 5, 6, 0, 0, 176, 177, 7, 3, 0, 0, 177, 
-		178, 5, 6, 0, 0, 178, 180, 3, 30, 15, 0, 179, 162, 1, 0, 0, 0, 179, 165, 
-		1, 0, 0, 0, 179, 168, 1, 0, 0, 0, 179, 171, 1, 0, 0, 0, 179, 174, 1, 0, 
-		0, 0, 180, 29, 1, 0, 0, 0, 181, 186, 3, 32, 16, 0, 182, 183, 5, 6, 0, 
-		0, 183, 185, 3, 32, 16, 0, 184, 182, 1, 0, 0, 0, 185, 188, 1, 0, 0, 0, 
-		186, 184, 1, 0, 0, 0, 186, 187, 1, 0, 0, 0, 187, 31, 1, 0, 0, 0, 188, 
-		186, 1, 0, 0, 0, 189, 190, 7, 4, 0, 0, 190, 33, 1, 0, 0, 0, 191, 192, 
-		7, 5, 0, 0, 192, 35, 1, 0, 0, 0, 193, 194, 7, 6, 0, 0, 194, 37, 1, 0, 
-		0, 0, 17, 44, 51, 58, 60, 69, 77, 84, 103, 111, 119, 126, 141, 149, 151, 
-		160, 179, 186
+		7, 15, 2, 16, 7, 16, 2, 17, 7, 17, 2, 18, 7, 18, 2, 19, 7, 19, 2, 20, 
+		7, 20, 2, 21, 7, 21, 2, 22, 7, 22, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 
+		3, 0, 53, 8, 0, 1, 1, 1, 1, 1, 1, 4, 1, 58, 8, 1, 11, 1, 12, 1, 59, 1, 
+		2, 1, 2, 1, 2, 1, 2, 1, 2, 3, 2, 67, 8, 2, 3, 2, 69, 8, 2, 1, 3, 1, 3, 
+		1, 3, 1, 3, 1, 3, 5, 3, 76, 8, 3, 10, 3, 12, 3, 79, 9, 3, 1, 3, 1, 3, 
+		1, 4, 1, 4, 1, 4, 3, 4, 86, 8, 4, 1, 4, 1, 4, 3, 4, 90, 8, 4, 1, 4, 1, 
+		4, 1, 5, 1, 5, 1, 5, 3, 5, 97, 8, 5, 1, 5, 1, 5, 3, 5, 101, 8, 5, 1, 5, 
+		1, 5, 1, 5, 1, 5, 1, 6, 1, 6, 1, 7, 1, 7, 1, 7, 1, 7, 1, 7, 1, 7, 1, 7, 
+		1, 7, 1, 7, 1, 7, 1, 7, 3, 7, 120, 8, 7, 1, 8, 1, 8, 1, 9, 1, 9, 1, 9, 
+		5, 9, 127, 8, 9, 10, 9, 12, 9, 130, 9, 9, 1, 10, 1, 10, 1, 10, 5, 10, 
+		135, 8, 10, 10, 10, 12, 10, 138, 9, 10, 1, 11, 1, 11, 1, 11, 1, 11, 5, 
+		11, 144, 8, 11, 10, 11, 12, 11, 147, 9, 11, 1, 12, 1, 12, 1, 12, 1, 12, 
+		1, 12, 3, 12, 154, 8, 12, 1, 13, 1, 13, 1, 14, 1, 14, 3, 14, 160, 8, 14, 
+		1, 14, 1, 14, 1, 15, 1, 15, 1, 15, 1, 15, 1, 15, 1, 15, 1, 15, 1, 15, 
+		1, 15, 1, 15, 1, 15, 3, 15, 175, 8, 15, 1, 15, 1, 15, 1, 15, 1, 15, 1, 
+		15, 1, 15, 5, 15, 183, 8, 15, 10, 15, 12, 15, 186, 9, 15, 1, 16, 1, 16, 
+		1, 17, 1, 17, 1, 17, 1, 17, 3, 17, 194, 8, 17, 1, 18, 1, 18, 1, 18, 1, 
+		18, 1, 18, 1, 18, 1, 18, 1, 18, 1, 18, 1, 18, 1, 18, 1, 18, 1, 18, 1, 
+		18, 1, 18, 1, 18, 1, 18, 3, 18, 213, 8, 18, 1, 19, 1, 19, 1, 19, 5, 19, 
+		218, 8, 19, 10, 19, 12, 19, 221, 9, 19, 1, 20, 1, 20, 1, 21, 1, 21, 1, 
+		22, 1, 22, 1, 22, 0, 1, 30, 23, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 
+		22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 0, 7, 1, 0, 56, 61, 2, 
+		0, 10, 10, 15, 23, 1, 0, 9, 16, 1, 0, 32, 33, 2, 0, 32, 68, 74, 74, 1, 
+		0, 38, 47, 2, 0, 48, 55, 66, 74, 234, 0, 52, 1, 0, 0, 0, 2, 54, 1, 0, 
+		0, 0, 4, 68, 1, 0, 0, 0, 6, 70, 1, 0, 0, 0, 8, 82, 1, 0, 0, 0, 10, 93, 
+		1, 0, 0, 0, 12, 106, 1, 0, 0, 0, 14, 119, 1, 0, 0, 0, 16, 121, 1, 0, 0, 
+		0, 18, 123, 1, 0, 0, 0, 20, 131, 1, 0, 0, 0, 22, 139, 1, 0, 0, 0, 24, 
+		153, 1, 0, 0, 0, 26, 155, 1, 0, 0, 0, 28, 157, 1, 0, 0, 0, 30, 174, 1, 
+		0, 0, 0, 32, 187, 1, 0, 0, 0, 34, 193, 1, 0, 0, 0, 36, 212, 1, 0, 0, 0, 
+		38, 214, 1, 0, 0, 0, 40, 222, 1, 0, 0, 0, 42, 224, 1, 0, 0, 0, 44, 226, 
+		1, 0, 0, 0, 46, 47, 3, 2, 1, 0, 47, 48, 5, 0, 0, 1, 48, 53, 1, 0, 0, 0, 
+		49, 50, 3, 16, 8, 0, 50, 51, 5, 0, 0, 1, 51, 53, 1, 0, 0, 0, 52, 46, 1, 
+		0, 0, 0, 52, 49, 1, 0, 0, 0, 53, 1, 1, 0, 0, 0, 54, 57, 3, 16, 8, 0, 55, 
+		56, 5, 8, 0, 0, 56, 58, 3, 4, 2, 0, 57, 55, 1, 0, 0, 0, 58, 59, 1, 0, 
+		0, 0, 59, 57, 1, 0, 0, 0, 59, 60, 1, 0, 0, 0, 60, 3, 1, 0, 0, 0, 61, 69, 
+		3, 6, 3, 0, 62, 69, 3, 10, 5, 0, 63, 69, 3, 8, 4, 0, 64, 66, 3, 14, 7, 
+		0, 65, 67, 3, 6, 3, 0, 66, 65, 1, 0, 0, 0, 66, 67, 1, 0, 0, 0, 67, 69, 
+		1, 0, 0, 0, 68, 61, 1, 0, 0, 0, 68, 62, 1, 0, 0, 0, 68, 63, 1, 0, 0, 0, 
+		68, 64, 1, 0, 0, 0, 69, 5, 1, 0, 0, 0, 70, 71, 5, 65, 0, 0, 71, 72, 5, 
+		3, 0, 0, 72, 77, 3, 34, 17, 0, 73, 74, 5, 5, 0, 0, 74, 76, 3, 34, 17, 
+		0, 75, 73, 1, 0, 0, 0, 76, 79, 1, 0, 0, 0, 77, 75, 1, 0, 0, 0, 77, 78, 
+		1, 0, 0, 0, 78, 80, 1, 0, 0, 0, 79, 77, 1, 0, 0, 0, 80, 81, 5, 4, 0, 0, 
+		81, 7, 1, 0, 0, 0, 82, 83, 3, 12, 6, 0, 83, 85, 5, 3, 0, 0, 84, 86, 3, 
+		34, 17, 0, 85, 84, 1, 0, 0, 0, 85, 86, 1, 0, 0, 0, 86, 89, 1, 0, 0, 0, 
+		87, 88, 5, 5, 0, 0, 88, 90, 3, 44, 22, 0, 89, 87, 1, 0, 0, 0, 89, 90, 
+		1, 0, 0, 0, 90, 91, 1, 0, 0, 0, 91, 92, 5, 4, 0, 0, 92, 9, 1, 0, 0, 0, 
+		93, 94, 3, 12, 6, 0, 94, 96, 5, 3, 0, 0, 95, 97, 3, 34, 17, 0, 96, 95, 
+		1, 0, 0, 0, 96, 97, 1, 0, 0, 0, 97, 100, 1, 0, 0, 0, 98, 99, 5, 5, 0, 
+		0, 99, 101, 3, 44, 22, 0, 100, 98, 1, 0, 0, 0, 100, 101, 1, 0, 0, 0, 101, 
+		102, 1, 0, 0, 0, 102, 103, 5, 4, 0, 0, 103, 104, 3, 32, 16, 0, 104, 105, 
+		3, 44, 22, 0, 105, 11, 1, 0, 0, 0, 106, 107, 7, 0, 0, 0, 107, 13, 1, 0, 
+		0, 0, 108, 109, 5, 62, 0, 0, 109, 110, 5, 3, 0, 0, 110, 120, 5, 4, 0, 
+		0, 111, 112, 5, 63, 0, 0, 112, 113, 5, 3, 0, 0, 113, 120, 5, 4, 0, 0, 
+		114, 115, 5, 64, 0, 0, 115, 116, 5, 3, 0, 0, 116, 117, 3, 34, 17, 0, 117, 
+		118, 5, 4, 0, 0, 118, 120, 1, 0, 0, 0, 119, 108, 1, 0, 0, 0, 119, 111, 
+		1, 0, 0, 0, 119, 114, 1, 0, 0, 0, 120, 15, 1, 0, 0, 0, 121, 122, 3, 18, 
+		9, 0, 122, 17, 1, 0, 0, 0, 123, 128, 3, 20, 10, 0, 124, 125, 5, 25, 0, 
+		0, 125, 127, 3, 20, 10, 0, 126, 124, 1, 0, 0, 0, 127, 130, 1, 0, 0, 0, 
+		128, 126, 1, 0, 0, 0, 128, 129, 1, 0, 0, 0, 129, 19, 1, 0, 0, 0, 130, 
+		128, 1, 0, 0, 0, 131, 136, 3, 22, 11, 0, 132, 133, 5, 24, 0, 0, 133, 135, 
+		3, 22, 11, 0, 134, 132, 1, 0, 0, 0, 135, 138, 1, 0, 0, 0, 136, 134, 1, 
+		0, 0, 0, 136, 137, 1, 0, 0, 0, 137, 21, 1, 0, 0, 0, 138, 136, 1, 0, 0, 
+		0, 139, 145, 3, 24, 12, 0, 140, 141, 3, 26, 13, 0, 141, 142, 3, 24, 12, 
+		0, 142, 144, 1, 0, 0, 0, 143, 140, 1, 0, 0, 0, 144, 147, 1, 0, 0, 0, 145, 
+		143, 1, 0, 0, 0, 145, 146, 1, 0, 0, 0, 146, 23, 1, 0, 0, 0, 147, 145, 
+		1, 0, 0, 0, 148, 149, 5, 3, 0, 0, 149, 150, 3, 16, 8, 0, 150, 151, 5, 
+		4, 0, 0, 151, 154, 1, 0, 0, 0, 152, 154, 3, 28, 14, 0, 153, 148, 1, 0, 
+		0, 0, 153, 152, 1, 0, 0, 0, 154, 25, 1, 0, 0, 0, 155, 156, 7, 1, 0, 0, 
+		156, 27, 1, 0, 0, 0, 157, 159, 5, 1, 0, 0, 158, 160, 3, 30, 15, 0, 159, 
+		158, 1, 0, 0, 0, 159, 160, 1, 0, 0, 0, 160, 161, 1, 0, 0, 0, 161, 162, 
+		5, 2, 0, 0, 162, 29, 1, 0, 0, 0, 163, 164, 6, 15, -1, 0, 164, 165, 5, 
+		26, 0, 0, 165, 175, 3, 30, 15, 5, 166, 167, 5, 3, 0, 0, 167, 168, 3, 30, 
+		15, 0, 168, 169, 5, 4, 0, 0, 169, 175, 1, 0, 0, 0, 170, 171, 3, 34, 17, 
+		0, 171, 172, 3, 32, 16, 0, 172, 173, 3, 44, 22, 0, 173, 175, 1, 0, 0, 
+		0, 174, 163, 1, 0, 0, 0, 174, 166, 1, 0, 0, 0, 174, 170, 1, 0, 0, 0, 175, 
+		184, 1, 0, 0, 0, 176, 177, 10, 3, 0, 0, 177, 178, 5, 24, 0, 0, 178, 183, 
+		3, 30, 15, 4, 179, 180, 10, 2, 0, 0, 180, 181, 5, 25, 0, 0, 181, 183, 
+		3, 30, 15, 3, 182, 176, 1, 0, 0, 0, 182, 179, 1, 0, 0, 0, 183, 186, 1, 
+		0, 0, 0, 184, 182, 1, 0, 0, 0, 184, 185, 1, 0, 0, 0, 185, 31, 1, 0, 0, 
+		0, 186, 184, 1, 0, 0, 0, 187, 188, 7, 2, 0, 0, 188, 33, 1, 0, 0, 0, 189, 
+		194, 3, 42, 21, 0, 190, 194, 3, 36, 18, 0, 191, 192, 5, 6, 0, 0, 192, 
+		194, 3, 38, 19, 0, 193, 189, 1, 0, 0, 0, 193, 190, 1, 0, 0, 0, 193, 191, 
+		1, 0, 0, 0, 194, 35, 1, 0, 0, 0, 195, 196, 5, 32, 0, 0, 196, 197, 5, 6, 
+		0, 0, 197, 213, 3, 38, 19, 0, 198, 199, 5, 33, 0, 0, 199, 200, 5, 6, 0, 
+		0, 200, 213, 3, 38, 19, 0, 201, 202, 5, 34, 0, 0, 202, 203, 5, 6, 0, 0, 
+		203, 213, 3, 38, 19, 0, 204, 205, 5, 35, 0, 0, 205, 206, 5, 6, 0, 0, 206, 
+		213, 3, 38, 19, 0, 207, 208, 5, 36, 0, 0, 208, 209, 5, 6, 0, 0, 209, 210, 
+		7, 3, 0, 0, 210, 211, 5, 6, 0, 0, 211, 213, 3, 38, 19, 0, 212, 195, 1, 
+		0, 0, 0, 212, 198, 1, 0, 0, 0, 212, 201, 1, 0, 0, 0, 212, 204, 1, 0, 0, 
+		0, 212, 207, 1, 0, 0, 0, 213, 37, 1, 0, 0, 0, 214, 219, 3, 40, 20, 0, 
+		215, 216, 5, 6, 0, 0, 216, 218, 3, 40, 20, 0, 217, 215, 1, 0, 0, 0, 218, 
+		221, 1, 0, 0, 0, 219, 217, 1, 0, 0, 0, 219, 220, 1, 0, 0, 0, 220, 39, 
+		1, 0, 0, 0, 221, 219, 1, 0, 0, 0, 222, 223, 7, 4, 0, 0, 223, 41, 1, 0, 
+		0, 0, 224, 225, 7, 5, 0, 0, 225, 43, 1, 0, 0, 0, 226, 227, 7, 6, 0, 0, 
+		227, 45, 1, 0, 0, 0, 21, 52, 59, 66, 68, 77, 85, 89, 96, 100, 119, 128, 
+		136, 145, 153, 159, 174, 182, 184, 193, 212, 219
 	];
 }

@@ -155,13 +155,9 @@ fn visit_comparison_op(ctx: &ComparisonOpContext<'_>) -> Result<ComparisonOp> {
     }
 }
 
-fn visit_spanset_op(ctx: &SpansetOpContext<'_>) -> Result<SpansetOp> {
+fn visit_spanset_rel_op(ctx: &SpansetRelOpContext<'_>) -> Result<SpansetOp> {
     // Order matters: longer/more-specific tokens first to avoid masking.
-    if ctx.AND().is_some() {
-        Ok(SpansetOp::And)
-    } else if ctx.OR().is_some() {
-        Ok(SpansetOp::Or)
-    } else if ctx.DESC().is_some() {
+    if ctx.DESC().is_some() {
         Ok(SpansetOp::Descendant)
     } else if ctx.ANC().is_some() {
         Ok(SpansetOp::Ancestor)
@@ -173,10 +169,11 @@ fn visit_spanset_op(ctx: &SpansetOpContext<'_>) -> Result<SpansetOp> {
         Ok(SpansetOp::NotChild)
     } else if ctx.NOT_PARENT().is_some() {
         Ok(SpansetOp::NotParent)
-    } else if ctx.NOT_SIBLING().is_some() {
-        // The lexer prefers NEQ_RE, but the grammar also accepts NEQ_RE here
-        // — check both via the text fallback below if the dedicated accessor
-        // returned None.
+    } else if ctx.NEQ_RE().is_some() {
+        // The grammar reuses NEQ_RE for the not-sibling structural relation
+        // — its alternative spelling `!~` collides with the regex-not-match
+        // comparison operator at the lexer level. Inside `spansetRelOp`
+        // it can only mean not-sibling.
         Ok(SpansetOp::NotSibling)
     } else if ctx.SIBLING().is_some() {
         Ok(SpansetOp::Sibling)
@@ -185,12 +182,10 @@ fn visit_spanset_op(ctx: &SpansetOpContext<'_>) -> Result<SpansetOp> {
     } else if ctx.LT().is_some() {
         Ok(SpansetOp::Parent)
     } else {
-        // Fallback: inspect raw text to handle the `!~` collision (lexer
-        // emits NEQ_RE; not exposed by the spansetOp context accessors).
-        match ctx.get_text().as_str() {
-            "!~" => Ok(SpansetOp::NotSibling),
-            other => Err(parse_error(format!("unknown spanset operator: {other}"))),
-        }
+        Err(parse_error(format!(
+            "unknown spanset relation operator: {}",
+            ctx.get_text()
+        )))
     }
 }
 
@@ -420,6 +415,16 @@ fn pop_two_filters(filters: &[Rc<SpanFilterContextAll<'_>>], depth: usize) -> Re
     if filters.len() < 2 {
         return Err(parse_error("binary filter requires two operands"));
     }
+    // The grammar's `spanFilter AND spanFilter` / `OR` rules always
+    // produce exactly two children; flag a regression in dev/CI builds
+    // if a future grammar change produces n-ary operands and silently
+    // drops the extras here.
+    debug_assert_eq!(
+        filters.len(),
+        2,
+        "binary filter expected exactly two operands, got {}",
+        filters.len()
+    );
     let lhs = visit_span_filter(&filters[0], depth + 1)?;
     let rhs = visit_span_filter(&filters[1], depth + 1)?;
     Ok((lhs, rhs))
@@ -438,34 +443,73 @@ fn visit_span_selector(ctx: &SpanSelectorContext<'_>) -> Result<SpanSelector> {
     }
 }
 
-fn visit_spanset_expr(ctx: &SpansetExprContextAll<'_>) -> Result<SpansetExpr> {
-    match ctx {
-        SpansetExprContextAll::SpansetLeafContext(c) => {
-            let sel_ctx = c.spanSelector().ok_or_else(|| parse_error("missing span selector"))?;
-            Ok(SpansetExpr::Selector(visit_span_selector(&sel_ctx)?))
-        }
-        SpansetExprContextAll::SpansetParenContext(c) => {
-            // Parens don't add an AST node; pass through.
-            let inner = c.spansetExpr().ok_or_else(|| parse_error("missing inner spanset"))?;
-            visit_spanset_expr(&inner)
-        }
-        SpansetExprContextAll::SpansetBinaryContext(c) => {
-            let exprs = c.spansetExpr_all();
-            if exprs.len() < 2 {
-                return Err(parse_error("spanset binary op requires two operands"));
-            }
-            let lhs = visit_spanset_expr(&exprs[0])?;
-            let rhs = visit_spanset_expr(&exprs[1])?;
-            let op_ctx = c.spansetOp().ok_or_else(|| parse_error("missing spanset operator"))?;
-            let op = visit_spanset_op(&op_ctx)?;
-            Ok(SpansetExpr::Op {
-                lhs: Box::new(lhs),
-                op,
-                rhs: Box::new(rhs),
-            })
-        }
-        SpansetExprContextAll::Error(_) => Err(parse_error("error in spanset expression")),
+fn visit_spanset_expr(ctx: &SpansetExprContext<'_>) -> Result<SpansetExpr> {
+    let or_ctx = ctx.spansetOr().ok_or_else(|| parse_error("missing spansetOr"))?;
+    visit_spanset_or(&or_ctx)
+}
+
+/// Lowest-precedence boolean tier: left-associative `||` over the AND tier.
+fn visit_spanset_or(ctx: &SpansetOrContext<'_>) -> Result<SpansetExpr> {
+    let mut iter = ctx.spansetAnd_all().into_iter();
+    let first = iter.next().ok_or_else(|| parse_error("missing spansetAnd"))?;
+    let mut acc = visit_spanset_and(&first)?;
+    for next_ctx in iter {
+        let rhs = visit_spanset_and(&next_ctx)?;
+        acc = SpansetExpr::Op {
+            lhs: Box::new(acc),
+            op: SpansetOp::Or,
+            rhs: Box::new(rhs),
+        };
     }
+    Ok(acc)
+}
+
+/// Boolean AND tier: left-associative `&&` over the relation tier.
+fn visit_spanset_and(ctx: &SpansetAndContext<'_>) -> Result<SpansetExpr> {
+    let mut iter = ctx.spansetRel_all().into_iter();
+    let first = iter.next().ok_or_else(|| parse_error("missing spansetRel"))?;
+    let mut acc = visit_spanset_rel(&first)?;
+    for next_ctx in iter {
+        let rhs = visit_spanset_rel(&next_ctx)?;
+        acc = SpansetExpr::Op {
+            lhs: Box::new(acc),
+            op: SpansetOp::And,
+            rhs: Box::new(rhs),
+        };
+    }
+    Ok(acc)
+}
+
+/// Structural-relation tier: chains `>>` / `<<` / `~` / `!~` etc. left-assoc.
+fn visit_spanset_rel(ctx: &SpansetRelContext<'_>) -> Result<SpansetExpr> {
+    let primaries = ctx.spansetPrimary_all();
+    let ops = ctx.spansetRelOp_all();
+    if primaries.is_empty() {
+        return Err(parse_error("missing spansetPrimary"));
+    }
+    if primaries.len() != ops.len() + 1 {
+        return Err(parse_error("malformed spanset relation chain"));
+    }
+    let mut acc = visit_spanset_primary(&primaries[0])?;
+    for (op_ctx, next_primary) in ops.iter().zip(primaries.iter().skip(1)) {
+        let op = visit_spanset_rel_op(op_ctx)?;
+        let rhs = visit_spanset_primary(next_primary)?;
+        acc = SpansetExpr::Op {
+            lhs: Box::new(acc),
+            op,
+            rhs: Box::new(rhs),
+        };
+    }
+    Ok(acc)
+}
+
+/// Atom tier: bare span selector or a parenthesised sub-expression.
+fn visit_spanset_primary(ctx: &SpansetPrimaryContext<'_>) -> Result<SpansetExpr> {
+    if let Some(inner) = ctx.spansetExpr() {
+        return visit_spanset_expr(&inner);
+    }
+    let sel_ctx = ctx.spanSelector().ok_or_else(|| parse_error("missing span selector"))?;
+    Ok(SpansetExpr::Selector(visit_span_selector(&sel_ctx)?))
 }
 
 // ----------------------------------------------------------------------------
@@ -494,7 +538,22 @@ fn visit_aggregate(ctx: &AggregateContext<'_>) -> Result<PipelineStage> {
     if op.requires_arg() && arg.is_none() {
         return Err(parse_error(format!("{} requires a field argument", op.as_str())));
     }
-    Ok(PipelineStage::Aggregate { op, arg })
+    let percentile = match (ctx.literal(), op) {
+        (Some(lit_ctx), AggregationOp::Quantile) => Some(visit_percentile_literal(&lit_ctx)?),
+        (Some(_), other) => {
+            return Err(parse_error(format!(
+                "{} accepts no second literal argument; only `quantile_over_time` does",
+                other.as_str()
+            )));
+        }
+        (None, AggregationOp::Quantile) => {
+            return Err(parse_error(
+                "quantile_over_time(.field, p) requires a percentile literal in [0, 1]",
+            ));
+        }
+        (None, _) => None,
+    };
+    Ok(PipelineStage::Aggregate { op, arg, percentile })
 }
 
 fn visit_aggregate_filter(ctx: &AggregateFilterContext<'_>) -> Result<PipelineStage> {
@@ -508,11 +567,65 @@ fn visit_aggregate_filter(ctx: &AggregateFilterContext<'_>) -> Result<PipelineSt
     if op.requires_arg() && arg.is_none() {
         return Err(parse_error(format!("{} requires a field argument", op.as_str())));
     }
+    // `aggregateFilter`'s grammar is `... LPAREN fieldRef? (COMMA
+    // literal)? RPAREN comparisonOp literal`, so `literal_all()`
+    // contains either one entry (just the cmp RHS) or two entries
+    // (percentile inside parens at [0], cmp RHS at [1]).
+    let mut literals = ctx.literal_all();
+    let cmp_lit = literals.pop().ok_or_else(|| parse_error("missing comparison literal"))?;
+    let percentile_lit = literals.pop();
+    if !literals.is_empty() {
+        return Err(parse_error("unexpected extra literal in aggregate filter"));
+    }
+    let percentile = match (percentile_lit, op) {
+        (Some(lit_ctx), AggregationOp::Quantile) => Some(visit_percentile_literal(&lit_ctx)?),
+        (Some(_), other) => {
+            return Err(parse_error(format!(
+                "{} accepts no second literal argument; only `quantile_over_time` does",
+                other.as_str()
+            )));
+        }
+        (None, AggregationOp::Quantile) => {
+            return Err(parse_error(
+                "quantile_over_time(.field, p) requires a percentile literal in [0, 1]",
+            ));
+        }
+        (None, _) => None,
+    };
     let cmp_ctx = ctx.comparisonOp().ok_or_else(|| parse_error("missing comparison op"))?;
     let cmp = visit_comparison_op(&cmp_ctx)?;
-    let lit_ctx = ctx.literal().ok_or_else(|| parse_error("missing literal"))?;
-    let value = visit_literal(&lit_ctx)?;
-    Ok(PipelineStage::AggregateFilter { op, arg, cmp, value })
+    let value = visit_literal(&cmp_lit)?;
+    Ok(PipelineStage::AggregateFilter {
+        op,
+        arg,
+        percentile,
+        cmp,
+        value,
+    })
+}
+
+/// Extract a numeric percentile literal in `[0.0, 1.0]`, used by
+/// `quantile_over_time(.field, p)`.
+fn visit_percentile_literal(lit_ctx: &LiteralContext<'_>) -> Result<f64> {
+    let lit = visit_literal(lit_ctx)?;
+    let p = match lit {
+        LiteralValue::Float(f) => f,
+        // Allow an integer literal that's already in range (e.g. `0` or `1`)
+        // so users don't have to write `0.0` / `1.0` explicitly.
+        #[allow(clippy::cast_precision_loss)]
+        LiteralValue::Int(i) => i as f64,
+        _ => {
+            return Err(parse_error(
+                "quantile_over_time percentile must be a numeric literal in [0, 1]",
+            ));
+        }
+    };
+    if !(0.0..=1.0).contains(&p) {
+        return Err(parse_error(format!(
+            "quantile_over_time percentile {p} is out of range [0, 1]"
+        )));
+    }
+    Ok(p)
 }
 
 fn visit_metrics_function(ctx: &MetricsFunctionContext<'_>) -> Result<MetricsFunction> {

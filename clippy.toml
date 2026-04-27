@@ -32,8 +32,10 @@ too-many-lines-threshold = 150
 # Single character binding names (allowed for short-lived variables)
 single-char-binding-names-threshold = 4
 
-# Enforce minimum Rust version
-msrv = "1.75.0"
+# Enforce minimum Rust version. Tracks Cargo.toml's `rust-version`.
+# `Option::is_none_or` requires 1.82+; `BinaryHeap::peek_mut`-style mut
+# methods we already rely on require 1.92+.
+msrv = "1.82.0"
 
 # Literal representation
 literal-representation-threshold = 65536

@@ -29,11 +29,11 @@ byClause
     ;
 
 aggregate
-    : aggregateOp LPAREN fieldRef? RPAREN
+    : aggregateOp LPAREN fieldRef? (COMMA literal)? RPAREN
     ;
 
 aggregateFilter
-    : aggregateOp LPAREN fieldRef? RPAREN comparisonOp literal
+    : aggregateOp LPAREN fieldRef? (COMMA literal)? RPAREN comparisonOp literal
     ;
 
 aggregateOp
@@ -53,16 +53,44 @@ metricsFunction
 
 // =====================================================================
 // Spansets
+//
+// Operator precedence from lowest to highest:
+//   1. OR  (left-assoc)
+//   2. AND (left-assoc)
+//   3. structural relations: DESC `>>`, GT `>`, ANC `<<`, LT `<`,
+//      SIBLING `~`, NOT_DESC `!>>`, NOT_CHILD `!>`, NOT_ANC `!<<`,
+//      NOT_PARENT `!<`, and NEQ_RE `!~` (re-used as not-sibling).
+//      Left-assoc, all at the same tier.
+//   4. parenthesised group / bare span selector (atom).
+//
+// This mirrors the per-token precedence ladder used by `spanFilter`
+// below: relationships bind tighter than booleans so a query like
+// `{a} >> {b} && {c}` parses as `({a} >> {b}) && {c}`.
 // =====================================================================
 spansetExpr
-    : spansetExpr spansetOp spansetExpr   # SpansetBinary
-    | LPAREN spansetExpr RPAREN           # SpansetParen
-    | spanSelector                        # SpansetLeaf
+    : spansetOr
     ;
 
-spansetOp
-    : AND | OR | DESC | GT | ANC | LT | SIBLING
-    | NOT_DESC | NOT_CHILD | NOT_ANC | NOT_PARENT | NOT_SIBLING
+spansetOr
+    : spansetAnd (OR spansetAnd)*
+    ;
+
+spansetAnd
+    : spansetRel (AND spansetRel)*
+    ;
+
+spansetRel
+    : spansetPrimary (spansetRelOp spansetPrimary)*
+    ;
+
+spansetPrimary
+    : LPAREN spansetExpr RPAREN
+    | spanSelector
+    ;
+
+spansetRelOp
+    : DESC | GT | ANC | LT | SIBLING
+    | NOT_DESC | NOT_CHILD | NOT_ANC | NOT_PARENT | NEQ_RE
     ;
 
 spanSelector

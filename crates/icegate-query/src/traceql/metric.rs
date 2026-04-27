@@ -53,6 +53,11 @@ pub enum PipelineStage {
         op: AggregationOp,
         /// Field argument (`None` for `count()`; required for others).
         arg: Option<FieldRef>,
+        /// Percentile in `[0.0, 1.0]` — required for
+        /// [`AggregationOp::Quantile`], ignored otherwise. `None` for any
+        /// non-quantile op or when the parser hasn't seen the second arg
+        /// yet (the planner validates and returns a 400 in that case).
+        percentile: Option<f64>,
     },
     /// `count() > 3`, `avg(duration) < 100ms` — filter the aggregated rows
     /// by comparing the aggregate result to a literal.
@@ -61,6 +66,8 @@ pub enum PipelineStage {
         op: AggregationOp,
         /// Optional argument to that aggregation.
         arg: Option<FieldRef>,
+        /// Percentile, semantics identical to [`PipelineStage::Aggregate::percentile`].
+        percentile: Option<f64>,
         /// Comparison operator.
         cmp: ComparisonOp,
         /// RHS literal.
@@ -148,6 +155,7 @@ mod tests {
             stages: vec![PipelineStage::AggregateFilter {
                 op: AggregationOp::Count,
                 arg: None,
+                percentile: None,
                 cmp: ComparisonOp::Gt,
                 value: LiteralValue::Int(3),
             }],

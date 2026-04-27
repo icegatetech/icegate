@@ -109,6 +109,12 @@ pub async fn collect_indexed_int_values_via_dict(
     column_name: &str,
     out: &mut BTreeSet<i32>,
 ) -> Result<(), MetadataScanError> {
+    if is_system_reserved_value_column(column_name) {
+        // Mirror [`collect_indexed_values_via_dict`] — refuse at the
+        // metadata-scan layer for system metadata columns even if the
+        // HTTP layer's reserved-name validation is bypassed.
+        return Ok(());
+    }
     let schema = metadata.file_metadata().schema_descr();
     let Some(leaf_idx) = (0..schema.num_columns()).find(|&i| schema.column(i).name() == column_name) else {
         return Ok(());

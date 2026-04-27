@@ -297,6 +297,13 @@ fn datum_for(field: &FieldRef, value: &LiteralValue) -> Option<Datum> {
         (FieldRef::Intrinsic(IntrinsicField::Status | IntrinsicField::Kind), LiteralValue::Int(v)) => {
             i32::try_from(*v).ok().map(Datum::int)
         }
+        // Drop string RHS against the INT enum columns: a literal like
+        // `{ status = "error" }` (string, not the bare `error` keyword)
+        // would otherwise fall through to the `(_, String)` arm and
+        // produce a bogus `Datum::string` against an INT32 column.
+        // Returning None drops the predicate so the query degrades to
+        // an over-approximation rather than a planner type error.
+        (FieldRef::Intrinsic(IntrinsicField::Status | IntrinsicField::Kind), LiteralValue::String(_)) => None,
         // String columns: `name`, `service_name`, `cloud_account_id`,
         // `trace_id`, `span_id`, `parent_span_id`. RHS must be a string.
         (_, LiteralValue::String(s)) => Some(Datum::string(s.clone())),
@@ -421,6 +428,31 @@ mod tests {
     fn drops_map_attribute_predicate() {
         let p = translate(r#"{ span.http.method = "GET" }"#);
         assert!(matches!(p, Predicate::AlwaysTrue));
+    }
+
+    #[test]
+    fn drops_status_string_literal_against_int_column() {
+        // `status = "error"` is a *string* literal, not the bare `error`
+        // keyword. Pushing it as a string Datum against the INT32
+        // status_code column would be a planner type error, so the
+        // predicate must be dropped to AlwaysTrue.
+        let p = translate(r#"{ status = "error" }"#);
+        assert!(
+            matches!(p, Predicate::AlwaysTrue),
+            "expected AlwaysTrue, got: {}",
+            dbg(&p)
+        );
+    }
+
+    #[test]
+    fn drops_kind_string_literal_against_int_column() {
+        // Same as above but for `kind`.
+        let p = translate(r#"{ kind = "server" }"#);
+        assert!(
+            matches!(p, Predicate::AlwaysTrue),
+            "expected AlwaysTrue, got: {}",
+            dbg(&p)
+        );
     }
 
     #[test]

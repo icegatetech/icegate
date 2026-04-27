@@ -3,10 +3,9 @@
 use std::ops::Not;
 
 use datafusion::{
-    arrow::datatypes::DataType,
     functions::regex::regexp_like,
     functions_nested::{extract::array_element, map_extract::map_extract},
-    logical_expr::{Expr, ExprSchemable, lit},
+    logical_expr::{Expr, lit},
     prelude::{DataFrame, col},
     scalar::ScalarValue,
 };
@@ -42,23 +41,23 @@ fn apply_selector(df: DataFrame, selector: SpanSelector) -> Result<DataFrame> {
     match selector.filter {
         None => Ok(df),
         Some(filter) => {
-            let pred = filter_to_expr(&filter)?;
+            let pred = filter_to_expr(&filter);
             Ok(df.filter(pred)?)
         }
     }
 }
 
-fn filter_to_expr(f: &SpanFilter) -> Result<Expr> {
+fn filter_to_expr(f: &SpanFilter) -> Expr {
     match f {
         SpanFilter::Paren(inner) => filter_to_expr(inner),
-        SpanFilter::Not(inner) => Ok(Not::not(filter_to_expr(inner)?)),
-        SpanFilter::And(l, r) => Ok(filter_to_expr(l)?.and(filter_to_expr(r)?)),
-        SpanFilter::Or(l, r) => Ok(filter_to_expr(l)?.or(filter_to_expr(r)?)),
+        SpanFilter::Not(inner) => Not::not(filter_to_expr(inner)),
+        SpanFilter::And(l, r) => filter_to_expr(l).and(filter_to_expr(r)),
+        SpanFilter::Or(l, r) => filter_to_expr(l).or(filter_to_expr(r)),
         SpanFilter::Compare { field, op, value } => compare_to_expr(field, *op, value),
     }
 }
 
-fn compare_to_expr(field: &FieldRef, op: ComparisonOp, value: &LiteralValue) -> Result<Expr> {
+fn compare_to_expr(field: &FieldRef, op: ComparisonOp, value: &LiteralValue) -> Expr {
     match field {
         FieldRef::Intrinsic(intrinsic) => {
             let lhs = intrinsic_column(*intrinsic);
@@ -70,22 +69,17 @@ fn compare_to_expr(field: &FieldRef, op: ComparisonOp, value: &LiteralValue) -> 
 }
 
 /// Apply a [`ComparisonOp`] between a LHS expression and a RHS literal expression.
-///
-/// # Errors
-///
-/// Propagates DataFusion errors from [`regex_match`] when the op is a regex
-/// compare.
-fn apply_op(lhs: Expr, op: ComparisonOp, rhs: Expr) -> Result<Expr> {
-    Ok(match op {
+fn apply_op(lhs: Expr, op: ComparisonOp, rhs: Expr) -> Expr {
+    match op {
         ComparisonOp::Eq => lhs.eq(rhs),
         ComparisonOp::Neq => lhs.not_eq(rhs),
         ComparisonOp::Gt => lhs.gt(rhs),
         ComparisonOp::Ge => lhs.gt_eq(rhs),
         ComparisonOp::Lt => lhs.lt(rhs),
         ComparisonOp::Le => lhs.lt_eq(rhs),
-        ComparisonOp::Re => regex_match(lhs, rhs, false)?,
-        ComparisonOp::Nre => regex_match(lhs, rhs, true)?,
-    })
+        ComparisonOp::Re => regex_match(lhs, rhs, false),
+        ComparisonOp::Nre => regex_match(lhs, rhs, true),
+    }
 }
 
 /// Map a `TraceQL` intrinsic field to the physical spans-table column (or a
@@ -136,18 +130,7 @@ pub(crate) fn intrinsic_column(i: IntrinsicField) -> Expr {
 /// Resource and Any paths. A query against `span.service.name` would still
 /// go through `span_attributes[service.name]`; that's rare enough that the
 /// lost optimization is acceptable.
-///
-/// # Errors
-///
-/// Propagates DataFusion errors from [`regex_match`] when the op is a regex
-/// compare.
-fn attribute_compare(
-    scope: Scope,
-    name: &str,
-    op: ComparisonOp,
-    field: &FieldRef,
-    value: &LiteralValue,
-) -> Result<Expr> {
+fn attribute_compare(scope: Scope, name: &str, op: ComparisonOp, field: &FieldRef, value: &LiteralValue) -> Expr {
     match scope {
         Scope::Resource | Scope::Parent(ParentScope::Resource) => {
             apply_op(resource_attribute_lhs(name), op, literal_to_scalar(field, value))
@@ -160,9 +143,9 @@ fn attribute_compare(
             // `literal_to_scalar` field-specific coercion is consistent (it's
             // identical for both branches but building twice is cheap and
             // avoids accidental reuse of a moved Expr).
-            let resource_cmp = apply_op(resource_attribute_lhs(name), op, literal_to_scalar(field, value))?;
-            let span_cmp = apply_op(span_attribute_lhs(name), op, literal_to_scalar(field, value))?;
-            Ok(resource_cmp.or(span_cmp))
+            let resource_cmp = apply_op(resource_attribute_lhs(name), op, literal_to_scalar(field, value));
+            let span_cmp = apply_op(span_attribute_lhs(name), op, literal_to_scalar(field, value));
+            resource_cmp.or(span_cmp)
         }
         Scope::Event | Scope::Link => {
             // Event/link attribute scopes aren't modelled in v1 — they live
@@ -220,11 +203,17 @@ fn literal_to_scalar(field: &FieldRef, lit_val: &LiteralValue) -> Expr {
         (FieldRef::Intrinsic(IntrinsicField::Status), LiteralValue::Status(s)) => lit(s.otlp_code()),
         (FieldRef::Intrinsic(IntrinsicField::Kind), LiteralValue::Kind(k)) => lit(k.otlp_code()),
         // Duration: LHS is BIGINT micros, RHS literal is nanos → divide.
+        // Round *up* so a sub-microsecond literal like `500ns` does not
+        // silently collapse to 0µs and start matching every row. Worst
+        // case the user asked for `> 500ns` and we test against `> 1µs`,
+        // which is still a meaningful filter.
         // `TraceDuration` is intentionally absent here: its LHS is `Utf8(NULL)`
         // (see `intrinsic_column`), so the literal does not need micro
         // coercion — falling through to the catch-all `Duration` arm below
         // is fine and never matches.
-        (FieldRef::Intrinsic(IntrinsicField::Duration), LiteralValue::Duration(ns)) => lit(*ns / 1_000),
+        (FieldRef::Intrinsic(IntrinsicField::Duration), LiteralValue::Duration(ns)) => {
+            lit(ns.saturating_add(999) / 1_000)
+        }
         // String / numeric / bool — direct.
         (_, LiteralValue::String(s)) => lit(s.clone()),
         (_, LiteralValue::Int(i)) => lit(*i),
@@ -252,17 +241,15 @@ fn literal_to_scalar(field: &FieldRef, lit_val: &LiteralValue) -> Expr {
     }
 }
 
-fn regex_match(lhs: Expr, rhs: Expr, negated: bool) -> Result<Expr> {
-    let arr = lhs.cast_to(&DataType::Utf8, &df_dummy_schema())?;
-    let pat_arr = rhs.cast_to(&DataType::Utf8, &df_dummy_schema())?;
-    let m = regexp_like().call(vec![arr, pat_arr]);
-    Ok(if negated { m.not() } else { m })
-}
-
-/// `cast_to` requires a `DFSchema`; provide an empty one (the cast is column-
-/// or scalar-agnostic for our use).
-fn df_dummy_schema() -> datafusion::common::DFSchema {
-    datafusion::common::DFSchema::empty()
+fn regex_match(lhs: Expr, rhs: Expr, negated: bool) -> Expr {
+    // Pass the operands through directly — DataFusion infers Utf8 coercion
+    // from `regexp_like`'s signature. The previous `cast_to(...)` calls
+    // used an empty `DFSchema` which silently broke plan-time column
+    // refs (the cast looks up the column type via the schema and finds
+    // nothing), so attribute-scoped patterns like `{ name =~ "GET.*" }`
+    // would either misbehave or be rejected during type-checking.
+    let m = regexp_like().call(vec![lhs, rhs]);
+    if negated { m.not() } else { m }
 }
 
 #[cfg(test)]

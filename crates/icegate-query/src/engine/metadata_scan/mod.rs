@@ -44,9 +44,9 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 pub use error::MetadataScanError;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
-use iceberg::scan::FileScanTask;
+use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::table::Table;
 pub use predicate::base_predicate;
 
@@ -147,22 +147,25 @@ pub async fn scan_labels(
     extra_predicate: Predicate,
 ) -> Result<BTreeSet<String>, MetadataScanError> {
     let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
-    let files = plan_files(table, &predicate).await?;
-    tracing::Span::current().record("num_files", files.len());
+    let plan_stream = plan_files(table, &predicate).await?;
     let file_io = table.file_io().clone();
 
-    let mut stream = stream::iter(files)
-        .map(|task| {
+    let mut num_files: usize = 0;
+    let mut stream = plan_stream
+        .map_err(MetadataScanError::Iceberg)
+        .map_ok(|task| {
             let file_io = file_io.clone();
             let predicate = predicate.clone();
             async move { scan_labels_for_file(&file_io, task, &predicate, config).await }
         })
-        .buffer_unordered(METADATA_SCAN_CONCURRENCY);
+        .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
 
     let mut result: BTreeSet<String> = BTreeSet::new();
     while let Some(r) = stream.next().await {
         result.extend(r?);
+        num_files += 1;
     }
+    tracing::Span::current().record("num_files", num_files);
 
     Ok(result)
 }
@@ -196,14 +199,15 @@ pub async fn scan_label_values(
 ) -> Result<BTreeSet<String>, MetadataScanError> {
     let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
     let kind = values::classify_label(label_name, config);
-    let files = plan_files(table, &predicate).await?;
-    tracing::Span::current().record("num_files", files.len());
+    let plan_stream = plan_files(table, &predicate).await?;
     let file_io = table.file_io().clone();
 
     let indexed_column = config.resolve_column(label_name).to_string();
     let label_name = label_name.to_string();
-    let mut stream = stream::iter(files)
-        .map(|task| {
+    let mut num_files: usize = 0;
+    let mut stream = plan_stream
+        .map_err(MetadataScanError::Iceberg)
+        .map_ok(|task| {
             let file_io = file_io.clone();
             let label = label_name.clone();
             let indexed_column = indexed_column.clone();
@@ -212,12 +216,14 @@ pub async fn scan_label_values(
                 scan_label_values_for_file(&file_io, task, &predicate, config, kind, &label, &indexed_column).await
             }
         })
-        .buffer_unordered(METADATA_SCAN_CONCURRENCY);
+        .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
 
     let mut result: BTreeSet<String> = BTreeSet::new();
     while let Some(r) = stream.next().await {
         result.extend(r?);
+        num_files += 1;
     }
+    tracing::Span::current().record("num_files", num_files);
 
     Ok(result)
 }
@@ -251,13 +257,14 @@ pub async fn scan_label_int_values(
     extra_predicate: Predicate,
 ) -> Result<BTreeSet<i32>, MetadataScanError> {
     let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
-    let files = plan_files(table, &predicate).await?;
-    tracing::Span::current().record("num_files", files.len());
+    let plan_stream = plan_files(table, &predicate).await?;
     let file_io = table.file_io().clone();
 
     let column = column.to_string();
-    let mut stream = stream::iter(files)
-        .map(|task| {
+    let mut num_files: usize = 0;
+    let mut stream = plan_stream
+        .map_err(MetadataScanError::Iceberg)
+        .map_ok(|task| {
             let file_io = file_io.clone();
             let predicate = predicate.clone();
             let column = column.clone();
@@ -269,27 +276,34 @@ pub async fn scan_label_int_values(
                 Ok::<BTreeSet<i32>, MetadataScanError>(out)
             }
         })
-        .buffer_unordered(METADATA_SCAN_CONCURRENCY);
+        .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
 
     let mut result: BTreeSet<i32> = BTreeSet::new();
     while let Some(r) = stream.next().await {
         result.extend(r?);
+        num_files += 1;
     }
+    tracing::Span::current().record("num_files", num_files);
 
     Ok(result)
 }
 
-/// Plan the files to scan for the given predicate.
-async fn plan_files(table: &Table, predicate: &Predicate) -> Result<Vec<FileScanTask>, MetadataScanError> {
+/// Plan the files to scan for the given predicate, returning a stream
+/// of [`FileScanTask`]s.
+///
+/// The previous implementation called `try_collect()` and materialized
+/// the entire `Vec<FileScanTask>` before returning — fine for tiny
+/// tables but a memory hazard once a tenant accumulates tens of
+/// thousands of data files. Returning the stream lets callers feed
+/// `buffer_unordered` directly so per-file readers fire as soon as the
+/// catalog yields the first task.
+async fn plan_files(table: &Table, predicate: &Predicate) -> Result<FileScanTaskStream, MetadataScanError> {
     let scan = table
         .scan()
         .with_filter(predicate.clone())
         .build()
         .map_err(MetadataScanError::Iceberg)?;
-
-    let stream = scan.plan_files().await.map_err(MetadataScanError::Iceberg)?;
-    let files: Vec<FileScanTask> = stream.try_collect().await.map_err(MetadataScanError::Iceberg)?;
-    Ok(files)
+    scan.plan_files().await.map_err(MetadataScanError::Iceberg)
 }
 
 /// Process one Parquet file for a label/tag enumeration request.

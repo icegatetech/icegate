@@ -12,12 +12,8 @@
 
 use std::collections::BTreeMap;
 
-use datafusion::arrow::{
-    array::{
-        Array, AsArray, Int32Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
-        TimestampMicrosecondArray,
-    },
-    datatypes::Int32Type,
+use datafusion::arrow::array::{
+    Array, AsArray, Int32Array, ListArray, MapArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value::Value as AnyVal},
@@ -169,9 +165,9 @@ fn build_span_value(
     if let Some(s) = status {
         span.insert("status".into(), json!({"code": otlp_status_name(s)}));
     }
-    span.insert("startTimeUnixNano".into(), json!((start_micros * 1_000).to_string()));
+    span.insert("startTimeUnixNano".into(), json!(micros_to_nanos_str(start_micros)));
     if let Some(e) = end_micros {
-        span.insert("endTimeUnixNano".into(), json!((e * 1_000).to_string()));
+        span.insert("endTimeUnixNano".into(), json!(micros_to_nanos_str(e)));
     }
     span.insert("attributes".into(), Value::Array(attrs));
     if !events.is_empty() {
@@ -236,14 +232,14 @@ fn string_col_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringAr
     batch
         .schema()
         .column_with_name(name)
-        .map(|(idx, _)| batch.column(idx).as_string::<i32>())
+        .and_then(|(idx, _)| batch.column(idx).as_any().downcast_ref::<StringArray>())
 }
 
 fn i32_col_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
     batch
         .schema()
         .column_with_name(name)
-        .map(|(idx, _)| batch.column(idx).as_primitive::<Int32Type>())
+        .and_then(|(idx, _)| batch.column(idx).as_any().downcast_ref::<Int32Array>())
 }
 
 fn ts_col<'a>(batch: &'a RecordBatch, name: &str) -> crate::error::Result<&'a TimestampMicrosecondArray> {
@@ -427,7 +423,7 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
             // A span is the root when `parent_span_id` is null or empty.
             // If the `parent_span_id` column is missing entirely, treat
             // every span as a root (best-effort).
-            let is_root = parents.as_ref().map_or(true, |c| c.is_null(row) || c.value(row).is_empty());
+            let is_root = parents.as_ref().is_none_or(|c| c.is_null(row) || c.value(row).is_empty());
             // Use the row's `timestamp` for ordering. Missing or zero
             // timestamp sorts last (fallback to `i64::MAX`).
             let ts_micros = starts.map_or(i64::MAX, |c| c.value(row));
@@ -516,7 +512,7 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
                 root_trace_name,
                 // Tempo reports times in nanoseconds. Our Iceberg rows are in
                 // microseconds (per `schema::COL_TIMESTAMP`), so scale up.
-                start_time_unix_nano: (start_micros * 1_000).to_string(),
+                start_time_unix_nano: micros_to_nanos_str(start_micros),
                 duration_ms: u64::try_from(((end_micros - start_micros) / 1_000).max(0)).unwrap_or(0),
                 span_sets,
             }
@@ -778,7 +774,20 @@ fn proto_attributes(map_arr: &MapArray, row: usize) -> Vec<KeyValue> {
 #[allow(clippy::cast_sign_loss)]
 const fn micros_to_nanos_u64(micros: i64) -> u64 {
     // Timestamps before epoch are invalid for OTLP; clamp to 0.
-    if micros < 0 { 0 } else { (micros as u64) * 1_000 }
+    if micros < 0 {
+        0
+    } else {
+        (micros as u64).saturating_mul(1_000)
+    }
+}
+
+/// Render an i64 microseconds value as the OTLP `*UnixNano` string.
+///
+/// Multiplies by `1_000` with `saturating_mul` so a malformed timestamp
+/// (e.g. one near `i64::MAX`) produces `i64::MAX` rather than wrapping
+/// to a small/negative value.
+fn micros_to_nanos_str(micros: i64) -> String {
+    micros.saturating_mul(1_000).to_string()
 }
 
 /// Reinterpret an `i32` storage value as an OTLP `uint32` count.

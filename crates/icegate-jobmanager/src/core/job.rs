@@ -495,7 +495,7 @@ impl Job {
         }
 
         self.iteration_interval
-            .map_or(true, |interval| Utc::now() >= self.started_at + interval)
+            .is_none_or(|interval| Utc::now() >= self.started_at + interval)
     }
 
     // State mutations
@@ -656,7 +656,7 @@ impl Job {
 
     #[allow(dead_code)]
     pub(crate) fn should_poll(&self) -> bool {
-        self.next_start_at.map_or(true, |next_start| Utc::now() > next_start)
+        self.next_start_at.is_none_or(|next_start| Utc::now() > next_start)
     }
 
     pub(crate) fn tasks_as_iter(&self) -> impl Iterator<Item = &Task> {

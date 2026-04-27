@@ -134,10 +134,9 @@ impl QueryExecutor {
     /// Create a DataFusion session context (timed), counting errors via metrics.
     async fn create_session(&self) -> LokiResult<SessionContext> {
         let start = Instant::now();
-        let session = self.engine.create_session().await.map_err(|e| {
+        let session = self.engine.create_session().await.inspect_err(|_| {
             self.metrics.record_session_create_duration(start.elapsed());
             self.metrics.add_error("loki", "session");
-            e
         })?;
         self.metrics.record_session_create_duration(start.elapsed());
         Ok(session)

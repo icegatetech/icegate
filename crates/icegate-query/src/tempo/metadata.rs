@@ -165,7 +165,7 @@ pub async fn list_tags_v2(
 
     // Resource scope: resource_attributes map keys + top-level resource
     // columns that exist in the schema.
-    if scope_filter.map_or(true, |s| s == Scope::Resource) {
+    if scope_filter.is_none_or(|s| s == Scope::Resource) {
         let mut tags: BTreeSet<String> = metadata_scan::scan_labels(
             &table,
             tenant_id,
@@ -189,7 +189,7 @@ pub async fn list_tags_v2(
 
     // Span scope: span_attributes map keys + span-specific indexed columns
     // (name).
-    if scope_filter.map_or(true, |s| s == Scope::Span) {
+    if scope_filter.is_none_or(|s| s == Scope::Span) {
         let tags: BTreeSet<String> = metadata_scan::scan_labels(
             &table,
             tenant_id,
@@ -206,7 +206,7 @@ pub async fn list_tags_v2(
         });
     }
 
-    if scope_filter.map_or(true, |s| s == Scope::Intrinsic) {
+    if scope_filter.is_none_or(|s| s == Scope::Intrinsic) {
         groups.push(ScopeGroup {
             name: Scope::Intrinsic.as_str().to_string(),
             tags: TRACEQL_INTRINSIC_TAGS.iter().map(|s| (*s).to_string()).collect(),
@@ -216,13 +216,13 @@ pub async fn list_tags_v2(
     // event and link attributes require unnesting nested LIST<STRUCT> maps —
     // deferred. Return empty lists so Grafana's query builder still shows
     // the sections.
-    if scope_filter.map_or(true, |s| s == Scope::Event) {
+    if scope_filter.is_none_or(|s| s == Scope::Event) {
         groups.push(ScopeGroup {
             name: Scope::Event.as_str().to_string(),
             tags: Vec::new(),
         });
     }
-    if scope_filter.map_or(true, |s| s == Scope::Link) {
+    if scope_filter.is_none_or(|s| s == Scope::Link) {
         groups.push(ScopeGroup {
             name: Scope::Link.as_str().to_string(),
             tags: Vec::new(),

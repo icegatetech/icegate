@@ -1,6 +1,9 @@
 //! Tests for Tempo tag-discovery endpoints:
 //! `/api/search/tags`, `/api/v2/search/tags`,
-//! `/api/search/tag/{name}/values`.
+//! `/api/search/tag/{name}/values`, and the typed
+//! `/api/v2/search/tag/{name}/values` (where `inspectedBytes` is
+//! serialised as a string and the `status` enum uses keyword-typed
+//! variants like `STATUS_CODE_OK`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

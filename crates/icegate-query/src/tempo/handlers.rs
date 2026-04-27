@@ -29,7 +29,10 @@ use super::{
     trace_by_id::{default_window, fetch},
     validation,
 };
-use crate::traceql::{antlr::AntlrParser, iceberg_predicate::translate_query_to_predicate_excluding, parser::Parser};
+use crate::{
+    error::QueryError,
+    traceql::{antlr::AntlrParser, iceberg_predicate::translate_query_to_predicate_excluding, parser::Parser},
+};
 
 // ============================================================================
 // Helpers
@@ -51,9 +54,20 @@ fn extract_tenant_id(headers: &HeaderMap) -> String {
 
 /// Convert a Unix epoch second value into a UTC `DateTime`.
 ///
-/// Falls back to [`DateTime::UNIX_EPOCH`] for ambiguous/out-of-range inputs.
-fn parse_epoch_seconds(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).single().unwrap_or(DateTime::UNIX_EPOCH)
+/// Returns [`QueryError::Validation`] for ambiguous/out-of-range inputs —
+/// silently clamping to `UNIX_EPOCH` would mask client bugs and produce
+/// surprise wide-window scans starting in 1970.
+///
+/// # Errors
+///
+/// Returns [`TempoError`] (HTTP 400) when `secs` is outside chrono's
+/// representable range or otherwise non-single.
+fn parse_epoch_seconds(secs: i64) -> TempoResult<DateTime<Utc>> {
+    Utc.timestamp_opt(secs, 0).single().ok_or_else(|| {
+        TempoError::new(QueryError::Validation(format!(
+            "invalid epoch-seconds timestamp: {secs} (out of representable range)"
+        )))
+    })
 }
 
 /// Parse the optional `?q=` `TraceQL` query and translate it to an
@@ -149,8 +163,8 @@ pub async fn get_trace(
 
     let now = Utc::now();
     let (default_start, default_end) = default_window(now);
-    let start = params.start.map_or(default_start, parse_epoch_seconds);
-    let end = params.end.map_or(default_end, parse_epoch_seconds);
+    let start = params.start.map(parse_epoch_seconds).transpose()?.unwrap_or(default_start);
+    let end = params.end.map(parse_epoch_seconds).transpose()?.unwrap_or(default_end);
     validation::validate_query_window(start, end).map_err(TempoError::new)?;
 
     let result = fetch(state.engine, &tenant_id, &trace_id, start, end).await?;

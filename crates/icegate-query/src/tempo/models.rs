@@ -87,7 +87,6 @@ pub struct TagValuesQueryParams {
     pub q: Option<String>,
     /// Accepted for Grafana compatibility but currently ignored.
     #[serde(rename = "maxStaleValues", default)]
-    #[allow(dead_code)]
     pub max_stale_values: Option<u64>,
 }
 

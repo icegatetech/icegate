@@ -62,7 +62,7 @@ pub enum SpansetOp {
 impl SpansetOp {
     /// Source-form spelling of the operator.
     #[must_use]
-    pub const fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::And => "&&",
             Self::Or => "||",
@@ -85,7 +85,7 @@ impl SpansetOp {
     /// this code path because boolean composition inside a single selector
     /// is encoded via [`SpanFilter`], not as a [`SpansetOp`]).
     #[must_use]
-    pub const fn is_hierarchy(&self) -> bool {
+    pub const fn is_hierarchy(self) -> bool {
         !matches!(self, Self::And | Self::Or)
     }
 }

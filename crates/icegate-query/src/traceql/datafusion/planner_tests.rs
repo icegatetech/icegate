@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use chrono::{TimeZone, Utc};
+use chrono::{Duration, Utc};
 use datafusion::{
     arrow::{
         array::{ArrayRef, Int32Array, Int64Array, MapBuilder, StringArray, StringBuilder, TimestampMicrosecondArray},
@@ -192,12 +192,17 @@ fn fixture_session() -> SessionContext {
     ctx
 }
 
-/// Wide time window that covers any "now-ish" timestamp the fixture emits.
+/// Wide time window relative to wall-clock now. Anchoring to `Utc::now()`
+/// instead of fixed calendar dates keeps the fixture-emitted timestamps
+/// inside the window regardless of when the test runs (a hard-coded
+/// `2026..2099` worked until the fixture started writing `now()`-scoped
+/// rows on systems whose clock had drifted).
 fn make_query_ctx(tenant: &str) -> QueryContext {
+    let now = Utc::now();
     QueryContext {
         tenant_id: tenant.to_string(),
-        start: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-        end: Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap(),
+        start: now - Duration::days(1),
+        end: now + Duration::days(1),
         limit: None,
         // Disable spss in the default test context so existing
         // row-count assertions aren't accidentally clipped by the cap.
@@ -349,6 +354,51 @@ async fn span_scope_service_name_does_not_short_circuit_to_column() {
     let qctx = make_query_ctx("t1");
     let total = run_and_count(ctx, qctx, r#"{ span.service.name = "frontend" }"#).await;
     assert_eq!(total, 0);
+}
+
+// =========================================================================
+// Regex (=~ and !~) routing
+// =========================================================================
+//
+// Regression: `regex_match` previously cast both operands using an empty
+// `DFSchema`, which broke plan-time column resolution for any non-trivial
+// LHS. These tests exercise the post-fix path on intrinsic name, resource
+// attribute, and the negated form.
+
+#[tokio::test]
+async fn regex_intrinsic_name_matches_get_prefix() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let total = run_and_count(ctx, qctx, r#"{ name =~ "GET.*" }"#).await;
+    // Both t1 rows are named "GET /a" / "GET /b".
+    assert_eq!(total, 2);
+}
+
+#[tokio::test]
+async fn regex_intrinsic_name_negated_excludes_get_prefix() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let total = run_and_count(ctx, qctx, r#"{ name !~ "GET.*" }"#).await;
+    // Both t1 rows are named "GET .." so the negated regex matches none.
+    assert_eq!(total, 0);
+}
+
+#[tokio::test]
+async fn regex_resource_service_name_matches_prefix() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let total = run_and_count(ctx, qctx, r#"{ resource.service.name =~ "fro.*" }"#).await;
+    // Both t1 rows have service.name="frontend".
+    assert_eq!(total, 2);
+}
+
+#[tokio::test]
+async fn regex_resource_service_name_negated_excludes_match() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t2");
+    let total = run_and_count(ctx, qctx, r#"{ resource.service.name !~ "fro.*" }"#).await;
+    // The t2 row has service.name="backend" → !~ "fro.*" matches.
+    assert_eq!(total, 1);
 }
 
 // =========================================================================

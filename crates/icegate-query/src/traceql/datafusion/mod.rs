@@ -7,13 +7,12 @@ mod registry;
 mod selectors;
 
 // Re-exports consumed by the metrics planner (and any downstream callers
-// that need a uniform field-ref → group-key conversion).
-pub(crate) use pipeline::field_ref_to_group_key as pipeline_field_ref_to_group_key;
+// that need a uniform field-ref → group-key conversion). The original
+// names are preserved — module-path qualification (`super::pipeline_…`)
+// already disambiguates at the call site.
+pub(crate) use pipeline::field_ref_to_group_key;
 pub use planner::DataFusionPlanner;
-pub(crate) use selectors::{
-    intrinsic_column as selectors_intrinsic_column, resource_attribute_lhs as selectors_resource_attribute_lhs,
-    span_attribute_lhs as selectors_span_attribute_lhs,
-};
+pub(crate) use selectors::{intrinsic_column, resource_attribute_lhs, span_attribute_lhs};
 
 #[cfg(test)]
 mod planner_tests;

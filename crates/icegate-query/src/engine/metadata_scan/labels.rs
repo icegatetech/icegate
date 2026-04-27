@@ -80,7 +80,7 @@ pub fn collect_indexed_from_metadata(
             let col = rg.column(leaf_idx);
             // No stats → conservative: assume the column might have values
             // (over-approximation is allowed).
-            let has_values = col.statistics().map_or(true, |stats| {
+            let has_values = col.statistics().is_none_or(|stats| {
                 let null_count = stats.null_count_opt().unwrap_or(0);
                 // `num_rows()` is i64 in parquet-rs; coerce to u64 for the
                 // comparison. Row counts are always non-negative.

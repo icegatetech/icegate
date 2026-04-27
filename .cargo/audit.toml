@@ -7,5 +7,6 @@ ignore = [
     # TODO: rustls-webpki 0.101.7 CRL matching flaw; transitive via aws-smithy-http-client -> rustls 0.21. Remove once AWS SDK drops legacy rustls.
     "RUSTSEC-2026-0049",
     "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099"
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104"
 ]

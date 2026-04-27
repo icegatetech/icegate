@@ -262,3 +262,12 @@ fn strip_schema_metadata(df: DataFrame) -> datafusion::error::Result<DataFrame> 
 pub(crate) fn not_implemented(feature: &str) -> QueryError {
     QueryError::NotImplemented(format!("TraceQL feature not yet supported in planner v1: {feature}"))
 }
+
+/// Convenience: client-facing validation error (HTTP 400).
+///
+/// Used when the planner can prove a query is malformed or violates a
+/// documented constraint (e.g. `step < 1µs`) — distinct from
+/// [`not_implemented`], which is server-side and surfaces as 501.
+pub(crate) fn validation(msg: impl Into<String>) -> QueryError {
+    QueryError::Validation(msg.into())
+}

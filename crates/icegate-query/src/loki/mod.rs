@@ -21,9 +21,17 @@ use crate::engine::metadata_scan::MetadataScanConfig;
 /// Per-logs metadata-scan configuration.
 ///
 /// Lists the indexed label columns surfaced in `/labels`, the Grafana-
-/// compatible alias renames, and the high-cardinality attribute-map keys
-/// (`trace_id`, `span_id`) that should be hidden from `/labels` output.
-/// `/label_values` can still resolve these explicitly via the alias logic.
+/// compatible alias renames (`level`/`detected_level` → `severity_text`,
+/// `service` → `service_name`), and the high-cardinality attribute-map
+/// keys (`trace_id`, `span_id`) that should be hidden from `/labels`
+/// output to keep the dropdown manageable.
+///
+/// Note: `/label_values` resolution for `trace_id` / `span_id` is *not*
+/// handled by `label_aliases` — those only carry the three rename
+/// mappings above. Trace/span-ID values are surfaced via the
+/// `indexed_columns` set on [`LOGS_VALUES_METADATA_CONFIG`] (which
+/// references `LOG_INDEXED_ATTRIBUTE_COLUMNS`), so the `/label_values`
+/// endpoint can enumerate them while `/labels` keeps them hidden.
 const LOGS_METADATA_CONFIG: MetadataScanConfig = MetadataScanConfig {
     indexed_columns: LOG_SERIES_LABEL_COLUMNS,
     label_aliases: &[
@@ -37,12 +45,17 @@ const LOGS_METADATA_CONFIG: MetadataScanConfig = MetadataScanConfig {
 
 /// Indexed columns eligible for `/label_values` lookup on the logs table.
 ///
-/// Superset of the series-label columns: includes high-cardinality identifiers
-/// (`trace_id`, `span_id`) that are hidden from `/labels` but can still be
-/// enumerated via the explicit value endpoint.
+/// Superset of the series-label columns: includes high-cardinality
+/// identifiers (`trace_id`, `span_id`) that are hidden from `/labels`
+/// but can still be enumerated via the explicit value endpoint.
+///
+/// `label_aliases` and `map_column` are inherited from
+/// [`LOGS_METADATA_CONFIG`] so future updates to the alias list or the
+/// attribute-map column propagate automatically — only `indexed_columns`
+/// (broader here) and `excluded_map_keys` (empty here) differ.
 const LOGS_VALUES_METADATA_CONFIG: MetadataScanConfig = MetadataScanConfig {
     indexed_columns: icegate_common::schema::LOG_INDEXED_ATTRIBUTE_COLUMNS,
     label_aliases: LOGS_METADATA_CONFIG.label_aliases,
     excluded_map_keys: &[],
-    map_column: icegate_common::schema::COL_ATTRIBUTES,
+    map_column: LOGS_METADATA_CONFIG.map_column,
 };

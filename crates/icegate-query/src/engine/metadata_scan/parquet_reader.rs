@@ -322,22 +322,25 @@ pub async fn read_column_int_dictionaries(
             out.insert(0);
         }
 
-        // Try dictionary page first.
-        if let Some(dict_offset) = col_chunk.dictionary_page_offset() {
+        // Try dictionary page first. Compute the byte range from the
+        // dict-page offset → first-data-page offset; if either offset
+        // refuses to fit in `u64` we fall through to the stats path
+        // rather than abandoning the row group entirely (this is the
+        // same control flow as `dict_end <= dict_start` below).
+        let dict_range: Option<core::ops::Range<u64>> = col_chunk.dictionary_page_offset().and_then(|dict_offset| {
             let data_offset = col_chunk.data_page_offset();
-            let Ok(dict_start) = u64::try_from(dict_offset) else {
-                no_dict_no_stats += 1;
-                continue;
-            };
-            let Ok(dict_end) = u64::try_from(data_offset) else {
-                no_dict_no_stats += 1;
-                continue;
-            };
+            let dict_start = u64::try_from(dict_offset).ok()?;
+            let dict_end = u64::try_from(data_offset).ok()?;
             if dict_end > dict_start {
-                ranges.push(dict_start..dict_end);
-                selected_rgs.push(rg_idx);
-                continue;
+                Some(dict_start..dict_end)
+            } else {
+                None
             }
+        });
+        if let Some(range) = dict_range {
+            ranges.push(range);
+            selected_rgs.push(rg_idx);
+            continue;
         }
 
         // Fallback: row-group statistics. For fixed-width INT32 the
@@ -526,17 +529,17 @@ fn eval_range_ord<T: ?Sized + Ord>(op: PredicateOperator, min: Option<&T>, max: 
     use std::cmp::Ordering;
     match op {
         PredicateOperator::Eq => {
-            min.map_or(true, |mn| mn.cmp(value) != Ordering::Greater)
-                && max.map_or(true, |mx| mx.cmp(value) != Ordering::Less)
+            min.is_none_or(|mn| mn.cmp(value) != Ordering::Greater)
+                && max.is_none_or(|mx| mx.cmp(value) != Ordering::Less)
         }
         PredicateOperator::NotEq => match (min, max) {
             (Some(mn), Some(mx)) => !(mn.cmp(value) == Ordering::Equal && mx.cmp(value) == Ordering::Equal),
             _ => true,
         },
-        PredicateOperator::LessThan => min.map_or(true, |mn| mn.cmp(value) == Ordering::Less),
-        PredicateOperator::LessThanOrEq => min.map_or(true, |mn| mn.cmp(value) != Ordering::Greater),
-        PredicateOperator::GreaterThan => max.map_or(true, |mx| mx.cmp(value) == Ordering::Greater),
-        PredicateOperator::GreaterThanOrEq => max.map_or(true, |mx| mx.cmp(value) != Ordering::Less),
+        PredicateOperator::LessThan => min.is_none_or(|mn| mn.cmp(value) == Ordering::Less),
+        PredicateOperator::LessThanOrEq => min.is_none_or(|mn| mn.cmp(value) != Ordering::Greater),
+        PredicateOperator::GreaterThan => max.is_none_or(|mx| mx.cmp(value) == Ordering::Greater),
+        PredicateOperator::GreaterThanOrEq => max.is_none_or(|mx| mx.cmp(value) != Ordering::Less),
         _ => true,
     }
 }

@@ -369,9 +369,10 @@ fn parses_pipeline_avg_with_field() {
     let e = parse("{} | avg(duration)");
     if let TraceQLExpr::Pipeline(PipelineExpr::Search { stages, .. }) = e {
         assert_eq!(stages.len(), 1);
-        if let PipelineStage::Aggregate { op, arg } = &stages[0] {
+        if let PipelineStage::Aggregate { op, arg, percentile } = &stages[0] {
             assert_eq!(*op, AggregationOp::Avg);
             assert_eq!(*arg, Some(FieldRef::Intrinsic(IntrinsicField::Duration)));
+            assert_eq!(*percentile, None);
         } else {
             panic!("expected Aggregate stage");
         }

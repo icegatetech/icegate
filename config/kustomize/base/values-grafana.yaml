@@ -91,8 +91,9 @@ datasources:
             # user is actually after.
             spanStartTimeShift: -1h
             spanEndTimeShift: 1h
-            filterByTraceID: true
-            filterBySpanID: false
+            # `customQuery: true` means Grafana ignores `filterByTraceID` /
+            # `filterBySpanID` and uses the literal `query` template
+            # below instead, so we don't list those toggles.
             customQuery: true
             query: '{trace_id="$${__span.traceId}"}'
         secureJsonData:

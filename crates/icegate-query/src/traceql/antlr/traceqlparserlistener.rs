@@ -86,51 +86,65 @@ fn enter_metricsFunction(&mut self, _ctx: &MetricsFunctionContext<'input>) { }
  */
 fn exit_metricsFunction(&mut self, _ctx: &MetricsFunctionContext<'input>) { }
 /**
- * Enter a parse tree produced by the {@code SpansetParen}
- * labeled alternative in {@link TraceQLParser#spansetExpr}.
+ * Enter a parse tree produced by {@link TraceQLParser#spansetExpr}.
  * @param ctx the parse tree
  */
-fn enter_SpansetParen(&mut self, _ctx: &SpansetParenContext<'input>) { }
+fn enter_spansetExpr(&mut self, _ctx: &SpansetExprContext<'input>) { }
 /**
- * Exit a parse tree produced by the {@code SpansetParen}
- * labeled alternative in {@link TraceQLParser#spansetExpr}.
+ * Exit a parse tree produced by {@link TraceQLParser#spansetExpr}.
  * @param ctx the parse tree
  */
-fn exit_SpansetParen(&mut self, _ctx: &SpansetParenContext<'input>) { }
+fn exit_spansetExpr(&mut self, _ctx: &SpansetExprContext<'input>) { }
 /**
- * Enter a parse tree produced by the {@code SpansetLeaf}
- * labeled alternative in {@link TraceQLParser#spansetExpr}.
+ * Enter a parse tree produced by {@link TraceQLParser#spansetOr}.
  * @param ctx the parse tree
  */
-fn enter_SpansetLeaf(&mut self, _ctx: &SpansetLeafContext<'input>) { }
+fn enter_spansetOr(&mut self, _ctx: &SpansetOrContext<'input>) { }
 /**
- * Exit a parse tree produced by the {@code SpansetLeaf}
- * labeled alternative in {@link TraceQLParser#spansetExpr}.
+ * Exit a parse tree produced by {@link TraceQLParser#spansetOr}.
  * @param ctx the parse tree
  */
-fn exit_SpansetLeaf(&mut self, _ctx: &SpansetLeafContext<'input>) { }
+fn exit_spansetOr(&mut self, _ctx: &SpansetOrContext<'input>) { }
 /**
- * Enter a parse tree produced by the {@code SpansetBinary}
- * labeled alternative in {@link TraceQLParser#spansetExpr}.
+ * Enter a parse tree produced by {@link TraceQLParser#spansetAnd}.
  * @param ctx the parse tree
  */
-fn enter_SpansetBinary(&mut self, _ctx: &SpansetBinaryContext<'input>) { }
+fn enter_spansetAnd(&mut self, _ctx: &SpansetAndContext<'input>) { }
 /**
- * Exit a parse tree produced by the {@code SpansetBinary}
- * labeled alternative in {@link TraceQLParser#spansetExpr}.
+ * Exit a parse tree produced by {@link TraceQLParser#spansetAnd}.
  * @param ctx the parse tree
  */
-fn exit_SpansetBinary(&mut self, _ctx: &SpansetBinaryContext<'input>) { }
+fn exit_spansetAnd(&mut self, _ctx: &SpansetAndContext<'input>) { }
 /**
- * Enter a parse tree produced by {@link TraceQLParser#spansetOp}.
+ * Enter a parse tree produced by {@link TraceQLParser#spansetRel}.
  * @param ctx the parse tree
  */
-fn enter_spansetOp(&mut self, _ctx: &SpansetOpContext<'input>) { }
+fn enter_spansetRel(&mut self, _ctx: &SpansetRelContext<'input>) { }
 /**
- * Exit a parse tree produced by {@link TraceQLParser#spansetOp}.
+ * Exit a parse tree produced by {@link TraceQLParser#spansetRel}.
  * @param ctx the parse tree
  */
-fn exit_spansetOp(&mut self, _ctx: &SpansetOpContext<'input>) { }
+fn exit_spansetRel(&mut self, _ctx: &SpansetRelContext<'input>) { }
+/**
+ * Enter a parse tree produced by {@link TraceQLParser#spansetPrimary}.
+ * @param ctx the parse tree
+ */
+fn enter_spansetPrimary(&mut self, _ctx: &SpansetPrimaryContext<'input>) { }
+/**
+ * Exit a parse tree produced by {@link TraceQLParser#spansetPrimary}.
+ * @param ctx the parse tree
+ */
+fn exit_spansetPrimary(&mut self, _ctx: &SpansetPrimaryContext<'input>) { }
+/**
+ * Enter a parse tree produced by {@link TraceQLParser#spansetRelOp}.
+ * @param ctx the parse tree
+ */
+fn enter_spansetRelOp(&mut self, _ctx: &SpansetRelOpContext<'input>) { }
+/**
+ * Exit a parse tree produced by {@link TraceQLParser#spansetRelOp}.
+ * @param ctx the parse tree
+ */
+fn exit_spansetRelOp(&mut self, _ctx: &SpansetRelOpContext<'input>) { }
 /**
  * Enter a parse tree produced by {@link TraceQLParser#spanSelector}.
  * @param ctx the parse tree

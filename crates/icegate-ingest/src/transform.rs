@@ -523,14 +523,20 @@ pub fn spans_to_record_batch(
                 // Resource attributes go to `resource_attributes`.
                 add_flattened_attributes_dotted(resource_attrs, &mut resource_attrs_builder);
 
-                // Scope + span attributes fold into `span_attributes`. Arrow
-                // `MapBuilder` preserves insertion order and downstream readers
-                // resolve duplicate keys within a row as last-write-wins, so
-                // writing scope first and span second makes span.* shadow
-                // scope.* on any key collision — the spec-mandated behaviour.
+                // Scope + span attributes fold into `span_attributes` with
+                // explicit per-span de-duplication: insertion order into a
+                // `MapBuilder` is preserved, but downstream `MAP<K,V>`
+                // readers vary on duplicate-key resolution (some surface
+                // both, some last-write-wins). We avoid relying on
+                // reader-specific semantics by merging into a HashMap
+                // first — scope first, then span — so span attrs win on
+                // collision and we emit at most one entry per key.
                 let scope_attrs = scope_spans.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
-                add_flattened_attributes_dotted(scope_attrs, &mut span_attrs_builder);
-                add_flattened_attributes_dotted(&span.attributes, &mut span_attrs_builder);
+                let merged_span_attrs = merge_dotted_attributes(scope_attrs, &span.attributes);
+                for (key, value) in &merged_span_attrs {
+                    span_attrs_builder.keys().append_value(key);
+                    span_attrs_builder.values().append_value(value);
+                }
 
                 resource_attrs_builder
                     .append(true)
@@ -941,6 +947,38 @@ fn add_flattened_attributes_dotted(
             attributes_builder.values().append_value(value);
         }
     }
+}
+
+/// Merge scope and span attributes into a single deduplicated, sorted
+/// key→value map.
+///
+/// Scope attributes are inserted first; span attributes overwrite on
+/// collision so span-level metadata always wins over the (broader)
+/// scope-level metadata — matching the `OTel` data model where span
+/// attributes describe the operation and scope attributes describe the
+/// instrumentation library that produced it.
+///
+/// Returning a [`std::collections::BTreeMap`] guarantees a single entry
+/// per key (so downstream `MAP<K,V>` readers can't disagree on which
+/// duplicate to surface) and gives a deterministic on-disk attribute
+/// order for reproducible parquet output.
+fn merge_dotted_attributes(
+    scope_attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+    span_attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+) -> std::collections::BTreeMap<String, String> {
+    let mut merged: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for kv in scope_attrs {
+        for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
+            merged.insert(key, value);
+        }
+    }
+    // Span attributes overwrite any scope-level entry with the same key.
+    for kv in span_attrs {
+        for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
+            merged.insert(key, value);
+        }
+    }
+    merged
 }
 
 /// Processes trace and span IDs, returning hex-encoded values if valid.

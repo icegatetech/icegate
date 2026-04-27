@@ -80,7 +80,7 @@ impl AntlrParser {
 }
 
 impl Parser for AntlrParser {
-    #[tracing::instrument(skip(self), fields(query))]
+    #[tracing::instrument(skip(self), fields(query = %query))]
     fn parse(&self, query: &str) -> Result<TraceQLExpr> {
         let input = InputStream::new(query);
         let mut lexer = TraceQLLexer::new(input);

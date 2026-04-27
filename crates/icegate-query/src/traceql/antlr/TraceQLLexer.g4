@@ -34,7 +34,10 @@ NOT_DESC     : '!>>' ;
 NOT_ANC      : '!<<' ;
 NOT_CHILD    : '!>' ;
 NOT_PARENT   : '!<' ;
-NOT_SIBLING  : '!~' ;       // overlaps NEQ_RE — disambiguated by parser context
+// `!~` is tokenised as NEQ_RE (defined above with the comparison
+// operators) and re-used in the `spansetOp` parser rule for the
+// not-sibling structural relation. ANTLR resolves duplicates by first
+// definition, so a separate NOT_SIBLING token would always be shadowed.
 
 // =====================================================================
 // Boolean operators
@@ -118,8 +121,12 @@ BYTES
     : DIGIT+ ('.' DIGIT+)? ('KB' | 'MB' | 'GB' | 'TB' | 'PB' | 'KiB' | 'MiB' | 'GiB' | 'TiB' | 'PiB' | 'B')
     ;
 
-FLOAT  : '-'? DIGIT+ '.' DIGIT+ ;
-INT    : '-'? DIGIT+ ;
+// Numeric literals are unsigned at the lexer level: a leading `-` becomes
+// the standalone MINUS token so `5-3` tokenizes as `INT(5) MINUS INT(3)`
+// instead of `INT(5) INT(-3)`. Negative literals are produced at the
+// parser level via unary `MINUS` in front of the FLOAT/INT terminal.
+FLOAT  : DIGIT+ '.' DIGIT+ ;
+INT    : DIGIT+ ;
 STRING : '"' (~["\\] | '\\' .)* '"' | '\'' (~['\\] | '\\' .)* '\'' ;
 
 // IDENT allows internal hyphens to match common service / attribute names

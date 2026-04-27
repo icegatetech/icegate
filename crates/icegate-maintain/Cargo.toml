@@ -42,7 +42,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+icegate-common = { workspace = true, features = ["testing"] }
 testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
-aws-config = { workspace = true }
-aws-sdk-s3 = { workspace = true }

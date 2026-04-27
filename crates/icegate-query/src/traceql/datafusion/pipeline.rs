@@ -13,7 +13,7 @@ use datafusion::{
 };
 use icegate_common::schema::COL_TRACE_ID;
 
-use super::planner::not_implemented;
+use super::planner::{not_implemented, validation};
 use crate::{
     error::Result,
     traceql::{
@@ -43,13 +43,19 @@ pub fn apply_search_pipeline(mut df: DataFrame, stages: &[PipelineStage], _ctx: 
     for stage in stages {
         match stage {
             PipelineStage::By(GroupingKeys { keys }) => {
-                group_keys = keys.iter().map(field_ref_to_group_key).collect();
+                group_keys = keys.iter().map(field_ref_to_group_key).collect::<Result<Vec<_>>>()?;
             }
-            PipelineStage::Aggregate { op, arg } => {
-                df = apply_aggregate(df, &group_keys, *op, arg.as_ref())?;
+            PipelineStage::Aggregate { op, arg, percentile } => {
+                df = apply_aggregate(df, &group_keys, *op, arg.as_ref(), *percentile)?;
             }
-            PipelineStage::AggregateFilter { op, arg, cmp, value } => {
-                df = apply_aggregate(df, &group_keys, *op, arg.as_ref())?;
+            PipelineStage::AggregateFilter {
+                op,
+                arg,
+                percentile,
+                cmp,
+                value,
+            } => {
+                df = apply_aggregate(df, &group_keys, *op, arg.as_ref(), *percentile)?;
                 df = apply_aggregate_filter(df, *op, *cmp, value)?;
             }
         }
@@ -61,17 +67,17 @@ pub fn apply_search_pipeline(mut df: DataFrame, stages: &[PipelineStage], _ctx: 
 /// Convert a `FieldRef` into the `DataFusion` `Expr` used as a `GROUP BY`
 /// key.
 ///
-/// Intrinsics are resolved through [`super::selectors_intrinsic_column`]
+/// Intrinsics are resolved through [`super::intrinsic_column`]
 /// (with `trace_id` short-circuited to a plain column reference for clarity);
 /// attributes are resolved through [`group_key_for_attribute`] which picks
 /// the right map column per scope.
-pub(crate) fn field_ref_to_group_key(field: &FieldRef) -> Expr {
-    match field {
+pub(crate) fn field_ref_to_group_key(field: &FieldRef) -> Result<Expr> {
+    Ok(match field {
         // Short-circuit the common case so the optimizer sees a plain column ref.
         FieldRef::Intrinsic(IntrinsicField::TraceID) => col(COL_TRACE_ID),
-        FieldRef::Intrinsic(other) => super::selectors_intrinsic_column(*other),
-        FieldRef::Attribute { scope, name } => group_key_for_attribute(*scope, name),
-    }
+        FieldRef::Intrinsic(other) => super::intrinsic_column(*other),
+        FieldRef::Attribute { scope, name } => group_key_for_attribute(*scope, name)?,
+    })
 }
 
 /// Pick a single value expression for GROUP BY when grouping by an attribute.
@@ -81,20 +87,32 @@ pub(crate) fn field_ref_to_group_key(field: &FieldRef) -> Expr {
 /// key present in both maps with different values) produces the resource
 /// value, which matches `OTel` Semantic Conventions (resource attrs are the
 /// more stable identity).
-fn group_key_for_attribute(scope: Scope, name: &str) -> Expr {
-    match scope {
-        Scope::Resource | Scope::Parent(ParentScope::Resource) => super::selectors_resource_attribute_lhs(name),
-        Scope::Span | Scope::Parent(ParentScope::Span) => super::selectors_span_attribute_lhs(name),
+///
+/// `Scope::Event` / `Scope::Link` raise `NotImplemented`: returning a
+/// NULL literal would silently collapse every row into a single group,
+/// which is worse than a clear server-side error.
+fn group_key_for_attribute(scope: Scope, name: &str) -> Result<Expr> {
+    Ok(match scope {
+        Scope::Resource | Scope::Parent(ParentScope::Resource) => super::resource_attribute_lhs(name),
+        Scope::Span | Scope::Parent(ParentScope::Span) => super::span_attribute_lhs(name),
         Scope::Any => coalesce(vec![
-            super::selectors_resource_attribute_lhs(name),
-            super::selectors_span_attribute_lhs(name),
+            super::resource_attribute_lhs(name),
+            super::span_attribute_lhs(name),
         ]),
-        Scope::Event | Scope::Link => lit(ScalarValue::Utf8(None)),
-    }
+        Scope::Event | Scope::Link => {
+            return Err(not_implemented("grouping by event/link attributes"));
+        }
+    })
 }
 
 /// Build and apply a single aggregation over `df`.
-fn apply_aggregate(df: DataFrame, group_keys: &[Expr], op: AggregationOp, arg: Option<&FieldRef>) -> Result<DataFrame> {
+fn apply_aggregate(
+    df: DataFrame,
+    group_keys: &[Expr],
+    op: AggregationOp,
+    arg: Option<&FieldRef>,
+    percentile: Option<f64>,
+) -> Result<DataFrame> {
     let agg_alias = format!("__agg_{}", op.as_str());
     let agg_expr: Expr = match op {
         AggregationOp::Count => count(lit(1_i64)).alias(agg_alias),
@@ -102,7 +120,21 @@ fn apply_aggregate(df: DataFrame, group_keys: &[Expr], op: AggregationOp, arg: O
         AggregationOp::Avg => avg(field_arg_expr(arg)?).alias(agg_alias),
         AggregationOp::Min => min(field_arg_expr(arg)?).alias(agg_alias),
         AggregationOp::Max => max(field_arg_expr(arg)?).alias(agg_alias),
-        AggregationOp::Quantile => return Err(not_implemented("quantile_over_time")),
+        AggregationOp::Quantile => {
+            let p = percentile
+                .ok_or_else(|| validation("quantile_over_time(.field, p) requires a percentile literal in [0, 1]"))?;
+            // `approx_percentile_cont` takes a `Sort` for the first arg
+            // (the value to estimate the percentile over). Order doesn't
+            // matter for percentile estimation — the t-digest is
+            // associative — so we sort ascending with nulls last for
+            // deterministic explain output.
+            datafusion::functions_aggregate::approx_percentile_cont::approx_percentile_cont(
+                field_arg_expr(arg)?.sort(true, false),
+                lit(p),
+                None,
+            )
+            .alias(agg_alias)
+        }
     };
     Ok(df.aggregate(group_keys.to_vec(), vec![agg_expr])?)
 }
@@ -134,11 +166,14 @@ fn apply_aggregate_filter(
 /// Resolve the field argument required by `sum/avg/min/max` to a column expr.
 fn field_arg_expr(arg: Option<&FieldRef>) -> Result<Expr> {
     let Some(field) = arg else {
-        return Err(not_implemented("aggregation requires argument"));
+        // Caller-side mistake (e.g. `sum()` with no arg) — surface as 400.
+        return Err(validation(
+            "aggregation `sum / avg / min / max` requires a field argument",
+        ));
     };
     Ok(match field {
-        FieldRef::Intrinsic(i) => super::selectors_intrinsic_column(*i),
-        FieldRef::Attribute { scope, name } => group_key_for_attribute(*scope, name),
+        FieldRef::Intrinsic(i) => super::intrinsic_column(*i),
+        FieldRef::Attribute { scope, name } => group_key_for_attribute(*scope, name)?,
     })
 }
 

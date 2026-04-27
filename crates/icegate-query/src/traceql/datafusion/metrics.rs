@@ -17,7 +17,7 @@ use datafusion::{
 };
 use icegate_common::schema::COL_TIMESTAMP;
 
-use super::planner::not_implemented;
+use super::planner::{not_implemented, validation};
 use crate::{
     error::Result,
     traceql::{
@@ -66,7 +66,7 @@ pub fn apply_metrics(
     for stage in prelude {
         if let PipelineStage::By(GroupingKeys { keys }) = stage {
             for k in keys {
-                group_keys.push(super::pipeline_field_ref_to_group_key(k));
+                group_keys.push(super::field_ref_to_group_key(k)?);
             }
         } else {
             return Err(not_implemented("metrics-mode prelude stage other than `by`"));
@@ -74,7 +74,7 @@ pub fn apply_metrics(
     }
     if let Some(g) = group_by {
         for k in &g.keys {
-            group_keys.push(super::pipeline_field_ref_to_group_key(k));
+            group_keys.push(super::field_ref_to_group_key(k)?);
         }
     }
 
@@ -110,6 +110,15 @@ pub fn apply_metrics(
 /// result is i64 micros — a deterministic, integer-arithmetic alternative
 /// to a `date_grid` UDF for v1.
 fn time_bucket_expr(step_ns: i64) -> Result<Expr> {
+    // The bucket expression is `(ts / step) * step` so a zero step
+    // produces a runtime divide-by-zero — surface a 400 instead.
+    // Sub-microsecond steps are also rejected: we operate on µs-precision
+    // timestamps, so they would silently round to zero in integer math.
+    if step_ns < 1_000 {
+        return Err(validation(format!(
+            "step must be at least 1µs (got {step_ns}ns); use a larger `step` query parameter"
+        )));
+    }
     let step_micros = step_ns / 1_000;
     let schema = DFSchema::empty();
     // Cast Timestamp(Microsecond) to Int64 micros so integer arithmetic works

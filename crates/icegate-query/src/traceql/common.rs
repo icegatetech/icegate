@@ -163,59 +163,57 @@ pub enum LiteralValue {
 }
 
 /// Span status enum literal.
+///
+/// `#[repr(i32)]` pins the discriminants to the OTLP `Status.code` enum
+/// used by the spans schema (`status_code` column), so [`Self::otlp_code`]
+/// can derive the encoding via a cast instead of a hand-maintained match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
 pub enum StatusValue {
-    /// `ok`
-    Ok,
-    /// `error`
-    Error,
     /// `unset`
-    Unset,
+    Unset = 0,
+    /// `ok`
+    Ok = 1,
+    /// `error`
+    Error = 2,
 }
 
 impl StatusValue {
     /// Numeric encoding matching the OTLP `Status.code` enum used in the
     /// spans schema (`status_code` column).
     #[must_use]
-    pub const fn otlp_code(&self) -> i32 {
-        match self {
-            Self::Unset => 0,
-            Self::Ok => 1,
-            Self::Error => 2,
-        }
+    pub const fn otlp_code(self) -> i32 {
+        self as i32
     }
 }
 
 /// Span kind enum literal.
+///
+/// `#[repr(i32)]` pins the discriminants to the OTLP `SpanKind` enum
+/// used by the spans schema (`kind` column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
 pub enum KindValue {
     /// Unspecified kind.
-    Unspecified,
+    Unspecified = 0,
     /// `internal`
-    Internal,
+    Internal = 1,
     /// `server`
-    Server,
+    Server = 2,
     /// `client`
-    Client,
+    Client = 3,
     /// `producer`
-    Producer,
+    Producer = 4,
     /// `consumer`
-    Consumer,
+    Consumer = 5,
 }
 
 impl KindValue {
     /// Numeric encoding matching the OTLP `SpanKind` enum used in the
     /// spans schema (`kind` column).
     #[must_use]
-    pub const fn otlp_code(&self) -> i32 {
-        match self {
-            Self::Unspecified => 0,
-            Self::Internal => 1,
-            Self::Server => 2,
-            Self::Client => 3,
-            Self::Producer => 4,
-            Self::Consumer => 5,
-        }
+    pub const fn otlp_code(self) -> i32 {
+        self as i32
     }
 }
 
@@ -254,7 +252,11 @@ mod tests {
 
     #[test]
     fn kind_otlp_code_matches_otlp_spec() {
+        assert_eq!(KindValue::Unspecified.otlp_code(), 0);
+        assert_eq!(KindValue::Internal.otlp_code(), 1);
         assert_eq!(KindValue::Server.otlp_code(), 2);
         assert_eq!(KindValue::Client.otlp_code(), 3);
+        assert_eq!(KindValue::Producer.otlp_code(), 4);
+        assert_eq!(KindValue::Consumer.otlp_code(), 5);
     }
 }

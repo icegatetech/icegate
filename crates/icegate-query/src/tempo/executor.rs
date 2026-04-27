@@ -58,7 +58,11 @@ pub async fn execute(
     let end = params.end.as_deref().map_or(Ok(now), parse_time).map_err(TempoError::new)?;
     validation::validate_query_window(start, end).map_err(TempoError::new)?;
 
-    // ----- duration filters: reject loudly until the planner consumes them -----
+    // ----- duration filters: validate format first, then reject as not-yet-implemented -----
+    // Validate before the NotImplemented short-circuit so malformed values
+    // surface as 400 (caller error) rather than being masked by the 501.
+    validate_duration_param("minDuration", params.min_duration.as_deref())?;
+    validate_duration_param("maxDuration", params.max_duration.as_deref())?;
     if params.min_duration.is_some() || params.max_duration.is_some() {
         return Err(TempoError::new(QueryError::NotImplemented(
             "minDuration / maxDuration are accepted by the API but not yet \
@@ -67,11 +71,6 @@ pub async fn execute(
                 .to_string(),
         )));
     }
-    // Eagerly validate the duration parameters so that if a caller starts
-    // sending them once the planner supports them, we don't ship a regression
-    // where malformed values silently parse to None.
-    let _min_duration_check = params.min_duration.as_deref().and_then(parse_duration_opt);
-    let _max_duration_check = params.max_duration.as_deref().and_then(parse_duration_opt);
 
     // ----- spans-per-spanset cap -----
     // `spss=0` disables the per-trace span cap (matches upstream Tempo).
@@ -122,6 +121,14 @@ pub async fn execute(
     .map_err(join_error)?;
     let expr = parse_result.map_err(TempoError::new)?;
 
+    // Reject metrics-mode queries on the search endpoint: the planner accepts them but
+    // `spansets_to_search_response` only knows how to format spanset RecordBatches.
+    if expr.is_metrics() {
+        return Err(TempoError::new(QueryError::Validation(
+            "metrics-mode queries are not supported on /api/search; use the metrics endpoint".to_string(),
+        )));
+    }
+
     let session = engine.create_session().await.map_err(TempoError::new)?;
     let planner = DataFusionPlanner::new(session, qctx);
     let df = planner.plan(expr).await.map_err(TempoError::new)?;
@@ -161,6 +168,25 @@ pub(super) fn make_query_error_send(err: QueryError) -> QueryError {
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn join_error(e: tokio::task::JoinError) -> TempoError {
     TempoError::new(QueryError::Internal(format!("task panicked: {e}")))
+}
+
+/// Validate the format of an optional duration query parameter without
+/// consuming it. Returns an HTTP 400 (`Validation`) when the value is
+/// present but cannot be parsed as a `TraceQL` duration literal.
+///
+/// `None` and well-formed inputs both succeed silently. Used to prove
+/// that malformed `minDuration` / `maxDuration` values fail loudly even
+/// while the planner still rejects the *feature* with a 501 below.
+fn validate_duration_param(name: &str, value: Option<&str>) -> TempoResult<()> {
+    let Some(text) = value else {
+        return Ok(());
+    };
+    if parse_duration_opt(text).is_some() {
+        return Ok(());
+    }
+    Err(TempoError::new(QueryError::Validation(format!(
+        "invalid {name} format: {text:?} (expected TraceQL duration literal, e.g. `5s`, `100ms`)"
+    ))))
 }
 
 /// Parse a Tempo time parameter.
