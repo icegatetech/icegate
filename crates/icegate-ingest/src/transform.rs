@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringBuilder, TimestampMicrosecondArray},
+    array::{ArrayBuilder, ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringBuilder, TimestampMicrosecondArray},
     datatypes::{DataType, Schema},
 };
 use iceberg::arrow::schema_to_arrow_schema;
@@ -30,6 +30,22 @@ use opentelemetry_proto::tonic::{
 pub fn logs_arrow_schema() -> Schema {
     let iceberg_schema = icegate_common::schema::logs_schema().expect("logs_schema should always be valid");
     schema_to_arrow_schema(&iceberg_schema).expect("schema conversion should succeed")
+}
+
+/// Returns the Arrow schema for spans, derived from the Iceberg spans schema.
+///
+/// Uses `icegate_common::schema::spans_schema()` as the source of truth
+/// and converts it to Arrow format using
+/// `iceberg::arrow::schema_to_arrow_schema()`.
+///
+/// # Panics
+///
+/// Panics if the Iceberg schema cannot be created or converted to Arrow.
+/// This should never happen in practice as the schema is statically defined.
+#[allow(clippy::expect_used)]
+pub fn spans_arrow_schema() -> Schema {
+    let iceberg_schema = icegate_common::schema::spans_schema().expect("spans_schema should always be valid");
+    schema_to_arrow_schema(&iceberg_schema).expect("spans schema conversion should succeed")
 }
 
 /// Transforms an OTLP logs export request to an Arrow `RecordBatch`.
@@ -223,6 +239,464 @@ pub fn logs_to_record_batch(
     })
 }
 
+/// Transforms an OTLP traces export request to an Arrow `RecordBatch`.
+///
+/// Extracts all spans from the request, validating `trace_id` (16 bytes,
+/// non-zero) and `span_id` (8 bytes, non-zero) per span. Invalid spans are
+/// dropped silently and counted in the second return value so the caller
+/// can surface partial-success metrics.
+///
+/// Produces every column in the spans schema: top-level fields, the merged
+/// attributes map (resource + scope + span attributes plus indexed-column
+/// duplicates), and the nested `events` / `links` `List<Struct>` arrays.
+/// Links with invalid `trace_id` / `span_id` are dropped from the list and
+/// counted into the parent span's `dropped_links_count`.
+///
+/// # Arguments
+///
+/// * `request` - The OTLP export traces request
+/// * `tenant_id` - Tenant identifier (from request metadata or default)
+///
+/// # Returns
+///
+/// `(Some(batch), drops)` if at least one span is valid, or
+/// `(None, drops)` if zero valid spans remain.
+///
+/// # Errors
+///
+/// Returns `IngestError` if schema validation or `RecordBatch` creation fails.
+#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::too_many_lines)]
+#[tracing::instrument(skip(request))]
+pub fn spans_to_record_batch(
+    request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+    tenant_id: Option<&str>,
+) -> crate::error::Result<(Option<RecordBatch>, usize)> {
+    use arrow::array::{Int32Builder, Int64Array, ListBuilder, StructBuilder, TimestampMicrosecondBuilder};
+
+    let ingested_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_micros() as i64;
+
+    let total_spans: usize = request
+        .resource_spans
+        .iter()
+        .flat_map(|rs| &rs.scope_spans)
+        .map(|ss| ss.spans.len())
+        .sum();
+
+    if total_spans == 0 {
+        return Ok((None, 0));
+    }
+
+    let schema = spans_arrow_schema();
+    let (attr_key_field, attr_value_field) = extract_map_fields_from_schema_named(&schema, "attributes")?;
+
+    // Top-level column builders. Events and links are written as all-null
+    // placeholders; Tasks 14 and 15 replace these with real list builders.
+    let mut tenant_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
+    let mut cloud_account_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
+    let mut service_name_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
+    let mut trace_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
+    let mut span_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
+    let mut parent_span_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
+    let mut timestamp_builder: Vec<i64> = Vec::with_capacity(total_spans);
+    let mut end_timestamp_builder: Vec<i64> = Vec::with_capacity(total_spans);
+    let mut ingested_timestamp_builder: Vec<i64> = Vec::with_capacity(total_spans);
+    let mut duration_micros_builder: Vec<i64> = Vec::with_capacity(total_spans);
+    let mut trace_state_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
+    let mut name_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
+    let mut kind_builder = Int32Builder::with_capacity(total_spans);
+    let mut status_code_builder = Int32Builder::with_capacity(total_spans);
+    let mut status_message_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
+    let mut attributes_builder = MapBuilder::new(
+        Some(MapFieldNames {
+            entry: "key_value".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        }),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    )
+    .with_keys_field(attr_key_field)
+    .with_values_field(attr_value_field);
+    let mut flags_builder = Int32Builder::with_capacity(total_spans);
+    let mut dropped_attributes_count_builder = Int32Builder::with_capacity(total_spans);
+    let mut dropped_events_count_builder = Int32Builder::with_capacity(total_spans);
+    let mut dropped_links_count_builder = Int32Builder::with_capacity(total_spans);
+
+    // Events list<struct> builder: struct fields (in schema order) are
+    // (timestamp, name, attributes: Map<Utf8,Utf8>, dropped_attributes_count).
+    let events_field = schema.field_with_name("events").expect("events field").clone();
+    let events_element_field = match events_field.data_type() {
+        DataType::List(inner) => inner.clone(),
+        _ => {
+            return Err(crate::error::IngestError::Validation("events must be List".into()));
+        }
+    };
+    let event_struct_fields = match events_element_field.data_type() {
+        DataType::Struct(fs) => fs.clone(),
+        _ => {
+            return Err(crate::error::IngestError::Validation(
+                "events element must be Struct".into(),
+            ));
+        }
+    };
+    let (event_attr_key_field, event_attr_value_field) =
+        extract_map_fields_from_nested_struct(&event_struct_fields, "attributes")?;
+
+    let mut events_builder = ListBuilder::new(StructBuilder::new(
+        event_struct_fields.iter().cloned().collect::<Vec<_>>(),
+        vec![
+            Box::new(TimestampMicrosecondBuilder::new()) as Box<dyn ArrayBuilder>,
+            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+            Box::new(
+                MapBuilder::new(
+                    Some(MapFieldNames {
+                        entry: "key_value".to_string(),
+                        key: "key".to_string(),
+                        value: "value".to_string(),
+                    }),
+                    StringBuilder::new(),
+                    StringBuilder::new(),
+                )
+                .with_keys_field(event_attr_key_field)
+                .with_values_field(event_attr_value_field),
+            ) as Box<dyn ArrayBuilder>,
+            Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
+        ],
+    ))
+    .with_field(events_element_field);
+
+    // Links list<struct> builder: struct fields (in schema order) are
+    // (trace_id, span_id, trace_state?, attributes: Map, dropped_attributes_count, flags?).
+    let links_field = schema.field_with_name("links").expect("links field").clone();
+    let links_element_field = match links_field.data_type() {
+        DataType::List(inner) => inner.clone(),
+        _ => {
+            return Err(crate::error::IngestError::Validation("links must be List".into()));
+        }
+    };
+    let link_struct_fields = match links_element_field.data_type() {
+        DataType::Struct(fs) => fs.clone(),
+        _ => {
+            return Err(crate::error::IngestError::Validation(
+                "links element must be Struct".into(),
+            ));
+        }
+    };
+    let (link_attr_key_field, link_attr_value_field) =
+        extract_map_fields_from_nested_struct(&link_struct_fields, "attributes")?;
+
+    let mut links_builder = ListBuilder::new(StructBuilder::new(
+        link_struct_fields.iter().cloned().collect::<Vec<_>>(),
+        vec![
+            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>, // trace_id
+            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>, // span_id
+            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>, // trace_state (nullable)
+            Box::new(
+                MapBuilder::new(
+                    Some(MapFieldNames {
+                        entry: "key_value".to_string(),
+                        key: "key".to_string(),
+                        value: "value".to_string(),
+                    }),
+                    StringBuilder::new(),
+                    StringBuilder::new(),
+                )
+                .with_keys_field(link_attr_key_field)
+                .with_values_field(link_attr_value_field),
+            ) as Box<dyn ArrayBuilder>,
+            Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>, // dropped_attributes_count
+            Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>, // flags (nullable)
+        ],
+    ))
+    .with_field(links_element_field);
+
+    let tenant = tenant_id.unwrap_or(DEFAULT_TENANT_ID);
+    let empty_attrs: Vec<opentelemetry_proto::tonic::common::v1::KeyValue> = Vec::new();
+    let mut drops: usize = 0;
+
+    for resource_spans in &request.resource_spans {
+        let resource_attrs = resource_spans.resource.as_ref().map_or(&empty_attrs, |r| &r.attributes);
+        let service_name = resource_attrs
+            .iter()
+            .find(|kv| kv.key == "service.name")
+            .and_then(|kv| extract_string_value(kv.value.as_ref()));
+        let cloud_account_id = resource_attrs
+            .iter()
+            .find(|kv| kv.key == "cloud.account.id")
+            .and_then(|kv| extract_string_value(kv.value.as_ref()));
+
+        for scope_spans in &resource_spans.scope_spans {
+            for span in &scope_spans.spans {
+                if span.trace_id.len() != 16 || is_zero_bytes(&span.trace_id) {
+                    drops += 1;
+                    continue;
+                }
+                if span.span_id.len() != 8 || is_zero_bytes(&span.span_id) {
+                    drops += 1;
+                    continue;
+                }
+
+                // Tracks how many links were dropped during transform (invalid
+                // trace_id/span_id). Added to span.dropped_links_count so the
+                // caller sees a faithful total.
+                let mut extra_dropped_links: i32 = 0;
+
+                tenant_id_builder.append_value(tenant);
+                match cloud_account_id.as_deref() {
+                    Some(acc) => cloud_account_id_builder.append_value(acc),
+                    None => cloud_account_id_builder.append_null(),
+                }
+                match service_name.as_deref() {
+                    Some(svc) => service_name_builder.append_value(svc),
+                    None => service_name_builder.append_null(),
+                }
+
+                trace_id_builder.append_value(hex::encode(&span.trace_id));
+                span_id_builder.append_value(hex::encode(&span.span_id));
+                if span.parent_span_id.len() == 8 && !is_zero_bytes(&span.parent_span_id) {
+                    parent_span_id_builder.append_value(hex::encode(&span.parent_span_id));
+                } else {
+                    parent_span_id_builder.append_null();
+                }
+
+                let start_micros = (span.start_time_unix_nano / 1000) as i64;
+                let end_micros = (span.end_time_unix_nano / 1000) as i64;
+                timestamp_builder.push(start_micros);
+                end_timestamp_builder.push(end_micros);
+                ingested_timestamp_builder.push(ingested_timestamp);
+                duration_micros_builder.push((end_micros - start_micros).max(0));
+
+                if span.trace_state.is_empty() {
+                    trace_state_builder.append_null();
+                } else {
+                    trace_state_builder.append_value(&span.trace_state);
+                }
+                name_builder.append_value(&span.name);
+
+                if span.kind == 0 {
+                    kind_builder.append_null();
+                } else {
+                    kind_builder.append_value(span.kind);
+                }
+
+                match span.status.as_ref() {
+                    Some(status) => {
+                        if status.code == 0 {
+                            status_code_builder.append_null();
+                        } else {
+                            status_code_builder.append_value(status.code);
+                        }
+                        if status.message.is_empty() {
+                            status_message_builder.append_null();
+                        } else {
+                            status_message_builder.append_value(&status.message);
+                        }
+                    }
+                    None => {
+                        status_code_builder.append_null();
+                        status_message_builder.append_null();
+                    }
+                }
+
+                // Resource + scope + span-level attributes, flattened with dot separator.
+                add_flattened_attributes_dotted(resource_attrs, &mut attributes_builder);
+                let scope_attrs = scope_spans.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
+                add_flattened_attributes_dotted(scope_attrs, &mut attributes_builder);
+                add_flattened_attributes_dotted(&span.attributes, &mut attributes_builder);
+
+                // Indexed column duplication — schema-column-name keys (underscore form).
+                duplicate_span_indexed_columns(
+                    &mut attributes_builder,
+                    service_name.as_deref(),
+                    cloud_account_id.as_deref(),
+                    &span.trace_id,
+                    &span.span_id,
+                    &span.parent_span_id,
+                    span.kind,
+                    span.status.as_ref().map(|s| s.code),
+                    &span.name,
+                );
+
+                attributes_builder.append(true).expect("append attributes map entry");
+
+                // Events list<struct>: one row per parent span.
+                {
+                    let struct_builder = events_builder.values();
+                    for event in &span.events {
+                        struct_builder
+                            .field_builder::<TimestampMicrosecondBuilder>(0)
+                            .expect("event timestamp builder")
+                            .append_value((event.time_unix_nano / 1000) as i64);
+                        struct_builder
+                            .field_builder::<StringBuilder>(1)
+                            .expect("event name builder")
+                            .append_value(&event.name);
+                        let attr_b = struct_builder
+                            .field_builder::<MapBuilder<StringBuilder, StringBuilder>>(2)
+                            .expect("event attrs builder");
+                        for kv in &event.attributes {
+                            for (k, v) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
+                                attr_b.keys().append_value(&k);
+                                attr_b.values().append_value(v);
+                            }
+                        }
+                        attr_b.append(true).expect("append event attrs map");
+                        struct_builder
+                            .field_builder::<Int32Builder>(3)
+                            .expect("event dropped count builder")
+                            .append_value(u32_count_to_i32(
+                                event.dropped_attributes_count,
+                                "event.dropped_attributes_count",
+                            )?);
+                        struct_builder.append(true);
+                    }
+                    events_builder.append(true);
+                }
+
+                // Links list<struct>: drop entries with invalid ids and count them.
+                {
+                    let struct_builder = links_builder.values();
+                    for link in &span.links {
+                        if link.trace_id.len() != 16
+                            || is_zero_bytes(&link.trace_id)
+                            || link.span_id.len() != 8
+                            || is_zero_bytes(&link.span_id)
+                        {
+                            extra_dropped_links += 1;
+                            continue;
+                        }
+                        struct_builder
+                            .field_builder::<StringBuilder>(0)
+                            .expect("link trace_id builder")
+                            .append_value(hex::encode(&link.trace_id));
+                        struct_builder
+                            .field_builder::<StringBuilder>(1)
+                            .expect("link span_id builder")
+                            .append_value(hex::encode(&link.span_id));
+                        let ts_b = struct_builder
+                            .field_builder::<StringBuilder>(2)
+                            .expect("link trace_state builder");
+                        if link.trace_state.is_empty() {
+                            ts_b.append_null();
+                        } else {
+                            ts_b.append_value(&link.trace_state);
+                        }
+                        let attr_b = struct_builder
+                            .field_builder::<MapBuilder<StringBuilder, StringBuilder>>(3)
+                            .expect("link attrs builder");
+                        for kv in &link.attributes {
+                            for (k, v) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
+                                attr_b.keys().append_value(&k);
+                                attr_b.values().append_value(v);
+                            }
+                        }
+                        attr_b.append(true).expect("append link attrs map");
+                        struct_builder
+                            .field_builder::<Int32Builder>(4)
+                            .expect("link dropped count builder")
+                            .append_value(u32_count_to_i32(
+                                link.dropped_attributes_count,
+                                "link.dropped_attributes_count",
+                            )?);
+                        let flags_b = struct_builder.field_builder::<Int32Builder>(5).expect("link flags builder");
+                        if link.flags == 0 {
+                            flags_b.append_null();
+                        } else {
+                            flags_b.append_value(u32_count_to_i32(link.flags, "link.flags")?);
+                        }
+                        struct_builder.append(true);
+                    }
+                    links_builder.append(true);
+                }
+
+                if span.flags == 0 {
+                    flags_builder.append_null();
+                } else {
+                    flags_builder.append_value(u32_count_to_i32(span.flags, "span.flags")?);
+                }
+                if span.dropped_attributes_count == 0 {
+                    dropped_attributes_count_builder.append_null();
+                } else {
+                    dropped_attributes_count_builder.append_value(u32_count_to_i32(
+                        span.dropped_attributes_count,
+                        "span.dropped_attributes_count",
+                    )?);
+                }
+                if span.dropped_events_count == 0 {
+                    dropped_events_count_builder.append_null();
+                } else {
+                    dropped_events_count_builder.append_value(u32_count_to_i32(
+                        span.dropped_events_count,
+                        "span.dropped_events_count",
+                    )?);
+                }
+                // Sum u32 and per-transform i32 counter in i64, then narrow:
+                // avoids wrapping at the i32 boundary if they happen to add up.
+                let total_dropped_links_i64 = i64::from(span.dropped_links_count) + i64::from(extra_dropped_links);
+                let total_dropped_links = i32::try_from(total_dropped_links_i64).map_err(|_| {
+                    crate::error::IngestError::Validation(format!(
+                        "dropped_links_count total exceeds i32::MAX: {total_dropped_links_i64}"
+                    ))
+                })?;
+                if total_dropped_links == 0 {
+                    dropped_links_count_builder.append_null();
+                } else {
+                    dropped_links_count_builder.append_value(total_dropped_links);
+                }
+            }
+        }
+    }
+
+    let valid_rows = tenant_id_builder.len();
+    if valid_rows == 0 {
+        return Ok((None, drops));
+    }
+
+    let events_array: ArrayRef = Arc::new(events_builder.finish());
+    let links_array: ArrayRef = Arc::new(links_builder.finish());
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(tenant_id_builder.finish()),
+        Arc::new(cloud_account_id_builder.finish()),
+        Arc::new(service_name_builder.finish()),
+        Arc::new(trace_id_builder.finish()),
+        Arc::new(span_id_builder.finish()),
+        Arc::new(parent_span_id_builder.finish()),
+        Arc::new(arrow::array::TimestampMicrosecondArray::from(timestamp_builder)),
+        Arc::new(arrow::array::TimestampMicrosecondArray::from(end_timestamp_builder)),
+        Arc::new(arrow::array::TimestampMicrosecondArray::from(
+            ingested_timestamp_builder,
+        )),
+        Arc::new(Int64Array::from(duration_micros_builder)),
+        Arc::new(trace_state_builder.finish()),
+        Arc::new(name_builder.finish()),
+        Arc::new(kind_builder.finish()),
+        Arc::new(status_code_builder.finish()),
+        Arc::new(status_message_builder.finish()),
+        Arc::new(attributes_builder.finish()),
+        Arc::new(flags_builder.finish()),
+        Arc::new(dropped_attributes_count_builder.finish()),
+        Arc::new(dropped_events_count_builder.finish()),
+        Arc::new(dropped_links_count_builder.finish()),
+        events_array,
+        links_array,
+    ];
+
+    let batch = RecordBatch::try_new(Arc::new(schema), columns).map_err(|e| {
+        tracing::error!("Failed to create spans RecordBatch: {e}");
+        crate::error::IngestError::Validation(format!("Failed to create spans RecordBatch: {e}"))
+    })?;
+
+    Ok((Some(batch), drops))
+}
+
 /// Extracts a string value from an OTLP `AnyValue` reference.
 ///
 /// Converts various OTLP value types to string representation.
@@ -332,6 +806,19 @@ fn is_zero_bytes(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == 0)
 }
 
+/// Convert an OTLP `u32` counter into the schema's signed `i32` field.
+///
+/// OTLP represents `flags` and `dropped_*_count` as `u32`. Iceberg stores
+/// them as `Int` (i32). Realistic telemetry values sit far below `i32::MAX`,
+/// but `as i32` silently wraps for anything above `2^31 - 1`, producing a
+/// negative count that later readers would see as "-2 billion dropped
+/// events". Fail the transform instead so the caller can surface the
+/// malformed span via `partial_success`.
+fn u32_count_to_i32(value: u32, context: &'static str) -> crate::error::Result<i32> {
+    i32::try_from(value)
+        .map_err(|_| crate::error::IngestError::Validation(format!("{context} exceeds i32::MAX: {value}")))
+}
+
 /// Extracts map field metadata from the Arrow schema for attributes field.
 ///
 /// Returns a tuple of (`key_field`, `value_field`) from the schema's map type definition.
@@ -346,29 +833,69 @@ fn is_zero_bytes(bytes: &[u8]) -> bool {
 fn extract_map_fields_from_schema(
     schema: &Schema,
 ) -> crate::error::Result<(arrow::datatypes::FieldRef, arrow::datatypes::FieldRef)> {
-    let attributes_field = schema
-        .field_with_name("attributes")
-        .map_err(|_| crate::error::IngestError::Validation("Schema must contain an 'attributes' field".to_string()))?;
+    extract_map_fields_from_schema_named(schema, "attributes")
+}
 
-    // Extract map field information from schema
-    match attributes_field.data_type() {
+/// Extracts map field metadata from the Arrow schema by field name.
+///
+/// Used by both `logs_to_record_batch` (via `extract_map_fields_from_schema`)
+/// and `spans_to_record_batch` (directly).
+fn extract_map_fields_from_schema_named(
+    schema: &Schema,
+    name: &str,
+) -> crate::error::Result<(arrow::datatypes::FieldRef, arrow::datatypes::FieldRef)> {
+    let field = schema
+        .field_with_name(name)
+        .map_err(|_| crate::error::IngestError::Validation(format!("Schema must contain a '{name}' field")))?;
+    match field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => {
                 if fields.len() < 2 {
                     return Err(crate::error::IngestError::Validation(format!(
-                        "Expected at least 2 fields in map entries struct, found {}",
+                        "Expected at least 2 fields in map entries struct for '{name}', found {}",
                         fields.len()
                     )));
                 }
                 Ok((fields[0].clone(), fields[1].clone()))
             }
-            _ => Err(crate::error::IngestError::Validation(
-                "Expected Struct type for map entries in 'attributes' field".to_string(),
-            )),
+            _ => Err(crate::error::IngestError::Validation(format!(
+                "Expected Struct type for map entries in '{name}' field"
+            ))),
         },
         _ => Err(crate::error::IngestError::Validation(format!(
-            "Expected Map type for 'attributes' field, found {:?}",
-            attributes_field.data_type()
+            "Expected Map type for '{name}' field, found {:?}",
+            field.data_type()
+        ))),
+    }
+}
+
+/// Extracts map key/value field refs from a struct's inner field list.
+///
+/// Used to populate nested `Map` builders inside the events/links struct arrays.
+fn extract_map_fields_from_nested_struct(
+    fields: &arrow::datatypes::Fields,
+    map_field_name: &str,
+) -> crate::error::Result<(arrow::datatypes::FieldRef, arrow::datatypes::FieldRef)> {
+    let map_field = fields.iter().find(|f| f.name() == map_field_name).ok_or_else(|| {
+        crate::error::IngestError::Validation(format!("nested struct missing '{map_field_name}' field"))
+    })?;
+    match map_field.data_type() {
+        DataType::Map(entries_field, _) => match entries_field.data_type() {
+            DataType::Struct(inner_fields) => {
+                if inner_fields.len() < 2 {
+                    return Err(crate::error::IngestError::Validation(format!(
+                        "map entries struct for '{map_field_name}' needs 2+ fields, got {}",
+                        inner_fields.len()
+                    )));
+                }
+                Ok((inner_fields[0].clone(), inner_fields[1].clone()))
+            }
+            _ => Err(crate::error::IngestError::Validation(format!(
+                "map entries must be Struct for '{map_field_name}'"
+            ))),
+        },
+        _ => Err(crate::error::IngestError::Validation(format!(
+            "'{map_field_name}' must be Map"
         ))),
     }
 }
@@ -386,6 +913,75 @@ fn add_flattened_attributes(
             attributes_builder.keys().append_value(normalize_attribute_key(&key));
             attributes_builder.values().append_value(value);
         }
+    }
+}
+
+/// Appends flattened attributes to the map builder using dot-separator keys.
+///
+/// Used by spans where OTel-native dotted attribute names must be preserved.
+fn add_flattened_attributes_dotted(
+    attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+    attributes_builder: &mut MapBuilder<StringBuilder, StringBuilder>,
+) {
+    for kv in attributes {
+        for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
+            attributes_builder.keys().append_value(&key);
+            attributes_builder.values().append_value(value);
+        }
+    }
+}
+
+/// Duplicates span indexed columns into the attributes map for UI/query parity.
+///
+/// Matches the logs pipeline's behaviour: indexed top-level columns are
+/// mirrored into the attributes map under schema-column-name keys
+/// (underscore form), which is how downstream consumers (Tempo eventually,
+/// but Grafana panels today) surface these values.
+#[allow(clippy::too_many_arguments)]
+fn duplicate_span_indexed_columns(
+    attributes_builder: &mut MapBuilder<StringBuilder, StringBuilder>,
+    service_name: Option<&str>,
+    cloud_account_id: Option<&str>,
+    trace_id: &[u8],
+    span_id: &[u8],
+    parent_span_id: &[u8],
+    kind: i32,
+    status_code: Option<i32>,
+    name: &str,
+) {
+    if let Some(svc) = service_name {
+        attributes_builder.keys().append_value("service_name");
+        attributes_builder.values().append_value(svc);
+    }
+    if let Some(acc) = cloud_account_id {
+        attributes_builder.keys().append_value("cloud_account_id");
+        attributes_builder.values().append_value(acc);
+    }
+    if trace_id.len() == 16 && !is_zero_bytes(trace_id) {
+        attributes_builder.keys().append_value("trace_id");
+        attributes_builder.values().append_value(hex::encode(trace_id));
+    }
+    if span_id.len() == 8 && !is_zero_bytes(span_id) {
+        attributes_builder.keys().append_value("span_id");
+        attributes_builder.values().append_value(hex::encode(span_id));
+    }
+    if parent_span_id.len() == 8 && !is_zero_bytes(parent_span_id) {
+        attributes_builder.keys().append_value("parent_span_id");
+        attributes_builder.values().append_value(hex::encode(parent_span_id));
+    }
+    if kind != 0 {
+        attributes_builder.keys().append_value("kind");
+        attributes_builder.values().append_value(kind.to_string());
+    }
+    if let Some(code) = status_code {
+        if code != 0 {
+            attributes_builder.keys().append_value("status_code");
+            attributes_builder.values().append_value(code.to_string());
+        }
+    }
+    if !name.is_empty() {
+        attributes_builder.keys().append_value("name");
+        attributes_builder.values().append_value(name);
     }
 }
 
@@ -514,6 +1110,56 @@ fn flatten_any_value(prefix: &str, value: Option<&AnyValue>) -> Vec<(String, Str
                         result.push((prefix.to_string(), s));
                     }
                 }
+            }
+        }
+    }
+
+    result
+}
+
+/// Flattens an OTLP `AnyValue` into dotted key-value pairs.
+///
+/// Mirrors [`flatten_any_value`] but joins nested `KvlistValue` keys with a
+/// dot (`.`) separator instead of underscore. Use this for spans and other
+/// signals where OTel-native dotted attribute names must be preserved.
+///
+/// # Arguments
+///
+/// * `prefix` - key prefix for nested values (empty string at the root).
+/// * `value` - OTLP `AnyValue` to flatten.
+///
+/// # Returns
+///
+/// Vector of (key, value) string pairs representing the flattened structure.
+/// Primitive values yield a single pair `(prefix, stringified_value)`.
+/// Arrays are stringified (not flattened) since they have no indexable keys.
+fn flatten_any_value_dotted(prefix: &str, value: Option<&AnyValue>) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let Some(v) = value else {
+        return result;
+    };
+    let Some(val) = &v.value else {
+        return result;
+    };
+
+    match val {
+        Value::KvlistValue(kvs) => {
+            for kv in &kvs.values {
+                let nested_prefix = if prefix.is_empty() {
+                    kv.key.clone()
+                } else {
+                    format!("{prefix}.{}", kv.key)
+                };
+                result.extend(flatten_any_value_dotted(&nested_prefix, kv.value.as_ref()));
+            }
+        }
+        Value::ArrayValue(arr) => {
+            let items: Vec<String> = arr.values.iter().filter_map(|v| extract_any_value_string(Some(v))).collect();
+            result.push((prefix.to_string(), format!("[{}]", items.join(", "))));
+        }
+        _ => {
+            if let Some(s) = extract_any_value_string(Some(v)) {
+                result.push((prefix.to_string(), s));
             }
         }
     }
@@ -810,5 +1456,456 @@ mod tests {
         assert_eq!(flattened.len(), 1);
         assert_eq!(flattened[0].0, "key");
         assert_eq!(flattened[0].1, "simple");
+    }
+
+    #[test]
+    fn flatten_nested_attributes_with_dot_separator() {
+        use std::collections::HashMap;
+
+        use opentelemetry_proto::tonic::common::v1::{KeyValueList, any_value::Value};
+
+        let nested_kv = AnyValue {
+            value: Some(Value::KvlistValue(KeyValueList {
+                values: vec![
+                    KeyValue {
+                        key: "method".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue("POST".to_string())),
+                        }),
+                    },
+                    KeyValue {
+                        key: "details".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(Value::KvlistValue(KeyValueList {
+                                values: vec![KeyValue {
+                                    key: "status".to_string(),
+                                    value: Some(AnyValue {
+                                        value: Some(Value::IntValue(200)),
+                                    }),
+                                }],
+                            })),
+                        }),
+                    },
+                ],
+            })),
+        };
+
+        let flattened = flatten_any_value_dotted("http", Some(&nested_kv));
+        let map: HashMap<String, String> = flattened.into_iter().collect();
+
+        assert_eq!(map.get("http.method"), Some(&"POST".to_string()));
+        assert_eq!(map.get("http.details.status"), Some(&"200".to_string()));
+    }
+
+    #[test]
+    fn spans_arrow_schema_has_nested_events_and_links() {
+        let schema = spans_arrow_schema();
+        assert!(schema.field_with_name("trace_id").is_ok());
+        assert!(schema.field_with_name("events").is_ok());
+        assert!(schema.field_with_name("links").is_ok());
+    }
+
+    #[test]
+    fn spans_to_record_batch_empty_request_returns_none() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        let request = ExportTraceServiceRequest { resource_spans: vec![] };
+        let (batch, drops) = spans_to_record_batch(&request, None).expect("should not error");
+        assert!(batch.is_none());
+        assert_eq!(drops, 0);
+    }
+
+    #[test]
+    fn spans_to_record_batch_single_span_populates_top_level_columns() {
+        use opentelemetry_proto::tonic::{
+            collector::trace::v1::ExportTraceServiceRequest,
+            resource::v1::Resource,
+            trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status::StatusCode},
+        };
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue("svc".to_string())),
+                        }),
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![1u8; 16],
+                        span_id: vec![2u8; 8],
+                        parent_span_id: vec![3u8; 8],
+                        trace_state: "state-x".to_string(),
+                        name: "http.request".to_string(),
+                        kind: 2,
+                        start_time_unix_nano: 1_700_000_000_000_000_000,
+                        end_time_unix_nano: 1_700_000_000_000_500_000,
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                        events: vec![],
+                        dropped_events_count: 0,
+                        links: vec![],
+                        dropped_links_count: 0,
+                        status: Some(Status {
+                            message: "ok".to_string(),
+                            code: StatusCode::Ok as i32,
+                        }),
+                        flags: 0,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (batch_opt, drops) = spans_to_record_batch(&request, Some("tenant-1")).expect("ok");
+        let batch = batch_opt.expect("batch");
+        assert_eq!(drops, 0);
+        assert_eq!(batch.num_rows(), 1);
+
+        let trace_id = batch
+            .column_by_name("trace_id")
+            .expect("trace_id")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("utf8");
+        assert_eq!(trace_id.value(0), hex::encode(vec![1u8; 16]));
+
+        let span_id = batch
+            .column_by_name("span_id")
+            .expect("span_id")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("utf8");
+        assert_eq!(span_id.value(0), hex::encode(vec![2u8; 8]));
+
+        let duration = batch
+            .column_by_name("duration_micros")
+            .expect("duration")
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("i64");
+        assert_eq!(duration.value(0), 500);
+    }
+
+    #[test]
+    fn spans_to_record_batch_drops_span_with_invalid_trace_id() {
+        use opentelemetry_proto::tonic::{
+            collector::trace::v1::ExportTraceServiceRequest,
+            resource::v1::Resource,
+            trace::v1::{ResourceSpans, ScopeSpans, Span},
+        };
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![0u8; 16], // all-zero -> invalid
+                        span_id: vec![2u8; 8],
+                        parent_span_id: vec![],
+                        trace_state: String::new(),
+                        name: "x".to_string(),
+                        kind: 0,
+                        start_time_unix_nano: 1,
+                        end_time_unix_nano: 2,
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                        events: vec![],
+                        dropped_events_count: 0,
+                        links: vec![],
+                        dropped_links_count: 0,
+                        status: None,
+                        flags: 0,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (batch_opt, drops) = spans_to_record_batch(&request, None).expect("ok");
+        assert!(batch_opt.is_none());
+        assert_eq!(drops, 1);
+    }
+
+    #[test]
+    fn spans_attributes_preserve_dots_and_duplicate_indexed_columns() {
+        use arrow::array::{Array, MapArray, StringArray};
+        use opentelemetry_proto::tonic::{
+            collector::trace::v1::ExportTraceServiceRequest,
+            resource::v1::Resource,
+            trace::v1::{ResourceSpans, ScopeSpans, Span},
+        };
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("svc".to_string())),
+                            }),
+                        },
+                        KeyValue {
+                            key: "cloud.account.id".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("acc-1".to_string())),
+                            }),
+                        },
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![1u8; 16],
+                        span_id: vec![2u8; 8],
+                        parent_span_id: vec![3u8; 8],
+                        trace_state: String::new(),
+                        name: "op".to_string(),
+                        kind: 2,
+                        start_time_unix_nano: 1,
+                        end_time_unix_nano: 2,
+                        attributes: vec![KeyValue {
+                            key: "http.method".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("GET".to_string())),
+                            }),
+                        }],
+                        dropped_attributes_count: 0,
+                        events: vec![],
+                        dropped_events_count: 0,
+                        links: vec![],
+                        dropped_links_count: 0,
+                        status: None,
+                        flags: 0,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (batch, _) = spans_to_record_batch(&request, Some("tenant-1")).expect("ok");
+        let batch = batch.expect("batch");
+        let attrs = batch
+            .column_by_name("attributes")
+            .expect("attributes")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map");
+
+        let entries = attrs.value(0);
+        let entries_struct = entries.as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
+        let keys = entries_struct.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+        let values = entries_struct.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+        let pairs: std::collections::BTreeMap<String, String> = (0..keys.len())
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect();
+
+        // User attribute preserves OTel dotted keys.
+        assert_eq!(pairs.get("http.method"), Some(&"GET".to_string()));
+        // Resource-derived attributes preserve dots.
+        assert_eq!(pairs.get("service.name"), Some(&"svc".to_string()));
+        assert_eq!(pairs.get("cloud.account.id"), Some(&"acc-1".to_string()));
+        // Indexed-column duplication: schema column names copied into attributes using underscore keys.
+        assert_eq!(pairs.get("service_name"), Some(&"svc".to_string()));
+        assert_eq!(pairs.get("cloud_account_id"), Some(&"acc-1".to_string()));
+        assert_eq!(pairs.get("trace_id"), Some(&hex::encode(vec![1u8; 16])));
+        assert_eq!(pairs.get("span_id"), Some(&hex::encode(vec![2u8; 8])));
+        assert_eq!(pairs.get("parent_span_id"), Some(&hex::encode(vec![3u8; 8])));
+        assert_eq!(pairs.get("kind"), Some(&"2".to_string()));
+        assert_eq!(pairs.get("name"), Some(&"op".to_string()));
+    }
+
+    #[test]
+    fn spans_events_are_materialized_as_list_of_structs() {
+        use arrow::array::{Array, ListArray, StringArray, StructArray, TimestampMicrosecondArray};
+        use opentelemetry_proto::tonic::{
+            collector::trace::v1::ExportTraceServiceRequest,
+            resource::v1::Resource,
+            trace::v1::{ResourceSpans, ScopeSpans, Span, span::Event},
+        };
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![1u8; 16],
+                        span_id: vec![2u8; 8],
+                        parent_span_id: vec![],
+                        trace_state: String::new(),
+                        name: "op".to_string(),
+                        kind: 0,
+                        start_time_unix_nano: 1_000,
+                        end_time_unix_nano: 2_000,
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                        events: vec![Event {
+                            time_unix_nano: 1_500,
+                            name: "cache.hit".to_string(),
+                            attributes: vec![KeyValue {
+                                key: "db.system".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(Value::StringValue("postgres".to_string())),
+                                }),
+                            }],
+                            dropped_attributes_count: 0,
+                        }],
+                        dropped_events_count: 0,
+                        links: vec![],
+                        dropped_links_count: 0,
+                        status: None,
+                        flags: 0,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (batch, _) = spans_to_record_batch(&request, None).expect("ok");
+        let batch = batch.expect("batch");
+        let events = batch
+            .column_by_name("events")
+            .expect("events")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("list");
+        let row0 = events.value(0);
+        let row0_struct = row0.as_any().downcast_ref::<StructArray>().expect("struct");
+        assert_eq!(row0_struct.len(), 1);
+
+        let ts = row0_struct
+            .column_by_name("timestamp")
+            .expect("timestamp")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("ts");
+        assert_eq!(ts.value(0), 1); // 1500 ns / 1000 = 1 μs
+
+        let name = row0_struct
+            .column_by_name("name")
+            .expect("name")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name");
+        assert_eq!(name.value(0), "cache.hit");
+    }
+
+    #[test]
+    fn spans_links_are_materialized_and_invalid_ids_dropped() {
+        use arrow::array::{Array, Int32Array, ListArray, StringArray, StructArray};
+        use opentelemetry_proto::tonic::{
+            collector::trace::v1::ExportTraceServiceRequest,
+            resource::v1::Resource,
+            trace::v1::{ResourceSpans, ScopeSpans, Span, span::Link},
+        };
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![1u8; 16],
+                        span_id: vec![2u8; 8],
+                        parent_span_id: vec![],
+                        trace_state: String::new(),
+                        name: "op".to_string(),
+                        kind: 0,
+                        start_time_unix_nano: 1,
+                        end_time_unix_nano: 2,
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                        events: vec![],
+                        dropped_events_count: 0,
+                        links: vec![
+                            Link {
+                                trace_id: vec![9u8; 16],
+                                span_id: vec![8u8; 8],
+                                trace_state: "tstate".to_string(),
+                                attributes: vec![],
+                                dropped_attributes_count: 0,
+                                flags: 0,
+                            },
+                            Link {
+                                trace_id: vec![9u8; 16],
+                                span_id: vec![0u8; 4], // invalid -> dropped
+                                trace_state: String::new(),
+                                attributes: vec![],
+                                dropped_attributes_count: 0,
+                                flags: 0,
+                            },
+                        ],
+                        dropped_links_count: 0,
+                        status: None,
+                        flags: 0,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (batch, _) = spans_to_record_batch(&request, None).expect("ok");
+        let batch = batch.expect("batch");
+
+        let links = batch
+            .column_by_name("links")
+            .expect("links")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("list");
+        let row0 = links.value(0);
+        let row0_struct = row0.as_any().downcast_ref::<StructArray>().expect("struct");
+        assert_eq!(row0_struct.len(), 1); // second link dropped
+
+        let trace_ids = row0_struct
+            .column_by_name("trace_id")
+            .expect("trace_id")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert_eq!(trace_ids.value(0), hex::encode(vec![9u8; 16]));
+
+        let trace_state = row0_struct
+            .column_by_name("trace_state")
+            .expect("trace_state")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert_eq!(trace_state.value(0), "tstate");
+
+        let dropped_links = batch
+            .column_by_name("dropped_links_count")
+            .expect("dropped_links_count")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("i32");
+        assert_eq!(dropped_links.value(0), 1);
     }
 }

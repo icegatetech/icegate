@@ -6,6 +6,7 @@ use super::config::ShiftTimeoutsConfig;
 use crate::error::IngestError;
 
 #[allow(clippy::struct_field_names)]
+#[derive(Clone)]
 pub struct TimeoutEstimator {
     plan_base: ChronoDuration,
     shift_base: ChronoDuration,

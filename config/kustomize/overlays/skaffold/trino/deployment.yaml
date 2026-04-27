@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino
+  namespace: infra
+  labels:
+    app.kubernetes.io/name: trino
+    app.kubernetes.io/component: coordinator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: trino
+      app.kubernetes.io/component: coordinator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: trino
+        app.kubernetes.io/component: coordinator
+    spec:
+      # Trino's coordinator image runs as the `trino` user (UID/GID 1000) by
+      # default. `runAsNonRoot: true` requires a numeric UID so the kubelet
+      # can verify the user is non-root without resolving names inside the
+      # image, hence the explicit 1000s. Trino writes its working state to
+      # /data/trino, so we can't set readOnlyRootFilesystem: true without
+      # adding an emptyDir volume; that's a follow-up if stricter hardening
+      # is needed.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: trino
+          image: trinodb/trino:479
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: trino-s3-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: trino-s3-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            # Region is not sensitive — keep inline.
+            - name: AWS_REGION
+              value: us-east-1
+          volumeMounts:
+            - name: catalog
+              mountPath: /etc/trino/catalog/iceberg.properties
+              subPath: iceberg.properties
+              readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - /usr/lib/trino/bin/health-check
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - /usr/lib/trino/bin/health-check
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: catalog
+          configMap:
+            name: trino-config
+            items:
+              - key: iceberg.properties
+                path: iceberg.properties

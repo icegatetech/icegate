@@ -21,6 +21,9 @@ pub mod otlp_http;
 /// OTLP to Arrow transform utilities (shared by gRPC and HTTP)
 pub mod transform;
 
+/// Shared helpers for OTLP traces partial-success response composition.
+pub(crate) mod otlp_traces_partial;
+
 /// Shift operations: moving data from WAL to Iceberg
 pub(crate) mod shift;
 

@@ -60,7 +60,7 @@ query:
     port: 3200
   tracing:
     enabled: true
-    otlpEndpoint: http://jaeger-collector.observability.svc.cluster.local.:4317
+    otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317
     sampleRatio: 1.0
   rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
@@ -87,7 +87,7 @@ ingest:
     port: 4317
   tracing:
     enabled: true
-    otlpEndpoint: http://jaeger-collector.observability.svc.cluster.local.:4317
+    otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317
     sampleRatio: 1.0
   shift:
     jobsmanager:

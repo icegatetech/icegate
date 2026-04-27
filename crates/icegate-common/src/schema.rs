@@ -201,82 +201,9 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// - `timestamp` (descending)
 #[allow(clippy::too_many_lines)]
 pub fn spans_schema() -> Result<Schema> {
-    // Create Map<String, String> for main attributes (field IDs: 24, 25)
-    let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(24, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            25,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-
-    // Create Map<String, String> for event attributes (field IDs: 26, 27)
-    let event_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(26, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            27,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-
-    // Create Map<String, String> for link attributes (field IDs: 28, 29)
-    let link_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(28, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            29,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-
-    // Event struct (nested in spans) - NO trace_id/span_id
-    let event_struct = Type::Struct(StructType::new(vec![
-        Arc::new(NestedField::required(
-            30,
-            "timestamp",
-            Type::Primitive(PrimitiveType::Timestamp),
-        )),
-        Arc::new(NestedField::required(
-            31,
-            "name",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::required(32, "attributes", event_attributes_map)),
-        Arc::new(NestedField::required(
-            33,
-            "dropped_attributes_count",
-            Type::Primitive(PrimitiveType::Int),
-        )),
-    ]));
-
-    // Link struct (nested in spans) - HAS trace_id/span_id
-    let link_struct = Type::Struct(StructType::new(vec![
-        Arc::new(NestedField::required(
-            34,
-            "trace_id",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::required(
-            35,
-            "span_id",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::optional(
-            36,
-            "trace_state",
-            Type::Primitive(PrimitiveType::String),
-        )),
-        Arc::new(NestedField::required(37, "attributes", link_attributes_map)),
-        Arc::new(NestedField::required(
-            38,
-            "dropped_attributes_count",
-            Type::Primitive(PrimitiveType::Int),
-        )),
-        Arc::new(NestedField::optional(39, "flags", Type::Primitive(PrimitiveType::Int))),
-    ]));
-
+    // Field IDs are hardcoded depth-first so reading top-to-bottom gives the
+    // assignment order. Parents sit on the left column, their nested children
+    // on indented lines immediately below.
     let schema = Schema::builder()
         .with_schema_id(2)
         .with_fields(vec![
@@ -333,12 +260,12 @@ pub fn spans_schema() -> Result<Schema> {
                 "duration_micros",
                 Type::Primitive(PrimitiveType::Long),
             )),
+            // Span metadata
             Arc::new(NestedField::optional(
                 11,
                 "trace_state",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Span metadata
             Arc::new(NestedField::required(
                 12,
                 "name",
@@ -355,42 +282,120 @@ pub fn spans_schema() -> Result<Schema> {
                 "status_message",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Attributes (merged from resource, scope, and span attributes)
-            Arc::new(NestedField::required(16, "attributes", attributes_map)),
+            // Attributes (merged from resource, scope, and span attributes).
+            // Map nested key/value consume IDs 17, 18.
+            Arc::new(NestedField::required(
+                16,
+                "attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(17, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        18,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
+            )),
             // Flags and monitoring
-            Arc::new(NestedField::optional(17, "flags", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(19, "flags", Type::Primitive(PrimitiveType::Int))),
             Arc::new(NestedField::optional(
-                18,
+                20,
                 "dropped_attributes_count",
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
-                19,
+                21,
                 "dropped_events_count",
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
-                20,
+                22,
                 "dropped_links_count",
                 Type::Primitive(PrimitiveType::Int),
             )),
-            // Nested events (NO trace_id/span_id - inherits from parent span)
+            // Nested events (NO trace_id/span_id — inherits from parent span).
+            // List element struct consumes ID 24; its fields consume 25–27, 30;
+            // the nested attributes Map consumes 27 with key/value 28, 29.
             Arc::new(NestedField::optional(
-                21,
+                23,
                 "events",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    40,
-                    event_struct,
+                    24,
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::required(
+                            25,
+                            "timestamp",
+                            Type::Primitive(PrimitiveType::Timestamp),
+                        )),
+                        Arc::new(NestedField::required(
+                            26,
+                            "name",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::required(
+                            27,
+                            "attributes",
+                            Type::Map(MapType::new(
+                                Arc::new(NestedField::required(28, "key", Type::Primitive(PrimitiveType::String))),
+                                Arc::new(NestedField::required(
+                                    29,
+                                    "value",
+                                    Type::Primitive(PrimitiveType::String),
+                                )),
+                            )),
+                        )),
+                        Arc::new(NestedField::required(
+                            30,
+                            "dropped_attributes_count",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                    ])),
                     true,
                 )))),
             )),
-            // Nested links (HAS trace_id/span_id - references linked span)
+            // Nested links (HAS trace_id/span_id — references linked span).
+            // List element struct consumes ID 32; its fields consume 33–36, 39, 40;
+            // the nested attributes Map consumes 36 with key/value 37, 38.
             Arc::new(NestedField::optional(
-                22,
+                31,
                 "links",
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
-                    41,
-                    link_struct,
+                    32,
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::required(
+                            33,
+                            "trace_id",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::required(
+                            34,
+                            "span_id",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            35,
+                            "trace_state",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::required(
+                            36,
+                            "attributes",
+                            Type::Map(MapType::new(
+                                Arc::new(NestedField::required(37, "key", Type::Primitive(PrimitiveType::String))),
+                                Arc::new(NestedField::required(
+                                    38,
+                                    "value",
+                                    Type::Primitive(PrimitiveType::String),
+                                )),
+                            )),
+                        )),
+                        Arc::new(NestedField::required(
+                            39,
+                            "dropped_attributes_count",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                        Arc::new(NestedField::optional(40, "flags", Type::Primitive(PrimitiveType::Int))),
+                    ])),
                     true,
                 )))),
             )),
@@ -1041,12 +1046,66 @@ mod tests {
     #[test]
     fn test_spans_schema() {
         let schema = spans_schema().expect("Failed to create spans schema");
-        // highest_field_id includes nested field IDs from Maps, Lists, and Structs
-        assert!(schema.highest_field_id() >= 22);
+        assert_eq!(schema.highest_field_id(), 40);
         assert!(schema.field_by_name("trace_id").is_some());
         assert!(schema.field_by_name("span_id").is_some());
         assert!(schema.field_by_name("events").is_some());
         assert!(schema.field_by_name("links").is_some());
+    }
+
+    #[test]
+    fn test_spans_schema_nested_ids_sequential() {
+        use iceberg::spec::Type;
+
+        let schema = spans_schema().expect("Failed to create spans schema");
+        // attributes Map: parent=16, key=17, value=18
+        let attrs = schema.field_by_name("attributes").expect("attributes field");
+        assert_eq!(attrs.id, 16);
+        let Type::Map(map) = &*attrs.field_type else {
+            panic!("attributes must be Map");
+        };
+        assert_eq!(map.key_field.id, 17);
+        assert_eq!(map.value_field.id, 18);
+
+        // events List<Struct>: list=23, elem struct=24,
+        // struct fields timestamp=25, name=26, attributes=27 (map key=28, value=29), dropped_attributes_count=30
+        let events = schema.field_by_name("events").expect("events field");
+        assert_eq!(events.id, 23);
+        let Type::List(list) = &*events.field_type else {
+            panic!("events must be List");
+        };
+        assert_eq!(list.element_field.id, 24);
+        let Type::Struct(s) = &*list.element_field.field_type else {
+            panic!("events element must be Struct");
+        };
+        let ids: Vec<i32> = s.fields().iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![25, 26, 27, 30]);
+        let inner_attrs = s.fields().iter().find(|f| f.name == "attributes").expect("event attrs");
+        let Type::Map(m) = &*inner_attrs.field_type else {
+            panic!("event attributes must be Map");
+        };
+        assert_eq!(m.key_field.id, 28);
+        assert_eq!(m.value_field.id, 29);
+
+        // links List<Struct>: list=31, elem struct=32,
+        // struct fields trace_id=33, span_id=34, trace_state=35, attributes=36 (key=37, value=38), dropped_attributes_count=39, flags=40
+        let links = schema.field_by_name("links").expect("links field");
+        assert_eq!(links.id, 31);
+        let Type::List(list) = &*links.field_type else {
+            panic!("links must be List");
+        };
+        assert_eq!(list.element_field.id, 32);
+        let Type::Struct(s) = &*list.element_field.field_type else {
+            panic!("links element must be Struct");
+        };
+        let ids: Vec<i32> = s.fields().iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![33, 34, 35, 36, 39, 40]);
+        let inner_attrs = s.fields().iter().find(|f| f.name == "attributes").expect("link attrs");
+        let Type::Map(m) = &*inner_attrs.field_type else {
+            panic!("link attributes must be Map");
+        };
+        assert_eq!(m.key_field.id, 37);
+        assert_eq!(m.value_field.id, 38);
     }
 
     #[test]

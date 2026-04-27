@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-config
+  namespace: infra
+  labels:
+    app.kubernetes.io/name: trino
+    app.kubernetes.io/component: coordinator
+data:
+  # Iceberg catalog backed by Nessie REST + MinIO S3. Mirrors the
+  # docker-compose config at config/docker/trino/iceberg.properties with
+  # in-cluster DNS for Nessie and MinIO.
+  iceberg.properties: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://nessie.infra.svc.cluster.local.:19120/iceberg
+    iceberg.rest-catalog.prefix=main
+    fs.native-s3.enabled=true
+    s3.endpoint=http://minio.infra.svc.cluster.local.:9000
+    s3.region=us-east-1
+    s3.path-style-access=true
+    s3.aws-access-key=minioadmin
+    s3.aws-secret-key=minioadmin

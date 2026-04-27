@@ -19,6 +19,10 @@ pub enum MaintainError {
     /// Schema construction error.
     #[error("{0}")]
     Schema(#[from] SchemaError),
+
+    /// Migration requires operator intervention (e.g. manual table drop).
+    #[error("migration requires manual intervention: {0}")]
+    Migration(String),
 }
 
 impl From<icegate_common::error::CommonError> for MaintainError {

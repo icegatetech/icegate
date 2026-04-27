@@ -10,6 +10,7 @@ use super::{RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryValu
 use crate::error::{IngestError, Result};
 
 static LOGS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
+static SPANS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SortColumnDescriptor {
@@ -24,13 +25,21 @@ pub(crate) struct SortColumnsDescriptor {
     columns: Vec<SortColumnDescriptor>,
 }
 
-// TODO(high): make a generic solution without binding to logs
 impl SortColumnsDescriptor {
     pub(crate) fn logs() -> Result<&'static Self> {
-        match LOGS_SORT_DESCRIPTOR.get_or_init(|| Self::try_from_logs_sort_order().map_err(|err| err.to_string())) {
+        match LOGS_SORT_DESCRIPTOR.get_or_init(|| Self::try_from_logs().map_err(|err| err.to_string())) {
             Ok(descriptor) => Ok(descriptor),
             Err(message) => Err(IngestError::Config(format!(
                 "failed to initialize logs sort descriptor: {message}"
+            ))),
+        }
+    }
+
+    pub(crate) fn spans() -> Result<&'static Self> {
+        match SPANS_SORT_DESCRIPTOR.get_or_init(|| Self::try_from_spans().map_err(|err| err.to_string())) {
+            Ok(descriptor) => Ok(descriptor),
+            Err(message) => Err(IngestError::Config(format!(
+                "failed to initialize spans sort descriptor: {message}"
             ))),
         }
     }
@@ -39,9 +48,15 @@ impl SortColumnsDescriptor {
         self.columns.as_slice()
     }
 
-    fn try_from_logs_sort_order() -> Result<Self> {
+    fn try_from_logs() -> Result<Self> {
         let schema = icegate_common::schema::logs_schema()?;
         let sort_order = icegate_common::schema::logs_sort_order(&schema)?;
+        Self::try_from_schema_sort_order(&schema, &sort_order)
+    }
+
+    fn try_from_spans() -> Result<Self> {
+        let schema = icegate_common::schema::spans_schema()?;
+        let sort_order = icegate_common::schema::spans_sort_order(&schema)?;
         Self::try_from_schema_sort_order(&schema, &sort_order)
     }
 
@@ -49,13 +64,11 @@ impl SortColumnsDescriptor {
         let mut columns = Vec::with_capacity(sort_order.fields.len());
 
         for sort_field in &sort_order.fields {
-            let schema_field = resolve_logs_sort_schema_field(schema, sort_field)?;
+            let schema_field = resolve_sort_schema_field(schema, sort_field)?;
             let primitive_type = schema_field
                 .field_type
                 .as_primitive_type()
-                .ok_or_else(|| {
-                    IngestError::Shift(format!("logs sort field '{}' must be primitive", schema_field.name))
-                })?
+                .ok_or_else(|| IngestError::Shift(format!("sort field '{}' must be primitive", schema_field.name)))?
                 .clone();
             columns.push(SortColumnDescriptor {
                 column_name: schema_field.name.clone(),
@@ -107,7 +120,7 @@ impl SortColumnCache {
                 },
                 ref other => {
                     return Err(IngestError::Shift(format!(
-                        "unsupported logs sort column type for '{column_name}' in {context}: {other}"
+                        "unsupported sort column type for '{column_name}' in {context}: {other}"
                     )));
                 }
             };
@@ -146,14 +159,11 @@ impl SortColumnCache {
     }
 }
 
-fn resolve_logs_sort_schema_field<'a>(
-    schema: &'a Schema,
-    sort_field: &SortField,
-) -> Result<&'a iceberg::spec::NestedField> {
+fn resolve_sort_schema_field<'a>(schema: &'a Schema, sort_field: &SortField) -> Result<&'a iceberg::spec::NestedField> {
     if sort_field.transform != Transform::Identity {
         return Err(iceberg::Error::new(
             iceberg::ErrorKind::FeatureUnsupported,
-            format!("unsupported logs merge sort transform: {}", sort_field.transform),
+            format!("unsupported merge sort transform: {}", sort_field.transform),
         )
         .into());
     }
@@ -164,7 +174,7 @@ fn resolve_logs_sort_schema_field<'a>(
         .ok_or_else(|| {
             iceberg::Error::new(
                 iceberg::ErrorKind::DataInvalid,
-                format!("logs sort field source_id {} not found in schema", sort_field.source_id),
+                format!("sort field source_id {} not found in schema", sort_field.source_id),
             )
             .into()
         })
@@ -282,8 +292,38 @@ mod tests {
         NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortField, SortOrder, Transform, Type,
     };
 
-    use super::{SortColumnsDescriptor, resolve_logs_sort_schema_field};
+    use super::{SortColumnsDescriptor, resolve_sort_schema_field};
     use crate::error::IngestError;
+
+    #[test]
+    fn spans_sort_descriptor_matches_spans_sort_order() {
+        let schema = icegate_common::schema::spans_schema().expect("spans schema");
+        let sort_order = icegate_common::schema::spans_sort_order(&schema).expect("spans sort order");
+        let descriptor = SortColumnsDescriptor::spans().expect("spans descriptor");
+
+        assert_eq!(descriptor.columns().len(), sort_order.fields.len());
+
+        for (descriptor_column, sort_field) in descriptor.columns().iter().zip(&sort_order.fields) {
+            let schema_field = resolve_sort_schema_field(&schema, sort_field).expect("sort field must resolve");
+            assert_eq!(descriptor_column.column_name, schema_field.name);
+            assert_eq!(
+                descriptor_column.primitive_type,
+                schema_field
+                    .field_type
+                    .as_primitive_type()
+                    .expect("sort field must be primitive")
+                    .clone()
+            );
+            assert_eq!(
+                descriptor_column.descending,
+                matches!(sort_field.direction, SortDirection::Descending)
+            );
+            assert_eq!(
+                descriptor_column.nulls_first,
+                matches!(sort_field.null_order, NullOrder::First)
+            );
+        }
+    }
 
     #[test]
     fn logs_sort_descriptor_matches_logs_sort_order() {
@@ -294,7 +334,7 @@ mod tests {
         assert_eq!(descriptor.columns().len(), sort_order.fields.len());
 
         for (descriptor_column, sort_field) in descriptor.columns().iter().zip(&sort_order.fields) {
-            let schema_field = resolve_logs_sort_schema_field(&schema, sort_field).expect("sort field must resolve");
+            let schema_field = resolve_sort_schema_field(&schema, sort_field).expect("sort field must resolve");
             assert_eq!(descriptor_column.column_name, schema_field.name);
             assert_eq!(
                 descriptor_column.primitive_type,
@@ -339,7 +379,7 @@ mod tests {
 
         match err {
             IngestError::Iceberg(err) => {
-                assert!(err.to_string().contains("unsupported logs merge sort transform"));
+                assert!(err.to_string().contains("unsupported merge sort transform"));
             }
             other => panic!("unexpected error variant: {other}"),
         }

@@ -1,5 +1,8 @@
-use std::sync::Arc;
 use std::time::Instant;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use icegate_jobmanager::{Error, JobManager};
@@ -11,6 +14,7 @@ use super::{
     executor::TaskStatus,
     iceberg_storage::{Storage, WrittenDataFiles},
     plan_runner::{PlanTaskResult, PlanTaskRunner},
+    row_groups_merger::RowGroupsMergerObserver,
     shift_runner::{ShiftTaskFailure, ShiftTaskFailureReason, ShiftTaskResult, ShiftTaskRunner},
 };
 use crate::infra::metrics::ShiftMetrics;
@@ -95,6 +99,68 @@ pub struct ShiftTaskRunnerWithMetrics<R> {
     inner: Arc<R>,
     metrics: ShiftMetrics,
     topic: Topic,
+}
+
+/// Row groups merger observer that records metrics.
+pub struct RowGroupsMergerObserverWithMetrics {
+    metrics: ShiftMetrics,
+    topic: Topic,
+    opened_at: Mutex<HashMap<(u64, usize), Instant>>,
+}
+
+impl RowGroupsMergerObserverWithMetrics {
+    /// Create a new merger observer wrapper.
+    pub fn new(metrics: ShiftMetrics, topic: impl Into<String>) -> Self {
+        Self {
+            metrics,
+            topic: topic.into(),
+            opened_at: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl RowGroupsMergerObserver for RowGroupsMergerObserverWithMetrics {
+    fn on_row_group_opened(&self, segment_offset: u64, row_group_idx: usize, bytes: u64) {
+        let bytes_i64 = i64::try_from(bytes).unwrap_or(i64::MAX);
+        let previous = self
+            .opened_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((segment_offset, row_group_idx), Instant::now());
+        if previous.is_some() {
+            tracing::error!(
+                segment_offset,
+                row_group_idx,
+                "row group opened twice without close; replacing previous open timestamp"
+            );
+        }
+        self.metrics.add_row_groups_merger_open_row_groups(1, self.topic.as_str());
+        self.metrics
+            .add_row_groups_merger_open_row_group_bytes(bytes_i64, self.topic.as_str());
+    }
+
+    fn on_row_group_closed(&self, segment_offset: u64, row_group_idx: usize, bytes: u64) {
+        // Use the same i64::MAX saturation as on_row_group_opened so open/close updates stay symmetric even if bytes does not fit i64.
+        let bytes_i64 = i64::try_from(bytes).unwrap_or(i64::MAX);
+        let opened_at = self
+            .opened_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(segment_offset, row_group_idx));
+        self.metrics.add_row_groups_merger_open_row_groups(-1, self.topic.as_str());
+        self.metrics
+            .add_row_groups_merger_open_row_group_bytes(-bytes_i64, self.topic.as_str());
+        if let Some(opened_at) = opened_at {
+            self.metrics
+                .record_row_groups_merger_row_group_lifetime_duration(opened_at.elapsed(), self.topic.as_str());
+        } else {
+            tracing::error!(
+                segment_offset,
+                row_group_idx,
+                "row group closed without open; skipping lifetime metric"
+            );
+        }
+    }
 }
 
 impl<R> ShiftTaskRunnerWithMetrics<R>

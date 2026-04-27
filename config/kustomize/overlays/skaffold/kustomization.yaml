@@ -5,6 +5,7 @@ resources:
   - ../../base
   - secret-aws.yaml
   - secret-aws-infra.yaml
+  - trino
 
 helmGlobals:
   chartHome: ../../../helm

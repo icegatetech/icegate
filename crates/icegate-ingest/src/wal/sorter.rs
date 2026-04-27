@@ -5,7 +5,7 @@ use arrow::{
     compute::take,
     record_batch::RecordBatch,
 };
-use icegate_common::LOGS_TOPIC;
+use icegate_common::{LOGS_TOPIC, SPANS_TOPIC};
 use icegate_queue::{PreparedWalRowGroup, WriteRequest};
 
 use super::{
@@ -25,9 +25,12 @@ impl WalSorter {
         Self { row_group_size }
     }
 
-    /// Sort logs for WAL so that each output batch contains exactly one tenant.
-    fn sort_logs(&self, batch: &RecordBatch) -> Result<Vec<PreparedWalRowGroup>> {
-        // TODO(high): make a generic solution without binding to logs. Need to parameterize SortColumnsDescriptor.
+    /// Sort a batch for WAL so that each output batch contains exactly one tenant.
+    fn sort(
+        &self,
+        descriptor: &'static SortColumnsDescriptor,
+        batch: &RecordBatch,
+    ) -> Result<Vec<PreparedWalRowGroup>> {
         struct TenantGroup {
             row_indices: Vec<usize>,
         }
@@ -44,13 +47,13 @@ impl WalSorter {
         let tenant_idx = batch
             .schema()
             .index_of("tenant_id")
-            .map_err(|err| IngestError::Shift(format!("logs batch is missing tenant_id: {err}")))?;
+            .map_err(|err| IngestError::Shift(format!("batch is missing tenant_id: {err}")))?;
         let tenant_id_column = batch
             .column(tenant_idx)
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| IngestError::Shift("tenant_id must be Utf8 for WAL sorting".to_string()))?;
-        let sort_columns = SortColumnCache::try_new(batch, SortColumnsDescriptor::logs()?, "WAL sorting")?;
+        let sort_columns = SortColumnCache::try_new(batch, descriptor, "WAL sorting")?;
 
         let mut tenant_groups = Vec::new();
         let mut tenant_group_idx_by_id = HashMap::new();
@@ -110,13 +113,44 @@ impl WalSorter {
     }
 }
 
-/// Prepare WAL batches for one ingest request.
+/// Prepare WAL batches for one logs ingest request.
 pub(crate) fn sort_logs(
     batch: &RecordBatch,
     row_group_size: usize,
     trace_context: Option<String>,
 ) -> Result<Option<PreparedWalWrite>> {
-    let row_groups = WalSorter::new(row_group_size).sort_logs(batch)?;
+    prepare(
+        SortColumnsDescriptor::logs()?,
+        LOGS_TOPIC,
+        batch,
+        row_group_size,
+        trace_context,
+    )
+}
+
+/// Prepare WAL batches for one spans ingest request.
+pub(crate) fn sort_spans(
+    batch: &RecordBatch,
+    row_group_size: usize,
+    trace_context: Option<String>,
+) -> Result<Option<PreparedWalWrite>> {
+    prepare(
+        SortColumnsDescriptor::spans()?,
+        SPANS_TOPIC,
+        batch,
+        row_group_size,
+        trace_context,
+    )
+}
+
+fn prepare(
+    descriptor: &'static SortColumnsDescriptor,
+    topic: &'static str,
+    batch: &RecordBatch,
+    row_group_size: usize,
+    trace_context: Option<String>,
+) -> Result<Option<PreparedWalWrite>> {
+    let row_groups = WalSorter::new(row_group_size).sort(descriptor, batch)?;
     if row_groups.is_empty() {
         return Ok(None);
     }
@@ -125,7 +159,7 @@ pub(crate) fn sort_logs(
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     Ok(Some(PreparedWalWrite {
         write_request: WriteRequest {
-            topic: LOGS_TOPIC.to_string(),
+            topic: topic.to_string(),
             row_groups,
             response_tx,
             trace_context,
@@ -174,12 +208,17 @@ mod tests {
     };
     use icegate_queue::{WriteResult, channel};
 
-    use super::{WalSorter, logs_row_group_boundary_range_from_batch, sort_logs};
+    use super::{WalSorter, logs_row_group_boundary_range_from_batch, sort_logs, sort_spans};
     use crate::error::IngestError;
     use crate::wal::{
-        RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue, WalAckOutcome,
-        deserialize_row_group_metadata, serialize_row_group_metadata, submit_sorted_logs_to_wal,
+        RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue,
+        SortColumnsDescriptor, WalAckOutcome, deserialize_row_group_metadata, serialize_row_group_metadata,
+        submit_sorted_rows_to_wal,
     };
+
+    fn logs_descriptor() -> &'static SortColumnsDescriptor {
+        SortColumnsDescriptor::logs().expect("logs descriptor")
+    }
 
     fn logs_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -279,7 +318,7 @@ mod tests {
 
     #[test]
     fn pre_wal_sorter_splits_mixed_tenants_into_homogeneous_batches() {
-        let batches = WalSorter::new(2).sort_logs(&logs_batch()).expect("sort logs");
+        let batches = WalSorter::new(2).sort(logs_descriptor(), &logs_batch()).expect("sort logs");
 
         assert_eq!(batches.len(), 3);
         assert_eq!(
@@ -295,7 +334,7 @@ mod tests {
 
     #[test]
     fn pre_wal_sorter_keeps_logs_sort_order_inside_tenant() {
-        let batches = WalSorter::new(8).sort_logs(&logs_batch()).expect("sort logs");
+        let batches = WalSorter::new(8).sort(logs_descriptor(), &logs_batch()).expect("sort logs");
         let tenant_a = &batches[1].batch;
 
         assert_eq!(
@@ -316,7 +355,7 @@ mod tests {
 
     #[test]
     fn pre_wal_sorter_outputs_single_tenant_per_batch() {
-        let batches = WalSorter::new(1).sort_logs(&logs_batch()).expect("sort logs");
+        let batches = WalSorter::new(1).sort(logs_descriptor(), &logs_batch()).expect("sort logs");
 
         for batch in batches {
             let tenant_ids = tenant_values(&batch.batch);
@@ -326,7 +365,7 @@ mod tests {
 
     #[test]
     fn pre_wal_sorter_preserves_input_tenant_order() {
-        let batches = WalSorter::new(2).sort_logs(&logs_batch()).expect("sort logs");
+        let batches = WalSorter::new(2).sort(logs_descriptor(), &logs_batch()).expect("sort logs");
 
         let tenant_heads = batches
             .iter()
@@ -359,7 +398,7 @@ mod tests {
         )
         .expect("logs batch");
 
-        let batches = WalSorter::new(8).sort_logs(&batch).expect("sort logs");
+        let batches = WalSorter::new(8).sort(logs_descriptor(), &batch).expect("sort logs");
 
         assert_eq!(batches.len(), 1);
         assert_eq!(row_ids(&batches[0].batch), vec![11, 12, 13]);
@@ -367,7 +406,7 @@ mod tests {
 
     #[test]
     fn pre_wal_sorter_keeps_order_across_multiple_row_groups_for_same_tenant() {
-        let batches = WalSorter::new(2).sort_logs(&logs_batch()).expect("sort logs");
+        let batches = WalSorter::new(2).sort(logs_descriptor(), &logs_batch()).expect("sort logs");
 
         assert_eq!(row_ids(&batches[1].batch), vec![4, 2]);
         assert_eq!(row_ids(&batches[2].batch), vec![1]);
@@ -375,7 +414,7 @@ mod tests {
 
     #[test]
     fn pre_wal_sorter_metadata_matches_final_row_group_edges() {
-        let batches = WalSorter::new(2).sort_logs(&logs_batch()).expect("sort logs");
+        let batches = WalSorter::new(2).sort(logs_descriptor(), &logs_batch()).expect("sort logs");
 
         let ranges = batches
             .iter()
@@ -592,7 +631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_sorted_logs_to_wal_sends_one_logical_request() {
+    async fn submit_sorted_rows_to_wal_sends_one_logical_request() {
         let batch = logs_batch();
         let (tx, mut rx) = channel(1);
 
@@ -615,7 +654,7 @@ mod tests {
         let prepared = sort_logs(&batch, 4, Some("trace-request".to_string()))
             .expect("prepare wal write")
             .expect("prepared wal write");
-        let pending = submit_sorted_logs_to_wal(&tx, prepared).await.expect("submit wal write");
+        let pending = submit_sorted_rows_to_wal(&tx, prepared).await.expect("submit wal write");
         let summary = match pending.wait_for_ack().await.expect("wait for wal ack") {
             WalAckOutcome::Success(summary) => summary,
             WalAckOutcome::Partial(_) => panic!("unexpected partial wal write"),
@@ -646,7 +685,7 @@ mod tests {
         let prepared = sort_logs(&batch, 4, Some("trace-request".to_string()))
             .expect("prepare wal write")
             .expect("prepared wal write");
-        let pending = submit_sorted_logs_to_wal(&tx, prepared).await.expect("submit wal write");
+        let pending = submit_sorted_rows_to_wal(&tx, prepared).await.expect("submit wal write");
         let outcome = pending.wait_for_ack().await.expect("wait for wal ack");
         writer.await.expect("writer task");
 
@@ -658,5 +697,142 @@ mod tests {
                 assert_eq!(partial.trace_context.as_deref(), Some("trace-ack"));
             }
         }
+    }
+
+    #[test]
+    fn sort_logs_regression_for_fixed_input() {
+        // Fixed input. Do not mutate once this test is green; it is the contract
+        // that the pipeline-generalization refactor must preserve.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("cloud_account_id", DataType::Utf8, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("row_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["tenant-a", "tenant-b", "tenant-a", "tenant-a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("acc-1"),
+                    Some("acc-9"),
+                    Some("acc-2"),
+                    Some("acc-1"),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("svc-x"),
+                    Some("svc-q"),
+                    Some("svc-y"),
+                    Some("svc-x"),
+                ])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(100),
+                    Some(200),
+                    Some(50),
+                    Some(75),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ],
+        )
+        .expect("regression batch");
+
+        let prepared = sort_logs(&batch, 8, None)
+            .expect("prepare wal write")
+            .expect("prepared wal write");
+
+        assert_eq!(prepared.write_request.topic, icegate_common::LOGS_TOPIC);
+        assert_eq!(prepared.write_request.row_groups.len(), 2);
+        assert_eq!(prepared.records, 4);
+
+        // Tenant-a group: 3 rows, sorted by (cloud_account_id asc, service_name asc, timestamp desc).
+        let rg0 = &prepared.write_request.row_groups[0];
+        assert_eq!(rg0.batch.num_rows(), 3);
+        let row_ids_rg0: Vec<i64> = (0..rg0.batch.num_rows())
+            .map(|i| {
+                rg0.batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("row_id")
+                    .value(i)
+            })
+            .collect();
+        assert_eq!(row_ids_rg0, vec![1, 4, 3]); // acc-1/svc-x/ts=100, acc-1/svc-x/ts=75, acc-2/svc-y/ts=50
+
+        // Tenant-b group: 1 row.
+        let rg1 = &prepared.write_request.row_groups[1];
+        assert_eq!(rg1.batch.num_rows(), 1);
+        let row_ids_rg1: Vec<i64> = (0..rg1.batch.num_rows())
+            .map(|i| {
+                rg1.batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("row_id")
+                    .value(i)
+            })
+            .collect();
+        assert_eq!(row_ids_rg1, vec![2]);
+
+        // Boundary metadata is non-empty JSON for every row group.
+        for rg in &prepared.write_request.row_groups {
+            let metadata = rg.metadata.as_deref().expect("metadata");
+            assert!(metadata.starts_with('{'));
+            assert!(metadata.contains("\"min_key\""));
+            assert!(metadata.contains("\"max_key\""));
+        }
+    }
+
+    #[test]
+    fn sort_spans_produces_spans_topic_and_tenant_homogeneous_groups() {
+        // Build a minimal batch with only the fields the spans sort descriptor cares about:
+        // tenant_id, cloud_account_id, service_name, trace_id, timestamp.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("cloud_account_id", DataType::Utf8, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("row_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["tenant-b", "tenant-a", "tenant-a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("acc-2"), Some("acc-1"), Some("acc-1")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("svc-2"), Some("svc-1"), Some("svc-1")])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["trace-b", "trace-a2", "trace-a1"])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(30), Some(10), Some(20)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+        )
+        .expect("spans batch");
+
+        let prepared = sort_spans(&batch, 8, None)
+            .expect("prepare wal write")
+            .expect("prepared wal write");
+
+        assert_eq!(prepared.write_request.topic, icegate_common::SPANS_TOPIC);
+        assert_eq!(prepared.write_request.row_groups.len(), 2);
+        // Tenant-a group sorted by (cloud_account_id asc, service_name asc, trace_id asc, timestamp desc).
+        // Both rows share acc-1/svc-1, so sort by trace_id asc: row_id 3 (trace-a1), row_id 2 (trace-a2).
+        let rg_a = prepared
+            .write_request
+            .row_groups
+            .iter()
+            .find(|rg| rg.batch.num_rows() == 2)
+            .expect("tenant-a group");
+        let row_ids: Vec<i64> = (0..rg_a.batch.num_rows())
+            .map(|i| {
+                rg_a.batch
+                    .column(5)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("row_id")
+                    .value(i)
+            })
+            .collect();
+        assert_eq!(row_ids, vec![3, 2]);
     }
 }
