@@ -13,11 +13,31 @@ use std::collections::BTreeSet;
 
 use iceberg::arrow::ArrowFileReader;
 use iceberg::expr::Predicate;
+use icegate_common::schema::COL_TENANT_ID;
 use parquet::file::metadata::ParquetMetaData;
 
 use super::MetadataScanConfig;
 use super::error::MetadataScanError;
 use super::parquet_reader;
+
+/// Tag/label names that are unconditionally hidden from discovery,
+/// regardless of caller config. The tenant column is system-level
+/// metadata: surfacing it as a tag would let any caller enumerate
+/// tenants and constitutes a cross-tenant information leak. Excluded
+/// at the metadata-scan layer (the "ground") rather than per-caller so
+/// no future config can accidentally re-expose it.
+///
+/// Comparison is case-insensitive — defenders should not have to know
+/// whether a particular ingest path writes `tenant_id`, `Tenant_ID`,
+/// etc.
+const SYSTEM_RESERVED_TAG_NAMES: &[&str] = &[COL_TENANT_ID];
+
+/// Whether `name` matches a system-reserved tag (case-insensitively).
+fn is_system_reserved(name: &str) -> bool {
+    SYSTEM_RESERVED_TAG_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
 
 /// Walk row-group statistics and add every indexed column listed in
 /// `config.indexed_columns` that has at least one non-null value to `out`.
@@ -33,8 +53,13 @@ pub fn collect_indexed_from_metadata(
     let schema = metadata.file_metadata().schema_descr();
 
     // Map indexed column name -> leaf column index. Done once per file.
+    // System-reserved names (tenant_id) are dropped here so a misconfigured
+    // `indexed_columns` list cannot leak them into discovery.
     let mut name_to_leaf: Vec<(&'static str, usize)> = Vec::new();
     for &name in config.indexed_columns {
+        if is_system_reserved(name) {
+            continue;
+        }
         if let Some(idx) = (0..schema.num_columns()).find(|&i| schema.column(i).name() == name) {
             name_to_leaf.push((name, idx));
         }
@@ -107,9 +132,44 @@ pub async fn collect_map_keys_via_dict(
 
     parquet_reader::read_column_dictionaries(reader, metadata, predicate, key_leaf_idx, out).await?;
 
+    // Hard exclusion: system-reserved keys (tenant_id) are stripped
+    // unconditionally regardless of caller config. The tenant column
+    // identifies isolation boundaries; surfacing it as a tag is a
+    // cross-tenant information leak.
+    out.retain(|k| !is_system_reserved(k));
     // Remove caller-configured keys that are not useful for label discovery.
     for &key in config.excluded_map_keys {
         out.remove(key);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_system_reserved;
+
+    #[test]
+    fn tenant_id_is_system_reserved() {
+        assert!(is_system_reserved("tenant_id"));
+    }
+
+    #[test]
+    fn tenant_id_match_is_case_insensitive() {
+        assert!(is_system_reserved("TENANT_ID"));
+        assert!(is_system_reserved("Tenant_Id"));
+    }
+
+    #[test]
+    fn unrelated_names_are_not_reserved() {
+        for ok in [
+            "service_name",
+            "trace_id",
+            "span_id",
+            "tenantid", // no underscore — different name
+            "x_tenant_id",
+            "",
+        ] {
+            assert!(!is_system_reserved(ok), "{ok} should not be reserved");
+        }
+    }
 }

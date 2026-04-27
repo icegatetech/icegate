@@ -326,11 +326,13 @@ async fn v2_tag_values_for_resource_service_name_returns_typed_string() -> Resul
     Ok(())
 }
 
-/// The closed-enum intrinsics (`status`, `kind`) return their canonical
-/// `{type: "keyword"}` value lists irrespective of which codes appear
-/// in the data — Grafana renders these as a fixed dropdown. Without
-/// this, Grafana shows 404 for the value picker and the user cannot
-/// build `{ status = error }` filters from the UI.
+/// The closed-enum intrinsics (`status`, `kind`) return their values
+/// `{type: "keyword"}` typed so Grafana renders them as a fixed
+/// dropdown. The set reflects codes actually present in the time
+/// window — for the seeded data only `unset` (code 0) and `ok`
+/// (code 1) appear; `error` (code 2) is intentionally absent so we
+/// also exercise the "code missing → not in dropdown" path. Without
+/// the v2 route Grafana shows 404 and the value picker stays empty.
 #[tokio::test]
 async fn v2_tag_values_for_status_intrinsic_returns_keyword_enum() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start().await?;
@@ -342,10 +344,7 @@ async fn v2_tag_values_for_status_intrinsic_returns_keyword_enum() -> Result<(),
 
     let resp = server
         .client
-        .get(format!(
-            "{}/api/v2/search/tag/status/values?q=%7Bresource.service.name%3Dicegate-ingest%7D",
-            server.base_url
-        ))
+        .get(format!("{}/api/v2/search/tag/status/values", server.base_url))
         .header("X-Scope-OrgID", "tempo-tenant")
         .send()
         .await?;
@@ -358,14 +357,16 @@ async fn v2_tag_values_for_status_intrinsic_returns_keyword_enum() -> Result<(),
         .iter()
         .filter_map(|v| Some((v["type"].as_str()?, v["value"].as_str()?)))
         .collect();
-    for code in ["error", "ok", "unset"] {
+    for code in ["ok", "unset"] {
         assert!(
             pairs.contains(&("keyword", code)),
-            "expected (keyword, {}) in status enum: {:?}",
-            code,
-            pairs
+            "expected (keyword, {code}) in status enum: {pairs:?}"
         );
     }
+    assert!(
+        !pairs.contains(&("keyword", "error")),
+        "code `error` is not in the seeded data; should not appear: {pairs:?}"
+    );
 
     server.shutdown().await;
     Ok(())

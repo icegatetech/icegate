@@ -54,12 +54,15 @@ pub struct TagsQueryParams {
     pub start: Option<i64>,
     /// Unix epoch seconds — end of time window (optional).
     pub end: Option<i64>,
-    /// Optional `TraceQL` filter restricting the row set before tag
-    /// discovery. Currently accepted-and-ignored — tag enumeration does
-    /// not yet push the filter through. Kept in the struct so Grafana-
-    /// supplied values don't trigger deserialisation errors.
+    /// Optional `TraceQL` filter restricting the candidate row-group
+    /// set before tag discovery. Indexed conjuncts (`service.name`,
+    /// `cloud.account.id`, `name`, `status`, `kind`, `trace.id`,
+    /// `span.id`, `parent.span.id`) are pushed into iceberg as a
+    /// `Predicate`; non-pushdownable clauses (regex, MAP-attribute
+    /// equality, range ops, hierarchy operators, …) are silently
+    /// dropped per the metadata-scan over-approximation contract.
+    /// Malformed input returns HTTP 400.
     #[serde(default)]
-    #[allow(dead_code)]
     pub q: Option<String>,
     /// Scope filter for v2: `resource | span | intrinsic | event | link`.
     /// Ignored by the v1 endpoint.
@@ -76,12 +79,11 @@ pub struct TagValuesQueryParams {
     /// Maximum number of distinct values to return. Defaults to
     /// [`TagValuesQueryParams::DEFAULT_LIMIT`] when unspecified.
     pub limit: Option<usize>,
-    /// Optional `TraceQL` filter restricting the row set before tag-value
-    /// discovery. Accepted on both `v1` and `v2`. Currently parsed but
-    /// **not** pushed into the metadata-scan path — kept here so Grafana-
-    /// supplied values don't trigger deserialisation errors.
+    /// Optional `TraceQL` filter restricting the candidate row-group
+    /// set before tag-value discovery. Accepted on both `v1` and `v2`.
+    /// See [`TagsQueryParams::q`] for the pushdown rules. Malformed
+    /// input returns HTTP 400.
     #[serde(default)]
-    #[allow(dead_code)]
     pub q: Option<String>,
     /// Accepted for Grafana compatibility but currently ignored.
     #[serde(rename = "maxStaleValues", default)]

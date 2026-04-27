@@ -222,6 +222,63 @@ pub async fn scan_label_values(
     Ok(result)
 }
 
+/// Compute the distinct INT32 values of a single named column in `table`
+/// for the given tenant, time range, and additional predicate.
+///
+/// Used for low-cardinality enum columns (e.g. spans `status_code` /
+/// `kind`) that aren't surfaced through `MetadataScanConfig` because
+/// their wire-format values are integers, not strings. Callers are
+/// responsible for spelling the codes back to user-facing names.
+///
+/// # Errors
+///
+/// Returns an error if iceberg planning fails or if a referenced Parquet
+/// file cannot be read.
+#[tracing::instrument(
+    skip(table, extra_predicate),
+    fields(
+        tenant_id = %tenant_id,
+        column = %column,
+        num_files = tracing::field::Empty,
+    )
+)]
+pub async fn scan_label_int_values(
+    table: &Table,
+    tenant_id: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    column: &str,
+    extra_predicate: Predicate,
+) -> Result<BTreeSet<i32>, MetadataScanError> {
+    let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
+    let files = plan_files(table, &predicate).await?;
+    tracing::Span::current().record("num_files", files.len());
+    let file_io = table.file_io().clone();
+
+    let column = column.to_string();
+    let mut stream = stream::iter(files)
+        .map(|task| {
+            let file_io = file_io.clone();
+            let predicate = predicate.clone();
+            let column = column.clone();
+            async move {
+                let (mut reader, metadata) = parquet_reader::open_file_direct(&file_io, &task).await?;
+                let mut out: BTreeSet<i32> = BTreeSet::new();
+                values::collect_indexed_int_values_via_dict(&mut reader, &metadata, &predicate, &column, &mut out)
+                    .await?;
+                Ok::<BTreeSet<i32>, MetadataScanError>(out)
+            }
+        })
+        .buffer_unordered(METADATA_SCAN_CONCURRENCY);
+
+    let mut result: BTreeSet<i32> = BTreeSet::new();
+    while let Some(r) = stream.next().await {
+        result.extend(r?);
+    }
+
+    Ok(result)
+}
+
 /// Plan the files to scan for the given predicate.
 async fn plan_files(table: &Table, predicate: &Predicate) -> Result<Vec<FileScanTask>, MetadataScanError> {
     let scan = table

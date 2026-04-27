@@ -29,6 +29,9 @@ pub mod datafusion;
 pub mod duration;
 /// Top-level TraceQL expression enum.
 pub mod expr;
+/// Translate a parsed TraceQL query into an iceberg `Predicate`
+/// fragment for metadata-scan pushdown.
+pub mod iceberg_predicate;
 /// Pipeline aggregations and metrics-mode functions.
 pub mod metric;
 /// Parser trait for TraceQL query parsing.
@@ -40,6 +43,7 @@ pub mod spanset;
 
 pub use common::{ComparisonOp, FieldRef, IntrinsicField, LiteralValue, Scope};
 pub use expr::TraceQLExpr;
+pub use iceberg_predicate::{translate_query_to_predicate, translate_query_to_predicate_excluding};
 pub use metric::{AggregationOp, GroupingKeys, MetricsFunction, PipelineExpr, PipelineStage};
 pub use parser::Parser;
 pub use planner::{DEFAULT_SEARCH_LIMIT, DEFAULT_SPANS_PER_SPANSET, Planner, QueryContext};

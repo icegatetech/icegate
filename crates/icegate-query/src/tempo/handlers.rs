@@ -12,11 +12,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, TimeZone, Utc};
+use iceberg::expr::Predicate;
 use icegate_common::{DEFAULT_TENANT_ID, TENANT_ID_HEADER, is_valid_tenant_id};
 use serde_json::json;
 
 use super::{
-    error::TempoResult,
+    error::{TempoError, TempoResult},
     executor,
     formatters::{spans_to_otlp_json, spans_to_otlp_proto},
     metadata,
@@ -26,7 +27,9 @@ use super::{
     },
     server::TempoState,
     trace_by_id::{default_window, fetch},
+    validation,
 };
+use crate::traceql::{antlr::AntlrParser, iceberg_predicate::translate_query_to_predicate_excluding, parser::Parser};
 
 // ============================================================================
 // Helpers
@@ -51,6 +54,50 @@ fn extract_tenant_id(headers: &HeaderMap) -> String {
 /// Falls back to [`DateTime::UNIX_EPOCH`] for ambiguous/out-of-range inputs.
 fn parse_epoch_seconds(secs: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(secs, 0).single().unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+/// Parse the optional `?q=` `TraceQL` query and translate it to an
+/// iceberg [`Predicate`] for metadata-scan pushdown.
+///
+/// `None`, `Some("")`, and `Some("{}")` collapse to
+/// [`Predicate::AlwaysTrue`] without touching the parser. Anything else
+/// is length-validated, parsed in `spawn_blocking` (ANTLR uses `Rc` and
+/// is therefore not `Send`), and translated via
+/// [`translate_query_to_predicate_excluding`]. Non-pushdownable clauses
+/// are silently dropped per the metadata-scan over-approximation
+/// contract.
+///
+/// `exclude_column` is the underlying physical column the caller is
+/// enumerating distinct values of, when applicable. Any conjunct in
+/// `q` that targets the same column is dropped from the pushdown so
+/// the dropdown still shows every value satisfying the *other*
+/// clauses. See
+/// [`super::metadata::target_column_for_tag`] for the resolution.
+/// Pass `None` for endpoints that aren't enumerating a specific tag's
+/// values (e.g. `/api/v2/search/tags`).
+///
+/// Malformed queries surface as HTTP 400 (`Parse`), matching
+/// [`super::executor::execute`]'s behaviour on `/api/search`.
+async fn parse_q_to_predicate(q: Option<&str>, exclude_column: Option<&str>) -> TempoResult<Predicate> {
+    let Some(q) = q else {
+        return Ok(Predicate::AlwaysTrue);
+    };
+    if q.is_empty() || q == "{}" {
+        return Ok(Predicate::AlwaysTrue);
+    }
+    validation::validate_query_length(q).map_err(TempoError::new)?;
+    let q_owned = q.to_string();
+    let span = tracing::Span::current();
+    let parse_result = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| {
+            let parser = AntlrParser::new();
+            parser.parse(&q_owned).map_err(super::executor::make_query_error_send)
+        })
+    })
+    .await
+    .map_err(super::executor::join_error)?;
+    let expr = parse_result.map_err(TempoError::new)?;
+    Ok(translate_query_to_predicate_excluding(&expr, exclude_column))
 }
 
 /// Decide whether the caller wants OTLP protobuf or JSON.
@@ -104,19 +151,33 @@ pub async fn get_trace(
     let (default_start, default_end) = default_window(now);
     let start = params.start.map_or(default_start, parse_epoch_seconds);
     let end = params.end.map_or(default_end, parse_epoch_seconds);
+    validation::validate_query_window(start, end).map_err(TempoError::new)?;
 
-    let batches = fetch(state.engine, &tenant_id, &trace_id, start, end).await?;
-    if batches.iter().all(|b| b.num_rows() == 0) {
+    let result = fetch(state.engine, &tenant_id, &trace_id, start, end).await?;
+    if result.batches.iter().all(|b| b.num_rows() == 0) {
         return Ok((StatusCode::NOT_FOUND, Json(json!({"error": "trace not found"}))).into_response());
     }
 
+    // Surface truncation to the caller via response header — the body
+    // payload itself stays valid OTLP so existing decoders keep working.
+    let truncated_header_value = axum::http::HeaderValue::from_static("true");
+    let truncated_pair = result.truncated.then_some(("x-icegate-truncated", truncated_header_value));
+
     if wants_protobuf(&headers) {
-        let bytes = spans_to_otlp_proto(&batches)?;
+        let bytes = spans_to_otlp_proto(&result.batches)?;
         let content_type = axum::http::HeaderValue::from_static("application/protobuf");
-        Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+        let mut resp = ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
+        if let Some((name, value)) = truncated_pair {
+            resp.headers_mut().insert(name, value);
+        }
+        Ok(resp)
     } else {
-        let body = spans_to_otlp_json(&batches)?;
-        Ok((StatusCode::OK, Json(body)).into_response())
+        let body = spans_to_otlp_json(&result.batches)?;
+        let mut resp = (StatusCode::OK, Json(body)).into_response();
+        if let Some((name, value)) = truncated_pair {
+            resp.headers_mut().insert(name, value);
+        }
+        Ok(resp)
     }
 }
 
@@ -151,7 +212,20 @@ pub async fn search_traces(
 // ============================================================================
 
 /// Handle `GET /api/search/tags` — flat list of all distinct tag names.
-#[tracing::instrument(skip_all, fields(tenant_id, error = tracing::field::Empty))]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        endpoint = "tempo.search_tags_v1",
+        tenant_id = tracing::field::Empty,
+        q = ?params.q,
+        start = ?params.start,
+        end = ?params.end,
+        effective_start = tracing::field::Empty,
+        effective_end = tracing::field::Empty,
+        result_count = tracing::field::Empty,
+        error = tracing::field::Empty,
+    ),
+)]
 pub async fn search_tags_v1(
     State(state): State<TempoState>,
     headers: HeaderMap,
@@ -159,14 +233,32 @@ pub async fn search_tags_v1(
 ) -> TempoResult<impl IntoResponse> {
     let tenant_id = extract_tenant_id(&headers);
     tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    // Tag-list endpoints don't enumerate a specific column, so no
+    // self-exclusion applies.
+    let extra_predicate = parse_q_to_predicate(params.q.as_deref(), None).await?;
 
-    let tag_names = metadata::list_tags_v1(&state, &tenant_id, params.start, params.end).await?;
+    let tag_names = metadata::list_tags_v1(&state, &tenant_id, params.start, params.end, extra_predicate).await?;
+    tracing::Span::current().record("result_count", tag_names.len());
     Ok((StatusCode::OK, Json(TagsV1Response { tag_names })))
 }
 
 /// Handle `GET /api/v2/search/tags` — scoped tag list used by Grafana's
 /// query builder.
-#[tracing::instrument(skip_all, fields(tenant_id, scope = tracing::field::Empty, error = tracing::field::Empty))]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        endpoint = "tempo.search_tags_v2",
+        tenant_id = tracing::field::Empty,
+        scope = tracing::field::Empty,
+        q = ?params.q,
+        start = ?params.start,
+        end = ?params.end,
+        effective_start = tracing::field::Empty,
+        effective_end = tracing::field::Empty,
+        result_count = tracing::field::Empty,
+        error = tracing::field::Empty,
+    ),
+)]
 pub async fn search_tags_v2(
     State(state): State<TempoState>,
     headers: HeaderMap,
@@ -178,15 +270,45 @@ pub async fn search_tags_v2(
     if let Some(s) = scope_filter {
         tracing::Span::current().record("scope", s.as_str());
     }
+    // Tag-list endpoints don't enumerate a specific column, so no
+    // self-exclusion applies.
+    let extra_predicate = parse_q_to_predicate(params.q.as_deref(), None).await?;
 
-    let response: TagsV2Response =
-        metadata::list_tags_v2(&state, &tenant_id, params.start, params.end, scope_filter).await?;
+    let response: TagsV2Response = metadata::list_tags_v2(
+        &state,
+        &tenant_id,
+        params.start,
+        params.end,
+        scope_filter,
+        extra_predicate,
+    )
+    .await?;
+    tracing::Span::current().record(
+        "result_count",
+        response.scopes.iter().map(|s| s.tags.len()).sum::<usize>(),
+    );
     Ok((StatusCode::OK, Json(response)))
 }
 
 /// Handle `GET /api/search/tag/{name}/values` — distinct values for a
 /// single tag.
-#[tracing::instrument(skip_all, fields(tenant_id, tag_name = %tag_name, error = tracing::field::Empty))]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        endpoint = "tempo.tag_values",
+        tenant_id = tracing::field::Empty,
+        tag_name = %tag_name,
+        target_column = tracing::field::Empty,
+        q = ?params.q,
+        start = ?params.start,
+        end = ?params.end,
+        effective_start = tracing::field::Empty,
+        effective_end = tracing::field::Empty,
+        limit = tracing::field::Empty,
+        result_count = tracing::field::Empty,
+        error = tracing::field::Empty,
+    ),
+)]
 pub async fn tag_values(
     State(state): State<TempoState>,
     headers: HeaderMap,
@@ -195,9 +317,29 @@ pub async fn tag_values(
 ) -> TempoResult<impl IntoResponse> {
     let tenant_id = extract_tenant_id(&headers);
     tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    validation::validate_tag_name(&tag_name).map_err(TempoError::new)?;
     let limit = params.limit.unwrap_or(TagValuesQueryParams::DEFAULT_LIMIT);
+    tracing::Span::current().record("limit", limit);
+    // Drop self-referential clauses from `q` so e.g. asking for
+    // distinct `service.name` with `q={ resource.service.name = "x" }`
+    // still returns every service rather than collapsing to `["x"]`.
+    let exclude_column = metadata::target_column_for_tag(&tag_name);
+    if let Some(col) = exclude_column {
+        tracing::Span::current().record("target_column", col);
+    }
+    let extra_predicate = parse_q_to_predicate(params.q.as_deref(), exclude_column).await?;
 
-    let tag_values = metadata::list_tag_values(&state, &tenant_id, &tag_name, params.start, params.end, limit).await?;
+    let tag_values = metadata::list_tag_values(
+        &state,
+        &tenant_id,
+        &tag_name,
+        params.start,
+        params.end,
+        limit,
+        extra_predicate,
+    )
+    .await?;
+    tracing::Span::current().record("result_count", tag_values.len());
     Ok((StatusCode::OK, Json(TagValuesResponse { tag_values })))
 }
 
@@ -211,7 +353,23 @@ pub async fn tag_values(
 /// the value pickers for `name`, `status`, `kind`, `resource.service.name`,
 /// etc. all fail with no completion suggestions, even though the v1
 /// endpoint serves the same data.
-#[tracing::instrument(skip_all, fields(tenant_id, tag_name = %tag_name, error = tracing::field::Empty))]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        endpoint = "tempo.tag_values_v2",
+        tenant_id = tracing::field::Empty,
+        tag_name = %tag_name,
+        target_column = tracing::field::Empty,
+        q = ?params.q,
+        start = ?params.start,
+        end = ?params.end,
+        effective_start = tracing::field::Empty,
+        effective_end = tracing::field::Empty,
+        limit = tracing::field::Empty,
+        result_count = tracing::field::Empty,
+        error = tracing::field::Empty,
+    ),
+)]
 pub async fn tag_values_v2(
     State(state): State<TempoState>,
     headers: HeaderMap,
@@ -220,10 +378,29 @@ pub async fn tag_values_v2(
 ) -> TempoResult<impl IntoResponse> {
     let tenant_id = extract_tenant_id(&headers);
     tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    validation::validate_tag_name(&tag_name).map_err(TempoError::new)?;
     let limit = params.limit.unwrap_or(TagValuesQueryParams::DEFAULT_LIMIT);
+    tracing::Span::current().record("limit", limit);
+    // Drop self-referential clauses from `q` so e.g. asking for
+    // distinct `status` with `q={ status = error }` still returns
+    // every status rather than collapsing to `["error"]`.
+    let exclude_column = metadata::target_column_for_tag(&tag_name);
+    if let Some(col) = exclude_column {
+        tracing::Span::current().record("target_column", col);
+    }
+    let extra_predicate = parse_q_to_predicate(params.q.as_deref(), exclude_column).await?;
 
-    let tag_values =
-        metadata::list_tag_values_v2(&state, &tenant_id, &tag_name, params.start, params.end, limit).await?;
+    let tag_values = metadata::list_tag_values_v2(
+        &state,
+        &tenant_id,
+        &tag_name,
+        params.start,
+        params.end,
+        limit,
+        extra_predicate,
+    )
+    .await?;
+    tracing::Span::current().record("result_count", tag_values.len());
     Ok((
         StatusCode::OK,
         Json(TagValuesV2Response {

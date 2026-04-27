@@ -13,13 +13,20 @@
 use std::collections::BTreeMap;
 
 use datafusion::arrow::{
-    array::{Array, AsArray, Int32Array, MapArray, RecordBatch, StringArray, TimestampMicrosecondArray},
+    array::{
+        Array, AsArray, Int32Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+        TimestampMicrosecondArray,
+    },
     datatypes::Int32Type,
 };
 use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value::Value as AnyVal},
     resource::v1::Resource,
-    trace::v1::{ResourceSpans, ScopeSpans, Span, Status, TracesData, status::StatusCode},
+    trace::v1::{
+        ResourceSpans, ScopeSpans, Span, Status, TracesData,
+        span::{Event, Link},
+        status::StatusCode,
+    },
 };
 use prost::Message;
 use serde_json::{Map, Value, json};
@@ -57,6 +64,10 @@ pub fn spans_to_otlp_json(batches: &[RecordBatch]) -> crate::error::Result<Value
         let resource_attrs = map_col(batch, "resource_attributes")?;
         let span_attrs = map_col(batch, "span_attributes")?;
         let svc_names = string_col_opt(batch, "service_name");
+        let events_col = list_col_opt(batch, "events");
+        let links_col = list_col_opt(batch, "links");
+        let dropped_events = i32_col_opt(batch, "dropped_events_count");
+        let dropped_links = i32_col_opt(batch, "dropped_links_count");
 
         for row in 0..batch.num_rows() {
             let svc = svc_names
@@ -71,6 +82,15 @@ pub fn spans_to_otlp_json(batches: &[RecordBatch]) -> crate::error::Result<Value
                 spans: Vec::new(),
             });
 
+            let events = events_col.map(|c| json_events_for_row(c, row)).unwrap_or_default();
+            let links = links_col.map(|c| json_links_for_row(c, row)).unwrap_or_default();
+            let dropped_events_count = dropped_events
+                .filter(|c| !c.is_null(row))
+                .map_or(0, |c| u32_from_i32(c.value(row)));
+            let dropped_links_count = dropped_links
+                .filter(|c| !c.is_null(row))
+                .map_or(0, |c| u32_from_i32(c.value(row)));
+
             let span_value = build_span_value(
                 trace_ids.value(row),
                 span_ids.value(row),
@@ -81,6 +101,10 @@ pub fn spans_to_otlp_json(batches: &[RecordBatch]) -> crate::error::Result<Value
                 starts.value(row),
                 ends.as_ref().map(|c| c.value(row)),
                 row_attributes(span_attrs, row),
+                events,
+                dropped_events_count,
+                links,
+                dropped_links_count,
             );
             group.spans.push(span_value);
         }
@@ -125,6 +149,10 @@ fn build_span_value(
     start_micros: i64,
     end_micros: Option<i64>,
     attrs: Vec<Value>,
+    events: Vec<Value>,
+    dropped_events_count: u32,
+    links: Vec<Value>,
+    dropped_links_count: u32,
 ) -> Value {
     let mut span = Map::new();
     span.insert("traceId".into(), json!(trace_id));
@@ -146,6 +174,18 @@ fn build_span_value(
         span.insert("endTimeUnixNano".into(), json!((e * 1_000).to_string()));
     }
     span.insert("attributes".into(), Value::Array(attrs));
+    if !events.is_empty() {
+        span.insert("events".into(), Value::Array(events));
+    }
+    if dropped_events_count > 0 {
+        span.insert("droppedEventsCount".into(), json!(dropped_events_count));
+    }
+    if !links.is_empty() {
+        span.insert("links".into(), Value::Array(links));
+    }
+    if dropped_links_count > 0 {
+        span.insert("droppedLinksCount".into(), json!(dropped_links_count));
+    }
     Value::Object(span)
 }
 
@@ -227,6 +267,20 @@ fn map_col<'a>(batch: &'a RecordBatch, name: &str) -> crate::error::Result<&'a M
         .ok_or_else(|| crate::error::QueryError::Internal(format!("column {name} not Map")))
 }
 
+/// Get an optional `List<Struct>` column (e.g. `events`, `links`).
+///
+/// Returns `None` when the column is missing or has the wrong Arrow
+/// type, mirroring the rest of the `*_opt` helpers in this module.
+/// Some test batches (and possibly older writers) omit these columns
+/// entirely; treating their absence as "no nested rows" keeps the
+/// formatter resilient.
+fn list_col_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a ListArray> {
+    batch
+        .schema()
+        .column_with_name(name)
+        .and_then(|(idx, _)| batch.column(idx).as_any().downcast_ref::<ListArray>())
+}
+
 fn column<'a>(batch: &'a RecordBatch, name: &str) -> crate::error::Result<&'a dyn Array> {
     batch
         .schema()
@@ -258,6 +312,14 @@ fn column<'a>(batch: &'a RecordBatch, name: &str) -> crate::error::Result<&'a dy
 ///
 /// `BTreeMap` is used to keep the output deterministic, which also makes
 /// testing easier downstream.
+//
+// The function exceeds the project's 150-line clippy threshold because the
+// nested `BestSpan` and `Acc` structs plus the per-batch / per-row
+// accumulation logic genuinely belong together — splitting them into
+// separate helpers is on the cleanup list (architecture review #5) but
+// would not improve readability today. Suppress the lint locally rather
+// than push the cleanup into this PR.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
     /// Best representative span seen so far for a trace. Ordering
@@ -311,11 +373,16 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
         /// preserved from the planner so the root sits at index 0
         /// when present.
         spans: Vec<MatchedSpan>,
-        /// Minimum `timestamp` seen, in microseconds. Zero acts as
-        /// "uninitialised" since Iceberg timestamps are always positive.
-        start_micros: i64,
-        /// Maximum `end_timestamp` seen, in microseconds.
-        end_micros: i64,
+        /// Minimum `timestamp` seen, in microseconds. `None` until the
+        /// first row arrives — using a real Option instead of a
+        /// magic-zero sentinel keeps a synthetic / clock-skewed
+        /// epoch-zero span (timestamp = 1970-01-01) from being treated
+        /// as "uninitialised" and silently dropping the trace's true
+        /// start time.
+        start_micros: Option<i64>,
+        /// Maximum `end_timestamp` seen, in microseconds. `None` until
+        /// the first row arrives.
+        end_micros: Option<i64>,
     }
 
     let mut by_trace: BTreeMap<String, Acc> = BTreeMap::new();
@@ -416,15 +483,11 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
 
             if let Some(s) = starts {
                 let t = s.value(row);
-                if acc.start_micros == 0 || t < acc.start_micros {
-                    acc.start_micros = t;
-                }
+                acc.start_micros = Some(acc.start_micros.map_or(t, |cur| cur.min(t)));
             }
             if let Some(e) = ends {
                 let t = e.value(row);
-                if t > acc.end_micros {
-                    acc.end_micros = t;
-                }
+                acc.end_micros = Some(acc.end_micros.map_or(t, |cur| cur.max(t)));
             }
         }
     }
@@ -442,14 +505,19 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
                 spans: acc.spans,
                 matched,
             }];
+            // Resolve the trace start / end. With no observed timestamps
+            // (e.g. column missing entirely), fall back to zero so the
+            // serialised payload stays well-formed.
+            let start_micros = acc.start_micros.unwrap_or(0);
+            let end_micros = acc.end_micros.unwrap_or(start_micros);
             TraceSummary {
                 trace_id: tid,
                 root_service_name,
                 root_trace_name,
                 // Tempo reports times in nanoseconds. Our Iceberg rows are in
                 // microseconds (per `schema::COL_TIMESTAMP`), so scale up.
-                start_time_unix_nano: (acc.start_micros * 1_000).to_string(),
-                duration_ms: u64::try_from(((acc.end_micros - acc.start_micros) / 1_000).max(0)).unwrap_or(0),
+                start_time_unix_nano: (start_micros * 1_000).to_string(),
+                duration_ms: u64::try_from(((end_micros - start_micros) / 1_000).max(0)).unwrap_or(0),
                 span_sets,
             }
         })
@@ -560,6 +628,10 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
         let resource_attrs_col = map_col(batch, "resource_attributes")?;
         let span_attrs_col = map_col(batch, "span_attributes")?;
         let svcs = string_col_opt(batch, "service_name");
+        let events_col = list_col_opt(batch, "events");
+        let links_col = list_col_opt(batch, "links");
+        let dropped_events = i32_col_opt(batch, "dropped_events_count");
+        let dropped_links = i32_col_opt(batch, "dropped_links_count");
 
         for row in 0..batch.num_rows() {
             let svc = svcs
@@ -574,6 +646,15 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
                 spans: Vec::new(),
             });
 
+            let events = events_col.map(|c| proto_events_for_row(c, row)).unwrap_or_default();
+            let links = links_col.map(|c| proto_links_for_row(c, row)).unwrap_or_default();
+            let dropped_events_count = dropped_events
+                .filter(|c| !c.is_null(row))
+                .map_or(0, |c| u32_from_i32(c.value(row)));
+            let dropped_links_count = dropped_links
+                .filter(|c| !c.is_null(row))
+                .map_or(0, |c| u32_from_i32(c.value(row)));
+
             let span = row_to_proto_span(
                 trace_ids.value(row),
                 span_ids.value(row),
@@ -587,6 +668,10 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
                 starts.value(row),
                 ends.as_ref().map(|c| c.value(row)),
                 proto_attributes(span_attrs_col, row),
+                events,
+                dropped_events_count,
+                links,
+                dropped_links_count,
             );
             group.spans.push(span);
         }
@@ -643,6 +728,10 @@ fn row_to_proto_span(
     start_micros: i64,
     end_micros: Option<i64>,
     attributes: Vec<KeyValue>,
+    events: Vec<Event>,
+    dropped_events_count: u32,
+    links: Vec<Link>,
+    dropped_links_count: u32,
 ) -> Span {
     Span {
         trace_id: hex::decode(trace_id).unwrap_or_default(),
@@ -656,10 +745,10 @@ fn row_to_proto_span(
         end_time_unix_nano: end_micros.map_or(0, micros_to_nanos_u64),
         attributes,
         dropped_attributes_count: 0,
-        events: vec![],
-        dropped_events_count: 0,
-        links: vec![],
-        dropped_links_count: 0,
+        events,
+        dropped_events_count,
+        links,
+        dropped_links_count,
         status: status_code.map(|c| Status {
             message: status_message.unwrap_or_default(),
             code: status_code_to_proto(c),
@@ -692,6 +781,231 @@ const fn micros_to_nanos_u64(micros: i64) -> u64 {
     if micros < 0 { 0 } else { (micros as u64) * 1_000 }
 }
 
+/// Reinterpret an `i32` storage value as an OTLP `uint32` count.
+///
+/// Iceberg stores `dropped_*_count` and link `flags` as signed Int32
+/// (no native uint32 type). OTLP uses `uint32`. Negative values are
+/// invariant violations from a buggy writer; clamp to 0 rather than
+/// surfacing wrap-around to the client.
+#[allow(clippy::cast_sign_loss)]
+const fn u32_from_i32(v: i32) -> u32 {
+    if v < 0 { 0 } else { v as u32 }
+}
+
+/// Decode this row's `events` cell into OTLP proto [`Event`]s.
+///
+/// Returns an empty vector when the cell is null, the column has the
+/// wrong Arrow shape, or the list is empty. Robust to per-element nulls
+/// and missing optional sub-fields so a malformed write cannot poison
+/// the response.
+fn proto_events_for_row(events_list: &ListArray, row: usize) -> Vec<Event> {
+    if events_list.is_null(row) {
+        return vec![];
+    }
+    let elem = events_list.value(row);
+    let Some(st) = elem.as_any().downcast_ref::<StructArray>() else {
+        return vec![];
+    };
+    let timestamps = st
+        .column_by_name("timestamp")
+        .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>());
+    let names = st.column_by_name("name").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let attributes = st
+        .column_by_name("attributes")
+        .and_then(|c| c.as_any().downcast_ref::<MapArray>());
+    let dropped_attrs = st
+        .column_by_name("dropped_attributes_count")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+
+    let mut out = Vec::with_capacity(st.len());
+    for i in 0..st.len() {
+        if st.is_null(i) {
+            continue;
+        }
+        let time_unix_nano = timestamps
+            .filter(|t| !t.is_null(i))
+            .map_or(0, |t| micros_to_nanos_u64(t.value(i)));
+        let name = names
+            .filter(|n| !n.is_null(i))
+            .map(|n| n.value(i).to_string())
+            .unwrap_or_default();
+        let attributes = attributes.map(|a| proto_attributes(a, i)).unwrap_or_default();
+        let dropped_attributes_count = dropped_attrs.filter(|d| !d.is_null(i)).map_or(0, |d| u32_from_i32(d.value(i)));
+        out.push(Event {
+            time_unix_nano,
+            name,
+            attributes,
+            dropped_attributes_count,
+        });
+    }
+    out
+}
+
+/// Decode this row's `links` cell into OTLP proto [`Link`]s.
+///
+/// Trace and span IDs are stored as hex strings (see ingest's
+/// `transform.rs`); we hex-decode them back to raw bytes so the wire
+/// format matches the OTLP `bytes` typing. Invalid hex collapses to
+/// empty bytes, mirroring how `row_to_proto_span` handles malformed
+/// span/trace IDs.
+fn proto_links_for_row(links_list: &ListArray, row: usize) -> Vec<Link> {
+    if links_list.is_null(row) {
+        return vec![];
+    }
+    let elem = links_list.value(row);
+    let Some(st) = elem.as_any().downcast_ref::<StructArray>() else {
+        return vec![];
+    };
+    let trace_ids = st
+        .column_by_name("trace_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let span_ids = st
+        .column_by_name("span_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let trace_states = st
+        .column_by_name("trace_state")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let attributes = st
+        .column_by_name("attributes")
+        .and_then(|c| c.as_any().downcast_ref::<MapArray>());
+    let dropped_attrs = st
+        .column_by_name("dropped_attributes_count")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+    let flags_arr = st.column_by_name("flags").and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+
+    let mut out = Vec::with_capacity(st.len());
+    for i in 0..st.len() {
+        if st.is_null(i) {
+            continue;
+        }
+        let trace_id_hex = trace_ids.filter(|t| !t.is_null(i)).map_or("", |t| t.value(i));
+        let span_id_hex = span_ids.filter(|s| !s.is_null(i)).map_or("", |s| s.value(i));
+        let trace_state = trace_states
+            .filter(|t| !t.is_null(i))
+            .map(|t| t.value(i).to_string())
+            .unwrap_or_default();
+        let attributes = attributes.map(|a| proto_attributes(a, i)).unwrap_or_default();
+        let dropped_attributes_count = dropped_attrs.filter(|d| !d.is_null(i)).map_or(0, |d| u32_from_i32(d.value(i)));
+        let flags = flags_arr.filter(|f| !f.is_null(i)).map_or(0, |f| u32_from_i32(f.value(i)));
+        out.push(Link {
+            trace_id: hex::decode(trace_id_hex).unwrap_or_default(),
+            span_id: hex::decode(span_id_hex).unwrap_or_default(),
+            trace_state,
+            attributes,
+            dropped_attributes_count,
+            flags,
+        });
+    }
+    out
+}
+
+/// Decode this row's `events` cell into OTLP JSON event objects.
+///
+/// Mirrors [`proto_events_for_row`] but builds `serde_json::Value`s in
+/// the camelCase OTLP/JSON shape (`timeUnixNano` as a stringified nanos
+/// value, `droppedAttributesCount`).
+fn json_events_for_row(events_list: &ListArray, row: usize) -> Vec<Value> {
+    if events_list.is_null(row) {
+        return vec![];
+    }
+    let elem = events_list.value(row);
+    let Some(st) = elem.as_any().downcast_ref::<StructArray>() else {
+        return vec![];
+    };
+    let timestamps = st
+        .column_by_name("timestamp")
+        .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>());
+    let names = st.column_by_name("name").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let attributes = st
+        .column_by_name("attributes")
+        .and_then(|c| c.as_any().downcast_ref::<MapArray>());
+    let dropped_attrs = st
+        .column_by_name("dropped_attributes_count")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+
+    let mut out = Vec::with_capacity(st.len());
+    for i in 0..st.len() {
+        if st.is_null(i) {
+            continue;
+        }
+        let time_unix_nano = timestamps
+            .filter(|t| !t.is_null(i))
+            .map_or(0_u64, |t| micros_to_nanos_u64(t.value(i)));
+        let name = names.filter(|n| !n.is_null(i)).map_or("", |n| n.value(i));
+        let attrs = attributes.map(|a| row_attributes(a, i)).unwrap_or_default();
+        let dropped = dropped_attrs.filter(|d| !d.is_null(i)).map_or(0, |d| u32_from_i32(d.value(i)));
+        let mut ev = Map::new();
+        ev.insert("timeUnixNano".into(), json!(time_unix_nano.to_string()));
+        ev.insert("name".into(), json!(name));
+        ev.insert("attributes".into(), Value::Array(attrs));
+        if dropped > 0 {
+            ev.insert("droppedAttributesCount".into(), json!(dropped));
+        }
+        out.push(Value::Object(ev));
+    }
+    out
+}
+
+/// Decode this row's `links` cell into OTLP JSON link objects.
+///
+/// Trace and span IDs are kept as hex strings — matches the
+/// per-span `traceId` / `spanId` shape emitted by [`build_span_value`].
+fn json_links_for_row(links_list: &ListArray, row: usize) -> Vec<Value> {
+    if links_list.is_null(row) {
+        return vec![];
+    }
+    let elem = links_list.value(row);
+    let Some(st) = elem.as_any().downcast_ref::<StructArray>() else {
+        return vec![];
+    };
+    let trace_ids = st
+        .column_by_name("trace_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let span_ids = st
+        .column_by_name("span_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let trace_states = st
+        .column_by_name("trace_state")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let attributes = st
+        .column_by_name("attributes")
+        .and_then(|c| c.as_any().downcast_ref::<MapArray>());
+    let dropped_attrs = st
+        .column_by_name("dropped_attributes_count")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+    let flags_arr = st.column_by_name("flags").and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+
+    let mut out = Vec::with_capacity(st.len());
+    for i in 0..st.len() {
+        if st.is_null(i) {
+            continue;
+        }
+        let trace_id_hex = trace_ids.filter(|t| !t.is_null(i)).map_or("", |t| t.value(i));
+        let span_id_hex = span_ids.filter(|s| !s.is_null(i)).map_or("", |s| s.value(i));
+        let attrs = attributes.map(|a| row_attributes(a, i)).unwrap_or_default();
+        let dropped = dropped_attrs.filter(|d| !d.is_null(i)).map_or(0, |d| u32_from_i32(d.value(i)));
+        let flags = flags_arr.filter(|f| !f.is_null(i)).map_or(0, |f| u32_from_i32(f.value(i)));
+        let mut lnk = Map::new();
+        lnk.insert("traceId".into(), json!(trace_id_hex));
+        lnk.insert("spanId".into(), json!(span_id_hex));
+        if let Some(ts) = trace_states.filter(|t| !t.is_null(i)) {
+            let s = ts.value(i);
+            if !s.is_empty() {
+                lnk.insert("traceState".into(), json!(s));
+            }
+        }
+        lnk.insert("attributes".into(), Value::Array(attrs));
+        if dropped > 0 {
+            lnk.insert("droppedAttributesCount".into(), json!(dropped));
+        }
+        if flags > 0 {
+            lnk.insert("flags".into(), json!(flags));
+        }
+        out.push(Value::Object(lnk));
+    }
+    out
+}
+
 const fn status_code_to_proto(code: i32) -> i32 {
     match code {
         1 => StatusCode::Ok as i32,
@@ -705,12 +1019,159 @@ mod proto_tests {
     use std::sync::Arc;
 
     use datafusion::arrow::{
-        array::{Int32Array, Int64Array, MapBuilder, StringArray, StringBuilder, TimestampMicrosecondArray},
-        datatypes::{DataType, Field, Schema, TimeUnit},
+        array::{
+            ArrayRef, Int32Array, Int64Array, ListArray, MapBuilder, StringArray, StringBuilder, StructArray,
+            TimestampMicrosecondArray,
+        },
+        buffer::OffsetBuffer,
+        datatypes::{DataType, Field, Fields, Schema, TimeUnit},
         record_batch::RecordBatch,
     };
 
     use super::*;
+
+    /// Build a 1-entry `Map<Utf8,Utf8>` array with a single key/value pair.
+    /// Shared by both top-level span attributes and the nested attribute
+    /// maps inside event/link list elements.
+    fn single_attr_map(key: &str, value: &str) -> datafusion::arrow::array::MapArray {
+        let mut b = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        b.keys().append_value(key);
+        b.values().append_value(value);
+        b.append(true).expect("map row");
+        b.finish()
+    }
+
+    fn map_field(name: &str) -> Field {
+        Field::new(
+            name,
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("keys", DataType::Utf8, false)),
+                            Arc::new(Field::new("values", DataType::Utf8, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        )
+    }
+
+    /// Build a single-row `RecordBatch` carrying one event and one link.
+    /// The event has a name + one attribute; the link points at a hex
+    /// `trace_id`/`span_id` with one attribute and `flags=1`.
+    ///
+    /// This is the fixture that exercises the events/links code paths
+    /// in both the proto and JSON formatters.
+    fn single_span_batch_with_events_and_links() -> RecordBatch {
+        // -- events: List<Struct{timestamp, name, attributes, dropped_attributes_count}> --
+        let event_attrs = single_attr_map("exception.message", "boom");
+        let event_attrs_dt = event_attrs.data_type().clone();
+        let event_fields: Fields = vec![
+            Arc::new(Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )),
+            Arc::new(Field::new("name", DataType::Utf8, false)),
+            Arc::new(Field::new("attributes", event_attrs_dt, false)),
+            Arc::new(Field::new("dropped_attributes_count", DataType::Int32, true)),
+        ]
+        .into();
+        let event_struct = StructArray::new(
+            event_fields.clone(),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![1_500_000_000_000_000_i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["exception"])),
+                Arc::new(event_attrs),
+                Arc::new(Int32Array::from(vec![Some(0)])),
+            ],
+            None,
+        );
+        let event_item_field = Arc::new(Field::new("item", DataType::Struct(event_fields), true));
+        let events_array = ListArray::new(
+            event_item_field.clone(),
+            OffsetBuffer::<i32>::from_lengths(std::iter::once(1)),
+            Arc::new(event_struct),
+            None,
+        );
+
+        // -- links: List<Struct{trace_id, span_id, trace_state, attributes, dropped_attributes_count, flags}> --
+        let link_attrs = single_attr_map("link.role", "parent");
+        let link_attrs_dt = link_attrs.data_type().clone();
+        let link_fields: Fields = vec![
+            Arc::new(Field::new("trace_id", DataType::Utf8, false)),
+            Arc::new(Field::new("span_id", DataType::Utf8, false)),
+            Arc::new(Field::new("trace_state", DataType::Utf8, true)),
+            Arc::new(Field::new("attributes", link_attrs_dt, false)),
+            Arc::new(Field::new("dropped_attributes_count", DataType::Int32, true)),
+            Arc::new(Field::new("flags", DataType::Int32, true)),
+        ]
+        .into();
+        let link_struct = StructArray::new(
+            link_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["fedcba98765432100123456789abcdef"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["1122334455667788"])),
+                Arc::new(StringArray::from(vec![None as Option<&str>])),
+                Arc::new(link_attrs),
+                Arc::new(Int32Array::from(vec![Some(0)])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+            ],
+            None,
+        );
+        let link_item_field = Arc::new(Field::new("item", DataType::Struct(link_fields), true));
+        let links_array = ListArray::new(
+            link_item_field.clone(),
+            OffsetBuffer::<i32>::from_lengths(std::iter::once(1)),
+            Arc::new(link_struct),
+            None,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("span_id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("kind", DataType::Int32, true),
+            Field::new("status_code", DataType::Int32, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            map_field("resource_attributes"),
+            map_field("span_attributes"),
+            Field::new("events", DataType::List(event_item_field), true),
+            Field::new("links", DataType::List(link_item_field), true),
+            Field::new("dropped_events_count", DataType::Int32, true),
+            Field::new("dropped_links_count", DataType::Int32, true),
+        ]));
+
+        let res_attrs = single_attr_map("k8s.namespace.name", "icegate");
+        let span_attrs = single_attr_map("http.method", "GET");
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["0102030405060708090a0b0c0d0e0f10"])),
+                Arc::new(StringArray::from(vec!["aabbccddeeff0011"])),
+                Arc::new(StringArray::from(vec!["GET /api"])),
+                Arc::new(Int32Array::from(vec![Some(2)])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec![Some("frontend")])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_000_000_000])),
+                Arc::new(res_attrs),
+                Arc::new(span_attrs),
+                Arc::new(events_array),
+                Arc::new(links_array),
+                Arc::new(Int32Array::from(vec![Some(2)])),
+                Arc::new(Int32Array::from(vec![Some(3)])),
+            ],
+        )
+        .expect("record batch")
+    }
 
     fn single_span_batch() -> RecordBatch {
         fn map_field(name: &str) -> Field {
@@ -838,6 +1299,105 @@ mod proto_tests {
     #[test]
     fn negative_timestamp_clamps_to_zero_nanos() {
         assert_eq!(micros_to_nanos_u64(-1), 0);
+    }
+
+    /// Span events stored in the `events` `List<Struct>` column must
+    /// surface in the OTLP proto response — they were previously
+    /// hardcoded to an empty vector, hiding all timed annotations from
+    /// downstream consumers (Grafana's "Events" tab, OTLP exporters).
+    #[test]
+    fn events_round_trip_through_proto() {
+        let batches = vec![single_span_batch_with_events_and_links()];
+        let bytes = spans_to_otlp_proto(&batches).expect("proto encode");
+        let decoded = TracesData::decode(&*bytes).expect("proto decode");
+        let span = &decoded.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(span.events.len(), 1, "expected exactly one event on the span");
+        let ev = &span.events[0];
+        assert_eq!(ev.name, "exception");
+        // 1.5e15 micros → 1.5e18 nanos.
+        assert_eq!(ev.time_unix_nano, 1_500_000_000_000_000_000);
+        assert_eq!(ev.dropped_attributes_count, 0);
+        let attrs: Vec<(&str, &str)> = ev
+            .attributes
+            .iter()
+            .filter_map(|kv| {
+                let v = kv.value.as_ref()?;
+                match &v.value {
+                    Some(AnyVal::StringValue(s)) => Some((kv.key.as_str(), s.as_str())),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(attrs, vec![("exception.message", "boom")]);
+        // The top-level dropped_events_count column (= 2) must propagate.
+        assert_eq!(span.dropped_events_count, 2);
+    }
+
+    /// Span links stored in the `links` `List<Struct>` column must
+    /// surface in the OTLP proto response with hex-decoded raw bytes
+    /// for `trace_id`/`span_id`, matching the OTLP `bytes` typing.
+    #[test]
+    fn links_round_trip_through_proto() {
+        let batches = vec![single_span_batch_with_events_and_links()];
+        let bytes = spans_to_otlp_proto(&batches).expect("proto encode");
+        let decoded = TracesData::decode(&*bytes).expect("proto decode");
+        let span = &decoded.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(span.links.len(), 1, "expected exactly one link on the span");
+        let lnk = &span.links[0];
+        assert_eq!(lnk.trace_id.len(), 16, "trace_id should be 16 raw bytes");
+        assert_eq!(lnk.span_id.len(), 8, "span_id should be 8 raw bytes");
+        // Spot-check the first/last bytes of the hex round-trip:
+        // "fedcba98765432100123456789abcdef" → bytes 0xfe…0xef.
+        assert_eq!(lnk.trace_id[0], 0xfe);
+        assert_eq!(lnk.trace_id[15], 0xef);
+        assert_eq!(lnk.span_id[0], 0x11);
+        assert_eq!(lnk.span_id[7], 0x88);
+        assert_eq!(lnk.flags, 1);
+        let attrs: Vec<(&str, &str)> = lnk
+            .attributes
+            .iter()
+            .filter_map(|kv| {
+                let v = kv.value.as_ref()?;
+                match &v.value {
+                    Some(AnyVal::StringValue(s)) => Some((kv.key.as_str(), s.as_str())),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(attrs, vec![("link.role", "parent")]);
+        // Top-level dropped_links_count column (= 3) must propagate.
+        assert_eq!(span.dropped_links_count, 3);
+    }
+
+    /// JSON formatter must also emit `events` and `links` arrays under
+    /// the OTLP camelCase keys. Trace and span IDs in JSON keep their
+    /// hex-string encoding to match how the surrounding span emits its
+    /// own `traceId` / `spanId`.
+    #[test]
+    fn events_and_links_appear_in_otlp_json() {
+        let batches = vec![single_span_batch_with_events_and_links()];
+        let value = spans_to_otlp_json(&batches).expect("json build");
+        let span = &value["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+
+        let events = span.get("events").expect("events array present");
+        assert_eq!(events.as_array().expect("events is array").len(), 1);
+        assert_eq!(events[0]["name"], "exception");
+        assert_eq!(events[0]["timeUnixNano"], "1500000000000000000");
+        let event_attrs = events[0]["attributes"].as_array().expect("event attrs");
+        assert_eq!(event_attrs[0]["key"], "exception.message");
+        assert_eq!(event_attrs[0]["value"]["stringValue"], "boom");
+
+        let links = span.get("links").expect("links array present");
+        assert_eq!(links.as_array().expect("links is array").len(), 1);
+        assert_eq!(links[0]["traceId"], "fedcba98765432100123456789abcdef");
+        assert_eq!(links[0]["spanId"], "1122334455667788");
+        assert_eq!(links[0]["flags"], 1);
+        let link_attrs = links[0]["attributes"].as_array().expect("link attrs");
+        assert_eq!(link_attrs[0]["key"], "link.role");
+        assert_eq!(link_attrs[0]["value"]["stringValue"], "parent");
+
+        assert_eq!(span["droppedEventsCount"], 2);
+        assert_eq!(span["droppedLinksCount"], 3);
     }
 }
 

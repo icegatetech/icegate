@@ -17,6 +17,7 @@ use datafusion::arrow::array::{Array, MapArray, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
 use iceberg::expr::Predicate;
+use icegate_common::schema::COL_TENANT_ID;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
@@ -24,6 +25,15 @@ use parquet::file::metadata::ParquetMetaData;
 use super::MetadataScanConfig;
 use super::error::MetadataScanError;
 use super::parquet_reader;
+
+/// Whether `name` matches a system-reserved column whose values must
+/// never be enumerated through tag-discovery, regardless of caller
+/// validation. Mirrors the discovery-side guard in
+/// [`super::labels::is_system_reserved`] — see that module for the
+/// rationale.
+fn is_system_reserved_value_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case(COL_TENANT_ID)
+}
 
 /// Which code path to use for a given label name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +73,12 @@ pub async fn collect_indexed_values_via_dict(
     column_name: &str,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
+    if is_system_reserved_value_column(column_name) {
+        // Refuse at the metadata-scan layer — tenant_id is system
+        // metadata and must never be enumerated as a label/tag value
+        // even if HTTP-layer validation is bypassed.
+        return Ok(());
+    }
     let schema = metadata.file_metadata().schema_descr();
     let Some(leaf_idx) = (0..schema.num_columns()).find(|&i| schema.column(i).name() == column_name) else {
         // Column not present in this file — nothing to do. Not an error
@@ -71,6 +87,34 @@ pub async fn collect_indexed_values_via_dict(
     };
 
     parquet_reader::read_column_dictionaries(reader, metadata, predicate, leaf_idx, out).await
+}
+
+/// Collect distinct values for an indexed top-level INT32 column by
+/// reading only its dictionary page for every row group that survives
+/// row-group predicate pruning.
+///
+/// Mirrors [`collect_indexed_values_via_dict`] but for fixed-width
+/// integer columns (used for the `status_code` and `kind` enum columns
+/// on the spans table). Files lacking the named column contribute
+/// nothing — over-approximation semantics.
+///
+/// # Errors
+///
+/// Returns `MetadataScanError::Parquet` if a column chunk fails to decode.
+#[tracing::instrument(skip_all, fields(column = column_name))]
+pub async fn collect_indexed_int_values_via_dict(
+    reader: &mut ArrowFileReader,
+    metadata: &ParquetMetaData,
+    predicate: &Predicate,
+    column_name: &str,
+    out: &mut BTreeSet<i32>,
+) -> Result<(), MetadataScanError> {
+    let schema = metadata.file_metadata().schema_descr();
+    let Some(leaf_idx) = (0..schema.num_columns()).find(|&i| schema.column(i).name() == column_name) else {
+        return Ok(());
+    };
+
+    parquet_reader::read_column_int_dictionaries(reader, metadata, predicate, leaf_idx, out).await
 }
 
 /// Project the configured MAP column and collect distinct values for a
@@ -92,6 +136,12 @@ pub async fn stream_map_values(
     label_name: &str,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
+    if is_system_reserved_value_column(label_name) {
+        // Refuse at the metadata-scan layer — even if some ingest path
+        // smuggles `tenant_id` into the attributes MAP, we never
+        // enumerate its values.
+        return Ok(());
+    }
     let schema_descr = builder.parquet_schema();
     let has_map = (0..schema_descr.num_columns()).any(|i| {
         schema_descr
@@ -156,10 +206,10 @@ fn collect_map_values_from_batch(
 
     for i in 0..keys.len() {
         if keys.is_valid(i) && keys.value(i) == label_name && values.is_valid(i) {
-            let v = values.value(i);
-            if !out.contains(v) {
-                out.insert(v.to_string());
-            }
+            // `BTreeSet::insert` already short-circuits on duplicates and
+            // returns `bool` — a separate `contains` check is a wasted
+            // O(log n) tree walk per row.
+            out.insert(values.value(i).to_string());
         }
     }
 

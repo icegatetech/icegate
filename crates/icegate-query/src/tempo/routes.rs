@@ -1,8 +1,19 @@
 //! Tempo API routes
 
-use axum::{Router, routing::get};
+use axum::{Router, extract::DefaultBodyLimit, http::StatusCode, routing::get};
+use tower_http::timeout::TimeoutLayer;
 
-use super::{handlers, server::TempoState};
+/// HTTP status returned when a request exceeds [`REQUEST_TIMEOUT`].
+/// `503 Service Unavailable` matches axum's recommendation for an
+/// upstream timeout; Grafana surfaces it as a transient error rather
+/// than blaming the query for being malformed.
+const TIMEOUT_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
+
+use super::{
+    handlers,
+    server::TempoState,
+    validation::{MAX_BODY_BYTES, REQUEST_TIMEOUT},
+};
 
 /// Build the Tempo HTTP router.
 ///
@@ -20,6 +31,17 @@ use super::{handlers, server::TempoState};
 ///   probe; must return 200 with body `echo` or Grafana hides the search
 ///   builder behind an "Unable to connect to Tempo search" banner.
 /// - `GET  /ready`                          — health check.
+///
+/// # Middleware
+///
+/// Two layers are applied to every route:
+/// - [`DefaultBodyLimit`] caps incoming POST bodies at
+///   [`MAX_BODY_BYTES`]. Axum's default of 2 `MiB` is far larger than any
+///   legitimate Tempo request body and would let an attacker drive the
+///   lexer / parser with megabyte-sized `q=` parameters.
+/// - [`TimeoutLayer`] with [`REQUEST_TIMEOUT`] guarantees the server
+///   never holds a request open indefinitely on a downstream catalog
+///   hang or runaway scan.
 pub fn routes(state: TempoState) -> Router {
     Router::new()
         .route("/api/traces/{trace_id}", get(handlers::get_trace))
@@ -35,5 +57,7 @@ pub fn routes(state: TempoState) -> Router {
         .route("/api/v2/search/tag/{name}/values", get(handlers::tag_values_v2))
         .route("/api/echo", get(handlers::echo))
         .route("/ready", get(handlers::ready))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(TIMEOUT_STATUS, REQUEST_TIMEOUT))
         .with_state(state)
 }

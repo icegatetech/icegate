@@ -25,6 +25,7 @@ use icegate_common::schema::{
     COL_CLOUD_ACCOUNT_ID, COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES,
     COL_SPAN_ID, COL_TRACE_ID, SPAN_INDEXED_ATTRIBUTE_COLUMNS, TRACEQL_INTRINSIC_TAGS,
 };
+use icegate_common::schema::{COL_KIND, COL_STATUS_CODE};
 use icegate_common::{ICEGATE_NAMESPACE, SPANS_TABLE};
 
 use super::error::{TempoError, TempoResult};
@@ -40,17 +41,6 @@ const VALUE_TYPE_STRING: &str = "string";
 /// v2 tag-values response. Grafana renders `keyword`-typed values as a
 /// fixed dropdown rather than a free-text input.
 const VALUE_TYPE_KEYWORD: &str = "keyword";
-
-/// Canonical `TraceQL` `status` enum values, ordered as Tempo emits them.
-/// Returned regardless of whether each code actually appears in the data
-/// — the closed enum is small enough that the static list is more useful
-/// than a dynamic scan would be.
-const STATUS_ENUM_VALUES: &[&str] = &["error", "ok", "unset"];
-
-/// Canonical `TraceQL` `kind` enum values matching the OTLP `SpanKind`
-/// definitions. Returned as a static list for the same reason as
-/// [`STATUS_ENUM_VALUES`].
-const KIND_ENUM_VALUES: &[&str] = &["client", "consumer", "internal", "producer", "server", "unspecified"];
 
 /// Top-level resource columns surfaced under the `resource` scope as
 /// `OTel`-dotted tag names. Each entry maps the user-facing `TraceQL` /
@@ -120,6 +110,12 @@ const DEFAULT_LOOKBACK_HOURS: i64 = 6;
 /// List all distinct tag names for the spans table in the given tenant+time
 /// window. Used by the v1 `/api/search/tags` endpoint.
 ///
+/// `extra_predicate` is AND'd with the tenant+time base predicate by the
+/// metadata-scan layer; pass [`Predicate::AlwaysTrue`] to disable. The
+/// over-approximation contract applies — non-pushdownable `TraceQL`
+/// clauses are dropped upstream and only widen the candidate row-group
+/// set.
+///
 /// # Errors
 ///
 /// Returns a [`TempoError`] wrapping the underlying metadata-scan or
@@ -129,8 +125,9 @@ pub async fn list_tags_v1(
     tenant_id: &str,
     start: Option<i64>,
     end: Option<i64>,
+    extra_predicate: Predicate,
 ) -> TempoResult<Vec<String>> {
-    let v2 = list_tags_v2(state, tenant_id, start, end, None).await?;
+    let v2 = list_tags_v2(state, tenant_id, start, end, None, extra_predicate).await?;
     let mut out: BTreeSet<String> = BTreeSet::new();
     for group in v2.scopes {
         out.extend(group.tags);
@@ -145,6 +142,10 @@ pub async fn list_tags_v1(
 /// empty or unrecognised scope case (no `scope=` query param) returns all
 /// scopes.
 ///
+/// `extra_predicate` is forwarded to every metadata-scan call so file
+/// pruning and row-group pruning can fire on indexed columns (e.g.
+/// `service_name`, `status_code`).
+///
 /// # Errors
 ///
 /// Returns a [`TempoError`] wrapping the underlying metadata-scan or
@@ -155,8 +156,9 @@ pub async fn list_tags_v2(
     start: Option<i64>,
     end: Option<i64>,
     scope_filter: Option<Scope>,
+    extra_predicate: Predicate,
 ) -> TempoResult<super::models::TagsV2Response> {
-    let (start_dt, end_dt) = resolve_window(start, end);
+    let (start_dt, end_dt) = resolve_window(start, end)?;
     let table = load_spans_table(state).await?;
 
     let mut groups: Vec<ScopeGroup> = Vec::with_capacity(5);
@@ -170,7 +172,7 @@ pub async fn list_tags_v2(
             start_dt,
             end_dt,
             &SPANS_RESOURCE_CONFIG,
-            Predicate::AlwaysTrue,
+            extra_predicate.clone(),
         )
         .await
         .map_err(|e| TempoError(QueryError::from(e)))?;
@@ -194,7 +196,7 @@ pub async fn list_tags_v2(
             start_dt,
             end_dt,
             &SPANS_SPAN_CONFIG,
-            Predicate::AlwaysTrue,
+            extra_predicate.clone(),
         )
         .await
         .map_err(|e| TempoError(QueryError::from(e)))?;
@@ -238,7 +240,12 @@ pub async fn list_tags_v2(
 /// Intrinsics that are numeric (`duration`, `status`, `kind`, …) or
 /// derived (`traceDuration`, `rootName`) currently return an empty list —
 /// we only enumerate values for columns whose distinct set is cheap to
-/// compute via the metadata-scan path.
+/// compute via the metadata-scan path. Status/kind enums are surfaced
+/// via the typed [`list_tag_values_v2`] path instead.
+///
+/// `extra_predicate` is forwarded to every metadata-scan call so indexed
+/// `TraceQL` selectors (e.g. `q={ resource.service.name = "x" }`) prune
+/// the candidate file/row-group set.
 ///
 /// # Errors
 ///
@@ -251,8 +258,9 @@ pub async fn list_tag_values(
     start: Option<i64>,
     end: Option<i64>,
     limit: usize,
+    extra_predicate: Predicate,
 ) -> TempoResult<Vec<String>> {
-    let (start_dt, end_dt) = resolve_window(start, end);
+    let (start_dt, end_dt) = resolve_window(start, end)?;
     let table = load_spans_table(state).await?;
 
     let tag = TagRef::parse(tag_name);
@@ -260,20 +268,28 @@ pub async fn list_tag_values(
 
     match tag {
         TagRef::Intrinsic(name) => match name {
-            "name" => {
-                values = scan_values_either(&table, tenant_id, start_dt, end_dt, COL_NAME).await?;
+            "name" | "span:name" => {
+                values = scan_values_either(&table, tenant_id, start_dt, end_dt, COL_NAME, extra_predicate).await?;
             }
-            "rootServiceName" => {
-                values = scan_values_either(&table, tenant_id, start_dt, end_dt, COL_SERVICE_NAME).await?;
+            "rootServiceName" | "trace:rootService" => {
+                values =
+                    scan_values_either(&table, tenant_id, start_dt, end_dt, COL_SERVICE_NAME, extra_predicate).await?;
             }
-            "traceID" => {
-                values = scan_values_either(&table, tenant_id, start_dt, end_dt, COL_TRACE_ID).await?;
-            }
-            "spanID" => {
-                values = scan_values_either(&table, tenant_id, start_dt, end_dt, COL_SPAN_ID).await?;
-            }
-            // Intrinsics that we can't cheaply enumerate (numeric,
-            // derived). Return empty — still 200, keeps Grafana happy.
+            // `trace:id` / `span:id` (and the legacy `traceID` /
+            // `spanID`) are intentionally NOT enumerated. Per Tempo
+            // convention they are omitted from tag discovery and
+            // `/tag/{name}/values` returns the empty set — enumerating
+            // the distinct set of per-trace / per-span identifiers is
+            // both useless (every row contributes a unique value) and
+            // expensive. They remain queryable in TraceQL via the
+            // parser; predicate pushdown is handled by
+            // `target_column_for_tag`.
+            //
+            // Other intrinsics that we can't cheaply enumerate
+            // (numeric: `duration`, `traceDuration`, `span:duration`,
+            // `trace:duration`; derived: `rootName`, `trace:rootName`)
+            // also fall through here. Return empty — still 200, keeps
+            // Grafana happy.
             _ => {}
         },
         TagRef::Scoped {
@@ -288,7 +304,7 @@ pub async fn list_tag_values(
                 end_dt,
                 &SPANS_VALUES_RESOURCE_CONFIG,
                 mapped.unwrap_or(key),
-                Predicate::AlwaysTrue,
+                extra_predicate,
             )
             .await
             .map_err(|e| TempoError(QueryError::from(e)))?;
@@ -305,7 +321,7 @@ pub async fn list_tag_values(
                 end_dt,
                 &SPANS_VALUES_SPAN_CONFIG,
                 mapped.unwrap_or(key),
-                Predicate::AlwaysTrue,
+                extra_predicate,
             )
             .await
             .map_err(|e| TempoError(QueryError::from(e)))?;
@@ -320,7 +336,7 @@ pub async fn list_tag_values(
                 end_dt,
                 &SPANS_VALUES_SPAN_CONFIG,
                 mapped,
-                Predicate::AlwaysTrue,
+                extra_predicate.clone(),
             )
             .await
             .map_err(|e| TempoError(QueryError::from(e)))?;
@@ -331,7 +347,7 @@ pub async fn list_tag_values(
                 end_dt,
                 &SPANS_VALUES_RESOURCE_CONFIG,
                 mapped,
-                Predicate::AlwaysTrue,
+                extra_predicate,
             )
             .await
             .map_err(|e| TempoError(QueryError::from(e)))?;
@@ -356,10 +372,11 @@ pub async fn list_tag_values(
 /// `v2` typed shape (`{type, value}` per entry).
 ///
 /// Reuses [`list_tag_values`] for string-typed lookups and adds typed
-/// handling for the closed-enum intrinsics (`status`, `kind`). Numeric
-/// and derived intrinsics still return an empty list — they require
-/// reading non-string columns which the metadata-scan layer doesn't
-/// support today.
+/// handling for the closed-enum intrinsics (`status`, `kind`) — these
+/// scan the corresponding INT column for distinct codes actually
+/// present in the time window (with `extra_predicate` applied) and map
+/// each code back to its `OTel` spelling. Numeric and derived intrinsics
+/// other than `status` / `kind` still return an empty list.
 ///
 /// # Errors
 ///
@@ -372,18 +389,22 @@ pub async fn list_tag_values_v2(
     start: Option<i64>,
     end: Option<i64>,
     limit: usize,
+    extra_predicate: Predicate,
 ) -> TempoResult<Vec<TagValueV2>> {
-    // The closed enum intrinsics are answered without touching the
-    // catalog: their canonical value sets are fixed by the OTLP spec,
-    // and Grafana renders them as a dropdown regardless of which codes
-    // actually appear in the data.
+    // Status / kind are closed enums that live in INT columns
+    // (`status_code`, `kind`). Scan the column dictionary for codes
+    // actually present in the window — empty result is intentional
+    // (e.g. no `error` rows in the window means no `error` in the
+    // dropdown).
     if let TagRef::Intrinsic(name) = TagRef::parse(tag_name) {
-        if let Some(values) = enum_intrinsic_values(name) {
+        if let Some(values) =
+            enum_intrinsic_values_dynamic(state, tenant_id, name, start, end, extra_predicate.clone()).await?
+        {
             return Ok(values.into_iter().take(limit).collect());
         }
     }
 
-    let strings = list_tag_values(state, tenant_id, tag_name, start, end, limit).await?;
+    let strings = list_tag_values(state, tenant_id, tag_name, start, end, limit, extra_predicate).await?;
     Ok(strings
         .into_iter()
         .map(|value| TagValueV2 {
@@ -393,24 +414,60 @@ pub async fn list_tag_values_v2(
         .collect())
 }
 
-/// Static value set for the closed-enum `TraceQL` intrinsics
-/// (`status`, `kind`). Returns `None` for any other intrinsic so callers
-/// can fall through to the dynamic string-value path.
-fn enum_intrinsic_values(name: &str) -> Option<Vec<TagValueV2>> {
-    let codes: &'static [&'static str] = match name {
-        "status" => STATUS_ENUM_VALUES,
-        "kind" => KIND_ENUM_VALUES,
-        _ => return None,
+/// Dynamic value set for the closed-enum `TraceQL` intrinsics
+/// (`status`, `kind`). Reads the underlying INT32 column via
+/// [`metadata_scan::scan_label_int_values`] — which combines Parquet
+/// dictionary pages, row-group statistics min/max, and null-count —
+/// then maps each surviving OTLP code to its canonical spelling.
+///
+/// Returns `Ok(None)` for any other intrinsic so callers fall through
+/// to the string-value path. Returns `Ok(Some(empty))` when nothing
+/// in the window has a status/kind set — Grafana then shows an empty
+/// dropdown, matching the requested behaviour: the dropdown reflects
+/// data, not the static OTLP enum.
+///
+/// **NULL handling**: IceGate's spans-ingest writes both OTLP
+/// `Status.code = 0` (Unset) and the absent-status case as Parquet
+/// NULL (see `crates/icegate-ingest/src/transform.rs::498-521`); same
+/// for `SpanKind::Unspecified`. The metadata-scan layer surfaces
+/// observed nulls back as the canonical code `0`, so traces with no
+/// explicit status still produce an `unset` entry in the dropdown.
+async fn enum_intrinsic_values_dynamic(
+    state: &TempoState,
+    tenant_id: &str,
+    intrinsic: &str,
+    start: Option<i64>,
+    end: Option<i64>,
+    extra_predicate: Predicate,
+) -> TempoResult<Option<Vec<TagValueV2>>> {
+    let (column, code_to_name): (&str, fn(i32) -> Option<&'static str>) = match intrinsic {
+        "status" | "span:status" => (COL_STATUS_CODE, status_code_to_str),
+        "kind" | "span:kind" => (COL_KIND, kind_code_to_str),
+        _ => return Ok(None),
     };
-    Some(
-        codes
-            .iter()
-            .map(|code| TagValueV2 {
+    let (start_dt, end_dt) = resolve_window(start, end)?;
+    let table = load_spans_table(state).await?;
+
+    let codes = metadata_scan::scan_label_int_values(&table, tenant_id, start_dt, end_dt, column, extra_predicate)
+        .await
+        .map_err(|e| TempoError(QueryError::from(e)))?;
+
+    let mut out: Vec<TagValueV2> = Vec::with_capacity(codes.len());
+    for code in codes {
+        if let Some(name) = code_to_name(code) {
+            out.push(TagValueV2 {
                 value_type: VALUE_TYPE_KEYWORD,
-                value: (*code).to_string(),
-            })
-            .collect(),
-    )
+                value: name.to_string(),
+            });
+        } else {
+            // Schema drift: code seen in data is outside the OTLP enum
+            // we know about. Don't render it as a raw integer in a
+            // keyword-typed dropdown — drop with a warn so operators
+            // notice if the spec grows.
+            tracing::warn!(intrinsic, code, "unknown OTLP code in tag-value enumeration");
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Enumerate distinct values for an indexed top-level column. The column
@@ -422,6 +479,7 @@ async fn scan_values_either(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     column: &str,
+    extra_predicate: Predicate,
 ) -> TempoResult<BTreeSet<String>> {
     metadata_scan::scan_label_values(
         table,
@@ -430,7 +488,7 @@ async fn scan_values_either(
         end,
         &SPANS_VALUES_SPAN_CONFIG,
         column,
-        Predicate::AlwaysTrue,
+        extra_predicate,
     )
     .await
     .map_err(|e| TempoError(QueryError::from(e)))
@@ -451,20 +509,122 @@ fn map_attribute_to_column(key: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolve the underlying physical column being enumerated by a
+/// `tag-values` request. Used by the handlers to drop self-referential
+/// conjuncts from the `q` pushdown — see
+/// [`crate::traceql::translate_query_to_predicate_excluding`].
+///
+/// Returns `None` for tags that live in MAP attribute columns (e.g.
+/// arbitrary span attributes) — there's no top-level column to
+/// self-reference, so the standard pushdown rules apply unchanged.
+#[must_use]
+pub fn target_column_for_tag(tag_name: &str) -> Option<&'static str> {
+    match TagRef::parse(tag_name) {
+        TagRef::Intrinsic(name) => match name {
+            "name" | "span:name" => Some(COL_NAME),
+            "rootServiceName" | "trace:rootService" => Some(COL_SERVICE_NAME),
+            // `traceID` / `spanID` kept as aliases for backward compat
+            // with older Grafana clients still emitting the legacy
+            // camelCase intrinsics; canonical modern spelling is the
+            // colon form.
+            "traceID" | "trace:id" => Some(COL_TRACE_ID),
+            "spanID" | "span:id" => Some(COL_SPAN_ID),
+            "status" | "span:status" => Some(COL_STATUS_CODE),
+            "kind" | "span:kind" => Some(COL_KIND),
+            _ => None,
+        },
+        TagRef::Scoped {
+            scope: Scope::Resource | Scope::Span,
+            key,
+        }
+        | TagRef::UnscopedAttribute(key) => map_attribute_to_column(key),
+        TagRef::Scoped {
+            scope: Scope::Event | Scope::Link | Scope::Intrinsic,
+            ..
+        } => None,
+    }
+}
+
+/// Map an OTLP `Status.code` integer back to its canonical `TraceQL`
+/// spelling. Inverse of [`crate::traceql::common::StatusValue::otlp_code`].
+/// Returns `None` for codes outside the spec — callers drop those rather
+/// than render an integer in a keyword-typed dropdown.
+const fn status_code_to_str(code: i32) -> Option<&'static str> {
+    match code {
+        0 => Some("unset"),
+        1 => Some("ok"),
+        2 => Some("error"),
+        _ => None,
+    }
+}
+
+/// Map an OTLP `SpanKind` integer back to its canonical `TraceQL`
+/// spelling. Inverse of [`crate::traceql::common::KindValue::otlp_code`].
+/// Returns `None` for codes outside the spec.
+const fn kind_code_to_str(code: i32) -> Option<&'static str> {
+    match code {
+        0 => Some("unspecified"),
+        1 => Some("internal"),
+        2 => Some("server"),
+        3 => Some("client"),
+        4 => Some("producer"),
+        5 => Some("consumer"),
+        _ => None,
+    }
+}
+
 /// Check whether a named column exists in the spans table schema.
 fn table_has_column(table: &iceberg::table::Table, col: &str) -> bool {
     table.metadata().current_schema().field_by_name(col).is_some()
 }
 
 /// Resolve the `[start, end]` window from optional Unix-epoch-second
-/// parameters.
-fn resolve_window(start: Option<i64>, end: Option<i64>) -> (DateTime<Utc>, DateTime<Utc>) {
+/// parameters and validate it against the server-side caps.
+///
+/// Defaults when params are missing — Grafana's tag-discovery calls
+/// commonly omit both:
+/// - `end` missing → `end = now`.
+/// - `start` missing → `start = end - DEFAULT_LOOKBACK_HOURS` (6h
+///   today). When end is also missing this becomes `now - 6h`,
+///   producing a `[now-6h, now]` window — bounded enough that the
+///   metadata-scan pruning still has work to do.
+///
+/// The effective window is recorded on the current tracing span so
+/// operators can verify what was actually scanned, regardless of what
+/// the client sent. A `debug` log fires whenever a default is
+/// applied.
+///
+/// # Errors
+///
+/// Returns [`TempoError`] (HTTP 400) when the resolved window is
+/// inverted or wider than [`super::validation::MAX_QUERY_WINDOW`].
+fn resolve_window(start: Option<i64>, end: Option<i64>) -> TempoResult<(DateTime<Utc>, DateTime<Utc>)> {
     let now = Utc::now();
     let end_dt = end.and_then(|s| Utc.timestamp_opt(s, 0).single()).unwrap_or(now);
     let start_dt = start
         .and_then(|s| Utc.timestamp_opt(s, 0).single())
         .unwrap_or_else(|| end_dt - chrono::Duration::hours(DEFAULT_LOOKBACK_HOURS));
-    (start_dt, end_dt)
+    super::validation::validate_query_window(start_dt, end_dt).map_err(TempoError::new)?;
+
+    // Surface the resolved window to the calling handler's tracing
+    // span so dashboards/log searches see what was actually scanned,
+    // not just what the client sent. Handler instrument! macros
+    // declare these fields as `tracing::field::Empty`.
+    let span = tracing::Span::current();
+    span.record("effective_start", start_dt.timestamp());
+    span.record("effective_end", end_dt.timestamp());
+    if start.is_none() || end.is_none() {
+        tracing::debug!(
+            start_explicit = start.is_some(),
+            end_explicit = end.is_some(),
+            effective_start = start_dt.timestamp(),
+            effective_end = end_dt.timestamp(),
+            default_lookback_hours = DEFAULT_LOOKBACK_HOURS,
+            "applied default tag-discovery window",
+        );
+    }
+
+    Ok((start_dt, end_dt))
 }
 
 /// Load the `spans` Iceberg table via the query engine's catalog.
@@ -481,7 +641,8 @@ async fn load_spans_table(state: &TempoState) -> TempoResult<iceberg::table::Tab
 
 #[cfg(test)]
 mod tests {
-    use super::{map_attribute_to_column, resolve_window};
+    use super::{kind_code_to_str, map_attribute_to_column, resolve_window, status_code_to_str};
+    use crate::traceql::common::{KindValue, StatusValue};
 
     #[test]
     fn map_attribute_maps_service_name() {
@@ -495,16 +656,81 @@ mod tests {
     }
 
     #[test]
+    fn status_code_to_str_round_trips_otlp_codes() {
+        for v in [StatusValue::Unset, StatusValue::Ok, StatusValue::Error] {
+            // Round-trip via the OTel code → spelling helper. Spelling
+            // must match what `traceql::common::StatusValue` would print.
+            let spelling = status_code_to_str(v.otlp_code()).expect("known code");
+            let expected = match v {
+                StatusValue::Ok => "ok",
+                StatusValue::Error => "error",
+                StatusValue::Unset => "unset",
+            };
+            assert_eq!(spelling, expected);
+        }
+    }
+
+    #[test]
+    fn kind_code_to_str_round_trips_otlp_codes() {
+        for v in [
+            KindValue::Unspecified,
+            KindValue::Internal,
+            KindValue::Server,
+            KindValue::Client,
+            KindValue::Producer,
+            KindValue::Consumer,
+        ] {
+            let spelling = kind_code_to_str(v.otlp_code()).expect("known code");
+            let expected = match v {
+                KindValue::Unspecified => "unspecified",
+                KindValue::Internal => "internal",
+                KindValue::Server => "server",
+                KindValue::Client => "client",
+                KindValue::Producer => "producer",
+                KindValue::Consumer => "consumer",
+            };
+            assert_eq!(spelling, expected);
+        }
+    }
+
+    #[test]
+    fn status_code_to_str_unknown_is_none() {
+        assert_eq!(status_code_to_str(99), None);
+        assert_eq!(status_code_to_str(-1), None);
+    }
+
+    #[test]
+    fn kind_code_to_str_unknown_is_none() {
+        assert_eq!(kind_code_to_str(99), None);
+        assert_eq!(kind_code_to_str(-1), None);
+    }
+
+    #[test]
     fn resolve_window_defaults_to_six_hour_lookback() {
-        let (start, end) = resolve_window(None, None);
+        let (start, end) = resolve_window(None, None).expect("default window must validate");
         let diff = end - start;
         assert_eq!(diff.num_hours(), 6);
     }
 
     #[test]
     fn resolve_window_respects_explicit_start_end() {
-        let (start, end) = resolve_window(Some(100), Some(200));
+        let (start, end) = resolve_window(Some(100), Some(200)).expect("explicit window must validate");
         assert_eq!(start.timestamp(), 100);
         assert_eq!(end.timestamp(), 200);
+    }
+
+    #[test]
+    fn resolve_window_rejects_inverted_range() {
+        let err = resolve_window(Some(200), Some(100)).expect_err("inverted window must reject");
+        assert!(matches!(err.0, crate::error::QueryError::Validation(_)));
+    }
+
+    #[test]
+    fn resolve_window_rejects_oversize_range() {
+        // 31-day window — wider than `MAX_QUERY_WINDOW = 30d`.
+        let now = chrono::Utc::now().timestamp();
+        let start = now - chrono::Duration::days(31).num_seconds();
+        let err = resolve_window(Some(start), Some(now)).expect_err("oversize window must reject");
+        assert!(matches!(err.0, crate::error::QueryError::Validation(_)));
     }
 }

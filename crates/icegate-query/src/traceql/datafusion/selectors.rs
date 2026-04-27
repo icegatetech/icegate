@@ -60,26 +60,12 @@ fn filter_to_expr(f: &SpanFilter) -> Result<Expr> {
 
 fn compare_to_expr(field: &FieldRef, op: ComparisonOp, value: &LiteralValue) -> Result<Expr> {
     match field {
-        FieldRef::Intrinsic(_) => {
-            let lhs = intrinsic_column_from_field(field);
+        FieldRef::Intrinsic(intrinsic) => {
+            let lhs = intrinsic_column(*intrinsic);
             let rhs = literal_to_scalar(field, value);
             apply_op(lhs, op, rhs)
         }
         FieldRef::Attribute { scope, name } => attribute_compare(*scope, name, op, field, value),
-    }
-}
-
-/// Extract the intrinsic column for a `FieldRef` (caller guarantees the
-/// field is an intrinsic).
-fn intrinsic_column_from_field(field: &FieldRef) -> Expr {
-    match field {
-        FieldRef::Intrinsic(i) => intrinsic_column(*i),
-        FieldRef::Attribute { .. } => {
-            unreachable!(
-                "intrinsic_column_from_field called with attribute field {field:?}; \
-                 callers must dispatch on FieldRef variant before invoking this helper"
-            )
-        }
     }
 }
 
@@ -110,10 +96,11 @@ pub(crate) fn intrinsic_column(i: IntrinsicField) -> Expr {
         IntrinsicField::Status => col(COL_STATUS_CODE),
         IntrinsicField::StatusMessage => col(COL_STATUS_MESSAGE),
         IntrinsicField::Kind => col(COL_KIND),
-        IntrinsicField::Duration | IntrinsicField::TraceDuration => col(COL_DURATION_MICROS),
+        IntrinsicField::Duration => col(COL_DURATION_MICROS),
         IntrinsicField::TraceID => col(COL_TRACE_ID),
         IntrinsicField::SpanID => col(COL_SPAN_ID),
-        IntrinsicField::RootName
+        IntrinsicField::TraceDuration
+        | IntrinsicField::RootName
         | IntrinsicField::RootServiceName
         | IntrinsicField::Parent
         | IntrinsicField::EventName
@@ -123,6 +110,13 @@ pub(crate) fn intrinsic_column(i: IntrinsicField) -> Expr {
             // v1 simplification: these intrinsics are not modelled. Return a
             // NULL literal so comparisons fall through (matches Tempo's
             // behaviour for missing intrinsics).
+            //
+            // `TraceDuration` is the *trace*'s wall-clock duration (root
+            // span end - root span start) — it is NOT the per-span
+            // `duration_micros`. Aliasing it to the spans column would
+            // silently return wrong results for `{ traceDuration > 5s }`,
+            // so until we model trace-level fields we make any comparison
+            // against `TraceDuration` produce no matches.
             lit(ScalarValue::Utf8(None))
         }
     }
@@ -226,9 +220,11 @@ fn literal_to_scalar(field: &FieldRef, lit_val: &LiteralValue) -> Expr {
         (FieldRef::Intrinsic(IntrinsicField::Status), LiteralValue::Status(s)) => lit(s.otlp_code()),
         (FieldRef::Intrinsic(IntrinsicField::Kind), LiteralValue::Kind(k)) => lit(k.otlp_code()),
         // Duration: LHS is BIGINT micros, RHS literal is nanos → divide.
-        (FieldRef::Intrinsic(IntrinsicField::Duration | IntrinsicField::TraceDuration), LiteralValue::Duration(ns)) => {
-            lit(*ns / 1_000)
-        }
+        // `TraceDuration` is intentionally absent here: its LHS is `Utf8(NULL)`
+        // (see `intrinsic_column`), so the literal does not need micro
+        // coercion — falling through to the catch-all `Duration` arm below
+        // is fine and never matches.
+        (FieldRef::Intrinsic(IntrinsicField::Duration), LiteralValue::Duration(ns)) => lit(*ns / 1_000),
         // String / numeric / bool — direct.
         (_, LiteralValue::String(s)) => lit(s.clone()),
         (_, LiteralValue::Int(i)) => lit(*i),

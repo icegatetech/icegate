@@ -9,10 +9,11 @@ use super::{
     error::{TempoError, TempoResult},
     formatters::spansets_to_search_response,
     models::{SearchParams, SearchResponse},
+    validation,
 };
 use crate::{
     engine::QueryEngine,
-    error::QueryError,
+    error::{ParseError, QueryError},
     traceql::{
         DEFAULT_SPANS_PER_SPANSET,
         antlr::AntlrParser,
@@ -34,18 +35,45 @@ use crate::{
 ///
 /// # Errors
 ///
-/// - 400 (`Parse` / `Validation` / `Plan`) when the query is malformed.
-/// - 501 (`NotImplemented`) when the query uses unsupported features.
+/// - 400 (`Parse` / `Validation` / `Plan`) when the query is malformed,
+///   too long, or its time window is inverted / oversize.
+/// - 501 (`NotImplemented`) when the query uses unsupported features —
+///   currently includes the `minDuration` / `maxDuration` parameters,
+///   which are accepted by the wire format but not yet pushed into the
+///   planner. Returning 501 (rather than silently ignoring) prevents a
+///   caller from believing their filter applied.
 /// - 500 for engine / `DataFusion` failures.
 pub async fn execute(
     engine: Arc<QueryEngine>,
     tenant_id: String,
     params: &SearchParams,
 ) -> TempoResult<SearchResponse> {
+    // ----- time window -----
     let now = Utc::now();
-    let start = params.start.as_deref().map_or(now - Duration::hours(1), parse_time);
-    let end = params.end.as_deref().map_or(now, parse_time);
+    let start = params
+        .start
+        .as_deref()
+        .map_or(Ok(now - Duration::hours(1)), parse_time)
+        .map_err(TempoError::new)?;
+    let end = params.end.as_deref().map_or(Ok(now), parse_time).map_err(TempoError::new)?;
+    validation::validate_query_window(start, end).map_err(TempoError::new)?;
 
+    // ----- duration filters: reject loudly until the planner consumes them -----
+    if params.min_duration.is_some() || params.max_duration.is_some() {
+        return Err(TempoError::new(QueryError::NotImplemented(
+            "minDuration / maxDuration are accepted by the API but not yet \
+             applied by the planner; remove the parameter or use a span-level \
+             `{ duration > Xs }` filter in the TraceQL query"
+                .to_string(),
+        )));
+    }
+    // Eagerly validate the duration parameters so that if a caller starts
+    // sending them once the planner supports them, we don't ship a regression
+    // where malformed values silently parse to None.
+    let _min_duration_check = params.min_duration.as_deref().and_then(parse_duration_opt);
+    let _max_duration_check = params.max_duration.as_deref().and_then(parse_duration_opt);
+
+    // ----- spans-per-spanset cap -----
     // `spss=0` disables the per-trace span cap (matches upstream Tempo).
     // Anything else — including the absent case — clamps to the
     // server-side default so we never let a single pathological trace
@@ -56,30 +84,83 @@ pub async fn execute(
         None => Some(DEFAULT_SPANS_PER_SPANSET),
     };
 
+    // ----- search limit (clamped to MAX_SEARCH_LIMIT) -----
+    let limit = validation::clamp_search_limit(params.limit);
+
     let qctx = QueryContext {
         tenant_id,
         start,
         end,
-        limit: params.limit,
+        limit,
         spans_per_spanset,
-        min_duration: params.min_duration.as_deref().and_then(parse_duration_opt),
-        max_duration: params.max_duration.as_deref().and_then(parse_duration_opt),
+        // Always None until the planner consumes them; we already returned
+        // 501 above when the caller supplied a value.
+        min_duration: None,
+        max_duration: None,
         step: None,
         max_grid_points: QueryContext::DEFAULT_MAX_GRID_POINTS,
     };
 
+    // ----- query string -----
     // Default query when q is omitted: empty selector returns recent traces.
-    let q = params.q.clone().unwrap_or_else(|| "{}".to_string());
+    let q = params.q.as_deref().unwrap_or("{}");
+    validation::validate_query_length(q).map_err(TempoError::new)?;
+    let q_owned = q.to_string();
 
-    let parser = AntlrParser::new();
-    let expr = parser.parse(&q).map_err(TempoError::from)?;
+    // ANTLR parsing is CPU-bound and the parser internally uses `Rc`,
+    // which is not `Send`. Mirror the LogQL executor pattern: parse on a
+    // blocking pool and scrub the non-Send `ANTLRError` details before
+    // re-crossing the await boundary.
+    let span = tracing::Span::current();
+    let parse_result = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| {
+            let parser = AntlrParser::new();
+            parser.parse(&q_owned).map_err(make_query_error_send)
+        })
+    })
+    .await
+    .map_err(join_error)?;
+    let expr = parse_result.map_err(TempoError::new)?;
 
-    let session = engine.create_session().await.map_err(TempoError)?;
+    let session = engine.create_session().await.map_err(TempoError::new)?;
     let planner = DataFusionPlanner::new(session, qctx);
-    let df = planner.plan(expr).await.map_err(TempoError::from)?;
-    let batches: Vec<RecordBatch> = df.collect().await.map_err(|e| TempoError(QueryError::from(e)))?;
+    let df = planner.plan(expr).await.map_err(TempoError::new)?;
+
+    // Safety-net total-spans ceiling. The per-trace `spss` cap already
+    // bounds memory in the common case; this limit is the emergency
+    // brake for `spss=0` (Tempo's "unlimited" opt-out) so a single
+    // pathological multi-trace response cannot OOM the formatter.
+    // Applied unconditionally — if the cap fires when `spss` is set,
+    // the user has asked for far more spans than any real visualisation
+    // can render anyway.
+    let df = df
+        .limit(0, Some(validation::MAX_TOTAL_SPANS))
+        .map_err(|e| TempoError::new(QueryError::from(e)))?;
+
+    let batches: Vec<RecordBatch> = df.collect().await.map_err(|e| TempoError::new(QueryError::from(e)))?;
 
     Ok(spansets_to_search_response(&batches))
+}
+
+/// Strip non-Send `ANTLRError` details from [`QueryError`] so it can
+/// cross a `spawn_blocking` boundary. `ANTLRError` carries `Rc` and is
+/// therefore not `Send`; keeping only the human-readable message
+/// preserves the diagnostic without violating the trait bound.
+pub(super) fn make_query_error_send(err: QueryError) -> QueryError {
+    match err {
+        QueryError::Parse(errors) => {
+            QueryError::Parse(errors.into_iter().map(|e| ParseError { antlr_error: None, ..e }).collect())
+        }
+        other => other,
+    }
+}
+
+/// Map a [`tokio::task::JoinError`] from `spawn_blocking` into a [`TempoError`].
+///
+/// Takes by value because `map_err` passes ownership.
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn join_error(e: tokio::task::JoinError) -> TempoError {
+    TempoError::new(QueryError::Internal(format!("task panicked: {e}")))
 }
 
 /// Parse a Tempo time parameter.
@@ -88,8 +169,13 @@ pub async fn execute(
 /// (integer or fractional). We also accept millisecond / microsecond /
 /// nanosecond encodings by magnitude so clients that reuse a Loki-style
 /// nanosecond convention still work. RFC3339 is accepted as a fallback.
-/// Malformed input returns [`DateTime::UNIX_EPOCH`].
-fn parse_time(s: &str) -> DateTime<Utc> {
+///
+/// # Errors
+///
+/// Returns [`QueryError::Validation`] when the input does not parse as
+/// any of the accepted forms — silently returning [`DateTime::UNIX_EPOCH`]
+/// would obscure caller bugs and produce surprise wide-window scans.
+fn parse_time(s: &str) -> Result<DateTime<Utc>, QueryError> {
     // Fractional seconds (e.g. "1776611234.567") — handled first so we don't
     // truncate the sub-second component when the integer path succeeds.
     if s.contains('.') {
@@ -99,10 +185,12 @@ fn parse_time(s: &str) -> DateTime<Utc> {
     }
 
     if let Ok(n) = s.parse::<i64>() {
-        return from_epoch_with_magnitude(n);
+        return Ok(from_epoch_with_magnitude(n));
     }
 
-    DateTime::parse_from_rfc3339(s).map_or(DateTime::UNIX_EPOCH, |dt| dt.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| QueryError::Validation(format!("could not parse time '{s}': {e}")))
 }
 
 /// Convert a numeric timestamp to [`DateTime<Utc>`] based on magnitude.
@@ -127,16 +215,23 @@ fn from_epoch_with_magnitude(n: i64) -> DateTime<Utc> {
 
 /// Convert a fractional-seconds timestamp (`1776611234.567`) to a
 /// nanosecond-precise [`DateTime<Utc>`].
+///
+/// # Errors
+///
+/// Returns [`QueryError::Validation`] for non-finite values
+/// (`NaN` / +/- inf) and values that overflow `i64` nanoseconds.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-fn from_fractional_seconds(secs: f64) -> DateTime<Utc> {
+fn from_fractional_seconds(secs: f64) -> Result<DateTime<Utc>, QueryError> {
     if !secs.is_finite() {
-        return DateTime::UNIX_EPOCH;
+        return Err(QueryError::Validation(format!("non-finite timestamp '{secs}'")));
     }
     let nanos = (secs * 1_000_000_000.0).round();
     if nanos > i64::MAX as f64 || nanos < i64::MIN as f64 {
-        return DateTime::UNIX_EPOCH;
+        return Err(QueryError::Validation(format!(
+            "timestamp '{secs}' overflows i64 nanoseconds",
+        )));
     }
-    DateTime::from_timestamp_nanos(nanos as i64)
+    Ok(DateTime::from_timestamp_nanos(nanos as i64))
 }
 
 #[cfg(test)]
@@ -146,13 +241,13 @@ mod tests {
     #[test]
     fn parses_unix_epoch_seconds_not_nanos() {
         // 10-digit "now"-ish second value as Grafana sends it.
-        let t = parse_time("1776611234");
+        let t = parse_time("1776611234").expect("seconds parse");
         assert_eq!(t.timestamp(), 1_776_611_234);
     }
 
     #[test]
     fn parses_fractional_seconds() {
-        let t = parse_time("1776611234.5");
+        let t = parse_time("1776611234.5").expect("fractional parse");
         assert_eq!(t.timestamp(), 1_776_611_234);
         assert_eq!(t.timestamp_subsec_nanos(), 500_000_000);
     }
@@ -160,25 +255,32 @@ mod tests {
     #[test]
     fn parses_millisecond_magnitude() {
         // 13-digit value looks like ms.
-        let t = parse_time("1776611234567");
+        let t = parse_time("1776611234567").expect("ms parse");
         assert_eq!(t.timestamp_millis(), 1_776_611_234_567);
     }
 
     #[test]
     fn parses_nanosecond_magnitude() {
         // 19-digit value looks like ns.
-        let t = parse_time("1776611234567890000");
+        let t = parse_time("1776611234567890000").expect("ns parse");
         assert_eq!(t.timestamp_nanos_opt(), Some(1_776_611_234_567_890_000));
     }
 
     #[test]
     fn parses_rfc3339_fallback() {
-        let t = parse_time("2026-04-19T00:00:00Z");
+        let t = parse_time("2026-04-19T00:00:00Z").expect("rfc3339 parse");
         assert_eq!(t.timestamp(), 1_776_556_800);
     }
 
     #[test]
-    fn malformed_input_yields_unix_epoch() {
-        assert_eq!(parse_time("not-a-time"), DateTime::<Utc>::UNIX_EPOCH);
+    fn malformed_input_yields_validation_error() {
+        let err = parse_time("not-a-time").expect_err("must reject");
+        assert!(matches!(err, QueryError::Validation(_)));
+    }
+
+    #[test]
+    fn nan_seconds_yields_validation_error() {
+        let err = parse_time("NaN").expect_err("must reject");
+        assert!(matches!(err, QueryError::Validation(_)));
     }
 }

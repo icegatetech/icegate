@@ -624,3 +624,109 @@ async fn descendant_operator_returns_not_implemented() {
     let err = planner.plan(expr).await.expect_err("descendant must reject");
     assert!(matches!(err, QueryError::NotImplemented(_)));
 }
+
+/// Every hierarchy operator the parser accepts MUST be rejected with
+/// [`QueryError::NotImplemented`] until the planner models them. Without
+/// per-operator coverage a refactor could silently un-gate one of them
+/// and produce semantically-wrong but compilable plans.
+#[tokio::test]
+async fn child_operator_returns_not_implemented() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let expr = AntlrParser::new()
+        .parse("{ kind = server } > { kind = client }")
+        .expect("parse");
+    let planner = DataFusionPlanner::new(ctx, qctx);
+    let err = planner.plan(expr).await.expect_err("child must reject");
+    assert!(matches!(err, QueryError::NotImplemented(_)));
+}
+
+#[tokio::test]
+async fn ancestor_operator_returns_not_implemented() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let expr = AntlrParser::new()
+        .parse("{ kind = client } << { kind = server }")
+        .expect("parse");
+    let planner = DataFusionPlanner::new(ctx, qctx);
+    let err = planner.plan(expr).await.expect_err("ancestor must reject");
+    assert!(matches!(err, QueryError::NotImplemented(_)));
+}
+
+#[tokio::test]
+async fn parent_operator_returns_not_implemented() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let expr = AntlrParser::new()
+        .parse("{ kind = client } < { kind = server }")
+        .expect("parse");
+    let planner = DataFusionPlanner::new(ctx, qctx);
+    let err = planner.plan(expr).await.expect_err("parent must reject");
+    assert!(matches!(err, QueryError::NotImplemented(_)));
+}
+
+#[tokio::test]
+async fn sibling_operator_returns_not_implemented() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let expr = AntlrParser::new()
+        .parse("{ kind = client } ~ { kind = client }")
+        .expect("parse");
+    let planner = DataFusionPlanner::new(ctx, qctx);
+    let err = planner.plan(expr).await.expect_err("sibling must reject");
+    assert!(matches!(err, QueryError::NotImplemented(_)));
+}
+
+// =========================================================================
+// Tenant isolation
+// =========================================================================
+
+/// The planner MUST never leak rows belonging to one tenant into a
+/// different tenant's session. This is enforced by the unconditional
+/// `tenant_id = ?` filter in `apply_tenant_and_time`; the test pins the
+/// behaviour against the three-row fixture (two `t1` rows, one `t2`).
+#[tokio::test]
+async fn empty_selector_under_t2_returns_only_t2_rows() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t2");
+    let total = run_and_count(ctx, qctx, "{}").await;
+    assert_eq!(total, 1, "tenant t2 has exactly one fixture row");
+}
+
+#[tokio::test]
+async fn empty_selector_under_unknown_tenant_returns_zero_rows() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("does-not-exist");
+    let total = run_and_count(ctx, qctx, "{}").await;
+    assert_eq!(total, 0, "unknown tenant must surface zero rows");
+}
+
+/// A `traceID` filter that matches a row in tenant `t1` MUST return
+/// nothing when queried under tenant `t2`. Direct regression test
+/// against the cross-tenant `trace_id` leak called out in the planner
+/// stage-2 review.
+#[tokio::test]
+async fn cross_tenant_trace_id_filter_returns_zero_rows() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t2");
+    let total = run_and_count(ctx, qctx, r#"{ traceID = "t1-trace-1" }"#).await;
+    assert_eq!(total, 0, "trace IDs must never cross tenant boundaries");
+}
+
+// =========================================================================
+// TraceDuration intrinsic — v1 returns NULL literal
+// =========================================================================
+
+/// `traceDuration` is the *trace*'s wall-clock duration (root span end
+/// minus root span start), not a per-span duration. Until the planner
+/// models it, comparisons MUST evaluate to NULL (no rows match) rather
+/// than silently aliasing to `duration_micros` and returning the wrong
+/// answer.
+#[tokio::test]
+async fn trace_duration_filter_returns_zero_rows_in_v1() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    // Even a 1-microsecond threshold must not match — the LHS is NULL.
+    let total = run_and_count(ctx, qctx, "{ traceDuration > 1us }").await;
+    assert_eq!(total, 0, "traceDuration is NULL until planner models it");
+}

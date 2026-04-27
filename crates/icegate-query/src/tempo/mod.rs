@@ -12,6 +12,7 @@ pub mod models;
 mod routes;
 mod server;
 pub mod trace_by_id;
+mod validation;
 
 pub use config::TempoConfig;
 pub use server::run;

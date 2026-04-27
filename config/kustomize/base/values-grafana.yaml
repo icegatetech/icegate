@@ -39,7 +39,12 @@ datasources:
         url: http://prometheus-kube-prometheus-prometheus.observability.svc.cluster.local.:9090
         isDefault: false
         editable: false
+      # Demo datasources are wired together for trace<->logs
+      # correlation. Stable `uid:` values let each side reference
+      # the other by UID (Grafana's `tracesToLogsV2` and
+      # `derivedFields` cannot be linked by display name).
       - name: Loki (demo)
+        uid: loki-demo
         type: loki
         access: proxy
         url: http://icegate-query.icegate.svc.cluster.local.:3100
@@ -47,9 +52,24 @@ datasources:
         editable: false
         jsonData:
           httpHeaderName1: X-Scope-OrgID
+          # Logs -> trace: when a log line carries the `trace_id`
+          # Loki label, surface a clickable link that opens the
+          # corresponding trace in the Tempo (demo) datasource.
+          derivedFields:
+            - name: TraceID
+              matcherType: label
+              matcherRegex: trace_id
+              # `$$` escapes the leading `$` in Grafana provisioning
+              # so the literal `${__value.raw}` template reaches
+              # Grafana's link renderer instead of being substituted
+              # at provisioning time.
+              url: '$${__value.raw}'
+              datasourceUid: tempo-demo
+              urlDisplayLabel: View trace
         secureJsonData:
           httpHeaderValue1: demo
       - name: Tempo (demo)
+        uid: tempo-demo
         type: tempo
         access: proxy
         url: http://icegate-query.icegate.svc.cluster.local.:3200
@@ -57,6 +77,24 @@ datasources:
         editable: false
         jsonData:
           httpHeaderName1: X-Scope-OrgID
+          # Trace -> logs: when viewing a span, surface a
+          # "Logs for this span" button that issues a LogQL stream
+          # selector against the Loki (demo) datasource using the
+          # span's trace_id (and optionally span_id) as Loki labels.
+          # Both columns are top-level on the IceGate logs table and
+          # carry parquet bloom filters, so the lookup skips
+          # non-matching row groups in milliseconds.
+          tracesToLogsV2:
+            datasourceUid: loki-demo
+            # Widen the log-search window around the span; spans are
+            # short but the surrounding context is often what the
+            # user is actually after.
+            spanStartTimeShift: -1h
+            spanEndTimeShift: 1h
+            filterByTraceID: true
+            filterBySpanID: false
+            customQuery: true
+            query: '{trace_id="$${__span.traceId}"}'
         secureJsonData:
           httpHeaderValue1: demo
 

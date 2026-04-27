@@ -1101,16 +1101,44 @@ pub const SPAN_INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &[
 /// These are not literal column names — they are the user-facing tag names
 /// Grafana expects. Internal mapping to underlying columns happens in the
 /// tempo metadata layer.
+///
+/// Both legacy bare names (`name`, `status`, `kind`, `duration`,
+/// `traceDuration`, `rootName`, `rootServiceName`) and the modern
+/// colon-prefixed forms (`span:name`, `trace:duration`, …) are surfaced
+/// side-by-side, mirroring Tempo's own `/api/v2/search/tags` response
+/// (see <https://grafana.com/docs/tempo/latest/api_docs/>). Older
+/// Grafana versions and `TraceQL` queries use the bare names; newer
+/// versions use the colon-prefixed forms.
+///
+/// `trace:id` / `span:id` (and the legacy `traceID` / `spanID`) are
+/// **deliberately omitted** — Tempo itself does not surface them in tag
+/// discovery because enumerating the distinct value set of a per-trace
+/// or per-span identifier is both useless (every value is unique) and
+/// expensive. They remain queryable in `TraceQL` via the parser; the
+/// `tempo::metadata::target_column_for_tag` mapping still resolves them
+/// for predicate pushdown.
 pub const TRACEQL_INTRINSIC_TAGS: &[&str] = &[
+    // Legacy bare names — kept for backward compat with older Grafana
+    // versions that have not adopted the colon-prefixed spellings.
     "name",
     "status",
+    "statusMessage",
     "kind",
     "duration",
     "traceDuration",
     "rootName",
     "rootServiceName",
-    "traceID",
-    "spanID",
+    // Modern `span:*` colon-prefixed aliases per Tempo's intrinsic
+    // naming convention.
+    "span:duration",
+    "span:kind",
+    "span:name",
+    "span:status",
+    "span:statusMessage",
+    // Modern `trace:*` colon-prefixed aliases.
+    "trace:duration",
+    "trace:rootName",
+    "trace:rootService",
 ];
 
 #[cfg(test)]
