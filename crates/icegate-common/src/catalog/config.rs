@@ -148,7 +148,7 @@ impl CatalogConfig {
                 if warehouse.trim().is_empty() {
                     return Err(CommonError::Config("S3 catalog warehouse cannot be empty".into()));
                 }
-                if self.properties.get("bucket").is_none_or(|bucket| bucket.trim().is_empty()) {
+                if self.properties.get("bucket").map_or(true, |bucket| bucket.trim().is_empty()) {
                     return Err(CommonError::Config(
                         "S3 catalog requires `catalog.properties.bucket`".into(),
                     ));

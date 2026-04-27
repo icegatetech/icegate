@@ -424,6 +424,10 @@ mod tests {
             .await
             .expect("build catalog");
         let namespace = NamespaceIdent::new("ns1".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create namespace");
         let table = catalog
             .create_table(
                 &namespace,
