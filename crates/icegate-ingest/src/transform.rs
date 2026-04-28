@@ -537,9 +537,10 @@ pub fn spans_to_record_batch(
                 // `MapBuilder` is preserved, but downstream `MAP<K,V>`
                 // readers vary on duplicate-key resolution (some surface
                 // both, some last-write-wins). We avoid relying on
-                // reader-specific semantics by merging into a HashMap
+                // reader-specific semantics by merging into a `BTreeMap`
                 // first — scope first, then span — so span attrs win on
-                // collision and we emit at most one entry per key.
+                // collision (last-write-wins) and the sorted key order
+                // gives a deterministic on-disk attribute layout.
                 let scope_attrs = scope_spans.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
                 let merged_span_attrs = merge_dotted_attributes(scope_attrs, &span.attributes);
                 for (key, value) in &merged_span_attrs {

@@ -34,6 +34,7 @@ use iceberg::io::{FileIO, FileMetadata};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{Datum, PrimitiveLiteral};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+use parquet::basic::Type as PhysicalType;
 use parquet::column::page::{Page, PageReader};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
@@ -282,6 +283,24 @@ pub async fn read_column_int_dictionaries(
     leaf_idx: usize,
     out: &mut BTreeSet<i32>,
 ) -> Result<(), MetadataScanError> {
+    // Defensive guard: the dictionary path below decodes pages as PLAIN
+    // little-endian INT32 (4 bytes per value) without inspecting the
+    // physical type, so a non-INT32 column would silently emit garbage
+    // (e.g. an INT64 column would produce two i32s per stored value).
+    // Fail fast here so both the dictionary and stats paths inherit the
+    // guarantee — the latter is already protected by `extend_from_int_stats`'s
+    // `Statistics::Int32(s)` match, so this only adds the missing check
+    // for the dictionary path.
+    let leaf = metadata.file_metadata().schema_descr().column(leaf_idx);
+    if leaf.physical_type() != PhysicalType::INT32 {
+        return Err(MetadataScanError::Schema(format!(
+            "read_column_int_dictionaries called on non-INT32 column \
+             '{}' (leaf_idx={leaf_idx}, physical_type={:?})",
+            leaf.name(),
+            leaf.physical_type()
+        )));
+    }
+
     // Stage 1: row-group pruning + range planning. Identical to the
     // byte-array path; kept inlined rather than factored because the
     // shared signature would need to invent an enum over the two

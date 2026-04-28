@@ -66,8 +66,12 @@ pub fn apply_metrics(
     // (e.g., `1µs`) on a long range producing millions of empty groups.
     if let Some(duration_ns) = (ctx.end - ctx.start).num_nanoseconds() {
         if duration_ns > 0 && step_ns > 0 {
-            // Manual ceil division — `i64::div_ceil` is unstable.
-            let buckets = duration_ns / step_ns + i64::from(duration_ns % step_ns != 0);
+            // Inclusive-endpoint count: a `[start, end]` range of duration N
+            // over step S can land in `(N / S) + 1` distinct buckets when
+            // `end` is itself a bucket boundary (exact-multiple case).
+            // Integer division below truncates the remainder, then `+ 1`
+            // covers both the partial-step tail and the closing endpoint.
+            let buckets = duration_ns / step_ns + 1;
             if buckets > ctx.max_grid_points {
                 return Err(validation(format!(
                     "metrics query would produce {buckets} time buckets, exceeding the cap of {}; \
