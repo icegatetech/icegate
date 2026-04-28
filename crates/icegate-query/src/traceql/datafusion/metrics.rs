@@ -43,6 +43,9 @@ const METRIC_ALIAS: &str = "__metric";
 ///
 /// # Errors
 ///
+/// - [`crate::error::QueryError::Validation`] when the requested `step` and
+///   time range would produce more than [`QueryContext::max_grid_points`]
+///   buckets.
 /// - [`crate::error::QueryError::NotImplemented`] when a `prelude` stage is
 ///   anything other than `by(...)` (v1 only allows `by` in the prelude).
 /// - [`crate::error::QueryError::NotImplemented`] for `histogram_over_time`
@@ -57,6 +60,23 @@ pub fn apply_metrics(
     ctx: &QueryContext,
 ) -> Result<DataFrame> {
     let step_ns = ctx.step.and_then(|s| s.num_nanoseconds()).unwrap_or(DEFAULT_STEP_NANOS);
+
+    // Reject query/step combinations that would produce more bucket points
+    // than the configured cap. This protects the planner from a tiny `step`
+    // (e.g., `1µs`) on a long range producing millions of empty groups.
+    if let Some(duration_ns) = (ctx.end - ctx.start).num_nanoseconds() {
+        if duration_ns > 0 && step_ns > 0 {
+            // Manual ceil division — `i64::div_ceil` is unstable.
+            let buckets = duration_ns / step_ns + i64::from(duration_ns % step_ns != 0);
+            if buckets > ctx.max_grid_points {
+                return Err(validation(format!(
+                    "metrics query would produce {buckets} time buckets, exceeding the cap of {}; \
+                     widen `step` or narrow the time range",
+                    ctx.max_grid_points
+                )));
+            }
+        }
+    }
 
     // Group keys: time bucket first (becomes the x-axis), then optional
     // user-provided `by(...)` keys from prelude and/or the terminal function.

@@ -9,7 +9,7 @@ install:
 gen: antlr/TraceQLLexer.g4 antlr/TraceQLParser.g4
 	java -jar $(ANTLR4_JAR) -Dlanguage=Rust -visitor antlr/TraceQLLexer.g4 antlr/TraceQLParser.g4
 	sed -i.bak 's/TraceQLParserParserContext/TraceQLParserContext/g' antlr/traceqlparser.rs && rm antlr/traceqlparser.rs.bak # https://github.com/rrevenantt/antlr4rust/pull/53
-	for f in antlr/traceql*.rs; do sed -i.bak '1s/^/#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::unwrap_used, unused_parens)]\n/' $$f && rm $$f.bak; done
+	for f in antlr/traceql*.rs; do printf '#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::unwrap_used, unused_parens)]\n' | cat - "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; done
 
 clean:
 	rm -f antlr/traceql*.rs

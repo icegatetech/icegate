@@ -268,13 +268,7 @@ pub async fn scan_label_int_values(
             let file_io = file_io.clone();
             let predicate = predicate.clone();
             let column = column.clone();
-            async move {
-                let (mut reader, metadata) = parquet_reader::open_file_direct(&file_io, &task).await?;
-                let mut out: BTreeSet<i32> = BTreeSet::new();
-                values::collect_indexed_int_values_via_dict(&mut reader, &metadata, &predicate, &column, &mut out)
-                    .await?;
-                Ok::<BTreeSet<i32>, MetadataScanError>(out)
-            }
+            async move { scan_label_int_values_for_file(&file_io, task, &predicate, &column).await }
         })
         .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
 
@@ -360,5 +354,27 @@ async fn scan_label_values_for_file(
         }
     }
 
+    Ok(out)
+}
+
+/// Process one Parquet file for an INT32-indexed tag-value enumeration
+/// request (e.g. `status_code`, `kind`).
+///
+/// Mirrors [`scan_labels_for_file`] / [`scan_label_values_for_file`] so the
+/// per-file logic lives next to its tracing span and can be unit-tested in
+/// isolation. The actual scan goes through a dictionary-page read on the
+/// indexed column with row-group statistics fallback for chunks that skip
+/// dict encoding — see
+/// [`values::collect_indexed_int_values_via_dict`].
+#[tracing::instrument(skip_all, fields(file = %task.data_file_path, column = %column))]
+async fn scan_label_int_values_for_file(
+    file_io: &iceberg::io::FileIO,
+    task: FileScanTask,
+    predicate: &Predicate,
+    column: &str,
+) -> Result<BTreeSet<i32>, MetadataScanError> {
+    let (mut reader, metadata) = parquet_reader::open_file_direct(file_io, &task).await?;
+    let mut out: BTreeSet<i32> = BTreeSet::new();
+    values::collect_indexed_int_values_via_dict(&mut reader, &metadata, predicate, column, &mut out).await?;
     Ok(out)
 }

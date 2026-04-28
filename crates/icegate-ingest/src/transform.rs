@@ -246,11 +246,12 @@ pub fn logs_to_record_batch(
 /// dropped silently and counted in the second return value so the caller
 /// can surface partial-success metrics.
 ///
-/// Produces every column in the spans schema: top-level fields, the merged
-/// attributes map (resource + scope + span attributes plus indexed-column
-/// duplicates), and the nested `events` / `links` `List<Struct>` arrays.
-/// Links with invalid `trace_id` / `span_id` are dropped from the list and
-/// counted into the parent span's `dropped_links_count`.
+/// Produces every column in the spans schema: top-level fields, separate
+/// `resource_attributes` and `span_attributes` maps (the latter merging
+/// scope-level and span-level attributes with span winning on collision),
+/// and the nested `events` / `links` `List<Struct>` arrays. Links with
+/// invalid `trace_id` / `span_id` are dropped from the list and counted
+/// into the parent span's `dropped_links_count`.
 ///
 /// # Arguments
 ///
@@ -520,8 +521,16 @@ pub fn spans_to_record_batch(
                     }
                 }
 
-                // Resource attributes go to `resource_attributes`.
-                add_flattened_attributes_dotted(resource_attrs, &mut resource_attrs_builder);
+                // Resource attributes go to `resource_attributes`. Dedupe
+                // ahead of the `MapBuilder` for the same reason as the
+                // scope+span path below: downstream `MAP<K,V>` readers
+                // disagree on duplicate-key resolution, so we collapse to a
+                // single entry per key here.
+                let merged_resource_attrs = dedupe_dotted_attributes(resource_attrs);
+                for (key, value) in &merged_resource_attrs {
+                    resource_attrs_builder.keys().append_value(key);
+                    resource_attrs_builder.values().append_value(value);
+                }
 
                 // Scope + span attributes fold into `span_attributes` with
                 // explicit per-span de-duplication: insertion order into a
@@ -934,19 +943,22 @@ fn add_flattened_attributes(
     }
 }
 
-/// Appends flattened attributes to the map builder using dot-separator keys.
+/// Flatten a single attribute list and deduplicate keys into a sorted
+/// [`std::collections::BTreeMap`].
 ///
-/// Used by spans where OTel-native dotted attribute names must be preserved.
-fn add_flattened_attributes_dotted(
+/// Mirrors the deduplication semantics of [`merge_dotted_attributes`] for
+/// the single-input case so resource attributes get the same guarantee
+/// (one entry per key, deterministic order) as scope+span attributes.
+fn dedupe_dotted_attributes(
     attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
-    attributes_builder: &mut MapBuilder<StringBuilder, StringBuilder>,
-) {
+) -> std::collections::BTreeMap<String, String> {
+    let mut merged: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for kv in attributes {
         for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-            attributes_builder.keys().append_value(&key);
-            attributes_builder.values().append_value(value);
+            merged.insert(key, value);
         }
     }
+    merged
 }
 
 /// Merge scope and span attributes into a single deduplicated, sorted

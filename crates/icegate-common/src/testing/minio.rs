@@ -14,9 +14,9 @@ const MINIO_IMAGE: &str = "minio/minio";
 /// `MinIO` image tag — pinned to a release that supports `If-None-Match: *`.
 const MINIO_TAG: &str = "RELEASE.2025-01-20T14-49-07Z";
 /// `MinIO` root username (used for both the container and downstream S3 SDK calls).
-const MINIO_ROOT_USER: &str = "minioadmin";
+pub(crate) const MINIO_ROOT_USER: &str = "minioadmin";
 /// `MinIO` root password (used for both the container and downstream S3 SDK calls).
-const MINIO_ROOT_PASSWORD: &str = "minioadmin";
+pub(crate) const MINIO_ROOT_PASSWORD: &str = "minioadmin";
 
 /// Builder for [`MinIOContainer`] that supports optional Docker network and
 /// container-name configuration for inter-container DNS scenarios.
@@ -64,10 +64,10 @@ impl MinIOContainerBuilder {
             .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
             .with_cmd(["server", "/data"]);
 
-        // `with_network` and `with_container_name` come from `ImageExt` and
-        // change the type to `RequestedContainer<GenericImage>`. To keep the
-        // method-chained type uniform with the no-options path we apply them
-        // immediately before `.start()`.
+        // `with_network` and `with_container_name` come from `ImageExt`. The
+        // earlier `with_env_var` / `with_cmd` calls already converted `image`
+        // to `ContainerRequest<GenericImage>`, so these blocks just continue
+        // mutating the same value when the corresponding option is set.
         if let Some(net) = &self.network {
             image = image.with_network(net.clone());
         }

@@ -270,7 +270,15 @@ mod tests {
             &FieldRef::Intrinsic(IntrinsicField::Duration),
             &LiteralValue::Duration(1_000_000_000),
         );
-        // 1s = 1e9 ns = 1e6 micros — encoded as Int64(1_000_000).
-        assert!(format!("{e:?}").contains("1000000"));
+        // 1s = 1e9 ns = 1e6 micros — encoded as Int64(1_000_000). Assert
+        // both "contains 1000000" and "does NOT contain 1000000000" so a
+        // regression that drops the ns→µs conversion entirely (and emits
+        // the raw nanosecond literal) cannot satisfy the substring check.
+        let s = format!("{e:?}");
+        assert!(s.contains("1000000"), "expected micros in {s:?}");
+        assert!(
+            !s.contains("1000000000"),
+            "expected ns→µs conversion, got raw nanos in {s:?}"
+        );
     }
 }

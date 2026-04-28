@@ -424,9 +424,14 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
             // If the `parent_span_id` column is missing entirely, treat
             // every span as a root (best-effort).
             let is_root = parents.as_ref().is_none_or(|c| c.is_null(row) || c.value(row).is_empty());
-            // Use the row's `timestamp` for ordering. Missing or zero
-            // timestamp sorts last (fallback to `i64::MAX`).
-            let ts_micros = starts.map_or(i64::MAX, |c| c.value(row));
+            // Read raw timestamps respecting per-row nulls. `None` means
+            // "absent": the row sorts last in `BestSpan` ordering, never
+            // contributes to `acc.start_micros` / `acc.end_micros`, and
+            // displays as 0 in the matched-span output. Reading
+            // `c.value(row)` on a null cell would surface the buffer's
+            // underlying 0, biasing the earliest-timestamp tiebreak.
+            let ts_raw: Option<i64> = starts.and_then(|c| (!c.is_null(row)).then(|| c.value(row)));
+            let end_raw: Option<i64> = ends.and_then(|c| (!c.is_null(row)).then(|| c.value(row)));
             // Treat a null / empty service or name as "no value" so the
             // candidate can still be picked but won't pollute the summary.
             let service = svcs
@@ -440,8 +445,11 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
                 .map(|c| c.value(row).to_string())
                 .filter(|s| !s.is_empty());
 
-            let end_micros = ends.map_or(ts_micros, |c| c.value(row));
-            let duration_micros = (end_micros - ts_micros).max(0);
+            // Duration is meaningful only when both endpoints are known.
+            let duration_micros = match (ts_raw, end_raw) {
+                (Some(s), Some(e)) => (e - s).max(0),
+                _ => 0,
+            };
 
             // Build the matched-span entry surfaced in `spanSets`. We
             // emit one per row regardless of whether it satisfied the
@@ -457,7 +465,7 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
                 };
                 acc.spans.push(build_matched_span(
                     span_id,
-                    ts_micros,
+                    ts_raw.unwrap_or(0),
                     duration_micros,
                     service.as_deref(),
                     name.as_deref(),
@@ -466,7 +474,9 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
 
             let candidate = BestSpan {
                 is_root,
-                ts_micros,
+                // `i64::MAX` so an absent timestamp loses the
+                // smallest-`ts_micros` tiebreak in `should_replace`.
+                ts_micros: ts_raw.unwrap_or(i64::MAX),
                 duration_micros,
                 service,
                 name,
@@ -477,12 +487,10 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
                 _ => {}
             }
 
-            if let Some(s) = starts {
-                let t = s.value(row);
+            if let Some(t) = ts_raw {
                 acc.start_micros = Some(acc.start_micros.map_or(t, |cur| cur.min(t)));
             }
-            if let Some(e) = ends {
-                let t = e.value(row);
+            if let Some(t) = end_raw {
                 acc.end_micros = Some(acc.end_micros.map_or(t, |cur| cur.max(t)));
             }
         }

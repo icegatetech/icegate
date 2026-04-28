@@ -15,7 +15,7 @@ use crate::{
     engine::QueryEngine,
     error::{ParseError, QueryError},
     traceql::{
-        DEFAULT_SPANS_PER_SPANSET,
+        DEFAULT_SPANS_PER_SPANSET, TraceQLExpr,
         antlr::AntlrParser,
         datafusion::DataFusionPlanner,
         duration::parse_duration_opt,
@@ -104,22 +104,8 @@ pub async fn execute(
     // Default query when q is omitted: empty selector returns recent traces.
     let q = params.q.as_deref().unwrap_or("{}");
     validation::validate_query_length(q).map_err(TempoError::new)?;
-    let q_owned = q.to_string();
 
-    // ANTLR parsing is CPU-bound and the parser internally uses `Rc`,
-    // which is not `Send`. Mirror the LogQL executor pattern: parse on a
-    // blocking pool and scrub the non-Send `ANTLRError` details before
-    // re-crossing the await boundary.
-    let span = tracing::Span::current();
-    let parse_result = tokio::task::spawn_blocking(move || {
-        span.in_scope(|| {
-            let parser = AntlrParser::new();
-            parser.parse(&q_owned).map_err(make_query_error_send)
-        })
-    })
-    .await
-    .map_err(join_error)?;
-    let expr = parse_result.map_err(TempoError::new)?;
+    let expr = parse_query_blocking(q.to_string()).await?;
 
     // Reject metrics-mode queries on the search endpoint: the planner accepts them but
     // `spansets_to_search_response` only knows how to format spanset RecordBatches.
@@ -147,6 +133,30 @@ pub async fn execute(
     let batches: Vec<RecordBatch> = df.collect().await.map_err(|e| TempoError::new(QueryError::from(e)))?;
 
     Ok(spansets_to_search_response(&batches))
+}
+
+/// Parse a `TraceQL` query string on the blocking pool.
+///
+/// ANTLR parsing is CPU-bound and the parser internally uses [`std::rc::Rc`]
+/// (so `ANTLRError` is not [`Send`]). This helper centralises the
+/// `spawn_blocking + span.in_scope + make_query_error_send + join_error`
+/// dance so both [`execute`] and [`super::handlers::parse_q_to_predicate`]
+/// share a single parsing path.
+///
+/// `q` is taken by value because [`tokio::task::spawn_blocking`] needs a
+/// `'static` closure; callers should pre-validate length via
+/// [`super::validation::validate_query_length`].
+pub(super) async fn parse_query_blocking(q: String) -> TempoResult<TraceQLExpr> {
+    let span = tracing::Span::current();
+    let parse_result = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| {
+            let parser = AntlrParser::new();
+            parser.parse(&q).map_err(make_query_error_send)
+        })
+    })
+    .await
+    .map_err(join_error)?;
+    parse_result.map_err(TempoError::new)
 }
 
 /// Strip non-Send `ANTLRError` details from [`QueryError`] so it can

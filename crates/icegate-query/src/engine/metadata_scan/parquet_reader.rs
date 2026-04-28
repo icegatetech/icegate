@@ -390,21 +390,28 @@ pub async fn read_column_int_dictionaries(
 }
 
 /// `true` if the row-group statistics report at least one NULL value
-/// in this column chunk, or if the null-count is unknown but the chunk
-/// is at least one row long (conservative). `false` only when the
-/// statistics definitively report zero nulls.
+/// in this column chunk, or if the null-count is unknown (conservative).
+/// `false` only when the statistics definitively report zero nulls or
+/// when statistics are absent entirely.
 ///
 /// Used to surface OTLP `Unset` / `Unspecified` (which IceGate's
 /// ingest writes as Parquet NULL) back to enum-tag discovery so a
 /// status / kind dropdown isn't empty for traces that don't set those
 /// fields.
+///
+/// Callers iterate `metadata.row_group(rg_idx)` for non-empty row
+/// groups, so the "chunk has rows" precondition is implicit and there
+/// is no need to thread a row count through the signature.
 fn has_nulls(stats: Option<&Statistics>) -> bool {
     let Some(stats) = stats else {
         return false;
     };
     // `Statistics::null_count_opt` is the version-portable accessor
     // across the variants we care about (ByteArray, Int32, Int64, …).
-    matches!(stats.null_count_opt(), Some(n) if n > 0)
+    // `None` means the writer didn't emit a null-count — we cannot
+    // prove the chunk has zero nulls, so default to `true` and accept
+    // the over-approximation (a spurious sentinel `0` in the value set).
+    stats.null_count_opt().is_none_or(|n| n > 0)
 }
 
 /// Expand an `INT32` row-group statistics min/max range into the output
@@ -434,7 +441,15 @@ fn extend_from_int_stats(stats: Option<&Statistics>, out: &mut BTreeSet<i32>) ->
     }
     let spread = i64::from(max) - i64::from(min);
     if spread > i64::from(MAX_STATS_SPREAD) {
-        return false;
+        // Wide range — emitting `min..=max` would balloon the output set.
+        // Insert just the two boundary values; the metadata-scan contract
+        // permits over-approximation, and `min` / `max` are guaranteed to
+        // be present in the chunk. This is strictly better than dropping
+        // the row group entirely (`false` here would route through the
+        // `no_dict_no_stats` warn path and lose any signal at all).
+        out.insert(min);
+        out.insert(max);
+        return true;
     }
     for v in min..=max {
         out.insert(v);

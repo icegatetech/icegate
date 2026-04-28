@@ -12,6 +12,8 @@ use aws_sdk_s3::{
 };
 use object_store::{ObjectStore, aws::AmazonS3Builder};
 
+use super::minio::{MINIO_ROOT_PASSWORD, MINIO_ROOT_USER};
+
 /// Create an AWS S3 bucket for testing.
 ///
 /// # Arguments
@@ -26,7 +28,7 @@ pub async fn create_s3_bucket(endpoint: &str, bucket_name: &str) -> Result<(), B
     tracing::info!("Creating S3 bucket: {}", bucket_name);
 
     // Configure AWS SDK client for MinIO
-    let creds = Credentials::new("minioadmin", "minioadmin", None, None, "static");
+    let creds = Credentials::new(MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, None, None, "static");
     let shared_config = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .credentials_provider(SharedCredentialsProvider::new(creds))
@@ -83,8 +85,8 @@ pub fn create_s3_object_store(
         .with_bucket_name(bucket)
         .with_region("us-east-1")
         .with_endpoint(endpoint)
-        .with_access_key_id("minioadmin")
-        .with_secret_access_key("minioadmin")
+        .with_access_key_id(MINIO_ROOT_USER)
+        .with_secret_access_key(MINIO_ROOT_PASSWORD)
         .with_allow_http(true)
         .build()?;
 

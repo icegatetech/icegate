@@ -29,10 +29,7 @@ use super::{
     trace_by_id::{default_window, fetch},
     validation,
 };
-use crate::{
-    error::QueryError,
-    traceql::{antlr::AntlrParser, iceberg_predicate::translate_query_to_predicate_excluding, parser::Parser},
-};
+use crate::{error::QueryError, traceql::iceberg_predicate::translate_query_to_predicate_excluding};
 
 // ============================================================================
 // Helpers
@@ -100,17 +97,7 @@ async fn parse_q_to_predicate(q: Option<&str>, exclude_column: Option<&str>) -> 
         return Ok(Predicate::AlwaysTrue);
     }
     validation::validate_query_length(q).map_err(TempoError::new)?;
-    let q_owned = q.to_string();
-    let span = tracing::Span::current();
-    let parse_result = tokio::task::spawn_blocking(move || {
-        span.in_scope(|| {
-            let parser = AntlrParser::new();
-            parser.parse(&q_owned).map_err(super::executor::make_query_error_send)
-        })
-    })
-    .await
-    .map_err(super::executor::join_error)?;
-    let expr = parse_result.map_err(TempoError::new)?;
+    let expr = super::executor::parse_query_blocking(q.to_string()).await?;
     Ok(translate_query_to_predicate_excluding(&expr, exclude_column))
 }
 

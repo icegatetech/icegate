@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, TimeZone, Utc};
-use iceberg::expr::Predicate;
+use iceberg::expr::{Predicate, Reference};
 use icegate_common::schema::{
     COL_CLOUD_ACCOUNT_ID, COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES,
     COL_SPAN_ID, COL_TRACE_ID, SPAN_INDEXED_ATTRIBUTE_COLUMNS, TRACEQL_INTRINSIC_TAGS,
@@ -272,8 +272,12 @@ pub async fn list_tag_values(
                 values = scan_values_either(&table, tenant_id, start_dt, end_dt, COL_NAME, extra_predicate).await?;
             }
             "rootServiceName" | "trace:rootService" => {
-                values =
-                    scan_values_either(&table, tenant_id, start_dt, end_dt, COL_SERVICE_NAME, extra_predicate).await?;
+                // `rootServiceName` is the `service.name` of the root span only,
+                // not every span in the trace. Restrict the scan with
+                // `parent_span_id IS NULL` so a non-root span whose service
+                // name doesn't otherwise appear at root level isn't surfaced.
+                let root_only = extra_predicate.and(Reference::new(COL_PARENT_SPAN_ID).is_null());
+                values = scan_values_either(&table, tenant_id, start_dt, end_dt, COL_SERVICE_NAME, root_only).await?;
             }
             // `trace:id` / `span:id` (and the legacy `traceID` /
             // `spanID`) are intentionally NOT enumerated. Per Tempo
@@ -363,9 +367,7 @@ pub async fn list_tag_values(
         }
     }
 
-    let mut out: Vec<String> = values.into_iter().collect();
-    out.truncate(limit);
-    Ok(out)
+    Ok(values.into_iter().take(limit).collect())
 }
 
 /// Enumerate distinct values for a single tag and return them in the

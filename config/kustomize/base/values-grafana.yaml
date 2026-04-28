@@ -27,12 +27,6 @@ datasources:
         url: http://icegate-query.icegate.svc.cluster.local.:3200
         isDefault: false
         editable: false
-      - name: Jaeger
-        type: jaeger
-        access: proxy
-        url: http://jaeger-query.observability.svc.cluster.local.:16686
-        isDefault: false
-        editable: false
       - name: Prometheus
         type: prometheus
         access: proxy

@@ -20,7 +20,6 @@ Deploys the shared infrastructure and observability stack used by all overlays:
 
 - **Prometheus** (kube-prometheus-stack) — metrics collection
 - **Grafana** — dashboards
-- **Jaeger** — distributed tracing
 
 All observability resources are deployed to the `observability` namespace. Infrastructure resources use the `infra` namespace.
 

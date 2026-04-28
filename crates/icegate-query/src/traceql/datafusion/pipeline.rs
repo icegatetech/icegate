@@ -67,15 +67,33 @@ pub fn apply_search_pipeline(mut df: DataFrame, stages: &[PipelineStage], _ctx: 
 /// Convert a `FieldRef` into the `DataFusion` `Expr` used as a `GROUP BY`
 /// key.
 ///
-/// Intrinsics are resolved through [`super::intrinsic_column`]
-/// (with `trace_id` short-circuited to a plain column reference for clarity);
-/// attributes are resolved through [`group_key_for_attribute`] which picks
-/// the right map column per scope.
+/// Intrinsics that map to real columns are resolved through
+/// [`super::intrinsic_column`] (with `trace_id` short-circuited to a plain
+/// column reference for clarity); attributes are resolved through
+/// [`group_key_for_attribute`] which picks the right map column per scope.
+///
+/// Intrinsics that aren't modelled by a real spans column (e.g.
+/// `traceDuration`, `rootName`) are rejected with a clear server-side
+/// error: `intrinsic_column` would otherwise return `lit(NULL)` and silently
+/// collapse every row into a single NULL group, which is worse than a 400.
 pub(crate) fn field_ref_to_group_key(field: &FieldRef) -> Result<Expr> {
     Ok(match field {
         // Short-circuit the common case so the optimizer sees a plain column ref.
         FieldRef::Intrinsic(IntrinsicField::TraceID) => col(COL_TRACE_ID),
-        FieldRef::Intrinsic(other) => super::intrinsic_column(*other),
+        // Modelled intrinsics — `intrinsic_column` returns a real column ref.
+        FieldRef::Intrinsic(
+            i @ (IntrinsicField::Name
+            | IntrinsicField::Status
+            | IntrinsicField::StatusMessage
+            | IntrinsicField::Kind
+            | IntrinsicField::Duration
+            | IntrinsicField::SpanID),
+        ) => super::intrinsic_column(*i),
+        FieldRef::Intrinsic(other) => {
+            return Err(not_implemented(&format!(
+                "grouping by intrinsic {other:?} is not supported"
+            )));
+        }
         FieldRef::Attribute { scope, name } => group_key_for_attribute(*scope, name)?,
     })
 }
@@ -181,12 +199,15 @@ fn field_arg_expr(arg: Option<&FieldRef>) -> Result<Expr> {
 /// comparison against an aggregate result.
 ///
 /// Duration literals are stored as nanoseconds in the AST; aggregate values
-/// over `duration_micros` are in microseconds, so we pre-divide here.
+/// over `duration_micros` are in microseconds, so we pre-divide here. Use
+/// the same round-up coercion as the selector path
+/// ([`super::selectors`]) so a sub-microsecond literal like `500ns` does
+/// not silently collapse to `0µs` and start matching every row.
 fn literal_to_filter_expr(v: &LiteralValue) -> Expr {
     match v {
         LiteralValue::Int(i) => lit(*i),
         LiteralValue::Float(f) => lit(*f),
-        LiteralValue::Duration(ns) => lit(*ns / 1_000), // ns → micros
+        LiteralValue::Duration(ns) => lit(ns.saturating_add(999) / 1_000), // ns → micros, round up
         LiteralValue::Bytes(b) => lit(*b),
         LiteralValue::String(s) => lit(s.clone()),
         LiteralValue::Bool(b) => lit(*b),
