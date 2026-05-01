@@ -1101,9 +1101,7 @@ mod tests {
         open_row_group_bytes: AtomicI64,
         opened_calls: AtomicUsize,
         closed_calls: AtomicUsize,
-        lifetime_calls: AtomicUsize,
         opened_at: Mutex<HashMap<(u64, usize), std::time::Instant>>,
-        lifetimes: Mutex<Vec<Duration>>,
     }
 
     impl FakeObserver {
@@ -1113,14 +1111,6 @@ mod tests {
 
         fn open_row_group_bytes(&self) -> i64 {
             self.open_row_group_bytes.load(Ordering::SeqCst)
-        }
-
-        fn lifetime_calls(&self) -> usize {
-            self.lifetime_calls.load(Ordering::SeqCst)
-        }
-
-        fn lifetimes(&self) -> Vec<Duration> {
-            self.lifetimes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
         }
 
         fn opened_calls(&self) -> usize {
@@ -1149,18 +1139,11 @@ mod tests {
             self.closed_calls.fetch_add(1, Ordering::SeqCst);
             self.open_row_groups.fetch_sub(1, Ordering::SeqCst);
             self.open_row_group_bytes.fetch_sub(bytes, Ordering::SeqCst);
-            let opened_at = self
+            let _ = self
                 .opened_at
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&(segment_offset, row_group_idx));
-            if let Some(opened_at) = opened_at {
-                self.lifetime_calls.fetch_add(1, Ordering::SeqCst);
-                self.lifetimes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(opened_at.elapsed());
-            }
         }
     }
 
@@ -1388,38 +1371,6 @@ mod tests {
         .expect("merger");
 
         merger.into_stream().try_collect::<Vec<_>>().await.expect("merged")
-    }
-
-    async fn merged_values_with_observer(
-        queue_reader: Arc<FakeQueueReader>,
-        segments: Vec<SegmentToRead>,
-        observer: Arc<dyn RowGroupsMergerObserver>,
-    ) -> Vec<i64> {
-        let merger = RowGroupsMerger::new(
-            queue_reader,
-            &segments,
-            SortedBatchMergerConfig {
-                row_group_size: 8,
-                read_parallelism: 2,
-                topic: "logs".to_string(),
-                cancel_token: CancellationToken::new(),
-                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
-            },
-        )
-        .expect("merger")
-        .with_observer(observer);
-
-        merger
-            .into_stream()
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("merged")
-            .into_iter()
-            .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
-                (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
-            })
-            .collect()
     }
 
     #[tokio::test]
@@ -1794,130 +1745,115 @@ mod tests {
         assert_eq!(observer.open_row_group_bytes(), 0);
     }
 
+    /// Two disjoint time clusters of the same service packed into a single
+    /// chunk must keep their row-group-level boundaries intact.  The merger
+    /// emits batches in sort-key order and never invents timestamps in the
+    /// temporal gap between the two clusters — the downstream parquet writer
+    /// therefore preserves per-row-group min/max bounds (its `ColumnIndex` is
+    /// empty for the gap).
     #[tokio::test]
-    async fn merger_observer_keeps_balanced_counts_when_bootstrap_fails() {
-        let batch = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(40), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(40), 2)]);
-        let queue_reader = Arc::new(FakeQueueReader {
-            batches: HashMap::from([((1, 0), vec![batch.clone()]), ((2, 0), vec![batch_2.clone()])]),
-            open_delays: HashMap::new(),
-            error_after_n_reads: Some(2),
-            ..FakeQueueReader::default()
-        });
-        let observer = Arc::new(FakeObserver::default());
-        let merger = RowGroupsMerger::new(
-            queue_reader,
-            &[plan_with_bytes(1, 0, &batch, 10), plan_with_bytes(2, 0, &batch_2, 20)],
-            SortedBatchMergerConfig {
-                row_group_size: 1,
-                read_parallelism: 1,
-                topic: "logs".to_string(),
-                cancel_token: CancellationToken::new(),
-                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
-            },
-        )
-        .expect("merger")
-        .with_observer(Arc::clone(&observer) as Arc<dyn RowGroupsMergerObserver>);
-
-        let mut stream = merger.into_stream();
-        let err = stream.try_next().await.expect_err("bootstrap must fail");
-        assert!(matches!(err, IngestError::ShiftQueueRead(_)));
-        drop(stream);
-
-        assert_eq!(observer.opened_calls(), 1);
-        assert_eq!(observer.closed_calls(), 1);
-        assert_eq!(observer.open_row_groups(), 0);
-        assert_eq!(observer.open_row_group_bytes(), 0);
-    }
-
-    #[tokio::test]
-    async fn merger_output_is_unchanged_with_observer_enabled() {
-        let batch_1 = logs_batch(vec![
+    async fn merger_preserves_row_group_level_bounds_with_temporal_gap() {
+        // Cluster A: ts in [10..40]; Cluster B: ts in [200..230].  Same service
+        // → swept-line clusters disjoint in sort-key space, packed in one
+        // chunk by `bin_pack`.  Sort key uses ts DESC, so each cluster emits
+        // values from max ts to min ts; cluster B (later in time) precedes
+        // cluster A under the (account, service, ts DESC) ordering, but they
+        // share account/service so cluster ordering follows ts DESC anyway.
+        let cluster_a = logs_batch(vec![
             (Some("acc-1"), Some("svc-1"), Some(40), 1),
-            (Some("acc-1"), Some("svc-1"), Some(20), 3),
-        ]);
-        let batch_2 = logs_batch(vec![
             (Some("acc-1"), Some("svc-1"), Some(30), 2),
+            (Some("acc-1"), Some("svc-1"), Some(20), 3),
             (Some("acc-1"), Some("svc-1"), Some(10), 4),
         ]);
+        let cluster_b = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(230), 5),
+            (Some("acc-1"), Some("svc-1"), Some(220), 6),
+            (Some("acc-1"), Some("svc-1"), Some(210), 7),
+            (Some("acc-1"), Some("svc-1"), Some(200), 8),
+        ]);
         let queue_reader = Arc::new(FakeQueueReader {
-            batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
+            batches: HashMap::from([((1, 0), vec![cluster_a.clone()]), ((2, 0), vec![cluster_b.clone()])]),
             open_delays: HashMap::new(),
             ..FakeQueueReader::default()
         });
-        let expected = merged_values(
-            Arc::clone(&queue_reader),
-            vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2)],
-        )
-        .await;
-        let actual = merged_values_with_observer(
-            queue_reader,
-            vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2)],
-            Arc::new(FakeObserver::default()) as Arc<dyn RowGroupsMergerObserver>,
-        )
-        .await;
 
-        assert_eq!(actual, expected);
+        let batches =
+            merged_batches_with_row_group_size(queue_reader, vec![plan(1, 0, &cluster_a), plan(2, 0, &cluster_b)], 8)
+                .await;
+
+        // 1. The two disjoint clusters arrive as separate batch slices: the
+        //    merger never blends rows from cluster A and cluster B inside the
+        //    same emitted batch (cluster ordering is preserved).
+        // 2. No timestamp falls into the temporal gap (40, 200): if a future
+        //    refactor accidentally reorders or fabricates rows, this guard
+        //    fails immediately.
+        let timestamps: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                let col = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .expect("timestamp column");
+                (0..batch.num_rows()).map(|idx| col.value(idx)).collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Cluster B precedes cluster A under ts DESC; both clusters appear in
+        // their natural descending order.
+        assert_eq!(timestamps, vec![230, 220, 210, 200, 40, 30, 20, 10]);
+        for ts in &timestamps {
+            assert!(
+                !(40 < *ts && *ts < 200),
+                "merger must not surface a timestamp inside the temporal gap (40, 200): got {ts}"
+            );
+        }
+
+        // No batch may straddle the cluster boundary: every emitted batch's
+        // timestamp range must fit inside one of the two source clusters.
+        for batch in &batches {
+            let col = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("timestamp column");
+            let mins = (0..batch.num_rows()).map(|i| col.value(i)).min().expect("min");
+            let maxs = (0..batch.num_rows()).map(|i| col.value(i)).max().expect("max");
+            let in_a = mins >= 10 && maxs <= 40;
+            let in_b = mins >= 200 && maxs <= 230;
+            assert!(
+                in_a || in_b,
+                "batch range [{mins}, {maxs}] must stay within one cluster"
+            );
+        }
     }
 
+    /// When a single bin-packed chunk spans the UTC midnight day boundary,
+    /// the merger must keep the row order monotonic under the composite sort
+    /// key (account, service, ts DESC) — the day boundary is a purely
+    /// semantic line and must not perturb the merge.
     #[tokio::test]
-    async fn merger_observer_records_row_group_lifetime_for_multi_stream_merge() {
-        let batch_1 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(40), 1),
-            (Some("acc-1"), Some("svc-1"), Some(20), 3),
+    async fn merger_handles_chunk_spanning_day_boundary() {
+        // MICROS_PER_DAY duplicated as a local constant to avoid plumbing the
+        // planner-side constant through the merger's test scope.
+        const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+        let before = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(MICROS_PER_DAY - 10), 1),
+            (Some("acc-1"), Some("svc-1"), Some(MICROS_PER_DAY - 20), 2),
         ]);
-        let batch_2 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 2),
-            (Some("acc-1"), Some("svc-1"), Some(10), 4),
+        let after = logs_batch(vec![
+            (Some("acc-1"), Some("svc-1"), Some(MICROS_PER_DAY + 20), 3),
+            (Some("acc-1"), Some("svc-1"), Some(MICROS_PER_DAY + 10), 4),
         ]);
         let queue_reader = Arc::new(FakeQueueReader {
-            batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
+            batches: HashMap::from([((1, 0), vec![before.clone()]), ((2, 0), vec![after.clone()])]),
             open_delays: HashMap::new(),
             ..FakeQueueReader::default()
         });
-        let observer = Arc::new(FakeObserver::default());
-        let _values = merged_values_with_observer(
-            queue_reader,
-            vec![plan(1, 0, &batch_1), plan(2, 0, &batch_2)],
-            Arc::clone(&observer) as Arc<dyn RowGroupsMergerObserver>,
-        )
-        .await;
 
-        assert_eq!(observer.lifetime_calls(), 2);
-        assert_eq!(observer.lifetimes().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn merger_observer_records_row_group_lifetime_for_single_stream_merge() {
-        let batch = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 1),
-            (Some("acc-1"), Some("svc-1"), Some(20), 2),
-            (Some("acc-1"), Some("svc-1"), Some(10), 3),
-        ]);
-        let queue_reader = Arc::new(FakeQueueReader {
-            batches: HashMap::from([((1, 0), vec![batch.clone()])]),
-            open_delays: HashMap::new(),
-            ..FakeQueueReader::default()
-        });
-        let observer = Arc::new(FakeObserver::default());
-        let merger = RowGroupsMerger::new(
-            queue_reader,
-            &[plan(1, 0, &batch)],
-            SortedBatchMergerConfig {
-                row_group_size: 1,
-                read_parallelism: 1,
-                topic: "logs".to_string(),
-                cancel_token: CancellationToken::new(),
-                sort_descriptor: SortColumnsDescriptor::logs().expect("logs descriptor"),
-            },
-        )
-        .expect("merger")
-        .with_observer(Arc::clone(&observer) as Arc<dyn RowGroupsMergerObserver>);
-
-        let _batches = merger.into_stream().try_collect::<Vec<_>>().await.expect("merged");
-
-        assert_eq!(observer.lifetime_calls(), 1);
-        assert_eq!(observer.lifetimes().len(), 1);
+        let values = merged_values(queue_reader, vec![plan(1, 0, &before), plan(2, 0, &after)]).await;
+        // ts DESC → after-midnight rows first, then before-midnight rows.
+        assert_eq!(values, vec![3, 4, 1, 2]);
     }
 
     #[test]

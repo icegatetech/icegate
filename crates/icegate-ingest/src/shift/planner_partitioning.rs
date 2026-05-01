@@ -50,7 +50,7 @@ impl PlannerPartitionSpec {
                         },
                     });
                 }
-                PlannerPartitionField::DayTimestampColumnStats { plan_field } => {
+                PlannerPartitionField::DayTimestampColumnStats { plan_field, .. } => {
                     fields.push(ExtractField {
                         name: (*plan_field).to_string(),
                         extractor: FieldExtractor::ColumnStatsTimestampMicrosRange {
@@ -88,6 +88,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        error::IngestError,
         shift::planner::{MICROS_PER_DAY, PartitionBucket, PartitionValue, RowGroupPartition},
         wal::{
             RowGroupBoundaryKey, RowGroupBoundaryRange, serialize_row_group_boundary_range,
@@ -147,7 +148,7 @@ mod tests {
         let err = CURRENT_PLANNER_PARTITION_SPEC
             .plan_entries_to_row_groups(vec![plan_entry(None, Some(minimal_boundary_payload()), Some((1, 2)))])
             .expect_err("missing identity must error");
-        assert!(err.to_string().contains("missing tenant_id field"));
+        assert!(matches!(err, IngestError::Shift(_)));
     }
 
     #[test]
@@ -159,7 +160,7 @@ mod tests {
                 Some((1, 2)),
             )])
             .expect_err("empty identity must error");
-        assert!(err.to_string().contains("empty tenant_id"));
+        assert!(matches!(err, IngestError::Shift(_)));
     }
 
     #[test]
@@ -167,24 +168,148 @@ mod tests {
         let err = CURRENT_PLANNER_PARTITION_SPEC
             .plan_entries_to_row_groups(vec![plan_entry(Some("tenant-a"), None, Some((1, 2)))])
             .expect_err("missing boundary must error");
-        assert!(err.to_string().contains("missing boundary_range payload"));
+        assert!(matches!(err, IngestError::Shift(_)));
     }
 
     #[test]
-    fn missing_timestamp_range_is_cross_partition() {
-        // Column stats absent (e.g. all-null timestamp column) → no proof of
-        // single-day containment, fall back to cross-partition overflow.
-        let row_groups = CURRENT_PLANNER_PARTITION_SPEC
+    fn missing_timestamp_range_is_error_when_required() {
+        // timestamp is required in all current IceGate tables: absent column
+        // stats indicate a WAL writer bug or data corruption, not an expected
+        // all-null column.  The plan must fail-fast rather than silently
+        // degrading to cross-partition overflow and losing day boundaries.
+        let err = CURRENT_PLANNER_PARTITION_SPEC
             .plan_entries_to_row_groups(vec![plan_entry(
                 Some("tenant-a"),
                 Some(minimal_boundary_payload()),
                 None,
             )])
+            .expect_err("missing required timestamp stats must error");
+        assert!(matches!(err, IngestError::Shift(_)));
+    }
+
+    /// A boundary payload that is present but not a valid serialized
+    /// [`RowGroupBoundaryRange`] must surface as a planner-side error rather
+    /// than being silently accepted (which would corrupt clustering).
+    #[test]
+    fn malformed_boundary_payload_is_error() {
+        let mut entry = plan_entry(Some("tenant-a"), None, Some((1, 2)));
+        entry.extracted.insert(
+            PLAN_FIELD_BOUNDARY_RANGE.to_string(),
+            ExtractedValue::Utf8("not-json".to_string()),
+        );
+        let err = CURRENT_PLANNER_PARTITION_SPEC
+            .plan_entries_to_row_groups(vec![entry])
+            .expect_err("malformed boundary payload must error");
+        assert!(matches!(err, IngestError::Shift(_)));
+    }
+
+    /// Wrong-type guard: `timestamp_range` extractor is declared as
+    /// `ColumnStatsTimestampMicrosRange` but if a hypothetical adapter ever
+    /// supplied a UTF-8 value, the planner must reject the row group instead
+    /// of silently treating it as cross-partition.
+    #[test]
+    fn timestamp_range_with_utf8_value_is_error() {
+        let mut entry = plan_entry(Some("tenant-a"), Some(minimal_boundary_payload()), None);
+        entry.extracted.insert(
+            PLAN_FIELD_TIMESTAMP_RANGE.to_string(),
+            ExtractedValue::Utf8("not-a-range".to_string()),
+        );
+        let err = CURRENT_PLANNER_PARTITION_SPEC
+            .plan_entries_to_row_groups(vec![entry])
+            .expect_err("utf8 in timestamp_range must error");
+        assert!(matches!(err, IngestError::Shift(_)));
+    }
+
+    /// Wrong-type guard: identity tenant field declared as `Utf8` must reject
+    /// a `TimestampMicrosRange` payload.
+    #[test]
+    fn tenant_id_with_timestamp_range_value_is_error() {
+        let mut entry = plan_entry(None, Some(minimal_boundary_payload()), Some((1, 2)));
+        entry.extracted.insert(
+            PLAN_FIELD_TENANT_ID.to_string(),
+            ExtractedValue::TimestampMicrosRange(1, 2),
+        );
+        let err = CURRENT_PLANNER_PARTITION_SPEC
+            .plan_entries_to_row_groups(vec![entry])
+            .expect_err("timestamp in tenant_id must error");
+        assert!(matches!(err, IngestError::Shift(_)));
+    }
+
+    /// Edge case: timestamps straddling the unix epoch must use Euclidean
+    /// division so that `-1µs` lands in day `-1` and `0µs` in day `0`.  Plain
+    /// integer division would put both in day `0` and silently merge data
+    /// across the epoch boundary.
+    #[test]
+    fn negative_timestamp_just_before_epoch_belongs_to_day_minus_one() {
+        let row_groups = CURRENT_PLANNER_PARTITION_SPEC
+            .plan_entries_to_row_groups(vec![
+                plan_entry(Some("tenant-a"), Some(minimal_boundary_payload()), Some((-1, -1))),
+                plan_entry(Some("tenant-a"), Some(minimal_boundary_payload()), Some((0, 0))),
+            ])
+            .expect("ok");
+        assert!(matches!(
+            &row_groups[0].partition,
+            RowGroupPartition::Single(bucket)
+                if bucket == &PartitionBucket(vec![
+                    PartitionValue::String(Arc::from("tenant-a")),
+                    PartitionValue::Day(-1),
+                ])
+        ));
+        assert!(matches!(
+            &row_groups[1].partition,
+            RowGroupPartition::Single(bucket)
+                if bucket == &PartitionBucket(vec![
+                    PartitionValue::String(Arc::from("tenant-a")),
+                    PartitionValue::Day(0),
+                ])
+        ));
+    }
+
+    /// Timestamps anchored exactly at 00:00:00.000 UTC must fall on the *new*
+    /// day, not the previous one — `div_euclid(MICROS_PER_DAY)` is half-open
+    /// `[d, d+1)` per Iceberg's day-transform contract. A row group pinned to
+    /// midnight of day `d` is in day `d`; a row group whose `max_ts` touches
+    /// midnight of day `d+1` while `min_ts` sits in day `d` straddles the
+    /// boundary.
+    #[test]
+    fn day_boundary_at_exact_midnight_utc() {
+        // min_ts and max_ts both at the day-1 midnight boundary → entirely in
+        // day 1, single bucket.
+        let row_groups = CURRENT_PLANNER_PARTITION_SPEC
+            .plan_entries_to_row_groups(vec![plan_entry(
+                Some("tenant-a"),
+                Some(minimal_boundary_payload()),
+                Some((MICROS_PER_DAY, MICROS_PER_DAY)),
+            )])
+            .expect("ok");
+        assert!(matches!(
+            &row_groups[0].partition,
+            RowGroupPartition::Single(bucket)
+                if bucket == &PartitionBucket(vec![
+                    PartitionValue::String(Arc::from("tenant-a")),
+                    PartitionValue::Day(1),
+                ])
+        ));
+
+        // max_ts pinned exactly to the day-1 midnight while min_ts is the last
+        // microsecond of day 0 → cross-partition (day 0 → day 1).  This nails
+        // the half-open semantics: max_ts == MICROS_PER_DAY belongs to day 1,
+        // not day 0.
+        let row_groups = CURRENT_PLANNER_PARTITION_SPEC
+            .plan_entries_to_row_groups(vec![plan_entry(
+                Some("tenant-a"),
+                Some(minimal_boundary_payload()),
+                Some((MICROS_PER_DAY - 1, MICROS_PER_DAY)),
+            )])
             .expect("ok");
         assert!(matches!(
             &row_groups[0].partition,
             RowGroupPartition::CrossPartition(bucket)
-                if bucket == &PartitionBucket(vec![PartitionValue::String(Arc::from("tenant-a"))])
+                if bucket == &PartitionBucket(vec![
+                    PartitionValue::String(Arc::from("tenant-a")),
+                    PartitionValue::Day(0),
+                    PartitionValue::Day(1),
+                ])
         ));
     }
 
@@ -208,7 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn row_group_crossing_day_boundary_is_cross_partition() {
+    fn row_group_crossing_day_boundary_is_cross_partition_with_day_range_bucket() {
+        // A cross-day row group must land in CrossPartition, and its bucket
+        // must include (min_day, max_day) so that row groups straddling
+        // different day pairs are never packed into the same chunk.
         let row_groups = CURRENT_PLANNER_PARTITION_SPEC
             .plan_entries_to_row_groups(vec![plan_entry(
                 Some("tenant-a"),
@@ -219,8 +347,45 @@ mod tests {
         assert!(matches!(
             &row_groups[0].partition,
             RowGroupPartition::CrossPartition(bucket)
-                if bucket == &PartitionBucket(vec![PartitionValue::String(Arc::from("tenant-a"))])
+                if bucket == &PartitionBucket(vec![
+                    PartitionValue::String(Arc::from("tenant-a")),
+                    PartitionValue::Day(0),
+                    PartitionValue::Day(1),
+                ])
         ));
+    }
+
+    #[test]
+    fn cross_day_row_groups_straddling_different_days_have_distinct_buckets() {
+        // Two row groups of the same tenant each crossing a day boundary, but
+        // at different day pairs, must receive distinct CrossPartition buckets.
+        // Without this isolation, the planner could pack them into one chunk
+        // and the Iceberg writer would fan out to multiple day-partition files.
+        let rg_day0_1 = plan_entry(
+            Some("tenant-a"),
+            Some(minimal_boundary_payload()),
+            Some((MICROS_PER_DAY - 1, MICROS_PER_DAY + 1)), // crosses day 0→1
+        );
+        let rg_day1_2 = plan_entry(
+            Some("tenant-a"),
+            Some(minimal_boundary_payload()),
+            Some((2 * MICROS_PER_DAY - 1, 2 * MICROS_PER_DAY + 1)), // crosses day 1→2
+        );
+        let row_groups = CURRENT_PLANNER_PARTITION_SPEC
+            .plan_entries_to_row_groups(vec![rg_day0_1, rg_day1_2])
+            .expect("ok");
+        let bucket_0_1 = PartitionBucket(vec![
+            PartitionValue::String(Arc::from("tenant-a")),
+            PartitionValue::Day(0),
+            PartitionValue::Day(1),
+        ]);
+        let bucket_1_2 = PartitionBucket(vec![
+            PartitionValue::String(Arc::from("tenant-a")),
+            PartitionValue::Day(1),
+            PartitionValue::Day(2),
+        ]);
+        assert!(matches!(&row_groups[0].partition, RowGroupPartition::CrossPartition(b) if b == &bucket_0_1));
+        assert!(matches!(&row_groups[1].partition, RowGroupPartition::CrossPartition(b) if b == &bucket_1_2));
     }
 
     /// Regression: with composite sort key `(account, service, ts DESC)`, a

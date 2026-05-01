@@ -1224,6 +1224,22 @@ mod tests {
                         icegate_queue::ExtractedValue::Utf8(payload),
                     );
                 }
+                // Extract physical timestamp min/max from the batch column (index 3).
+                // All test timestamps are tiny values (< 1 second) so they always
+                // fall within day 0; a TimestampMicrosRange is required because
+                // CURRENT_PLANNER_PARTITION_SPEC has required=true for the day field.
+                let ts_col = row_group
+                    .batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .expect("timestamp column at index 3");
+                let min_ts = (0..ts_col.len()).filter_map(|i| ts_col.value(i).into()).min().unwrap_or(0);
+                let max_ts = (0..ts_col.len()).filter_map(|i| ts_col.value(i).into()).max().unwrap_or(0);
+                extracted.insert(
+                    crate::shift::plan_runner::PLAN_FIELD_TIMESTAMP_RANGE.to_string(),
+                    icegate_queue::ExtractedValue::TimestampMicrosRange(min_ts, max_ts),
+                );
                 entries.push(RowGroupPlanEntry {
                     wal_offset: segment.offset,
                     row_group_idx,
@@ -2045,6 +2061,19 @@ mod tests {
             0,
             "cancellation before write pipeline start must not call storage write"
         );
+        // No partial parquet output may exist after cancellation. The mock's
+        // `writes` accumulator collects every batch that reached
+        // `write_record_batches`; an empty vec proves the runner cancelled
+        // the queue stream before any data crossed the writer boundary.
+        assert!(
+            storage.writes.lock().await.is_empty(),
+            "no partial parquet payload may have been buffered into storage under cancellation"
+        );
+        // FakeStorage::get_data_files and FakeStorage::commit both panic on
+        // call; the runner reaching those methods would have aborted the
+        // tokio task before this point, so simply reaching the post-join
+        // assertions here is also a guarantee that neither the
+        // file-finalization nor the snapshot-commit phase ran.
         assert!(
             started_reads.load(Ordering::SeqCst) <= 2,
             "cancellation must stop scheduling reads beyond the in-flight parallelism window"
@@ -2171,8 +2200,7 @@ mod tests {
             let first_tenant = tenant_ids.first().expect("written tenant ids").clone();
             assert!(
                 tenant_ids.iter().all(|tenant_id| tenant_id == &first_tenant),
-                "partition bucket boundary violated: expected one tenant per output, got {:?}",
-                tenant_ids
+                "partition bucket boundary violated: expected one tenant per output, got {tenant_ids:?}",
             );
 
             let actual_row_ids = row_ids_from_batches(&writes[0]);

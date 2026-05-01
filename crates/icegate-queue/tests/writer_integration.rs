@@ -302,10 +302,12 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
         .entries
         .iter()
         .filter_map(|entry| {
-            entry
-                .extracted
-                .get("boundary")
-                .map(|v| (entry.row_group_idx, v.as_utf8().expect("boundary must be utf8").to_string()))
+            entry.extracted.get("boundary").map(|v| {
+                (
+                    entry.row_group_idx,
+                    v.as_utf8().expect("boundary must be utf8").to_string(),
+                )
+            })
         })
         .collect();
 

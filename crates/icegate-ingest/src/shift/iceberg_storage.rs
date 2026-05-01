@@ -117,6 +117,16 @@ pub trait Storage: Send + Sync {
 /// not fire.
 const WRITER_FILE_SIZE_FAILOVER_FACTOR: u64 = 2;
 
+/// Compute the writer rollover budget from the planner's per-task upper bound.
+///
+/// The writer must only roll over as a failover (planner-shaped chunks already
+/// target one file per task), so the budget is `upper_bound * 2` rather than
+/// the planner's upper bound itself.  Encapsulated as a `const fn` so the
+/// failover policy is verifiable in isolation.
+pub(super) const fn writer_max_parquet_bytes(upper_bound_input_bytes: u64) -> u64 {
+    upper_bound_input_bytes.saturating_mul(WRITER_FILE_SIZE_FAILOVER_FACTOR)
+}
+
 /// Iceberg storage for shift operations.
 pub struct IcebergStorage {
     loader: TableLoader,
@@ -129,10 +139,7 @@ impl IcebergStorage {
     /// Creates a new Iceberg storage for the provided table and catalog.
     pub fn new(catalog: Arc<dyn Catalog>, table: impl Into<String>, shift_config: &ShiftConfig) -> Self {
         let table_ident = TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.into());
-        let max_file_size_bytes = shift_config
-            .read
-            .upper_bound_input_bytes_per_task
-            .saturating_mul(WRITER_FILE_SIZE_FAILOVER_FACTOR);
+        let max_file_size_bytes = writer_max_parquet_bytes(shift_config.read.upper_bound_input_bytes_per_task);
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,
@@ -563,7 +570,24 @@ mod tests {
 
     use iceberg::io::FileIO;
 
-    use super::cleanup_generated_data_files;
+    use super::{cleanup_generated_data_files, writer_max_parquet_bytes};
+
+    /// Failover policy guard: writer rollover budget must be exactly
+    /// `upper_bound_input_bytes_per_task * 2`.  If this changes, the planner's
+    /// "one chunk == one parquet file" invariant has to be re-verified — the
+    /// writer would start splitting normal chunks instead of acting as a
+    /// failover.
+    #[test]
+    fn writer_max_parquet_bytes_doubles_planner_upper_bound() {
+        assert_eq!(writer_max_parquet_bytes(64 * 1024 * 1024), 128 * 1024 * 1024);
+        assert_eq!(writer_max_parquet_bytes(128 * 1024 * 1024), 256 * 1024 * 1024);
+    }
+
+    /// Saturating multiplication must not panic on absurdly large inputs.
+    #[test]
+    fn writer_max_parquet_bytes_saturates_on_overflow() {
+        assert_eq!(writer_max_parquet_bytes(u64::MAX), u64::MAX);
+    }
 
     #[tokio::test]
     async fn cleanup_generated_data_files_deletes_existing_paths() {

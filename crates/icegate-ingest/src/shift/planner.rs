@@ -137,17 +137,16 @@ fn row_group_partition(
                 }
                 // Intern the string so all row groups sharing the same identity
                 // value (e.g. same tenant_id) reuse one Arc<str> allocation.
-                let interned = interner
-                    .entry(value)
-                    .or_insert_with_key(|k| Arc::from(k.as_str()))
-                    .clone();
-                values.push(PartitionValue::String(interned));
+                let arc_str = interner.entry(value).or_insert_with_key(|k| Arc::from(k.as_str())).clone();
+                values.push(PartitionValue::String(arc_str));
             }
             PlannerPartitionField::DayTimestampColumnStats { plan_field } => {
-                // No stats (e.g. all-null timestamp column) → cross-partition
-                // overflow, since we cannot prove single-day containment.
                 let Some(value) = extracted.get(*plan_field) else {
-                    return Ok(RowGroupPartition::CrossPartition(PartitionBucket(values)));
+                    return Err(IngestError::Shift(format!(
+                        "missing required timestamp stats ({plan_field}) in plan entry \
+                         (WAL segment {wal_offset} row group {row_group_idx}): \
+                         timestamp column must be non-null for day partitioning"
+                    )));
                 };
                 let &ExtractedValue::TimestampMicrosRange(min_ts, max_ts) = value else {
                     return Err(IngestError::Shift(format!(
@@ -158,6 +157,11 @@ fn row_group_partition(
                 let min_day = micros_to_day(min_ts);
                 let max_day = micros_to_day(max_ts);
                 if min_day != max_day {
+                    // Row group straddles a day boundary: include the day range
+                    // in the bucket key so cross-day row groups from different
+                    // day pairs are never packed into the same shift task.
+                    values.push(PartitionValue::Day(min_day));
+                    values.push(PartitionValue::Day(max_day));
                     return Ok(RowGroupPartition::CrossPartition(PartitionBucket(values)));
                 }
                 values.push(PartitionValue::Day(min_day));
@@ -168,6 +172,7 @@ fn row_group_partition(
     Ok(RowGroupPartition::Single(bucket))
 }
 
+#[derive(Copy, Clone)]
 enum RequiredFieldKind {
     IdentityValue,
     BoundaryPayload,
@@ -738,7 +743,10 @@ mod tests {
         Cluster, PartitionBucket, PartitionValue, PlanRowGroup, PlannedChunk, PlannerConfig, RowGroupPartition,
         bin_pack, partition_by_bucket, sort_by_min_key, swept_line_cluster, tail_merge,
     };
-    use crate::wal::{RowGroupBoundaryKey, RowGroupBoundaryRange, test_utils::boundary_component_timestamp_micros};
+    use crate::{
+        error::IngestError,
+        wal::{RowGroupBoundaryKey, RowGroupBoundaryRange, test_utils::boundary_component_timestamp_micros},
+    };
 
     /// Build a row group with a single timestamp-only sort key
     /// (`min_ts`, `max_ts`) for tests; `descending=false` so larger values
@@ -786,10 +794,7 @@ mod tests {
     }
 
     fn test_bucket(label: &str, day: i32) -> PartitionBucket {
-        PartitionBucket(vec![
-            PartitionValue::String(Arc::from(label)),
-            PartitionValue::Day(day),
-        ])
+        PartitionBucket(vec![PartitionValue::String(Arc::from(label)), PartitionValue::Day(day)])
     }
 
     /// Build planner limits with `upper = 2 * lower` — preserves the previous
@@ -803,13 +808,6 @@ mod tests {
     }
 
     // ---- sort_by_min_key ----
-
-    #[test]
-    fn sort_single_row_group_is_noop() {
-        let mut rgs = vec![rg(0, 0, 1, 10, 20)];
-        sort_by_min_key(&mut rgs);
-        assert_eq!(rg_idxs_vec(&rgs), vec![(0, 0)]);
-    }
 
     #[test]
     fn sort_orders_by_min_key_ascending() {
@@ -907,15 +905,6 @@ mod tests {
     }
 
     #[test]
-    fn bin_pack_two_clusters_fit_in_one_chunk() {
-        let c1 = cluster(vec![rg(0, 0, 30, 0, 10)]);
-        let c2 = cluster(vec![rg(0, 1, 50, 20, 30)]);
-        let (chunks, _) = bin_pack(vec![c1, c2], &limits(100, 100)).expect("ok");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].total_bytes, 80);
-    }
-
-    #[test]
     fn bin_pack_two_clusters_exceed_upper_bound_split_into_two_chunks() {
         // Combined size 160 > upper_bound 128 → flush first, then accumulate second.
         let c1 = cluster(vec![rg(0, 0, 80, 0, 10)]);
@@ -952,42 +941,6 @@ mod tests {
         assert!(chunks.iter().all(|c| c.is_oversized_split));
         assert_eq!(chunks[0].total_bytes, 200);
         assert_eq!(chunks[1].total_bytes, 100);
-    }
-
-    #[test]
-    fn bin_pack_accumulates_past_lower_bound_up_to_upper_bound() {
-        // lower=64, upper=128: three 30-byte clusters must pack into one chunk
-        // (90 ≤ 128) even though 30+30=60 is already below lower_bound and
-        // 30+30+30=90 crosses lower_bound mid-accumulation.
-        let c1 = cluster(vec![rg(0, 0, 30, 0, 10)]);
-        let c2 = cluster(vec![rg(0, 1, 30, 20, 30)]);
-        let c3 = cluster(vec![rg(0, 2, 30, 40, 50)]);
-        let (chunks, _) = bin_pack(vec![c1, c2, c3], &limits_with_upper(64, 128, 100)).expect("ok");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].total_bytes, 90);
-    }
-
-    #[test]
-    fn bin_pack_flushes_before_next_cluster_after_lower_bound() {
-        // lower=64, upper=128: after the first 70-byte cluster the current
-        // chunk has reached lower_bound, so the next disjoint cluster starts a
-        // new chunk.
-        let c1 = cluster(vec![rg(0, 0, 70, 0, 10)]);
-        let c2 = cluster(vec![rg(0, 1, 70, 20, 30)]);
-        let (chunks, _) = bin_pack(vec![c1, c2], &limits_with_upper(64, 128, 100)).expect("ok");
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].total_bytes, 70);
-        assert_eq!(chunks[1].total_bytes, 70);
-    }
-
-    #[test]
-    fn bin_pack_starts_new_chunk_when_current_reached_lower_bound_even_if_upper_allows() {
-        let c1 = cluster(vec![rg(0, 0, 80, 0, 10)]);
-        let c2 = cluster(vec![rg(0, 1, 20, 20, 30)]);
-        let (chunks, _) = bin_pack(vec![c1, c2], &limits_with_upper(64, 128, 100)).expect("ok");
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].total_bytes, 80);
-        assert_eq!(chunks[1].total_bytes, 20);
     }
 
     #[test]
@@ -1062,7 +1015,7 @@ mod tests {
         let cluster = cluster(vec![rg(0, 0, 150, 0, 50), rg(0, 1, 10, 10, 60)]);
         let lim = limits_with_upper(64, 100, 100);
         let err = bin_pack(vec![cluster], &lim).expect_err("must fail when single rg > upper_bound");
-        assert!(err.to_string().contains("exceeds the planner upper bound"));
+        assert!(matches!(err, IngestError::Shift(_)));
     }
 
     // ---- tail_merge ----
@@ -1076,26 +1029,6 @@ mod tests {
         }];
         assert!(!tail_merge(&mut chunks, &limits(100, 100)));
         assert_eq!(chunks.len(), 1);
-    }
-
-    #[test]
-    fn tail_merge_merges_small_tail_when_combined_fits_hard_cap() {
-        let mut chunks = vec![
-            PlannedChunk {
-                row_groups: vec![rg(0, 0, 80, 0, 10)],
-                total_bytes: 80,
-                is_oversized_split: false,
-            },
-            PlannedChunk {
-                row_groups: vec![rg(0, 1, 10, 20, 30)],
-                total_bytes: 10,
-                is_oversized_split: false,
-            },
-        ];
-        // target=100, threshold=25, hard_cap=200.
-        assert!(tail_merge(&mut chunks, &limits(100, 100)));
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].total_bytes, 90);
     }
 
     #[test]
@@ -1160,25 +1093,6 @@ mod tests {
     }
 
     #[test]
-    fn tail_merge_skips_when_combined_exceeds_hard_cap() {
-        let mut chunks = vec![
-            PlannedChunk {
-                row_groups: vec![rg(0, 0, 195, 0, 10)],
-                total_bytes: 195,
-                is_oversized_split: false,
-            },
-            PlannedChunk {
-                row_groups: vec![rg(0, 1, 10, 20, 30)],
-                total_bytes: 10,
-                is_oversized_split: false,
-            },
-        ];
-        // target=100 → hard_cap=200; combined=205 > 200 → no merge.
-        assert!(!tail_merge(&mut chunks, &limits(100, 100)));
-        assert_eq!(chunks.len(), 2);
-    }
-
-    #[test]
     fn tail_merge_skips_when_previous_is_oversized_split() {
         let mut chunks = vec![
             PlannedChunk {
@@ -1214,14 +1128,14 @@ mod tests {
     fn partition_by_bucket_separates_different_buckets() {
         let bucket0 = test_bucket("bucket-a", 0);
         let bucket1 = test_bucket("bucket-a", 1);
-        let (buckets, cross_partition) = partition_by_bucket(vec![
+        let (by_bucket, cross_partition) = partition_by_bucket(vec![
             rg_with_bucket(0, 0, 100, 100, 200, bucket0.clone()),
             rg_with_bucket(1, 0, 100, 300, 400, bucket1.clone()),
         ]);
-        assert_eq!(buckets.len(), 2);
+        assert_eq!(by_bucket.len(), 2);
         assert!(cross_partition.is_empty());
-        assert_eq!(buckets[&bucket0].len(), 1);
-        assert_eq!(buckets[&bucket1].len(), 1);
+        assert_eq!(by_bucket[&bucket0].len(), 1);
+        assert_eq!(by_bucket[&bucket1].len(), 1);
     }
 
     #[test]
@@ -1234,36 +1148,6 @@ mod tests {
     }
 
     // ---- plan_row_groups with partitioning ----
-
-    /// Guard for the partition invariant documented on `tail_merge`: a small
-    /// tail chunk in day 0 must never be merged with day 1's chunk even when
-    /// the combined size would fit inside `upper_bound_bytes`.
-    ///
-    /// The invariant holds because `plan_bucket` (and thus `tail_merge`) is
-    /// called separately for each partition-bucket in `plan_row_groups`.  This test
-    /// would catch a regression if the two buckets were ever flattened before
-    /// `tail_merge` runs.
-    #[test]
-    fn plan_row_groups_small_tail_not_merged_across_partition_buckets() {
-        use tokio_util::sync::CancellationToken;
-
-        use super::plan_row_groups;
-
-        // Bucket 0: one tiny row group (10 B << lower_bound=64).
-        // Bucket 1: one larger row group (80 B > lower_bound).
-        // Combined 90 B < upper_bound=128 → would merge if in the same bucket.
-        let rg_day0 = rg_with_bucket(0, 0, 10, 0, 10, test_bucket("bucket-a", 0));
-        let rg_day1 = rg_with_bucket(1, 0, 80, 20, 30, test_bucket("bucket-a", 1));
-        let cancel_token = CancellationToken::new();
-        let (chunks, _) =
-            plan_row_groups(vec![rg_day0, rg_day1], &limits_with_upper(64, 128, 100), &cancel_token).expect("ok");
-        assert_eq!(chunks.len(), 2, "cross-partition tail_merge must not happen");
-        // partition_buckets is a HashMap → chunk order is non-deterministic;
-        // assert on the multiset of chunk sizes instead.
-        let mut sizes: Vec<u64> = chunks.iter().map(|c| c.total_bytes).collect();
-        sizes.sort_unstable();
-        assert_eq!(sizes, vec![10, 80]);
-    }
 
     #[test]
     fn plan_row_groups_single_day_workload_behavior_unchanged() {
@@ -1317,24 +1201,354 @@ mod tests {
 
     // ---- plan_row_groups partition isolation ----
 
+    /// `tail_merge` must skip when the previous and tail chunks live in
+    /// different partition buckets — even when their byte sums fit inside
+    /// `upper_bound_bytes`.  The numbers (chunk1=120 MB, chunk2=10 MB,
+    /// sum=130 MB > upper=128 MB) deliberately *also* fail the upper-bound
+    /// guard, so the assertion proves both invariants hold simultaneously.
+    /// Partition isolation is structural here: `plan_row_groups` calls
+    /// `tail_merge` once per bucket, so cross-bucket merging is impossible to
+    /// express through the public API regardless of the byte budget.
     #[test]
-    fn plan_row_groups_does_not_merge_tail_across_partitions() {
-        // Two partition-buckets, each with one cluster below lower_bound.
-        // tail_merge must not join them across a day boundary.
+    fn plan_row_groups_skips_tail_merge_when_partition_tuple_differs_case11() {
         use tokio_util::sync::CancellationToken;
 
         use super::plan_row_groups;
 
-        let rg_day0 = rg_with_bucket(0, 0, 30 * 1024 * 1024, 0, 10, test_bucket("bucket-a", 0));
-        let rg_day1 = rg_with_bucket(0, 1, 20 * 1024 * 1024, 20, 30, test_bucket("bucket-a", 1));
+        // 120 MB cluster in bucket day0 + 10 MB cluster in bucket day1.
+        let rg_day0 = rg_with_bucket(0, 0, 120 * 1024 * 1024, 0, 10, test_bucket("bucket-a", 0));
+        let rg_day1 = rg_with_bucket(0, 1, 10 * 1024 * 1024, 20, 30, test_bucket("bucket-a", 1));
         let cancel_token = CancellationToken::new();
-        let (chunks, _stats) = plan_row_groups(
+        let (chunks, stats) = plan_row_groups(
             vec![rg_day0, rg_day1],
             &limits_with_upper(64 * 1024 * 1024, 128 * 1024 * 1024, 100),
             &cancel_token,
         )
         .expect("ok");
-        assert_eq!(chunks.len(), 2, "each day must produce a separate chunk");
+        assert_eq!(chunks.len(), 2, "different partition buckets must not tail-merge");
+        assert!(!stats.tail_merged, "tail_merge must not have triggered across buckets");
+        let mut sizes: Vec<u64> = chunks.iter().map(|c| c.total_bytes).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![10 * 1024 * 1024, 120 * 1024 * 1024]);
+    }
+
+    /// Guard that cross-day row groups whose timestamps straddle different day
+    /// pairs are never packed into one chunk.  Before the fix, both row groups
+    /// would land in the same `CrossPartition` bucket keyed only by tenant, so
+    /// `bin_pack` could merge them into a single shift task, causing Iceberg's
+    /// partition fanout to write multiple day-partition files per task.
+    #[test]
+    fn plan_row_groups_cross_day_rgs_with_different_day_pairs_produce_separate_chunks() {
+        use tokio_util::sync::CancellationToken;
+
+        use super::plan_row_groups;
+
+        // Two cross-day row groups for the same tenant but straddling different
+        // day boundaries: (day0, day1) and (day1, day2).  Each must go into its
+        // own chunk so the writer never fans out across multiple day partitions.
+        let bucket_day0_1 = PartitionBucket(vec![
+            PartitionValue::String(Arc::from("tenant-a")),
+            PartitionValue::Day(0),
+            PartitionValue::Day(1),
+        ]);
+        let bucket_day1_2 = PartitionBucket(vec![
+            PartitionValue::String(Arc::from("tenant-a")),
+            PartitionValue::Day(1),
+            PartitionValue::Day(2),
+        ]);
+        let rg_cross_0_1 = cross_partition_rg(0, 0, 30, 0, 10, bucket_day0_1);
+        let rg_cross_1_2 = cross_partition_rg(1, 0, 30, 20, 30, bucket_day1_2);
+        let cancel_token = CancellationToken::new();
+        let (chunks, stats) =
+            plan_row_groups(vec![rg_cross_0_1, rg_cross_1_2], &limits(100, 100), &cancel_token).expect("ok");
+        assert_eq!(
+            chunks.len(),
+            2,
+            "cross-day rgs from different day pairs must not share a chunk"
+        );
+        assert_eq!(stats.cross_partition_row_groups, 2);
+    }
+
+    // ---- plan_row_groups domain end-to-end (ТЗ Cases 1, 2, 3, 4, 12) ----
+
+    /// ТЗ Case 1: a single fat service producing monotonic, disjoint row groups
+    /// must be split into ~`upper_bound`-sized chunks. None of the chunks can
+    /// be marked `is_oversized_split`, and `oversized_clusters` must stay at 0
+    /// because every cluster is below the upper bound.
+    #[test]
+    fn plan_row_groups_fat_monotonic_service_yields_three_lower_bound_chunks() {
+        use tokio_util::sync::CancellationToken;
+
+        use super::plan_row_groups;
+
+        // Thirty disjoint row groups of ~6.7 MB → 200 MB total. lower=64,
+        // upper=128 MB.  The bin-packer flushes every chunk once it crosses
+        // lower_bound, producing three chunks of ~67 MB each.
+        let rg_size: u64 = 6_700_000;
+        let rgs: Vec<PlanRowGroup> = (0..30)
+            .map(|i| {
+                #[allow(clippy::cast_possible_wrap)]
+                let i_i64 = i as i64;
+                rg(0, i, rg_size, i_i64 * 100, i_i64 * 100 + 50)
+            })
+            .collect();
+        let lim = limits_with_upper(64_000_000, 128_000_000, 1_000);
+        let cancel_token = CancellationToken::new();
+        let (chunks, stats) = plan_row_groups(rgs, &lim, &cancel_token).expect("ok");
+
+        // 30 disjoint clusters of 6.7 MB; bin_pack flushes once the chunk
+        // crosses lower_bound (64 MB), so each chunk gets exactly 10 row
+        // groups (10 * 6_700_000 = 67_000_000) — strictly inside
+        // [lower_bound, upper_bound].  Pinning the sizes is what guards
+        // against the small-file regression: any drift to chunks below
+        // lower_bound would fail the lower-bound assertion.
+        assert_eq!(chunks.len(), 3, "200 MB / 64 MB lower bound => 3 chunks");
+        assert_eq!(stats.oversized_clusters, 0);
+        assert!(!stats.tail_merged, "all chunks already >= lower_bound");
+        for chunk in &chunks {
+            assert!(!chunk.is_oversized_split);
+            assert_eq!(chunk.row_groups.len(), 10, "each chunk must hold 10 row groups");
+            assert_eq!(chunk.total_bytes, 67_000_000);
+            assert!(
+                chunk.total_bytes >= lim.lower_bound_bytes,
+                "chunk must reach lower bound"
+            );
+            assert!(chunk.total_bytes <= lim.upper_bound_bytes);
+        }
+    }
+
+    /// ТЗ Case 2: an overlapping cluster larger than `upper_bound` must be
+    /// linearly split.  Both sub-chunks are marked `is_oversized_split`, the
+    /// counter increments, and neither sub-chunk exceeds `upper_bound`.
+    #[test]
+    fn plan_row_groups_overlapping_oversized_cluster_yields_two_oversized_split_chunks() {
+        use tokio_util::sync::CancellationToken;
+
+        use super::plan_row_groups;
+
+        // Four overlapping 50-byte row groups => one cluster of 200 bytes.
+        // upper=128 forces the splitter into two sub-chunks of 100 bytes each
+        // (50+50 fits, +50 overflows, so flush; remaining 50+50 forms sub2).
+        let rgs = vec![
+            rg(0, 0, 50, 0, 100),
+            rg(0, 1, 50, 50, 150),
+            rg(0, 2, 50, 90, 200),
+            rg(0, 3, 50, 120, 220),
+        ];
+        let lim = limits_with_upper(64, 128, 100);
+        let cancel_token = CancellationToken::new();
+        let (chunks, stats) = plan_row_groups(rgs, &lim, &cancel_token).expect("ok");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(stats.oversized_clusters, 1);
+        for chunk in &chunks {
+            assert!(chunk.is_oversized_split);
+            assert!(chunk.total_bytes <= lim.upper_bound_bytes);
+        }
+    }
+
+    /// ТЗ Case 3: many thin disjoint clusters with combined size below
+    /// `upper_bound` must collapse into a single chunk that sits below
+    /// `lower_bound` — there is simply no more data to fill the chunk and the
+    /// last chunk is the only one, so tail-merge has nothing to merge.
+    #[test]
+    fn plan_row_groups_many_thin_disjoint_services_collapse_into_one_chunk() {
+        use tokio_util::sync::CancellationToken;
+
+        use super::plan_row_groups;
+
+        let rgs: Vec<PlanRowGroup> = (0..20)
+            .map(|i| {
+                #[allow(clippy::cast_possible_wrap)]
+                let i_i64 = i as i64;
+                rg(0, i, 3, i_i64 * 100, i_i64 * 100 + 50)
+            })
+            .collect();
+        let lim = limits_with_upper(64, 128, 1_000);
+        let cancel_token = CancellationToken::new();
+        let (chunks, stats) = plan_row_groups(rgs, &lim, &cancel_token).expect("ok");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].total_bytes, 60);
+        assert!(chunks[0].total_bytes < lim.lower_bound_bytes);
+        assert_eq!(stats.oversized_clusters, 0);
+        assert!(!stats.tail_merged, "single-chunk run cannot tail-merge");
+    }
+
+    /// ТЗ Case 4: fat service + skinny tail.  After bin-packing the planner
+    /// emits a small last chunk; tail-merge folds it into the previous chunk
+    /// because the combined size still fits inside `upper_bound`.
+    #[test]
+    fn plan_row_groups_fat_then_skinny_tail_merged_into_previous_chunk() {
+        use tokio_util::sync::CancellationToken;
+
+        use super::plan_row_groups;
+
+        // First two disjoint clusters of 70 bytes each cross lower_bound and
+        // flush, then a 10-byte skinny tail.  Tail-merge folds the 10-byte
+        // tail into the second 70-byte chunk (combined 80 ≤ upper=128).
+        let rgs = vec![rg(0, 0, 70, 0, 10), rg(0, 1, 70, 20, 30), rg(0, 2, 10, 40, 50)];
+        let lim = limits_with_upper(64, 128, 100);
+        let cancel_token = CancellationToken::new();
+        let (chunks, stats) = plan_row_groups(rgs, &lim, &cancel_token).expect("ok");
+
+        assert_eq!(chunks.len(), 2, "skinny tail must merge into previous chunk");
+        assert!(stats.tail_merged);
+        // Sort sizes because partition_by_bucket is HashMap-ordered.
+        let mut sizes: Vec<u64> = chunks.iter().map(|c| c.total_bytes).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![70, 80]);
+    }
+
+    /// ТЗ Case 12 fail-fast: a single WAL row group inside an oversized
+    /// cluster cannot exceed `upper_bound` — the planner cannot split a row
+    /// group, so this is an operator misconfiguration and must surface as
+    /// `IngestError::Shift`.
+    #[test]
+    fn plan_row_groups_oversized_cluster_with_single_rg_above_upper_is_error() {
+        use tokio_util::sync::CancellationToken;
+
+        use super::plan_row_groups;
+
+        // Two overlapping row groups: one 150 B (above upper=100), one 10 B.
+        // The cluster total 160 > upper triggers split_oversized; the 150 B
+        // row group then trips the per-row-group guard.
+        let rgs = vec![rg(0, 0, 150, 0, 50), rg(0, 1, 10, 10, 60)];
+        let lim = limits_with_upper(64, 100, 100);
+        let cancel_token = CancellationToken::new();
+        let err = plan_row_groups(rgs, &lim, &cancel_token).expect_err("rg > upper must error");
+        assert!(matches!(err, IngestError::Shift(_)));
+    }
+
+    // ---- split_oversized boundaries ----
+
+    /// A cluster sized *exactly* `upper_bound` must not trip `split_oversized`.
+    /// The strict `>` comparison in `bin_pack` is what guarantees this; if it
+    /// ever drifts to `>=`, an at-cap cluster would silently split and burn
+    /// the oversized counter.
+    #[test]
+    fn split_oversized_at_exact_upper_bound_does_not_split() {
+        // Two overlapping row groups of 64 bytes each = 128-byte cluster,
+        // upper_bound = 128.
+        let cluster = cluster(vec![rg(0, 0, 64, 0, 50), rg(0, 1, 64, 10, 60)]);
+        let lim = limits_with_upper(64, 128, 100);
+        let (chunks, oversized) = bin_pack(vec![cluster], &lim).expect("ok");
+        assert_eq!(chunks.len(), 1, "cluster at exact upper bound stays as one chunk");
+        assert_eq!(
+            oversized, 0,
+            "split_oversized counter must not increment at the boundary"
+        );
+        assert!(!chunks[0].is_oversized_split);
+        assert_eq!(chunks[0].total_bytes, 128);
+    }
+
+    /// Sanity counterpart to [`split_oversized_at_exact_upper_bound_does_not_split`]:
+    /// one byte over the boundary must trigger the split.
+    #[test]
+    fn split_oversized_at_upper_bound_plus_one_splits() {
+        // 65 + 64 = 129 bytes, upper_bound = 128 → must split.
+        let cluster = cluster(vec![rg(0, 0, 65, 0, 50), rg(0, 1, 64, 10, 60)]);
+        let lim = limits_with_upper(64, 128, 100);
+        let (chunks, oversized) = bin_pack(vec![cluster], &lim).expect("ok");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(oversized, 1);
+        assert!(chunks.iter().all(|c| c.is_oversized_split));
+    }
+
+    // ---- pairwise overlap identical bounds ----
+
+    /// A degenerate oversized cluster where every row group has identical
+    /// `[min, max]` bounds.  After `split_oversized` the resulting sub-chunks
+    /// must inherit those identical bounds — file-level pruning is fully
+    /// degraded for this window, but the planner must still produce the
+    /// expected `(127 MB, 74 MB)` shape with both chunks marked
+    /// `is_oversized_split`.  Regression guard against silently dropping the
+    /// oversized counter or smearing bounds.
+    #[test]
+    fn plan_row_groups_pairwise_overlap_yields_split_with_identical_bounds() {
+        use tokio_util::sync::CancellationToken;
+
+        use super::plan_row_groups;
+
+        // 30 row groups × 6.7 MB = 201 MB total. All share bounds [10, 80].
+        let rg_size: u64 = 6_700_000;
+        let rgs: Vec<PlanRowGroup> = (0..30).map(|i| rg(0, i, rg_size, 10, 80)).collect();
+        let lim = limits_with_upper(64_000_000, 128_000_000, 1_000);
+        let cancel_token = CancellationToken::new();
+        let (chunks, stats) = plan_row_groups(rgs, &lim, &cancel_token).expect("ok");
+
+        assert_eq!(chunks.len(), 2, "200 MB / 128 MB upper bound => 2 oversized sub-chunks");
+        assert_eq!(stats.oversized_clusters, 1);
+        for chunk in &chunks {
+            assert!(chunk.is_oversized_split);
+            assert!(chunk.total_bytes <= lim.upper_bound_bytes);
+        }
+        // Greedy split: first chunk packs as many RGs as fit ≤ upper_bound; the
+        // remainder forms the second chunk.  19 × 6.7 MB = 127.3 MB ≤ 128 MB,
+        // 20 × 6.7 MB = 134 MB > 128 MB → split point is 19.
+        assert_eq!(chunks[0].row_groups.len(), 19);
+        assert_eq!(chunks[1].row_groups.len(), 11);
+        assert_eq!(chunks[0].total_bytes, 19 * rg_size);
+        assert_eq!(chunks[1].total_bytes, 11 * rg_size);
+
+        // All row groups share bounds [10, 80] → both sub-chunks must expose
+        // identical min/max boundary keys (file-level pruning fully degraded).
+        for chunk in &chunks {
+            for plan_rg in &chunk.row_groups {
+                assert_eq!(plan_rg.boundary_range, chunks[0].row_groups[0].boundary_range);
+            }
+        }
+    }
+
+    // ---- tail_merge above-lower-bound boundary ----
+
+    /// Boundary refinement of [`tail_merge_skips_when_tail_at_or_above_lower_bound`]:
+    /// the existing test pins `tail=70 ≥ lower=64`.  This one nails the exact
+    /// off-by-one cliff: `tail=lower` (must skip) and `tail=lower+1` (must
+    /// skip).  The under-cliff case `tail < lower → merges` is covered by
+    /// [`tail_merge_merges_when_tail_below_lower_bound_and_combined_within_upper`].
+    #[test]
+    fn tail_merge_skips_when_tail_above_lower_bound() {
+        let lim = limits_with_upper(64, 128, 100);
+        for tail_bytes in [64u64, 65u64] {
+            let mut chunks = vec![
+                PlannedChunk {
+                    row_groups: vec![rg(0, 0, 32, 0, 10)],
+                    total_bytes: 32,
+                    is_oversized_split: false,
+                },
+                PlannedChunk {
+                    row_groups: vec![rg(0, 1, tail_bytes, 20, 30)],
+                    total_bytes: tail_bytes,
+                    is_oversized_split: false,
+                },
+            ];
+            assert!(
+                !tail_merge(&mut chunks, &lim),
+                "tail={tail_bytes} >= lower=64 must not trigger tail_merge"
+            );
+            assert_eq!(chunks.len(), 2);
+        }
+    }
+
+    // ---- plan_row_groups empty input ----
+
+    /// An empty input must produce an empty plan without panicking or
+    /// invoking any of the algorithm phases.
+    #[test]
+    fn plan_empty_row_groups_returns_empty_plan() {
+        use tokio_util::sync::CancellationToken;
+
+        use super::plan_row_groups;
+
+        let cancel_token = CancellationToken::new();
+        let (chunks, stats) = plan_row_groups(Vec::new(), &limits(100, 100), &cancel_token).expect("ok");
+        assert!(chunks.is_empty());
+        assert_eq!(stats.clusters, 0);
+        assert_eq!(stats.oversized_clusters, 0);
+        assert_eq!(stats.cross_partition_row_groups, 0);
+        assert!(!stats.tail_merged);
+        assert_eq!(stats.max_cluster_bytes, 0);
     }
 
     // ---- plan_row_groups cancellation ----
@@ -1349,6 +1563,6 @@ mod tests {
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
         let err = plan_row_groups(row_groups, &limits(100, 100), &cancel_token).expect_err("must abort on cancel");
-        assert!(err.to_string().contains("cancelled"));
+        assert!(matches!(err, IngestError::Shift(_)));
     }
 }

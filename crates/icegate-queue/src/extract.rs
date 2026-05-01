@@ -331,3 +331,199 @@ struct RowGroupMetadataEntry {
     row_group_idx: usize,
     payload: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{ArrayRef, Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    use bytes::Bytes;
+    use parquet::{
+        arrow::ArrowWriter,
+        file::{
+            metadata::{KeyValue, ParquetMetaData},
+            properties::{EnabledStatistics, WriterProperties},
+            reader::FileReader,
+            serialized_reader::SerializedFileReader,
+        },
+    };
+
+    use super::{ExtractField, FieldExtractor, ResolvedField};
+    use crate::error::QueueError;
+
+    /// Build a parquet payload from one batch per row group, optionally
+    /// embedding file-level key/value metadata. Each `flush()` between batches
+    /// closes the current row group, so `batches.len()` row groups end up in
+    /// the footer.
+    fn build_parquet(batches: Vec<RecordBatch>, kv_metadata: Vec<(String, String)>) -> Bytes {
+        assert!(!batches.is_empty(), "test parquet must contain at least one batch");
+        let schema = batches[0].schema();
+        let kv = kv_metadata
+            .into_iter()
+            .map(|(key, value)| KeyValue {
+                key,
+                value: Some(value),
+            })
+            .collect::<Vec<_>>();
+        let mut builder = WriterProperties::builder().set_statistics_enabled(EnabledStatistics::Chunk);
+        if !kv.is_empty() {
+            builder = builder.set_key_value_metadata(Some(kv));
+        }
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(builder.build())).expect("arrow writer");
+            for batch in batches {
+                writer.write(&batch).expect("write batch");
+                writer.flush().expect("flush row group");
+            }
+            writer.close().expect("close writer");
+        }
+        Bytes::from(buf)
+    }
+
+    fn parse_metadata(bytes: &Bytes) -> ParquetMetaData {
+        let reader = SerializedFileReader::new(bytes.clone()).expect("serialized reader");
+        reader.metadata().clone()
+    }
+
+    /// Single-column UTF-8 batch with the given values; used to populate
+    /// column statistics for `ColumnStatsUtf8Singleton` tests.
+    fn utf8_batch(column_name: &str, values: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(column_name, DataType::Utf8, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values)) as ArrayRef]).expect("utf8 batch")
+    }
+
+    /// Single-column INT64 batch; used to fail the timestamp-range extractor's
+    /// physical-type guard by handing it INT64 stats under a non-timestamp
+    /// schema and then retargeting the extractor at it.
+    fn int64_batch(column_name: &str, values: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(column_name, DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef]).expect("int64 batch")
+    }
+
+    fn utf8_singleton_field(plan_field: &str, column_name: &str) -> ExtractField {
+        ExtractField {
+            name: plan_field.to_string(),
+            extractor: FieldExtractor::ColumnStatsUtf8Singleton {
+                column_name: column_name.to_string(),
+            },
+        }
+    }
+
+    fn timestamp_range_field(plan_field: &str, column_name: &str) -> ExtractField {
+        ExtractField {
+            name: plan_field.to_string(),
+            extractor: FieldExtractor::ColumnStatsTimestampMicrosRange {
+                column_name: column_name.to_string(),
+            },
+        }
+    }
+
+    fn payload_field(plan_field: &str, key: &str) -> ExtractField {
+        ExtractField {
+            name: plan_field.to_string(),
+            extractor: FieldExtractor::FileKeyValueRowGroupPayload { key: key.to_string() },
+        }
+    }
+
+    fn assert_metadata_error<T>(result: Result<T, QueueError>) {
+        match result {
+            Err(QueueError::Metadata(_)) => {}
+            Err(other) => panic!("expected QueueError::Metadata, got {other:?}"),
+            Ok(_) => panic!("expected metadata error, got Ok"),
+        }
+    }
+
+    /// `ColumnStatsUtf8Singleton::resolve` must error when the requested
+    /// column does not exist in the parquet schema. Single line of defense
+    /// against the planner silently mapping the wrong column to a partition
+    /// value.
+    #[test]
+    fn column_stats_utf8_singleton_missing_column_errors() {
+        let bytes = build_parquet(vec![utf8_batch("present", vec![Some("a"), Some("a")])], Vec::new());
+        let meta = parse_metadata(&bytes);
+        let field = utf8_singleton_field("plan", "absent");
+
+        assert_metadata_error(ResolvedField::resolve(&field, &meta, 7).map(|_| ()));
+    }
+
+    /// All-null UTF-8 column produces row-group statistics with no min/max,
+    /// so the singleton extractor must surface a metadata error rather than
+    /// returning a default-empty value.
+    #[test]
+    fn column_stats_utf8_singleton_null_value_errors() {
+        let bytes = build_parquet(vec![utf8_batch("tenant_id", vec![None, None])], Vec::new());
+        let meta = parse_metadata(&bytes);
+        let field = utf8_singleton_field("plan", "tenant_id");
+        let resolved = ResolvedField::resolve(&field, &meta, 7).expect("resolve ok");
+        let row_group = meta.row_group(0);
+
+        assert_metadata_error(resolved.extract(row_group, 0, 7).map(|_| ()));
+    }
+
+    /// `ColumnStatsTimestampMicrosRange` requires INT64 statistics. A UTF-8
+    /// column targeted by the same extractor must fail the physical-type
+    /// guard rather than fall back to a permissive `None`.
+    #[test]
+    fn column_stats_timestamp_range_wrong_type_errors() {
+        // Parquet whose only column is a UTF-8 string column named
+        // "timestamp"; pointing the timestamp extractor at it triggers the
+        // INT64-only guard.
+        let bytes = build_parquet(
+            vec![utf8_batch("timestamp", vec![Some("not-a-number"), Some("either")])],
+            Vec::new(),
+        );
+        let meta = parse_metadata(&bytes);
+        let field = timestamp_range_field("plan", "timestamp");
+        let resolved = ResolvedField::resolve(&field, &meta, 7).expect("resolve ok");
+        let row_group = meta.row_group(0);
+
+        assert_metadata_error(resolved.extract(row_group, 0, 7).map(|_| ()));
+    }
+
+    /// Malformed JSON in the file-level key/value payload must surface as a
+    /// metadata error during `resolve` — the planner cannot recover from a
+    /// corrupted boundary payload, and silent loss of the field would
+    /// degrade downstream clustering invisibly.
+    #[test]
+    fn file_kv_payload_malformed_json_errors() {
+        let bytes = build_parquet(
+            vec![int64_batch("dummy", vec![1])],
+            vec![("boundary".to_string(), "{not json".to_string())],
+        );
+        let meta = parse_metadata(&bytes);
+        let field = payload_field("plan", "boundary");
+
+        assert_metadata_error(ResolvedField::resolve(&field, &meta, 7).map(|_| ()));
+    }
+
+    /// Two key/value entries pointing at the same `row_group_idx` must error
+    /// — the WAL writer never produces duplicates, so a duplicate signals
+    /// corruption that we refuse to silently dedup.
+    #[test]
+    fn file_kv_payload_multiple_row_groups_errors() {
+        let entries = serde_json::to_string(&[
+            super::RowGroupMetadataEntry {
+                row_group_idx: 0,
+                payload: "first".to_string(),
+            },
+            super::RowGroupMetadataEntry {
+                row_group_idx: 0,
+                payload: "second".to_string(),
+            },
+        ])
+        .expect("serialize entries");
+        let bytes = build_parquet(
+            vec![int64_batch("dummy", vec![1])],
+            vec![("boundary".to_string(), entries)],
+        );
+        let meta = parse_metadata(&bytes);
+        let field = payload_field("plan", "boundary");
+
+        assert_metadata_error(ResolvedField::resolve(&field, &meta, 7).map(|_| ()));
+    }
+}

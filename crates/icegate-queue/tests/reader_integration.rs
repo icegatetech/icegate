@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use futures::{TryStreamExt, stream::BoxStream};
 use icegate_queue::{
     ExtractField, ExtractedValue, FieldExtractor, ParquetQueueReader, QueueConfig, QueueWriter, SegmentsPlan,
-    WriteRequest, channel,
+    WAL_ROW_GROUP_METADATA_KEY, WriteRequest, channel,
 };
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
@@ -1041,6 +1041,135 @@ async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_with
         elapsed < Duration::from_millis(800),
         "planning must fail-fast on non-first segment error without waiting for offset 0, elapsed={elapsed:?}"
     );
+
+    Ok(())
+}
+
+/// End-to-end contract for the generic field-extraction API exercised by the
+/// shift planner: one `plan_segments` call must populate three independent
+/// extractor results — UTF-8 singleton column stat, micros timestamp range
+/// column stat, and a file-key-value payload — for every row group, indexed
+/// per `row_group_idx`.
+///
+/// Two row groups with intentionally different account / timestamp range /
+/// boundary payloads guard against the highest-risk regression in
+/// [`FieldExtractor::FileKeyValueRowGroupPayload`]: returning row group 0's
+/// payload for every index, dropping later payloads, or mis-aligning column
+/// stats across row groups.
+#[tokio::test]
+async fn test_plan_segments_extracts_all_three_field_types() -> Result<(), Box<dyn std::error::Error>> {
+    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+
+    let config = QueueConfig::new("queue").with_flush_interval_ms(50);
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, store.clone());
+    let handle = writer.start(rx);
+
+    // Two row groups with disjoint account / timestamp / boundary — the
+    // assertions below pin every extractor result to the *correct*
+    // row_group_idx, so any payload-index mismatch surfaces.
+    let batch_a = common::logs_batch(&[
+        (Some("acc-1"), Some("svc-a"), Some(100), 1),
+        (Some("acc-1"), Some("svc-a"), Some(400), 2),
+    ]);
+    let batch_b = common::logs_batch(&[
+        (Some("acc-2"), Some("svc-b"), Some(900), 3),
+        (Some("acc-2"), Some("svc-b"), Some(1_500), 4),
+    ]);
+    let expected_boundary_a = common::logs_row_group_boundary_range(&batch_a);
+    let expected_boundary_b = common::logs_row_group_boundary_range(&batch_b);
+
+    let (response_tx, response_rx) = oneshot::channel();
+    tx.send(WriteRequest {
+        topic: "logs".to_string(),
+        row_groups: common::prepared_logs_row_groups(vec![batch_a, batch_b]),
+        response_tx,
+        trace_context: None,
+    })
+    .await
+    .unwrap();
+    let result = response_rx.await.unwrap();
+    assert!(result.is_success());
+
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let cancel = CancellationToken::new();
+    let plan = reader
+        .plan_segments(
+            &"logs".to_string(),
+            0,
+            &[
+                ExtractField {
+                    name: "account".to_string(),
+                    extractor: FieldExtractor::ColumnStatsUtf8Singleton {
+                        column_name: "cloud_account_id".to_string(),
+                    },
+                },
+                ExtractField {
+                    name: "timestamp_range".to_string(),
+                    extractor: FieldExtractor::ColumnStatsTimestampMicrosRange {
+                        column_name: "timestamp".to_string(),
+                    },
+                },
+                ExtractField {
+                    name: "boundary".to_string(),
+                    extractor: FieldExtractor::FileKeyValueRowGroupPayload {
+                        key: WAL_ROW_GROUP_METADATA_KEY.to_string(),
+                    },
+                },
+            ],
+            &cancel,
+        )
+        .await?;
+
+    assert_eq!(plan.entries.len(), 2, "two batches => two row groups");
+
+    // Index entries by row_group_idx so any reordering is visible.
+    let by_idx: HashMap<usize, &icegate_queue::RowGroupPlanEntry> =
+        plan.entries.iter().map(|e| (e.row_group_idx, e)).collect();
+    assert_eq!(by_idx.len(), 2, "row_group_idx must be unique across entries");
+
+    let assert_extracted = |idx: usize,
+                            expected_account: &str,
+                            expected_range: (i64, i64),
+                            expected_boundary: &common::RowGroupBoundaryRange| {
+        let entry = by_idx.get(&idx).expect("row_group_idx must be present");
+        let account = entry
+            .extracted
+            .get("account")
+            .expect("account extractor must populate")
+            .as_utf8()
+            .expect("account must be utf8");
+        assert_eq!(account, expected_account, "account mismatch at row_group_idx={idx}");
+
+        let timestamp_range = entry
+            .extracted
+            .get("timestamp_range")
+            .expect("timestamp_range extractor must populate");
+        let &ExtractedValue::TimestampMicrosRange(min_ts, max_ts) = timestamp_range else {
+            panic!("timestamp_range must be TimestampMicrosRange at row_group_idx={idx}");
+        };
+        assert_eq!(
+            (min_ts, max_ts),
+            expected_range,
+            "timestamp range mismatch at row_group_idx={idx}"
+        );
+
+        let boundary_payload = entry
+            .extracted
+            .get("boundary")
+            .expect("boundary extractor must populate")
+            .as_utf8()
+            .expect("boundary payload must be utf8");
+        let parsed: common::RowGroupBoundaryRange = serde_json::from_str(boundary_payload)
+            .unwrap_or_else(|err| panic!("boundary payload must parse at row_group_idx={idx}: {err}"));
+        assert_eq!(&parsed, expected_boundary, "boundary mismatch at row_group_idx={idx}");
+    };
+
+    assert_extracted(0, "acc-1", (100, 400), &expected_boundary_a);
+    assert_extracted(1, "acc-2", (900, 1_500), &expected_boundary_b);
 
     Ok(())
 }

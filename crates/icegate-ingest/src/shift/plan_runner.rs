@@ -10,7 +10,7 @@ use uuid::Uuid;
 #[cfg(test)]
 pub(super) use super::planner::PLAN_FIELD_BOUNDARY_RANGE;
 #[cfg(test)]
-pub(super) use super::planner_partitioning::PLAN_FIELD_TENANT_ID;
+pub(super) use super::planner_partitioning::{PLAN_FIELD_TENANT_ID, PLAN_FIELD_TIMESTAMP_RANGE};
 use super::{
     SHIFT_TASK_CODE, SegmentToRead, ShiftConfig, ShiftInput,
     executor::TaskStatus,
@@ -256,12 +256,7 @@ where
 
         let plan = self
             .queue_reader
-            .plan_segments(
-                &self.topic,
-                start_offset,
-                &self.extract_fields,
-                cancel_token,
-            )
+            .plan_segments(&self.topic, start_offset, &self.extract_fields, cancel_token)
             .await
             .map_err(|e| Error::TaskExecution(format!("failed to plan segment record batches: {e}")))?;
 
@@ -335,7 +330,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use super::{PLAN_FIELD_BOUNDARY_RANGE, PLAN_FIELD_TENANT_ID, PlanTaskRunnerImpl};
+    use super::{PLAN_FIELD_BOUNDARY_RANGE, PLAN_FIELD_TENANT_ID, PLAN_FIELD_TIMESTAMP_RANGE, PlanTaskRunnerImpl};
     use crate::{
         error::Result as IngestResult,
         shift::{
@@ -355,6 +350,24 @@ mod tests {
         row_group_bytes: u64,
         boundary_payload: Option<String>,
     ) -> icegate_queue::RowGroupPlanEntry {
+        plan_entry_with_ts(
+            partition_value,
+            wal_offset,
+            row_group_idx,
+            row_group_bytes,
+            boundary_payload,
+            Some((1, 2)),
+        )
+    }
+
+    fn plan_entry_with_ts(
+        partition_value: Option<&str>,
+        wal_offset: u64,
+        row_group_idx: usize,
+        row_group_bytes: u64,
+        boundary_payload: Option<String>,
+        timestamp_range: Option<(i64, i64)>,
+    ) -> icegate_queue::RowGroupPlanEntry {
         let mut extracted = HashMap::new();
         if let Some(value) = partition_value {
             extracted.insert(
@@ -364,6 +377,12 @@ mod tests {
         }
         if let Some(p) = boundary_payload {
             extracted.insert(PLAN_FIELD_BOUNDARY_RANGE.to_string(), ExtractedValue::Utf8(p));
+        }
+        if let Some((min_ts, max_ts)) = timestamp_range {
+            extracted.insert(
+                PLAN_FIELD_TIMESTAMP_RANGE.to_string(),
+                ExtractedValue::TimestampMicrosRange(min_ts, max_ts),
+            );
         }
         icegate_queue::RowGroupPlanEntry {
             wal_offset,
@@ -571,6 +590,41 @@ mod tests {
         assert!(manager.task_ids.lock().expect("task ids lock").is_empty());
     }
 
+    /// An empty `tenant_id` extracted from a WAL row group must fail the plan
+    /// task end-to-end before any shift task is scheduled. The underlying
+    /// invariant lives in `plan_entries_to_row_groups`; this guard catches
+    /// regressions where the runner could swallow the error or partially
+    /// submit work before the validator runs.
+    #[tokio::test]
+    async fn schedule_shift_tasks_fails_fast_on_empty_tenant_id() {
+        let runner = test_runner(FakeQueueReader);
+        let manager = RecordingManager::new();
+        // Two entries: first valid, second with empty tenant_id. The plan must
+        // surface the error and submit zero shift tasks even though the first
+        // row group on its own would have been schedulable.
+        let payload = point_boundary_payload("acc-1", "svc-1", 10);
+        let plan = icegate_queue::SegmentsPlan {
+            entries: vec![
+                plan_entry(Some("tenant-a"), 7, 0, 1, Some(payload.clone())),
+                plan_entry(Some(""), 7, 1, 1, Some(payload)),
+            ],
+            last_segment_offset: Some(7),
+            segments_count: 1,
+            row_groups_total: 2,
+            input_bytes_total: 2,
+        };
+
+        let err = runner
+            .schedule_shift_tasks(&manager, plan, &CancellationToken::new())
+            .expect_err("empty tenant_id must abort plan task");
+
+        assert!(err.to_string().contains("tenant_id"));
+        assert!(
+            manager.task_ids.lock().expect("task ids lock").is_empty(),
+            "no shift task may be submitted when validation fails"
+        );
+    }
+
     #[tokio::test]
     async fn schedule_shift_tasks_rejects_placeholder_boundary_metadata() {
         let runner = test_runner(FakeQueueReader);
@@ -743,12 +797,13 @@ mod tests {
             for idx in 0..10 {
                 let min_ts: i64 = i64::from(svc) * 1_000 + i64::from(idx) * 10;
                 let max_ts: i64 = min_ts + 9;
-                entries.push(plan_entry(
+                entries.push(plan_entry_with_ts(
                     Some("tenant-a"),
                     1,
                     usize::try_from(svc * 10 + idx).expect("idx"),
                     1024 * 1024,
                     Some(timestamp_boundary("acc-1", &service, min_ts, max_ts)),
+                    Some((min_ts, max_ts)),
                 ));
             }
         }
