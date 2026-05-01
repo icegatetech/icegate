@@ -6,8 +6,6 @@ use iceberg::spec::TableMetadata;
 use crate::error::Result;
 use crate::model::CatalogRoot;
 
-#[cfg(test)]
-pub(crate) mod in_memory;
 pub(crate) mod s3;
 
 /// Opaque version token for compare-and-swap operations.
