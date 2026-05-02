@@ -112,6 +112,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - **MUST** write unit tests for all new functions and types
 - **MUST** mock external dependencies (APIs, databases, file systems)
 - **MUST** use the built-in `#[test]` attribute and `cargo test`
+- **NEVER** create methods in a structure just for tests (`#[cfg(test)]`).
 - Follow the Arrange-Act-Assert pattern
 - Do not commit commented-out tests
 - Use `#[cfg(test)]` modules for test code

@@ -19,6 +19,7 @@ testing = ["testcontainers", "aws-config", "aws-sdk-s3"]
 [dependencies]
 # Iceberg
 iceberg = { workspace = true }
+icegate-catalog-s3 = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-catalog-s3tables = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
