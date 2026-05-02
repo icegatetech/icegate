@@ -39,7 +39,7 @@ pub async fn run(
         metrics,
     };
 
-    let app = super::routes::routes(state);
+    let app = super::routes::routes(state, config.max_body_bytes);
 
     tracing::info!("OTLP HTTP server listening on {}", addr);
 

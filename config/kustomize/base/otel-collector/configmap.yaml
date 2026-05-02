@@ -81,9 +81,24 @@ data:
               - output: parse-json-body
                 expr: 'body matches "^\\{"'
           # Parse JSON body from Rust tracing-subscriber fmt().json()
-          # Format: {"timestamp":"...","level":"INFO","fields":{"message":"..."},"target":"...","span":{...}}
+          # Format: {"timestamp":"...","level":"INFO","fields":{"message":"..."},"target":"...","span":{...},"trace_id":"...","span_id":"..."}
+          # The embedded `trace:` block lifts the optional `trace_id`
+          # / `span_id` JSON fields (emitted by
+          # `icegate_common::tracing::TraceContextJsonFormatter` when
+          # an OTel SpanContext is active on the current span)
+          # straight into the OTLP log record's dedicated trace
+          # context fields. Logs outside a span lack the keys; the
+          # operator silently leaves the OTLP fields unset in that
+          # case, completing the trace ↔ logs correlation Grafana
+          # consumes via `tracesToLogsV2` and `derivedFields` on the
+          # demo datasources.
           - type: json_parser
             id: parse-json-body
+            trace:
+              trace_id:
+                parse_from: attributes.trace_id
+              span_id:
+                parse_from: attributes.span_id
             output: set-severity
           # Map level field to OTEL severity
           - type: severity_parser

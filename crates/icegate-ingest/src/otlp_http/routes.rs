@@ -2,6 +2,7 @@
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use tower_http::decompression::RequestDecompressionLayer;
@@ -14,7 +15,12 @@ use super::{handlers, server::OtlpHttpState};
 /// request bodies when a `Content-Encoding` header is present (gzip, zstd).
 /// This matches the `OpenTelemetry` Collector's default behaviour of sending
 /// gzip-compressed payloads.
-pub fn routes(state: OtlpHttpState) -> Router {
+///
+/// `max_body_bytes` caps the size of the decompressed request body. Requests larger than
+/// this limit are rejected with HTTP 413. Axum's framework default is 2 `MiB`, which is below
+/// realistic OTLP batch sizes; we raise it to a service-level value (see
+/// [`OtlpHttpConfig::max_body_bytes`](super::OtlpHttpConfig)).
+pub fn routes(state: OtlpHttpState, max_body_bytes: usize) -> Router {
     Router::new()
         // OTLP endpoints (support both protobuf and JSON)
         .route("/v1/logs", post(handlers::ingest_logs))
@@ -23,7 +29,10 @@ pub fn routes(state: OtlpHttpState) -> Router {
         // Health check
         .route("/health", get(handlers::health))
         // Decompress gzip / zstd request bodies (OTLP spec requirement).
+        // The body-limit layer is added after decompression so the cap applies to the
+        // *decompressed* payload size (the figure that drives parser memory usage).
         .layer(RequestDecompressionLayer::new())
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 
@@ -48,6 +57,10 @@ mod tests {
 
     use super::*;
     use crate::{infra::metrics::OtlpMetrics, otlp_http::server::OtlpHttpState};
+
+    /// Body limit used by tests that expect to *succeed*. Plenty of headroom for the small
+    /// fixtures built below.
+    const TEST_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
     fn test_state(write_channel: icegate_queue::WriteChannel) -> OtlpHttpState {
         OtlpHttpState {
@@ -128,7 +141,7 @@ mod tests {
         let writer = spawn_ack_writer(rx);
 
         let compressed = gzip_compress(&encode_protobuf());
-        let app = routes(test_state(tx));
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES);
         let request = Request::builder()
             .method("POST")
             .uri("/v1/logs")
@@ -152,7 +165,7 @@ mod tests {
         let writer = spawn_ack_writer(rx);
 
         let compressed = zstd_compress(&encode_protobuf());
-        let app = routes(test_state(tx));
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES);
         let request = Request::builder()
             .method("POST")
             .uri("/v1/logs")
@@ -177,7 +190,7 @@ mod tests {
 
         let json = serde_json::to_vec(&create_test_request()).expect("json encode");
         let compressed = gzip_compress(&json);
-        let app = routes(test_state(tx));
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES);
         let request = Request::builder()
             .method("POST")
             .uri("/v1/logs")
@@ -197,7 +210,7 @@ mod tests {
         let (tx, rx) = channel(1);
         let writer = spawn_ack_writer(rx);
 
-        let app = routes(test_state(tx));
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES);
         let request = Request::builder()
             .method("POST")
             .uri("/v1/logs")
@@ -209,5 +222,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         writer.await.expect("writer task");
+    }
+
+    /// Verifies that bodies exceeding `max_body_bytes` are rejected with HTTP 413.
+    /// This guards against regressions of the bug where the framework's 2 `MiB` default
+    /// silently dropped real OTLP batches.
+    #[tokio::test]
+    async fn rejects_payloads_exceeding_max_body_bytes() {
+        // 1 KiB cap; send a 2 KiB body — well under any realistic payload but above the cap.
+        const TINY_LIMIT_BYTES: usize = 1024;
+
+        // Channel intentionally sized with capacity but never read from: if the body
+        // limit fails open, the handler would attempt to write to it and the test would
+        // hang on `oneshot`, surfacing the regression.
+        let (tx, _rx) = channel(1);
+
+        let app = routes(test_state(tx), TINY_LIMIT_BYTES);
+        let oversized_body = vec![0_u8; TINY_LIMIT_BYTES * 2];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header(CONTENT_TYPE, "application/x-protobuf")
+            .body(Body::from(oversized_body))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

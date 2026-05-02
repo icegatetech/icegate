@@ -1,10 +1,12 @@
 //! Merged Iceberg + WAL table provider.
 //!
-//! `IcegateTableProvider` implements `TableProvider` and produces a
-//! `UnionExec` plan that reads from both Iceberg (committed data) and WAL
-//! (hot segments not yet committed). The offset boundary is determined by
-//! walking the Iceberg snapshot history for the `icegate.queue.offset`
-//! property.
+//! `IcegateTableProvider` implements `TableProvider` for any WAL-backed table
+//! (currently `logs` and `spans`) and produces a `UnionExec` plan that reads
+//! from both Iceberg (committed data) and WAL (hot segments not yet committed).
+//! The offset boundary is determined by walking the Iceberg snapshot history
+//! for the `icegate.queue.offset` property; the WAL topic to scan is supplied
+//! by the caller (the schema provider) so that each table's hot data is
+//! correctly scoped.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -40,6 +42,11 @@ use crate::engine::core::WAL_STORE_URL;
 pub(super) struct IcegateTableProvider {
     /// Table identifier in the catalog (namespace + name).
     table_ident: TableIdent,
+    /// WAL topic to scope segment listing to. By convention this matches the
+    /// Iceberg table name (`logs`, `spans`). Stored as `String` because the
+    /// underlying queue API expects `&Topic = &String`; the allocation
+    /// happens once per provider construction.
+    topic: String,
     /// Arrow schema for the table.
     schema: ArrowSchemaRef,
     /// Shared WAL queue reader for segment listing.
@@ -54,6 +61,7 @@ impl std::fmt::Debug for IcegateTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcegateTableProvider")
             .field("table_ident", &self.table_ident)
+            .field("topic", &self.topic)
             .finish_non_exhaustive()
     }
 }
@@ -69,10 +77,11 @@ impl IcegateTableProvider {
     ///
     /// Returns an error if the table cannot be loaded from the catalog or if
     /// the schema cannot be converted.
-    #[tracing::instrument(skip(catalog, wal_reader), fields(%table_ident))]
+    #[tracing::instrument(skip(catalog, wal_reader), fields(%table_ident, %topic))]
     pub(super) async fn try_new(
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
+        topic: &str,
         wal_reader: Arc<ParquetQueueReader>,
         wal_config: WalQueryConfig,
     ) -> Result<Self, iceberg::Error> {
@@ -83,6 +92,7 @@ impl IcegateTableProvider {
 
         Ok(Self {
             table_ident,
+            topic: topic.to_string(),
             schema,
             wal_reader,
             table,
@@ -285,10 +295,9 @@ impl IcegateTableProvider {
         // Intentionally uncancellable: WAL segment listing is a short metadata
         // operation during query planning that must run to completion.
         let uncancellable_token = CancellationToken::new();
-        let topic: String = icegate_common::LOGS_TOPIC.to_string();
         let segment_files = self
             .wal_reader
-            .list_segment_files(&topic, start_offset, &uncancellable_token)
+            .list_segment_files(&self.topic, start_offset, &uncancellable_token)
             .await
             .map_err(|e| DataFusionError::External(e.into()))?;
 

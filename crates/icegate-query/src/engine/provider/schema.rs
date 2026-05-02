@@ -1,7 +1,8 @@
 //! Custom schema provider for the IceGate namespace.
 //!
-//! Routes the "logs" table to [`IcegateTableProvider`] (merged Iceberg + WAL)
-//! while delegating other tables to standard `IcebergStaticTableProvider`.
+//! Routes WAL-backed tables (logs, spans) to [`IcegateTableProvider`] (merged
+//! Iceberg + WAL) while delegating other tables to the standard
+//! `IcebergStaticTableProvider`.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -19,8 +20,15 @@ use icegate_queue::ParquetQueueReader;
 use super::WalQueryConfig;
 use super::table::IcegateTableProvider;
 
-/// Schema provider that substitutes `IcegateTableProvider` for the "logs" table
-/// while using standard Iceberg providers for all other tables.
+/// Tables that have a corresponding WAL topic and therefore use the merged
+/// Iceberg + WAL provider. The slice value doubles as the WAL topic name —
+/// table name == topic name by convention. Tables not listed here (e.g.
+/// `events`, `metrics`) fall through to the standard Iceberg-only provider.
+const WAL_MERGED_TABLES: &[&str] = &[icegate_common::LOGS_TOPIC, icegate_common::SPANS_TOPIC];
+
+/// Schema provider that substitutes `IcegateTableProvider` for WAL-backed
+/// tables (logs, spans) while using standard Iceberg providers for all other
+/// tables.
 pub(super) struct IcegateSchemaProvider {
     /// All tables in the namespace, keyed by name.
     tables: HashMap<String, Arc<dyn TableProvider>>,
@@ -37,8 +45,9 @@ impl std::fmt::Debug for IcegateSchemaProvider {
 impl IcegateSchemaProvider {
     /// Creates a new schema provider for the given namespace.
     ///
-    /// For the "logs" table, creates an `IcegateTableProvider` that merges
-    /// Iceberg + WAL data. All other tables use `IcebergStaticTableProvider`.
+    /// Tables listed in [`WAL_MERGED_TABLES`] are wrapped in
+    /// [`IcegateTableProvider`] (merged Iceberg + WAL). All other tables use
+    /// `IcebergStaticTableProvider`.
     ///
     /// # Errors
     ///
@@ -62,17 +71,21 @@ impl IcegateSchemaProvider {
             let wal_reader = Arc::clone(&wal_reader);
             let wal_config = wal_config.clone();
             async move {
-                let provider: Arc<dyn TableProvider> = if name == icegate_common::LOGS_TOPIC {
-                    // Logs table: use our merged provider
-                    let table_ident = iceberg::TableIdent::new(namespace, name.clone());
-                    let provider = IcegateTableProvider::try_new(catalog, table_ident, wal_reader, wal_config).await?;
-                    Arc::new(provider)
-                } else {
-                    // Other tables: standard Iceberg static provider
-                    let table = catalog.load_table(ident).await?;
-                    let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
-                    Arc::new(provider)
-                };
+                // Look up the WAL topic in the allowlist; absence routes the
+                // table through the standard Iceberg-only provider.
+                let provider: Arc<dyn TableProvider> =
+                    if let Some(topic) = WAL_MERGED_TABLES.iter().copied().find(|t| *t == name) {
+                        // WAL-backed table: use our merged provider
+                        let table_ident = iceberg::TableIdent::new(namespace, name.clone());
+                        let provider =
+                            IcegateTableProvider::try_new(catalog, table_ident, topic, wal_reader, wal_config).await?;
+                        Arc::new(provider)
+                    } else {
+                        // Other tables: standard Iceberg static provider
+                        let table = catalog.load_table(ident).await?;
+                        let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
+                        Arc::new(provider)
+                    };
                 Ok::<_, iceberg::Error>((name, provider))
             }
         }))
@@ -101,5 +114,19 @@ impl SchemaProvider for IcegateSchemaProvider {
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         Ok(self.tables.get(name).cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WAL_MERGED_TABLES;
+
+    /// Guard against accidental drift in the WAL-merged table allowlist.
+    /// The dispatch in `IcegateSchemaProvider::try_new` keys off this slice;
+    /// removing an entry silently disables WAL merging for that table.
+    #[test]
+    fn wal_merged_tables_covers_logs_and_spans() {
+        assert!(WAL_MERGED_TABLES.contains(&icegate_common::LOGS_TOPIC));
+        assert!(WAL_MERGED_TABLES.contains(&icegate_common::SPANS_TOPIC));
     }
 }

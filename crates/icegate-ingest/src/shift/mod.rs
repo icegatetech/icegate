@@ -61,6 +61,14 @@ pub struct ShiftJobSpec {
     pub table: &'static str,
     /// Sort descriptor shared with the WAL sorter for this topic.
     pub descriptor: &'static SortColumnsDescriptor,
+    /// Columns that should get a Parquet bloom filter when written to
+    /// Iceberg. Use `&[]` to disable bloom filters for the table.
+    ///
+    /// Bloom filters cheaply skip whole row groups when an equality
+    /// predicate on a high-cardinality column does not match, which
+    /// is the access pattern for Tempo trace-by-id and any future
+    /// log-by-trace lookup.
+    pub bloom_filter_columns: &'static [&'static str],
 }
 
 /// Runs shift jobs inside the ingest process.
@@ -100,6 +108,7 @@ impl Shifter {
                 Arc::clone(&catalog),
                 spec.table,
                 shift_config.as_ref(),
+                spec.bloom_filter_columns,
             ));
             let plan_runner = Arc::new(PlanTaskRunnerImpl::new(
                 Arc::clone(&queue_reader),

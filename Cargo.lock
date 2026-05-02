@@ -3891,6 +3891,7 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "bytes",
+ "chrono",
  "dashmap",
  "foyer",
  "futures",
@@ -3912,6 +3913,7 @@ dependencies = [
  "prometheus",
  "rand 0.9.4",
  "serde",
+ "serde_json",
  "serde_yaml",
  "testcontainers",
  "thiserror 2.0.18",
@@ -3994,15 +3996,12 @@ dependencies = [
 name = "icegate-maintain"
 version = "0.1.0"
 dependencies = [
- "aws-config",
- "aws-sdk-s3",
  "clap",
  "iceberg",
  "icegate-common",
  "serde",
  "serde_yaml",
  "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -4025,6 +4024,7 @@ dependencies = [
  "datafusion",
  "datafusion-tracing",
  "futures",
+ "hex",
  "iceberg",
  "iceberg-datafusion",
  "icegate-common",
@@ -4032,8 +4032,10 @@ dependencies = [
  "itoa",
  "object_store",
  "opentelemetry",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "parquet",
+ "prost",
  "rand 0.9.4",
  "regex",
  "reqwest 0.13.2",
@@ -6695,15 +6697,6 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "url",
-]
-
-[[package]]
-name = "testcontainers-modules"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5985fde5befe4ffa77a052e035e16c2da86e8bae301baa9f9904ad3c494d357"
-dependencies = [
- "testcontainers",
 ]
 
 [[package]]

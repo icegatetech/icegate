@@ -184,7 +184,10 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// Based on the Span message from opentelemetry/proto/trace/v1/trace.proto.
 /// Includes nested events and links as List<Struct> types.
-/// Attributes are merged from resource, scope, and span-level attributes.
+/// Attributes are split into two top-level maps:
+/// - `resource_attributes` (Map<string, string>): OTLP resource attributes.
+/// - `span_attributes` (Map<string, string>): OTLP span attributes plus
+///   folded `InstrumentationScope.attributes`.
 ///
 /// # Nested Structures
 /// - events: `List<Struct>` - Span events (NO `trace_id`/`span_id`, inherits from parent)
@@ -282,11 +285,11 @@ pub fn spans_schema() -> Result<Schema> {
                 "status_message",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Attributes (merged from resource, scope, and span attributes).
+            // Resource-level attributes (OTLP `Resource.attributes`).
             // Map nested key/value consume IDs 17, 18.
             Arc::new(NestedField::required(
                 16,
-                "attributes",
+                "resource_attributes",
                 Type::Map(MapType::new(
                     Arc::new(NestedField::required(17, "key", Type::Primitive(PrimitiveType::String))),
                     Arc::new(NestedField::required(
@@ -398,6 +401,21 @@ pub fn spans_schema() -> Result<Schema> {
                     ])),
                     true,
                 )))),
+            )),
+            // Span-level attributes (OTLP `Span.attributes` plus folded
+            // `ScopeSpans.scope.attributes`). Parent + key + value consume
+            // IDs 41, 42, 43.
+            Arc::new(NestedField::required(
+                41,
+                "span_attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(42, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        43,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
             )),
         ])
         .build()?;
@@ -993,6 +1011,17 @@ pub const COL_TIMESTAMP: &str = "timestamp";
 pub const COL_BODY: &str = "body";
 /// Merged `MAP<String, String>` of resource/scope/log attributes.
 pub const COL_ATTRIBUTES: &str = "attributes";
+/// Spans table — resource-attribute MAP column.
+///
+/// Holds OTLP `Resource.attributes` after the 2026-04-19 split.
+/// Logs still use [`COL_ATTRIBUTES`] which is a single merged map.
+pub const COL_RESOURCE_ATTRIBUTES: &str = "resource_attributes";
+
+/// Spans table — span-attribute MAP column.
+///
+/// Holds OTLP `Span.attributes` plus folded `InstrumentationScope.attributes`
+/// after the 2026-04-19 split.
+pub const COL_SPAN_ATTRIBUTES: &str = "span_attributes";
 /// `OpenTelemetry` severity text (e.g. `"ERROR"`, `"INFO"`).
 pub const COL_SEVERITY_TEXT: &str = "severity_text";
 /// Service name extracted from resource attributes.
@@ -1003,6 +1032,24 @@ pub const COL_CLOUD_ACCOUNT_ID: &str = "cloud_account_id";
 pub const COL_TRACE_ID: &str = "trace_id";
 /// W3C Trace Context span identifier.
 pub const COL_SPAN_ID: &str = "span_id";
+/// Spans table — `parent_span_id` column (STRING).
+pub const COL_PARENT_SPAN_ID: &str = "parent_span_id";
+/// Spans table — `duration_micros` column (BIGINT).
+pub const COL_DURATION_MICROS: &str = "duration_micros";
+/// Spans table — `end_timestamp` column (TIMESTAMP).
+pub const COL_END_TIMESTAMP: &str = "end_timestamp";
+/// Spans table — `name` column (STRING).
+pub const COL_NAME: &str = "name";
+/// Spans table — `kind` column (INT, OTLP `SpanKind` enum).
+pub const COL_KIND: &str = "kind";
+/// Spans table — `status_code` column (INT, OTLP `Status.code` enum).
+pub const COL_STATUS_CODE: &str = "status_code";
+/// Spans table — `status_message` column (STRING).
+pub const COL_STATUS_MESSAGE: &str = "status_message";
+/// Spans table — `events` column (ARRAY of struct).
+pub const COL_EVENTS: &str = "events";
+/// Spans table — `links` column (ARRAY of struct).
+pub const COL_LINKS: &str = "links";
 /// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
 pub const LEVEL_ALIAS: &str = "level";
 
@@ -1028,6 +1075,72 @@ pub const LOG_INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &[
 /// Used by `/labels`, `/label_values` discovery, and `/series` endpoints.
 pub const LOG_SERIES_LABEL_COLUMNS: &[&str] = &[COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_SEVERITY_TEXT];
 
+// ── Span tag-discovery lists ─────────────────────────────────────────
+
+/// Indexed top-level columns on the `spans` table whose distinct values can
+/// be enumerated via the tag-values endpoint.
+///
+/// Combines low-cardinality columns (`cloud_account_id`, `service_name`,
+/// `name`) useful for label-style discovery with high-cardinality
+/// identifiers (`trace_id`, `span_id`, `parent_span_id`) that are useful
+/// as explicit filter values. Numeric-only columns (`duration_micros`,
+/// `kind`, `status_code`) are excluded — they are exposed separately as
+/// `TraceQL` intrinsics.
+pub const SPAN_INDEXED_ATTRIBUTE_COLUMNS: &[&str] = &[
+    COL_CLOUD_ACCOUNT_ID,
+    COL_SERVICE_NAME,
+    COL_NAME,
+    COL_TRACE_ID,
+    COL_SPAN_ID,
+    COL_PARENT_SPAN_ID,
+];
+
+/// `TraceQL` intrinsic tag names exposed on `/api/v2/search/tags` with
+/// `scope=intrinsic`.
+///
+/// These are not literal column names — they are the user-facing tag names
+/// Grafana expects. Internal mapping to underlying columns happens in the
+/// tempo metadata layer.
+///
+/// Both legacy bare names (`name`, `status`, `kind`, `duration`,
+/// `traceDuration`, `rootName`, `rootServiceName`) and the modern
+/// colon-prefixed forms (`span:name`, `trace:duration`, …) are surfaced
+/// side-by-side, mirroring Tempo's own `/api/v2/search/tags` response
+/// (see <https://grafana.com/docs/tempo/latest/api_docs/>). Older
+/// Grafana versions and `TraceQL` queries use the bare names; newer
+/// versions use the colon-prefixed forms.
+///
+/// `trace:id` / `span:id` (and the legacy `traceID` / `spanID`) are
+/// **deliberately omitted** — Tempo itself does not surface them in tag
+/// discovery because enumerating the distinct value set of a per-trace
+/// or per-span identifier is both useless (every value is unique) and
+/// expensive. They remain queryable in `TraceQL` via the parser; the
+/// `tempo::metadata::target_column_for_tag` mapping still resolves them
+/// for predicate pushdown.
+pub const TRACEQL_INTRINSIC_TAGS: &[&str] = &[
+    // Legacy bare names — kept for backward compat with older Grafana
+    // versions that have not adopted the colon-prefixed spellings.
+    "name",
+    "status",
+    "statusMessage",
+    "kind",
+    "duration",
+    "traceDuration",
+    "rootName",
+    "rootServiceName",
+    // Modern `span:*` colon-prefixed aliases per Tempo's intrinsic
+    // naming convention.
+    "span:duration",
+    "span:kind",
+    "span:name",
+    "span:status",
+    "span:statusMessage",
+    // Modern `trace:*` colon-prefixed aliases.
+    "trace:duration",
+    "trace:rootName",
+    "trace:rootService",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,11 +1159,19 @@ mod tests {
     #[test]
     fn test_spans_schema() {
         let schema = spans_schema().expect("Failed to create spans schema");
-        assert_eq!(schema.highest_field_id(), 40);
+        // Field IDs 1-22 + events(23-30) + links(31-40) + span_attributes(41-43).
+        assert_eq!(schema.highest_field_id(), 43);
         assert!(schema.field_by_name("trace_id").is_some());
         assert!(schema.field_by_name("span_id").is_some());
         assert!(schema.field_by_name("events").is_some());
         assert!(schema.field_by_name("links").is_some());
+        // Attributes split (spec 2026-04-19-spans-attributes-split-design.md):
+        assert!(
+            schema.field_by_name("attributes").is_none(),
+            "legacy single `attributes` field must be gone"
+        );
+        assert!(schema.field_by_name("resource_attributes").is_some());
+        assert!(schema.field_by_name("span_attributes").is_some());
     }
 
     #[test]
@@ -1058,11 +1179,12 @@ mod tests {
         use iceberg::spec::Type;
 
         let schema = spans_schema().expect("Failed to create spans schema");
-        // attributes Map: parent=16, key=17, value=18
-        let attrs = schema.field_by_name("attributes").expect("attributes field");
-        assert_eq!(attrs.id, 16);
-        let Type::Map(map) = &*attrs.field_type else {
-            panic!("attributes must be Map");
+
+        // resource_attributes Map: parent=16, key=17, value=18
+        let resource_attrs = schema.field_by_name("resource_attributes").expect("resource_attributes field");
+        assert_eq!(resource_attrs.id, 16);
+        let Type::Map(map) = &*resource_attrs.field_type else {
+            panic!("resource_attributes must be Map");
         };
         assert_eq!(map.key_field.id, 17);
         assert_eq!(map.value_field.id, 18);
@@ -1087,25 +1209,18 @@ mod tests {
         assert_eq!(m.key_field.id, 28);
         assert_eq!(m.value_field.id, 29);
 
-        // links List<Struct>: list=31, elem struct=32,
-        // struct fields trace_id=33, span_id=34, trace_state=35, attributes=36 (key=37, value=38), dropped_attributes_count=39, flags=40
+        // links: unchanged by this change (still IDs 31-40).
         let links = schema.field_by_name("links").expect("links field");
         assert_eq!(links.id, 31);
-        let Type::List(list) = &*links.field_type else {
-            panic!("links must be List");
+
+        // span_attributes Map: parent=41, key=42, value=43 (new, post-links).
+        let span_attrs = schema.field_by_name("span_attributes").expect("span_attributes field");
+        assert_eq!(span_attrs.id, 41);
+        let Type::Map(sm) = &*span_attrs.field_type else {
+            panic!("span_attributes must be Map");
         };
-        assert_eq!(list.element_field.id, 32);
-        let Type::Struct(s) = &*list.element_field.field_type else {
-            panic!("links element must be Struct");
-        };
-        let ids: Vec<i32> = s.fields().iter().map(|f| f.id).collect();
-        assert_eq!(ids, vec![33, 34, 35, 36, 39, 40]);
-        let inner_attrs = s.fields().iter().find(|f| f.name == "attributes").expect("link attrs");
-        let Type::Map(m) = &*inner_attrs.field_type else {
-            panic!("link attributes must be Map");
-        };
-        assert_eq!(m.key_field.id, 37);
-        assert_eq!(m.value_field.id, 38);
+        assert_eq!(sm.key_field.id, 42);
+        assert_eq!(sm.value_field.id, 43);
     }
 
     #[test]

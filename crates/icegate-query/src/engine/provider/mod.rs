@@ -10,9 +10,13 @@
 //! ```text
 //! IcegateCatalogProvider
 //!   -> IcegateSchemaProvider (for "icegate" namespace)
-//!     -> IcegateTableProvider (for "logs" table)
+//!     -> IcegateTableProvider (for WAL-backed tables: "logs", "spans")
 //!       -> UnionExec(IcegateIcebergScan, DataSourceExec[WAL Parquet])
 //! ```
+//!
+//! Tables without a corresponding WAL topic (currently `events`, `metrics`)
+//! fall through to the standard `IcebergStaticTableProvider` and read from
+//! committed Iceberg snapshots only.
 
 mod catalog;
 mod expr_to_predicate;
