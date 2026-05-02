@@ -132,7 +132,7 @@ pub(super) const fn writer_max_parquet_bytes(upper_bound_input_bytes: u64) -> u6
 pub struct IcebergStorage {
     loader: TableLoader,
     row_group_size: usize,
-    max_file_size_mb: u64,
+    max_file_size_bytes: u64,
     /// Column names that should get a Parquet bloom filter when written.
     ///
     /// The list is owned by the caller (typically a per-table

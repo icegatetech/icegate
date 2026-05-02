@@ -775,13 +775,13 @@ mod tests {
         let runner = test_runner(FakeQueueReader);
         let manager = RecordingManager::new();
 
-        // 1MB per row group × 10 row groups × 6 services = 60MB total. Default
-        // lower bound is 64MB, so the entire workload fits into one shift task;
-        // shrink the bounds via a custom config to force multiple tasks while
-        // still staying under upper bound.
+        // 1 byte per row group × 10 row groups × 6 services = 60 bytes total.
+        // Shrink bounds to force multiple tasks: lower=12, upper=24.
+        // The algorithm is scale-invariant so the structural result is identical
+        // to a 1MB-per-row-group workload with 12MB/24MB bounds.
         let mut shift_config = ShiftConfig::default();
-        shift_config.read.lower_bound_input_bytes_per_task = 12 * 1024 * 1024; // 12MB target.
-        shift_config.read.upper_bound_input_bytes_per_task = 24 * 1024 * 1024; // 24MB hard cap.
+        shift_config.read.lower_bound_input_bytes_per_task = 12; // 12 bytes target.
+        shift_config.read.upper_bound_input_bytes_per_task = 24; // 24 bytes hard cap.
         let runner = PlanTaskRunnerImpl::new(
             runner.queue_reader,
             runner.storage,
@@ -801,7 +801,7 @@ mod tests {
                     Some("tenant-a"),
                     1,
                     usize::try_from(svc * 10 + idx).expect("idx"),
-                    1024 * 1024,
+                    1,
                     Some(timestamp_boundary("acc-1", &service, min_ts, max_ts)),
                     Some((min_ts, max_ts)),
                 ));
@@ -813,7 +813,7 @@ mod tests {
             last_segment_offset: Some(1),
             segments_count: 1,
             row_groups_total,
-            input_bytes_total: row_groups_total as u64 * 1024 * 1024,
+            input_bytes_total: row_groups_total as u64,
         };
 
         let (task_ids, _) = runner

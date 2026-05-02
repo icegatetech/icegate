@@ -423,18 +423,32 @@ mod tests {
     };
 
     use arrow::{
-        array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
+        array::{Array, ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{DateTime, Utc};
     use futures::TryStreamExt;
-    use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Struct};
+    use iceberg::{
+        Catalog, NamespaceIdent, TableCreation,
+        io::FileIO,
+        spec::{
+            DataContentType, DataFile, DataFileBuilder, DataFileFormat, NestedField, PartitionSpec, PrimitiveType,
+            Schema as IcebergSchema, Struct, Transform, Type,
+        },
+        table::Table,
+    };
+    use icegate_common::{
+        ICEGATE_NAMESPACE,
+        catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
+        schema::{COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_TENANT_ID, COL_TIMESTAMP},
+    };
     use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
     use icegate_queue::{RowGroupPlanEntry, SegmentsPlan};
     use parquet::{
         arrow::arrow_writer::ArrowWriter,
+        arrow::{PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder},
         file::{
             properties::WriterProperties,
             reader::{FileReader, SerializedFileReader},
@@ -454,7 +468,7 @@ mod tests {
         shift::{
             PlannedRowGroup, SHIFT_TASK_CODE, SegmentToRead, ShiftConfig, ShiftInput, ShiftOutput,
             executor::TaskStatus,
-            iceberg_storage::{Storage, WrittenDataFiles},
+            iceberg_storage::{IcebergStorage, Storage, WrittenDataFiles},
             plan_runner::{PlanTaskRunner, PlanTaskRunnerImpl},
             timeout::TimeoutEstimator,
         },
@@ -1007,12 +1021,19 @@ mod tests {
     fn logs_ingest_batch(
         rows: Vec<(&str, Option<&str>, Option<&str>, Option<i64>, i64)>,
     ) -> arrow::record_batch::RecordBatch {
+        fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> Field {
+            Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                field_id.to_string(),
+            )]))
+        }
+
         let schema = Arc::new(Schema::new(vec![
-            Field::new("tenant_id", DataType::Utf8, false),
-            Field::new("cloud_account_id", DataType::Utf8, true),
-            Field::new("service_name", DataType::Utf8, true),
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
-            Field::new("row_id", DataType::Int64, false),
+            field_with_id(COL_TENANT_ID, DataType::Utf8, false, 1),
+            field_with_id(COL_CLOUD_ACCOUNT_ID, DataType::Utf8, true, 2),
+            field_with_id(COL_SERVICE_NAME, DataType::Utf8, true, 3),
+            field_with_id(COL_TIMESTAMP, DataType::Timestamp(TimeUnit::Microsecond, None), true, 4),
+            field_with_id("row_id", DataType::Int64, false, 5),
         ]));
         arrow::record_batch::RecordBatch::try_new(
             schema,
@@ -1138,6 +1159,46 @@ mod tests {
         }
     }
 
+    struct E2eParquetStorage {
+        inner: IcebergStorage,
+        written_data_files: Mutex<Vec<DataFile>>,
+    }
+
+    #[async_trait]
+    impl Storage for E2eParquetStorage {
+        async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
+            self.inner.get_last_offset(cancel_token).await
+        }
+
+        async fn write_record_batches(
+            &self,
+            batches: crate::shift::iceberg_storage::BoxRecordBatchStream,
+            cancel_token: &CancellationToken,
+        ) -> Result<WrittenDataFiles> {
+            let written = self.inner.write_record_batches(batches, cancel_token).await?;
+            self.written_data_files.lock().await.extend(written.data_files.iter().cloned());
+            Ok(written)
+        }
+
+        async fn get_data_files(
+            &self,
+            parquet_paths: &[String],
+            cancel_token: &CancellationToken,
+        ) -> Result<Vec<DataFile>> {
+            self.inner.get_data_files(parquet_paths, cancel_token).await
+        }
+
+        async fn commit(
+            &self,
+            data_files: Vec<DataFile>,
+            record_type: &str,
+            last_offset: u64,
+            cancel_token: &CancellationToken,
+        ) -> Result<usize> {
+            self.inner.commit(data_files, record_type, last_offset, cancel_token).await
+        }
+    }
+
     #[derive(Clone)]
     struct AddedTaskDefinition {
         id: Uuid,
@@ -1257,6 +1318,209 @@ mod tests {
             row_groups_total,
             input_bytes_total: row_groups_total as u64,
         }
+    }
+
+    async fn create_e2e_logs_table(table_name: &str) -> (Arc<dyn Catalog>, Table) {
+        let catalog_config = CatalogConfig {
+            backend: CatalogBackend::Memory,
+            warehouse: format!("memory://shift-runner-e2e-{}", Uuid::new_v4()),
+            properties: HashMap::new(),
+            cache: None,
+        };
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop())
+            .await
+            .expect("memory catalog");
+        let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create namespace");
+
+        let schema = IcebergSchema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, COL_TENANT_ID, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(2, COL_CLOUD_ACCOUNT_ID, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, COL_SERVICE_NAME, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(4, COL_TIMESTAMP, Type::Primitive(PrimitiveType::Timestamp)).into(),
+                NestedField::required(5, "row_id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("e2e logs schema");
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(1)
+            .add_partition_field(COL_TENANT_ID, COL_TENANT_ID, Transform::Identity)
+            .expect("tenant partition")
+            .add_partition_field(COL_TIMESTAMP, "timestamp_day", Transform::Day)
+            .expect("timestamp partition")
+            .build()
+            .expect("partition spec");
+        let sort_order = icegate_common::schema::logs_sort_order(&schema).expect("logs sort order");
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name(table_name.to_string())
+                    .schema(schema)
+                    .partition_spec(partition_spec)
+                    .sort_order(sort_order)
+                    .build(),
+            )
+            .await
+            .expect("create logs table");
+        (catalog, table)
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct LogOutputRow {
+        tenant_id: String,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
+        timestamp: i64,
+        row_id: i64,
+    }
+
+    fn nullable_string_value(array: &StringArray, row_idx: usize) -> Option<String> {
+        (!array.is_null(row_idx)).then(|| array.value(row_idx).to_string())
+    }
+
+    fn rows_from_record_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<LogOutputRow> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let tenant_ids = batch
+                    .column_by_name(COL_TENANT_ID)
+                    .expect("tenant_id column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("tenant_id string");
+                let cloud_account_ids = batch
+                    .column_by_name(COL_CLOUD_ACCOUNT_ID)
+                    .expect("cloud_account_id column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("cloud_account_id string");
+                let service_names = batch
+                    .column_by_name(COL_SERVICE_NAME)
+                    .expect("service_name column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("service_name string");
+                let timestamps = batch
+                    .column_by_name(COL_TIMESTAMP)
+                    .expect("timestamp column")
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .expect("timestamp micros");
+                let row_ids = batch
+                    .column_by_name("row_id")
+                    .expect("row_id column")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("row_id int64");
+
+                (0..batch.num_rows())
+                    .map(|row_idx| LogOutputRow {
+                        tenant_id: tenant_ids.value(row_idx).to_string(),
+                        cloud_account_id: nullable_string_value(cloud_account_ids, row_idx),
+                        service_name: nullable_string_value(service_names, row_idx),
+                        timestamp: timestamps.value(row_idx),
+                        row_id: row_ids.value(row_idx),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn log_sort_key_cmp(left: &LogOutputRow, right: &LogOutputRow) -> std::cmp::Ordering {
+        left.cloud_account_id
+            .cmp(&right.cloud_account_id)
+            .then_with(|| left.service_name.cmp(&right.service_name))
+            .then_with(|| right.timestamp.cmp(&left.timestamp))
+    }
+
+    async fn read_parquet_output_rows(file_io: &FileIO, path: &str) -> Vec<LogOutputRow> {
+        let bytes = file_io
+            .new_input(path)
+            .expect("parquet input")
+            .read()
+            .await
+            .expect("read parquet");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("parquet reader builder")
+            .build()
+            .expect("parquet record reader");
+        let batches = reader.collect::<std::result::Result<Vec<_>, _>>().expect("read record batches");
+        rows_from_record_batches(&batches)
+    }
+
+    async fn assert_parquet_row_group_bounds_match_sorted_rows(file_io: &FileIO, path: &str) {
+        let bytes = file_io
+            .new_input(path)
+            .expect("parquet input")
+            .read()
+            .await
+            .expect("read parquet");
+        let reader = SerializedFileReader::new(bytes).expect("serialized parquet reader");
+        let metadata = reader.metadata();
+        assert!(metadata.num_row_groups() > 0, "parquet file must contain row groups");
+
+        let record_reader = ParquetRecordBatchReaderBuilder::try_new(
+            file_io
+                .new_input(path)
+                .expect("parquet input")
+                .read()
+                .await
+                .expect("read parquet"),
+        )
+        .expect("parquet reader builder")
+        .build()
+        .expect("parquet record reader");
+        let batches = record_reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read record batches");
+        let rows = rows_from_record_batches(&batches);
+        let mut row_offset = 0usize;
+        for row_group_idx in 0..metadata.num_row_groups() {
+            let row_group = metadata.row_group(row_group_idx);
+            let row_count = usize::try_from(row_group.num_rows()).expect("row group row count");
+            let row_group_rows = &rows[row_offset..row_offset + row_count];
+            row_offset += row_count;
+
+            for window in row_group_rows.windows(2) {
+                assert_ne!(
+                    log_sort_key_cmp(&window[0], &window[1]),
+                    std::cmp::Ordering::Greater,
+                    "row group {row_group_idx} must not contradict logs sort order"
+                );
+            }
+
+            let service_stats = row_group
+                .columns()
+                .get(2)
+                .and_then(|column| column.statistics())
+                .expect("service_name statistics");
+            let Statistics::ByteArray(service_stats) = service_stats else {
+                panic!("service_name must have byte-array statistics");
+            };
+            let min_service =
+                std::str::from_utf8(service_stats.min_bytes_opt().expect("service min")).expect("service min utf8");
+            let max_service =
+                std::str::from_utf8(service_stats.max_bytes_opt().expect("service max")).expect("service max utf8");
+            let actual_min_service = row_group_rows
+                .iter()
+                .filter_map(|row| row.service_name.as_deref())
+                .min()
+                .expect("actual min service");
+            let actual_max_service = row_group_rows
+                .iter()
+                .filter_map(|row| row.service_name.as_deref())
+                .max()
+                .expect("actual max service");
+            assert_eq!(min_service, actual_min_service);
+            assert_eq!(max_service, actual_max_service);
+        }
+        assert_eq!(row_offset, rows.len(), "metadata row counts must cover all rows");
     }
 
     fn test_timeouts() -> TimeoutEstimator {
@@ -1401,7 +1665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_produces_non_overlapping_service_name_bounds_in_parquet_row_groups() {
+    async fn run_merger_stream_produces_non_overlapping_service_name_bounds_when_reencoded() {
         let queue_reader = Arc::new(FakeQueueReader {
             batches_by_offset: HashMap::from([(
                 1,
@@ -2082,6 +2346,159 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn run_end_to_end_writes_rows_sorted_in_actual_parquet_files() {
+        let ingest_segment_100 = logs_ingest_batch(vec![
+            ("tenant-b", Some("acc-2"), Some("svc-z"), Some(10), 900),
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 101),
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 102),
+            ("tenant-b", Some("acc-2"), Some("svc-y"), Some(20), 901),
+            ("tenant-a", Some("acc-1"), Some("svc-0"), Some(110), 103),
+            ("tenant-a", Some("acc-2"), Some("svc-a"), Some(50), 104),
+        ]);
+        let ingest_segment_101 = logs_ingest_batch(vec![
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 201),
+            ("tenant-b", Some("acc-2"), Some("svc-x"), Some(30), 902),
+            ("tenant-a", Some("acc-1"), Some("svc-2"), Some(90), 202),
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 203),
+            ("tenant-b", Some("acc-1"), Some("svc-a"), Some(70), 903),
+        ]);
+        let prepared_100 = sort_logs(&ingest_segment_100, 2, None)
+            .expect("prepare WAL segment 100")
+            .expect("segment 100 row groups");
+        let prepared_101 = sort_logs(&ingest_segment_101, 2, None)
+            .expect("prepare WAL segment 101")
+            .expect("segment 101 row groups");
+        let wal_segments = vec![
+            E2eWalSegment {
+                offset: 100,
+                row_groups: prepared_100.write_request.row_groups,
+            },
+            E2eWalSegment {
+                offset: 101,
+                row_groups: prepared_101.write_request.row_groups,
+            },
+        ];
+        let queue_reader = Arc::new(E2eQueueReader {
+            plan: build_segments_plan(&wal_segments),
+            segments: wal_segments
+                .iter()
+                .map(|segment| (segment.offset, segment.row_groups.clone()))
+                .collect(),
+        });
+
+        let plan_runner = PlanTaskRunnerImpl::new(
+            Arc::clone(&queue_reader),
+            Arc::new(E2ePlanStorage),
+            Arc::new(ShiftConfig::default()),
+            test_timeouts(),
+            "logs",
+            &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
+        );
+        let plan_manager = E2eManager::new();
+        let cancel = CancellationToken::new();
+        let plan_result = plan_runner
+            .run(Uuid::new_v4(), &plan_manager, &cancel)
+            .await
+            .expect("plan runner should schedule shift tasks");
+        assert_eq!(plan_result.status, TaskStatus::Ok);
+        assert_eq!(plan_result.shift_task_ids.len(), 2);
+
+        let table_name = format!("logs_e2e_{}", Uuid::new_v4().simple());
+        let (catalog, table) = create_e2e_logs_table(&table_name).await;
+        let mut shift_config = ShiftConfig::default();
+        shift_config.write.row_group_size = 2;
+        let storage = Arc::new(E2eParquetStorage {
+            inner: IcebergStorage::new(Arc::clone(&catalog), table_name.clone(), &shift_config, &[]),
+            written_data_files: Mutex::new(Vec::new()),
+        });
+        let expected_row_ids_by_tenant = HashMap::from([
+            ("tenant-a".to_string(), vec![103, 101, 102, 201, 203, 202, 104]),
+            ("tenant-b".to_string(), vec![903, 902, 901, 900]),
+        ]);
+
+        let shift_inputs = plan_manager
+            .added_tasks
+            .lock()
+            .expect("added tasks lock")
+            .iter()
+            .filter(|task| task.code == TaskCode::new(SHIFT_TASK_CODE))
+            .map(|task| {
+                let input: ShiftInput = serde_json::from_slice(&task.input).expect("shift input");
+                (task.id, input)
+            })
+            .collect::<Vec<_>>();
+
+        for (task_id, shift_input) in shift_inputs {
+            let shift_runner = ShiftTaskRunnerImpl::new(
+                Arc::clone(&queue_reader),
+                Arc::clone(&storage),
+                table_name.clone(),
+                2,
+                SortColumnsDescriptor::logs().expect("logs descriptor"),
+            )
+            .expect("non-zero output_batch_size must be accepted")
+            .with_segment_read_parallelism(2)
+            .expect("valid read parallelism");
+            let manager = RecordingJobManager::new();
+            let task = Arc::new(TestTask {
+                id: task_id,
+                code: TaskCode::new(SHIFT_TASK_CODE),
+                input: serde_json::to_vec(&shift_input).expect("serialize shift input"),
+                output: Vec::new(),
+                error: String::new(),
+                depends_on: Vec::new(),
+            });
+
+            let result = shift_runner.run(task, &manager, &cancel).await.expect("shift task run");
+            assert_eq!(result.status, TaskStatus::Ok);
+            assert_eq!(
+                result.parquet_files_total, 1,
+                "one planned tenant chunk should write one parquet file"
+            );
+
+            let completed = manager.completed.lock().expect("completed task lock");
+            assert_eq!(completed.len(), 1);
+            let output: ShiftOutput = serde_json::from_slice(&completed[0].1).expect("shift output");
+            drop(completed);
+            assert_eq!(output.parquet_files.len(), 1);
+        }
+
+        let written_files = storage.written_data_files.lock().await.clone();
+        assert_eq!(
+            written_files.len(),
+            2,
+            "two tenant shift tasks must write two parquet files"
+        );
+
+        let mut seen_by_tenant = HashMap::new();
+        for data_file in written_files {
+            let rows = read_parquet_output_rows(table.file_io(), data_file.file_path()).await;
+            let first_tenant = rows.first().expect("parquet rows").tenant_id.clone();
+            assert!(
+                rows.iter().all(|row| row.tenant_id == first_tenant),
+                "one parquet file must contain one tenant partition"
+            );
+            for window in rows.windows(2) {
+                assert_ne!(
+                    log_sort_key_cmp(&window[0], &window[1]),
+                    std::cmp::Ordering::Greater,
+                    "parquet rows must be monotonic by logs sort order"
+                );
+            }
+            let row_ids = rows.iter().map(|row| row.row_id).collect::<Vec<_>>();
+            assert_eq!(
+                &row_ids,
+                expected_row_ids_by_tenant.get(&first_tenant).expect("expected tenant rows"),
+                "parquet rows must preserve WAL-stable order for equal sort keys"
+            );
+            assert_parquet_row_group_bounds_match_sorted_rows(table.file_io(), data_file.file_path()).await;
+            seen_by_tenant.insert(first_tenant, row_ids);
+        }
+        assert_eq!(seen_by_tenant.len(), expected_row_ids_by_tenant.len());
+    }
+
+    #[tokio::test]
     async fn run_end_to_end_mixed_partition_planning_and_shift_merge_preserves_boundaries_and_order() {
         let ingest_segment_100 = logs_ingest_batch(vec![
             ("tenant-b", Some("acc-2"), Some("svc-z"), Some(10), 900),
@@ -2213,5 +2630,126 @@ mod tests {
                 "merged order must match sort order and WAL-stable tie-breakers"
             );
         }
+    }
+
+    /// Behavioural pin of the writer failover budget.
+    ///
+    /// `IcebergStorage` derives the writer rollover budget as
+    /// `upper_bound_input_bytes_per_task × WRITER_FILE_SIZE_FAILOVER_FACTOR`
+    /// (currently ×2). In normal operation the planner shapes one chunk per
+    /// shift task and the writer never rolls over; rollover is the failover
+    /// path. This test forces the failover to trigger by giving storage a
+    /// pathologically small `upper_bound`, while the planner runs with the
+    /// default config so a single shift task covers the whole tenant.
+    /// Encoded parquet output (footer + statistics + data) overshoots the tiny
+    /// budget and must split into multiple data files.
+    ///
+    /// Removing the failover multiplier or short-circuiting `target_file_size`
+    /// in [`IcebergStorage::write_parquet_files_once`] causes this test to
+    /// fail. The paired "no rollover under default config" invariant is
+    /// already pinned by `run_end_to_end_writes_rows_sorted_in_actual_parquet_files`
+    /// (asserts `parquet_files_total == 1`).
+    #[tokio::test]
+    async fn shift_task_rolls_over_data_files_when_writer_budget_is_pathologically_small() {
+        let ingest_segment = logs_ingest_batch(vec![
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 101),
+            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 102),
+            ("tenant-a", Some("acc-1"), Some("svc-0"), Some(110), 103),
+            ("tenant-a", Some("acc-1"), Some("svc-2"), Some(120), 104),
+            ("tenant-a", Some("acc-1"), Some("svc-3"), Some(130), 105),
+            ("tenant-a", Some("acc-1"), Some("svc-4"), Some(140), 106),
+        ]);
+        let prepared = sort_logs(&ingest_segment, 2, None)
+            .expect("prepare WAL segment")
+            .expect("segment row groups");
+        let wal_segments = vec![E2eWalSegment {
+            offset: 100,
+            row_groups: prepared.write_request.row_groups,
+        }];
+        let queue_reader = Arc::new(E2eQueueReader {
+            plan: build_segments_plan(&wal_segments),
+            segments: wal_segments
+                .iter()
+                .map(|segment| (segment.offset, segment.row_groups.clone()))
+                .collect(),
+        });
+
+        // Plan with default config: produces a single shift task for the tenant.
+        let plan_runner = PlanTaskRunnerImpl::new(
+            Arc::clone(&queue_reader),
+            Arc::new(E2ePlanStorage),
+            Arc::new(ShiftConfig::default()),
+            test_timeouts(),
+            "logs",
+            &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
+        );
+        let plan_manager = E2eManager::new();
+        let cancel = CancellationToken::new();
+        let plan_result = plan_runner
+            .run(Uuid::new_v4(), &plan_manager, &cancel)
+            .await
+            .expect("plan runner");
+        assert_eq!(plan_result.status, TaskStatus::Ok);
+        assert_eq!(
+            plan_result.shift_task_ids.len(),
+            1,
+            "single tenant => single shift task"
+        );
+
+        // Storage with pathological `upper_bound = 1`: writer budget = 2 bytes.
+        // Encoded parquet for 6 rows is hundreds of bytes (footer alone), so
+        // every row group flushed by `RollingFileWriterBuilder` overshoots the
+        // budget and starts a new file.
+        let table_name = format!("logs_failover_{}", Uuid::new_v4().simple());
+        let (catalog, _table) = create_e2e_logs_table(&table_name).await;
+        let mut storage_config = ShiftConfig::default();
+        storage_config.write.row_group_size = 2;
+        storage_config.read.upper_bound_input_bytes_per_task = 1;
+        let storage = Arc::new(E2eParquetStorage {
+            inner: IcebergStorage::new(Arc::clone(&catalog), table_name.clone(), &storage_config, &[]),
+            written_data_files: Mutex::new(Vec::new()),
+        });
+
+        let shift_inputs = plan_manager
+            .added_tasks
+            .lock()
+            .expect("added tasks lock")
+            .iter()
+            .filter(|task| task.code == TaskCode::new(SHIFT_TASK_CODE))
+            .map(|task| {
+                let input: ShiftInput = serde_json::from_slice(&task.input).expect("shift input");
+                (task.id, input)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shift_inputs.len(), 1);
+
+        let (task_id, shift_input) = shift_inputs.into_iter().next().expect("shift task");
+        let shift_runner = ShiftTaskRunnerImpl::new(
+            Arc::clone(&queue_reader),
+            Arc::clone(&storage),
+            table_name.clone(),
+            2,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size")
+        .with_segment_read_parallelism(2)
+        .expect("valid read parallelism");
+        let manager = RecordingJobManager::new();
+        let task = Arc::new(TestTask {
+            id: task_id,
+            code: TaskCode::new(SHIFT_TASK_CODE),
+            input: serde_json::to_vec(&shift_input).expect("serialize shift input"),
+            output: Vec::new(),
+            error: String::new(),
+            depends_on: Vec::new(),
+        });
+
+        let result = shift_runner.run(task, &manager, &cancel).await.expect("shift task run");
+        assert_eq!(result.status, TaskStatus::Ok);
+        assert!(
+            result.parquet_files_total > 1,
+            "tiny writer budget must trigger rollover into multiple parquet files; got {}",
+            result.parquet_files_total
+        );
     }
 }
