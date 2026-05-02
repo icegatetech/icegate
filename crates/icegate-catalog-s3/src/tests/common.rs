@@ -22,8 +22,8 @@ use crate::catalog::S3Catalog;
 use crate::config::S3CatalogConfig;
 use crate::error::{Error, Result};
 use crate::model::CatalogRoot;
-use crate::storage::{CatalogStorage, Version};
 use crate::storage::s3::S3CatalogStorage;
+use crate::storage::{CatalogStorage, Version};
 
 /// In-memory storage backend for unit tests.
 pub(crate) struct InMemoryCatalogStorage {

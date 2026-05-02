@@ -15,21 +15,12 @@ use crate::error::Error;
 /// `00042-uuid.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct MetadataVersion(i64);
+pub struct MetadataVersion(u32);
 
 impl MetadataVersion {
     /// Initial metadata version for newly created tables.
     pub(crate) const fn initial() -> Self {
         Self(0)
-    }
-
-    /// Create metadata version from a parsed numeric value.
-    fn from_i64(value: i64) -> Result<Self, Error> {
-        if value < 0 {
-            return Err(Error::InvalidMetadata(format!("Negative metadata version: {value}")));
-        }
-
-        Ok(Self(value))
     }
 
     /// Parse metadata version from an Iceberg metadata file location.
@@ -43,13 +34,12 @@ impl MetadataVersion {
             .split_once('-')
             .map(|(prefix, _)| prefix)
             .ok_or_else(|| Error::InvalidMetadata(format!("Missing metadata version in location: {location}")))?;
-        let parsed = version.parse::<i64>().map_err(|error| {
+
+        version.parse::<u32>().map(Self).map_err(|error| {
             Error::InvalidMetadata(format!(
                 "Invalid metadata version '{version}' in location {location}: {error}"
             ))
-        })?;
-
-        Self::from_i64(parsed)
+        })
     }
 
     /// Return the next metadata version.
@@ -60,8 +50,8 @@ impl MetadataVersion {
             .ok_or_else(|| Error::InvalidMetadata(format!("Metadata version overflow: {}", self.0)))
     }
 
-    /// Return the numeric value stored in `root.json`.
-    pub const fn as_i64(self) -> i64 {
+    /// Return the numeric value of this metadata version.
+    pub const fn as_u32(self) -> u32 {
         self.0
     }
 }
@@ -148,7 +138,7 @@ impl TableMetadataState {
         format!(
             "{}/metadata/{:05}-{}.metadata.json",
             table_location.trim_end_matches('/'),
-            version.as_i64(),
+            version.as_u32(),
             Uuid::new_v4()
         )
     }
@@ -487,7 +477,8 @@ impl CatalogRoot {
 
         let old_version = MetadataVersion::from_location(&entry.metadata_location)?;
         let new_version = MetadataVersion::from_location(&metadata_location)?;
-        if new_version.as_i64() != old_version.as_i64() + 1 {
+        let expected = old_version.as_u32().checked_add(1).ok_or(Error::CommitConflict)?;
+        if new_version.as_u32() != expected {
             return Err(Error::CommitConflict);
         }
 
@@ -607,7 +598,7 @@ mod tests {
         let version =
             MetadataVersion::from_location("s3://bucket/table/metadata/00042-uuid.json").expect("metadata version");
 
-        assert_eq!(version.as_i64(), 42);
+        assert_eq!(version.as_u32(), 42);
     }
 
     #[test]
@@ -638,12 +629,12 @@ mod tests {
         let version = MetadataVersion::from_location("s3://bucket/table/metadata/00007-uuid.metadata.json")
             .expect("metadata version with .metadata.json suffix");
 
-        assert_eq!(version.as_i64(), 7);
+        assert_eq!(version.as_u32(), 7);
     }
 
     #[test]
     fn metadata_version_next_overflows() {
-        let error = MetadataVersion(i64::MAX).next().expect_err("overflow must fail");
+        let error = MetadataVersion(u32::MAX).next().expect_err("overflow must fail");
 
         assert!(matches!(error, Error::InvalidMetadata(_)));
     }
@@ -846,7 +837,7 @@ mod tests {
         assert_eq!(
             MetadataVersion::from_location(entry.metadata_location())
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             1
         );
         assert_eq!(
@@ -989,7 +980,7 @@ mod tests {
         assert_eq!(
             MetadataVersion::from_location(entry.metadata_location())
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             0
         );
         assert!(
@@ -1017,7 +1008,7 @@ mod tests {
         assert_eq!(
             MetadataVersion::from_location(entry.metadata_location())
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             1
         );
     }
@@ -1101,7 +1092,7 @@ mod tests {
         assert_eq!(
             MetadataVersion::from_location(entry.metadata_location())
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             0
         );
     }

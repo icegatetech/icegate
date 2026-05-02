@@ -291,7 +291,7 @@ async fn register_table_uses_metadata_uuid_and_update_stays_in_same_prefix() {
     assert_eq!(
         MetadataVersion::from_location(&updated_location)
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         1
     );
 
@@ -950,7 +950,7 @@ async fn property_only_commits_advance_metadata_version() {
     assert_eq!(
         MetadataVersion::from_location(created.metadata_location().expect("created metadata location"))
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         0
     );
     assert_eq!(created.metadata().last_sequence_number(), 0);
@@ -978,13 +978,13 @@ async fn property_only_commits_advance_metadata_version() {
     assert_eq!(
         MetadataVersion::from_location(first.metadata_location().expect("first metadata location"))
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         1
     );
     assert_eq!(
         MetadataVersion::from_location(second.metadata_location().expect("second metadata location"))
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         2
     );
 
@@ -994,7 +994,7 @@ async fn property_only_commits_advance_metadata_version() {
     assert_eq!(
         MetadataVersion::from_location(entry.metadata_location())
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         2
     );
 }
@@ -1028,13 +1028,13 @@ async fn single_and_multi_table_commits_ignore_last_sequence_number() {
     assert_eq!(
         MetadataVersion::from_location(committed_a.metadata_location().expect("table a metadata location"))
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         1
     );
     assert_eq!(
         MetadataVersion::from_location(committed_b.metadata_location().expect("table b metadata location"))
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         1
     );
 
@@ -1053,7 +1053,7 @@ async fn single_and_multi_table_commits_ignore_last_sequence_number() {
     assert_eq!(
         MetadataVersion::from_location(updated_a.metadata_location().expect("updated table a metadata location"))
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         2
     );
 
@@ -1067,13 +1067,13 @@ async fn single_and_multi_table_commits_ignore_last_sequence_number() {
     assert_eq!(
         MetadataVersion::from_location(entry_a.metadata_location())
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         2
     );
     assert_eq!(
         MetadataVersion::from_location(entry_b.metadata_location())
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         1
     );
 }
@@ -1169,7 +1169,7 @@ async fn commit_vs_commit() {
     assert_eq!(
         MetadataVersion::from_location(loaded.metadata_location().expect("loaded metadata location"))
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         1
     );
 
@@ -1347,26 +1347,26 @@ async fn tx_ab_vs_single_a() {
         assert_eq!(
             MetadataVersion::from_location(loaded_a.metadata_location().expect("a location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             1
         );
         assert_eq!(
             MetadataVersion::from_location(loaded_b.metadata_location().expect("b location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             1
         );
     } else {
         assert_eq!(
             MetadataVersion::from_location(loaded_a.metadata_location().expect("a location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             1
         );
         assert_eq!(
             MetadataVersion::from_location(loaded_b.metadata_location().expect("b location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             0
         );
     }
@@ -1412,7 +1412,7 @@ async fn tx_ab_vs_tx_ac() {
     assert_eq!(
         MetadataVersion::from_location(loaded_a.metadata_location().expect("a location"))
             .expect("metadata version")
-            .as_i64(),
+            .as_u32(),
         1
     );
 
@@ -1420,32 +1420,32 @@ async fn tx_ab_vs_tx_ac() {
         assert_eq!(
             MetadataVersion::from_location(loaded_b.metadata_location().expect("b location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             1
         );
         assert_eq!(
             MetadataVersion::from_location(loaded_c.metadata_location().expect("c location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             0
         );
     } else {
         assert_eq!(
             MetadataVersion::from_location(loaded_a.metadata_location().expect("a location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             1
         );
         assert_eq!(
             MetadataVersion::from_location(loaded_b.metadata_location().expect("b location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             0
         );
         assert_eq!(
             MetadataVersion::from_location(loaded_c.metadata_location().expect("c location"))
                 .expect("metadata version")
-                .as_i64(),
+                .as_u32(),
             1
         );
     }
