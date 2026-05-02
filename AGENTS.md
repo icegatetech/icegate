@@ -2,6 +2,10 @@
 
 This file provides guidance to AI agents (Claude Code, Gemini Code Assist, etc.) when working with code in this repository.
 
+## Component Instructions
+
+- `icegate-catalog-s3`: [crates/icegate-catalog-s3/AGENTS.md](crates/icegate-catalog-s3/AGENTS.md)
+
 ## Build Commands
 
 ### Cargo Commands

@@ -12,6 +12,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{
     arrow::ArrowWriter,
     file::{metadata::KeyValue, properties::WriterProperties},
+    schema::types::ColumnPath,
 };
 use tokio::sync::RwLock;
 use tracing::{Instrument, debug, error, info, instrument, trace, warn};
@@ -54,6 +55,15 @@ pub struct QueueWriter {
 
     /// Events handler for queue writer operations.
     events: Arc<dyn QueueWriterEvents>,
+
+    /// Per-topic Parquet bloom-filter columns.
+    ///
+    /// The queue writer is intentionally topic-agnostic; callers
+    /// (typically the ingest binary) inject this map via
+    /// [`Self::with_bloom_filter_columns`] to declare which columns
+    /// should get a bloom filter for each topic. Topics not present
+    /// in the map are written without bloom filters.
+    bloom_filter_columns: HashMap<Topic, &'static [&'static str]>,
 }
 
 impl QueueWriter {
@@ -65,6 +75,7 @@ impl QueueWriter {
             offsets: Arc::new(RwLock::new(HashMap::new())),
             accumulators: Arc::new(RwLock::new(HashMap::new())),
             events: Arc::new(NoopQueueWriterEvents),
+            bloom_filter_columns: HashMap::new(),
         }
     }
 
@@ -72,6 +83,23 @@ impl QueueWriter {
     #[must_use]
     pub fn with_events(mut self, events: Arc<dyn QueueWriterEvents>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Configure which columns should get a Parquet bloom filter, per
+    /// topic.
+    ///
+    /// Bloom filters cheaply skip whole row groups when an equality
+    /// predicate on a high-cardinality column does not match, which
+    /// is the access pattern for Tempo trace-by-id and Loki `LogQL`
+    /// `{trace_id="..."}` lookups against fresh WAL data.
+    ///
+    /// Topics absent from `columns_by_topic` are written without
+    /// bloom filters; pass `&[]` for a topic to make that intent
+    /// explicit.
+    #[must_use]
+    pub fn with_bloom_filter_columns(mut self, columns_by_topic: HashMap<Topic, &'static [&'static str]>) -> Self {
+        self.bloom_filter_columns = columns_by_topic;
         self
     }
 
@@ -297,7 +325,7 @@ impl QueueWriter {
 
         // Convert to Parquet bytes — each batch becomes a row group
         let row_group_count = row_groups.len();
-        let writer_properties = self.writer_properties(&row_groups)?;
+        let writer_properties = self.writer_properties(topic, &row_groups)?;
         let span = tracing::Span::current();
         let parquet_bytes = tokio::task::spawn_blocking(move || {
             span.in_scope(|| Self::batches_to_parquet(writer_properties, &row_groups))
@@ -365,7 +393,14 @@ impl QueueWriter {
     }
 
     /// Creates Parquet writer properties from config.
-    fn writer_properties(&self, row_groups: &[PreparedWalRowGroup]) -> Result<WriterProperties> {
+    ///
+    /// `topic` selects the per-topic bloom-filter column list (see
+    /// [`Self::with_bloom_filter_columns`]); the WAL writer itself
+    /// stays topic-agnostic. The bloom-filter NDV is set to
+    /// `max_row_group_size`, which is the upper bound on distinct
+    /// values within a single row group and right-sizes the filter
+    /// without over-allocating.
+    fn writer_properties(&self, topic: &Topic, row_groups: &[PreparedWalRowGroup]) -> Result<WriterProperties> {
         let compression = self.config.write.compression.to_parquet_compression();
         let metadata_entries = row_groups
             .iter()
@@ -386,11 +421,23 @@ impl QueueWriter {
             }])
         };
 
-        Ok(WriterProperties::builder()
+        let max_row_group_size = self.config.common.max_row_group_size;
+        let mut builder = WriterProperties::builder()
             .set_compression(compression)
-            .set_max_row_group_size(self.config.common.max_row_group_size)
-            .set_key_value_metadata(key_value_metadata)
-            .build())
+            .set_max_row_group_size(max_row_group_size)
+            .set_key_value_metadata(key_value_metadata);
+
+        if let Some(bloom_columns) = self.bloom_filter_columns.get(topic) {
+            let ndv = u64::try_from(max_row_group_size).unwrap_or(u64::MAX);
+            for col in *bloom_columns {
+                let path = ColumnPath::from(*col);
+                builder = builder
+                    .set_column_bloom_filter_enabled(path.clone(), true)
+                    .set_column_bloom_filter_ndv(path, ndv);
+            }
+        }
+
+        Ok(builder.build())
     }
 
     /// Claims the next available offset for a topic.
@@ -1155,5 +1202,71 @@ mod tests {
         // Verify the segment at offset 3 exists
         let path = Path::from("queue/logs/00000000000000000003.parquet");
         assert!(store.head(&path).await.is_ok());
+    }
+
+    /// Reads back the WAL segment that `topic` last wrote to and
+    /// returns, for each column in `cols`, whether the file's first
+    /// row group carries a bloom filter for that column.
+    async fn bloom_filter_presence_for_topic(store: &InMemory, topic: &str, cols: &[&str]) -> Vec<bool> {
+        use parquet::file::{
+            metadata::ColumnChunkMetaData,
+            reader::{FileReader, SerializedFileReader},
+        };
+
+        let path = Path::from(format!("queue/{topic}/00000000000000000000.parquet"));
+        let bytes = store.get(&path).await.expect("get segment").bytes().await.expect("bytes");
+        let reader = SerializedFileReader::new(bytes).expect("serialized reader");
+        let row_group = reader.metadata().row_group(0);
+        cols.iter()
+            .map(|name| {
+                row_group
+                    .columns()
+                    .iter()
+                    .find(|c| c.column_path().string() == *name)
+                    .and_then(ColumnChunkMetaData::bloom_filter_offset)
+                    .is_some()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn writer_emits_bloom_filter_for_columns_listed_for_topic() {
+        // The shift-into-iceberg writer is not the only producer of
+        // parquet that the query engine reads — the WAL writer is too.
+        // When a topic declares bloom-filter columns, those columns
+        // must show up in the parquet footer of the WAL segment.
+        let store = Arc::new(InMemory::new());
+        let config = QueueConfig::new("queue");
+        let bloom_columns: HashMap<Topic, &'static [&'static str]> =
+            HashMap::from([("logs".to_string(), &["tenant_id"] as &'static [&'static str])]);
+        let writer = QueueWriter::new(config, Arc::clone(&store) as _).with_bloom_filter_columns(bloom_columns);
+
+        writer
+            .write_batches(&"logs".to_string(), vec![prepared_batch()])
+            .await
+            .expect("write batch");
+
+        let presence = bloom_filter_presence_for_topic(&store, "logs", &["tenant_id", "value"]).await;
+        assert_eq!(presence, vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn writer_skips_bloom_filter_for_topics_not_in_map() {
+        // Default policy (empty map) and topics absent from a
+        // populated map both yield zero bloom filters, so unrelated
+        // queues do not pay the write-side cost.
+        let store = Arc::new(InMemory::new());
+        let config = QueueConfig::new("queue");
+        let bloom_columns: HashMap<Topic, &'static [&'static str]> =
+            HashMap::from([("spans".to_string(), &["trace_id"] as &'static [&'static str])]);
+        let writer = QueueWriter::new(config, Arc::clone(&store) as _).with_bloom_filter_columns(bloom_columns);
+
+        writer
+            .write_batches(&"logs".to_string(), vec![prepared_batch()])
+            .await
+            .expect("write batch");
+
+        let presence = bloom_filter_presence_for_topic(&store, "logs", &["tenant_id", "value"]).await;
+        assert_eq!(presence, vec![false, false]);
     }
 }

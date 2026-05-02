@@ -9,7 +9,11 @@ ignore = [
     "crates/icegate-query/src/logql/antlr/",
     "!crates/icegate-query/src/logql/antlr/mod.rs",
     "!crates/icegate-query/src/logql/antlr/tests.rs",
-    "!crates/icegate-query/src/logql/antlr/visitors.rs"
+    "!crates/icegate-query/src/logql/antlr/visitors.rs",
+    "crates/icegate-query/src/traceql/antlr/",
+    "!crates/icegate-query/src/traceql/antlr/mod.rs",
+    "!crates/icegate-query/src/traceql/antlr/tests.rs",
+    "!crates/icegate-query/src/traceql/antlr/visitors.rs"
 ]
 
 # Basic formatting

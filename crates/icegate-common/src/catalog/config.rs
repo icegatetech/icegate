@@ -90,6 +90,11 @@ pub enum CatalogBackend {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         catalog_id: Option<String>,
     },
+    /// S3-backed catalog with `root.json` state.
+    S3 {
+        /// S3 key prefix used for catalog state (e.g. `catalog`).
+        warehouse: String,
+    },
 }
 
 impl CatalogConfig {
@@ -139,6 +144,16 @@ impl CatalogConfig {
                     }
                 }
             }
+            CatalogBackend::S3 { warehouse } => {
+                if warehouse.trim().is_empty() {
+                    return Err(CommonError::Config("S3 catalog warehouse cannot be empty".into()));
+                }
+                if self.properties.get("bucket").map_or(true, |bucket| bucket.trim().is_empty()) {
+                    return Err(CommonError::Config(
+                        "S3 catalog requires `catalog.properties.bucket`".into(),
+                    ));
+                }
+            }
         }
 
         // Validate cache config if present
@@ -185,5 +200,42 @@ impl Default for CatalogConfig {
             properties: HashMap::new(),
             cache: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn validate_rejects_missing_s3_bucket() {
+        let config = CatalogConfig {
+            backend: CatalogBackend::S3 {
+                warehouse: "catalog".to_string(),
+            },
+            warehouse: "warehouse".to_string(),
+            properties: HashMap::new(),
+            cache: None,
+        };
+
+        let error = config.validate().expect_err("validation must fail");
+        assert!(matches!(error, CommonError::Config(_)));
+    }
+
+    #[test]
+    fn validate_rejects_empty_s3_bucket() {
+        let config = CatalogConfig {
+            backend: CatalogBackend::S3 {
+                warehouse: "catalog".to_string(),
+            },
+            warehouse: "warehouse".to_string(),
+            properties: HashMap::from([("bucket".to_string(), "   ".to_string())]),
+            cache: None,
+        };
+
+        let error = config.validate().expect_err("validation must fail");
+        assert!(matches!(error, CommonError::Config(_)));
     }
 }

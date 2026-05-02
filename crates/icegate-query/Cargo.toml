@@ -69,6 +69,11 @@ tracing = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 
+# OTLP protobuf encoding for Tempo trace-by-ID responses
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+hex = { workspace = true }
+
 # Date and time
 chrono = { workspace = true }
 

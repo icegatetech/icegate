@@ -19,6 +19,7 @@ testing = ["testcontainers", "aws-config", "aws-sdk-s3"]
 [dependencies]
 # Iceberg
 iceberg = { workspace = true }
+icegate-catalog-s3 = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-catalog-s3tables = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
@@ -37,8 +38,10 @@ object_store_opendal = { workspace = true }
 
 # Configuration
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
+chrono = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

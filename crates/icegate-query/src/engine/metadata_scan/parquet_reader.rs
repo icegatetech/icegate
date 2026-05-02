@@ -34,6 +34,7 @@ use iceberg::io::{FileIO, FileMetadata};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{Datum, PrimitiveLiteral};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+use parquet::basic::Type as PhysicalType;
 use parquet::column::page::{Page, PageReader};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
@@ -249,6 +250,260 @@ fn decode_dictionary_from_chunk(
     Ok(())
 }
 
+/// Dictionary-page-only reader for a fixed-width INT32 column. Mirrors
+/// [`read_column_dictionaries`] but decodes PLAIN-encoded `INT32` values
+/// (4-byte little-endian per value) instead of variable-length byte
+/// arrays. Used to enumerate distinct codes from low-cardinality numeric
+/// columns such as `status_code` and `kind`.
+///
+/// Row groups without a dictionary page are skipped (over-approximation
+/// semantics): a low-cardinality enum should always dictionary-encode,
+/// so this path firing indicates an externally-produced file.
+///
+/// # Errors
+///
+/// Returns `MetadataScanError::Parquet` if any column chunk fails to
+/// decode. The file path is available via the surrounding tracing span.
+#[tracing::instrument(
+    skip_all,
+    fields(
+        leaf_idx = leaf_idx,
+        num_row_groups_total = metadata.num_row_groups(),
+        num_row_groups_pruned = tracing::field::Empty,
+        num_row_groups_no_dict = tracing::field::Empty,
+        num_chunks_fetched = tracing::field::Empty,
+        bytes_fetched = tracing::field::Empty,
+        num_values_decoded = tracing::field::Empty,
+    ),
+)]
+pub async fn read_column_int_dictionaries(
+    reader: &mut ArrowFileReader,
+    metadata: &ParquetMetaData,
+    predicate: &Predicate,
+    leaf_idx: usize,
+    out: &mut BTreeSet<i32>,
+) -> Result<(), MetadataScanError> {
+    // Defensive guard: the dictionary path below decodes pages as PLAIN
+    // little-endian INT32 (4 bytes per value) without inspecting the
+    // physical type, so a non-INT32 column would silently emit garbage
+    // (e.g. an INT64 column would produce two i32s per stored value).
+    // Fail fast here so both the dictionary and stats paths inherit the
+    // guarantee — the latter is already protected by `extend_from_int_stats`'s
+    // `Statistics::Int32(s)` match, so this only adds the missing check
+    // for the dictionary path.
+    let leaf = metadata.file_metadata().schema_descr().column(leaf_idx);
+    if leaf.physical_type() != PhysicalType::INT32 {
+        return Err(MetadataScanError::Schema(format!(
+            "read_column_int_dictionaries called on non-INT32 column \
+             '{}' (leaf_idx={leaf_idx}, physical_type={:?})",
+            leaf.name(),
+            leaf.physical_type()
+        )));
+    }
+
+    // Stage 1: row-group pruning + range planning. Identical to the
+    // byte-array path; kept inlined rather than factored because the
+    // shared signature would need to invent an enum over the two
+    // physical types and there are only two callers total.
+    //
+    // Row groups without a dictionary page fall back to row-group
+    // statistics min/max — for fixed-width INT32 columns the writer is
+    // free to skip dictionary encoding (PLAIN is already 4 bytes per
+    // value), and for low-cardinality enums (`status_code`, `kind`)
+    // emitting `min..=max` is a tight over-approximation that still
+    // honours the metadata-scan contract.
+    let mut ranges: Vec<Range<u64>> = Vec::new();
+    let mut selected_rgs: Vec<usize> = Vec::new();
+    let mut pruned: usize = 0;
+    let mut no_dict_fallback_to_stats: usize = 0;
+    let mut no_dict_no_stats: usize = 0;
+
+    for rg_idx in 0..metadata.num_row_groups() {
+        let rg = metadata.row_group(rg_idx);
+
+        if !row_group_can_match(rg, predicate) {
+            pruned += 1;
+            continue;
+        }
+
+        let col_chunk = rg.column(leaf_idx);
+
+        // Account for null values up-front. IceGate's spans-ingest writes
+        // OTLP `Status.code = 0` (Unset) and `SpanKind = 0` (Unspecified)
+        // — and the absent-status / absent-kind cases — as Parquet NULL
+        // (see `crates/icegate-ingest/src/transform.rs::498-521`). Neither
+        // the dictionary page nor the min/max stats describe NULL values,
+        // so we must read `null_count` separately and surface it as the
+        // sentinel `0` so callers can map it back to "unset" /
+        // "unspecified". This is the only way `status = unset` shows up
+        // in tag discovery for traces that simply didn't set a status.
+        if has_nulls(col_chunk.statistics()) {
+            out.insert(0);
+        }
+
+        // Try dictionary page first. Compute the byte range from the
+        // dict-page offset → first-data-page offset; if either offset
+        // refuses to fit in `u64` we fall through to the stats path
+        // rather than abandoning the row group entirely (this is the
+        // same control flow as `dict_end <= dict_start` below).
+        let dict_range: Option<core::ops::Range<u64>> = col_chunk.dictionary_page_offset().and_then(|dict_offset| {
+            let data_offset = col_chunk.data_page_offset();
+            let dict_start = u64::try_from(dict_offset).ok()?;
+            let dict_end = u64::try_from(data_offset).ok()?;
+            if dict_end > dict_start {
+                Some(dict_start..dict_end)
+            } else {
+                None
+            }
+        });
+        if let Some(range) = dict_range {
+            ranges.push(range);
+            selected_rgs.push(rg_idx);
+            continue;
+        }
+
+        // Fallback: row-group statistics. For fixed-width INT32 the
+        // writer often skips dict encoding entirely; stats give us a
+        // [min, max] interval that we expand into the candidate value
+        // set. For closed enums this typically captures every code
+        // exactly; for wider INT columns it over-approximates, which
+        // the metadata-scan contract permits.
+        if extend_from_int_stats(col_chunk.statistics(), out) {
+            no_dict_fallback_to_stats += 1;
+        } else {
+            no_dict_no_stats += 1;
+        }
+    }
+
+    let span = tracing::Span::current();
+    span.record("num_row_groups_pruned", pruned);
+    span.record("num_row_groups_no_dict", no_dict_fallback_to_stats + no_dict_no_stats);
+    span.record("num_chunks_fetched", ranges.len());
+
+    if no_dict_no_stats > 0 {
+        // Both encoding paths missing — we have no way to enumerate
+        // values for these row groups. Acceptable under
+        // over-approximation semantics; warn so operators notice.
+        tracing::warn!(
+            no_dict_no_stats,
+            "skipped row groups without dictionary page or INT32 statistics; int-value results may be incomplete"
+        );
+    }
+
+    if ranges.is_empty() {
+        return Ok(());
+    }
+
+    let bytes_total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+    span.record("bytes_fetched", bytes_total);
+
+    let chunks: Vec<Bytes> = reader.get_byte_ranges(ranges.clone()).await?;
+
+    let values_before = out.len();
+    for (rg_idx, (chunk_bytes, range)) in selected_rgs.iter().copied().zip(chunks.into_iter().zip(ranges.into_iter())) {
+        decode_int_dictionary_from_chunk(metadata, rg_idx, leaf_idx, chunk_bytes, range.start, out)?;
+    }
+    span.record("num_values_decoded", out.len() - values_before);
+
+    Ok(())
+}
+
+/// `true` if the row-group statistics report at least one NULL value
+/// in this column chunk, or if the null-count is unknown (conservative).
+/// `false` only when the statistics definitively report zero nulls or
+/// when statistics are absent entirely.
+///
+/// Used to surface OTLP `Unset` / `Unspecified` (which IceGate's
+/// ingest writes as Parquet NULL) back to enum-tag discovery so a
+/// status / kind dropdown isn't empty for traces that don't set those
+/// fields.
+///
+/// Callers iterate `metadata.row_group(rg_idx)` for non-empty row
+/// groups, so the "chunk has rows" precondition is implicit and there
+/// is no need to thread a row count through the signature.
+fn has_nulls(stats: Option<&Statistics>) -> bool {
+    let Some(stats) = stats else {
+        return false;
+    };
+    // `Statistics::null_count_opt` is the version-portable accessor
+    // across the variants we care about (ByteArray, Int32, Int64, …).
+    // `None` means the writer didn't emit a null-count — we cannot
+    // prove the chunk has zero nulls, so default to `true` and accept
+    // the over-approximation (a spurious sentinel `0` in the value set).
+    stats.null_count_opt().is_none_or(|n| n > 0)
+}
+
+/// Expand an `INT32` row-group statistics min/max range into the output
+/// set. Returns `true` if a usable INT32 range was found and applied.
+///
+/// For closed enums (`status_code` 0..=2, `kind` 0..=5) the
+/// `[min, max]` interval is tight enough that this is effectively the
+/// exact distinct set; for wider INT columns it over-approximates,
+/// which the metadata-scan contract permits. Capped at a defensive
+/// 1024-value spread to prevent a pathological writer reporting an
+/// absurd range from blowing out the result.
+fn extend_from_int_stats(stats: Option<&Statistics>, out: &mut BTreeSet<i32>) -> bool {
+    /// Maximum spread of values to emit from a single row-group's
+    /// INT32 stats. 1024 comfortably covers the OTLP enums (3 and 6
+    /// distinct values) while still bounding the work for unexpectedly
+    /// wide ranges.
+    const MAX_STATS_SPREAD: i32 = 1024;
+
+    let Some(Statistics::Int32(s)) = stats else {
+        return false;
+    };
+    let (Some(&min), Some(&max)) = (s.min_opt(), s.max_opt()) else {
+        return false;
+    };
+    if min > max {
+        return false;
+    }
+    let spread = i64::from(max) - i64::from(min);
+    if spread > i64::from(MAX_STATS_SPREAD) {
+        // Wide range — emitting `min..=max` would balloon the output set.
+        // Insert just the two boundary values; the metadata-scan contract
+        // permits over-approximation, and `min` / `max` are guaranteed to
+        // be present in the chunk. This is strictly better than dropping
+        // the row group entirely (`false` here would route through the
+        // `no_dict_no_stats` warn path and lose any signal at all).
+        out.insert(min);
+        out.insert(max);
+        return true;
+    }
+    for v in min..=max {
+        out.insert(v);
+    }
+    true
+}
+
+/// Decode the dictionary page of a fixed-width INT32 column from an
+/// already-fetched column chunk buffer.
+fn decode_int_dictionary_from_chunk(
+    metadata: &ParquetMetaData,
+    rg_idx: usize,
+    leaf_idx: usize,
+    chunk_bytes: Bytes,
+    chunk_start: u64,
+    out: &mut BTreeSet<i32>,
+) -> Result<(), MetadataScanError> {
+    let rg = metadata.row_group(rg_idx);
+    let col_chunk = rg.column(leaf_idx);
+
+    let chunk_reader = Arc::new(OffsetChunk {
+        bytes: chunk_bytes,
+        base: chunk_start,
+    });
+
+    let rg_num_rows = usize::try_from(rg.num_rows()).unwrap_or(0);
+    let mut page_reader = SerializedPageReader::new(chunk_reader, col_chunk, rg_num_rows, None)?;
+
+    if let Some(Page::DictionaryPage { buf, num_values, .. }) = page_reader.get_next_page()? {
+        decode_plain_int32_values(&buf, num_values as usize, out)?;
+    }
+
+    Ok(())
+}
+
 /// Evaluate `predicate` against `rg`'s row-group statistics.
 ///
 /// Returns `false` **only** when the statistics definitively prove that
@@ -308,17 +563,17 @@ fn eval_range_ord<T: ?Sized + Ord>(op: PredicateOperator, min: Option<&T>, max: 
     use std::cmp::Ordering;
     match op {
         PredicateOperator::Eq => {
-            min.map_or(true, |mn| mn.cmp(value) != Ordering::Greater)
-                && max.map_or(true, |mx| mx.cmp(value) != Ordering::Less)
+            min.is_none_or(|mn| mn.cmp(value) != Ordering::Greater)
+                && max.is_none_or(|mx| mx.cmp(value) != Ordering::Less)
         }
         PredicateOperator::NotEq => match (min, max) {
             (Some(mn), Some(mx)) => !(mn.cmp(value) == Ordering::Equal && mx.cmp(value) == Ordering::Equal),
             _ => true,
         },
-        PredicateOperator::LessThan => min.map_or(true, |mn| mn.cmp(value) == Ordering::Less),
-        PredicateOperator::LessThanOrEq => min.map_or(true, |mn| mn.cmp(value) != Ordering::Greater),
-        PredicateOperator::GreaterThan => max.map_or(true, |mx| mx.cmp(value) == Ordering::Greater),
-        PredicateOperator::GreaterThanOrEq => max.map_or(true, |mx| mx.cmp(value) != Ordering::Less),
+        PredicateOperator::LessThan => min.is_none_or(|mn| mn.cmp(value) == Ordering::Less),
+        PredicateOperator::LessThanOrEq => min.is_none_or(|mn| mn.cmp(value) != Ordering::Greater),
+        PredicateOperator::GreaterThan => max.is_none_or(|mx| mx.cmp(value) == Ordering::Greater),
+        PredicateOperator::GreaterThanOrEq => max.is_none_or(|mx| mx.cmp(value) != Ordering::Less),
         _ => true,
     }
 }
@@ -349,9 +604,10 @@ fn decode_plain_byte_array_values(
             )));
         }
         if let Ok(s) = std::str::from_utf8(&buf[i..i + len]) {
-            if !out.contains(s) {
-                out.insert(s.to_string());
-            }
+            // `BTreeSet::insert` is a no-op on duplicates and returns
+            // `bool` directly — the `contains` pre-check was a wasted
+            // O(log n) tree walk per dictionary entry.
+            out.insert(s.to_string());
         }
         i += len;
         decoded += 1;
@@ -363,6 +619,37 @@ fn decode_plain_byte_array_values(
              but buffer exhausted after {decoded} (buffer length: {})",
             buf.len(),
         )));
+    }
+
+    Ok(())
+}
+
+/// Decode PLAIN-encoded `INT32` values from a dictionary-page buffer and
+/// insert each distinct value into `out`.
+///
+/// PLAIN encoding for fixed-width integers is the raw little-endian byte
+/// sequence: 4 bytes per value, no length prefix. The caller has already
+/// confirmed the column is INT32 by virtue of which leaf index they
+/// asked for.
+fn decode_plain_int32_values(buf: &[u8], num_values: usize, out: &mut BTreeSet<i32>) -> Result<(), ParquetError> {
+    const VAL_BYTES: usize = 4;
+    let needed = num_values.checked_mul(VAL_BYTES).ok_or_else(|| {
+        ParquetError::General(format!("INT32 dictionary page size overflow: num_values={num_values}"))
+    })?;
+    if buf.len() < needed {
+        return Err(ParquetError::General(format!(
+            "truncated PLAIN INT32 dictionary page: expected {needed} bytes for {num_values} values, \
+             buffer length is {}",
+            buf.len(),
+        )));
+    }
+
+    for i in 0..num_values {
+        let off = i * VAL_BYTES;
+        let v = i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        // `BTreeSet::insert` is a no-op on duplicates and returns `bool`
+        // — no separate `contains` check needed.
+        out.insert(v);
     }
 
     Ok(())

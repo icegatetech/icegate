@@ -1,0 +1,35 @@
+[package]
+name = "icegate-catalog-s3"
+description = "S3-backed Iceberg catalog with root.json CAS semantics"
+readme = "../../README.md"
+keywords = ["iceberg", "s3", "catalog", "data-lake", "observability"]
+categories = ["database"]
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+iceberg = { workspace = true }
+object_store = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["minio"] }
+tokio = { workspace = true, features = ["test-util"] }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }

@@ -37,6 +37,16 @@ processors:
         statements:
           # Parse JSON body into a map
           - set(cache, ParseJSON(body))
+          # Lift the optional `trace_id` / `span_id` JSON fields
+          # (emitted by `icegate_common::tracing::TraceContextJsonFormatter`
+          # when an OTel SpanContext is active on the current span)
+          # into the OTLP log record's dedicated trace context fields.
+          # `trace_id.string` / `span_id.string` are the OTTL
+          # accessors that parse the W3C hex spelling (32-/16-char)
+          # the formatter emits. Logs outside a span lack the keys;
+          # the `where` guard skips the assignment in that case.
+          - set(trace_id.string, cache["trace_id"]) where cache["trace_id"] != nil
+          - set(span_id.string, cache["span_id"]) where cache["span_id"] != nil
           # Set severity from level field (mirrors K8s severity_parser mapping)
           - set(severity_text, cache["level"]) where cache["level"] != nil
           - set(severity_number, SEVERITY_NUMBER_TRACE) where IsMatch(severity_text, "TRACE")

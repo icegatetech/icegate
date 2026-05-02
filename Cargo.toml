@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/icegate-common",
+    "crates/icegate-catalog-s3",
     "crates/icegate-queue",
     "crates/icegate-query",
     "crates/icegate-ingest",
@@ -49,6 +50,7 @@ redundant_pub_crate = "allow"
 [workspace.dependencies]
 # Internal crates
 icegate-common = { path = "crates/icegate-common" }
+icegate-catalog-s3 = { path = "crates/icegate-catalog-s3" }
 icegate-queue = { path = "crates/icegate-queue" }
 
 # Arrow ecosystem (must match iceberg's version)
@@ -102,7 +104,7 @@ toml = "1.0.6"
 # HTTP server
 axum = "0.8.8"
 axum-extra = { version = "0.12.5", features = ["query"] }
-tower-http = { version = "0.6.8", features = ["trace", "decompression-gzip", "decompression-zstd"] }
+tower-http = { version = "0.6.8", features = ["trace", "decompression-gzip", "decompression-zstd", "timeout"] }
 
 # gRPC server
 tonic = "0.14"

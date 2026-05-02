@@ -6,7 +6,7 @@
 
 mod config;
 mod core;
-pub(crate) mod log_metadata_scan;
+pub(crate) mod metadata_scan;
 pub(crate) mod provider;
 
 pub use core::QueryEngine;

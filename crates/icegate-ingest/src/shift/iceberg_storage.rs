@@ -32,6 +32,7 @@ use icegate_common::{
 };
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::schema::types::ColumnPath;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, warn};
@@ -131,19 +132,34 @@ pub(super) const fn writer_max_parquet_bytes(upper_bound_input_bytes: u64) -> u6
 pub struct IcebergStorage {
     loader: TableLoader,
     row_group_size: usize,
-    max_file_size_bytes: u64,
+    max_file_size_mb: u64,
+    /// Column names that should get a Parquet bloom filter when written.
+    ///
+    /// The list is owned by the caller (typically a per-table
+    /// `ShiftJobSpec`); this struct stays table-agnostic and just
+    /// forwards the list to the writer-properties builder.
+    bloom_filter_columns: &'static [&'static str],
     retrier: Retrier,
 }
 
 impl IcebergStorage {
     /// Creates a new Iceberg storage for the provided table and catalog.
-    pub fn new(catalog: Arc<dyn Catalog>, table: impl Into<String>, shift_config: &ShiftConfig) -> Self {
+    ///
+    /// `bloom_filter_columns` is the per-table list of columns that
+    /// should have a Parquet bloom filter; pass `&[]` if none.
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        table: impl Into<String>,
+        shift_config: &ShiftConfig,
+        bloom_filter_columns: &'static [&'static str],
+    ) -> Self {
         let table_ident = TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.into());
         let max_file_size_bytes = writer_max_parquet_bytes(shift_config.read.upper_bound_input_bytes_per_task);
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,
             max_file_size_bytes,
+            bloom_filter_columns,
             retrier: Retrier::new(RetrierConfig::default()),
         }
     }
@@ -202,6 +218,7 @@ impl IcebergStorage {
         let handle = tokio::runtime::Handle::current();
         let row_group_size = self.row_group_size;
         let max_file_size_bytes = self.max_file_size_bytes;
+        let bloom_filter_columns = self.bloom_filter_columns;
         let cancel = cancel_token.clone();
         let table = self.load_table(cancel_token).await?;
 
@@ -216,6 +233,7 @@ impl IcebergStorage {
                 table,
                 row_group_size,
                 max_file_size_bytes,
+                bloom_filter_columns,
                 batches,
                 &cancel,
             ))
@@ -229,6 +247,7 @@ impl IcebergStorage {
         table: Table,
         row_group_size: usize,
         max_file_size_bytes: u64,
+        bloom_filter_columns: &'static [&'static str],
         mut batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
@@ -246,12 +265,7 @@ impl IcebergStorage {
         let file_name_generator = DefaultFileNameGenerator::new(write_id.to_string(), None, DataFileFormat::Parquet);
 
         // TODO(med): Issue #101. Add semaphore/CPU budget. The limit should protect ingest from ZSTD spikes during multiple shift tasks.
-        let writer_props = WriterProperties::builder()
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .set_data_page_row_count_limit((row_group_size / 10).max(1))
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .set_max_row_group_size(row_group_size)
-            .build();
+        let writer_props = build_writer_properties(row_group_size, bloom_filter_columns);
 
         let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table_metadata.current_schema().clone());
 
@@ -453,6 +467,35 @@ impl IcebergStorage {
     }
 }
 
+/// Builds the Parquet [`WriterProperties`] used for an Iceberg shift
+/// write.
+///
+/// Per-column bloom filters are enabled for every column listed in
+/// `bloom_filter_columns`. The NDV hint is set to `row_group_size`
+/// because that is the upper bound on distinct values within a single
+/// row group (every row contributes at most one new value), which
+/// right-sizes the bloom filter without over-allocating.
+///
+/// This function is intentionally table-agnostic — the caller decides
+/// which columns make sense to filter for the table being written.
+fn build_writer_properties(row_group_size: usize, bloom_filter_columns: &[&str]) -> WriterProperties {
+    let mut builder = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_data_page_row_count_limit((row_group_size / 10).max(1))
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_max_row_group_size(row_group_size);
+
+    let ndv = u64::try_from(row_group_size).unwrap_or(u64::MAX);
+    for col in bloom_filter_columns {
+        let path = ColumnPath::from(*col);
+        builder = builder
+            .set_column_bloom_filter_enabled(path.clone(), true)
+            .set_column_bloom_filter_ndv(path, ndv);
+    }
+
+    builder.build()
+}
+
 async fn cleanup_generated_data_files(file_io: &FileIO, generated_paths: &Arc<std::sync::Mutex<Vec<String>>>) {
     let generated = match generated_paths.lock() {
         Ok(guard) => guard.clone(),
@@ -568,9 +611,22 @@ impl TableLoader {
 mod tests {
     use std::sync::Arc;
 
+    use arrow::{
+        array::StringArray,
+        datatypes::{DataType, Field, Schema as ArrowSchema},
+        record_batch::RecordBatch,
+    };
+    use bytes::Bytes;
     use iceberg::io::FileIO;
+    use parquet::{
+        arrow::ArrowWriter,
+        file::{
+            metadata::ColumnChunkMetaData,
+            reader::{FileReader, SerializedFileReader},
+        },
+    };
 
-    use super::{cleanup_generated_data_files, writer_max_parquet_bytes};
+    use super::{build_writer_properties, cleanup_generated_data_files, writer_max_parquet_bytes};
 
     /// Failover policy guard: writer rollover budget must be exactly
     /// `upper_bound_input_bytes_per_task * 2`.  If this changes, the planner's
@@ -619,5 +675,63 @@ mod tests {
 
         assert!(!file_io.exists(path_1).await.expect("exists path_1"));
         assert!(!file_io.exists(path_2).await.expect("exists path_2"));
+    }
+
+    /// Writes a tiny parquet file using [`build_writer_properties`]
+    /// configured with `bloom_columns`, then returns — for each column
+    /// in `schema_columns` — whether the file's first row group
+    /// carries a bloom filter for that column.
+    fn bloom_filter_presence(schema_columns: &[&str], bloom_columns: &[&str]) -> Vec<bool> {
+        let schema = Arc::new(ArrowSchema::new(
+            schema_columns
+                .iter()
+                .map(|c| Field::new(*c, DataType::Utf8, false))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays = schema_columns
+            .iter()
+            .map(|_| Arc::new(StringArray::from(vec!["a", "b", "c"])) as _)
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("record batch");
+
+        let props = build_writer_properties(1024, bloom_columns);
+        let mut buffer = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, schema, Some(props)).expect("arrow writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+
+        let reader = SerializedFileReader::new(Bytes::from(buffer)).expect("serialized reader");
+        let row_group = reader.metadata().row_group(0);
+        schema_columns
+            .iter()
+            .map(|name| {
+                row_group
+                    .columns()
+                    .iter()
+                    .find(|c| c.column_path().string() == *name)
+                    .and_then(ColumnChunkMetaData::bloom_filter_offset)
+                    .is_some()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn writer_properties_emit_bloom_filter_for_listed_columns() {
+        // The columns named in the bloom-filter list get a bloom
+        // filter in the parquet footer; columns absent from the list
+        // (here `service_name`) do not, even though they are part of
+        // the same parquet file.
+        let presence = bloom_filter_presence(&["trace_id", "span_id", "service_name"], &["trace_id", "span_id"]);
+        assert_eq!(presence, vec![true, true, false]);
+    }
+
+    #[test]
+    fn writer_properties_skip_bloom_filter_when_list_is_empty() {
+        // No bloom filter columns configured ⇒ the parquet footer
+        // carries no bloom filter offsets for any column.
+        let presence = bloom_filter_presence(&["trace_id", "span_id"], &[]);
+        assert_eq!(presence, vec![false, false]);
     }
 }
