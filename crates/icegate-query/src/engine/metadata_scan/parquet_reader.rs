@@ -607,6 +607,20 @@ fn eval_binary_on_stats(rg: &RowGroupMetaData, col_name: &str, op: PredicateOper
             let max = s.max_opt().map(parquet::data_type::ByteArray::data);
             eval_range_ord(op, min, max, v.as_bytes())
         }
+        // FIXED_LEN_BYTE_ARRAY columns (`trace_id`/`span_id`/`parent_span_id`)
+        // store stats with the same byte ordering used for equality, so the
+        // generic `eval_range_ord<&[u8]>` path applies once we surface the
+        // min/max as `&[u8]`. Without this arm, predicates on those columns
+        // fall through to the conservative `_ => true` and never prune.
+        // `Datum::fixed` lowers to `PrimitiveLiteral::Binary` — iceberg-rust
+        // distinguishes `FIXED(N)` from `BINARY` via the datum type field,
+        // not the literal variant. `FixedLenByteArray` derefs to `ByteArray`
+        // so the `.data()` accessor is reached through auto-deref.
+        (Statistics::FixedLenByteArray(s), PrimitiveLiteral::Binary(v)) => {
+            let min = s.min_opt().map(|fla| fla.data());
+            let max = s.max_opt().map(|fla| fla.data());
+            eval_range_ord(op, min, max, v.as_slice())
+        }
         (Statistics::Int64(s), PrimitiveLiteral::Long(v)) => eval_range_ord(op, s.min_opt(), s.max_opt(), v),
         (Statistics::Int32(s), PrimitiveLiteral::Int(v)) => eval_range_ord(op, s.min_opt(), s.max_opt(), v),
         _ => true,
@@ -777,5 +791,69 @@ impl Read for BytesCursor {
         buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use datafusion::arrow::array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use iceberg::expr::PredicateOperator;
+    use iceberg::spec::Datum;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    use super::eval_binary_on_stats;
+
+    /// Write a single-column Parquet file with `FixedSizeBinary(16)` rows
+    /// to an in-memory buffer. Used by the `FIXED_LEN_BYTE_ARRAY` stats-pruning
+    /// tests below to exercise `eval_binary_on_stats` against real Parquet
+    /// metadata (rather than a hand-rolled `RowGroupMetaData` mock).
+    fn write_trace_id_parquet(rows: &[[u8; 16]]) -> Bytes {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "trace_id",
+            DataType::FixedSizeBinary(16),
+            false,
+        )]));
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+        for row in rows {
+            builder.append_value(row).expect("append 16-byte value");
+        }
+        let array: ArrayRef = Arc::new(builder.finish());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("record batch");
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).expect("ArrowWriter");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+        Bytes::from(buf)
+    }
+
+    #[test]
+    fn eval_binary_on_stats_prunes_fixed_len_byte_array_eq_outside_range() {
+        // Stats range [0x10..=0x20]; literal 0x05 is below — Eq cannot match.
+        let buf = write_trace_id_parquet(&[[0x10u8; 16], [0x20u8; 16]]);
+        let reader = SerializedFileReader::new(buf).expect("reader");
+        let rg = reader.metadata().row_group(0);
+        let datum = Datum::fixed(vec![0x05u8; 16]);
+        assert!(
+            !eval_binary_on_stats(rg, "trace_id", PredicateOperator::Eq, &datum),
+            "literal below stats range; row group must prune"
+        );
+    }
+
+    #[test]
+    fn eval_binary_on_stats_keeps_fixed_len_byte_array_eq_inside_range() {
+        // Stats range [0x10..=0x20]; literal 0x18 is inside — Eq might match.
+        let buf = write_trace_id_parquet(&[[0x10u8; 16], [0x20u8; 16]]);
+        let reader = SerializedFileReader::new(buf).expect("reader");
+        let rg = reader.metadata().row_group(0);
+        let datum = Datum::fixed(vec![0x18u8; 16]);
+        assert!(
+            eval_binary_on_stats(rg, "trace_id", PredicateOperator::Eq, &datum),
+            "literal inside stats range; row group must be kept"
+        );
     }
 }

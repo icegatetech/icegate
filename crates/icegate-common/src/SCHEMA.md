@@ -79,8 +79,8 @@ CREATE TABLE iceberg.triplecloud.logs (
     ingested_timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,
 
     -- W3C trace context (for correlation with spans)
-    trace_id VARCHAR,    -- W3C trace ID as hex string (32 chars)
-    span_id VARCHAR,     -- W3C span ID as hex string (16 chars)
+    trace_id VARBINARY,  -- 16-byte W3C trace ID (FIXED_LEN_BYTE_ARRAY(16))
+    span_id VARBINARY,   -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8))
 
     -- Severity information
     severity_text VARCHAR,
@@ -127,9 +127,9 @@ CREATE TABLE iceberg.triplecloud.spans (
     service_name VARCHAR,            -- Optional for flexibility
 
     -- Trace identifiers (W3C trace context) - sorted by these for trace analysis
-    trace_id VARCHAR NOT NULL,        -- W3C trace ID as hex string (32 chars)
-    span_id VARCHAR NOT NULL,         -- W3C span ID as hex string (16 chars)
-    parent_span_id VARCHAR,           -- W3C span ID as hex string (16 chars)
+    trace_id VARBINARY NOT NULL,      -- 16-byte W3C trace ID (FIXED_LEN_BYTE_ARRAY(16))
+    span_id VARBINARY NOT NULL,       -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8))
+    parent_span_id VARBINARY,         -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8)); all-zero or null for root spans
 
     -- Timestamp fields
     timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,
@@ -164,8 +164,8 @@ CREATE TABLE iceberg.triplecloud.spans (
 
     -- Nested links (HAS trace_id/span_id - references linked span)
     links ARRAY(ROW(
-        trace_id VARCHAR,             -- W3C trace ID as hex string (32 chars)
-        span_id VARCHAR,              -- W3C span ID as hex string (16 chars)
+        trace_id VARBINARY,           -- 16-byte W3C trace ID (FIXED_LEN_BYTE_ARRAY(16))
+        span_id VARBINARY,            -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8))
         trace_state VARCHAR,
         attributes MAP(VARCHAR, VARCHAR),
         dropped_attributes_count INTEGER,
@@ -218,8 +218,8 @@ CREATE TABLE iceberg.triplecloud.events (
     event_name VARCHAR NOT NULL,
 
     -- Trace context (for correlation)
-    trace_id VARCHAR,                 -- W3C trace ID as hex string (32 chars)
-    span_id VARCHAR,                  -- W3C span ID as hex string (16 chars)
+    trace_id VARBINARY,               -- 16-byte W3C trace ID (FIXED_LEN_BYTE_ARRAY(16))
+    span_id VARBINARY,                -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8))
 
     -- Event attributes
     attributes MAP(VARCHAR, VARCHAR) NOT NULL
@@ -314,8 +314,8 @@ CREATE TABLE iceberg.triplecloud.metrics (
         timestamp TIMESTAMP(6) WITH TIME ZONE,
         value_double DOUBLE,
         value_int BIGINT,
-        span_id VARCHAR,                  -- W3C span ID as hex string (16 chars)
-        trace_id VARCHAR,                 -- W3C trace ID as hex string (32 chars)
+        span_id VARBINARY,                -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8))
+        trace_id VARBINARY,               -- 16-byte W3C trace ID (FIXED_LEN_BYTE_ARRAY(16))
         attributes MAP(VARCHAR, VARCHAR)
     ))
 )
@@ -426,8 +426,8 @@ Rust types from `schema.rs` mapped to Trino SQL types:
 | `Boolean` | `BOOLEAN` | True/false value |
 | `Double` | `DOUBLE` | 64-bit floating point |
 | `Timestamp` | `TIMESTAMP(6) WITH TIME ZONE` | Microsecond precision with timezone |
-| `String` (trace_id) | `VARCHAR` | W3C trace ID as hex string (32 chars) |
-| `String` (span_id) | `VARCHAR` | W3C span ID as hex string (16 chars) |
+| `Fixed(16)` (trace_id) | `VARBINARY` | 16-byte W3C trace ID, stored as `FIXED_LEN_BYTE_ARRAY(16)` — see [Migration Guide](#migration-guide) |
+| `Fixed(8)` (span_id, parent_span_id) | `VARBINARY` | 8-byte W3C span ID, stored as `FIXED_LEN_BYTE_ARRAY(8)` — see [Migration Guide](#migration-guide) |
 | `Map<String, String>` | `MAP(VARCHAR, VARCHAR)` | Key-value pairs |
 | `List<T>` | `ARRAY(T)` | Array of elements |
 | `Struct` | `ROW(...)` | Nested structure with named fields |
@@ -491,3 +491,60 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 - Updated field optionality: `cloud_account_id`, `service_name`, and `body` are now optional where applicable
 - Updated sorting strategies: logs/events use descending timestamp, spans sorted by trace_id
 - Adjusted Parquet row group size to 64 MB and page size to 1 MB for better performance
+
+---
+
+## Migration Guide
+
+### Trace and Span ID storage change (GH-135)
+
+Prior to GH-135, `trace_id`, `span_id`, and `parent_span_id` were stored as
+UTF-8 hex strings (`VARCHAR`). They are now stored as fixed-length binary
+(`FIXED_LEN_BYTE_ARRAY(16)` for trace IDs, `FIXED_LEN_BYTE_ARRAY(8)` for
+span and parent span IDs). The change improves Parquet stats pruning and
+lets `DELTA_BYTE_ARRAY` encoding ship adjacent IDs in ~3-4 bytes/row vs.
+the dictionary+RLE on hex strings.
+
+**This is a breaking schema change.** `icegate-maintain migrate run`
+detects the type difference and refuses to evolve in place — Iceberg's
+schema evolution does not permit `STRING → FIXED(N)` promotion, so
+operators must perform a destructive migration.
+
+#### Affected tables
+
+- `logs` — `trace_id`, `span_id`
+- `spans` — `trace_id`, `span_id`, `parent_span_id`
+- `events` — `trace_id`, `span_id`
+- `metrics` — exemplar `trace_id`, `span_id` (nested)
+
+#### Procedure
+
+1. **Back up** the affected tables. With Nessie this is a `CREATE BRANCH`
+   off the live ref before you drop anything; with a hosted REST catalog,
+   snapshot the underlying object-store prefix.
+2. **Stop ingest writers** so no new files land in the old schema during
+   the cutover.
+3. **Drop and recreate** each affected table from the canonical Rust
+   schema:
+   ```bash
+   icegate-maintain migrate create
+   ```
+   This recreates every table with the new `Fixed(N)` columns.
+4. **Resume ingest** — new writes carry the new schema; queries against
+   pre-migration data require restoring from the backup branch (queries
+   that span both old and new schemas are not supported).
+
+#### Reader compatibility
+
+Any external reader (Trino, Athena, Spark) reading the IceGate tables
+directly must be updated to expect `VARBINARY` columns. Queries that
+hex-encode the values for display can use `to_hex(trace_id)` (Trino),
+`hex(trace_id)` (Spark/Athena), or the engine's equivalent.
+
+#### Root-span sentinel
+
+`parent_span_id` may arrive as either SQL null or 8 zero bytes for root
+spans — both are treated as "no parent" by the IceGate Tempo formatters
+and TraceQL planner. External readers must apply the same convention
+(check `parent_span_id IS NULL OR parent_span_id = X'00000000_00000000'`)
+when distinguishing root from child spans.

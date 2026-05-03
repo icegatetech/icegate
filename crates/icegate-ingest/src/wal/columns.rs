@@ -118,17 +118,28 @@ impl SortColumnCache {
                     descending: sort_column.descending,
                     nulls_first: sort_column.nulls_first,
                 },
-                PrimitiveType::Fixed(_) => CachedSortColumn::FixedBytes {
-                    values: column
-                        .as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .ok_or_else(|| {
-                            IngestError::Shift(format!("{column_name} must be FixedSizeBinary for {context}"))
-                        })?
-                        .clone(),
-                    descending: sort_column.descending,
-                    nulls_first: sort_column.nulls_first,
-                },
+                PrimitiveType::Fixed(expected_width) => {
+                    let arr = column.as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| {
+                        IngestError::Shift(format!("{column_name} must be FixedSizeBinary for {context}"))
+                    })?;
+                    let actual_width = arr.value_length();
+                    let expected_i32 = i32::try_from(expected_width).map_err(|_| {
+                        IngestError::Shift(format!(
+                            "{column_name} schema width {expected_width} overflows i32 for {context}"
+                        ))
+                    })?;
+                    if actual_width != expected_i32 {
+                        return Err(IngestError::Shift(format!(
+                            "{column_name} FixedSizeBinary width mismatch for {context}: \
+                             expected {expected_width}, array reports {actual_width}"
+                        )));
+                    }
+                    CachedSortColumn::FixedBytes {
+                        values: arr.clone(),
+                        descending: sort_column.descending,
+                        nulls_first: sort_column.nulls_first,
+                    }
+                }
                 ref other => {
                     return Err(IngestError::Shift(format!(
                         "unsupported sort column type for '{column_name}' in {context}: {other}"
@@ -577,5 +588,28 @@ mod tests {
             .find(|column| column.column_name == "trace_id")
             .expect("spans sort order must include trace_id");
         assert_eq!(trace_id_column.primitive_type, PrimitiveType::Fixed(16));
+    }
+
+    #[test]
+    fn sort_column_cache_rejects_fixed_size_binary_with_wrong_width() {
+        // Descriptor declares Fixed(16) for trace_id, but the batch arrives
+        // with FixedSizeBinary(8). The cache builder must surface this as
+        // IngestError::Shift instead of silently accepting a wrong-width array
+        // and producing nonsense ordering downstream.
+        let descriptor = fixed_bytes_descriptor(false, true);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "trace_id",
+            DataType::FixedSizeBinary(8),
+            true,
+        )]));
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(1, 8);
+        builder.append_value([0u8; 8]).expect("append 8 bytes");
+        let array: ArrayRef = Arc::new(builder.finish());
+        let batch = RecordBatch::try_new(arrow_schema, vec![array]).expect("batch");
+
+        match SortColumnCache::try_new(&batch, &descriptor, "wrong-width") {
+            Ok(_) => panic!("must reject mismatched widths"),
+            Err(err) => assert!(matches!(err, IngestError::Shift(_))),
+        }
     }
 }

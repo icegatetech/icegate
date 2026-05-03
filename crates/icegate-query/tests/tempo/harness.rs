@@ -216,9 +216,19 @@ pub async fn write_test_spans_with_properties(
     }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
+    // Row 0 is the trace's root (no parent). Rows 1 and 2 are children of
+    // row 0, so their `parent_span_id` matches row 0's `span_id`
+    // ("0102030405060708") above. Carrying a real non-null parent through
+    // FIXED_LEN_BYTE_ARRAY(8) exercises the full encode/decode path for
+    // every Tempo formatter test that consumes this fixture; an all-null
+    // column would let a future regression in `parent_span_id` plumbing
+    // ship without any integration coverage.
+    let row0_span_id = hex::decode("0102030405060708").expect("row0 span_id hex");
+    let parent_span_id_values: [Option<&[u8]>; 3] =
+        [None, Some(row0_span_id.as_slice()), Some(row0_span_id.as_slice())];
     let parent_span_id: ArrayRef = Arc::new(
         datafusion::arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-            std::iter::repeat_n::<Option<&[u8]>>(None, 3),
+            parent_span_id_values.into_iter(),
             8,
         )
         .expect("parent_span_id"),

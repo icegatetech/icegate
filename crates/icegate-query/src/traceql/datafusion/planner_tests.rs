@@ -817,12 +817,44 @@ async fn empty_selector_under_unknown_tenant_returns_zero_rows() {
 /// nothing when queried under tenant `t2`. Direct regression test
 /// against the cross-tenant `trace_id` leak called out in the planner
 /// stage-2 review.
+///
+/// Uses the hex-encoded form of the fixture's `t1-trace-1` row
+/// (`pad_id::<16>("t1-trace-1")` zero-padded → 32-char hex). This
+/// exercises the real hex-decode-and-typed-binary-equality path in
+/// `selectors.rs`, not the invalid-hex `lit(false)` short-circuit
+/// (which would let this test pass for the wrong reason after the
+/// `LogQL` Eq/Neq invariant fix).
 #[tokio::test]
 async fn cross_tenant_trace_id_filter_returns_zero_rows() {
     let ctx = fixture_session();
     let qctx = make_query_ctx("t2");
-    let total = run_and_count(ctx, qctx, r#"{ traceID = "t1-trace-1" }"#).await;
+    // Hex of `pad_id::<16>("t1-trace-1")` = b"t1-trace-1" + 6 NUL bytes.
+    let total = run_and_count(ctx, qctx, r#"{ traceID = "74312d74726163652d31000000000000" }"#).await;
     assert_eq!(total, 0, "trace IDs must never cross tenant boundaries");
+}
+
+/// Confirms the hex-encoded form of `pad_id::<16>("t1-trace-1")`
+/// matches the literal string used in
+/// [`cross_tenant_trace_id_filter_returns_zero_rows`]. Without this
+/// pin, a future change to `pad_id` would silently turn that test
+/// into a tautology again (the selector would no longer match the
+/// fixture and the assertion would pass for trivial reasons).
+#[test]
+fn pad_id_hex_matches_cross_tenant_test_literal() {
+    let bytes = pad_id::<16>("t1-trace-1");
+    assert_eq!(hex::encode(bytes), "74312d74726163652d31000000000000");
+}
+
+/// A `traceID` filter using the t1 hex literal MUST return rows when
+/// queried as t1 — companion to [`cross_tenant_trace_id_filter_returns_zero_rows`]
+/// to ensure that test isn't passing because the hex selector matches
+/// nothing in any tenant.
+#[tokio::test]
+async fn matching_tenant_trace_id_filter_returns_rows() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let total = run_and_count(ctx, qctx, r#"{ traceID = "74312d74726163652d31000000000000" }"#).await;
+    assert!(total > 0, "trace IDs must surface rows in their owning tenant");
 }
 
 // =========================================================================

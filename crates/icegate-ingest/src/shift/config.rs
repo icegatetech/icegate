@@ -447,4 +447,15 @@ mod tests {
             "worker_count must follow available CPU parallelism"
         );
     }
+
+    #[test]
+    fn shift_validate_rejects_zero_data_page_size_limit_bytes() {
+        // Guards the Helm chart / config field from defaulting to zero —
+        // a zero data page size limit silently disables Parquet page
+        // splitting, which would tank stats pruning at query time.
+        let mut config = ShiftConfig::default();
+        config.write.data_page_size_limit_bytes = 0;
+        let err = config.validate().expect_err("config must be invalid");
+        assert!(matches!(err, crate::error::IngestError::Config(_)));
+    }
 }

@@ -21,13 +21,24 @@ use crate::logql::log::Selector;
 /// Build a `Datum` matching the storage type of `column`. Most indexed
 /// columns are `STRING`; trace/span identifiers are `FIXED_LEN_BYTE_ARRAY`
 /// and require hex decoding before they can be compared. Returns `None` for
-/// values that fail to decode (e.g. malformed hex), which lets the caller
-/// drop the matcher rather than synthesize a never-matching predicate.
+/// values that fail to decode (e.g. malformed hex) **or that decode to the
+/// wrong number of bytes** — synthesizing a wrong-width `Datum::fixed`
+/// against a typed column would either fail at scan time or silently mismiss
+/// rows. Callers drop the matcher on `None`; over-approximation is fine
+/// because the `LogQL` execution-time planner re-validates and produces the
+/// precise filter.
 fn datum_for_column(column: &str, value: &str) -> Option<Datum> {
     match column {
-        COL_TRACE_ID | COL_SPAN_ID | COL_PARENT_SPAN_ID => hex::decode(value).ok().map(Datum::fixed),
+        COL_TRACE_ID => decode_fixed_hex(value, 16).map(Datum::fixed),
+        COL_SPAN_ID | COL_PARENT_SPAN_ID => decode_fixed_hex(value, 8).map(Datum::fixed),
         _ => Some(Datum::string(value.to_string())),
     }
+}
+
+/// Decode a lowercase hex string and require the result to be exactly
+/// `expected_len` bytes. Returns `None` for invalid hex or wrong length.
+fn decode_fixed_hex(value: &str, expected_len: usize) -> Option<Vec<u8>> {
+    hex::decode(value).ok().filter(|b| b.len() == expected_len)
 }
 
 /// Translate a `LogQL` selector into an iceberg predicate fragment.
@@ -144,5 +155,32 @@ mod tests {
         let p = selector_predicate(&sel, &LOG_CFG);
         let s = format!("{p:?}");
         assert!(s.contains("service_name"));
+    }
+
+    #[test]
+    fn selector_predicate_drops_trace_id_with_wrong_byte_length() {
+        // 8 hex chars = 4 bytes; trace_id requires 16. The matcher must be
+        // dropped (returns AlwaysTrue with no other matchers); silently
+        // emitting a 4-byte Datum::fixed against a 16-byte column would let
+        // iceberg-rust either error at scan time or produce wrong pruning.
+        let sel = Selector::new(vec![LabelMatcher::eq("trace_id", "deadbeef")]);
+        let p = selector_predicate(&sel, &LOG_CFG);
+        assert!(matches!(p, iceberg::expr::Predicate::AlwaysTrue));
+    }
+
+    #[test]
+    fn selector_predicate_drops_span_id_with_wrong_byte_length() {
+        // 4 hex chars = 2 bytes; span_id requires 8.
+        let sel = Selector::new(vec![LabelMatcher::eq("span_id", "dead")]);
+        let p = selector_predicate(&sel, &LOG_CFG);
+        assert!(matches!(p, iceberg::expr::Predicate::AlwaysTrue));
+    }
+
+    #[test]
+    fn selector_predicate_keeps_trace_id_with_correct_byte_length() {
+        let sel = Selector::new(vec![LabelMatcher::eq("trace_id", "0102030405060708090a0b0c0d0e0f10")]);
+        let p = selector_predicate(&sel, &LOG_CFG);
+        let s = format!("{p:?}");
+        assert!(s.contains("trace_id"));
     }
 }

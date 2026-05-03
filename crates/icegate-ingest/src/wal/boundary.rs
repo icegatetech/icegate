@@ -141,6 +141,15 @@ impl RowGroupBoundaryComponent {
                     right.type_name()
                 )))
             }
+            (Some(RowGroupBoundaryValue::FixedBytes(left)), Some(RowGroupBoundaryValue::FixedBytes(right)))
+                if left.len() != right.len() =>
+            {
+                Err(IngestError::Shift(format!(
+                    "incompatible boundary key structure at component {index}: fixed_bytes width differs ({} bytes, {} bytes)",
+                    left.len(),
+                    right.len()
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -240,6 +249,7 @@ mod tests {
     use std::cmp::Ordering;
 
     use super::{RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, compare_option_ord};
+    use crate::error::IngestError;
 
     #[test]
     fn compare_option_ord_handles_desc_nulls_first() {
@@ -452,6 +462,25 @@ mod tests {
             .compare_checked(&fixed_key)
             .expect_err("string vs fixed_bytes must be rejected");
         assert!(err.to_string().contains("value type differs"));
+    }
+
+    #[test]
+    fn row_group_boundary_key_rejects_mismatched_fixed_bytes_widths() {
+        // A 16-byte (trace_id-shaped) component compared against an 8-byte
+        // (span_id-shaped) component must fail compatibility — silently
+        // accepting the mismatch lets `compare_unchecked` lex-compare slices
+        // of unequal length and produce nonsense ordering across streams.
+        let key_16 = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::fixed_bytes(Some(vec![0u8; 16]), false, true)],
+        };
+        let key_8 = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::fixed_bytes(Some(vec![0u8; 8]), false, true)],
+        };
+
+        match key_16.compare_checked(&key_8) {
+            Ok(_) => panic!("mismatched fixed_bytes widths must be rejected"),
+            Err(err) => assert!(matches!(err, IngestError::Shift(_))),
+        }
     }
 
     #[test]

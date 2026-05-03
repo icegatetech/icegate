@@ -9,6 +9,42 @@ const COL_ATTR_KEYS: &str = "_attr_keys";
 /// Internal column name for serialized attribute values.
 const COL_ATTR_VALS: &str = "_attr_vals";
 
+/// Returns the `FixedSizeBinary` width in bytes for a binary identifier
+/// column on the `logs` table, or `None` for non-binary columns. Centralises
+/// the column-name → width mapping shared by `matcher_to_expr` and
+/// `binary_id_matcher_to_expr`. Only `trace_id` / `span_id` are top-level
+/// fields on logs (`parent_span_id` is not indexed there — see
+/// `LOG_INDEXED_ATTRIBUTE_COLUMNS`).
+const fn binary_id_width(column: &str) -> Option<i32> {
+    if string_eq(column, COL_TRACE_ID) {
+        Some(16)
+    } else if string_eq(column, COL_SPAN_ID) {
+        Some(8)
+    } else {
+        None
+    }
+}
+
+/// `const`-friendly string equality used by [`binary_id_width`]. Plain `==`
+/// on `&str` is not yet `const`-callable on stable Rust 1.95, so we compare
+/// the underlying byte slices manually. Both inputs are static column-name
+/// constants (`COL_TRACE_ID`, etc.), so this runs at most a few iterations.
+const fn string_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::functions_aggregate::expr_fn::{avg, bool_or, max, min, stddev, var_sample};
 use datafusion::{
@@ -1207,11 +1243,14 @@ impl DataFusionPlanner {
     /// Handles both indexed columns (e.g., `service_name`, `severity_text`) and
     /// attributes from the MAP column.
     ///
-    /// `trace_id`, `span_id`, and `parent_span_id` are stored as raw
-    /// `FIXED_LEN_BYTE_ARRAY`; the matcher value is treated as lowercase hex
-    /// and decoded into a typed `FixedSizeBinary` literal so the predicate
-    /// matches the column type. Malformed hex collapses to a NULL literal,
-    /// which never matches — equivalent to "no rows for that filter".
+    /// `trace_id` and `span_id` are stored as raw `FIXED_LEN_BYTE_ARRAY` and
+    /// route through [`Self::binary_id_matcher_to_expr`] so all four match
+    /// ops behave correctly on the typed column:
+    /// - `=` / `!=` on valid hex emits a typed `FixedSizeBinary` literal.
+    /// - `=` / `!=` on invalid hex collapses to `lit(false)` / `lit(true)`
+    ///   so DataFusion's three-valued logic doesn't drop the entire row set.
+    /// - `=~` / `!~` hex-encodes the column before applying `regexp_like`,
+    ///   matching the user's natural string view of the identifier.
     pub fn matcher_to_expr(matcher: &LabelMatcher) -> Expr {
         let mapped_label = Self::map_label_to_internal_name(&matcher.label);
         let col_expr = if Self::is_top_level_field(&matcher.label) {
@@ -1222,29 +1261,50 @@ impl DataFusionPlanner {
             datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(matcher.label.as_str())])
         };
 
-        let val = match mapped_label {
-            COL_TRACE_ID => match hex::decode(matcher.value.as_str()) {
-                Ok(bytes) if bytes.len() == 16 => lit(ScalarValue::FixedSizeBinary(16, Some(bytes))),
-                _ => lit(ScalarValue::FixedSizeBinary(16, None)),
-            },
-            COL_SPAN_ID => match hex::decode(matcher.value.as_str()) {
-                Ok(bytes) if bytes.len() == 8 => lit(ScalarValue::FixedSizeBinary(8, Some(bytes))),
-                _ => lit(ScalarValue::FixedSizeBinary(8, None)),
-            },
-            _ => lit(matcher.value.as_str()),
-        };
+        if let Some(width) = binary_id_width(mapped_label) {
+            return Self::binary_id_matcher_to_expr(col_expr, matcher.op, &matcher.value, width);
+        }
 
+        let val = lit(matcher.value.as_str());
         match matcher.op {
             MatchOp::Eq => col_expr.eq(val),
             MatchOp::Neq => col_expr.not_eq(val),
-            // Use regexp_like which returns boolean (true if pattern matches)
-            // Note: regex matching on binary columns is not supported, will treat as string
-            MatchOp::Re => {
-                datafusion::functions::regex::regexp_like().call(vec![col_expr, lit(matcher.value.as_str())])
+            MatchOp::Re => datafusion::functions::regex::regexp_like().call(vec![col_expr, val]),
+            MatchOp::Nre => datafusion::functions::regex::regexp_like().call(vec![col_expr, val]).not(),
+        }
+    }
+
+    /// Build a matcher expression for a binary identifier column
+    /// (`trace_id` / `span_id`).
+    ///
+    /// Hex is validated up front so equality and inequality can fall back to
+    /// constant boolean literals when the user supplies invalid hex —
+    /// preserving SQL set-theoretic semantics: `Neq` matches every valid
+    /// row, `Eq` matches none. Both raw forms (`col = NULL`, `col != NULL`)
+    /// fold to NULL under three-valued logic, which DataFusion treats as
+    /// "drop the row" — the opposite of the user's intent for `Neq`.
+    ///
+    /// Regex matchers run against the hex-encoded column via the `encode`
+    /// UDF; `regexp_like` cannot consume `FixedSizeBinary` directly.
+    fn binary_id_matcher_to_expr(col_expr: Expr, op: MatchOp, value: &str, width: i32) -> Expr {
+        let expected_len = usize::try_from(width).unwrap_or(0);
+        let decoded = hex::decode(value).ok().filter(|b| b.len() == expected_len);
+        match (op, decoded) {
+            (MatchOp::Eq, Some(b)) => col_expr.eq(lit(ScalarValue::FixedSizeBinary(width, Some(b)))),
+            (MatchOp::Neq, Some(b)) => col_expr.not_eq(lit(ScalarValue::FixedSizeBinary(width, Some(b)))),
+            // Invalid hex: see fn-level doc for why these collapse to constants.
+            (MatchOp::Eq, None) => lit(false),
+            (MatchOp::Neq, None) => lit(true),
+            (MatchOp::Re, _) => {
+                let hex_col = datafusion::functions::encoding::encode().call(vec![col_expr, lit("hex")]);
+                datafusion::functions::regex::regexp_like().call(vec![hex_col, lit(value)])
             }
-            MatchOp::Nre => datafusion::functions::regex::regexp_like()
-                .call(vec![col_expr, lit(matcher.value.as_str())])
-                .not(),
+            (MatchOp::Nre, _) => {
+                let hex_col = datafusion::functions::encoding::encode().call(vec![col_expr, lit("hex")]);
+                datafusion::functions::regex::regexp_like()
+                    .call(vec![hex_col, lit(value)])
+                    .not()
+            }
         }
     }
 
@@ -1631,5 +1691,74 @@ impl DataFusionPlanner {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod matcher_to_expr_tests {
+    //! Behavioral tests for `DataFusionPlanner::matcher_to_expr`.
+    //!
+    //! `trace_id` and `span_id` are stored as `FIXED_LEN_BYTE_ARRAY`. The
+    //! planner has to (a) reject malformed-hex matchers without poisoning
+    //! the row set under three-valued logic and (b) make `=~` / `!~` work
+    //! against the user-visible hex representation rather than the raw
+    //! binary column (which `regexp_like` cannot accept).
+    use super::DataFusionPlanner;
+    use crate::logql::log::LabelMatcher;
+
+    #[test]
+    fn neq_on_trace_id_with_invalid_hex_matches_all_rows() {
+        // Pre-fix this produced `col != typed_NULL`, which DataFusion's
+        // three-valued logic folds to NULL → drops every row. The user
+        // intent is the opposite: "match anything that is *not* this
+        // (uninterpretable) literal" should yield every row.
+        let m = LabelMatcher::neq("trace_id", "not-hex");
+        let expr = DataFusionPlanner::matcher_to_expr(&m);
+        let s = format!("{expr:?}");
+        assert!(
+            s.contains("Boolean(true)"),
+            "expected always-true literal expression for invalid-hex Neq, got: {s}"
+        );
+    }
+
+    #[test]
+    fn eq_on_trace_id_with_invalid_hex_matches_no_rows() {
+        // Pre-fix this produced `col = typed_NULL` → also folded to NULL →
+        // dropped every row. Same end result as Neq but for the wrong
+        // reason; the post-fix expression is an explicit `false` literal so
+        // the planner doesn't touch the row scanner at all.
+        let m = LabelMatcher::eq("trace_id", "not-hex");
+        let expr = DataFusionPlanner::matcher_to_expr(&m);
+        let s = format!("{expr:?}");
+        assert!(
+            s.contains("Boolean(false)"),
+            "expected always-false literal expression for invalid-hex Eq, got: {s}"
+        );
+    }
+
+    #[test]
+    fn re_on_trace_id_encodes_column_as_hex_before_regex() {
+        // `regexp_like` rejects FixedSizeBinary inputs at execution time, so
+        // the planner must convert the binary column to its hex string
+        // representation before applying the regex. The expression must
+        // contain RegexpLike AND EncodeFunc (wrapping the column).
+        let m = LabelMatcher::re("trace_id", "^abc");
+        let expr = DataFusionPlanner::matcher_to_expr(&m);
+        let s = format!("{expr:?}");
+        assert!(s.contains("RegexpLike"), "expected RegexpLike call in: {s}");
+        assert!(s.contains("EncodeFunc"), "expected EncodeFunc wrapper in: {s}");
+        assert!(s.contains("\"hex\""), "expected hex format literal in: {s}");
+    }
+
+    #[test]
+    fn eq_on_trace_id_with_valid_hex_uses_typed_binary_literal() {
+        let m = LabelMatcher::eq("trace_id", "0102030405060708090a0b0c0d0e0f10");
+        let expr = DataFusionPlanner::matcher_to_expr(&m);
+        let s = format!("{expr:?}");
+        // Must reach a typed FixedSizeBinary equality, not collapse to a
+        // boolean literal — the row scan still needs the typed predicate
+        // to drive Iceberg pruning.
+        assert!(s.contains("FixedSizeBinary"), "expected typed binary literal in: {s}");
+        assert!(s.contains("trace_id"), "expected column reference in: {s}");
     }
 }

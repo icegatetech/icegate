@@ -90,7 +90,9 @@ pub fn spans_to_otlp_json(batches: &[RecordBatch]) -> crate::error::Result<Value
 
             let trace_id_hex = hex::encode(trace_ids.value(row));
             let span_id_hex = hex::encode(span_ids.value(row));
-            let parent_hex = parent_ids.filter(|c| !c.is_null(row)).map(|c| hex::encode(c.value(row)));
+            let parent_hex = parent_ids
+                .filter(|c| !is_null_or_zero_parent(c, row))
+                .map(|c| hex::encode(c.value(row)));
             let span_value = build_span_value(
                 &trace_id_hex,
                 &span_id_hex,
@@ -271,6 +273,19 @@ fn id_hex(arr: &FixedSizeBinaryArray, row: usize) -> Option<String> {
     } else {
         Some(hex::encode(arr.value(row)))
     }
+}
+
+/// Returns `true` when a `parent_span_id` cell is either SQL-null or the
+/// all-zero sentinel that historically meant "no parent". After the
+/// `FIXED_LEN_BYTE_ARRAY(8)` migration, root spans round-trip as 8 zero
+/// bytes (some upstream writers historically wrote the empty string here,
+/// which is the natural Iceberg null), so both representations must be
+/// treated as "this span has no parent" by the JSON and proto formatters —
+/// otherwise Grafana's root-span detection breaks. The `TraceQL` search
+/// planner already applies the same rule when picking root spans
+/// (see `is_root` at the call site for `parents`).
+fn is_null_or_zero_parent(arr: &FixedSizeBinaryArray, row: usize) -> bool {
+    arr.is_null(row) || arr.value(row).iter().all(|&b| b == 0)
 }
 
 fn ts_col<'a>(batch: &'a RecordBatch, name: &str) -> crate::error::Result<&'a TimestampMicrosecondArray> {
@@ -684,7 +699,7 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
             let span = row_to_proto_span(
                 trace_ids.value(row),
                 span_ids.value(row),
-                parent_ids.filter(|c| !c.is_null(row)).map(|c| c.value(row)),
+                parent_ids.filter(|c| !is_null_or_zero_parent(c, row)).map(|c| c.value(row)),
                 names.value(row),
                 kinds.as_ref().map(|c| c.value(row)),
                 statuses.as_ref().map(|c| c.value(row)),
@@ -1736,5 +1751,42 @@ mod search_response_tests {
             .map(|kv| kv.value.string_value.as_str())
             .collect();
         assert_eq!(names, vec!["root-e", "child-e"]);
+    }
+}
+
+#[cfg(test)]
+mod parent_sentinel_tests {
+    use datafusion::arrow::array::FixedSizeBinaryArray;
+
+    use super::is_null_or_zero_parent;
+
+    /// Construct a 3-row `FixedSizeBinary(8)` array exercising every case the
+    /// helper must distinguish: SQL null, the all-zero "no parent" sentinel,
+    /// and a real 8-byte parent ID.
+    fn fixture() -> FixedSizeBinaryArray {
+        let real_parent: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [None, Some([0u8; 8].as_slice()), Some(real_parent.as_slice())].into_iter(),
+            8,
+        )
+        .expect("parent_span_id fixture")
+    }
+
+    #[test]
+    fn null_row_is_treated_as_no_parent() {
+        let arr = fixture();
+        assert!(is_null_or_zero_parent(&arr, 0));
+    }
+
+    #[test]
+    fn all_zero_row_is_treated_as_no_parent() {
+        let arr = fixture();
+        assert!(is_null_or_zero_parent(&arr, 1));
+    }
+
+    #[test]
+    fn non_zero_row_is_treated_as_parent() {
+        let arr = fixture();
+        assert!(!is_null_or_zero_parent(&arr, 2));
     }
 }

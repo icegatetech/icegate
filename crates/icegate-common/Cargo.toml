@@ -71,3 +71,6 @@ opentelemetry-otlp = { workspace = true }
 testcontainers = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+
+[dev-dependencies]
+arrow = { workspace = true }

@@ -193,3 +193,86 @@ pub const METRICS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
     ("max", Encoding::BYTE_STREAM_SPLIT),
     ("zero_threshold", Encoding::BYTE_STREAM_SPLIT),
 ];
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::basic::Encoding;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    use super::{ColumnEncoding, build_writer_properties};
+
+    /// End-to-end check that a `FixedSizeBinary(16)` column written with
+    /// the `DELTA_BYTE_ARRAY` override (a) actually emits that encoding
+    /// and (b) round-trips byte-for-byte through parquet-rs.
+    ///
+    /// Guards two production-critical invariants:
+    /// 1. `set_column_dictionary_enabled(false)` keeps firing for fixed
+    ///    binary columns — without it, parquet-rs treats the override as a
+    ///    fallback that triggers only after the dictionary page exceeds
+    ///    1 `MiB` (which never happens at `IceGate`'s row-group sizes), so
+    ///    the override would silently be a no-op.
+    /// 2. parquet-rs accepts `DELTA_BYTE_ARRAY` for `FIXED_LEN_BYTE_ARRAY`
+    ///    physical types — earlier parquet-rs versions only allowed it on
+    ///    `BYTE_ARRAY`. A future upgrade dropping that support would now
+    ///    fail loudly here.
+    #[test]
+    fn delta_byte_array_roundtrips_fixed_size_binary_16() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "trace_id",
+            DataType::FixedSizeBinary(16),
+            false,
+        )]));
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(3, 16);
+        for i in 0u8..3 {
+            let mut bytes = [0u8; 16];
+            bytes[0] = i;
+            builder.append_value(bytes).expect("append 16-byte value");
+        }
+        let array: ArrayRef = Arc::new(builder.finish());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).expect("record batch");
+
+        let overrides: &[ColumnEncoding] = &[("trace_id", Encoding::DELTA_BYTE_ARRAY)];
+        let props = build_writer_properties(
+            /* row_group_size */ 16,
+            /* data_page_size_limit_bytes */ 1 << 20,
+            /* bloom_filter_columns */ &[],
+            overrides,
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).expect("ArrowWriter");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+
+        // Byte-for-byte readback equality.
+        let buf = Bytes::from(buf);
+        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(buf.clone()).expect("reader builder");
+        let mut reader = reader_builder.build().expect("reader");
+        let read_batch = reader.next().expect("one batch").expect("batch ok");
+        assert_eq!(read_batch.column(0), &array, "FixedSizeBinary roundtrip mismatch");
+
+        // Encoding metadata: DELTA_BYTE_ARRAY must be present, RLE_DICTIONARY
+        // must NOT be present (since we force-disabled dictionary on the
+        // override column). `encodings()` returns an iterator; collect once
+        // so we can scan it twice for the contains assertions.
+        let file_reader = SerializedFileReader::new(buf).expect("file reader");
+        let row_group = file_reader.get_row_group(0).expect("row group 0");
+        let encodings: Vec<Encoding> = row_group.metadata().column(0).encodings().collect();
+        assert!(
+            encodings.contains(&Encoding::DELTA_BYTE_ARRAY),
+            "expected DELTA_BYTE_ARRAY in encodings, got {encodings:?}"
+        );
+        assert!(
+            !encodings.contains(&Encoding::RLE_DICTIONARY),
+            "dictionary encoding leaked through despite set_column_dictionary_enabled(false): {encodings:?}"
+        );
+    }
+}

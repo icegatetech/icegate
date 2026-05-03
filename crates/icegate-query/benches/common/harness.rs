@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use datafusion::arrow::array::{
-    ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
+    ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
+    TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::parquet::file::properties::WriterProperties;
@@ -241,13 +242,17 @@ pub async fn write_benchmark_logs(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    // Create hex-encoded trace and span IDs (matching logs schema)
-    let mut trace_id_builder = StringBuilder::new();
-    let mut span_id_builder = StringBuilder::new();
+    // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
+    // schema; decode the hex fixtures into raw bytes once and reuse them
+    // for every row.
+    let trace_id_bytes = hex::decode("0102030405060708090a0b0c0d0e0f10").expect("trace_id hex");
+    let span_id_bytes = hex::decode("0102030405060708").expect("span_id hex");
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
 
     for _ in 0..count {
-        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
-        span_id_builder.append_value("0102030405060708");
+        trace_id_builder.append_value(&trace_id_bytes).expect("trace_id length 16");
+        span_id_builder.append_value(&span_id_bytes).expect("span_id length 8");
     }
 
     let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
@@ -374,13 +379,17 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    // Create hex-encoded trace and span IDs (matching logs schema)
-    let mut trace_id_builder = StringBuilder::new();
-    let mut span_id_builder = StringBuilder::new();
+    // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
+    // schema; decode the hex fixtures into raw bytes once and reuse them
+    // for every row.
+    let trace_id_bytes = hex::decode("0102030405060708090a0b0c0d0e0f10").expect("trace_id hex");
+    let span_id_bytes = hex::decode("0102030405060708").expect("span_id hex");
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
 
     for _ in 0..count {
-        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
-        span_id_builder.append_value("0102030405060708");
+        trace_id_builder.append_value(&trace_id_bytes).expect("trace_id length 16");
+        span_id_builder.append_value(&span_id_bytes).expect("span_id length 8");
     }
 
     let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
@@ -497,13 +506,17 @@ pub async fn write_benchmark_logs_with_varied_labels(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    // Create hex-encoded trace and span IDs (matching logs schema)
-    let mut trace_id_builder = StringBuilder::new();
-    let mut span_id_builder = StringBuilder::new();
+    // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
+    // schema; decode the hex fixtures into raw bytes once and reuse them
+    // for every row.
+    let trace_id_bytes = hex::decode("0102030405060708090a0b0c0d0e0f10").expect("trace_id hex");
+    let span_id_bytes = hex::decode("0102030405060708").expect("span_id hex");
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
 
     for _ in 0..count {
-        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
-        span_id_builder.append_value("0102030405060708");
+        trace_id_builder.append_value(&trace_id_bytes).expect("trace_id length 16");
+        span_id_builder.append_value(&span_id_bytes).expect("span_id length 8");
     }
 
     let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
