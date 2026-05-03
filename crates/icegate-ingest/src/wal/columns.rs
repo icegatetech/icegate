@@ -552,6 +552,30 @@ mod tests {
     }
 
     #[test]
+    fn sort_column_cache_supports_fixed_bytes_sort_descending() {
+        // trace_a1 < trace_a2 < trace_b lexicographically; under descending
+        // sort the returned `Ordering` is reversed for unequal keys, while
+        // equal-row comparisons still resolve to `Equal` via the row-index
+        // tiebreaker.
+        let trace_a1 = [b'a', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_a2 = [b'a', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_b = [b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let batch = fixed_bytes_batch(&[Some(trace_b), Some(trace_a2), Some(trace_a1)]);
+        let descriptor = fixed_bytes_descriptor(true, true);
+        let cache = SortColumnCache::try_new(&batch, &descriptor, "fixed-bytes desc test").expect("cache");
+
+        // Row 0 = trace_b, row 1 = trace_a2, row 2 = trace_a1.
+        // Ascending would yield Greater/Greater/Less; descending reverses
+        // the unequal pairs.
+        assert_eq!(cache.compare_indices(0, 1), Ordering::Less);
+        assert_eq!(cache.compare_indices(1, 2), Ordering::Less);
+        assert_eq!(cache.compare_indices(2, 1), Ordering::Greater);
+        // Stable tiebreaker for equal rows is unaffected by direction.
+        assert_eq!(cache.compare_indices(0, 0), Ordering::Equal);
+    }
+
+    #[test]
     fn sort_column_cache_compares_across_streams_for_fixed_bytes() {
         let descriptor = fixed_bytes_descriptor(false, true);
         let left_batch = fixed_bytes_batch(&[Some([b'a', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])]);

@@ -17,6 +17,8 @@ This document contains Trino SQL DDL statements for creating Iceberg tables to s
   - [4. Metrics Table](#4-metrics-table)
 - [Post-Creation Tasks](#post-creation-tasks)
 - [Type Mappings](#type-mappings)
+- [Migration Guide](#migration-guide)
+  - [Trace and Span ID storage change (GH-135)](#trace-and-span-id-storage-change-gh-135)
 
 ---
 

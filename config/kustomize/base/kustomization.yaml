@@ -13,6 +13,7 @@ resources:
   - namespace-infra.yaml
   - namespace-observability.yaml
   - otel-collector
+  - cadvisor
 
 helmCharts:
   - name: kube-prometheus-stack

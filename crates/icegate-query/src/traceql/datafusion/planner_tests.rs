@@ -563,11 +563,7 @@ async fn child_only_filter_returns_full_trace_so_root_is_present() {
         }
     }
 
-    let trace_a = {
-        let mut padded = [0u8; 16];
-        padded[..7].copy_from_slice(b"trace-A");
-        padded.to_vec()
-    };
+    let trace_a = pad_id::<16>("trace-A").to_vec();
     // Both trace-A spans must be present — otherwise the formatter
     // can't recover the root and the search summary shows blanks.
     assert!(
@@ -580,11 +576,7 @@ async fn child_only_filter_returns_full_trace_so_root_is_present() {
         "expected trace-A's child span in result, got {:?}",
         pairs
     );
-    let trace_b = {
-        let mut padded = [0u8; 16];
-        padded[..7].copy_from_slice(b"trace-B");
-        padded.to_vec()
-    };
+    let trace_b = pad_id::<16>("trace-B").to_vec();
     // trace-B has no matching child, so it must NOT be in the result.
     assert!(
         !pairs.iter().any(|(t, _)| *t == trace_b),
@@ -622,11 +614,7 @@ async fn limit_caps_traces_not_span_rows() {
             trace_ids.insert(arr.value(row).to_vec());
         }
     }
-    let trace_a_padded = {
-        let mut padded = [0u8; 16];
-        padded[..7].copy_from_slice(b"trace-A");
-        padded.to_vec()
-    };
+    let trace_a_padded = pad_id::<16>("trace-A").to_vec();
     assert_eq!(trace_ids.len(), 1, "expected exactly one trace, got {:?}", trace_ids);
     assert!(
         trace_ids.contains(&trace_a_padded),
@@ -688,16 +676,8 @@ async fn spss_one_keeps_root_over_child() {
             );
         }
     }
-    let trace_a = {
-        let mut padded = [0u8; 16];
-        padded[..7].copy_from_slice(b"trace-A");
-        padded.to_vec()
-    };
-    let trace_b = {
-        let mut padded = [0u8; 16];
-        padded[..7].copy_from_slice(b"trace-B");
-        padded.to_vec()
-    };
+    let trace_a = pad_id::<16>("trace-A").to_vec();
+    let trace_b = pad_id::<16>("trace-B").to_vec();
     // Every trace's surviving span is a root span.
     assert_eq!(by_trace.get(&trace_a).map(String::as_str), Some("root-A"));
     assert_eq!(by_trace.get(&trace_b).map(String::as_str), Some("root-B"));
@@ -854,7 +834,10 @@ async fn matching_tenant_trace_id_filter_returns_rows() {
     let ctx = fixture_session();
     let qctx = make_query_ctx("t1");
     let total = run_and_count(ctx, qctx, r#"{ traceID = "74312d74726163652d31000000000000" }"#).await;
-    assert!(total > 0, "trace IDs must surface rows in their owning tenant");
+    assert_eq!(
+        total, 1,
+        "expected exactly one span for trace_id pad_id::<16>(\"t1-trace-1\") in tenant t1"
+    );
 }
 
 // =========================================================================

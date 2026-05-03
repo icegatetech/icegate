@@ -1,0 +1,123 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cadvisor
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: cadvisor
+    app.kubernetes.io/component: container-metrics
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cadvisor
+  namespaceSelector:
+    matchNames:
+      - observability
+  endpoints:
+    - port: http
+      interval: 30s
+      scrapeTimeout: 10s
+      path: /metrics
+      honorLabels: true
+      relabelings:
+        # Set `instance` and `node` from the host the cAdvisor pod runs on,
+        # not the cAdvisor pod's own name. Container-level pod/namespace come
+        # from cAdvisor's emitted Docker labels (see metricRelabelings).
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: instance
+      metricRelabelings:
+        # === Promote cAdvisor's Docker container labels onto the standard
+        # Prometheus label slots. The kube-prometheus-stack ServiceMonitor
+        # auto-injects pod/namespace/container/service labels from k8s service
+        # discovery — those refer to the cAdvisor DaemonSet pod itself, not
+        # the container being measured. We blank them, then refill from the
+        # `container_label_io_kubernetes_*` labels cAdvisor emits when run
+        # with `--store_container_labels=false --whitelisted_container_labels=...`.
+        - targetLabel: pod
+          replacement: ''
+        - targetLabel: namespace
+          replacement: ''
+        - targetLabel: container
+          replacement: ''
+        - targetLabel: uid
+          replacement: ''
+        - targetLabel: service
+          replacement: ''
+        - sourceLabels: [container_label_io_kubernetes_pod_name]
+          targetLabel: pod
+          regex: (.+)
+          replacement: $1
+        - sourceLabels: [container_label_io_kubernetes_pod_namespace]
+          targetLabel: namespace
+          regex: (.+)
+          replacement: $1
+        - sourceLabels: [container_label_io_kubernetes_container_name]
+          targetLabel: container
+          regex: (.+)
+          replacement: $1
+        - sourceLabels: [container_label_io_kubernetes_pod_uid]
+          targetLabel: uid
+          regex: (.+)
+          replacement: $1
+        # Drop the now-redundant container_label_* helper labels.
+        - regex: 'container_label_io_kubernetes_(container_name|pod_name|pod_namespace|pod_uid)'
+          action: labeldrop
+        # ===
+
+        # Drop less useful container CPU metrics (keep cfs_throttled_seconds_total
+        # unlike upstream, as it is needed for throttle analysis).
+        - sourceLabels: [__name__]
+          action: drop
+          regex: 'container_cpu_(load_average_10s|system_seconds_total|user_seconds_total)'
+        # Drop less useful container / always zero filesystem metrics.
+        - sourceLabels: [__name__]
+          action: drop
+          regex: 'container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)'
+        # Drop less useful / always zero container memory metrics.
+        - sourceLabels: [__name__]
+          action: drop
+          regex: 'container_memory_(mapped_file|swap)'
+        # Drop less useful container process metrics.
+        - sourceLabels: [__name__]
+          action: drop
+          regex: 'container_(file_descriptors|tasks_state|threads_max)'
+        # Drop container_memory_failures_total{scope="hierarchy"} metrics.
+        - sourceLabels: [__name__, scope]
+          action: drop
+          regex: 'container_memory_failures_total;hierarchy'
+        # Drop container_network metrics for CNI / virtual interfaces.
+        - sourceLabels: [__name__, interface]
+          action: drop
+          regex: 'container_network_.*;(cali|cilium|cni|lxc|nodelocaldns|tunl).*'
+        # Drop container spec metrics that overlap with kube-state-metrics.
+        - sourceLabels: [__name__]
+          action: drop
+          regex: 'container_spec.*'
+
+        # --- CFS orphan fix (carried over from values-prometheus.yaml) ---
+        # For container-level cgroup CFS metrics (pod=""), extract pod UID
+        # from the cgroup id path. Supports:
+        #   cgroup v1: /kubepods/burstable/pod<UID>/<ctr>
+        #   cgroup v1 (cgroupfs, no QoS): /kubepods/pod<UID>/<ctr>
+        #   cgroup v2 (systemd): kubepods-burstable.slice/kubepods-burstable-pod<UID>.slice/<ctr>
+        - sourceLabels: [id]
+          regex: '/kubepods/(?:burstable|guaranteed|besteffort)/pod([^/]+)/.*'
+          targetLabel: uid
+          replacement: '$1'
+          action: replace
+        - sourceLabels: [id]
+          regex: '/kubepods/pod([^/]+)/.*'
+          targetLabel: uid
+          replacement: '$1'
+          action: replace
+        - sourceLabels: [id]
+          regex: 'kubepods(?:-[^.]*)?\.slice/kubepods-[^-]*-pod([0-9a-f_-]+)\.slice/.*'
+          targetLabel: uid
+          replacement: '$1'
+          action: replace
+        # Drop cgroup metrics with no pod AND no uid (truly unattributable).
+        - sourceLabels: [id, pod, uid]
+          action: drop
+          regex: '.+;;'
