@@ -13,7 +13,10 @@ use std::{
 };
 
 use datafusion::arrow::{
-    array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray},
+    array::{
+        ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
+        TimestampMicrosecondArray,
+    },
     datatypes::DataType,
 };
 use datafusion::parquet::file::properties::WriterProperties;
@@ -152,23 +155,17 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
 
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = StringBuilder::new();
-    // Hex-encoded trace IDs (16 bytes → 32 hex chars)
+    // trace_id / span_id are FIXED_LEN_BYTE_ARRAY in storage; the per-row
+    // value is just `i` repeated for 16 / 8 bytes.
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
     for i in 0u8..5 {
-        trace_id_builder.append_value(format!(
-            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i
-        ));
+        trace_id_builder.append_value([i; 16]).expect("trace_id length 16");
     }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
-    let mut span_id_builder = StringBuilder::new();
-    // Hex-encoded span IDs (8 bytes → 16 hex chars)
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
     for i in 0u8..5 {
-        span_id_builder.append_value(format!(
-            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            i, i, i, i, i, i, i, i
-        ));
+        span_id_builder.append_value([i; 8]).expect("span_id length 8");
     }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 

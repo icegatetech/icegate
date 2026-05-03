@@ -14,7 +14,7 @@
 use icegate_common::{ICEGATE_NAMESPACE, SPANS_TABLE};
 use serde_json::Value;
 
-use super::harness::{TestServer, write_test_spans};
+use super::harness::{TestServer, write_test_spans, write_test_spans_with_properties};
 
 #[tokio::test]
 async fn v1_tags_returns_attribute_keys_and_intrinsics() -> Result<(), Box<dyn std::error::Error>> {
@@ -409,6 +409,68 @@ async fn v2_tag_values_for_name_intrinsic_returns_typed_strings() -> Result<(), 
     assert!(
         pairs.contains(&("string", "query users")),
         "expected (string, 'query users') in {:?}",
+        pairs
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Regression test: even when spans are written with the production
+/// shift-writer encoding policy (which force-disables dictionary on every
+/// column listed in `SPANS_COLUMN_ENCODINGS`), the `name` intrinsic still
+/// enumerates because `name` must remain dictionary-encoded — see the
+/// hard exclusion in `icegate_common::parquet_encoding`.
+///
+/// If `name` is ever re-added to `SPANS_COLUMN_ENCODINGS`, the dictionary
+/// page disappears, `metadata_scan::scan_label_values` returns the empty
+/// set, and Grafana's "Span Name" picker goes blank. The default-encoding
+/// happy path test above can't catch that regression because it bypasses
+/// `WriterProperties` entirely.
+#[tokio::test]
+async fn v2_tag_values_for_name_with_production_encoding_returns_names() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+
+    // Mirror the wiring in `icegate_ingest::cli::commands::run`: the shift
+    // writer for the spans topic gets `SPANS_COLUMN_ENCODINGS` plus a
+    // bloom filter on the trace-lookup id columns. The exact bloom list is
+    // incidental for this test; the load-bearing piece is the encoding
+    // override, which is what previously broke `name` enumeration.
+    let writer_properties = icegate_common::parquet_encoding::build_writer_properties(
+        20_000,
+        2 * 1024 * 1024,
+        &["trace_id", "span_id"],
+        icegate_common::parquet_encoding::SPANS_COLUMN_ENCODINGS,
+    );
+    write_test_spans_with_properties(&table, &catalog, "tempo-tenant", writer_properties).await?;
+
+    let resp = server
+        .client
+        .get(format!("{}/api/v2/search/tag/name/values", server.base_url))
+        .header("X-Scope-OrgID", "tempo-tenant")
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+    assert_eq!(status, 200, "Response body: {}", body);
+
+    let entries = body["tagValues"].as_array().expect("tagValues array");
+    let pairs: Vec<(&str, &str)> = entries
+        .iter()
+        .filter_map(|v| Some((v["type"].as_str()?, v["value"].as_str()?)))
+        .collect();
+    assert!(
+        pairs.contains(&("string", "GET /api/health")),
+        "expected (string, 'GET /api/health') with production encoding in {:?}",
+        pairs
+    );
+    assert!(
+        pairs.contains(&("string", "query users")),
+        "expected (string, 'query users') with production encoding in {:?}",
         pairs
     );
 

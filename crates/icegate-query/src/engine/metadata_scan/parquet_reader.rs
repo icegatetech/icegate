@@ -102,9 +102,14 @@ pub async fn open_builder(
 /// (decoding is CPU-cheap compared to the network fetch).
 ///
 /// Data pages are never decoded. Row groups without a dictionary page are
-/// skipped (acceptable under over-approximation semantics; the current
-/// ingest writer emits dictionaries for every low-cardinality string
-/// column). Row groups pruned by `predicate` are skipped before any I/O.
+/// skipped: any column reachable from
+/// [`crate::tempo::metadata::target_column_for_tag`] (i.e. surfaced through
+/// tag-value enumeration) is kept dictionary-encoded by policy in
+/// [`icegate_common::parquet_encoding`], so a missing dictionary on those
+/// columns indicates either an externally-produced file or a regression
+/// in that policy. The skip is logged with the column name so a future
+/// regression is visible without redeploy. Row groups pruned by
+/// `predicate` are skipped before any I/O.
 ///
 /// # Errors
 ///
@@ -133,11 +138,16 @@ pub async fn read_column_dictionaries(
     let mut ranges: Vec<Range<u64>> = Vec::new();
     let mut selected_rgs: Vec<usize> = Vec::new();
     let mut pruned: usize = 0;
-    // Row groups where the Parquet writer fell back to plain encoding
-    // (no dictionary page). This typically indicates high-cardinality
-    // data. We intentionally skip these: reading full data pages would
-    // be expensive and the over-approximation semantics allow it.
+    // Row groups whose column chunk has no dictionary page. The IceGate
+    // ingest writer keeps every enumerated string column dictionary-encoded
+    // by policy (see `icegate_common::parquet_encoding`), so this should
+    // only fire for externally-produced files. Reading the data pages as a
+    // fallback would defeat the metadata-scan optimisation — we count and
+    // log instead, and let the over-approximation contract carry the
+    // missing values.
     let mut no_dict: usize = 0;
+    // Column name for diagnostics (resolved once; used in the warn event).
+    let column_name = metadata.file_metadata().schema_descr().column(leaf_idx).name().to_string();
 
     for rg_idx in 0..metadata.num_row_groups() {
         let rg = metadata.row_group(rg_idx);
@@ -184,13 +194,15 @@ pub async fn read_column_dictionaries(
     span.record("num_chunks_fetched", ranges.len());
 
     if no_dict > 0 {
-        // Our ingest writer always emits dictionaries for string columns, so
-        // this path should only trigger for externally-produced files. Labels
-        // from these row groups will be missing (acceptable under
-        // over-approximation semantics).
+        // Enumerated string columns are kept dictionary-encoded by policy
+        // in `icegate_common::parquet_encoding`. A non-zero count here for
+        // an IceGate-written file therefore signals either an external
+        // file or a policy regression — surface the column name so it's
+        // actionable from logs alone.
         tracing::warn!(
+            column = %column_name,
             no_dict,
-            "skipped row groups without dictionary page; label results may be incomplete"
+            "skipped row groups without dictionary page; tag-value results may be incomplete (regression?)"
         );
     }
 
@@ -244,9 +256,55 @@ fn decode_dictionary_from_chunk(
     // column chunk, so one `get_next_page()` gives us exactly the dict
     // page. Drop without touching data pages.
     if let Some(Page::DictionaryPage { buf, num_values, .. }) = page_reader.get_next_page()? {
-        decode_plain_byte_array_values(&buf, num_values as usize, out)?;
+        // Branch on physical type: BYTE_ARRAY uses a length prefix per value;
+        // FIXED_LEN_BYTE_ARRAY is `type_length` raw bytes per value with no
+        // prefix. trace_id / span_id columns ride the FIXED path and are
+        // hex-encoded into `out` to keep the wire format string-typed.
+        let leaf = col_chunk.column_descr();
+        match leaf.physical_type() {
+            PhysicalType::BYTE_ARRAY => {
+                decode_plain_byte_array_values(&buf, num_values as usize, out)?;
+            }
+            PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                let type_length = usize::try_from(leaf.type_length().max(0)).unwrap_or(0);
+                if type_length > 0 {
+                    decode_plain_fixed_len_byte_array_values(&buf, num_values as usize, type_length, out)?;
+                }
+            }
+            _ => {}
+        }
     }
 
+    Ok(())
+}
+
+/// Decode PLAIN-encoded `FIXED_LEN_BYTE_ARRAY` values from a dictionary page
+/// and insert each distinct value into `out` as lowercase hex.
+///
+/// Parquet's PLAIN encoding for `FIXED_LEN_BYTE_ARRAY` is
+/// `[bytes; type_length]` repeated — no length prefix. We hex-encode here
+/// because all callers downstream (`label_values`, `/tags`) expect
+/// string-typed values on the wire.
+fn decode_plain_fixed_len_byte_array_values(
+    buf: &[u8],
+    num_values: usize,
+    type_length: usize,
+    out: &mut BTreeSet<String>,
+) -> Result<(), ParquetError> {
+    let needed = num_values.checked_mul(type_length).ok_or_else(|| {
+        ParquetError::General(format!(
+            "FIXED_LEN_BYTE_ARRAY dictionary page size overflow: num_values={num_values} type_length={type_length}"
+        ))
+    })?;
+    if buf.len() < needed {
+        return Err(ParquetError::General(format!(
+            "truncated PLAIN FIXED_LEN_BYTE_ARRAY dictionary page: expected {needed} bytes ({num_values} values × {type_length} bytes), got {}",
+            buf.len()
+        )));
+    }
+    for chunk in buf[..needed].chunks_exact(type_length) {
+        out.insert(hex::encode(chunk));
+    }
     Ok(())
 }
 

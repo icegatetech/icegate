@@ -12,7 +12,9 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use icegate_common::{
     IoHandle, LOGS_TABLE, LOGS_TOPIC, MetricsRuntime, SPANS_TABLE, SPANS_TOPIC,
     catalog::CatalogBuilder,
-    create_object_store, run_metrics_server,
+    create_object_store,
+    parquet_encoding::{LOGS_COLUMN_ENCODINGS, SPANS_COLUMN_ENCODINGS},
+    run_metrics_server,
     schema::{COL_SPAN_ID, COL_TRACE_ID},
 };
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
@@ -413,9 +415,14 @@ async fn run_services(
         (LOGS_TOPIC.to_string(), TRACE_LOOKUP_BLOOM_COLUMNS),
         (SPANS_TOPIC.to_string(), TRACE_LOOKUP_BLOOM_COLUMNS),
     ]);
+    let wal_column_encodings = std::collections::HashMap::from([
+        (LOGS_TOPIC.to_string(), LOGS_COLUMN_ENCODINGS),
+        (SPANS_TOPIC.to_string(), SPANS_COLUMN_ENCODINGS),
+    ]);
     let writer = QueueWriter::new(queue_config.clone(), queue_writer_store)
         .with_events(Arc::new(wal_writer_metrics))
-        .with_bloom_filter_columns(wal_bloom_filter_columns);
+        .with_bloom_filter_columns(wal_bloom_filter_columns)
+        .with_column_encodings(wal_column_encodings);
 
     // Run the WAL writer on a dedicated runtime so flush I/O is not
     // blocked by OTLP request processing on the main runtime.
@@ -464,6 +471,7 @@ async fn run_services(
             table: LOGS_TABLE,
             descriptor: SortColumnsDescriptor::logs()?,
             bloom_filter_columns: TRACE_LOOKUP_BLOOM_COLUMNS,
+            column_encodings: LOGS_COLUMN_ENCODINGS,
         },
         ShiftJobSpec {
             job_name: "shift_spans",
@@ -471,6 +479,7 @@ async fn run_services(
             table: SPANS_TABLE,
             descriptor: SortColumnsDescriptor::spans()?,
             bloom_filter_columns: TRACE_LOOKUP_BLOOM_COLUMNS,
+            column_encodings: SPANS_COLUMN_ENCODINGS,
         },
     ];
 

@@ -6,11 +6,17 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{ArrayBuilder, ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringBuilder, TimestampMicrosecondArray},
+    array::{
+        ArrayBuilder, ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringBuilder,
+        TimestampMicrosecondArray,
+    },
     datatypes::{DataType, Schema},
 };
 use iceberg::arrow::schema_to_arrow_schema;
-use icegate_common::DEFAULT_TENANT_ID;
+use icegate_common::{
+    DEFAULT_TENANT_ID,
+    schema::{COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME},
+};
 use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
     common::v1::{AnyValue, any_value::Value},
@@ -105,8 +111,8 @@ pub fn logs_to_record_batch(
     let mut timestamp_builder = Vec::with_capacity(total_records);
     let mut observed_timestamp_builder = Vec::with_capacity(total_records);
     let mut ingested_timestamp_builder = Vec::with_capacity(total_records);
-    let mut trace_id_builder = StringBuilder::with_capacity(total_records, total_records * 32);
-    let mut span_id_builder = StringBuilder::with_capacity(total_records, total_records * 16);
+    let mut trace_id_builder = FixedSizeBinaryBuilder::with_capacity(total_records, 16);
+    let mut span_id_builder = FixedSizeBinaryBuilder::with_capacity(total_records, 8);
     let mut severity_text_builder = StringBuilder::with_capacity(total_records, total_records * 8);
     let mut body_builder = StringBuilder::with_capacity(total_records, total_records * 256);
 
@@ -179,9 +185,8 @@ pub fn logs_to_record_batch(
                 // ingested_timestamp
                 ingested_timestamp_builder.push(ingested_timestamp);
 
-                // trace_id and span_id
-                let (trace_id_hex, span_id_hex) =
-                    process_trace_span_ids(log_record, &mut trace_id_builder, &mut span_id_builder);
+                // trace_id and span_id (populated directly into top-level columns)
+                process_trace_span_ids(log_record, &mut trace_id_builder, &mut span_id_builder);
 
                 // severity_text
                 if log_record.severity_text.is_empty() {
@@ -197,20 +202,24 @@ pub fn logs_to_record_batch(
                     body_builder.append_null();
                 }
 
-                // attributes (merged from resource, scope, and log record)
-                // Add resource, scope, and log record attributes (flatten nested, normalize keys)
-                add_flattened_attributes(resource_attrs, &mut attributes_builder);
-                add_flattened_attributes(scope_attrs, &mut attributes_builder);
-                add_flattened_attributes(&log_record.attributes, &mut attributes_builder);
-
-                // Duplicate indexed columns into attributes map for query layer
-                add_indexed_columns_to_attributes(
-                    &mut attributes_builder,
-                    trace_id_hex.as_ref(),
-                    span_id_hex.as_ref(),
-                    &log_record.severity_text,
-                    cloud_account_id.as_ref(),
-                );
+                // attributes (merged from resource, scope, and log record).
+                //
+                // Indexed top-level columns are deliberately NOT mirrored into this MAP —
+                // the read pipeline projects them as separate Arrow columns and
+                // `loki/formatters.rs::extract_labels` merges them into the final
+                // labels view at row materialisation time.
+                //
+                // Resource flattening additionally skips the OTLP keys whose
+                // normalised form collides with a promoted top-level column
+                // (`service.name` → `service_name`, `cloud.account.id` →
+                // `cloud_account_id`). Without the skip these would be written
+                // to the MAP a second time, polluting the per-row group key
+                // dictionary. Scope and log-record attributes are not filtered
+                // — a user-supplied `service_name` log attribute (rare, but
+                // semantically meaningful as an override) still flows through.
+                add_flattened_attributes(resource_attrs, &mut attributes_builder, LOG_PROMOTED_RESOURCE_KEYS);
+                add_flattened_attributes(scope_attrs, &mut attributes_builder, &[]);
+                add_flattened_attributes(&log_record.attributes, &mut attributes_builder, &[]);
 
                 attributes_builder.append(true).expect("append map entry");
             }
@@ -305,9 +314,9 @@ pub fn spans_to_record_batch(
     let mut tenant_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
     let mut cloud_account_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
     let mut service_name_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
-    let mut trace_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
-    let mut span_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
-    let mut parent_span_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
+    let mut trace_id_builder = FixedSizeBinaryBuilder::with_capacity(total_spans, 16);
+    let mut span_id_builder = FixedSizeBinaryBuilder::with_capacity(total_spans, 8);
+    let mut parent_span_id_builder = FixedSizeBinaryBuilder::with_capacity(total_spans, 8);
     let mut timestamp_builder: Vec<i64> = Vec::with_capacity(total_spans);
     let mut end_timestamp_builder: Vec<i64> = Vec::with_capacity(total_spans);
     let mut ingested_timestamp_builder: Vec<i64> = Vec::with_capacity(total_spans);
@@ -411,9 +420,9 @@ pub fn spans_to_record_batch(
     let mut links_builder = ListBuilder::new(StructBuilder::new(
         link_struct_fields.iter().cloned().collect::<Vec<_>>(),
         vec![
-            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>, // trace_id
-            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>, // span_id
-            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>, // trace_state (nullable)
+            Box::new(FixedSizeBinaryBuilder::new(16)) as Box<dyn ArrayBuilder>, // trace_id (16 bytes)
+            Box::new(FixedSizeBinaryBuilder::new(8)) as Box<dyn ArrayBuilder>,  // span_id (8 bytes)
+            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,            // trace_state (nullable)
             Box::new(
                 MapBuilder::new(
                     Some(MapFieldNames {
@@ -474,10 +483,17 @@ pub fn spans_to_record_batch(
                     None => service_name_builder.append_null(),
                 }
 
-                trace_id_builder.append_value(hex::encode(&span.trace_id));
-                span_id_builder.append_value(hex::encode(&span.span_id));
+                // Validated above: trace_id is 16 bytes, span_id is 8 bytes.
+                trace_id_builder
+                    .append_value(&span.trace_id)
+                    .expect("trace_id length validated to 16");
+                span_id_builder
+                    .append_value(&span.span_id)
+                    .expect("span_id length validated to 8");
                 if span.parent_span_id.len() == 8 && !is_zero_bytes(&span.parent_span_id) {
-                    parent_span_id_builder.append_value(hex::encode(&span.parent_span_id));
+                    parent_span_id_builder
+                        .append_value(&span.parent_span_id)
+                        .expect("parent_span_id length validated to 8");
                 } else {
                     parent_span_id_builder.append_null();
                 }
@@ -600,13 +616,15 @@ pub fn spans_to_record_batch(
                             continue;
                         }
                         struct_builder
-                            .field_builder::<StringBuilder>(0)
+                            .field_builder::<FixedSizeBinaryBuilder>(0)
                             .expect("link trace_id builder")
-                            .append_value(hex::encode(&link.trace_id));
+                            .append_value(&link.trace_id)
+                            .expect("link trace_id length validated to 16");
                         struct_builder
-                            .field_builder::<StringBuilder>(1)
+                            .field_builder::<FixedSizeBinaryBuilder>(1)
                             .expect("link span_id builder")
-                            .append_value(hex::encode(&link.span_id));
+                            .append_value(&link.span_id)
+                            .expect("link span_id length validated to 8");
                         let ts_b = struct_builder
                             .field_builder::<StringBuilder>(2)
                             .expect("link trace_state builder");
@@ -928,17 +946,32 @@ fn extract_map_fields_from_nested_struct(
     }
 }
 
+/// Resource-attribute keys (in their normalised form) that already have a
+/// dedicated top-level Iceberg column on the logs table. Skipped during
+/// resource flattening to keep the attributes MAP free of redundant copies
+/// — both to shrink Parquet pages and to keep the row-group key dictionary
+/// uncluttered.
+const LOG_PROMOTED_RESOURCE_KEYS: &[&str] = &[COL_SERVICE_NAME, COL_CLOUD_ACCOUNT_ID];
+
 /// Adds flattened attributes to the map builder with key normalization.
 ///
-/// Flattens nested structures and normalizes attribute keys by replacing dots with underscores.
+/// Flattens nested structures and normalises attribute keys by replacing
+/// dots with underscores. Any normalised key present in `skip_keys` is
+/// dropped (used to suppress already-promoted top-level columns from the
+/// resource flattening pass).
 fn add_flattened_attributes(
     attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
     attributes_builder: &mut MapBuilder<StringBuilder, StringBuilder>,
+    skip_keys: &[&str],
 ) {
     for kv in attributes {
         let flattened = flatten_any_value(&kv.key, kv.value.as_ref());
         for (key, value) in flattened {
-            attributes_builder.keys().append_value(normalize_attribute_key(&key));
+            let normalized = normalize_attribute_key(&key);
+            if skip_keys.contains(&normalized.as_str()) {
+                continue;
+            }
+            attributes_builder.keys().append_value(normalized);
             attributes_builder.values().append_value(value);
         }
     }
@@ -994,77 +1027,34 @@ fn merge_dotted_attributes(
     merged
 }
 
-/// Processes trace and span IDs, returning hex-encoded values if valid.
+/// Validates and writes raw `trace_id` and `span_id` bytes directly into the
+/// top-level fixed-size binary builders.
 ///
-/// Returns a tuple of (`trace_id_hex`, `span_id_hex`) where each is `Some(String)` if valid,
-/// or `None` if invalid or all zeros.
+/// Invalid byte lengths or all-zero IDs are written as nulls. The values are
+/// not returned: downstream consumers read them from the typed columns and
+/// hex-encode at API boundaries when needed.
+#[allow(clippy::expect_used)] // Byte lengths are validated before append
 fn process_trace_span_ids(
     log_record: &opentelemetry_proto::tonic::logs::v1::LogRecord,
-    trace_id_builder: &mut StringBuilder,
-    span_id_builder: &mut StringBuilder,
-) -> (Option<String>, Option<String>) {
-    // trace_id (16 bytes → 32 hex chars)
-    let trace_id_hex = if log_record.trace_id.len() == 16 && !is_zero_bytes(&log_record.trace_id) {
-        let hex_string = hex::encode(&log_record.trace_id);
-        trace_id_builder.append_value(hex_string.clone());
-        Some(hex_string)
+    trace_id_builder: &mut FixedSizeBinaryBuilder,
+    span_id_builder: &mut FixedSizeBinaryBuilder,
+) {
+    // trace_id (16 bytes raw)
+    if log_record.trace_id.len() == 16 && !is_zero_bytes(&log_record.trace_id) {
+        trace_id_builder
+            .append_value(&log_record.trace_id)
+            .expect("trace_id length checked to 16");
     } else {
         trace_id_builder.append_null();
-        None
-    };
+    }
 
-    // span_id (8 bytes → 16 hex chars)
-    let span_id_hex = if log_record.span_id.len() == 8 && !is_zero_bytes(&log_record.span_id) {
-        let hex_string = hex::encode(&log_record.span_id);
-        span_id_builder.append_value(hex_string.clone());
-        Some(hex_string)
+    // span_id (8 bytes raw)
+    if log_record.span_id.len() == 8 && !is_zero_bytes(&log_record.span_id) {
+        span_id_builder
+            .append_value(&log_record.span_id)
+            .expect("span_id length checked to 8");
     } else {
         span_id_builder.append_null();
-        None
-    };
-
-    (trace_id_hex, span_id_hex)
-}
-
-/// Adds indexed columns to the attributes map for query layer compatibility.
-///
-/// Duplicates `trace_id`, `span_id`, `severity_text`, and `account_id` into the attributes map
-/// to allow queries to use indexed columns for filtering then switch to attributes for operations.
-fn add_indexed_columns_to_attributes(
-    attributes_builder: &mut MapBuilder<StringBuilder, StringBuilder>,
-    trace_id_hex: Option<&String>,
-    span_id_hex: Option<&String>,
-    severity_text: &str,
-    cloud_account_id: Option<&String>,
-) {
-    // trace_id
-    if let Some(tid) = trace_id_hex {
-        attributes_builder.keys().append_value("trace_id");
-        attributes_builder.values().append_value(tid);
-    }
-
-    // span_id
-    if let Some(sid) = span_id_hex {
-        attributes_builder.keys().append_value("span_id");
-        attributes_builder.values().append_value(sid);
-    }
-
-    // severity_text
-    if !severity_text.is_empty() {
-        attributes_builder.keys().append_value("severity_text");
-        attributes_builder.values().append_value(severity_text);
-    }
-
-    // level (alias for severity_text for Grafana compatibility)
-    if !severity_text.is_empty() {
-        attributes_builder.keys().append_value("level"); // Loki support
-        attributes_builder.values().append_value(severity_text);
-    }
-
-    // cloud_account_id
-    if let Some(acc) = cloud_account_id {
-        attributes_builder.keys().append_value("cloud_account_id");
-        attributes_builder.values().append_value(acc);
     }
 }
 
@@ -1250,6 +1240,148 @@ mod tests {
         let batch = batch.expect("batch should exist");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 11);
+    }
+
+    /// The logs ingest path must NOT mirror indexed top-level columns into
+    /// the `attributes` MAP. Only OTLP-supplied attributes belong there.
+    /// The merged labels view is reconstructed at read time by
+    /// `loki/formatters.rs::extract_labels`.
+    #[test]
+    fn logs_to_record_batch_does_not_mirror_indexed_columns_into_attributes_map() {
+        use std::collections::BTreeMap;
+
+        use arrow::array::{Array, MapArray, StringArray};
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![
+                        KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("demo".to_string())),
+                            }),
+                        },
+                        KeyValue {
+                            key: "cloud.account.id".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("acc-1".to_string())),
+                            }),
+                        },
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        observed_time_unix_nano: 1_700_000_000_000_000_000,
+                        severity_number: 17, // ERROR
+                        severity_text: "ERROR".to_string(),
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("hello".to_string())),
+                        }),
+                        attributes: vec![KeyValue {
+                            key: "foo".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("bar".to_string())),
+                            }),
+                        }],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: vec![1u8; 16],
+                        span_id: vec![2u8; 8],
+                        event_name: String::new(),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let batch = logs_to_record_batch(&request, Some("tenant-1")).expect("ok").expect("batch");
+
+        // Indexed top-level columns must hold the values directly. trace_id /
+        // span_id are stored as raw `FIXED_LEN_BYTE_ARRAY` bytes, not hex.
+        let trace_id = batch
+            .column_by_name("trace_id")
+            .expect("trace_id col")
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .expect("FixedSizeBinary(16)");
+        assert_eq!(trace_id.value(0), &vec![1u8; 16][..]);
+
+        let span_id = batch
+            .column_by_name("span_id")
+            .expect("span_id col")
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .expect("FixedSizeBinary(8)");
+        assert_eq!(span_id.value(0), &vec![2u8; 8][..]);
+
+        let severity = batch
+            .column_by_name("severity_text")
+            .expect("severity_text col")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(severity.value(0), "ERROR");
+
+        let cloud_account = batch
+            .column_by_name("cloud_account_id")
+            .expect("cloud_account_id col")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(cloud_account.value(0), "acc-1");
+
+        // Pull the row's attribute MAP into a BTreeMap for assertions.
+        let attrs_map = batch
+            .column_by_name("attributes")
+            .expect("attributes col")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("MapArray");
+        let entries = attrs_map.value(0);
+        let entries_struct = entries
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("struct entries");
+        let keys = entries_struct.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+        let values = entries_struct.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+        let pairs: BTreeMap<String, String> = (0..keys.len())
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect();
+
+        // The user-supplied log attribute survives unchanged.
+        assert_eq!(pairs.get("foo"), Some(&"bar".to_string()));
+
+        // Indexed-column mirrors must NOT appear in the attributes MAP:
+        //
+        // - `trace_id` and `span_id`: removed by deleting
+        //   `add_indexed_columns_to_attributes` (these are OTLP LogRecord
+        //   top-level fields, never resource attributes).
+        // - `severity_text` and `level`: same — they came from the deleted
+        //   helper, not from any OTLP attribute key.
+        // - `service_name` and `cloud_account_id`: would otherwise be
+        //   normalised in by `add_flattened_attributes` (`service.name` →
+        //   `service_name`, `cloud.account.id` → `cloud_account_id`). Now
+        //   suppressed via `LOG_PROMOTED_RESOURCE_KEYS` to keep the per-row-
+        //   group key dictionary free of redundant entries.
+        for mirror in [
+            "trace_id",
+            "span_id",
+            "severity_text",
+            "level",
+            "service_name",
+            "cloud_account_id",
+        ] {
+            assert!(
+                !pairs.contains_key(mirror),
+                "mirror `{mirror}` must not appear in attributes MAP, got pairs: {pairs:?}"
+            );
+        }
     }
 
     #[test]
@@ -1581,17 +1713,17 @@ mod tests {
             .column_by_name("trace_id")
             .expect("trace_id")
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("utf8");
-        assert_eq!(trace_id.value(0), hex::encode(vec![1u8; 16]));
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .expect("FixedSizeBinary(16)");
+        assert_eq!(trace_id.value(0), &vec![1u8; 16][..]);
 
         let span_id = batch
             .column_by_name("span_id")
             .expect("span_id")
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("utf8");
-        assert_eq!(span_id.value(0), hex::encode(vec![2u8; 8]));
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .expect("FixedSizeBinary(8)");
+        assert_eq!(span_id.value(0), &vec![2u8; 8][..]);
 
         let duration = batch
             .column_by_name("duration_micros")
@@ -1925,9 +2057,9 @@ mod tests {
             .column_by_name("trace_id")
             .expect("trace_id")
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("utf8");
-        assert_eq!(trace_ids.value(0), hex::encode(vec![9u8; 16]));
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .expect("FixedSizeBinary(16)");
+        assert_eq!(trace_ids.value(0), &vec![9u8; 16][..]);
 
         let trace_state = row0_struct
             .column_by_name("trace_state")

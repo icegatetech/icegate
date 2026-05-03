@@ -1207,9 +1207,11 @@ impl DataFusionPlanner {
     /// Handles both indexed columns (e.g., `service_name`, `severity_text`) and
     /// attributes from the MAP column.
     ///
-    /// Indexed columns are used for WHERE clause filtering (fast),
-    /// then all subsequent operations use the attributes map.
-    /// All columns are now strings - no binary encoding/decoding needed.
+    /// `trace_id`, `span_id`, and `parent_span_id` are stored as raw
+    /// `FIXED_LEN_BYTE_ARRAY`; the matcher value is treated as lowercase hex
+    /// and decoded into a typed `FixedSizeBinary` literal so the predicate
+    /// matches the column type. Malformed hex collapses to a NULL literal,
+    /// which never matches — equivalent to "no rows for that filter".
     pub fn matcher_to_expr(matcher: &LabelMatcher) -> Expr {
         let mapped_label = Self::map_label_to_internal_name(&matcher.label);
         let col_expr = if Self::is_top_level_field(&matcher.label) {
@@ -1220,8 +1222,17 @@ impl DataFusionPlanner {
             datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(matcher.label.as_str())])
         };
 
-        // All columns are strings now - no binary decoding
-        let val = lit(matcher.value.as_str());
+        let val = match mapped_label {
+            COL_TRACE_ID => match hex::decode(matcher.value.as_str()) {
+                Ok(bytes) if bytes.len() == 16 => lit(ScalarValue::FixedSizeBinary(16, Some(bytes))),
+                _ => lit(ScalarValue::FixedSizeBinary(16, None)),
+            },
+            COL_SPAN_ID => match hex::decode(matcher.value.as_str()) {
+                Ok(bytes) if bytes.len() == 8 => lit(ScalarValue::FixedSizeBinary(8, Some(bytes))),
+                _ => lit(ScalarValue::FixedSizeBinary(8, None)),
+            },
+            _ => lit(matcher.value.as_str()),
+        };
 
         match matcher.op {
             MatchOp::Eq => col_expr.eq(val),

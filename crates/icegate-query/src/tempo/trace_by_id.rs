@@ -61,10 +61,16 @@ pub async fn fetch(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> TempoResult<FetchResult> {
+    // `trace_id` arrives from the URL as lowercase hex (32 chars). Decode to
+    // 16 raw bytes and compare against the typed FixedSizeBinary column;
+    // an invalid id yields no matches.
+    let trace_id_bytes = hex::decode(trace_id).unwrap_or_default();
+    let trace_id_lit = lit(ScalarValue::FixedSizeBinary(16, Some(trace_id_bytes)));
+
     let session = engine.create_session().await?;
     let df = session.table(SPANS_TABLE_FQN).await.map_err(QueryError::from)?;
     let df = df.filter(col(COL_TENANT_ID).eq(lit(tenant_id))).map_err(QueryError::from)?;
-    let df = df.filter(col(COL_TRACE_ID).eq(lit(trace_id))).map_err(QueryError::from)?;
+    let df = df.filter(col(COL_TRACE_ID).eq(trace_id_lit)).map_err(QueryError::from)?;
     let df = df
         .filter(
             col(COL_TIMESTAMP)

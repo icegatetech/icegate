@@ -60,6 +60,8 @@ pub mod config;
 pub mod error;
 /// Prometheus metrics utilities.
 pub mod metrics;
+/// Per-column Parquet encoding overrides shared across writers.
+pub mod parquet_encoding;
 /// Retry utilities.
 pub mod retrier;
 /// Schema definitions for Iceberg tables.

@@ -28,11 +28,9 @@ use iceberg::{
 };
 use icegate_common::{
     ICEGATE_NAMESPACE, WAL_OFFSET_PROPERTY,
+    parquet_encoding::{ColumnEncoding, build_writer_properties},
     retrier::{Retrier, RetrierConfig},
 };
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use parquet::schema::types::ColumnPath;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, warn};
@@ -115,12 +113,21 @@ pub struct IcebergStorage {
     loader: TableLoader,
     row_group_size: usize,
     max_file_size_mb: usize,
+    /// Maximum Parquet data page size in bytes, forwarded to
+    /// `WriterProperties::set_data_page_size_limit`.
+    data_page_size_limit_bytes: usize,
     /// Column names that should get a Parquet bloom filter when written.
     ///
     /// The list is owned by the caller (typically a per-table
     /// `ShiftJobSpec`); this struct stays table-agnostic and just
     /// forwards the list to the writer-properties builder.
     bloom_filter_columns: &'static [&'static str],
+    /// Per-column Parquet encoding overrides (empty = parquet-rs defaults).
+    ///
+    /// Forwarded to `set_column_encoding` on the writer-properties
+    /// builder. Entries for columns absent from the table's schema are
+    /// silently ignored, so a single combined list works across tables.
+    column_encodings: &'static [ColumnEncoding],
     retrier: Retrier,
 }
 
@@ -129,18 +136,23 @@ impl IcebergStorage {
     ///
     /// `bloom_filter_columns` is the per-table list of columns that
     /// should have a Parquet bloom filter; pass `&[]` if none.
+    /// `column_encodings` is the per-column encoding override list;
+    /// pass `&[]` to use parquet-rs defaults.
     pub fn new(
         catalog: Arc<dyn Catalog>,
         table: impl Into<String>,
         shift_config: &ShiftConfig,
         bloom_filter_columns: &'static [&'static str],
+        column_encodings: &'static [ColumnEncoding],
     ) -> Self {
         let table_ident = TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.into());
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,
             max_file_size_mb: shift_config.write.max_file_size_mb,
+            data_page_size_limit_bytes: shift_config.write.data_page_size_limit_bytes,
             bloom_filter_columns,
+            column_encodings,
             retrier: Retrier::new(RetrierConfig::default()),
         }
     }
@@ -199,7 +211,9 @@ impl IcebergStorage {
         let handle = tokio::runtime::Handle::current();
         let row_group_size = self.row_group_size;
         let max_file_size_mb = self.max_file_size_mb;
+        let data_page_size_limit_bytes = self.data_page_size_limit_bytes;
         let bloom_filter_columns = self.bloom_filter_columns;
+        let column_encodings = self.column_encodings;
         let cancel = cancel_token.clone();
         let table = self.load_table(cancel_token).await?;
 
@@ -214,7 +228,9 @@ impl IcebergStorage {
                 table,
                 row_group_size,
                 max_file_size_mb,
+                data_page_size_limit_bytes,
                 bloom_filter_columns,
+                column_encodings,
                 batches,
                 &cancel,
             ))
@@ -228,7 +244,9 @@ impl IcebergStorage {
         table: Table,
         row_group_size: usize,
         max_file_size_mb: usize,
+        data_page_size_limit_bytes: usize,
         bloom_filter_columns: &'static [&'static str],
+        column_encodings: &'static [ColumnEncoding],
         mut batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
@@ -246,7 +264,12 @@ impl IcebergStorage {
         let file_name_generator = DefaultFileNameGenerator::new(write_id.to_string(), None, DataFileFormat::Parquet);
 
         // TODO(med): Issue #101. Add semaphore/CPU budget. The limit should protect ingest from ZSTD spikes during multiple shift tasks.
-        let writer_props = build_writer_properties(row_group_size, bloom_filter_columns);
+        let writer_props = build_writer_properties(
+            row_group_size,
+            data_page_size_limit_bytes,
+            bloom_filter_columns,
+            column_encodings,
+        );
 
         let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table_metadata.current_schema().clone());
 
@@ -445,35 +468,6 @@ impl IcebergStorage {
     }
 }
 
-/// Builds the Parquet [`WriterProperties`] used for an Iceberg shift
-/// write.
-///
-/// Per-column bloom filters are enabled for every column listed in
-/// `bloom_filter_columns`. The NDV hint is set to `row_group_size`
-/// because that is the upper bound on distinct values within a single
-/// row group (every row contributes at most one new value), which
-/// right-sizes the bloom filter without over-allocating.
-///
-/// This function is intentionally table-agnostic — the caller decides
-/// which columns make sense to filter for the table being written.
-fn build_writer_properties(row_group_size: usize, bloom_filter_columns: &[&str]) -> WriterProperties {
-    let mut builder = WriterProperties::builder()
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_data_page_row_count_limit((row_group_size / 10).max(1))
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_max_row_group_size(row_group_size);
-
-    let ndv = u64::try_from(row_group_size).unwrap_or(u64::MAX);
-    for col in bloom_filter_columns {
-        let path = ColumnPath::from(*col);
-        builder = builder
-            .set_column_bloom_filter_enabled(path.clone(), true)
-            .set_column_bloom_filter_ndv(path, ndv);
-    }
-
-    builder.build()
-}
-
 async fn cleanup_generated_data_files(file_io: &FileIO, generated_paths: &Arc<std::sync::Mutex<Vec<String>>>) {
     let generated = match generated_paths.lock() {
         Ok(guard) => guard.clone(),
@@ -596,6 +590,7 @@ mod tests {
     };
     use bytes::Bytes;
     use iceberg::io::FileIO;
+    use icegate_common::parquet_encoding::build_writer_properties;
     use parquet::{
         arrow::ArrowWriter,
         file::{
@@ -604,7 +599,7 @@ mod tests {
         },
     };
 
-    use super::{build_writer_properties, cleanup_generated_data_files};
+    use super::cleanup_generated_data_files;
 
     #[tokio::test]
     async fn cleanup_generated_data_files_deletes_existing_paths() {
@@ -655,7 +650,7 @@ mod tests {
             .collect::<Vec<_>>();
         let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("record batch");
 
-        let props = build_writer_properties(1024, bloom_columns);
+        let props = build_writer_properties(1024, 2 * 1024 * 1024, bloom_columns, &[]);
         let mut buffer = Vec::new();
         {
             let mut writer = ArrowWriter::try_new(&mut buffer, schema, Some(props)).expect("arrow writer");

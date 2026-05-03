@@ -15,7 +15,7 @@
 //! [`crate::error::QueryError::NotImplemented`] from this planner.
 
 use datafusion::{
-    arrow::array::{Array, AsArray, RecordBatch},
+    arrow::array::{Array, RecordBatch},
     functions_aggregate::expr_fn::max,
     functions_window::expr_fn::row_number,
     logical_expr::{Expr, ExprFunctionExt, col, lit},
@@ -141,7 +141,7 @@ impl DataFusionPlanner {
     /// keeps the top `limit`. This collapses the row-cap problem from
     /// "first N matching spans" to "first N matching traces", which is
     /// the contract Tempo's `limit` query parameter promises.
-    async fn collect_recent_trace_ids(&self, selector: SpansetExpr, limit: usize) -> Result<Vec<String>> {
+    async fn collect_recent_trace_ids(&self, selector: SpansetExpr, limit: usize) -> Result<Vec<Vec<u8>>> {
         let df = self.scan_spans().await?;
         let df = self.apply_tenant_and_time(df)?;
         let df = selectors::apply_spanset(df, selector)?;
@@ -168,13 +168,23 @@ impl DataFusionPlanner {
     /// An empty `trace_ids` list short-circuits to an empty `DataFrame`
     /// with the spans-table schema (via `WHERE false`), saving a
     /// pointless full-table scan when stage 1 returned nothing.
-    async fn fetch_spans_for_trace_ids(&self, trace_ids: &[String]) -> Result<DataFrame> {
+    async fn fetch_spans_for_trace_ids(&self, trace_ids: &[Vec<u8>]) -> Result<DataFrame> {
         let df = self.scan_spans().await?;
         let df = self.apply_tenant_and_time(df)?;
         let df = if trace_ids.is_empty() {
             df.filter(lit(false))?
         } else {
-            let id_lits: Vec<Expr> = trace_ids.iter().cloned().map(lit).collect();
+            // Each trace_id is a 16-byte raw value matching the
+            // `FIXED_LEN_BYTE_ARRAY(16)` column type in storage.
+            let id_lits: Vec<Expr> = trace_ids
+                .iter()
+                .map(|bytes| {
+                    lit(datafusion::scalar::ScalarValue::FixedSizeBinary(
+                        16,
+                        Some(bytes.clone()),
+                    ))
+                })
+                .collect();
             df.filter(col(COL_TRACE_ID).in_list(id_lits, false))?
         };
         let df = self.apply_spans_per_spanset(df)?;
@@ -208,11 +218,14 @@ impl DataFusionPlanner {
         let Some(cap) = self.query_ctx.spans_per_spanset else {
             return Ok(df);
         };
-        // Boolean expression that evaluates to true for root spans
-        // (null or empty `parent_span_id`). Sorting it DESC pins
-        // roots to rank 1.
+        // Boolean expression that evaluates to true for root spans (null or
+        // all-zero `parent_span_id`). `parent_span_id` is now stored as raw
+        // FixedSizeBinary(8) — there is no empty-string sentinel; instead
+        // some writers historically emitted 8 zero bytes, which we treat as
+        // a root for compatibility. Sorting DESC pins roots to rank 1.
         let parent = col(COL_PARENT_SPAN_ID);
-        let is_root_indicator = parent.clone().is_null().or(parent.eq(lit("")));
+        let zero_id = lit(ScalarValue::FixedSizeBinary(8, Some(vec![0u8; 8])));
+        let is_root_indicator = parent.clone().is_null().or(parent.eq(zero_id));
         let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
 
         let row_num = row_number()
@@ -232,20 +245,26 @@ impl DataFusionPlanner {
     }
 }
 
-/// Extract the `trace_id` string column from stage-1 result batches
-/// into a flat `Vec<String>`. Drops null entries — `trace_id` is
-/// `NOT NULL` in the spans schema so this should not happen in
-/// practice, but defending against it keeps the IN list well-formed.
-fn extract_trace_ids(batches: &[RecordBatch]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// Extract the `trace_id` column from stage-1 result batches into a flat
+/// `Vec<Vec<u8>>` of raw 16-byte ids. Drops null entries — `trace_id` is
+/// `NOT NULL` in the spans schema so this should not happen in practice,
+/// but defending against it keeps the IN list well-formed.
+fn extract_trace_ids(batches: &[RecordBatch]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
     for batch in batches {
         let Some((idx, _)) = batch.schema().column_with_name(COL_TRACE_ID) else {
             continue;
         };
-        let column = batch.column(idx).as_string::<i32>();
+        let Some(column) = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::FixedSizeBinaryArray>()
+        else {
+            continue;
+        };
         for row in 0..column.len() {
             if column.is_valid(row) {
-                out.push(column.value(row).to_string());
+                out.push(column.value(row).to_vec());
             }
         }
     }

@@ -11,6 +11,8 @@ pub(crate) enum RowGroupBoundaryValue {
     String(String),
     /// Timestamp value in microseconds.
     TimestampMicros(i64),
+    /// Fixed-length raw bytes (e.g. `trace_id`: 16 B, `span_id`: 8 B).
+    FixedBytes(Vec<u8>),
 }
 
 /// Inclusive boundary range for one sorted row group.
@@ -108,6 +110,15 @@ impl RowGroupBoundaryComponent {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixed_bytes(value: Option<Vec<u8>>, descending: bool, nulls_first: bool) -> Self {
+        Self {
+            value: value.map(RowGroupBoundaryValue::FixedBytes),
+            descending,
+            nulls_first,
+        }
+    }
+
     fn validate_compatible_structure(&self, other: &Self, index: usize) -> Result<()> {
         if self.descending != other.descending {
             return Err(IngestError::Shift(format!(
@@ -164,6 +175,14 @@ impl RowGroupBoundaryComponent {
                 Some(RowGroupBoundaryValue::TimestampMicros(left)),
                 Some(RowGroupBoundaryValue::TimestampMicros(right)),
             ) => compare_option_ord(Some(*left), Some(*right), self.descending, self.nulls_first),
+            (Some(RowGroupBoundaryValue::FixedBytes(left)), Some(RowGroupBoundaryValue::FixedBytes(right))) => {
+                compare_option_ord(
+                    Some(left.as_slice()),
+                    Some(right.as_slice()),
+                    self.descending,
+                    self.nulls_first,
+                )
+            }
             (None, None) | (Some(_), Some(_)) => Ordering::Equal,
         }
     }
@@ -174,6 +193,7 @@ impl RowGroupBoundaryValue {
         match self {
             Self::String(_) => "string",
             Self::TimestampMicros(_) => "timestamp_micros",
+            Self::FixedBytes(_) => "fixed_bytes",
         }
     }
 }
@@ -211,6 +231,7 @@ const fn boundary_value_discriminant(value: &RowGroupBoundaryValue) -> u8 {
     match value {
         RowGroupBoundaryValue::String(_) => 0,
         RowGroupBoundaryValue::TimestampMicros(_) => 1,
+        RowGroupBoundaryValue::FixedBytes(_) => 2,
     }
 }
 
@@ -367,5 +388,103 @@ mod tests {
             .compare_checked(&timestamp_key)
             .expect_err("different component types must be rejected");
         assert!(err.to_string().contains("value type differs"));
+    }
+
+    #[test]
+    fn row_group_boundary_component_compares_fixed_bytes_lex() {
+        // trace_id-style 16-byte sentinels: trace_a1 < trace_a2 < trace_b
+        // when compared lexicographically.
+        let trace_a1: Vec<u8> = vec![b'a', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_a2: Vec<u8> = vec![b'a', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_b: Vec<u8> = vec![b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let lower = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::fixed_bytes(Some(trace_a1), false, true)],
+        };
+        let middle = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::fixed_bytes(
+                Some(trace_a2.clone()),
+                false,
+                true,
+            )],
+        };
+        let upper = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::fixed_bytes(Some(trace_b), false, true)],
+        };
+
+        assert_eq!(lower.compare_checked(&middle).expect("compatible keys"), Ordering::Less);
+        assert_eq!(middle.compare_checked(&upper).expect("compatible keys"), Ordering::Less);
+        // Descending direction reverses the order.
+        let middle_desc = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::fixed_bytes(Some(trace_a2), true, true)],
+        };
+        let upper_desc = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::fixed_bytes(
+                Some(vec![b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                true,
+                true,
+            )],
+        };
+        assert_eq!(
+            middle_desc.compare_checked(&upper_desc).expect("compatible keys"),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn row_group_boundary_key_rejects_mixed_string_and_fixed_bytes() {
+        let string_key = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::string(
+                Some("acc-1".to_string()),
+                false,
+                true,
+            )],
+        };
+        let fixed_key = RowGroupBoundaryKey {
+            components: vec![RowGroupBoundaryComponent::fixed_bytes(
+                Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+                false,
+                true,
+            )],
+        };
+
+        let err = string_key
+            .compare_checked(&fixed_key)
+            .expect_err("string vs fixed_bytes must be rejected");
+        assert!(err.to_string().contains("value type differs"));
+    }
+
+    #[test]
+    fn row_group_boundary_value_round_trips_fixed_bytes_json() {
+        use crate::wal::{deserialize_row_group_metadata, serialize_row_group_metadata};
+
+        let original = RowGroupBoundaryRange {
+            min_key: RowGroupBoundaryKey {
+                components: vec![
+                    RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
+                    RowGroupBoundaryComponent::fixed_bytes(
+                        Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+                        false,
+                        true,
+                    ),
+                    RowGroupBoundaryComponent::timestamp_micros(Some(30), true, true),
+                ],
+            },
+            max_key: RowGroupBoundaryKey {
+                components: vec![
+                    RowGroupBoundaryComponent::string(Some("acc-1".to_string()), false, true),
+                    RowGroupBoundaryComponent::fixed_bytes(
+                        Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 99]),
+                        false,
+                        true,
+                    ),
+                    RowGroupBoundaryComponent::timestamp_micros(Some(10), true, true),
+                ],
+            },
+        };
+
+        let serialized = serialize_row_group_metadata(&original).expect("serialize");
+        let restored = deserialize_row_group_metadata(&serialized).expect("deserialize");
+        assert_eq!(restored, original);
     }
 }

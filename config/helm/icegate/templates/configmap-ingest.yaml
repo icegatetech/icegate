@@ -56,6 +56,7 @@ data:
       write:
         row_group_size: {{ .Values.ingest.shift.write.rowGroupSize }}
         max_file_size_mb: {{ .Values.ingest.shift.write.maxFileSizeMb }}
+        data_page_size_limit_bytes: {{ .Values.ingest.shift.write.dataPageSizeLimitBytes | int }}
         table_cache_ttl_secs: {{ .Values.ingest.shift.write.tableCacheTtlSecs }}
       timeouts:
         plan_base_ms: {{ .Values.ingest.shift.timeouts.planBaseMs }}

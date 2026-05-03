@@ -12,10 +12,23 @@
 
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::Datum;
+use icegate_common::schema::{COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_TRACE_ID};
 
 use crate::engine::metadata_scan::MetadataScanConfig;
 use crate::logql::common::MatchOp;
 use crate::logql::log::Selector;
+
+/// Build a `Datum` matching the storage type of `column`. Most indexed
+/// columns are `STRING`; trace/span identifiers are `FIXED_LEN_BYTE_ARRAY`
+/// and require hex decoding before they can be compared. Returns `None` for
+/// values that fail to decode (e.g. malformed hex), which lets the caller
+/// drop the matcher rather than synthesize a never-matching predicate.
+fn datum_for_column(column: &str, value: &str) -> Option<Datum> {
+    match column {
+        COL_TRACE_ID | COL_SPAN_ID | COL_PARENT_SPAN_ID => hex::decode(value).ok().map(Datum::fixed),
+        _ => Some(Datum::string(value.to_string())),
+    }
+}
 
 /// Translate a `LogQL` selector into an iceberg predicate fragment.
 ///
@@ -32,9 +45,12 @@ pub fn selector_predicate(selector: &Selector, config: &MetadataScanConfig) -> P
             continue; // MAP-only label: cannot prune, omit
         }
         let col = config.resolve_column(&m.label).to_string();
+        let Some(datum) = datum_for_column(&col, &m.value) else {
+            continue; // malformed value (e.g. non-hex trace_id): cannot prune
+        };
         let p = match m.op {
-            MatchOp::Eq => Reference::new(col).equal_to(Datum::string(m.value.clone())),
-            MatchOp::Neq => Reference::new(col).not_equal_to(Datum::string(m.value.clone())),
+            MatchOp::Eq => Reference::new(col).equal_to(datum),
+            MatchOp::Neq => Reference::new(col).not_equal_to(datum),
             MatchOp::Re | MatchOp::Nre => continue, // regex: cannot prune, omit
         };
         out = Some(match out {

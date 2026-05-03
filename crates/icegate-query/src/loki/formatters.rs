@@ -7,8 +7,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use datafusion::arrow::{
     array::{
-        Array, Float64Array, Int64Array, MapArray, RecordBatch, StringArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray,
+        Array, FixedSizeBinaryArray, Float64Array, Int64Array, MapArray, RecordBatch, StringArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray,
     },
     datatypes::Schema,
 };
@@ -188,6 +188,13 @@ fn extract_body(batch: &RecordBatch, cols: &BatchColumns, row: usize) -> String 
         .unwrap_or_default()
 }
 
+/// Read a single row from a `FixedSizeBinary` column, returning `None` for
+/// nulls or for columns that cannot be downcast to `FixedSizeBinaryArray`.
+fn extract_fixed_bytes(batch: &RecordBatch, idx: usize, row: usize) -> Option<&[u8]> {
+    let arr = batch.column(idx).as_any().downcast_ref::<FixedSizeBinaryArray>()?;
+    if arr.is_null(row) { None } else { Some(arr.value(row)) }
+}
+
 /// Extract labels from indexed columns and `attributes` column.
 ///
 /// Uses string interning to deduplicate repeated label names/values across
@@ -222,7 +229,17 @@ fn extract_labels(
 
     if let Some(idx) = cols.severity_text {
         if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern(COL_SEVERITY_TEXT), interner.intern(val));
+            // `severity_text` is the canonical OTLP field; mirror it as
+            // `level` so Grafana's log panel — which colours and filters
+            // by the `level` label — works without the LogQL series
+            // planner having to alias the column. The series planner
+            // does alias `severity_text` → `level` for its DataFrame
+            // output, so the second insert below is idempotent on that
+            // path; for `plan_log` (raw entries) it's the only place
+            // `level` is emitted.
+            let severity_value = interner.intern(val);
+            labels.insert(interner.intern(COL_SEVERITY_TEXT), Arc::clone(&severity_value));
+            labels.insert(interner.intern(LEVEL_ALIAS), severity_value);
         }
     }
 
@@ -232,15 +249,18 @@ fn extract_labels(
         }
     }
 
+    // trace_id / span_id are stored as raw FIXED_LEN_BYTE_ARRAY (16 / 8 bytes).
+    // Hex-encode at materialisation time so Loki's wire format keeps emitting
+    // the canonical lowercase-hex W3C representation.
     if let Some(idx) = cols.trace_id {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern(COL_TRACE_ID), interner.intern(val));
+        if let Some(val) = extract_fixed_bytes(batch, idx, row) {
+            labels.insert(interner.intern(COL_TRACE_ID), interner.intern(&hex::encode(val)));
         }
     }
 
     if let Some(idx) = cols.span_id {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern(COL_SPAN_ID), interner.intern(val));
+        if let Some(val) = extract_fixed_bytes(batch, idx, row) {
+            labels.insert(interner.intern(COL_SPAN_ID), interner.intern(&hex::encode(val)));
         }
     }
 
@@ -419,10 +439,21 @@ fn extract_metric_labels(
     let mut labels = HashMap::with_capacity(label_cols.len() + 8);
 
     for (col_name, idx) in label_cols {
-        if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<StringArray>() {
+        let column = batch.column(*idx);
+        // Most indexed labels are Utf8; trace_id / span_id / parent_span_id are
+        // FixedSizeBinary and need hex-encoding for the wire format.
+        if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
             if !arr.is_null(row) {
                 let label_name = map_column_to_label(col_name);
                 labels.insert(interner.intern(label_name), interner.intern(arr.value(row)));
+            }
+        } else if let Some(arr) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            if !arr.is_null(row) {
+                let label_name = map_column_to_label(col_name);
+                labels.insert(
+                    interner.intern(label_name),
+                    interner.intern(&hex::encode(arr.value(row))),
+                );
             }
         }
     }
@@ -572,5 +603,138 @@ fn extract_series_attributes(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::{
+        array::{ArrayRef, FixedSizeBinaryArray, MapBuilder, MapFieldNames, StringArray, StringBuilder},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use super::*;
+
+    /// Build a single-row `RecordBatch` whose schema matches the projection
+    /// the `LogQL` planner emits for the formatter, with a MAP that does NOT
+    /// mirror the indexed columns (the post-change ingest behaviour).
+    fn build_row_batch(
+        cloud_account: &str,
+        service: &str,
+        severity: &str,
+        trace_id_hex: &str,
+        span_id_hex: &str,
+        map_pairs: &[(&str, &str)],
+    ) -> RecordBatch {
+        let map_field_names = MapFieldNames {
+            entry: "entries".to_string(),
+            key: "keys".to_string(),
+            value: "values".to_string(),
+        };
+        let mut map_builder = MapBuilder::new(Some(map_field_names), StringBuilder::new(), StringBuilder::new())
+            .with_keys_field(Arc::new(Field::new("keys", DataType::Utf8, false)))
+            .with_values_field(Arc::new(Field::new("values", DataType::Utf8, true)));
+        for (k, v) in map_pairs {
+            map_builder.keys().append_value(*k);
+            map_builder.values().append_value(*v);
+        }
+        map_builder.append(true).expect("append map row");
+        let attributes_array = map_builder.finish();
+        let attributes_field = Field::new(COL_ATTRIBUTES, attributes_array.data_type().clone(), true);
+
+        let cloud_arr: ArrayRef = Arc::new(StringArray::from(vec![cloud_account]));
+        let service_arr: ArrayRef = Arc::new(StringArray::from(vec![service]));
+        let severity_arr: ArrayRef = Arc::new(StringArray::from(vec![severity]));
+        // `level` is the alias the planner adds via `col(severity_text).alias("level")`.
+        let level_arr: ArrayRef = Arc::new(StringArray::from(vec![severity]));
+        // `trace_id` / `span_id` flow through DataFusion as raw FixedSizeBinary;
+        // hex strings only exist at the API boundary.
+        let trace_bytes = hex::decode(trace_id_hex).expect("trace_id_hex");
+        let span_bytes = hex::decode(span_id_hex).expect("span_id_hex");
+        let trace_arr: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(std::iter::once(trace_bytes.as_slice()))
+                .expect("trace FixedSizeBinaryArray"),
+        );
+        let span_arr: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(std::iter::once(span_bytes.as_slice()))
+                .expect("span FixedSizeBinaryArray"),
+        );
+        let attrs_arr: ArrayRef = Arc::new(attributes_array);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_CLOUD_ACCOUNT_ID, DataType::Utf8, true),
+            Field::new(COL_SERVICE_NAME, DataType::Utf8, true),
+            Field::new(COL_SEVERITY_TEXT, DataType::Utf8, true),
+            Field::new(LEVEL_ALIAS, DataType::Utf8, true),
+            Field::new(COL_TRACE_ID, DataType::FixedSizeBinary(16), true),
+            Field::new(COL_SPAN_ID, DataType::FixedSizeBinary(8), true),
+            attributes_field,
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                cloud_arr,
+                service_arr,
+                severity_arr,
+                level_arr,
+                trace_arr,
+                span_arr,
+                attrs_arr,
+            ],
+        )
+        .expect("RecordBatch::try_new")
+    }
+
+    /// After dropping the write-time duplication, the indexed-column values
+    /// reach the Loki output exclusively through the typed top-level columns.
+    /// The formatter is the row-materialisation point that merges them into
+    /// the labels map; this test pins that contract.
+    #[test]
+    fn extract_labels_merges_indexed_columns_when_map_lacks_them() {
+        let batch = build_row_batch(
+            "acc-1",
+            "svc",
+            "ERROR",
+            "0102030405060708090a0b0c0d0e0f10",
+            "1112131415161718",
+            &[("foo", "bar")],
+        );
+
+        let cols = BatchColumns::from_schema(batch.schema().as_ref());
+        let mut interner = StringInterner::new();
+        let labels = extract_labels(&batch, &cols, 0, &mut interner);
+
+        // Indexed top-level columns are projected into the labels map.
+        assert_eq!(
+            labels.get(&Arc::<str>::from(COL_CLOUD_ACCOUNT_ID)).map(AsRef::as_ref),
+            Some("acc-1"),
+        );
+        assert_eq!(
+            labels.get(&Arc::<str>::from(COL_SERVICE_NAME)).map(AsRef::as_ref),
+            Some("svc"),
+        );
+        assert_eq!(
+            labels.get(&Arc::<str>::from(COL_SEVERITY_TEXT)).map(AsRef::as_ref),
+            Some("ERROR"),
+        );
+        assert_eq!(
+            labels.get(&Arc::<str>::from(LEVEL_ALIAS)).map(AsRef::as_ref),
+            Some("ERROR")
+        );
+        assert_eq!(
+            labels.get(&Arc::<str>::from(COL_TRACE_ID)).map(AsRef::as_ref),
+            Some("0102030405060708090a0b0c0d0e0f10"),
+        );
+        assert_eq!(
+            labels.get(&Arc::<str>::from(COL_SPAN_ID)).map(AsRef::as_ref),
+            Some("1112131415161718"),
+        );
+
+        // User attribute from the MAP is also surfaced.
+        assert_eq!(labels.get(&Arc::<str>::from("foo")).map(AsRef::as_ref), Some("bar"));
+
+        // Sanity: only the seven keys above (six indexed + one user attr).
+        assert_eq!(labels.len(), 7, "got labels: {labels:?}");
     }
 }

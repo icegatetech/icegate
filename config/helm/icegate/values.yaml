@@ -230,13 +230,14 @@ ingest:
   ## Shift configuration (WAL -> Iceberg)
   shift:
     read:
-      maxRecordBatchesPerTask: 128
-      maxInputBytesPerTask: 67108864
+      maxRecordBatchesPerTask: 192
+      maxInputBytesPerTask: 100663296
       planSegmentReadParallelism: 8
       shiftSegmentReadParallelism: 8
     write:
-      rowGroupSize: 8192
+      rowGroupSize: 20000
       maxFileSizeMb: 64
+      dataPageSizeLimitBytes: 2097152
       tableCacheTtlSecs: 60
     timeouts:
       planBaseMs: 10000
