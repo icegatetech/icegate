@@ -31,7 +31,7 @@ pub(crate) use executor::{
 };
 use iceberg::Catalog;
 pub(crate) use iceberg_storage::IcebergStorage;
-use icegate_common::parquet_encoding::ColumnEncoding;
+use icegate_common::parquet_writer::ColumnEncoding;
 use icegate_jobmanager::{
     CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
     Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
@@ -73,8 +73,8 @@ pub struct ShiftJobSpec {
     /// Per-column Parquet encoding overrides applied when writing to
     /// Iceberg. Use `&[]` to fall back to parquet-rs defaults.
     ///
-    /// See [`icegate_common::parquet_encoding::ICEGATE_COLUMN_ENCODINGS`]
-    /// for the shared list used by both this writer and the WAL writer.
+    /// See [`icegate_common::parquet_encoding`] for the per-table
+    /// encoding lists shared between this writer and the WAL writer.
     pub column_encodings: &'static [ColumnEncoding],
 }
 

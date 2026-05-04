@@ -167,7 +167,7 @@ pub async fn write_test_spans(
 /// Like [`write_test_spans`] but lets the caller pin the Parquet
 /// `WriterProperties`. Use this from tests that need to reproduce the
 /// production shift-writer encoding (e.g. via
-/// [`icegate_common::parquet_encoding::build_writer_properties`]) so a
+/// [`icegate_common::parquet_writer::build_writer_properties`]) so a
 /// regression in encoding policy doesn't silently slip past
 /// metadata-scan-based tag enumeration.
 pub async fn write_test_spans_with_properties(

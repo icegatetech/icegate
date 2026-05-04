@@ -440,7 +440,7 @@ async fn v2_tag_values_for_name_with_production_encoding_returns_names() -> Resu
     // bloom filter on the trace-lookup id columns. The exact bloom list is
     // incidental for this test; the load-bearing piece is the encoding
     // override, which is what previously broke `name` enumeration.
-    let writer_properties = icegate_common::parquet_encoding::build_writer_properties(
+    let writer_properties = icegate_common::parquet_writer::build_writer_properties(
         20_000,
         2 * 1024 * 1024,
         &["trace_id", "span_id"],

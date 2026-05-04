@@ -1,17 +1,18 @@
 //! Per-table, per-column Parquet encoding overrides for IceGate tables.
 //!
 //! Each entry in a list pins a column to a specific Parquet encoding
-//! **and disables dictionary encoding for that column** — without
-//! disabling dictionary, parquet-rs treats `set_column_encoding` as a
-//! fallback that only fires after the per-column dictionary page
-//! exceeds `dictionary_page_size_limit` (1 MiB default). At IceGate's
-//! row-group sizes (20,000 rows) most numeric and timestamp dictionaries
-//! never reach that limit, so the override never runs and the column
-//! stays at RLE_DICTIONARY. Forcing dictionary off makes the configured
+//! **and disables dictionary encoding for that column** when consumed by
+//! [`crate::parquet_writer::build_writer_properties`]. Without disabling
+//! dictionary, parquet-rs treats `set_column_encoding` as a fallback
+//! that only fires after the per-column dictionary page exceeds
+//! `dictionary_page_size_limit` (1 MiB default). At IceGate's row-group
+//! sizes (~20,000 rows) most numeric and timestamp dictionaries never
+//! reach that limit, so the override never runs and the column stays at
+//! `RLE_DICTIONARY`. Forcing dictionary off makes the configured
 //! encoding the primary encoding.
 //!
 //! The encodings below also require `WriterVersion::PARQUET_2_0` — they
-//! are not part of the PARQUET_1_0 spec.
+//! are not part of the `PARQUET_1_0` spec.
 //!
 //! Lists are **per-table** because effective encoding depends on data
 //! shape per table; e.g. timestamp columns benefit from `DELTA_BINARY_PACKED`
@@ -63,68 +64,14 @@
 //!   shuffle that pays off only when followed by a compression codec
 //!   (IceGate uses ZSTD).
 
-use parquet::basic::{Compression, Encoding, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
-use parquet::schema::types::ColumnPath;
+use parquet::basic::Encoding;
 
-/// A `(column_name, encoding)` override. Dictionary is **always**
-/// disabled for the named column when this override is applied; see
-/// the module-level docs for why.
-pub type ColumnEncoding = (&'static str, Encoding);
-
-/// Build the Parquet [`WriterProperties`] used for IceGate Iceberg shift
-/// writes (and any test that wants to reproduce the production encoding
-/// policy).
-///
-/// `column_encodings` pins the per-column encoding override and
-/// **force-disables dictionary** for each named column — see the
-/// module-level docs. `bloom_filter_columns` enables a per-column
-/// bloom filter sized for `row_group_size` distinct values (every row
-/// contributes at most one new value, so this is the natural NDV cap).
-///
-/// Both lists are intentionally borrowed: the writer properties built
-/// here own the column paths internally, so callers can pass static
-/// slices without further allocation.
-#[must_use]
-pub fn build_writer_properties(
-    row_group_size: usize,
-    data_page_size_limit_bytes: usize,
-    bloom_filter_columns: &[&str],
-    column_encodings: &[ColumnEncoding],
-) -> WriterProperties {
-    // PARQUET_2_0 is required for the DELTA / BYTE_STREAM_SPLIT encodings
-    // configured below; every reader IceGate supports (DataFusion, Trino,
-    // modern Spark/Athena) accepts files written at this version.
-    let mut builder = WriterProperties::builder()
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_data_page_size_limit(data_page_size_limit_bytes)
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_max_row_group_size(row_group_size);
-
-    // Dictionary is force-disabled on every column with an explicit
-    // encoding override: parquet-rs treats `set_column_encoding` as a
-    // fallback that only fires after the dictionary page exceeds 1 MiB,
-    // which never happens for our row-group sizes — so without disabling
-    // dictionary the configured encoding (DELTA_*, BYTE_STREAM_SPLIT)
-    // would never run.
-    for &(col, encoding) in column_encodings {
-        let path = ColumnPath::from(col);
-        builder = builder
-            .set_column_dictionary_enabled(path.clone(), false)
-            .set_column_encoding(path, encoding);
-    }
-
-    let ndv = u64::try_from(row_group_size).unwrap_or(u64::MAX);
-    for col in bloom_filter_columns {
-        let path = ColumnPath::from(*col);
-        builder = builder
-            .set_column_bloom_filter_enabled(path.clone(), true)
-            .set_column_bloom_filter_ndv(path, ndv);
-    }
-
-    builder.build()
-}
+use crate::parquet_writer::ColumnEncoding;
+use crate::schema::{
+    COL_COUNT, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_INGESTED_TIMESTAMP, COL_MAX, COL_MIN,
+    COL_OBSERVED_TIMESTAMP, COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_START_TIMESTAMP, COL_STATUS_MESSAGE, COL_SUM,
+    COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE, COL_VALUE_DOUBLE, COL_ZERO_COUNT, COL_ZERO_THRESHOLD,
+};
 
 /// Encoding overrides for the `logs` table.
 ///
@@ -133,11 +80,11 @@ pub fn build_writer_properties(
 /// `trace_id`/`span_id` get `DELTA_BYTE_ARRAY` (see module-level docs for
 /// why).
 pub const LOGS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
-    ("timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("observed_timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("ingested_timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("trace_id", Encoding::DELTA_BYTE_ARRAY),
-    ("span_id", Encoding::DELTA_BYTE_ARRAY),
+    (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_OBSERVED_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_INGESTED_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_TRACE_ID, Encoding::DELTA_BYTE_ARRAY),
+    (COL_SPAN_ID, Encoding::DELTA_BYTE_ARRAY),
 ];
 
 /// Encoding overrides for the `spans` table.
@@ -153,15 +100,15 @@ pub const LOGS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 /// `name` empties the Grafana "Span Name" picker. See the module-level
 /// "Hard exclusion" docs.
 pub const SPANS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
-    ("timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("end_timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("ingested_timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("duration_micros", Encoding::DELTA_BINARY_PACKED),
-    ("status_message", Encoding::DELTA_LENGTH_BYTE_ARRAY),
-    ("trace_state", Encoding::DELTA_LENGTH_BYTE_ARRAY),
-    ("trace_id", Encoding::DELTA_BYTE_ARRAY),
-    ("span_id", Encoding::DELTA_BYTE_ARRAY),
-    ("parent_span_id", Encoding::DELTA_BYTE_ARRAY),
+    (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_END_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_INGESTED_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_DURATION_MICROS, Encoding::DELTA_BINARY_PACKED),
+    (COL_STATUS_MESSAGE, Encoding::DELTA_LENGTH_BYTE_ARRAY),
+    (COL_TRACE_STATE, Encoding::DELTA_LENGTH_BYTE_ARRAY),
+    (COL_TRACE_ID, Encoding::DELTA_BYTE_ARRAY),
+    (COL_SPAN_ID, Encoding::DELTA_BYTE_ARRAY),
+    (COL_PARENT_SPAN_ID, Encoding::DELTA_BYTE_ARRAY),
 ];
 
 /// Encoding overrides for the `events` table.
@@ -169,11 +116,11 @@ pub const SPANS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 /// Sort order: `cloud_account_id, service_name, timestamp DESC`.
 /// `trace_id`/`span_id` get `DELTA_BYTE_ARRAY` — same reasoning as logs.
 pub const EVENTS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
-    ("timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("observed_timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("ingested_timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("trace_id", Encoding::DELTA_BYTE_ARRAY),
-    ("span_id", Encoding::DELTA_BYTE_ARRAY),
+    (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_OBSERVED_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_INGESTED_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_TRACE_ID, Encoding::DELTA_BYTE_ARRAY),
+    (COL_SPAN_ID, Encoding::DELTA_BYTE_ARRAY),
 ];
 
 /// Encoding overrides for the `metrics` table.
@@ -182,97 +129,14 @@ pub const EVENTS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 /// service_instance_id, timestamp DESC`. Float-valued metric columns
 /// get `BYTE_STREAM_SPLIT` to expose byte-plane locality to ZSTD.
 pub const METRICS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
-    ("timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("start_timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("ingested_timestamp", Encoding::DELTA_BINARY_PACKED),
-    ("count", Encoding::DELTA_BINARY_PACKED),
-    ("zero_count", Encoding::DELTA_BINARY_PACKED),
-    ("value_double", Encoding::BYTE_STREAM_SPLIT),
-    ("sum", Encoding::BYTE_STREAM_SPLIT),
-    ("min", Encoding::BYTE_STREAM_SPLIT),
-    ("max", Encoding::BYTE_STREAM_SPLIT),
-    ("zero_threshold", Encoding::BYTE_STREAM_SPLIT),
+    (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_START_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_INGESTED_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_COUNT, Encoding::DELTA_BINARY_PACKED),
+    (COL_ZERO_COUNT, Encoding::DELTA_BINARY_PACKED),
+    (COL_VALUE_DOUBLE, Encoding::BYTE_STREAM_SPLIT),
+    (COL_SUM, Encoding::BYTE_STREAM_SPLIT),
+    (COL_MIN, Encoding::BYTE_STREAM_SPLIT),
+    (COL_MAX, Encoding::BYTE_STREAM_SPLIT),
+    (COL_ZERO_THRESHOLD, Encoding::BYTE_STREAM_SPLIT),
 ];
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use bytes::Bytes;
-    use parquet::arrow::ArrowWriter;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::basic::Encoding;
-    use parquet::file::reader::{FileReader, SerializedFileReader};
-
-    use super::{ColumnEncoding, build_writer_properties};
-
-    /// End-to-end check that a `FixedSizeBinary(16)` column written with
-    /// the `DELTA_BYTE_ARRAY` override (a) actually emits that encoding
-    /// and (b) round-trips byte-for-byte through parquet-rs.
-    ///
-    /// Guards two production-critical invariants:
-    /// 1. `set_column_dictionary_enabled(false)` keeps firing for fixed
-    ///    binary columns — without it, parquet-rs treats the override as a
-    ///    fallback that triggers only after the dictionary page exceeds
-    ///    1 `MiB` (which never happens at `IceGate`'s row-group sizes), so
-    ///    the override would silently be a no-op.
-    /// 2. parquet-rs accepts `DELTA_BYTE_ARRAY` for `FIXED_LEN_BYTE_ARRAY`
-    ///    physical types — earlier parquet-rs versions only allowed it on
-    ///    `BYTE_ARRAY`. A future upgrade dropping that support would now
-    ///    fail loudly here.
-    #[test]
-    fn delta_byte_array_roundtrips_fixed_size_binary_16() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "trace_id",
-            DataType::FixedSizeBinary(16),
-            false,
-        )]));
-        let mut builder = FixedSizeBinaryBuilder::with_capacity(3, 16);
-        for i in 0u8..3 {
-            let mut bytes = [0u8; 16];
-            bytes[0] = i;
-            builder.append_value(bytes).expect("append 16-byte value");
-        }
-        let array: ArrayRef = Arc::new(builder.finish());
-        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).expect("record batch");
-
-        let overrides: &[ColumnEncoding] = &[("trace_id", Encoding::DELTA_BYTE_ARRAY)];
-        let props = build_writer_properties(
-            /* row_group_size */ 16,
-            /* data_page_size_limit_bytes */ 1 << 20,
-            /* bloom_filter_columns */ &[],
-            overrides,
-        );
-        let mut buf: Vec<u8> = Vec::new();
-        {
-            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).expect("ArrowWriter");
-            writer.write(&batch).expect("write batch");
-            writer.close().expect("close writer");
-        }
-
-        // Byte-for-byte readback equality.
-        let buf = Bytes::from(buf);
-        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(buf.clone()).expect("reader builder");
-        let mut reader = reader_builder.build().expect("reader");
-        let read_batch = reader.next().expect("one batch").expect("batch ok");
-        assert_eq!(read_batch.column(0), &array, "FixedSizeBinary roundtrip mismatch");
-
-        // Encoding metadata: DELTA_BYTE_ARRAY must be present, RLE_DICTIONARY
-        // must NOT be present (since we force-disabled dictionary on the
-        // override column). `encodings()` returns an iterator; collect once
-        // so we can scan it twice for the contains assertions.
-        let file_reader = SerializedFileReader::new(buf).expect("file reader");
-        let row_group = file_reader.get_row_group(0).expect("row group 0");
-        let encodings: Vec<Encoding> = row_group.metadata().column(0).encodings().collect();
-        assert!(
-            encodings.contains(&Encoding::DELTA_BYTE_ARRAY),
-            "expected DELTA_BYTE_ARRAY in encodings, got {encodings:?}"
-        );
-        assert!(
-            !encodings.contains(&Encoding::RLE_DICTIONARY),
-            "dictionary encoding leaked through despite set_column_dictionary_enabled(false): {encodings:?}"
-        );
-    }
-}

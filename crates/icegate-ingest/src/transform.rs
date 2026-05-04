@@ -186,7 +186,7 @@ pub fn logs_to_record_batch(
                 ingested_timestamp_builder.push(ingested_timestamp);
 
                 // trace_id and span_id (populated directly into top-level columns)
-                process_trace_span_ids(log_record, &mut trace_id_builder, &mut span_id_builder);
+                process_trace_span_ids(log_record, &mut trace_id_builder, &mut span_id_builder)?;
 
                 // severity_text
                 if log_record.severity_text.is_empty() {
@@ -459,19 +459,60 @@ pub fn spans_to_record_batch(
 
         for scope_spans in &resource_spans.scope_spans {
             for span in &scope_spans.spans {
-                if span.trace_id.len() != 16 || is_zero_bytes(&span.trace_id) {
-                    drops += 1;
-                    continue;
-                }
-                if span.span_id.len() != 8 || is_zero_bytes(&span.span_id) {
-                    drops += 1;
-                    continue;
-                }
+                // Hoist all fixed-size-binary length validation to a single
+                // block. `try_into` carries the length check at the type
+                // level (slice → &[u8; N]) and `is_zero_bytes` rules out
+                // OTLP "absent" sentinels. After this:
+                //   - trace_id_arr: `&[u8; 16]`, non-zero — span dropped
+                //     and counted otherwise
+                //   - span_id_arr : `&[u8; 8]`,  non-zero — span dropped
+                //     and counted otherwise
+                //   - parent_span_id_arr: `Option<&[u8; 8]>` — `None`
+                //     maps to `append_null` (legitimate root span)
+                // No FixedSizeBinaryBuilder append below can fail: the
+                // builder's `value_length` matches the array's compile-time
+                // size, so the post-validation `.expect("…")` lines have
+                // no reachable panic path.
+                let trace_id_arr: &[u8; 16] = match <&[u8; 16]>::try_from(span.trace_id.as_slice()) {
+                    Ok(a) if !is_zero_bytes(a) => a,
+                    _ => {
+                        drops += 1;
+                        continue;
+                    }
+                };
+                let span_id_arr: &[u8; 8] = match <&[u8; 8]>::try_from(span.span_id.as_slice()) {
+                    Ok(a) if !is_zero_bytes(a) => a,
+                    _ => {
+                        drops += 1;
+                        continue;
+                    }
+                };
+                let parent_span_id_arr: Option<&[u8; 8]> = match <&[u8; 8]>::try_from(span.parent_span_id.as_slice()) {
+                    Ok(a) if !is_zero_bytes(a) => Some(a),
+                    _ => None,
+                };
 
                 // Tracks how many links were dropped during transform (invalid
                 // trace_id/span_id). Added to span.dropped_links_count so the
                 // caller sees a faithful total.
                 let mut extra_dropped_links: i32 = 0;
+
+                // ── Builder appends ──────────────────────────────────────
+                // FixedSizeBinaryBuilder appends go FIRST. Arrow has no
+                // public per-builder truncate API, so reordering puts the
+                // fallible builders ahead of the infallible ones — any
+                // (post-validation, unreachable) failure here leaves
+                // tenant/account/service untouched and avoids row
+                // misalignment. `?` converts the never-firing
+                // `ArrowError` into `IngestError::Arrow` — a hard,
+                // surface-able error rather than a silent panic if the
+                // validation chain ever regresses.
+                trace_id_builder.append_value(trace_id_arr)?;
+                span_id_builder.append_value(span_id_arr)?;
+                match parent_span_id_arr {
+                    Some(p) => parent_span_id_builder.append_value(p)?,
+                    None => parent_span_id_builder.append_null(),
+                }
 
                 tenant_id_builder.append_value(tenant);
                 match cloud_account_id.as_deref() {
@@ -481,21 +522,6 @@ pub fn spans_to_record_batch(
                 match service_name.as_deref() {
                     Some(svc) => service_name_builder.append_value(svc),
                     None => service_name_builder.append_null(),
-                }
-
-                // Validated above: trace_id is 16 bytes, span_id is 8 bytes.
-                trace_id_builder
-                    .append_value(&span.trace_id)
-                    .expect("trace_id length validated to 16");
-                span_id_builder
-                    .append_value(&span.span_id)
-                    .expect("span_id length validated to 8");
-                if span.parent_span_id.len() == 8 && !is_zero_bytes(&span.parent_span_id) {
-                    parent_span_id_builder
-                        .append_value(&span.parent_span_id)
-                        .expect("parent_span_id length validated to 8");
-                } else {
-                    parent_span_id_builder.append_null();
                 }
 
                 let start_micros = (span.start_time_unix_nano / 1000) as i64;
@@ -607,24 +633,33 @@ pub fn spans_to_record_batch(
                 {
                     let struct_builder = links_builder.values();
                     for link in &span.links {
-                        if link.trace_id.len() != 16
-                            || is_zero_bytes(&link.trace_id)
-                            || link.span_id.len() != 8
-                            || is_zero_bytes(&link.span_id)
-                        {
-                            extra_dropped_links += 1;
-                            continue;
-                        }
+                        // Length-validated fixed-size arrays mirror the
+                        // outer span loop; failure on either id drops the
+                        // link and bumps the per-span counter so the
+                        // emitted `dropped_links_count` includes our own
+                        // drops on top of the OTLP-reported total.
+                        let link_trace_id_arr: &[u8; 16] = match <&[u8; 16]>::try_from(link.trace_id.as_slice()) {
+                            Ok(a) if !is_zero_bytes(a) => a,
+                            _ => {
+                                extra_dropped_links += 1;
+                                continue;
+                            }
+                        };
+                        let link_span_id_arr: &[u8; 8] = match <&[u8; 8]>::try_from(link.span_id.as_slice()) {
+                            Ok(a) if !is_zero_bytes(a) => a,
+                            _ => {
+                                extra_dropped_links += 1;
+                                continue;
+                            }
+                        };
                         struct_builder
                             .field_builder::<FixedSizeBinaryBuilder>(0)
                             .expect("link trace_id builder")
-                            .append_value(&link.trace_id)
-                            .expect("link trace_id length validated to 16");
+                            .append_value(link_trace_id_arr)?;
                         struct_builder
                             .field_builder::<FixedSizeBinaryBuilder>(1)
                             .expect("link span_id builder")
-                            .append_value(&link.span_id)
-                            .expect("link span_id length validated to 8");
+                            .append_value(link_span_id_arr)?;
                         let ts_b = struct_builder
                             .field_builder::<StringBuilder>(2)
                             .expect("link trace_state builder");
@@ -1033,29 +1068,30 @@ fn merge_dotted_attributes(
 /// Invalid byte lengths or all-zero IDs are written as nulls. The values are
 /// not returned: downstream consumers read them from the typed columns and
 /// hex-encode at API boundaries when needed.
-#[allow(clippy::expect_used)] // Byte lengths are validated before append
+///
+/// Length validation runs through `<&[u8; N]>::try_from` so the
+/// post-validation builder appends are type-system-unreachable failures
+/// (builder `value_length` matches the array's compile-time size).
+/// `IngestError::Arrow` is therefore unreachable in practice; if the
+/// validation chain ever regresses it surfaces as a hard error rather
+/// than a silent panic.
 fn process_trace_span_ids(
     log_record: &opentelemetry_proto::tonic::logs::v1::LogRecord,
     trace_id_builder: &mut FixedSizeBinaryBuilder,
     span_id_builder: &mut FixedSizeBinaryBuilder,
-) {
+) -> crate::error::Result<()> {
     // trace_id (16 bytes raw)
-    if log_record.trace_id.len() == 16 && !is_zero_bytes(&log_record.trace_id) {
-        trace_id_builder
-            .append_value(&log_record.trace_id)
-            .expect("trace_id length checked to 16");
-    } else {
-        trace_id_builder.append_null();
+    match <&[u8; 16]>::try_from(log_record.trace_id.as_slice()) {
+        Ok(a) if !is_zero_bytes(a) => trace_id_builder.append_value(a)?,
+        _ => trace_id_builder.append_null(),
     }
 
     // span_id (8 bytes raw)
-    if log_record.span_id.len() == 8 && !is_zero_bytes(&log_record.span_id) {
-        span_id_builder
-            .append_value(&log_record.span_id)
-            .expect("span_id length checked to 8");
-    } else {
-        span_id_builder.append_null();
+    match <&[u8; 8]>::try_from(log_record.span_id.as_slice()) {
+        Ok(a) if !is_zero_bytes(a) => span_id_builder.append_value(a)?,
+        _ => span_id_builder.append_null(),
     }
+    Ok(())
 }
 
 /// Recursively flattens an OTLP `AnyValue` into key-value pairs.

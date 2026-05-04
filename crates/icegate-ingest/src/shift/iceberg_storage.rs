@@ -28,7 +28,7 @@ use iceberg::{
 };
 use icegate_common::{
     ICEGATE_NAMESPACE, WAL_OFFSET_PROPERTY,
-    parquet_encoding::{ColumnEncoding, build_writer_properties},
+    parquet_writer::{ColumnEncoding, build_writer_properties},
     retrier::{Retrier, RetrierConfig},
 };
 use tokio::sync::RwLock;
@@ -590,7 +590,7 @@ mod tests {
     };
     use bytes::Bytes;
     use iceberg::io::FileIO;
-    use icegate_common::parquet_encoding::build_writer_properties;
+    use icegate_common::parquet_writer::build_writer_properties;
     use parquet::{
         arrow::ArrowWriter,
         file::{

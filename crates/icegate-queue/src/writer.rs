@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt, future::join_all};
-use icegate_common::parquet_encoding::ColumnEncoding;
+use icegate_common::parquet_writer::ColumnEncoding;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{
     arrow::ArrowWriter,

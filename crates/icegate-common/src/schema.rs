@@ -1054,6 +1054,28 @@ pub const COL_STATUS_MESSAGE: &str = "status_message";
 pub const COL_EVENTS: &str = "events";
 /// Spans table — `links` column (ARRAY of struct).
 pub const COL_LINKS: &str = "links";
+/// Logs/events/spans — observed-by-collector timestamp (`TIMESTAMP`).
+pub const COL_OBSERVED_TIMESTAMP: &str = "observed_timestamp";
+/// Logs/events/spans/metrics — write-side timestamp captured by ingest (`TIMESTAMP`).
+pub const COL_INGESTED_TIMESTAMP: &str = "ingested_timestamp";
+/// Spans — W3C trace state (`STRING`).
+pub const COL_TRACE_STATE: &str = "trace_state";
+/// Metrics — histogram/summary start timestamp (`TIMESTAMP`).
+pub const COL_START_TIMESTAMP: &str = "start_timestamp";
+/// Metrics — histogram/summary count (`BIGINT`).
+pub const COL_COUNT: &str = "count";
+/// Metrics — exponential-histogram zero-bucket count (`BIGINT`).
+pub const COL_ZERO_COUNT: &str = "zero_count";
+/// Metrics — point value as `DOUBLE`.
+pub const COL_VALUE_DOUBLE: &str = "value_double";
+/// Metrics — histogram/summary sum (`DOUBLE`).
+pub const COL_SUM: &str = "sum";
+/// Metrics — histogram min (`DOUBLE`).
+pub const COL_MIN: &str = "min";
+/// Metrics — histogram max (`DOUBLE`).
+pub const COL_MAX: &str = "max";
+/// Metrics — exponential-histogram zero threshold (`DOUBLE`).
+pub const COL_ZERO_THRESHOLD: &str = "zero_threshold";
 /// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
 pub const LEVEL_ALIAS: &str = "level";
 

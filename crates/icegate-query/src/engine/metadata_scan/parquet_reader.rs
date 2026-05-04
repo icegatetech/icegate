@@ -146,8 +146,6 @@ pub async fn read_column_dictionaries(
     // log instead, and let the over-approximation contract carry the
     // missing values.
     let mut no_dict: usize = 0;
-    // Column name for diagnostics (resolved once; used in the warn event).
-    let column_name = metadata.file_metadata().schema_descr().column(leaf_idx).name().to_string();
 
     for rg_idx in 0..metadata.num_row_groups() {
         let rg = metadata.row_group(rg_idx);
@@ -198,9 +196,14 @@ pub async fn read_column_dictionaries(
         // in `icegate_common::parquet_encoding`. A non-zero count here for
         // an IceGate-written file therefore signals either an external
         // file or a policy regression — surface the column name so it's
-        // actionable from logs alone.
+        // actionable from logs alone. The lookup is hoisted into the warn
+        // arm so the cold path's allocation doesn't run for the common
+        // (no-dict == 0) case. Bind the descriptor `Arc` to a local first
+        // so the `&str` returned by `.name()` doesn't outlive the
+        // temporary chain it would otherwise borrow from.
+        let column = metadata.file_metadata().schema_descr().column(leaf_idx);
         tracing::warn!(
-            column = %column_name,
+            column = %column.name(),
             no_dict,
             "skipped row groups without dictionary page; tag-value results may be incomplete (regression?)"
         );
