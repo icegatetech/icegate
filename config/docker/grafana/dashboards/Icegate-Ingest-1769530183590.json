@@ -348,7 +348,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p50",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p50",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
@@ -357,7 +357,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p95",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p90-histogram_quantile"
         },
@@ -366,7 +366,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p99",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p99",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p50-histogram_quantile"
         }
@@ -461,7 +461,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{protocol}} - {{signal}} - p50",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
@@ -470,7 +470,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{protocol}} - {{signal}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p50-histogram_quantile"
         },
@@ -479,7 +479,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "{{protocol}} - {{signal}} - p99",
           "range": true,
           "refId": "A"
         }
@@ -575,7 +575,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{protocol}} - {{signal}} - {{encoding}} - p50",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
@@ -584,7 +584,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{protocol}} - {{signal}} - {{encoding}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p90-histogram_quantile"
         },
@@ -593,7 +593,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "{{protocol}} - {{signal}} - {{encoding}} - p99",
           "range": true,
           "refId": "A"
         }
@@ -803,7 +803,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p50",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p50",
           "range": true,
           "refId": "A"
         },
@@ -812,7 +812,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p95",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p95",
           "range": true,
           "refId": "B"
         },
@@ -821,7 +821,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p99",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p99",
           "range": true,
           "refId": "C"
         }
@@ -1031,7 +1031,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{protocol}} - {{signal}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
@@ -1041,7 +1041,7 @@
           "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{protocol}} - {{signal}} - p50",
           "range": true,
           "refId": "A"
         },
@@ -1050,7 +1050,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "{{protocol}} - {{signal}} - p99",
           "range": true,
           "refId": "B"
         }
@@ -1865,7 +1865,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{protocol}} - {{signal}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
@@ -1875,7 +1875,7 @@
           "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{protocol}} - {{signal}} - p50",
           "range": true,
           "refId": "A"
         },
@@ -1884,7 +1884,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "{{protocol}} - {{signal}} - p99",
           "range": true,
           "refId": "B"
         }

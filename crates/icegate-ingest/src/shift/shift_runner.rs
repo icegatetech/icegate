@@ -1295,12 +1295,14 @@ mod tests {
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .expect("timestamp column at index 3");
-                let min_ts = (0..ts_col.len()).filter_map(|i| ts_col.value(i).into()).min().unwrap_or(0);
-                let max_ts = (0..ts_col.len()).filter_map(|i| ts_col.value(i).into()).max().unwrap_or(0);
-                extracted.insert(
-                    crate::shift::plan_runner::PLAN_FIELD_TIMESTAMP_RANGE.to_string(),
-                    icegate_queue::ExtractedValue::TimestampMicrosRange(min_ts, max_ts),
-                );
+                let mut valid_ts = (0..ts_col.len()).filter(|&i| ts_col.is_valid(i)).map(|i| ts_col.value(i));
+                if let Some(first) = valid_ts.next() {
+                    let (min_ts, max_ts) = valid_ts.fold((first, first), |(mn, mx), v| (mn.min(v), mx.max(v)));
+                    extracted.insert(
+                        crate::shift::plan_runner::PLAN_FIELD_TIMESTAMP_RANGE.to_string(),
+                        icegate_queue::ExtractedValue::TimestampMicrosRange(min_ts, max_ts),
+                    );
+                }
                 entries.push(RowGroupPlanEntry {
                     wal_offset: segment.offset,
                     row_group_idx,

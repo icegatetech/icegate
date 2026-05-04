@@ -237,12 +237,6 @@ fn extract_column_stats_utf8_singleton(
                 ))
             })?;
 
-            if value.is_empty() {
-                return Err(QueueError::Metadata(format!(
-                    "empty value in stats for '{column_name}' row group {row_group_idx} of WAL segment {wal_offset}"
-                )));
-            }
-
             Ok(value.to_string())
         }
         _ => Err(QueueError::Metadata(format!(

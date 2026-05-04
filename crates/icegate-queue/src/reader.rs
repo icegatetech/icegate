@@ -1,7 +1,7 @@
 //! Queue reader for reading Parquet segments from object storage.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
@@ -366,6 +366,16 @@ impl ParquetQueueReader {
         fields: &[ExtractField],
         cancel_token: &CancellationToken,
     ) -> Result<SegmentsPlan> {
+        let mut seen_names = HashSet::with_capacity(fields.len());
+        for field in fields {
+            if !seen_names.insert(field.name.as_str()) {
+                return Err(QueueError::Config(format!(
+                    "duplicate ExtractField name: '{}'",
+                    field.name
+                )));
+            }
+        }
+
         let listed = self.list_segments(topic, start_offset, cancel_token).await?;
         if listed.is_empty() {
             return Ok(SegmentsPlan {
