@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use icegate_jobmanager::{Error, JobManager};
-use icegate_queue::{QueueReader, RecordBatchStream, SegmentsPlan, Topic};
+use icegate_queue::{ExtractField, QueueReader, RecordBatchStream, SegmentsPlan, Topic};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -80,6 +80,28 @@ where
                     self.metrics
                         .record_task_failure(super::PLAN_TASK_CODE, plan_result.status.as_str(), &self.topic);
                 }
+
+                if let Some(summary) = &plan_result.plan_summary {
+                    tracing::debug!(
+                        target: "icegate_ingest::shift::planner",
+                        topic = %self.topic,
+                        n_row_groups = summary.n_row_groups,
+                        n_clusters = summary.n_clusters,
+                        n_chunks = summary.n_chunks,
+                        max_cluster_bytes = summary.max_cluster_bytes,
+                        n_oversized_clusters = summary.oversized_clusters,
+                        tail_merged = summary.tail_merged,
+                        n_cross_partition_row_groups = summary.cross_partition_row_groups,
+                        "planner: chunks built"
+                    );
+                    for &bytes in &summary.shift_task_input_bytes {
+                        self.metrics.record_planned_input_bytes_per_task(bytes, &self.topic);
+                    }
+                    // On 64-bit targets `usize == u64`; cast is lossless.
+                    self.metrics
+                        .record_planner_oversized_clusters(summary.oversized_clusters as u64, &self.topic);
+                }
+
                 Ok(plan_result)
             }
             Err(err) => {
@@ -312,31 +334,17 @@ where
         &self,
         topic: &Topic,
         start_offset: u64,
-        group_by_column_name: &str,
-        max_record_batches_per_task: usize,
-        max_input_bytes_per_task: u64,
+        fields: &[ExtractField],
         cancel_token: &CancellationToken,
     ) -> icegate_queue::Result<SegmentsPlan> {
         let start = Instant::now();
-        let result = self
-            .inner
-            .plan_segments(
-                topic,
-                start_offset,
-                group_by_column_name,
-                max_record_batches_per_task,
-                max_input_bytes_per_task,
-                cancel_token,
-            )
-            .await;
+        let result = self.inner.plan_segments(topic, start_offset, fields, cancel_token).await;
+        // Per-task input bytes are recorded by the plan-runner once it shapes
+        // chunks; this surface only records the queue read duration.
         match &result {
-            Ok(plan) => {
+            Ok(_) => {
                 self.metrics
                     .record_queue_plan_duration(start.elapsed(), topic.as_str(), TaskStatus::Ok.as_str());
-                for group in &plan.groups {
-                    self.metrics
-                        .record_planned_input_bytes_per_task(group.input_bytes_total, topic.as_str());
-                }
             }
             Err(_) => {
                 self.metrics
@@ -368,15 +376,6 @@ where
             ),
         }
         result
-    }
-
-    async fn read_segment_row_group_metadata(
-        &self,
-        topic: &Topic,
-        offset: u64,
-        cancel_token: &CancellationToken,
-    ) -> icegate_queue::Result<std::collections::HashMap<usize, String>> {
-        self.inner.read_segment_row_group_metadata(topic, offset, cancel_token).await
     }
 }
 

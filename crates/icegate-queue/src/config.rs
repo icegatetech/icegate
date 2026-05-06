@@ -101,7 +101,6 @@ pub struct QueueWriteConfig {
     pub records_per_flush_multiplier: usize,
 
     /// Maximum bytes to accumulate before flush.
-    /// It is better to synchronize with `ShiftReadConfig::max_input_bytes_per_task`.
     pub max_bytes_per_flush: usize,
 
     /// Maximum time to wait before flush (in milliseconds).

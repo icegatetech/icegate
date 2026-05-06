@@ -19,15 +19,13 @@ use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
-    Topic,
+    Topic, WAL_ROW_GROUP_METADATA_KEY as ROW_GROUP_METADATA_KEY,
     accumulator::TopicAccumulator,
     channel::{PreparedWalRowGroup, WriteReceiver, WriteRequest},
     config::QueueConfig,
     error::{QueueError, Result},
     segment::SegmentId,
 };
-
-const ROW_GROUP_METADATA_KEY: &str = "icegate.queue.row_group_metadata.v1";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct RowGroupMetadataEntry {

@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::collections::HashMap;
+
 use futures::TryStreamExt;
 use icegate_queue::{QueueConfig, QueueWriter, WriteRequest, channel};
 use object_store::path::Path;
@@ -286,9 +288,28 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
     handle.await.unwrap().unwrap();
 
     let reader = ParquetQueueReader::new("queue", store, 8192)?;
-    let metadata = reader
-        .read_segment_row_group_metadata(&"logs".to_string(), 0, &CancellationToken::new())
+    let fields = vec![icegate_queue::ExtractField {
+        name: "boundary".to_string(),
+        extractor: icegate_queue::FieldExtractor::FileKeyValueRowGroupPayload {
+            key: icegate_queue::WAL_ROW_GROUP_METADATA_KEY.to_string(),
+        },
+    }];
+    let plan = reader
+        .plan_segments(&"logs".to_string(), 0, &fields, &CancellationToken::new())
         .await?;
+
+    let metadata: HashMap<usize, String> = plan
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            entry.extracted.get("boundary").map(|v| {
+                (
+                    entry.row_group_idx,
+                    v.as_utf8().expect("boundary must be utf8").to_string(),
+                )
+            })
+        })
+        .collect();
 
     assert_eq!(metadata.len(), 2);
     assert_eq!(

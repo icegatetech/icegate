@@ -14,6 +14,8 @@ pub mod instrumentation;
 pub mod parquet_meta_reader;
 /// Plan task runner for shift operations.
 pub mod plan_runner;
+mod planner;
+mod planner_partitioning;
 mod row_groups_merger;
 /// Shift task runner for shift operations.
 pub mod shift_runner;
@@ -31,6 +33,7 @@ pub(crate) use executor::{
 };
 use iceberg::Catalog;
 pub(crate) use iceberg_storage::IcebergStorage;
+use iceberg_storage::writer_max_parquet_bytes;
 use icegate_jobmanager::{
     CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
     Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
@@ -41,6 +44,7 @@ use instrumentation::{
     ShiftTaskRunnerWithMetrics, StorageWithMetrics,
 };
 use plan_runner::PlanTaskRunnerImpl;
+pub use planner_partitioning::{CURRENT_PLANNER_PARTITION_SPEC, PlannerPartitionSpec};
 use shift_runner::ShiftTaskRunnerImpl;
 use timeout::TimeoutEstimator;
 
@@ -61,6 +65,8 @@ pub struct ShiftJobSpec {
     pub table: &'static str,
     /// Sort descriptor shared with the WAL sorter for this topic.
     pub descriptor: &'static SortColumnsDescriptor,
+    /// Explicit limited partition spec used by the shift planner adapter.
+    pub planner_partition_spec: &'static PlannerPartitionSpec,
     /// Columns that should get a Parquet bloom filter when written to
     /// Iceberg. Use `&[]` to disable bloom filters for the table.
     ///
@@ -108,6 +114,7 @@ impl Shifter {
                 Arc::clone(&catalog),
                 spec.table,
                 shift_config.as_ref(),
+                writer_max_parquet_bytes(shift_config.read.upper_bound_input_mb_per_task * 1024 * 1024),
                 spec.bloom_filter_columns,
             ));
             let plan_runner = Arc::new(PlanTaskRunnerImpl::new(
@@ -116,6 +123,7 @@ impl Shifter {
                 shift_config.clone(),
                 timeouts.clone(),
                 spec.topic,
+                spec.planner_partition_spec,
             ));
             let plan_runner = Arc::new(PlanTaskRunnerWithMetrics::new(
                 plan_runner,

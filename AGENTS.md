@@ -189,3 +189,5 @@ The project uses `rustfmt` for code formatting. Configuration is in `rustfmt.tom
 - It is better to give an error than to use/calculate/show invalid data.
 - NEVER delete TODO comments if the changes do not fully cover the necessary edits in the comment.
 - Format only the affected crate: `cargo +nightly fmt -p <crate>`.
+- All code and comments should be in English only.
+- ALWAYS use the Iceberg schema only from `crates/icegate-common/src/schema.rs`, NEVER hardcode columns in the working code.

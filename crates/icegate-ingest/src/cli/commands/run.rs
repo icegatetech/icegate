@@ -463,6 +463,7 @@ async fn run_services(
             topic: LOGS_TOPIC,
             table: LOGS_TABLE,
             descriptor: SortColumnsDescriptor::logs()?,
+            planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
             bloom_filter_columns: TRACE_LOOKUP_BLOOM_COLUMNS,
         },
         ShiftJobSpec {
@@ -470,6 +471,7 @@ async fn run_services(
             topic: SPANS_TOPIC,
             table: SPANS_TABLE,
             descriptor: SortColumnsDescriptor::spans()?,
+            planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
             bloom_filter_columns: TRACE_LOOKUP_BLOOM_COLUMNS,
         },
     ];

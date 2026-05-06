@@ -316,7 +316,7 @@
               }
             ]
           },
-          "unit": "bytes"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -326,7 +326,7 @@
         "x": 12,
         "y": 1
       },
-      "id": 23,
+      "id": 22,
       "maxDataPoints": 500,
       "options": {
         "legend": {
@@ -346,32 +346,32 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p50",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p90-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p99",
           "range": true,
-          "refId": "A"
+          "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p50-histogram_quantile"
         }
       ],
-      "title": "Request: size",
+      "title": "Request: latency",
       "type": "timeseries"
     },
     {
@@ -461,7 +461,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{protocol}} - {{signal}} - p50",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
@@ -470,7 +470,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{protocol}} - {{signal}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p50-histogram_quantile"
         },
@@ -479,7 +479,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_otlp_records_per_request_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "{{protocol}} - {{signal}} - p99",
           "range": true,
           "refId": "A"
         }
@@ -543,7 +543,7 @@
               }
             ]
           },
-          "unit": "s"
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -553,7 +553,7 @@
         "x": 0,
         "y": 7
       },
-      "id": 22,
+      "id": 23,
       "maxDataPoints": 500,
       "options": {
         "legend": {
@@ -573,32 +573,32 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))\n",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p50",
+          "legendFormat": "{{protocol}} - {{signal}} - {{encoding}} - p50",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))\n",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p95",
+          "legendFormat": "{{protocol}} - {{signal}} - {{encoding}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p90-histogram_quantile"
         },
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_request_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, encoding) (rate(icegate_ingest_otlp_request_size_bytes_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p99",
+          "legendFormat": "{{protocol}} - {{signal}} - {{encoding}} - p99",
           "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p50-histogram_quantile"
+          "refId": "A"
         }
       ],
-      "title": "Request: latency",
+      "title": "Request: size",
       "type": "timeseries"
     },
     {
@@ -717,7 +717,7 @@
     },
     {
       "datasource": "Prometheus",
-      "description": "OTLP WAL sorting duration before enqueue.",
+      "description": "OTLP request decode duration.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -779,6 +779,120 @@
         "h": 6,
         "w": 6,
         "x": 12,
+        "y": 7
+      },
+      "id": 75,
+      "maxDataPoints": 500,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "{{protocol}} - {{signal}} - {{status}} - p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Request: decode latency [1m]",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "OTLP WAL sorting duration before enqueue.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 9,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
         "y": 7
       },
       "id": 77,
@@ -892,8 +1006,8 @@
       "gridPos": {
         "h": 6,
         "w": 6,
-        "x": 18,
-        "y": 82
+        "x": 0,
+        "y": 13
       },
       "id": 26,
       "maxDataPoints": 500,
@@ -917,7 +1031,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p95",
+          "legendFormat": "{{protocol}} - {{signal}} - p95",
           "range": true,
           "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
         },
@@ -927,7 +1041,7 @@
           "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
           "hide": false,
-          "legendFormat": "p50",
+          "legendFormat": "{{protocol}} - {{signal}} - p50",
           "range": true,
           "refId": "A"
         },
@@ -936,7 +1050,7 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_wal_ack_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "fromExploreMetrics": false,
-          "legendFormat": "p99",
+          "legendFormat": "{{protocol}} - {{signal}} - p99",
           "range": true,
           "refId": "B"
         }
@@ -1007,7 +1121,7 @@
       "gridPos": {
         "h": 6,
         "w": 6,
-        "x": 0,
+        "x": 6,
         "y": 13
       },
       "id": 31,
@@ -1122,7 +1236,7 @@
       "gridPos": {
         "h": 6,
         "w": 6,
-        "x": 6,
+        "x": 12,
         "y": 13
       },
       "id": 30,
@@ -1151,99 +1265,6 @@
         }
       ],
       "title": "WAL: pending bytes to flush",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "description": "Number of records in the accumulator",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 12,
-        "y": 13
-      },
-      "id": 29,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "icegate_ingest_wal_pending_records{job=\"ingest\"}",
-          "legendFormat": "{{topic}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "WAL: pending records to flush",
       "type": "timeseries"
     },
     {
@@ -1394,121 +1415,6 @@
                 "value": 80
               }
             ]
-          },
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 0,
-        "y": 19
-      },
-      "id": 32,
-      "maxDataPoints": 500,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))\n",
-          "fromExploreMetrics": false,
-          "legendFormat": "p95",
-          "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
-        },
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))",
-          "fromExploreMetrics": false,
-          "hide": false,
-          "legendFormat": "p50",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))",
-          "fromExploreMetrics": false,
-          "legendFormat": "p99",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "title": "WAL: segment size [1m]",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "description": "",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 9,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
           }
         },
         "overrides": []
@@ -1516,7 +1422,7 @@
       "gridPos": {
         "h": 6,
         "w": 6,
-        "x": 6,
+        "x": 0,
         "y": 19
       },
       "id": 33,
@@ -1624,17 +1530,17 @@
               }
             ]
           },
-          "unit": "cps"
+          "unit": "bytes"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 6,
         "w": 6,
-        "x": 12,
+        "x": 6,
         "y": 19
       },
-      "id": 34,
+      "id": 32,
       "maxDataPoints": 500,
       "options": {
         "legend": {
@@ -1654,14 +1560,126 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (topic) (rate(icegate_ingest_wal_segments_total{job=\"ingest\"}[1m]))",
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))\n",
           "fromExploreMetrics": false,
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "hide": false,
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, topic) (rate(icegate_ingest_wal_segment_bytes_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "WAL: segment size [1m]",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "Number of records in the accumulator",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 19
+      },
+      "id": 29,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "icegate_ingest_wal_pending_records{job=\"ingest\"}",
           "legendFormat": "{{topic}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "WAL: write segments count [1m]",
+      "title": "WAL: pending records to flush",
       "type": "timeseries"
     },
     {
@@ -1776,6 +1794,308 @@
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
+            "fillOpacity": 9,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 25
+      },
+      "id": 25,
+      "maxDataPoints": 500,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "{{protocol}} - {{signal}} - p95",
+          "range": true,
+          "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "hide": false,
+          "legendFormat": "{{protocol}} - {{signal}} - p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "fromExploreMetrics": false,
+          "legendFormat": "{{protocol}} - {{signal}} - p99",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "WAL: write to WAL latency [1m]",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 9,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 25
+      },
+      "id": 34,
+      "maxDataPoints": 500,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "sum by (topic) (rate(icegate_ingest_wal_segments_total{job=\"ingest\"}[1m]))",
+          "fromExploreMetrics": false,
+          "legendFormat": "{{topic}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "WAL: write segments count [1m]",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 25
+      },
+      "id": 27,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "sum by (protocol, signal) (rate(icegate_ingest_wal_queue_unavailable_total{job=\"ingest\"}[1m]))",
+          "legendFormat": "{{protocol}} - {{signal}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "WAL: write to queue unavailable [1m]",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
             "fillOpacity": 0,
             "gradientMode": "none",
             "hideFrom": {
@@ -1823,7 +2143,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 25
+        "y": 31
       },
       "id": 72,
       "options": {
@@ -1916,7 +2236,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 25
+        "y": 31
       },
       "id": 71,
       "maxDataPoints": 500,
@@ -1956,218 +2276,12 @@
       "type": "timeseries"
     },
     {
-      "datasource": "Prometheus",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 9,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 12,
-        "y": 25
-      },
-      "id": 25,
-      "maxDataPoints": 500,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
-          "fromExploreMetrics": false,
-          "legendFormat": "p95",
-          "range": true,
-          "refId": "icegate_ingest_shift_plan_duration_seconds_bucket-p99-histogram_quantile"
-        },
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
-          "fromExploreMetrics": false,
-          "hide": false,
-          "legendFormat": "p50",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal) (rate(icegate_ingest_wal_enqueue_duration_seconds_bucket{job=\"ingest\"}[1m])))",
-          "fromExploreMetrics": false,
-          "legendFormat": "p99",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "title": "WAL: write to WAL latency [1m]",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 18,
-        "y": 25
-      },
-      "id": 27,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "sum by (protocol, signal) (rate(icegate_ingest_wal_queue_unavailable_total{job=\"ingest\"}[1m]))",
-          "legendFormat": "{{protocol}} - {{signal}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "WAL: write to queue unavailable [1m]",
-      "type": "timeseries"
-    },
-    {
       "collapsed": true,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 37
       },
       "id": 50,
       "panels": [
@@ -3151,7 +3265,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 32
+        "y": 38
       },
       "id": 5,
       "panels": [],
@@ -3221,7 +3335,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 33
+        "y": 39
       },
       "id": 1,
       "options": {
@@ -3315,7 +3429,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 33
+        "y": 39
       },
       "id": 7,
       "options": {
@@ -3427,7 +3541,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 33
+        "y": 39
       },
       "id": 8,
       "options": {
@@ -3521,7 +3635,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 33
+        "y": 39
       },
       "id": 68,
       "options": {
@@ -3633,7 +3747,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 39
+        "y": 45
       },
       "id": 6,
       "maxDataPoints": 500,
@@ -3746,7 +3860,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 39
+        "y": 45
       },
       "id": 2,
       "options": {
@@ -3840,7 +3954,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 39
+        "y": 45
       },
       "id": 3,
       "options": {
@@ -3933,7 +4047,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 39
+        "y": 45
       },
       "id": 4,
       "options": {
@@ -4026,7 +4140,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 45
+        "y": 51
       },
       "id": 10,
       "options": {
@@ -4138,7 +4252,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 45
+        "y": 51
       },
       "id": 11,
       "options": {
@@ -4250,7 +4364,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 45
+        "y": 51
       },
       "id": 12,
       "options": {
@@ -4343,7 +4457,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 45
+        "y": 51
       },
       "id": 9,
       "options": {
@@ -4455,7 +4569,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 51
+        "y": 57
       },
       "id": 53,
       "options": {
@@ -4567,7 +4681,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 51
+        "y": 57
       },
       "id": 13,
       "options": {
@@ -4661,7 +4775,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 51
+        "y": 57
       },
       "id": 15,
       "options": {
@@ -4773,7 +4887,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 51
+        "y": 57
       },
       "id": 14,
       "options": {
@@ -4884,7 +4998,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 57
+        "y": 63
       },
       "id": 16,
       "options": {
@@ -4978,7 +5092,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 57
+        "y": 63
       },
       "id": 19,
       "interval": "1m",
@@ -5072,7 +5186,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 57
+        "y": 63
       },
       "id": 18,
       "options": {
@@ -5165,7 +5279,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 57
+        "y": 63
       },
       "id": 17,
       "options": {
@@ -5258,7 +5372,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 63
+        "y": 69
       },
       "id": 69,
       "maxDataPoints": 500,
@@ -5360,7 +5474,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 63
+        "y": 69
       },
       "id": 70,
       "options": {
@@ -5454,7 +5568,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 63
+        "y": 69
       },
       "id": 73,
       "options": {
@@ -5563,7 +5677,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 63
+        "y": 69
       },
       "id": 74,
       "options": {
@@ -5599,7 +5713,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 75
       },
       "id": 37,
       "panels": [],
@@ -5669,7 +5783,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 70
+        "y": 76
       },
       "id": 38,
       "options": {
@@ -5762,7 +5876,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 70
+        "y": 76
       },
       "id": 39,
       "options": {
@@ -5855,7 +5969,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 70
+        "y": 76
       },
       "id": 40,
       "maxDataPoints": 500,
@@ -5957,7 +6071,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 70
+        "y": 76
       },
       "id": 41,
       "options": {
@@ -6050,7 +6164,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 76
+        "y": 82
       },
       "id": 42,
       "maxDataPoints": 500,
@@ -6152,7 +6266,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 76
+        "y": 82
       },
       "id": 43,
       "maxDataPoints": 500,
@@ -6254,7 +6368,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 76
+        "y": 82
       },
       "id": 44,
       "options": {
@@ -6347,7 +6461,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 76
+        "y": 82
       },
       "id": 45,
       "options": {
@@ -6440,7 +6554,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 82
+        "y": 88
       },
       "id": 46,
       "options": {
@@ -6533,7 +6647,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 82
+        "y": 88
       },
       "id": 62,
       "options": {
@@ -6626,7 +6740,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 82
+        "y": 88
       },
       "id": 63,
       "options": {
@@ -6655,120 +6769,6 @@
       ],
       "title": "Jobmanager: save conflict retry rate [1m]",
       "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "description": "OTLP request decode duration.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 9,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 18,
-        "y": 7
-      },
-      "id": 75,
-      "maxDataPoints": 500,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
-          "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p50",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
-          "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p95",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": "Prometheus",
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, protocol, signal, status) (rate(icegate_ingest_otlp_decode_duration_seconds_bucket{job=\"ingest\"}[1m])))",
-          "fromExploreMetrics": false,
-          "legendFormat": "{{signal}} - {{status}} - p99",
-          "range": true,
-          "refId": "C"
-        }
-      ],
-      "title": "Request: decode latency [1m]",
-      "type": "timeseries"
     }
   ],
   "preload": false,
@@ -6785,5 +6785,5 @@
   "timezone": "browser",
   "title": "Ingest",
   "uid": "g78tk2",
-  "version": 13
+  "version": 17
 }

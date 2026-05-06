@@ -110,11 +110,29 @@ pub trait Storage: Send + Sync {
     ) -> Result<usize>;
 }
 
+/// Failover multiplier on top of the planner's upper bound. The writer flips
+/// to a new file only when actual encoded parquet bytes overshoot
+/// `upper_bound_input_mb_per_task * 1024 * 1024 * factor` — i.e., parquet overhead
+/// (footers, statistics, padding) plus a safety margin. In normal operation
+/// the planner already shapes one chunk per shift task, so rollover should
+/// not fire.
+const WRITER_FILE_SIZE_FAILOVER_FACTOR: u64 = 2;
+
+/// Compute the writer rollover budget from the planner's per-task upper bound.
+///
+/// The writer must only roll over as a failover (planner-shaped chunks already
+/// target one file per task), so the budget is `upper_bound * 2` rather than
+/// the planner's upper bound itself.  Encapsulated as a `const fn` so the
+/// failover policy is verifiable in isolation.
+pub(crate) const fn writer_max_parquet_bytes(upper_bound_input_bytes: u64) -> u64 {
+    upper_bound_input_bytes.saturating_mul(WRITER_FILE_SIZE_FAILOVER_FACTOR)
+}
+
 /// Iceberg storage for shift operations.
 pub struct IcebergStorage {
     loader: TableLoader,
     row_group_size: usize,
-    max_file_size_mb: usize,
+    max_file_size_bytes: u64,
     /// Column names that should get a Parquet bloom filter when written.
     ///
     /// The list is owned by the caller (typically a per-table
@@ -133,13 +151,14 @@ impl IcebergStorage {
         catalog: Arc<dyn Catalog>,
         table: impl Into<String>,
         shift_config: &ShiftConfig,
+        max_file_size_bytes: u64,
         bloom_filter_columns: &'static [&'static str],
     ) -> Self {
         let table_ident = TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.into());
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,
-            max_file_size_mb: shift_config.write.max_file_size_mb,
+            max_file_size_bytes,
             bloom_filter_columns,
             retrier: Retrier::new(RetrierConfig::default()),
         }
@@ -198,7 +217,7 @@ impl IcebergStorage {
         // still resolves normally.
         let handle = tokio::runtime::Handle::current();
         let row_group_size = self.row_group_size;
-        let max_file_size_mb = self.max_file_size_mb;
+        let max_file_size_bytes = self.max_file_size_bytes;
         let bloom_filter_columns = self.bloom_filter_columns;
         let cancel = cancel_token.clone();
         let table = self.load_table(cancel_token).await?;
@@ -213,7 +232,7 @@ impl IcebergStorage {
             handle.block_on(Self::write_parquet_files_once(
                 table,
                 row_group_size,
-                max_file_size_mb,
+                max_file_size_bytes,
                 bloom_filter_columns,
                 batches,
                 &cancel,
@@ -227,7 +246,7 @@ impl IcebergStorage {
     async fn write_parquet_files_once(
         table: Table,
         row_group_size: usize,
-        max_file_size_mb: usize,
+        max_file_size_bytes: u64,
         bloom_filter_columns: &'static [&'static str],
         mut batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
@@ -250,9 +269,12 @@ impl IcebergStorage {
 
         let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table_metadata.current_schema().clone());
 
+        // Convert to `usize` for the iceberg writer API. On 64-bit targets `u64`
+        // never overflows `usize`; saturate on 32-bit targets.
+        let target_file_size = usize::try_from(max_file_size_bytes).unwrap_or(usize::MAX);
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
-            max_file_size_mb * 1024 * 1024,
+            target_file_size,
             table_file_io.clone(),
             location_generator,
             file_name_generator,
@@ -604,7 +626,24 @@ mod tests {
         },
     };
 
-    use super::{build_writer_properties, cleanup_generated_data_files};
+    use super::{build_writer_properties, cleanup_generated_data_files, writer_max_parquet_bytes};
+
+    /// Failover policy guard: writer rollover budget must be exactly
+    /// `upper_bound_bytes * 2`.  If this changes, the planner's
+    /// "one chunk == one parquet file" invariant has to be re-verified — the
+    /// writer would start splitting normal chunks instead of acting as a
+    /// failover.
+    #[test]
+    fn writer_max_parquet_bytes_doubles_planner_upper_bound() {
+        assert_eq!(writer_max_parquet_bytes(64 * 1024 * 1024), 128 * 1024 * 1024);
+        assert_eq!(writer_max_parquet_bytes(128 * 1024 * 1024), 256 * 1024 * 1024);
+    }
+
+    /// Saturating multiplication must not panic on absurdly large inputs.
+    #[test]
+    fn writer_max_parquet_bytes_saturates_on_overflow() {
+        assert_eq!(writer_max_parquet_bytes(u64::MAX), u64::MAX);
+    }
 
     #[tokio::test]
     async fn cleanup_generated_data_files_deletes_existing_paths() {
