@@ -117,8 +117,8 @@ where
             .plan_entries_to_row_groups(plan.entries)
             .map_err(|e| Error::TaskExecution(e.to_string()))?;
         let limits = PlannerConfig::from_bounds(
-            self.shift_config.read.lower_bound_input_bytes_per_task,
-            self.shift_config.read.upper_bound_input_bytes_per_task,
+            self.shift_config.read.lower_bound_input_mb_per_task * 1024 * 1024,
+            self.shift_config.read.upper_bound_input_mb_per_task * 1024 * 1024,
             self.shift_config.read.max_record_batches_per_task,
         );
 
@@ -775,13 +775,11 @@ mod tests {
         let runner = test_runner(FakeQueueReader);
         let manager = RecordingManager::new();
 
-        // 1 byte per row group × 10 row groups × 6 services = 60 bytes total.
-        // Shrink bounds to force multiple tasks: lower=12, upper=24.
-        // The algorithm is scale-invariant so the structural result is identical
-        // to a 1MB-per-row-group workload with 12MB/24MB bounds.
+        // 1 MB per row group × 10 row groups × 6 services = 60 MB total.
+        // Shrink bounds to force multiple tasks: lower=12 MB, upper=24 MB.
         let mut shift_config = ShiftConfig::default();
-        shift_config.read.lower_bound_input_bytes_per_task = 12; // 12 bytes target.
-        shift_config.read.upper_bound_input_bytes_per_task = 24; // 24 bytes hard cap.
+        shift_config.read.lower_bound_input_mb_per_task = 12;
+        shift_config.read.upper_bound_input_mb_per_task = 24;
         let runner = PlanTaskRunnerImpl::new(
             runner.queue_reader,
             runner.storage,
@@ -801,7 +799,7 @@ mod tests {
                     Some("tenant-a"),
                     1,
                     usize::try_from(svc * 10 + idx).expect("idx"),
-                    1,
+                    1024 * 1024,
                     Some(timestamp_boundary("acc-1", &service, min_ts, max_ts)),
                     Some((min_ts, max_ts)),
                 ));
@@ -813,7 +811,7 @@ mod tests {
             last_segment_offset: Some(1),
             segments_count: 1,
             row_groups_total,
-            input_bytes_total: row_groups_total as u64,
+            input_bytes_total: row_groups_total as u64 * 1024 * 1024,
         };
 
         let (task_ids, _) = runner

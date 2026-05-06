@@ -468,7 +468,7 @@ mod tests {
         shift::{
             PlannedRowGroup, SHIFT_TASK_CODE, SegmentToRead, ShiftConfig, ShiftInput, ShiftOutput,
             executor::TaskStatus,
-            iceberg_storage::{IcebergStorage, Storage, WrittenDataFiles},
+            iceberg_storage::{IcebergStorage, Storage, WrittenDataFiles, writer_max_parquet_bytes},
             plan_runner::{PlanTaskRunner, PlanTaskRunnerImpl},
             timeout::TimeoutEstimator,
         },
@@ -2411,7 +2411,13 @@ mod tests {
         let mut shift_config = ShiftConfig::default();
         shift_config.write.row_group_size = 2;
         let storage = Arc::new(E2eParquetStorage {
-            inner: IcebergStorage::new(Arc::clone(&catalog), table_name.clone(), &shift_config, &[]),
+            inner: IcebergStorage::new(
+                Arc::clone(&catalog),
+                table_name.clone(),
+                &shift_config,
+                writer_max_parquet_bytes(shift_config.read.upper_bound_input_mb_per_task * 1024 * 1024),
+                &[],
+            ),
             written_data_files: Mutex::new(Vec::new()),
         });
         let expected_row_ids_by_tenant = HashMap::from([
@@ -2636,12 +2642,12 @@ mod tests {
 
     /// Behavioural pin of the writer failover budget.
     ///
-    /// `IcebergStorage` derives the writer rollover budget as
-    /// `upper_bound_input_bytes_per_task × WRITER_FILE_SIZE_FAILOVER_FACTOR`
+    /// `IcebergStorage` uses a writer rollover budget of
+    /// `upper_bound_bytes × WRITER_FILE_SIZE_FAILOVER_FACTOR`
     /// (currently ×2). In normal operation the planner shapes one chunk per
     /// shift task and the writer never rolls over; rollover is the failover
     /// path. This test forces the failover to trigger by giving storage a
-    /// pathologically small `upper_bound`, while the planner runs with the
+    /// pathologically small budget (2 bytes), while the planner runs with the
     /// default config so a single shift task covers the whole tenant.
     /// Encoded parquet output (footer + statistics + data) overshoots the tiny
     /// budget and must split into multiple data files.
@@ -2698,7 +2704,7 @@ mod tests {
             "single tenant => single shift task"
         );
 
-        // Storage with pathological `upper_bound = 1`: writer budget = 2 bytes.
+        // Storage with pathological budget = 2 bytes (writer_max_parquet_bytes(1)).
         // Encoded parquet for 6 rows is hundreds of bytes (footer alone), so
         // every row group flushed by `RollingFileWriterBuilder` overshoots the
         // budget and starts a new file.
@@ -2706,9 +2712,14 @@ mod tests {
         let (catalog, _table) = create_e2e_logs_table(&table_name).await;
         let mut storage_config = ShiftConfig::default();
         storage_config.write.row_group_size = 2;
-        storage_config.read.upper_bound_input_bytes_per_task = 1;
         let storage = Arc::new(E2eParquetStorage {
-            inner: IcebergStorage::new(Arc::clone(&catalog), table_name.clone(), &storage_config, &[]),
+            inner: IcebergStorage::new(
+                Arc::clone(&catalog),
+                table_name.clone(),
+                &storage_config,
+                writer_max_parquet_bytes(1), // 2 bytes: forces rollover on every row group
+                &[],
+            ),
             written_data_files: Mutex::new(Vec::new()),
         });
 

@@ -164,16 +164,16 @@ impl JobsStorageConfig {
 pub struct ShiftReadConfig {
     /// Maximum number of row groups to process per shift task. The restriction is necessary because very small row groups can be stored in the WAL, which can reduce performance.
     pub max_record_batches_per_task: usize,
-    /// Soft per-task input target. Planner flushes a chunk when adding the next
+    /// Soft per-task input target in megabytes. Planner flushes a chunk when adding the next
     /// cluster would push it past this size; chunks below this size are
     /// candidates for tail-merge with their predecessor. Acts as the lower
     /// bound of the desired output parquet file size range.
     /// Synchronize with `QueueWriteConfig::max_bytes_per_flush`.
-    pub lower_bound_input_bytes_per_task: u64,
-    /// Hard per-task input cap. Clusters above this are split into oversized
+    pub lower_bound_input_mb_per_task: u64,
+    /// Hard per-task input cap in megabytes. Clusters above this are split into oversized
     /// sub-chunks (disjointness lost). Acts as the upper bound of the desired
     /// output parquet file size range. Must be `>= lower_bound`.
-    pub upper_bound_input_bytes_per_task: u64,
+    pub upper_bound_input_mb_per_task: u64,
     /// Maximum number of WAL segments to read in parallel in plan stage.
     pub plan_segment_read_parallelism: usize,
     /// Maximum number of WAL segments to read in parallel in shift stage.
@@ -184,8 +184,8 @@ impl Default for ShiftReadConfig {
     fn default() -> Self {
         Self {
             max_record_batches_per_task: 1024,
-            lower_bound_input_bytes_per_task: 64 * 1024 * 1024, // 64MB
-            upper_bound_input_bytes_per_task: 128 * 1024 * 1024, // 128MB
+            lower_bound_input_mb_per_task: 64,
+            upper_bound_input_mb_per_task: 128,
             plan_segment_read_parallelism: 8,
             shift_segment_read_parallelism: 8,
         }
@@ -284,19 +284,19 @@ impl ShiftConfig {
                 "max_record_batches_per_task must be greater than zero".to_string(),
             ));
         }
-        if self.read.lower_bound_input_bytes_per_task == 0 {
+        if self.read.lower_bound_input_mb_per_task == 0 {
             return Err(IngestError::Config(
-                "lower_bound_input_bytes_per_task must be greater than zero".to_string(),
+                "lower_bound_input_mb_per_task must be greater than zero".to_string(),
             ));
         }
-        if self.read.upper_bound_input_bytes_per_task == 0 {
+        if self.read.upper_bound_input_mb_per_task == 0 {
             return Err(IngestError::Config(
-                "upper_bound_input_bytes_per_task must be greater than zero".to_string(),
+                "upper_bound_input_mb_per_task must be greater than zero".to_string(),
             ));
         }
-        if self.read.upper_bound_input_bytes_per_task < self.read.lower_bound_input_bytes_per_task {
+        if self.read.upper_bound_input_mb_per_task < self.read.lower_bound_input_mb_per_task {
             return Err(IngestError::Config(
-                "upper_bound_input_bytes_per_task must be >= lower_bound_input_bytes_per_task".to_string(),
+                "upper_bound_input_mb_per_task must be >= lower_bound_input_mb_per_task".to_string(),
             ));
         }
         if self.read.plan_segment_read_parallelism == 0 {
@@ -399,14 +399,14 @@ mod tests {
     #[test]
     fn shift_read_default_input_bytes_bounds() {
         let config = ShiftConfig::default();
-        assert_eq!(config.read.lower_bound_input_bytes_per_task, 64 * 1024 * 1024);
-        assert_eq!(config.read.upper_bound_input_bytes_per_task, 128 * 1024 * 1024);
+        assert_eq!(config.read.lower_bound_input_mb_per_task, 64);
+        assert_eq!(config.read.upper_bound_input_mb_per_task, 128);
     }
 
     #[test]
     fn shift_validate_rejects_zero_lower_bound() {
         let mut config = ShiftConfig::default();
-        config.read.lower_bound_input_bytes_per_task = 0;
+        config.read.lower_bound_input_mb_per_task = 0;
         let err = config.validate().expect_err("config must be invalid");
         assert!(
             matches!(err, crate::error::IngestError::Config(_)),
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn shift_validate_rejects_zero_upper_bound() {
         let mut config = ShiftConfig::default();
-        config.read.upper_bound_input_bytes_per_task = 0;
+        config.read.upper_bound_input_mb_per_task = 0;
         let err = config.validate().expect_err("config must be invalid");
         assert!(
             matches!(err, crate::error::IngestError::Config(_)),
@@ -428,8 +428,8 @@ mod tests {
     #[test]
     fn shift_validate_rejects_upper_below_lower() {
         let mut config = ShiftConfig::default();
-        config.read.lower_bound_input_bytes_per_task = 200;
-        config.read.upper_bound_input_bytes_per_task = 100;
+        config.read.lower_bound_input_mb_per_task = 200;
+        config.read.upper_bound_input_mb_per_task = 100;
         let err = config.validate().expect_err("config must be invalid");
         assert!(
             matches!(err, crate::error::IngestError::Config(_)),

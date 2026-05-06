@@ -112,7 +112,7 @@ pub trait Storage: Send + Sync {
 
 /// Failover multiplier on top of the planner's upper bound. The writer flips
 /// to a new file only when actual encoded parquet bytes overshoot
-/// `upper_bound_input_bytes_per_task * factor` — i.e., parquet overhead
+/// `upper_bound_input_mb_per_task * 1024 * 1024 * factor` — i.e., parquet overhead
 /// (footers, statistics, padding) plus a safety margin. In normal operation
 /// the planner already shapes one chunk per shift task, so rollover should
 /// not fire.
@@ -124,7 +124,7 @@ const WRITER_FILE_SIZE_FAILOVER_FACTOR: u64 = 2;
 /// target one file per task), so the budget is `upper_bound * 2` rather than
 /// the planner's upper bound itself.  Encapsulated as a `const fn` so the
 /// failover policy is verifiable in isolation.
-pub(super) const fn writer_max_parquet_bytes(upper_bound_input_bytes: u64) -> u64 {
+pub(crate) const fn writer_max_parquet_bytes(upper_bound_input_bytes: u64) -> u64 {
     upper_bound_input_bytes.saturating_mul(WRITER_FILE_SIZE_FAILOVER_FACTOR)
 }
 
@@ -151,10 +151,10 @@ impl IcebergStorage {
         catalog: Arc<dyn Catalog>,
         table: impl Into<String>,
         shift_config: &ShiftConfig,
+        max_file_size_bytes: u64,
         bloom_filter_columns: &'static [&'static str],
     ) -> Self {
         let table_ident = TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.into());
-        let max_file_size_bytes = writer_max_parquet_bytes(shift_config.read.upper_bound_input_bytes_per_task);
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,
@@ -629,7 +629,7 @@ mod tests {
     use super::{build_writer_properties, cleanup_generated_data_files, writer_max_parquet_bytes};
 
     /// Failover policy guard: writer rollover budget must be exactly
-    /// `upper_bound_input_bytes_per_task * 2`.  If this changes, the planner's
+    /// `upper_bound_bytes * 2`.  If this changes, the planner's
     /// "one chunk == one parquet file" invariant has to be re-verified — the
     /// writer would start splitting normal chunks instead of acting as a
     /// failover.
