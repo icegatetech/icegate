@@ -2417,6 +2417,7 @@ mod tests {
                 &shift_config,
                 writer_max_parquet_bytes(shift_config.read.upper_bound_input_mb_per_task * 1024 * 1024),
                 &[],
+                &[],
             ),
             written_data_files: Mutex::new(Vec::new()),
         });
@@ -2649,7 +2650,7 @@ mod tests {
     /// path. This test forces the failover to trigger by giving storage a
     /// pathologically small budget (2 bytes), while the planner runs with the
     /// default config so a single shift task covers the whole tenant.
-    /// Encoded parquet output (footer + statistics + data) overshoots the tiny
+    /// coded parquet output (footer + statistics + data) overshoots the tiny
     /// budget and must split into multiple data files.
     ///
     /// Removing the failover multiplier or short-circuiting `target_file_size`
@@ -2718,6 +2719,7 @@ mod tests {
                 table_name.clone(),
                 &storage_config,
                 writer_max_parquet_bytes(1), // 2 bytes: forces rollover on every row group
+                &[],
                 &[],
             ),
             written_data_files: Mutex::new(Vec::new()),

@@ -621,7 +621,7 @@ mod tests {
         },
     };
 
-    use super::{build_writer_properties, cleanup_generated_data_files, writer_max_parquet_bytes};
+    use super::{cleanup_generated_data_files, writer_max_parquet_bytes};
 
     /// Failover policy guard: writer rollover budget must be exactly
     /// `upper_bound_bytes * 2`.  If this changes, the planner's
