@@ -43,6 +43,7 @@ mod accumulator;
 mod channel;
 mod config;
 mod error;
+mod extract;
 mod reader;
 mod segment;
 mod writer;
@@ -50,9 +51,16 @@ mod writer;
 pub use channel::{PreparedWalRowGroup, Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult, channel};
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
+pub use extract::{ExtractField, ExtractedValue, FieldExtractor};
 pub use reader::{
-    GroupedSegmentsPlan, ListedSegment, ParquetQueueReader, PlannedRowGroup, QueueReader, RecordBatchStream,
-    SegmentFile, SegmentRecordBatchIdxs, SegmentsPlan,
+    ListedSegment, ParquetQueueReader, QueueReader, RecordBatchStream, RowGroupPlanEntry, SegmentFile, SegmentsPlan,
 };
 pub use segment::SegmentId;
 pub use writer::{NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome};
+
+/// WAL footer key for per-row-group opaque payloads.
+///
+/// Used by the queue writer to store boundary ranges and similar payloads.
+/// Callers wiring [`FieldExtractor::FileKeyValueRowGroupPayload`] should pass
+/// this constant rather than hard-coding the string.
+pub const WAL_ROW_GROUP_METADATA_KEY: &str = "icegate.queue.row_group_metadata.v1";

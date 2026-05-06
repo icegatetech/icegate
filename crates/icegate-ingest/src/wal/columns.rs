@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, sync::OnceLock};
+use std::{
+    cmp::Ordering,
+    sync::{Arc, OnceLock},
+};
 
 use arrow::{
     array::{Array, FixedSizeBinaryArray, StringArray, TimestampMicrosecondArray},
@@ -48,6 +51,11 @@ impl SortColumnsDescriptor {
         self.columns.as_slice()
     }
 
+    /// Sort-key column names in Iceberg sort-order order.
+    pub(crate) fn column_names(&self) -> Arc<[String]> {
+        self.columns.iter().map(|column| column.column_name.clone()).collect()
+    }
+
     fn try_from_logs() -> Result<Self> {
         let schema = icegate_common::schema::logs_schema()?;
         let sort_order = icegate_common::schema::logs_sort_order(&schema)?;
@@ -84,11 +92,13 @@ impl SortColumnsDescriptor {
 
 pub(crate) struct SortColumnCache {
     columns: Vec<CachedSortColumn>,
+    column_names: Arc<[String]>,
 }
 
 impl SortColumnCache {
     pub(crate) fn try_new(batch: &RecordBatch, descriptor: &SortColumnsDescriptor, context: &str) -> Result<Self> {
         let mut columns = Vec::with_capacity(descriptor.columns.len());
+        let column_names = descriptor.column_names();
 
         for sort_column in descriptor.columns() {
             let column_name = sort_column.column_name.as_str();
@@ -149,7 +159,11 @@ impl SortColumnCache {
             columns.push(cached);
         }
 
-        Ok(Self { columns })
+        Ok(Self { columns, column_names })
+    }
+
+    pub(crate) fn column_names(&self) -> Arc<[String]> {
+        Arc::clone(&self.column_names)
     }
 
     pub(crate) fn compare_indices(&self, left_row_idx: usize, right_row_idx: usize) -> Ordering {
@@ -175,9 +189,7 @@ impl SortColumnCache {
     }
 
     pub(crate) fn boundary_key(&self, row_idx: usize) -> RowGroupBoundaryKey {
-        RowGroupBoundaryKey {
-            components: self.columns.iter().map(|column| column.boundary_component(row_idx)).collect(),
-        }
+        RowGroupBoundaryKey::new(self.columns.iter().map(|column| column.boundary_component(row_idx)).collect())
     }
 }
 

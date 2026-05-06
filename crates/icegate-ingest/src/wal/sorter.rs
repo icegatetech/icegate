@@ -9,7 +9,7 @@ use icegate_common::{LOGS_TOPIC, SPANS_TOPIC};
 use icegate_queue::{PreparedWalRowGroup, WriteRequest};
 
 use super::{
-    RowGroupBoundaryRange, SortColumnCache, SortColumnsDescriptor, metadata::serialize_row_group_metadata,
+    RowGroupBoundaryRange, SortColumnCache, SortColumnsDescriptor, metadata::serialize_row_group_boundary_range,
     writer::PreparedWalWrite,
 };
 use crate::error::{IngestError, Result};
@@ -44,6 +44,7 @@ impl WalSorter {
             ));
         }
 
+        // TODO(high): it's fragile, what if the partitioning key (tenant_id) changes
         let tenant_idx = batch
             .schema()
             .index_of("tenant_id")
@@ -94,7 +95,7 @@ impl WalSorter {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let row_group_batch = Self::take_rows(batch, UInt32Array::from(row_indices))?;
-                let metadata = serialize_row_group_metadata(&boundary_range)?;
+                let metadata = serialize_row_group_boundary_range(&boundary_range)?;
                 output.push(PreparedWalRowGroup::new(row_group_batch).with_metadata(metadata));
             }
         }
@@ -176,25 +177,17 @@ fn row_group_boundary_range_from_cached_columns(
 ) -> Result<RowGroupBoundaryRange> {
     let min_key = columns.boundary_key(first_row_idx);
     let max_key = columns.boundary_key(last_row_idx);
-    let range = RowGroupBoundaryRange { min_key, max_key };
+    let range = RowGroupBoundaryRange {
+        names: columns.column_names(),
+        min_key,
+        max_key,
+    };
     range.validate().map_err(|err| match err {
         IngestError::Shift(message) => IngestError::Shift(format!("invalid WAL row-group boundary range: {message}")),
         other => other,
     })?;
 
     Ok(range)
-}
-
-#[cfg(test)]
-pub(crate) fn logs_row_group_boundary_range_from_batch(batch: &RecordBatch) -> Result<RowGroupBoundaryRange> {
-    if batch.num_rows() == 0 {
-        return Err(IngestError::Shift(
-            "cannot build boundary range from empty WAL row group".to_string(),
-        ));
-    }
-    let sort_columns = SortColumnCache::try_new(batch, SortColumnsDescriptor::logs()?, "WAL sorting")?;
-    let last_row_idx = batch.num_rows() - 1;
-    row_group_boundary_range_from_cached_columns(&sort_columns, 0, last_row_idx)
 }
 
 #[cfg(test)]
@@ -208,12 +201,14 @@ mod tests {
     };
     use icegate_queue::{WriteResult, channel};
 
-    use super::{WalSorter, logs_row_group_boundary_range_from_batch, sort_logs, sort_spans};
+    use super::{WalSorter, sort_logs, sort_spans};
     use crate::error::IngestError;
     use crate::wal::{
-        RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue,
-        SortColumnsDescriptor, WalAckOutcome, deserialize_row_group_metadata, serialize_row_group_metadata,
-        submit_sorted_rows_to_wal,
+        RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue, SortColumnsDescriptor, WalAckOutcome,
+        deserialize_row_group_boundary_range, serialize_row_group_boundary_range, submit_sorted_rows_to_wal,
+        test_utils::{
+            boundary_component_string, boundary_component_timestamp_micros, logs_row_group_boundary_range_from_batch,
+        },
     };
 
     fn logs_descriptor() -> &'static SortColumnsDescriptor {
@@ -302,18 +297,24 @@ mod tests {
             .collect()
     }
 
+    fn logs_names() -> std::sync::Arc<[String]> {
+        std::sync::Arc::from([
+            "cloud_account_id".to_string(),
+            "service_name".to_string(),
+            "timestamp".to_string(),
+        ])
+    }
+
     fn key(
         cloud_account_id: Option<&str>,
         service_name: Option<&str>,
         timestamp_micros: Option<i64>,
     ) -> RowGroupBoundaryKey {
-        RowGroupBoundaryKey {
-            components: vec![
-                RowGroupBoundaryComponent::string(cloud_account_id.map(str::to_string), false, true),
-                RowGroupBoundaryComponent::string(service_name.map(str::to_string), false, true),
-                RowGroupBoundaryComponent::timestamp_micros(timestamp_micros, true, true),
-            ],
-        }
+        RowGroupBoundaryKey::new(vec![
+            boundary_component_string(cloud_account_id.map(str::to_string), false, true),
+            boundary_component_string(service_name.map(str::to_string), false, true),
+            boundary_component_timestamp_micros(timestamp_micros, true, true),
+        ])
     }
 
     #[test]
@@ -420,13 +421,14 @@ mod tests {
             .iter()
             .map(|row_group| {
                 let metadata = row_group.metadata.as_deref().expect("metadata");
-                deserialize_row_group_metadata(metadata).expect("deserialize metadata")
+                deserialize_row_group_boundary_range(metadata).expect("deserialize metadata")
             })
             .collect::<Vec<_>>();
 
         assert_eq!(
             ranges[0],
             RowGroupBoundaryRange {
+                names: logs_names(),
                 min_key: key(Some("acc-1"), None, Some(40)),
                 max_key: key(Some("acc-2"), Some("svc-2"), Some(10)),
             }
@@ -434,6 +436,7 @@ mod tests {
         assert_eq!(
             ranges[1],
             RowGroupBoundaryRange {
+                names: logs_names(),
                 min_key: key(None, Some("svc-0"), Some(50)),
                 max_key: key(Some("acc-1"), Some("svc-2"), Some(30)),
             }
@@ -441,6 +444,7 @@ mod tests {
         assert_eq!(
             ranges[2],
             RowGroupBoundaryRange {
+                names: logs_names(),
                 min_key: key(Some("acc-2"), Some("svc-1"), Some(20)),
                 max_key: key(Some("acc-2"), Some("svc-1"), Some(20)),
             }
@@ -467,13 +471,14 @@ mod tests {
         )
         .expect("sorted logs batch");
         let expected = RowGroupBoundaryRange {
+            names: logs_names(),
             min_key: key(Some("acc-2"), Some("svc-1"), Some(20)),
             max_key: key(Some("acc-3"), Some("svc-0"), Some(30)),
         };
 
         let range = logs_row_group_boundary_range_from_batch(&batch).expect("boundary range");
-        let metadata = serialize_row_group_metadata(&range).expect("serialize metadata");
-        let restored = deserialize_row_group_metadata(&metadata).expect("deserialize metadata");
+        let metadata = serialize_row_group_boundary_range(&range).expect("serialize metadata");
+        let restored = deserialize_row_group_boundary_range(&metadata).expect("deserialize metadata");
 
         assert_eq!(range, expected);
         assert_eq!(restored, expected);
@@ -511,14 +516,14 @@ mod tests {
         let batch = logs_batch().slice(4, 1);
         let range = logs_row_group_boundary_range_from_batch(&batch).expect("boundary range");
 
-        assert_eq!(range.min_key.components[0].value, None);
-        assert_eq!(range.max_key.components[0].value, None);
+        assert_eq!(range.min_key.components()[0].value, None);
+        assert_eq!(range.max_key.components()[0].value, None);
         assert_eq!(
-            range.min_key.components[1].value,
+            range.min_key.components()[1].value,
             Some(RowGroupBoundaryValue::String("svc-0".to_string()))
         );
         assert_eq!(
-            range.max_key.components[1].value,
+            range.max_key.components()[1].value,
             Some(RowGroupBoundaryValue::String("svc-0".to_string()))
         );
     }
@@ -546,11 +551,11 @@ mod tests {
 
         let range = logs_row_group_boundary_range_from_batch(&batch).expect("boundary range");
         assert_eq!(
-            range.min_key.components[2].value,
+            range.min_key.components()[2].value,
             Some(RowGroupBoundaryValue::TimestampMicros(30))
         );
         assert_eq!(
-            range.max_key.components[2].value,
+            range.max_key.components()[2].value,
             Some(RowGroupBoundaryValue::TimestampMicros(10))
         );
         assert_ne!(
@@ -561,14 +566,15 @@ mod tests {
 
     #[test]
     fn deserialize_logs_row_group_metadata_rejects_missing_boundary_fields() {
-        let err = deserialize_row_group_metadata("{}").expect_err("metadata must be rejected");
+        let err = deserialize_row_group_boundary_range("{}").expect_err("metadata must be rejected");
         assert!(err.to_string().contains("missing field"));
     }
 
     #[test]
     fn deserialize_logs_row_group_metadata_rejects_different_component_count() {
-        let err = deserialize_row_group_metadata(
+        let err = deserialize_row_group_boundary_range(
             r#"{
+                "names": ["cloud_account_id"],
                 "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
                 "max_key": {"components":[
                     {"value":{"String":"acc-1"},"descending":false,"nulls_first":true},
@@ -578,13 +584,14 @@ mod tests {
         )
         .expect_err("metadata must be rejected");
 
-        assert!(err.to_string().contains("component count differs"));
+        assert!(err.to_string().contains("arity mismatch"));
     }
 
     #[test]
     fn deserialize_logs_row_group_metadata_rejects_different_component_flags() {
-        let err = deserialize_row_group_metadata(
+        let err = deserialize_row_group_boundary_range(
             r#"{
+                "names": ["cloud_account_id"],
                 "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
                 "max_key": {"components":[{"value":{"String":"acc-2"},"descending":true,"nulls_first":true}]}
             }"#,
@@ -596,8 +603,9 @@ mod tests {
 
     #[test]
     fn deserialize_logs_row_group_metadata_rejects_different_component_types() {
-        let err = deserialize_row_group_metadata(
+        let err = deserialize_row_group_boundary_range(
             r#"{
+                "names": ["cloud_account_id"],
                 "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
                 "max_key": {"components":[{"value":{"TimestampMicros":10},"descending":false,"nulls_first":true}]}
             }"#,
