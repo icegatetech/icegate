@@ -8,10 +8,14 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt, future::join_all};
+use icegate_common::parquet_writer::ColumnEncoding;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{
     arrow::ArrowWriter,
-    file::{metadata::KeyValue, properties::WriterProperties},
+    file::{
+        metadata::KeyValue,
+        properties::{EnabledStatistics, WriterProperties, WriterVersion},
+    },
     schema::types::ColumnPath,
 };
 use tokio::sync::RwLock;
@@ -64,6 +68,15 @@ pub struct QueueWriter {
     /// should get a bloom filter for each topic. Topics not present
     /// in the map are written without bloom filters.
     bloom_filter_columns: HashMap<Topic, &'static [&'static str]>,
+
+    /// Per-topic Parquet column-encoding overrides.
+    ///
+    /// Encoding effectiveness depends on data shape per table (e.g.
+    /// `trace_id` collapses to runs on the spans table where it is a
+    /// sort key, but is random on logs), so the queue writer takes a
+    /// per-topic map. Topics absent from the map fall back to
+    /// parquet-rs defaults.
+    column_encodings: HashMap<Topic, &'static [ColumnEncoding]>,
 }
 
 impl QueueWriter {
@@ -76,6 +89,7 @@ impl QueueWriter {
             accumulators: Arc::new(RwLock::new(HashMap::new())),
             events: Arc::new(NoopQueueWriterEvents),
             bloom_filter_columns: HashMap::new(),
+            column_encodings: HashMap::new(),
         }
     }
 
@@ -100,6 +114,21 @@ impl QueueWriter {
     #[must_use]
     pub fn with_bloom_filter_columns(mut self, columns_by_topic: HashMap<Topic, &'static [&'static str]>) -> Self {
         self.bloom_filter_columns = columns_by_topic;
+        self
+    }
+
+    /// Configure per-topic Parquet column-encoding overrides.
+    ///
+    /// Used together with `WriterVersion::PARQUET_2_0` (also enabled by
+    /// the queue writer) to access DELTA / `BYTE_STREAM_SPLIT` encodings.
+    /// Each topic gets its own list because encoding effectiveness
+    /// depends on data shape: e.g. `trace_id` is sorted on the spans
+    /// topic but random on the logs topic.
+    ///
+    /// Topics absent from the map fall back to parquet-rs defaults.
+    #[must_use]
+    pub fn with_column_encodings(mut self, encodings_by_topic: HashMap<Topic, &'static [ColumnEncoding]>) -> Self {
+        self.column_encodings = encodings_by_topic;
         self
     }
 
@@ -422,10 +451,30 @@ impl QueueWriter {
         };
 
         let max_row_group_size = self.config.common.max_row_group_size;
+        // PARQUET_2_0 enables DELTA / BYTE_STREAM_SPLIT encodings used by
+        // `column_encodings`; it is also accepted by every reader IceGate
+        // supports (DataFusion, Trino, modern Spark/Athena).
         let mut builder = WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_compression(compression)
             .set_max_row_group_size(max_row_group_size)
+            .set_statistics_enabled(EnabledStatistics::Page)
             .set_key_value_metadata(key_value_metadata);
+
+        // Dictionary is force-disabled on every column with an explicit
+        // encoding override: parquet-rs treats `set_column_encoding` as a
+        // fallback that only fires after the dictionary page exceeds
+        // 1 MiB, which never happens for our row-group sizes — so without
+        // disabling dictionary the configured encoding (DELTA_*,
+        // BYTE_STREAM_SPLIT) would never run.
+        if let Some(encodings) = self.column_encodings.get(topic) {
+            for &(col, encoding) in *encodings {
+                let path = ColumnPath::from(col);
+                builder = builder
+                    .set_column_dictionary_enabled(path.clone(), false)
+                    .set_column_encoding(path, encoding);
+            }
+        }
 
         if let Some(bloom_columns) = self.bloom_filter_columns.get(topic) {
             let ndv = u64::try_from(max_row_group_size).unwrap_or(u64::MAX);

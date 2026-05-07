@@ -22,6 +22,18 @@ use datafusion::{
 };
 use icegate_common::SPANS_TABLE_FQN;
 
+/// Pad an ASCII label up to `N` bytes with trailing zeros so it round-trips
+/// through a `FIXED_LEN_BYTE_ARRAY(N)` column. Lexicographic ordering of
+/// the padded bytes matches the original alphabetic ordering of the label,
+/// which is what most fixture-based assertions rely on.
+fn pad_id<const N: usize>(label: &str) -> [u8; N] {
+    let mut padded = [0u8; N];
+    let bytes = label.as_bytes();
+    let len = bytes.len().min(N);
+    padded[..len].copy_from_slice(&bytes[..len]);
+    padded
+}
+
 use super::DataFusionPlanner;
 use crate::{
     error::QueryError,
@@ -66,13 +78,16 @@ fn fixture_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("tenant_id", DataType::Utf8, false),
         Field::new("service_name", DataType::Utf8, true),
-        Field::new("trace_id", DataType::Utf8, false),
-        Field::new("span_id", DataType::Utf8, false),
+        // `trace_id` / `span_id` / `parent_span_id` are stored as raw fixed-
+        // length bytes (16 / 8 / 8) — the same physical type the production
+        // schema uses post-optimisation.
+        Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+        Field::new("span_id", DataType::FixedSizeBinary(8), false),
         // `parent_span_id` is nullable in the real spans schema and the
         // search-mode planner needs it to apply root-first ordering when
         // `spans_per_spanset` is set. Tests that don't exercise that
         // path leave the column null.
-        Field::new("parent_span_id", DataType::Utf8, true),
+        Field::new("parent_span_id", DataType::FixedSizeBinary(8), true),
         Field::new("name", DataType::Utf8, false),
         Field::new("kind", DataType::Int32, true),
         Field::new("status_code", DataType::Int32, true),
@@ -96,11 +111,23 @@ fn make_fixture_batch(schema: Arc<Schema>) -> RecordBatch {
     // service_name column is populated at ingest from resource.service.name;
     // both t1 spans use "frontend", t2 uses "backend".
     let service_names = StringArray::from(vec![Some("frontend"), Some("frontend"), Some("backend")]);
-    let trace_ids = StringArray::from(vec!["t1-trace-1", "t1-trace-2", "t2-trace-1"]);
-    let span_ids = StringArray::from(vec!["s1", "s2", "s3"]);
+    // 16-byte fixed-length sentinels: pad each label with trailing zeros so
+    // lexicographic ordering matches the original alphabetic expectations.
+    let trace_id_bytes: [[u8; 16]; 3] = [pad_id("t1-trace-1"), pad_id("t1-trace-2"), pad_id("t2-trace-1")];
+    let trace_ids =
+        datafusion::arrow::array::FixedSizeBinaryArray::try_from_iter(trace_id_bytes.iter().map(<[u8; 16]>::as_slice))
+            .expect("trace_ids");
+    let span_id_bytes: [[u8; 8]; 3] = [pad_id("s1"), pad_id("s2"), pad_id("s3")];
+    let span_ids =
+        datafusion::arrow::array::FixedSizeBinaryArray::try_from_iter(span_id_bytes.iter().map(<[u8; 8]>::as_slice))
+            .expect("span_ids");
     // No parent_span_id values — every fixture span is its own root,
     // mirroring how single-span traces look in the wild.
-    let parent_span_ids = StringArray::from(vec![None::<&str>, None, None]);
+    let parent_span_ids = datafusion::arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        std::iter::repeat_n::<Option<&[u8]>>(None, 3),
+        8,
+    )
+    .expect("parent_span_ids");
     let names = StringArray::from(vec!["GET /a", "GET /b", "POST /c"]);
     // OTel SpanKind: 2 = SERVER, 3 = CLIENT.
     let kinds = Int32Array::from(vec![Some(2), Some(2), Some(3)]);
@@ -427,12 +454,22 @@ fn multi_trace_fixture_session() -> SessionContext {
 
     let tenants = StringArray::from(vec!["t1", "t1", "t1"]);
     let service_names = StringArray::from(vec![Some("frontend"), Some("frontend"), Some("backend")]);
-    let trace_ids = StringArray::from(vec!["trace-A", "trace-A", "trace-B"]);
-    let span_ids = StringArray::from(vec!["A-root", "A-child", "B-root"]);
-    // Root spans have a null parent; the child of trace-A points back
-    // at A-root so the planner's root-first ordering can promote
-    // A-root above A-child when applying the spss cap.
-    let parent_span_ids = StringArray::from(vec![None, Some("A-root"), None]);
+    let trace_id_bytes: [[u8; 16]; 3] = [pad_id("trace-A"), pad_id("trace-A"), pad_id("trace-B")];
+    let trace_ids =
+        datafusion::arrow::array::FixedSizeBinaryArray::try_from_iter(trace_id_bytes.iter().map(<[u8; 16]>::as_slice))
+            .expect("trace_ids");
+    let span_id_bytes: [[u8; 8]; 3] = [pad_id("A-root"), pad_id("A-child"), pad_id("B-root")];
+    let span_ids =
+        datafusion::arrow::array::FixedSizeBinaryArray::try_from_iter(span_id_bytes.iter().map(<[u8; 8]>::as_slice))
+            .expect("span_ids");
+    // Root spans have a null parent; the child of trace-A points back at
+    // A-root so the planner's root-first ordering can promote A-root above
+    // A-child when applying the spss cap.
+    let a_root_parent: [u8; 8] = pad_id("A-root");
+    let parent_opts: [Option<&[u8]>; 3] = [None, Some(a_root_parent.as_slice()), None];
+    let parent_span_ids =
+        datafusion::arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(parent_opts.into_iter(), 8)
+            .expect("parent_span_ids");
     let names = StringArray::from(vec!["root-A", "child-A", "root-B"]);
     let kinds = Int32Array::from(vec![Some(2), Some(3), Some(2)]);
     let statuses = Int32Array::from(vec![Some(1), Some(1), Some(1)]);
@@ -506,41 +543,43 @@ async fn child_only_filter_returns_full_trace_so_root_is_present() {
     let planner = DataFusionPlanner::new(ctx, qctx);
     let batches = planner.plan(expr).await.expect("plan").collect().await.expect("collect");
 
-    // Collect (trace_id, name) pairs from the result.
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    // Collect (trace_id_bytes, name) pairs from the result.
+    let mut pairs: Vec<(Vec<u8>, String)> = Vec::new();
     for batch in &batches {
         let trace_idx = batch.schema().column_with_name(COL_TRACE_ID).expect("trace_id col").0;
         let name_idx = batch.schema().column_with_name(COL_NAME).expect("name col").0;
         let trace_arr = batch
             .column(trace_idx)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("trace_id Utf8");
+            .downcast_ref::<datafusion::arrow::array::FixedSizeBinaryArray>()
+            .expect("trace_id FixedSizeBinary");
         let name_arr = batch
             .column(name_idx)
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("name Utf8");
         for row in 0..batch.num_rows() {
-            pairs.push((trace_arr.value(row).to_string(), name_arr.value(row).to_string()));
+            pairs.push((trace_arr.value(row).to_vec(), name_arr.value(row).to_string()));
         }
     }
 
+    let trace_a = pad_id::<16>("trace-A").to_vec();
     // Both trace-A spans must be present — otherwise the formatter
     // can't recover the root and the search summary shows blanks.
     assert!(
-        pairs.iter().any(|(t, n)| t == "trace-A" && n == "root-A"),
+        pairs.iter().any(|(t, n)| *t == trace_a && n == "root-A"),
         "expected trace-A's root span in result, got {:?}",
         pairs
     );
     assert!(
-        pairs.iter().any(|(t, n)| t == "trace-A" && n == "child-A"),
+        pairs.iter().any(|(t, n)| *t == trace_a && n == "child-A"),
         "expected trace-A's child span in result, got {:?}",
         pairs
     );
+    let trace_b = pad_id::<16>("trace-B").to_vec();
     // trace-B has no matching child, so it must NOT be in the result.
     assert!(
-        !pairs.iter().any(|(t, _)| t == "trace-B"),
+        !pairs.iter().any(|(t, _)| *t == trace_b),
         "trace-B has no matching child but appeared in result: {:?}",
         pairs
     );
@@ -561,7 +600,7 @@ async fn limit_caps_traces_not_span_rows() {
     let planner = DataFusionPlanner::new(ctx, qctx);
     let batches = planner.plan(expr).await.expect("plan").collect().await.expect("collect");
 
-    let mut trace_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut trace_ids: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     let mut total_rows = 0;
     for batch in &batches {
         total_rows += batch.num_rows();
@@ -569,15 +608,16 @@ async fn limit_caps_traces_not_span_rows() {
         let arr = batch
             .column(trace_idx)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("trace_id Utf8");
+            .downcast_ref::<datafusion::arrow::array::FixedSizeBinaryArray>()
+            .expect("trace_id FixedSizeBinary");
         for row in 0..batch.num_rows() {
-            trace_ids.insert(arr.value(row).to_string());
+            trace_ids.insert(arr.value(row).to_vec());
         }
     }
+    let trace_a_padded = pad_id::<16>("trace-A").to_vec();
     assert_eq!(trace_ids.len(), 1, "expected exactly one trace, got {:?}", trace_ids);
     assert!(
-        trace_ids.contains("trace-A"),
+        trace_ids.contains(&trace_a_padded),
         "expected the most recent trace (trace-A), got {:?}",
         trace_ids
     );
@@ -613,32 +653,34 @@ async fn spss_one_keeps_root_over_child() {
     let planner = DataFusionPlanner::new(ctx, qctx);
     let batches = planner.plan(expr).await.expect("plan").collect().await.expect("collect");
 
-    let mut by_trace: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut by_trace: std::collections::BTreeMap<Vec<u8>, String> = std::collections::BTreeMap::new();
     for batch in &batches {
         let trace_idx = batch.schema().column_with_name(COL_TRACE_ID).expect("trace_id col").0;
         let name_idx = batch.schema().column_with_name(COL_NAME).expect("name col").0;
         let trace_arr = batch
             .column(trace_idx)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("trace_id Utf8");
+            .downcast_ref::<datafusion::arrow::array::FixedSizeBinaryArray>()
+            .expect("trace_id FixedSizeBinary");
         let name_arr = batch
             .column(name_idx)
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("name Utf8");
         for row in 0..batch.num_rows() {
-            let prev = by_trace.insert(trace_arr.value(row).to_string(), name_arr.value(row).to_string());
+            let prev = by_trace.insert(trace_arr.value(row).to_vec(), name_arr.value(row).to_string());
             assert!(
                 prev.is_none(),
                 "spss=1 must yield at most one span per trace; got duplicate for trace {}",
-                trace_arr.value(row)
+                hex::encode(trace_arr.value(row))
             );
         }
     }
+    let trace_a = pad_id::<16>("trace-A").to_vec();
+    let trace_b = pad_id::<16>("trace-B").to_vec();
     // Every trace's surviving span is a root span.
-    assert_eq!(by_trace.get("trace-A").map(String::as_str), Some("root-A"));
-    assert_eq!(by_trace.get("trace-B").map(String::as_str), Some("root-B"));
+    assert_eq!(by_trace.get(&trace_a).map(String::as_str), Some("root-A"));
+    assert_eq!(by_trace.get(&trace_b).map(String::as_str), Some("root-B"));
 }
 
 /// `spans_per_spanset = None` (Tempo's `spss=0`) disables the cap —
@@ -755,12 +797,47 @@ async fn empty_selector_under_unknown_tenant_returns_zero_rows() {
 /// nothing when queried under tenant `t2`. Direct regression test
 /// against the cross-tenant `trace_id` leak called out in the planner
 /// stage-2 review.
+///
+/// Uses the hex-encoded form of the fixture's `t1-trace-1` row
+/// (`pad_id::<16>("t1-trace-1")` zero-padded → 32-char hex). This
+/// exercises the real hex-decode-and-typed-binary-equality path in
+/// `selectors.rs`, not the invalid-hex `lit(false)` short-circuit
+/// (which would let this test pass for the wrong reason after the
+/// `LogQL` Eq/Neq invariant fix).
 #[tokio::test]
 async fn cross_tenant_trace_id_filter_returns_zero_rows() {
     let ctx = fixture_session();
     let qctx = make_query_ctx("t2");
-    let total = run_and_count(ctx, qctx, r#"{ traceID = "t1-trace-1" }"#).await;
+    // Hex of `pad_id::<16>("t1-trace-1")` = b"t1-trace-1" + 6 NUL bytes.
+    let total = run_and_count(ctx, qctx, r#"{ traceID = "74312d74726163652d31000000000000" }"#).await;
     assert_eq!(total, 0, "trace IDs must never cross tenant boundaries");
+}
+
+/// Confirms the hex-encoded form of `pad_id::<16>("t1-trace-1")`
+/// matches the literal string used in
+/// [`cross_tenant_trace_id_filter_returns_zero_rows`]. Without this
+/// pin, a future change to `pad_id` would silently turn that test
+/// into a tautology again (the selector would no longer match the
+/// fixture and the assertion would pass for trivial reasons).
+#[test]
+fn pad_id_hex_matches_cross_tenant_test_literal() {
+    let bytes = pad_id::<16>("t1-trace-1");
+    assert_eq!(hex::encode(bytes), "74312d74726163652d31000000000000");
+}
+
+/// A `traceID` filter using the t1 hex literal MUST return rows when
+/// queried as t1 — companion to [`cross_tenant_trace_id_filter_returns_zero_rows`]
+/// to ensure that test isn't passing because the hex selector matches
+/// nothing in any tenant.
+#[tokio::test]
+async fn matching_tenant_trace_id_filter_returns_rows() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let total = run_and_count(ctx, qctx, r#"{ traceID = "74312d74726163652d31000000000000" }"#).await;
+    assert_eq!(
+        total, 1,
+        "expected exactly one span for trace_id pad_id::<16>(\"t1-trace-1\") in tenant t1"
+    );
 }
 
 // =========================================================================

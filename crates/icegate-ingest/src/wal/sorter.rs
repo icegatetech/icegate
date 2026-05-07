@@ -195,7 +195,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{
-        array::{Array, ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
+        array::{Array, ArrayRef, FixedSizeBinaryArray, Int64Array, StringArray, TimestampMicrosecondArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
         record_batch::RecordBatch,
     };
@@ -800,17 +800,29 @@ mod tests {
             Field::new("tenant_id", DataType::Utf8, false),
             Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
-            Field::new("trace_id", DataType::Utf8, false),
+            // `trace_id` is `FIXED_LEN_BYTE_ARRAY(16)` in storage; use raw
+            // 16-byte values so the sort comparator picks the right path.
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("row_id", DataType::Int64, false),
         ]));
+        // 16-byte sentinel values that preserve the prior alphabetic
+        // ordering: the second byte distinguishes a1 < a2 < b for tenant-a's
+        // two rows and tenant-b's row.
+        let trace_a1: [u8; 16] = [b'a', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_a2: [u8; 16] = [b'a', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_b: [u8; 16] = [b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_id_arr = FixedSizeBinaryArray::try_from_iter(
+            [trace_b.as_slice(), trace_a2.as_slice(), trace_a1.as_slice()].into_iter(),
+        )
+        .expect("trace_id array");
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(vec!["tenant-b", "tenant-a", "tenant-a"])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("acc-2"), Some("acc-1"), Some("acc-1")])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("svc-2"), Some("svc-1"), Some("svc-1")])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["trace-b", "trace-a2", "trace-a1"])) as ArrayRef,
+                Arc::new(trace_id_arr) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![Some(30), Some(10), Some(20)])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
             ],

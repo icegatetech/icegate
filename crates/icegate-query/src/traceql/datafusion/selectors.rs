@@ -214,6 +214,18 @@ fn literal_to_scalar(field: &FieldRef, lit_val: &LiteralValue) -> Expr {
         (FieldRef::Intrinsic(IntrinsicField::Duration), LiteralValue::Duration(ns)) => {
             lit(ns.saturating_add(999) / 1_000)
         }
+        // Trace / span identifiers are stored as raw FixedSizeBinary; the
+        // literal arrives from TraceQL as a hex string. Decode and emit a
+        // typed binary literal so the predicate matches the column type.
+        // Invalid hex collapses to a NULL literal, which never matches.
+        (FieldRef::Intrinsic(IntrinsicField::TraceID), LiteralValue::String(s)) => match hex::decode(s) {
+            Ok(bytes) if bytes.len() == 16 => lit(ScalarValue::FixedSizeBinary(16, Some(bytes))),
+            _ => lit(ScalarValue::FixedSizeBinary(16, None)),
+        },
+        (FieldRef::Intrinsic(IntrinsicField::SpanID), LiteralValue::String(s)) => match hex::decode(s) {
+            Ok(bytes) if bytes.len() == 8 => lit(ScalarValue::FixedSizeBinary(8, Some(bytes))),
+            _ => lit(ScalarValue::FixedSizeBinary(8, None)),
+        },
         // String / numeric / bool — direct.
         (_, LiteralValue::String(s)) => lit(s.clone()),
         (_, LiteralValue::Int(i)) => lit(*i),

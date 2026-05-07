@@ -13,7 +13,8 @@
 use std::collections::BTreeMap;
 
 use datafusion::arrow::array::{
-    Array, AsArray, Int32Array, ListArray, MapArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+    Array, AsArray, FixedSizeBinaryArray, Int32Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value::Value as AnyVal},
@@ -49,9 +50,9 @@ pub fn spans_to_otlp_json(batches: &[RecordBatch]) -> crate::error::Result<Value
     let mut by_service: BTreeMap<String, JsonServiceGroup> = BTreeMap::new();
 
     for batch in batches {
-        let trace_ids = string_col(batch, "trace_id")?;
-        let span_ids = string_col(batch, "span_id")?;
-        let parent_ids = string_col_opt(batch, "parent_span_id");
+        let trace_ids = fixed_bin_col(batch, "trace_id")?;
+        let span_ids = fixed_bin_col(batch, "span_id")?;
+        let parent_ids = fixed_bin_col_opt(batch, "parent_span_id");
         let names = string_col(batch, "name")?;
         let kinds = i32_col_opt(batch, "kind");
         let statuses = i32_col_opt(batch, "status_code");
@@ -87,10 +88,15 @@ pub fn spans_to_otlp_json(batches: &[RecordBatch]) -> crate::error::Result<Value
                 .filter(|c| !c.is_null(row))
                 .map_or(0, |c| u32_from_i32(c.value(row)));
 
+            let trace_id_hex = hex::encode(trace_ids.value(row));
+            let span_id_hex = hex::encode(span_ids.value(row));
+            let parent_hex = parent_ids
+                .filter(|c| !is_null_or_zero_parent(c, row))
+                .map(|c| hex::encode(c.value(row)));
             let span_value = build_span_value(
-                trace_ids.value(row),
-                span_ids.value(row),
-                parent_ids.as_ref().map(|c| c.value(row)),
+                &trace_id_hex,
+                &span_id_hex,
+                parent_hex.as_deref(),
                 names.value(row),
                 kinds.as_ref().map(|c| c.value(row)),
                 statuses.as_ref().map(|c| c.value(row)),
@@ -242,6 +248,46 @@ fn i32_col_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array>
         .and_then(|(idx, _)| batch.column(idx).as_any().downcast_ref::<Int32Array>())
 }
 
+/// Read a `FIXED_LEN_BYTE_ARRAY(n)` column (used for `trace_id`, `span_id`,
+/// `parent_span_id`). Returns `None` if the column is missing or has the
+/// wrong physical type.
+fn fixed_bin_col_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a FixedSizeBinaryArray> {
+    batch
+        .schema()
+        .column_with_name(name)
+        .and_then(|(idx, _)| batch.column(idx).as_any().downcast_ref::<FixedSizeBinaryArray>())
+}
+
+/// Required-column variant of [`fixed_bin_col_opt`].
+fn fixed_bin_col<'a>(batch: &'a RecordBatch, name: &str) -> crate::error::Result<&'a FixedSizeBinaryArray> {
+    fixed_bin_col_opt(batch, name)
+        .ok_or_else(|| crate::error::QueryError::Internal(format!("column {name} not FixedSizeBinary")))
+}
+
+/// Read a single `trace_id` / `span_id` / `parent_span_id` row as a hex-
+/// encoded String, or `None` if the cell is null. Bytes-to-hex conversion
+/// happens once per row at the API boundary; storage stays compact.
+fn id_hex(arr: &FixedSizeBinaryArray, row: usize) -> Option<String> {
+    if arr.is_null(row) {
+        None
+    } else {
+        Some(hex::encode(arr.value(row)))
+    }
+}
+
+/// Returns `true` when a `parent_span_id` cell is either SQL-null or the
+/// all-zero sentinel that historically meant "no parent". After the
+/// `FIXED_LEN_BYTE_ARRAY(8)` migration, root spans round-trip as 8 zero
+/// bytes (some upstream writers historically wrote the empty string here,
+/// which is the natural Iceberg null), so both representations must be
+/// treated as "this span has no parent" by the JSON and proto formatters —
+/// otherwise Grafana's root-span detection breaks. The `TraceQL` search
+/// planner already applies the same rule when picking root spans
+/// (see `is_root` at the call site for `parents`).
+fn is_null_or_zero_parent(arr: &FixedSizeBinaryArray, row: usize) -> bool {
+    arr.is_null(row) || arr.value(row).iter().all(|&b| b == 0)
+}
+
 fn ts_col<'a>(batch: &'a RecordBatch, name: &str) -> crate::error::Result<&'a TimestampMicrosecondArray> {
     let arr = column(batch, name)?;
     arr.as_any()
@@ -385,17 +431,10 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
 
     for batch in batches {
         // `trace_id` is required — skip batches missing it.
-        let Some(trace_ids) = batch
-            .schema()
-            .column_with_name("trace_id")
-            .map(|(i, _)| batch.column(i).as_string::<i32>())
-        else {
+        let Some(trace_ids) = fixed_bin_col_opt(batch, "trace_id") else {
             continue;
         };
-        let span_ids = batch
-            .schema()
-            .column_with_name("span_id")
-            .map(|(i, _)| batch.column(i).as_string::<i32>());
+        let span_ids = fixed_bin_col_opt(batch, "span_id");
         let names = batch
             .schema()
             .column_with_name("name")
@@ -412,18 +451,20 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
             .schema()
             .column_with_name("end_timestamp")
             .and_then(|(i, _)| batch.column(i).as_any().downcast_ref::<TimestampMicrosecondArray>());
-        let parents = batch
-            .schema()
-            .column_with_name("parent_span_id")
-            .map(|(i, _)| batch.column(i).as_string::<i32>());
+        let parents = fixed_bin_col_opt(batch, "parent_span_id");
 
         for row in 0..batch.num_rows() {
-            let tid = trace_ids.value(row).to_string();
+            let tid = id_hex(trace_ids, row).unwrap_or_default();
             let acc = by_trace.entry(tid).or_default();
-            // A span is the root when `parent_span_id` is null or empty.
-            // If the `parent_span_id` column is missing entirely, treat
-            // every span as a root (best-effort).
-            let is_root = parents.as_ref().is_none_or(|c| c.is_null(row) || c.value(row).is_empty());
+            // A span is the root when `parent_span_id` is null or all-zero.
+            // Some writers historically emitted root spans with an
+            // empty-string parent; that value now arrives as 8 zero bytes
+            // through `FIXED_LEN_BYTE_ARRAY`, so we still treat it as a
+            // root. If the `parent_span_id` column is missing entirely,
+            // every span is treated as a root (best-effort).
+            let is_root = parents
+                .as_ref()
+                .is_none_or(|c| c.is_null(row) || c.value(row).iter().all(|&b| b == 0));
             // Read raw timestamps respecting per-row nulls. `None` means
             // "absent": the row sorts last in `BestSpan` ordering, never
             // contributes to `acc.start_micros` / `acc.end_micros`, and
@@ -458,11 +499,7 @@ pub fn spansets_to_search_response(batches: &[RecordBatch]) -> SearchResponse {
             // root-first), so each row is something the user is likely
             // to want to see in the inline trace preview.
             if let Some(span_ids) = span_ids {
-                let span_id = if span_ids.is_null(row) {
-                    String::new()
-                } else {
-                    span_ids.value(row).to_string()
-                };
+                let span_id = id_hex(span_ids, row).unwrap_or_default();
                 acc.spans.push(build_matched_span(
                     span_id,
                     ts_raw.unwrap_or(0),
@@ -620,9 +657,9 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
     let mut by_service: BTreeMap<String, ServiceGroup> = BTreeMap::new();
 
     for batch in batches {
-        let trace_ids = string_col(batch, "trace_id")?;
-        let span_ids = string_col(batch, "span_id")?;
-        let parent_ids = string_col_opt(batch, "parent_span_id");
+        let trace_ids = fixed_bin_col(batch, "trace_id")?;
+        let span_ids = fixed_bin_col(batch, "span_id")?;
+        let parent_ids = fixed_bin_col_opt(batch, "parent_span_id");
         let names = string_col(batch, "name")?;
         let kinds = i32_col_opt(batch, "kind");
         let statuses = i32_col_opt(batch, "status_code");
@@ -662,7 +699,7 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
             let span = row_to_proto_span(
                 trace_ids.value(row),
                 span_ids.value(row),
-                parent_ids.as_ref().map(|c| c.value(row)),
+                parent_ids.filter(|c| !is_null_or_zero_parent(c, row)).map(|c| c.value(row)),
                 names.value(row),
                 kinds.as_ref().map(|c| c.value(row)),
                 statuses.as_ref().map(|c| c.value(row)),
@@ -722,9 +759,9 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
 
 #[allow(clippy::too_many_arguments)]
 fn row_to_proto_span(
-    trace_id: &str,
-    span_id: &str,
-    parent: Option<&str>,
+    trace_id: &[u8],
+    span_id: &[u8],
+    parent: Option<&[u8]>,
     name: &str,
     kind: Option<i32>,
     status_code: Option<i32>,
@@ -738,10 +775,10 @@ fn row_to_proto_span(
     dropped_links_count: u32,
 ) -> Span {
     Span {
-        trace_id: hex::decode(trace_id).unwrap_or_default(),
-        span_id: hex::decode(span_id).unwrap_or_default(),
+        trace_id: trace_id.to_vec(),
+        span_id: span_id.to_vec(),
         trace_state: String::new(),
-        parent_span_id: parent.and_then(|p| hex::decode(p).ok()).unwrap_or_default(),
+        parent_span_id: parent.map(<[u8]>::to_vec).unwrap_or_default(),
         flags: 0,
         name: name.to_string(),
         kind: kind.unwrap_or(0),
@@ -875,10 +912,10 @@ fn proto_links_for_row(links_list: &ListArray, row: usize) -> Vec<Link> {
     };
     let trace_ids = st
         .column_by_name("trace_id")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
     let span_ids = st
         .column_by_name("span_id")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
     let trace_states = st
         .column_by_name("trace_state")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -895,8 +932,14 @@ fn proto_links_for_row(links_list: &ListArray, row: usize) -> Vec<Link> {
         if st.is_null(i) {
             continue;
         }
-        let trace_id_hex = trace_ids.filter(|t| !t.is_null(i)).map_or("", |t| t.value(i));
-        let span_id_hex = span_ids.filter(|s| !s.is_null(i)).map_or("", |s| s.value(i));
+        let trace_id = trace_ids
+            .filter(|t| !t.is_null(i))
+            .map(|t| t.value(i).to_vec())
+            .unwrap_or_default();
+        let span_id = span_ids
+            .filter(|s| !s.is_null(i))
+            .map(|s| s.value(i).to_vec())
+            .unwrap_or_default();
         let trace_state = trace_states
             .filter(|t| !t.is_null(i))
             .map(|t| t.value(i).to_string())
@@ -905,8 +948,8 @@ fn proto_links_for_row(links_list: &ListArray, row: usize) -> Vec<Link> {
         let dropped_attributes_count = dropped_attrs.filter(|d| !d.is_null(i)).map_or(0, |d| u32_from_i32(d.value(i)));
         let flags = flags_arr.filter(|f| !f.is_null(i)).map_or(0, |f| u32_from_i32(f.value(i)));
         out.push(Link {
-            trace_id: hex::decode(trace_id_hex).unwrap_or_default(),
-            span_id: hex::decode(span_id_hex).unwrap_or_default(),
+            trace_id,
+            span_id,
             trace_state,
             attributes,
             dropped_attributes_count,
@@ -977,10 +1020,10 @@ fn json_links_for_row(links_list: &ListArray, row: usize) -> Vec<Value> {
     };
     let trace_ids = st
         .column_by_name("trace_id")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
     let span_ids = st
         .column_by_name("span_id")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
     let trace_states = st
         .column_by_name("trace_state")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -997,8 +1040,14 @@ fn json_links_for_row(links_list: &ListArray, row: usize) -> Vec<Value> {
         if st.is_null(i) {
             continue;
         }
-        let trace_id_hex = trace_ids.filter(|t| !t.is_null(i)).map_or("", |t| t.value(i));
-        let span_id_hex = span_ids.filter(|s| !s.is_null(i)).map_or("", |s| s.value(i));
+        let trace_id_hex = trace_ids
+            .filter(|t| !t.is_null(i))
+            .map(|t| hex::encode(t.value(i)))
+            .unwrap_or_default();
+        let span_id_hex = span_ids
+            .filter(|s| !s.is_null(i))
+            .map(|s| hex::encode(s.value(i)))
+            .unwrap_or_default();
         let attrs = attributes.map(|a| row_attributes(a, i)).unwrap_or_default();
         let dropped = dropped_attrs.filter(|d| !d.is_null(i)).map_or(0, |d| u32_from_i32(d.value(i)));
         let flags = flags_arr.filter(|f| !f.is_null(i)).map_or(0, |f| u32_from_i32(f.value(i)));
@@ -1122,19 +1171,27 @@ mod proto_tests {
         let link_attrs = single_attr_map("link.role", "parent");
         let link_attrs_dt = link_attrs.data_type().clone();
         let link_fields: Fields = vec![
-            Arc::new(Field::new("trace_id", DataType::Utf8, false)),
-            Arc::new(Field::new("span_id", DataType::Utf8, false)),
+            Arc::new(Field::new("trace_id", DataType::FixedSizeBinary(16), false)),
+            Arc::new(Field::new("span_id", DataType::FixedSizeBinary(8), false)),
             Arc::new(Field::new("trace_state", DataType::Utf8, true)),
             Arc::new(Field::new("attributes", link_attrs_dt, false)),
             Arc::new(Field::new("dropped_attributes_count", DataType::Int32, true)),
             Arc::new(Field::new("flags", DataType::Int32, true)),
         ]
         .into();
+        let link_trace_id = hex::decode("fedcba98765432100123456789abcdef").expect("link trace_id hex");
+        let link_span_id = hex::decode("1122334455667788").expect("link span_id hex");
         let link_struct = StructArray::new(
             link_fields.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["fedcba98765432100123456789abcdef"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["1122334455667788"])),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(link_trace_id.as_slice()))
+                        .expect("link trace_id"),
+                ) as ArrayRef,
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(link_span_id.as_slice()))
+                        .expect("link span_id"),
+                ),
                 Arc::new(StringArray::from(vec![None as Option<&str>])),
                 Arc::new(link_attrs),
                 Arc::new(Int32Array::from(vec![Some(0)])),
@@ -1151,8 +1208,8 @@ mod proto_tests {
         );
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("trace_id", DataType::Utf8, false),
-            Field::new("span_id", DataType::Utf8, false),
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+            Field::new("span_id", DataType::FixedSizeBinary(8), false),
             Field::new("name", DataType::Utf8, false),
             Field::new("kind", DataType::Int32, true),
             Field::new("status_code", DataType::Int32, true),
@@ -1169,11 +1226,15 @@ mod proto_tests {
         let res_attrs = single_attr_map("k8s.namespace.name", "icegate");
         let span_attrs = single_attr_map("http.method", "GET");
 
+        let trace_bytes = hex::decode("0102030405060708090a0b0c0d0e0f10").expect("trace_id hex");
+        let span_bytes = hex::decode("aabbccddeeff0011").expect("span_id hex");
         RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["0102030405060708090a0b0c0d0e0f10"])),
-                Arc::new(StringArray::from(vec!["aabbccddeeff0011"])),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(trace_bytes.as_slice())).expect("trace_id"),
+                ),
+                Arc::new(FixedSizeBinaryArray::try_from_iter(std::iter::once(span_bytes.as_slice())).expect("span_id")),
                 Arc::new(StringArray::from(vec!["GET /api"])),
                 Arc::new(Int32Array::from(vec![Some(2)])),
                 Arc::new(Int32Array::from(vec![Some(1)])),
@@ -1213,8 +1274,8 @@ mod proto_tests {
         }
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("trace_id", DataType::Utf8, false),
-            Field::new("span_id", DataType::Utf8, false),
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+            Field::new("span_id", DataType::FixedSizeBinary(8), false),
             Field::new("name", DataType::Utf8, false),
             Field::new("kind", DataType::Int32, true),
             Field::new("status_code", DataType::Int32, true),
@@ -1237,11 +1298,15 @@ mod proto_tests {
         span_b.append(true).expect("map row");
         let span_attrs = span_b.finish();
 
+        let trace_bytes = hex::decode("0102030405060708090a0b0c0d0e0f10").expect("trace_id hex");
+        let span_bytes = hex::decode("aabbccddeeff0011").expect("span_id hex");
         RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["0102030405060708090a0b0c0d0e0f10"])),
-                Arc::new(StringArray::from(vec!["aabbccddeeff0011"])),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(trace_bytes.as_slice())).expect("trace_id"),
+                ),
+                Arc::new(FixedSizeBinaryArray::try_from_iter(std::iter::once(span_bytes.as_slice())).expect("span_id")),
                 Arc::new(StringArray::from(vec!["GET /api"])),
                 Arc::new(Int32Array::from(vec![Some(2)])),
                 Arc::new(Int32Array::from(vec![Some(1)])),
@@ -1423,16 +1488,37 @@ mod search_response_tests {
     use std::sync::Arc;
 
     use datafusion::arrow::{
-        array::{RecordBatch, StringArray, TimestampMicrosecondArray},
+        array::{FixedSizeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
 
     use super::spansets_to_search_response;
 
+    /// Pad a synthetic id label up to `N` bytes so it round-trips through
+    /// `FIXED_LEN_BYTE_ARRAY`. Returns the hex representation the formatter
+    /// will emit so callers can assert against it.
+    fn pad_id<const N: usize>(label: &str) -> ([u8; N], String) {
+        let mut padded = [0u8; N];
+        let bytes = label.as_bytes();
+        let len = bytes.len().min(N);
+        padded[..len].copy_from_slice(&bytes[..len]);
+        let hex_repr = hex::encode(padded);
+        (padded, hex_repr)
+    }
+
+    /// Hex-encoded form of `pad_id(label)` for one byte width. Convenience
+    /// for assertions like `summary.trace_id == hex_id::<16>("trace-a")`.
+    pub(crate) fn hex_id<const N: usize>(label: &str) -> String {
+        pad_id::<N>(label).1
+    }
+
     /// Build a minimal record batch carrying just the columns the search
     /// formatter actually inspects. `parents[i]` of `None` means "no
-    /// `parent_span_id` column value" (null), `Some("")` means an empty
-    /// string. Both are treated as roots by the formatter.
+    /// `parent_span_id` column value" (null) — treated as a root by the
+    /// formatter. With `parent_span_id` now stored as a fixed 8-byte binary,
+    /// the legacy `Some("")` empty-string sentinel no longer round-trips
+    /// through Parquet; tests that wanted "child of unknown" should pass
+    /// `Some("…")` with any non-null label.
     ///
     /// Each row gets a synthetic `span_id` of the form `span-{i}` so
     /// `spanSets` assertions can pin specific spans without callers
@@ -1446,24 +1532,36 @@ mod search_response_tests {
         end_micros: &[i64],
     ) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("trace_id", DataType::Utf8, false),
-            Field::new("span_id", DataType::Utf8, false),
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+            Field::new("span_id", DataType::FixedSizeBinary(8), false),
             Field::new("name", DataType::Utf8, false),
             Field::new("service_name", DataType::Utf8, true),
-            Field::new("parent_span_id", DataType::Utf8, true),
+            Field::new("parent_span_id", DataType::FixedSizeBinary(8), true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
             Field::new("end_timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         ]));
-        let span_ids: Vec<String> = (0..trace_ids.len()).map(|i| format!("span-{i}")).collect();
-        let span_ids_refs: Vec<&str> = span_ids.iter().map(String::as_str).collect();
+
+        let trace_id_bytes: Vec<[u8; 16]> = trace_ids.iter().map(|t| pad_id::<16>(t).0).collect();
+        let trace_id_arr = FixedSizeBinaryArray::try_from_iter(trace_id_bytes.iter().map(<[u8; 16]>::as_slice))
+            .expect("trace_id array");
+
+        let span_id_bytes: Vec<[u8; 8]> = (0..trace_ids.len()).map(|i| pad_id::<8>(&format!("span-{i}")).0).collect();
+        let span_id_arr =
+            FixedSizeBinaryArray::try_from_iter(span_id_bytes.iter().map(<[u8; 8]>::as_slice)).expect("span_id array");
+
+        let parent_bytes: Vec<Option<[u8; 8]>> = parents.iter().map(|p| p.map(|label| pad_id::<8>(label).0)).collect();
+        let parent_arr =
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(parent_bytes.iter().map(Option::as_ref), 8)
+                .expect("parent_span_id array");
+
         RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(trace_ids.to_vec())),
-                Arc::new(StringArray::from(span_ids_refs)),
+                Arc::new(trace_id_arr),
+                Arc::new(span_id_arr),
                 Arc::new(StringArray::from(names.to_vec())),
                 Arc::new(StringArray::from(services.to_vec())),
-                Arc::new(StringArray::from(parents.to_vec())),
+                Arc::new(parent_arr),
                 Arc::new(TimestampMicrosecondArray::from(start_micros.to_vec())),
                 Arc::new(TimestampMicrosecondArray::from(end_micros.to_vec())),
             ],
@@ -1488,7 +1586,7 @@ mod search_response_tests {
         let resp = spansets_to_search_response(&[batch]);
         assert_eq!(resp.traces.len(), 1);
         let summary = &resp.traces[0];
-        assert_eq!(summary.trace_id, "trace-a");
+        assert_eq!(summary.trace_id, hex_id::<16>("trace-a"));
         assert_eq!(summary.root_service_name.as_deref(), Some("frontend"));
         assert_eq!(summary.root_trace_name.as_deref(), Some("root-span"));
     }
@@ -1554,7 +1652,7 @@ mod search_response_tests {
         assert_eq!(span_set.matched, 1);
         assert_eq!(span_set.spans.len(), 1);
         let span = &span_set.spans[0];
-        assert_eq!(span.span_id, "span-0");
+        assert_eq!(span.span_id, hex_id::<8>("span-0"));
         // 1_000_000 micros → 1_000_000_000 nanos.
         assert_eq!(span.start_time_unix_nano, "1000000000");
         // (1_500_000 - 1_000_000) micros → 500_000_000 nanos.
@@ -1653,5 +1751,42 @@ mod search_response_tests {
             .map(|kv| kv.value.string_value.as_str())
             .collect();
         assert_eq!(names, vec!["root-e", "child-e"]);
+    }
+}
+
+#[cfg(test)]
+mod parent_sentinel_tests {
+    use datafusion::arrow::array::FixedSizeBinaryArray;
+
+    use super::is_null_or_zero_parent;
+
+    /// Construct a 3-row `FixedSizeBinary(8)` array exercising every case the
+    /// helper must distinguish: SQL null, the all-zero "no parent" sentinel,
+    /// and a real 8-byte parent ID.
+    fn fixture() -> FixedSizeBinaryArray {
+        let real_parent: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [None, Some([0u8; 8].as_slice()), Some(real_parent.as_slice())].into_iter(),
+            8,
+        )
+        .expect("parent_span_id fixture")
+    }
+
+    #[test]
+    fn null_row_is_treated_as_no_parent() {
+        let arr = fixture();
+        assert!(is_null_or_zero_parent(&arr, 0));
+    }
+
+    #[test]
+    fn all_zero_row_is_treated_as_no_parent() {
+        let arr = fixture();
+        assert!(is_null_or_zero_parent(&arr, 1));
+    }
+
+    #[test]
+    fn non_zero_row_is_treated_as_parent() {
+        let arr = fixture();
+        assert!(!is_null_or_zero_parent(&arr, 2));
     }
 }

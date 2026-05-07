@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use datafusion::arrow::array::{
-    ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
+    ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
+    TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::parquet::file::properties::WriterProperties;
@@ -35,6 +36,18 @@ use reqwest::Client;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+/// Build a `FixedSizeBinary(byte_width)` array by decoding `hex` once and
+/// repeating the resulting bytes `count` times. Used to seed identical
+/// `trace_id` / `span_id` values across many synthetic rows.
+fn build_fixed_binary_array(hex: &str, count: usize, byte_width: i32) -> ArrayRef {
+    let bytes = hex::decode(hex).expect("fixed binary hex");
+    let mut builder = FixedSizeBinaryBuilder::with_capacity(count, byte_width);
+    for _ in 0..count {
+        builder.append_value(&bytes).expect("append fixed binary");
+    }
+    Arc::new(builder.finish())
+}
 
 /// Test server configuration and handles
 pub struct TestServer {
@@ -241,17 +254,11 @@ pub async fn write_benchmark_logs(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    // Create hex-encoded trace and span IDs (matching logs schema)
-    let mut trace_id_builder = StringBuilder::new();
-    let mut span_id_builder = StringBuilder::new();
-
-    for _ in 0..count {
-        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
-        span_id_builder.append_value("0102030405060708");
-    }
-
-    let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
-    let span_id_arr: ArrayRef = Arc::new(span_id_builder.finish());
+    // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
+    // schema; decode the hex fixtures into raw bytes once and reuse them
+    // for every row.
+    let trace_id_arr = build_fixed_binary_array("0102030405060708090a0b0c0d0e0f10", count, 16);
+    let span_id_arr = build_fixed_binary_array("0102030405060708", count, 8);
 
     let batch = RecordBatch::try_new(
         arrow_schema.clone(),
@@ -374,17 +381,11 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    // Create hex-encoded trace and span IDs (matching logs schema)
-    let mut trace_id_builder = StringBuilder::new();
-    let mut span_id_builder = StringBuilder::new();
-
-    for _ in 0..count {
-        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
-        span_id_builder.append_value("0102030405060708");
-    }
-
-    let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
-    let span_id_arr: ArrayRef = Arc::new(span_id_builder.finish());
+    // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
+    // schema; decode the hex fixtures into raw bytes once and reuse them
+    // for every row.
+    let trace_id_arr = build_fixed_binary_array("0102030405060708090a0b0c0d0e0f10", count, 16);
+    let span_id_arr = build_fixed_binary_array("0102030405060708", count, 8);
 
     let batch = RecordBatch::try_new(
         arrow_schema.clone(),
@@ -497,17 +498,11 @@ pub async fn write_benchmark_logs_with_varied_labels(
 
     let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
 
-    // Create hex-encoded trace and span IDs (matching logs schema)
-    let mut trace_id_builder = StringBuilder::new();
-    let mut span_id_builder = StringBuilder::new();
-
-    for _ in 0..count {
-        trace_id_builder.append_value("0102030405060708090a0b0c0d0e0f10");
-        span_id_builder.append_value("0102030405060708");
-    }
-
-    let trace_id_arr: ArrayRef = Arc::new(trace_id_builder.finish());
-    let span_id_arr: ArrayRef = Arc::new(span_id_builder.finish());
+    // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
+    // schema; decode the hex fixtures into raw bytes once and reuse them
+    // for every row.
+    let trace_id_arr = build_fixed_binary_array("0102030405060708090a0b0c0d0e0f10", count, 16);
+    let span_id_arr = build_fixed_binary_array("0102030405060708", count, 8);
 
     let batch = RecordBatch::try_new(
         arrow_schema.clone(),

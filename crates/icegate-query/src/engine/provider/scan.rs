@@ -198,6 +198,7 @@ async fn get_batch_stream(
     }
     let table_scan = scan_builder
         .with_batch_size(Some(ICEBERG_SCAN_BATCH_SIZE))
+        .with_row_selection_enabled(true)
         .build()
         .map_err(to_datafusion_error)?;
 

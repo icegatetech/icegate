@@ -11,8 +11,8 @@ use std::sync::Arc;
 use datafusion::{
     arrow::{
         array::{
-            ArrayRef, Int32Array, Int64Array, ListArray, MapBuilder, MapFieldNames, RecordBatch, StringArray,
-            StringBuilder, TimestampMicrosecondArray,
+            ArrayRef, FixedSizeBinaryBuilder, Int32Array, Int64Array, ListArray, MapBuilder, MapFieldNames,
+            RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
         },
         buffer::OffsetBuffer,
         datatypes::{DataType, Field},
@@ -152,10 +152,29 @@ impl TestServer {
 /// `service_name="backend"`, with a handful of attribute keys including a
 /// well-known resource-prefix one (`k8s.namespace.name`) and a span-scope
 /// one (`http.method`).
+///
+/// Uses default Parquet `WriterProperties` (dictionary on for every string
+/// column). For tests that need to exercise the production shift-writer
+/// encoding policy, see [`write_test_spans_with_properties`].
 pub async fn write_test_spans(
     table: &Table,
     catalog: &Arc<dyn Catalog>,
     tenant_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_test_spans_with_properties(table, catalog, tenant_id, WriterProperties::builder().build()).await
+}
+
+/// Like [`write_test_spans`] but lets the caller pin the Parquet
+/// `WriterProperties`. Use this from tests that need to reproduce the
+/// production shift-writer encoding (e.g. via
+/// [`icegate_common::parquet_writer::build_writer_properties`]) so a
+/// regression in encoding policy doesn't silently slip past
+/// metadata-scan-based tag enumeration.
+pub async fn write_test_spans_with_properties(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    writer_properties: WriterProperties,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,17 +196,43 @@ pub async fn write_test_spans(
         Some("frontend"),
         Some("backend"),
     ]));
-    let trace_id: ArrayRef = Arc::new(StringArray::from(vec![
+    // trace_id / span_id are FIXED_LEN_BYTE_ARRAY in storage; decode the
+    // hex fixtures into raw bytes so the schema check passes.
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
+    for hex_id in [
         "0102030405060708090a0b0c0d0e0f10",
         "1112131415161718191a1b1c1d1e1f20",
         "2122232425262728292a2b2c2d2e2f30",
-    ]));
-    let span_id: ArrayRef = Arc::new(StringArray::from(vec![
-        "0102030405060708",
-        "1112131415161718",
-        "2122232425262728",
-    ]));
-    let parent_span_id: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>, None, None]));
+    ] {
+        let bytes = hex::decode(hex_id).expect("trace_id hex");
+        trace_id_builder.append_value(&bytes).expect("trace_id length 16");
+    }
+    let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
+
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
+    for hex_id in ["0102030405060708", "1112131415161718", "2122232425262728"] {
+        let bytes = hex::decode(hex_id).expect("span_id hex");
+        span_id_builder.append_value(&bytes).expect("span_id length 8");
+    }
+    let span_id: ArrayRef = Arc::new(span_id_builder.finish());
+
+    // Row 0 is the trace's root (no parent). Rows 1 and 2 are children of
+    // row 0, so their `parent_span_id` matches row 0's `span_id`
+    // ("0102030405060708") above. Carrying a real non-null parent through
+    // FIXED_LEN_BYTE_ARRAY(8) exercises the full encode/decode path for
+    // every Tempo formatter test that consumes this fixture; an all-null
+    // column would let a future regression in `parent_span_id` plumbing
+    // ship without any integration coverage.
+    let row0_span_id = hex::decode("0102030405060708").expect("row0 span_id hex");
+    let parent_span_id_values: [Option<&[u8]>; 3] =
+        [None, Some(row0_span_id.as_slice()), Some(row0_span_id.as_slice())];
+    let parent_span_id: ArrayRef = Arc::new(
+        datafusion::arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            parent_span_id_values.into_iter(),
+            8,
+        )
+        .expect("parent_span_id"),
+    );
     let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
         now_micros,
         now_micros - 1000,
@@ -280,10 +325,8 @@ pub async fn write_test_spans(
     let unique_suffix = format!("tempo-{tenant_id}-{now_micros}");
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
     let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::builder().build(),
-        table.metadata().current_schema().clone(),
-    );
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(writer_properties, table.metadata().current_schema().clone());
     let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer_builder,
         table.file_io().clone(),

@@ -35,6 +35,18 @@ pub(crate) fn boundary_component_timestamp_micros(
     }
 }
 
+pub(crate) fn boundary_component_fixed_bytes(
+    value: Option<Vec<u8>>,
+    descending: bool,
+    nulls_first: bool,
+) -> RowGroupBoundaryComponent {
+    RowGroupBoundaryComponent {
+        value: value.map(RowGroupBoundaryValue::FixedBytes),
+        descending,
+        nulls_first,
+    }
+}
+
 /// Build a [`RowGroupBoundaryRange`] from the first and last row of a sorted logs batch.
 ///
 /// # Errors

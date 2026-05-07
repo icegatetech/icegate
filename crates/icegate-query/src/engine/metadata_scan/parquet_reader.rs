@@ -102,9 +102,14 @@ pub async fn open_builder(
 /// (decoding is CPU-cheap compared to the network fetch).
 ///
 /// Data pages are never decoded. Row groups without a dictionary page are
-/// skipped (acceptable under over-approximation semantics; the current
-/// ingest writer emits dictionaries for every low-cardinality string
-/// column). Row groups pruned by `predicate` are skipped before any I/O.
+/// skipped: any column reachable from
+/// [`crate::tempo::metadata::target_column_for_tag`] (i.e. surfaced through
+/// tag-value enumeration) is kept dictionary-encoded by policy in
+/// [`icegate_common::parquet_encoding`], so a missing dictionary on those
+/// columns indicates either an externally-produced file or a regression
+/// in that policy. The skip is logged with the column name so a future
+/// regression is visible without redeploy. Row groups pruned by
+/// `predicate` are skipped before any I/O.
 ///
 /// # Errors
 ///
@@ -133,10 +138,13 @@ pub async fn read_column_dictionaries(
     let mut ranges: Vec<Range<u64>> = Vec::new();
     let mut selected_rgs: Vec<usize> = Vec::new();
     let mut pruned: usize = 0;
-    // Row groups where the Parquet writer fell back to plain encoding
-    // (no dictionary page). This typically indicates high-cardinality
-    // data. We intentionally skip these: reading full data pages would
-    // be expensive and the over-approximation semantics allow it.
+    // Row groups whose column chunk has no dictionary page. The IceGate
+    // ingest writer keeps every enumerated string column dictionary-encoded
+    // by policy (see `icegate_common::parquet_encoding`), so this should
+    // only fire for externally-produced files. Reading the data pages as a
+    // fallback would defeat the metadata-scan optimisation — we count and
+    // log instead, and let the over-approximation contract carry the
+    // missing values.
     let mut no_dict: usize = 0;
 
     for rg_idx in 0..metadata.num_row_groups() {
@@ -184,13 +192,20 @@ pub async fn read_column_dictionaries(
     span.record("num_chunks_fetched", ranges.len());
 
     if no_dict > 0 {
-        // Our ingest writer always emits dictionaries for string columns, so
-        // this path should only trigger for externally-produced files. Labels
-        // from these row groups will be missing (acceptable under
-        // over-approximation semantics).
+        // Enumerated string columns are kept dictionary-encoded by policy
+        // in `icegate_common::parquet_encoding`. A non-zero count here for
+        // an IceGate-written file therefore signals either an external
+        // file or a policy regression — surface the column name so it's
+        // actionable from logs alone. The lookup is hoisted into the warn
+        // arm so the cold path's allocation doesn't run for the common
+        // (no-dict == 0) case. Bind the descriptor `Arc` to a local first
+        // so the `&str` returned by `.name()` doesn't outlive the
+        // temporary chain it would otherwise borrow from.
+        let column = metadata.file_metadata().schema_descr().column(leaf_idx);
         tracing::warn!(
+            column = %column.name(),
             no_dict,
-            "skipped row groups without dictionary page; label results may be incomplete"
+            "skipped row groups without dictionary page; tag-value results may be incomplete (regression?)"
         );
     }
 
@@ -244,9 +259,55 @@ fn decode_dictionary_from_chunk(
     // column chunk, so one `get_next_page()` gives us exactly the dict
     // page. Drop without touching data pages.
     if let Some(Page::DictionaryPage { buf, num_values, .. }) = page_reader.get_next_page()? {
-        decode_plain_byte_array_values(&buf, num_values as usize, out)?;
+        // Branch on physical type: BYTE_ARRAY uses a length prefix per value;
+        // FIXED_LEN_BYTE_ARRAY is `type_length` raw bytes per value with no
+        // prefix. trace_id / span_id columns ride the FIXED path and are
+        // hex-encoded into `out` to keep the wire format string-typed.
+        let leaf = col_chunk.column_descr();
+        match leaf.physical_type() {
+            PhysicalType::BYTE_ARRAY => {
+                decode_plain_byte_array_values(&buf, num_values as usize, out)?;
+            }
+            PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                let type_length = usize::try_from(leaf.type_length().max(0)).unwrap_or(0);
+                if type_length > 0 {
+                    decode_plain_fixed_len_byte_array_values(&buf, num_values as usize, type_length, out)?;
+                }
+            }
+            _ => {}
+        }
     }
 
+    Ok(())
+}
+
+/// Decode PLAIN-encoded `FIXED_LEN_BYTE_ARRAY` values from a dictionary page
+/// and insert each distinct value into `out` as lowercase hex.
+///
+/// Parquet's PLAIN encoding for `FIXED_LEN_BYTE_ARRAY` is
+/// `[bytes; type_length]` repeated — no length prefix. We hex-encode here
+/// because all callers downstream (`label_values`, `/tags`) expect
+/// string-typed values on the wire.
+fn decode_plain_fixed_len_byte_array_values(
+    buf: &[u8],
+    num_values: usize,
+    type_length: usize,
+    out: &mut BTreeSet<String>,
+) -> Result<(), ParquetError> {
+    let needed = num_values.checked_mul(type_length).ok_or_else(|| {
+        ParquetError::General(format!(
+            "FIXED_LEN_BYTE_ARRAY dictionary page size overflow: num_values={num_values} type_length={type_length}"
+        ))
+    })?;
+    if buf.len() < needed {
+        return Err(ParquetError::General(format!(
+            "truncated PLAIN FIXED_LEN_BYTE_ARRAY dictionary page: expected {needed} bytes ({num_values} values × {type_length} bytes), got {}",
+            buf.len()
+        )));
+    }
+    for chunk in buf[..needed].chunks_exact(type_length) {
+        out.insert(hex::encode(chunk));
+    }
     Ok(())
 }
 
@@ -549,6 +610,20 @@ fn eval_binary_on_stats(rg: &RowGroupMetaData, col_name: &str, op: PredicateOper
             let max = s.max_opt().map(parquet::data_type::ByteArray::data);
             eval_range_ord(op, min, max, v.as_bytes())
         }
+        // FIXED_LEN_BYTE_ARRAY columns (`trace_id`/`span_id`/`parent_span_id`)
+        // store stats with the same byte ordering used for equality, so the
+        // generic `eval_range_ord<&[u8]>` path applies once we surface the
+        // min/max as `&[u8]`. Without this arm, predicates on those columns
+        // fall through to the conservative `_ => true` and never prune.
+        // `Datum::fixed` lowers to `PrimitiveLiteral::Binary` — iceberg-rust
+        // distinguishes `FIXED(N)` from `BINARY` via the datum type field,
+        // not the literal variant. `FixedLenByteArray` derefs to `ByteArray`
+        // so the `.data()` accessor is reached through auto-deref.
+        (Statistics::FixedLenByteArray(s), PrimitiveLiteral::Binary(v)) => {
+            let min = s.min_opt().map(|fla| fla.data());
+            let max = s.max_opt().map(|fla| fla.data());
+            eval_range_ord(op, min, max, v.as_slice())
+        }
         (Statistics::Int64(s), PrimitiveLiteral::Long(v)) => eval_range_ord(op, s.min_opt(), s.max_opt(), v),
         (Statistics::Int32(s), PrimitiveLiteral::Int(v)) => eval_range_ord(op, s.min_opt(), s.max_opt(), v),
         _ => true,
@@ -719,5 +794,69 @@ impl Read for BytesCursor {
         buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use datafusion::arrow::array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use iceberg::expr::PredicateOperator;
+    use iceberg::spec::Datum;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    use super::eval_binary_on_stats;
+
+    /// Write a single-column Parquet file with `FixedSizeBinary(16)` rows
+    /// to an in-memory buffer. Used by the `FIXED_LEN_BYTE_ARRAY` stats-pruning
+    /// tests below to exercise `eval_binary_on_stats` against real Parquet
+    /// metadata (rather than a hand-rolled `RowGroupMetaData` mock).
+    fn write_trace_id_parquet(rows: &[[u8; 16]]) -> Bytes {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "trace_id",
+            DataType::FixedSizeBinary(16),
+            false,
+        )]));
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+        for row in rows {
+            builder.append_value(row).expect("append 16-byte value");
+        }
+        let array: ArrayRef = Arc::new(builder.finish());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("record batch");
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).expect("ArrowWriter");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+        Bytes::from(buf)
+    }
+
+    #[test]
+    fn eval_binary_on_stats_prunes_fixed_len_byte_array_eq_outside_range() {
+        // Stats range [0x10..=0x20]; literal 0x05 is below — Eq cannot match.
+        let buf = write_trace_id_parquet(&[[0x10u8; 16], [0x20u8; 16]]);
+        let reader = SerializedFileReader::new(buf).expect("reader");
+        let rg = reader.metadata().row_group(0);
+        let datum = Datum::fixed(vec![0x05u8; 16]);
+        assert!(
+            !eval_binary_on_stats(rg, "trace_id", PredicateOperator::Eq, &datum),
+            "literal below stats range; row group must prune"
+        );
+    }
+
+    #[test]
+    fn eval_binary_on_stats_keeps_fixed_len_byte_array_eq_inside_range() {
+        // Stats range [0x10..=0x20]; literal 0x18 is inside — Eq might match.
+        let buf = write_trace_id_parquet(&[[0x10u8; 16], [0x20u8; 16]]);
+        let reader = SerializedFileReader::new(buf).expect("reader");
+        let rg = reader.metadata().row_group(0);
+        let datum = Datum::fixed(vec![0x18u8; 16]);
+        assert!(
+            eval_binary_on_stats(rg, "trace_id", PredicateOperator::Eq, &datum),
+            "literal inside stats range; row group must be kept"
+        );
     }
 }

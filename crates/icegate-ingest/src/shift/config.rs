@@ -199,6 +199,12 @@ pub struct ShiftWriteConfig {
     /// Parquet row group size (number of rows per row group).
     /// It is better to synchronize with `QueueCommonConfig::max_row_group_size`.
     pub row_group_size: usize,
+    /// Maximum Parquet data page size, in bytes.
+    ///
+    /// Forwarded to `WriterProperties::set_data_page_size_limit`. Smaller pages
+    /// improve page-index predicate pushdown at the cost of metadata overhead;
+    /// larger pages reduce overhead but coarsen statistics granularity.
+    pub data_page_size_limit_bytes: usize,
     /// Time-to-live for cached Iceberg table metadata, in seconds.
     pub table_cache_ttl_secs: u64,
 }
@@ -206,7 +212,8 @@ pub struct ShiftWriteConfig {
 impl Default for ShiftWriteConfig {
     fn default() -> Self {
         Self {
-            row_group_size: 8_192,
+            row_group_size: 20_000,
+            data_page_size_limit_bytes: 2 * 1024 * 1024,
             table_cache_ttl_secs: 60,
         }
     }
@@ -277,6 +284,11 @@ impl ShiftConfig {
         if self.write.row_group_size < 128 {
             return Err(IngestError::Config(
                 "row_group_size must be greater than zero".to_string(),
+            ));
+        }
+        if self.write.data_page_size_limit_bytes == 0 {
+            return Err(IngestError::Config(
+                "data_page_size_limit_bytes must be greater than zero".to_string(),
             ));
         }
         if self.read.max_record_batches_per_task == 0 {
@@ -467,5 +479,16 @@ mod tests {
             default_jobs_manager_worker_count(),
             "worker_count must follow available CPU parallelism"
         );
+    }
+
+    #[test]
+    fn shift_validate_rejects_zero_data_page_size_limit_bytes() {
+        // Guards the Helm chart / config field from defaulting to zero —
+        // a zero data page size limit silently disables Parquet page
+        // splitting, which would tank stats pruning at query time.
+        let mut config = ShiftConfig::default();
+        config.write.data_page_size_limit_bytes = 0;
+        let err = config.validate().expect_err("config must be invalid");
+        assert!(matches!(err, crate::error::IngestError::Config(_)));
     }
 }

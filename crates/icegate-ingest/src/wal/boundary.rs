@@ -11,6 +11,8 @@ pub(crate) enum RowGroupBoundaryValue {
     String(String),
     /// Timestamp value in microseconds.
     TimestampMicros(i64),
+    /// Fixed-length raw bytes (e.g. `trace_id`: 16 B, `span_id`: 8 B).
+    FixedBytes(Vec<u8>),
 }
 
 /// Inclusive boundary range for one sorted row group.
@@ -135,6 +137,15 @@ impl RowGroupBoundaryComponent {
                     right.type_name()
                 )))
             }
+            (Some(RowGroupBoundaryValue::FixedBytes(left)), Some(RowGroupBoundaryValue::FixedBytes(right)))
+                if left.len() != right.len() =>
+            {
+                Err(IngestError::Shift(format!(
+                    "incompatible boundary key structure at component {index}: fixed_bytes width differs ({} bytes, {} bytes)",
+                    left.len(),
+                    right.len()
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -169,6 +180,14 @@ impl RowGroupBoundaryComponent {
                 Some(RowGroupBoundaryValue::TimestampMicros(left)),
                 Some(RowGroupBoundaryValue::TimestampMicros(right)),
             ) => compare_option_ord(Some(*left), Some(*right), self.descending, self.nulls_first),
+            (Some(RowGroupBoundaryValue::FixedBytes(left)), Some(RowGroupBoundaryValue::FixedBytes(right))) => {
+                compare_option_ord(
+                    Some(left.as_slice()),
+                    Some(right.as_slice()),
+                    self.descending,
+                    self.nulls_first,
+                )
+            }
             (None, None) | (Some(_), Some(_)) => Ordering::Equal,
         }
     }
@@ -179,6 +198,7 @@ impl RowGroupBoundaryValue {
         match self {
             Self::String(_) => "string",
             Self::TimestampMicros(_) => "timestamp_micros",
+            Self::FixedBytes(_) => "fixed_bytes",
         }
     }
 }
@@ -216,6 +236,7 @@ const fn boundary_value_discriminant(value: &RowGroupBoundaryValue) -> u8 {
     match value {
         RowGroupBoundaryValue::String(_) => 0,
         RowGroupBoundaryValue::TimestampMicros(_) => 1,
+        RowGroupBoundaryValue::FixedBytes(_) => 2,
     }
 }
 
@@ -224,7 +245,10 @@ mod tests {
     use std::{cmp::Ordering, sync::Arc};
 
     use super::{RowGroupBoundaryKey, RowGroupBoundaryRange, compare_option_ord};
-    use crate::wal::test_utils::{boundary_component_string, boundary_component_timestamp_micros};
+    use crate::error::IngestError;
+    use crate::wal::test_utils::{
+        boundary_component_fixed_bytes, boundary_component_string, boundary_component_timestamp_micros,
+    };
 
     #[test]
     fn compare_option_ord_handles_desc_nulls_first() {
@@ -378,5 +402,115 @@ mod tests {
             .compare_checked(&timestamp_key)
             .expect_err("different component types must be rejected");
         assert!(err.to_string().contains("value type differs"));
+    }
+
+    #[test]
+    fn row_group_boundary_component_compares_fixed_bytes_lex() {
+        // trace_id-style 16-byte sentinels: trace_a1 < trace_a2 < trace_b
+        // when compared lexicographically.
+        let trace_a1: Vec<u8> = vec![b'a', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_a2: Vec<u8> = vec![b'a', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_b: Vec<u8> = vec![b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let lower = RowGroupBoundaryKey {
+            components: vec![boundary_component_fixed_bytes(Some(trace_a1), false, true)],
+        };
+        let middle = RowGroupBoundaryKey {
+            components: vec![boundary_component_fixed_bytes(Some(trace_a2.clone()), false, true)],
+        };
+        let upper = RowGroupBoundaryKey {
+            components: vec![boundary_component_fixed_bytes(Some(trace_b), false, true)],
+        };
+
+        assert_eq!(lower.compare_checked(&middle).expect("compatible keys"), Ordering::Less);
+        assert_eq!(middle.compare_checked(&upper).expect("compatible keys"), Ordering::Less);
+        // Descending direction reverses the order.
+        let middle_desc = RowGroupBoundaryKey {
+            components: vec![boundary_component_fixed_bytes(Some(trace_a2), true, true)],
+        };
+        let upper_desc = RowGroupBoundaryKey {
+            components: vec![boundary_component_fixed_bytes(
+                Some(vec![b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                true,
+                true,
+            )],
+        };
+        assert_eq!(
+            middle_desc.compare_checked(&upper_desc).expect("compatible keys"),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn row_group_boundary_key_rejects_mixed_string_and_fixed_bytes() {
+        let string_key = RowGroupBoundaryKey {
+            components: vec![boundary_component_string(Some("acc-1".to_string()), false, true)],
+        };
+        let fixed_key = RowGroupBoundaryKey {
+            components: vec![boundary_component_fixed_bytes(
+                Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+                false,
+                true,
+            )],
+        };
+
+        let err = string_key
+            .compare_checked(&fixed_key)
+            .expect_err("string vs fixed_bytes must be rejected");
+        assert!(err.to_string().contains("value type differs"));
+    }
+
+    #[test]
+    fn row_group_boundary_key_rejects_mismatched_fixed_bytes_widths() {
+        // A 16-byte (trace_id-shaped) component compared against an 8-byte
+        // (span_id-shaped) component must fail compatibility — silently
+        // accepting the mismatch lets `compare_unchecked` lex-compare slices
+        // of unequal length and produce nonsense ordering across streams.
+        let key_16 = RowGroupBoundaryKey {
+            components: vec![boundary_component_fixed_bytes(Some(vec![0u8; 16]), false, true)],
+        };
+        let key_8 = RowGroupBoundaryKey {
+            components: vec![boundary_component_fixed_bytes(Some(vec![0u8; 8]), false, true)],
+        };
+
+        match key_16.compare_checked(&key_8) {
+            Ok(_) => panic!("mismatched fixed_bytes widths must be rejected"),
+            Err(err) => assert!(matches!(err, IngestError::Shift(_))),
+        }
+    }
+
+    #[test]
+    fn row_group_boundary_value_round_trips_fixed_bytes_json() {
+        use crate::wal::{deserialize_row_group_boundary_range, serialize_row_group_boundary_range};
+
+        let original = RowGroupBoundaryRange {
+            names: names(),
+            min_key: RowGroupBoundaryKey {
+                components: vec![
+                    boundary_component_string(Some("acc-1".to_string()), false, true),
+                    boundary_component_fixed_bytes(
+                        Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+                        false,
+                        true,
+                    ),
+                    boundary_component_timestamp_micros(Some(30), true, true),
+                ],
+            },
+            max_key: RowGroupBoundaryKey {
+                components: vec![
+                    boundary_component_string(Some("acc-1".to_string()), false, true),
+                    boundary_component_fixed_bytes(
+                        Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 99]),
+                        false,
+                        true,
+                    ),
+                    boundary_component_timestamp_micros(Some(10), true, true),
+                ],
+            },
+        };
+
+        let serialized = serialize_row_group_boundary_range(&original).expect("serialize");
+        let restored = deserialize_row_group_boundary_range(&serialized).expect("deserialize");
+        assert_eq!(restored, original);
     }
 }

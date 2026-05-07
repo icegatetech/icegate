@@ -86,16 +86,19 @@ pub fn logs_schema() -> Result<Schema> {
                 "ingested_timestamp",
                 Type::Primitive(PrimitiveType::Timestamp),
             )),
-            // W3C trace context
+            // W3C trace context. Stored as raw fixed-length bytes (16 / 8) — half
+            // the wire size of the previous lowercase-hex strings, and a perfect
+            // fit for `FIXED_LEN_BYTE_ARRAY` in Parquet. The query layer hex-
+            // encodes/decodes at API boundaries.
             Arc::new(NestedField::optional(
                 7,
                 "trace_id",
-                Type::Primitive(PrimitiveType::String),
+                Type::Primitive(PrimitiveType::Fixed(16)),
             )),
             Arc::new(NestedField::optional(
                 8,
                 "span_id",
-                Type::Primitive(PrimitiveType::String),
+                Type::Primitive(PrimitiveType::Fixed(8)),
             )),
             // Severity information
             Arc::new(NestedField::optional(
@@ -226,21 +229,22 @@ pub fn spans_schema() -> Result<Schema> {
                 "service_name",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Trace identifiers
+            // Trace identifiers stored as raw fixed-length bytes — see logs schema
+            // doc comment for rationale. Hex encode/decode at API boundaries only.
             Arc::new(NestedField::required(
                 4,
                 "trace_id",
-                Type::Primitive(PrimitiveType::String),
+                Type::Primitive(PrimitiveType::Fixed(16)),
             )),
             Arc::new(NestedField::required(
                 5,
                 "span_id",
-                Type::Primitive(PrimitiveType::String),
+                Type::Primitive(PrimitiveType::Fixed(8)),
             )),
             Arc::new(NestedField::optional(
                 6,
                 "parent_span_id",
-                Type::Primitive(PrimitiveType::String),
+                Type::Primitive(PrimitiveType::Fixed(8)),
             )),
             // Timestamp fields
             Arc::new(NestedField::required(
@@ -368,12 +372,12 @@ pub fn spans_schema() -> Result<Schema> {
                         Arc::new(NestedField::required(
                             33,
                             "trace_id",
-                            Type::Primitive(PrimitiveType::String),
+                            Type::Primitive(PrimitiveType::Fixed(16)),
                         )),
                         Arc::new(NestedField::required(
                             34,
                             "span_id",
-                            Type::Primitive(PrimitiveType::String),
+                            Type::Primitive(PrimitiveType::Fixed(8)),
                         )),
                         Arc::new(NestedField::optional(
                             35,
@@ -566,16 +570,16 @@ pub fn events_schema() -> Result<Schema> {
                 "event_name",
                 Type::Primitive(PrimitiveType::String),
             )),
-            // Trace context
+            // Trace context — raw fixed-length bytes (see logs schema rationale).
             Arc::new(NestedField::optional(
                 9,
                 "trace_id",
-                Type::Primitive(PrimitiveType::String),
+                Type::Primitive(PrimitiveType::Fixed(16)),
             )),
             Arc::new(NestedField::optional(
                 10,
                 "span_id",
-                Type::Primitive(PrimitiveType::String),
+                Type::Primitive(PrimitiveType::Fixed(8)),
             )),
             // Event attributes
             Arc::new(NestedField::required(11, "attributes", attributes_map)),
@@ -722,12 +726,12 @@ pub fn metrics_schema() -> Result<Schema> {
         Arc::new(NestedField::optional(
             43,
             "span_id",
-            Type::Primitive(PrimitiveType::String),
+            Type::Primitive(PrimitiveType::Fixed(8)),
         )),
         Arc::new(NestedField::optional(
             44,
             "trace_id",
-            Type::Primitive(PrimitiveType::String),
+            Type::Primitive(PrimitiveType::Fixed(16)),
         )),
         Arc::new(NestedField::required(45, "attributes", exemplar_attributes_map)),
     ]));
@@ -1028,11 +1032,11 @@ pub const COL_SEVERITY_TEXT: &str = "severity_text";
 pub const COL_SERVICE_NAME: &str = "service_name";
 /// Cloud account identifier for multi-account tenancy.
 pub const COL_CLOUD_ACCOUNT_ID: &str = "cloud_account_id";
-/// W3C Trace Context trace identifier.
+/// W3C Trace Context trace identifier (`FIXED_LEN_BYTE_ARRAY(16)`).
 pub const COL_TRACE_ID: &str = "trace_id";
-/// W3C Trace Context span identifier.
+/// W3C Trace Context span identifier (`FIXED_LEN_BYTE_ARRAY(8)`).
 pub const COL_SPAN_ID: &str = "span_id";
-/// Spans table — `parent_span_id` column (STRING).
+/// Spans table — `parent_span_id` column (`FIXED_LEN_BYTE_ARRAY(8)`).
 pub const COL_PARENT_SPAN_ID: &str = "parent_span_id";
 /// Spans table — `duration_micros` column (BIGINT).
 pub const COL_DURATION_MICROS: &str = "duration_micros";
@@ -1050,6 +1054,28 @@ pub const COL_STATUS_MESSAGE: &str = "status_message";
 pub const COL_EVENTS: &str = "events";
 /// Spans table — `links` column (ARRAY of struct).
 pub const COL_LINKS: &str = "links";
+/// Logs/events/spans — observed-by-collector timestamp (`TIMESTAMP`).
+pub const COL_OBSERVED_TIMESTAMP: &str = "observed_timestamp";
+/// Logs/events/spans/metrics — write-side timestamp captured by ingest (`TIMESTAMP`).
+pub const COL_INGESTED_TIMESTAMP: &str = "ingested_timestamp";
+/// Spans — W3C trace state (`STRING`).
+pub const COL_TRACE_STATE: &str = "trace_state";
+/// Metrics — histogram/summary start timestamp (`TIMESTAMP`).
+pub const COL_START_TIMESTAMP: &str = "start_timestamp";
+/// Metrics — histogram/summary count (`BIGINT`).
+pub const COL_COUNT: &str = "count";
+/// Metrics — exponential-histogram zero-bucket count (`BIGINT`).
+pub const COL_ZERO_COUNT: &str = "zero_count";
+/// Metrics — point value as `DOUBLE`.
+pub const COL_VALUE_DOUBLE: &str = "value_double";
+/// Metrics — histogram/summary sum (`DOUBLE`).
+pub const COL_SUM: &str = "sum";
+/// Metrics — histogram min (`DOUBLE`).
+pub const COL_MIN: &str = "min";
+/// Metrics — histogram max (`DOUBLE`).
+pub const COL_MAX: &str = "max";
+/// Metrics — exponential-histogram zero threshold (`DOUBLE`).
+pub const COL_ZERO_THRESHOLD: &str = "zero_threshold";
 /// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
 pub const LEVEL_ALIAS: &str = "level";
 

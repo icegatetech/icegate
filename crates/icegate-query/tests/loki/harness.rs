@@ -12,7 +12,8 @@ use std::sync::Arc;
 use datafusion::{
     arrow::{
         array::{
-            ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
+            ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
+            TimestampMicrosecondArray,
         },
         datatypes::DataType,
     },
@@ -231,51 +232,37 @@ pub async fn write_test_logs_for_tenant(
         "2122232425262728292a2b2c2d2e2f30",
     ];
     let span_ids = ["0102030405060708", "1112131415161718", "2122232425262728"];
-    let severity_texts = ["INFO", "WARN", "ERROR"];
     let bodies = [
         format!("{} message 1", body_prefix),
         format!("{} message 2", body_prefix),
         format!("{} message 3", body_prefix),
     ];
 
-    for i in 0..3 {
+    for body in &bodies {
         // tenant_marker
         attributes_builder.keys().append_value("tenant_marker");
         attributes_builder.values().append_value(tenant_id);
-        // service_name (duplicate indexed column into attributes)
-        attributes_builder.keys().append_value("service_name");
-        attributes_builder.values().append_value(service_name);
-        // cloud_account_id (duplicate indexed column into attributes)
-        attributes_builder.keys().append_value("cloud_account_id");
-        attributes_builder.values().append_value("acc-1");
-        // trace_id (duplicate indexed column into attributes)
-        attributes_builder.keys().append_value("trace_id");
-        attributes_builder.values().append_value(trace_ids[i]);
-        // span_id (duplicate indexed column into attributes)
-        attributes_builder.keys().append_value("span_id");
-        attributes_builder.values().append_value(span_ids[i]);
-        // severity_text (duplicate indexed column into attributes)
-        attributes_builder.keys().append_value("severity_text");
-        attributes_builder.values().append_value(severity_texts[i]);
         // body (duplicate indexed column into attributes)
         attributes_builder.keys().append_value("body");
-        attributes_builder.values().append_value(bodies[i].as_str());
+        attributes_builder.values().append_value(body.as_str());
         attributes_builder.append(true)?;
     }
 
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = StringBuilder::new();
-    // Hex-encoded trace IDs (16 bytes → 32 hex chars)
+    // trace_id is now stored as raw 16-byte FIXED_LEN_BYTE_ARRAY; decode hex
+    // fixtures into bytes to match the production schema.
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
     for tid in trace_ids {
-        trace_id_builder.append_value(tid);
+        let bytes = hex::decode(tid).expect("trace_id hex");
+        trace_id_builder.append_value(&bytes).expect("trace_id length 16");
     }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
-    let mut span_id_builder = StringBuilder::new();
-    // Hex-encoded span IDs (8 bytes → 16 hex chars)
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
     for sid in span_ids {
-        span_id_builder.append_value(sid);
+        let bytes = hex::decode(sid).expect("span_id hex");
+        span_id_builder.append_value(&bytes).expect("span_id length 8");
     }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
@@ -392,29 +379,20 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         "2122232425262728292a2b2c2d2e2f30",
     ];
     let span_ids = ["0102030405060708", "1112131415161718", "2122232425262728"];
-    let severity_texts = ["INFO", "WARN", "ERROR"];
     let bodies = [
         "User logged in successfully",
         "Page rendered in 120ms",
         "Database connection slow",
     ];
 
+    // Indexed top-level columns are NOT mirrored into the attributes map —
+    // the read pipeline reconstructs the merged labels view from the typed
+    // columns at materialisation time (see loki/formatters.rs::extract_labels).
     // Row 0
     attributes_builder.keys().append_value("user_id");
     attributes_builder.values().append_value("user-123");
     attributes_builder.keys().append_value("request_id");
     attributes_builder.values().append_value("req-456");
-    // Duplicate indexed columns into attributes
-    attributes_builder.keys().append_value("service_name");
-    attributes_builder.values().append_value("frontend");
-    attributes_builder.keys().append_value("cloud_account_id");
-    attributes_builder.values().append_value("acc-1");
-    attributes_builder.keys().append_value("trace_id");
-    attributes_builder.values().append_value(trace_ids[0]);
-    attributes_builder.keys().append_value("span_id");
-    attributes_builder.values().append_value(span_ids[0]);
-    attributes_builder.keys().append_value("severity_text");
-    attributes_builder.values().append_value(severity_texts[0]);
     attributes_builder.keys().append_value("body");
     attributes_builder.values().append_value(bodies[0]);
     attributes_builder.append(true)?;
@@ -423,17 +401,6 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
     attributes_builder.values().append_value("/dashboard");
     attributes_builder.keys().append_value("latency_ms");
     attributes_builder.values().append_value("120");
-    // Duplicate indexed columns into attributes
-    attributes_builder.keys().append_value("service_name");
-    attributes_builder.values().append_value("frontend");
-    attributes_builder.keys().append_value("cloud_account_id");
-    attributes_builder.values().append_value("acc-1");
-    attributes_builder.keys().append_value("trace_id");
-    attributes_builder.values().append_value(trace_ids[1]);
-    attributes_builder.keys().append_value("span_id");
-    attributes_builder.values().append_value(span_ids[1]);
-    attributes_builder.keys().append_value("severity_text");
-    attributes_builder.values().append_value(severity_texts[1]);
     attributes_builder.keys().append_value("body");
     attributes_builder.values().append_value(bodies[1]);
     attributes_builder.append(true)?;
@@ -442,34 +409,24 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
     attributes_builder.values().append_value("db-primary");
     attributes_builder.keys().append_value("query_time_ms");
     attributes_builder.values().append_value("250");
-    // Duplicate indexed columns into attributes
-    attributes_builder.keys().append_value("service_name");
-    attributes_builder.values().append_value("backend");
-    attributes_builder.keys().append_value("cloud_account_id");
-    attributes_builder.values().append_value("acc-1");
-    attributes_builder.keys().append_value("trace_id");
-    attributes_builder.values().append_value(trace_ids[2]);
-    attributes_builder.keys().append_value("span_id");
-    attributes_builder.values().append_value(span_ids[2]);
-    attributes_builder.keys().append_value("severity_text");
-    attributes_builder.values().append_value(severity_texts[2]);
     attributes_builder.keys().append_value("body");
     attributes_builder.values().append_value(bodies[2]);
     attributes_builder.append(true)?;
 
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
-    let mut trace_id_builder = StringBuilder::new();
-    // Hex-encoded trace IDs (16 bytes → 32 hex chars)
+    // trace_id / span_id are now FIXED_LEN_BYTE_ARRAY — decode hex fixtures.
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
     for tid in trace_ids {
-        trace_id_builder.append_value(tid);
+        let bytes = hex::decode(tid).expect("trace_id hex");
+        trace_id_builder.append_value(&bytes).expect("trace_id length 16");
     }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
 
-    let mut span_id_builder = StringBuilder::new();
-    // Hex-encoded span IDs (8 bytes → 16 hex chars)
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
     for sid in span_ids {
-        span_id_builder.append_value(sid);
+        let bytes = hex::decode(sid).expect("span_id hex");
+        span_id_builder.append_value(&bytes).expect("span_id length 8");
     }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
