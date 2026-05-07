@@ -97,7 +97,7 @@ fn queue_benchmarks(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
-                    let batches = generate_batches_for_throughput(10, 10_000);
+                    let batches = generate_batches_for_throughput(10, 21_000);
                     for batch in batches {
                         write_batch(&tx, "large", batch).await;
                     }
