@@ -116,9 +116,8 @@ pub fn prepared_row_groups(batches: Vec<RecordBatch>) -> Vec<PreparedWalRowGroup
 }
 
 #[allow(dead_code)]
-pub fn logs_batch(rows: &[(Option<&str>, Option<&str>, Option<i64>, i64)]) -> RecordBatch {
+pub fn logs_batch(rows: &[(Option<&str>, Option<i64>, i64)]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("cloud_account_id", DataType::Utf8, true),
         Field::new("service_name", DataType::Utf8, true),
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
         Field::new("value", DataType::Int64, false),
@@ -127,18 +126,13 @@ pub fn logs_batch(rows: &[(Option<&str>, Option<&str>, Option<i64>, i64)]) -> Re
         schema,
         vec![
             Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(cloud_account_id, _, _, _)| *cloud_account_id)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(StringArray::from(
-                rows.iter().map(|(_, service_name, _, _)| *service_name).collect::<Vec<_>>(),
+                rows.iter().map(|(service_name, _, _)| *service_name).collect::<Vec<_>>(),
             )) as ArrayRef,
             Arc::new(TimestampMicrosecondArray::from(
-                rows.iter().map(|(_, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
+                rows.iter().map(|(_, timestamp, _)| *timestamp).collect::<Vec<_>>(),
             )) as ArrayRef,
             Arc::new(Int64Array::from(
-                rows.iter().map(|(_, _, _, value)| *value).collect::<Vec<_>>(),
+                rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
             )) as ArrayRef,
         ],
     )
@@ -152,18 +146,13 @@ pub fn logs_row_group_boundary_range(batch: &RecordBatch) -> RowGroupBoundaryRan
         "logs_row_group_boundary_range requires a non-empty batch"
     );
 
-    let cloud_account_id = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap_or_else(|| panic!("cloud_account_id"));
     let service_name = batch
-        .column(1)
+        .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap_or_else(|| panic!("service_name"));
     let timestamp = batch
-        .column(2)
+        .column(1)
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
         .unwrap_or_else(|| panic!("timestamp"));
@@ -171,19 +160,9 @@ pub fn logs_row_group_boundary_range(batch: &RecordBatch) -> RowGroupBoundaryRan
     let first_row_idx = 0usize;
     let last_row_idx = batch.num_rows() - 1;
     RowGroupBoundaryRange {
-        names: vec![
-            "cloud_account_id".to_string(),
-            "service_name".to_string(),
-            "timestamp".to_string(),
-        ],
+        names: vec!["service_name".to_string(), "timestamp".to_string()],
         min_key: RowGroupBoundaryKey {
             components: vec![
-                RowGroupBoundaryComponent {
-                    value: (!cloud_account_id.is_null(first_row_idx))
-                        .then(|| RowGroupBoundaryValue::String(cloud_account_id.value(first_row_idx).to_string())),
-                    descending: false,
-                    nulls_first: true,
-                },
                 RowGroupBoundaryComponent {
                     value: (!service_name.is_null(first_row_idx))
                         .then(|| RowGroupBoundaryValue::String(service_name.value(first_row_idx).to_string())),
@@ -200,12 +179,6 @@ pub fn logs_row_group_boundary_range(batch: &RecordBatch) -> RowGroupBoundaryRan
         },
         max_key: RowGroupBoundaryKey {
             components: vec![
-                RowGroupBoundaryComponent {
-                    value: (!cloud_account_id.is_null(last_row_idx))
-                        .then(|| RowGroupBoundaryValue::String(cloud_account_id.value(last_row_idx).to_string())),
-                    descending: false,
-                    nulls_first: true,
-                },
                 RowGroupBoundaryComponent {
                     value: (!service_name.is_null(last_row_idx))
                         .then(|| RowGroupBoundaryValue::String(service_name.value(last_row_idx).to_string())),

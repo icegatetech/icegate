@@ -260,23 +260,20 @@ mod tests {
     #[test]
     fn row_group_boundary_key_matches_logs_order() {
         let lower = RowGroupBoundaryKey::new(vec![
-            boundary_component_string(Some("acc-1".to_string()), false, true),
             boundary_component_string(Some("svc-1".to_string()), false, true),
             boundary_component_timestamp_micros(Some(20), true, true),
         ]);
         let higher = RowGroupBoundaryKey::new(vec![
-            boundary_component_string(Some("acc-1".to_string()), false, true),
             boundary_component_string(Some("svc-1".to_string()), false, true),
             boundary_component_timestamp_micros(Some(30), true, true),
         ]);
-        let null_cloud = RowGroupBoundaryKey::new(vec![
+        let null_service = RowGroupBoundaryKey::new(vec![
             boundary_component_string(None, false, true),
-            boundary_component_string(Some("svc-9".to_string()), false, true),
             boundary_component_timestamp_micros(Some(1), true, true),
         ]);
 
         assert_eq!(
-            null_cloud.compare_checked(&lower).expect("compatible keys"),
+            null_service.compare_checked(&lower).expect("compatible keys"),
             Ordering::Less
         );
         assert_eq!(higher.compare_checked(&lower).expect("compatible keys"), Ordering::Less);
@@ -287,22 +284,16 @@ mod tests {
     }
 
     fn names() -> Arc<[String]> {
-        Arc::from([
-            "cloud_account_id".to_string(),
-            "service_name".to_string(),
-            "timestamp".to_string(),
-        ])
+        Arc::from(["service_name".to_string(), "timestamp".to_string()])
     }
 
     #[test]
     fn row_group_boundary_range_preserves_key_order() {
         let min_key = RowGroupBoundaryKey::new(vec![
-            boundary_component_string(Some("acc-1".to_string()), false, true),
             boundary_component_string(Some("svc-a".to_string()), false, true),
             boundary_component_timestamp_micros(Some(50), true, true),
         ]);
         let max_key = RowGroupBoundaryKey::new(vec![
-            boundary_component_string(Some("acc-1".to_string()), false, true),
             boundary_component_string(Some("svc-b".to_string()), false, true),
             boundary_component_timestamp_micros(Some(10), true, true),
         ]);
@@ -323,11 +314,11 @@ mod tests {
         let range = RowGroupBoundaryRange {
             names: Arc::from(["timestamp".to_string()]),
             min_key: RowGroupBoundaryKey::new(vec![
-                boundary_component_string(Some("acc-1".to_string()), false, true),
+                boundary_component_string(Some("svc-1".to_string()), false, true),
                 boundary_component_timestamp_micros(Some(10), true, true),
             ]),
             max_key: RowGroupBoundaryKey::new(vec![
-                boundary_component_string(Some("acc-1".to_string()), false, true),
+                boundary_component_string(Some("svc-1".to_string()), false, true),
                 boundary_component_timestamp_micros(Some(20), true, true),
             ]),
         };
@@ -349,12 +340,10 @@ mod tests {
     #[test]
     fn row_group_boundary_range_handles_equal_prefix_and_timestamp_desc() {
         let min_key = RowGroupBoundaryKey::new(vec![
-            boundary_component_string(Some("acc-1".to_string()), false, true),
             boundary_component_string(Some("svc-1".to_string()), false, true),
             boundary_component_timestamp_micros(Some(30), true, true),
         ]);
         let max_key = RowGroupBoundaryKey::new(vec![
-            boundary_component_string(Some("acc-1".to_string()), false, true),
             boundary_component_string(Some("svc-1".to_string()), false, true),
             boundary_component_timestamp_micros(Some(10), true, true),
         ]);
@@ -484,10 +473,14 @@ mod tests {
         use crate::wal::{deserialize_row_group_boundary_range, serialize_row_group_boundary_range};
 
         let original = RowGroupBoundaryRange {
-            names: names(),
+            names: Arc::from([
+                "service_name".to_string(),
+                "trace_id".to_string(),
+                "timestamp".to_string(),
+            ]),
             min_key: RowGroupBoundaryKey {
                 components: vec![
-                    boundary_component_string(Some("acc-1".to_string()), false, true),
+                    boundary_component_string(Some("svc-1".to_string()), false, true),
                     boundary_component_fixed_bytes(
                         Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
                         false,
@@ -498,7 +491,7 @@ mod tests {
             },
             max_key: RowGroupBoundaryKey {
                 components: vec![
-                    boundary_component_string(Some("acc-1".to_string()), false, true),
+                    boundary_component_string(Some("svc-1".to_string()), false, true),
                     boundary_component_fixed_bytes(
                         Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 99]),
                         false,

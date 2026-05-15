@@ -80,13 +80,7 @@ mod tests {
 
     /// Minimal logs-like config for test cases.
     const LOG_CFG: MetadataScanConfig = MetadataScanConfig {
-        indexed_columns: &[
-            "service_name",
-            "severity_text",
-            "trace_id",
-            "span_id",
-            "cloud_account_id",
-        ],
+        indexed_columns: &["service_name", "severity_text", "trace_id", "span_id"],
         label_aliases: &[
             ("level", "severity_text"),
             ("detected_level", "severity_text"),

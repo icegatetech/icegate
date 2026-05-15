@@ -13,8 +13,8 @@ use datafusion::arrow::{
     datatypes::Schema,
 };
 use icegate_common::schema::{
-    COL_ATTRIBUTES, COL_BODY, COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TIMESTAMP,
-    COL_TRACE_ID, LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS, LOG_SERIES_LABEL_COLUMNS,
+    COL_ATTRIBUTES, COL_BODY, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID,
+    LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS, LOG_SERIES_LABEL_COLUMNS,
 };
 
 use super::models::{MetricSeries, QueryResult, QueryStats, ResultType, Stream};
@@ -100,7 +100,6 @@ impl Default for StringInterner {
 pub struct BatchColumns {
     pub timestamp: Option<usize>,
     pub body: Option<usize>,
-    pub cloud_account_id: Option<usize>,
     pub service_name: Option<usize>,
     pub severity_text: Option<usize>,
     pub level: Option<usize>,
@@ -115,7 +114,6 @@ impl BatchColumns {
         Self {
             timestamp: schema.index_of(COL_TIMESTAMP).ok(),
             body: schema.index_of(COL_BODY).ok(),
-            cloud_account_id: schema.index_of(COL_CLOUD_ACCOUNT_ID).ok(),
             service_name: schema.index_of(COL_SERVICE_NAME).ok(),
             severity_text: schema.index_of(COL_SEVERITY_TEXT).ok(),
             level: schema.index_of(LEVEL_ALIAS).ok(),
@@ -214,12 +212,6 @@ fn extract_labels(
             .downcast_ref::<StringArray>()
             .and_then(|arr| if arr.is_null(row) { None } else { Some(arr.value(row)) })
     };
-
-    if let Some(idx) = cols.cloud_account_id {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern(COL_CLOUD_ACCOUNT_ID), interner.intern(val));
-        }
-    }
 
     if let Some(idx) = cols.service_name {
         if let Some(val) = extract_string(idx) {
@@ -619,7 +611,6 @@ mod tests {
     /// the `LogQL` planner emits for the formatter, with a MAP that does NOT
     /// mirror the indexed columns (the post-change ingest behaviour).
     fn build_row_batch(
-        cloud_account: &str,
         service: &str,
         severity: &str,
         trace_id_hex: &str,
@@ -642,7 +633,6 @@ mod tests {
         let attributes_array = map_builder.finish();
         let attributes_field = Field::new(COL_ATTRIBUTES, attributes_array.data_type().clone(), true);
 
-        let cloud_arr: ArrayRef = Arc::new(StringArray::from(vec![cloud_account]));
         let service_arr: ArrayRef = Arc::new(StringArray::from(vec![service]));
         let severity_arr: ArrayRef = Arc::new(StringArray::from(vec![severity]));
         // `level` is the alias the planner adds via `col(severity_text).alias("level")`.
@@ -662,7 +652,6 @@ mod tests {
         let attrs_arr: ArrayRef = Arc::new(attributes_array);
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new(COL_CLOUD_ACCOUNT_ID, DataType::Utf8, true),
             Field::new(COL_SERVICE_NAME, DataType::Utf8, true),
             Field::new(COL_SEVERITY_TEXT, DataType::Utf8, true),
             Field::new(LEVEL_ALIAS, DataType::Utf8, true),
@@ -673,15 +662,7 @@ mod tests {
 
         RecordBatch::try_new(
             schema,
-            vec![
-                cloud_arr,
-                service_arr,
-                severity_arr,
-                level_arr,
-                trace_arr,
-                span_arr,
-                attrs_arr,
-            ],
+            vec![service_arr, severity_arr, level_arr, trace_arr, span_arr, attrs_arr],
         )
         .expect("RecordBatch::try_new")
     }
@@ -693,7 +674,6 @@ mod tests {
     #[test]
     fn extract_labels_merges_indexed_columns_when_map_lacks_them() {
         let batch = build_row_batch(
-            "acc-1",
             "svc",
             "ERROR",
             "0102030405060708090a0b0c0d0e0f10",
@@ -706,10 +686,6 @@ mod tests {
         let labels = extract_labels(&batch, &cols, 0, &mut interner);
 
         // Indexed top-level columns are projected into the labels map.
-        assert_eq!(
-            labels.get(&Arc::<str>::from(COL_CLOUD_ACCOUNT_ID)).map(AsRef::as_ref),
-            Some("acc-1"),
-        );
         assert_eq!(
             labels.get(&Arc::<str>::from(COL_SERVICE_NAME)).map(AsRef::as_ref),
             Some("svc"),
@@ -734,7 +710,7 @@ mod tests {
         // User attribute from the MAP is also surfaced.
         assert_eq!(labels.get(&Arc::<str>::from("foo")).map(AsRef::as_ref), Some("bar"));
 
-        // Sanity: only the seven keys above (six indexed + one user attr).
-        assert_eq!(labels.len(), 7, "got labels: {labels:?}");
+        // Sanity: only the six keys above (five indexed + one user attr).
+        assert_eq!(labels.len(), 6, "got labels: {labels:?}");
     }
 }

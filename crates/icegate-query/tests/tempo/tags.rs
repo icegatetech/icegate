@@ -119,7 +119,7 @@ async fn v2_tags_groups_by_scope() -> Result<(), Box<dyn std::error::Error>> {
         span
     );
     assert!(
-        !span.contains(&"service_name") && !span.contains(&"cloud_account_id") && !span.contains(&"name"),
+        !span.contains(&"service_name") && !span.contains(&"name"),
         "physical resource/intrinsic column names leaked into span scope: {:?}",
         span
     );

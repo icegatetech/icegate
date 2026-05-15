@@ -228,13 +228,7 @@ mod tests {
     use crate::engine::metadata_scan::MetadataScanConfig;
 
     const LOG_CFG: MetadataScanConfig = MetadataScanConfig {
-        indexed_columns: &[
-            "service_name",
-            "severity_text",
-            "trace_id",
-            "span_id",
-            "cloud_account_id",
-        ],
+        indexed_columns: &["service_name", "severity_text", "trace_id", "span_id"],
         label_aliases: &[("level", "severity_text"), ("service", "service_name")],
         excluded_map_keys: &[],
         map_column: "attributes",
@@ -251,7 +245,6 @@ mod tests {
         assert_eq!(classify_label("trace_id", &LOG_CFG), LabelKind::Indexed);
         assert_eq!(classify_label("span_id", &LOG_CFG), LabelKind::Indexed);
         assert_eq!(classify_label("severity_text", &LOG_CFG), LabelKind::Indexed);
-        assert_eq!(classify_label("cloud_account_id", &LOG_CFG), LabelKind::Indexed);
     }
 
     #[test]

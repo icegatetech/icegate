@@ -48,9 +48,11 @@ async fn test_labels_endpoint() -> Result<(), Box<dyn std::error::Error>> {
         "labels should include 'severity_text', got: {:?}",
         label_strs
     );
+    // `cloud_account_id` was removed as a top-level column; it must no longer
+    // appear in the labels discovery response.
     assert!(
-        label_strs.contains(&"cloud_account_id"),
-        "labels should include 'cloud_account_id', got: {:?}",
+        !label_strs.contains(&"cloud_account_id"),
+        "labels must not include 'cloud_account_id', got: {:?}",
         label_strs
     );
 

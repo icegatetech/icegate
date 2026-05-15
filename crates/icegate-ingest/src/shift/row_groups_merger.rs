@@ -1193,9 +1193,8 @@ mod tests {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn logs_batch(rows: Vec<(Option<&str>, Option<&str>, Option<i64>, i64)>) -> RecordBatch {
+    fn logs_batch(rows: Vec<(Option<&str>, Option<i64>, i64)>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("value", DataType::Int64, false),
@@ -1204,18 +1203,13 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(
-                    rows.iter()
-                        .map(|(cloud_account_id, _, _, _)| *cloud_account_id)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(StringArray::from(
-                    rows.iter().map(|(_, service_name, _, _)| *service_name).collect::<Vec<_>>(),
+                    rows.iter().map(|(service_name, _, _)| *service_name).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(
-                    rows.iter().map(|(_, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
+                    rows.iter().map(|(_, timestamp, _)| *timestamp).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Arc::new(Int64Array::from(
-                    rows.iter().map(|(_, _, _, value)| *value).collect::<Vec<_>>(),
+                    rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
                 )) as ArrayRef,
             ],
         )
@@ -1254,11 +1248,7 @@ mod tests {
                 row_group_idx,
                 row_group_bytes: 1,
                 boundary_range: RowGroupBoundaryRange {
-                    names: Arc::from([
-                        "cloud_account_id".to_string(),
-                        "service_name".to_string(),
-                        "timestamp".to_string(),
-                    ]),
+                    names: Arc::from(["service_name".to_string(), "timestamp".to_string()]),
                     min_key,
                     max_key,
                 },
@@ -1266,13 +1256,8 @@ mod tests {
         }
     }
 
-    fn key(
-        cloud_account_id: Option<&str>,
-        service_name: Option<&str>,
-        timestamp_micros: Option<i64>,
-    ) -> RowGroupBoundaryKey {
+    fn key(service_name: Option<&str>, timestamp_micros: Option<i64>) -> RowGroupBoundaryKey {
         RowGroupBoundaryKey::new(vec![
-            boundary_component_string(cloud_account_id.map(str::to_string), false, true),
             boundary_component_string(service_name.map(str::to_string), false, true),
             boundary_component_timestamp_micros(timestamp_micros, true, true),
         ])
@@ -1346,7 +1331,7 @@ mod tests {
             .expect("merged")
             .into_iter()
             .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
+                let values = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("values");
                 (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
             })
             .collect()
@@ -1375,9 +1360,9 @@ mod tests {
 
     #[tokio::test]
     async fn merger_preserves_global_order_across_non_overlapping_clusters() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(20), 2)]);
-        let batch_3 = logs_batch(vec![(Some("acc-2"), Some("svc-1"), Some(10), 3)]);
+        let batch_1 = logs_batch(vec![(Some("svc-1"), Some(30), 1)]);
+        let batch_2 = logs_batch(vec![(Some("svc-1"), Some(20), 2)]);
+        let batch_3 = logs_batch(vec![(Some("svc-1"), Some(10), 3)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([
                 ((1, 0), vec![batch_1.clone()]),
@@ -1405,7 +1390,7 @@ mod tests {
         let values = batches
             .iter()
             .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
+                let values = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("values");
                 (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -1415,9 +1400,9 @@ mod tests {
     #[tokio::test]
     async fn merger_slices_single_source_cluster_without_reordering() {
         let batch = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 1),
-            (Some("acc-1"), Some("svc-1"), Some(20), 2),
-            (Some("acc-1"), Some("svc-1"), Some(10), 3),
+            (Some("svc-1"), Some(30), 1),
+            (Some("svc-1"), Some(20), 2),
+            (Some("svc-1"), Some(10), 3),
         ]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch.clone()])]),
@@ -1429,7 +1414,7 @@ mod tests {
         let values = batches
             .iter()
             .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
+                let values = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("values");
                 (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -1443,14 +1428,8 @@ mod tests {
 
     #[tokio::test]
     async fn merger_slices_contiguous_single_source_output_inside_mixed_cluster() {
-        let batch_1 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(40), 1),
-            (Some("acc-1"), Some("svc-1"), Some(30), 2),
-        ]);
-        let batch_2 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 3),
-            (Some("acc-1"), Some("svc-1"), Some(10), 4),
-        ]);
+        let batch_1 = logs_batch(vec![(Some("svc-1"), Some(40), 1), (Some("svc-1"), Some(30), 2)]);
+        let batch_2 = logs_batch(vec![(Some("svc-1"), Some(30), 3), (Some("svc-1"), Some(10), 4)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
             open_delays: HashMap::new(),
@@ -1465,21 +1444,15 @@ mod tests {
 
     #[tokio::test]
     async fn merger_releases_interleave_sources_before_yielding_output() {
-        let batch_1 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(40), 1),
-            (Some("acc-1"), Some("svc-1"), Some(20), 3),
-        ]);
-        let batch_2 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 2),
-            (Some("acc-1"), Some("svc-1"), Some(10), 4),
-        ]);
+        let batch_1 = logs_batch(vec![(Some("svc-1"), Some(40), 1), (Some("svc-1"), Some(20), 3)]);
+        let batch_2 = logs_batch(vec![(Some("svc-1"), Some(30), 2), (Some("svc-1"), Some(10), 4)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
             open_delays: HashMap::new(),
             ..FakeQueueReader::default()
         });
-        let batch_1_value_column = Arc::clone(batch_1.column(3));
-        let batch_2_value_column = Arc::clone(batch_2.column(3));
+        let batch_1_value_column = Arc::clone(batch_1.column(2));
+        let batch_2_value_column = Arc::clone(batch_2.column(2));
 
         let merger = RowGroupsMerger::new(
             queue_reader,
@@ -1496,7 +1469,7 @@ mod tests {
 
         let mut stream = merger.into_stream();
         let merged_batch = stream.try_next().await.expect("next merged batch").expect("merged batch");
-        let values = merged_batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
+        let values = merged_batch.column(2).as_any().downcast_ref::<Int64Array>().expect("values");
         assert_eq!(
             (0..merged_batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
@@ -1508,14 +1481,14 @@ mod tests {
     #[tokio::test]
     async fn merger_returns_cancelled_before_emitting_next_batch() {
         let batch_1 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(60), 1),
-            (Some("acc-1"), Some("svc-1"), Some(40), 3),
-            (Some("acc-1"), Some("svc-1"), Some(20), 5),
+            (Some("svc-1"), Some(60), 1),
+            (Some("svc-1"), Some(40), 3),
+            (Some("svc-1"), Some(20), 5),
         ]);
         let batch_2 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(50), 2),
-            (Some("acc-1"), Some("svc-1"), Some(30), 4),
-            (Some("acc-1"), Some("svc-1"), Some(10), 6),
+            (Some("svc-1"), Some(50), 2),
+            (Some("svc-1"), Some(30), 4),
+            (Some("svc-1"), Some(10), 6),
         ]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
@@ -1538,7 +1511,7 @@ mod tests {
 
         let mut stream = merger.into_stream();
         let first_batch = stream.try_next().await.expect("first batch").expect("first batch");
-        let values = first_batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
+        let values = first_batch.column(2).as_any().downcast_ref::<Int64Array>().expect("values");
         assert_eq!(
             (0..first_batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>(),
             vec![1, 2]
@@ -1551,9 +1524,9 @@ mod tests {
 
     #[tokio::test]
     async fn merger_merges_overlapping_row_groups_in_single_cluster() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(20), 2)]);
-        let batch_3 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(40), 3)]);
+        let batch_1 = logs_batch(vec![(Some("svc-1"), Some(30), 1)]);
+        let batch_2 = logs_batch(vec![(Some("svc-1"), Some(20), 2)]);
+        let batch_3 = logs_batch(vec![(Some("svc-1"), Some(40), 3)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([
                 ((1, 0), vec![batch_1.clone()]),
@@ -1582,7 +1555,7 @@ mod tests {
         let values = batches
             .iter()
             .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("values");
+                let values = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("values");
                 (0..batch.num_rows()).map(|idx| values.value(idx)).collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -1591,15 +1564,9 @@ mod tests {
 
     #[tokio::test]
     async fn merger_preserves_wal_order_for_equal_keys_across_segments() {
-        let batch_1 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 11),
-            (Some("acc-1"), Some("svc-1"), Some(30), 12),
-        ]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 21)]);
-        let batch_3 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 31),
-            (Some("acc-1"), Some("svc-1"), Some(30), 32),
-        ]);
+        let batch_1 = logs_batch(vec![(Some("svc-1"), Some(30), 11), (Some("svc-1"), Some(30), 12)]);
+        let batch_2 = logs_batch(vec![(Some("svc-1"), Some(30), 21)]);
+        let batch_3 = logs_batch(vec![(Some("svc-1"), Some(30), 31), (Some("svc-1"), Some(30), 32)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([
                 ((10, 0), vec![batch_1.clone()]),
@@ -1620,14 +1587,8 @@ mod tests {
 
     #[tokio::test]
     async fn merger_preserves_wal_order_for_equal_keys_across_row_groups_in_segment() {
-        let row_group_0 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 101),
-            (Some("acc-1"), Some("svc-1"), Some(30), 102),
-        ]);
-        let row_group_1 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(30), 201),
-            (Some("acc-1"), Some("svc-1"), Some(30), 202),
-        ]);
+        let row_group_0 = logs_batch(vec![(Some("svc-1"), Some(30), 101), (Some("svc-1"), Some(30), 102)]);
+        let row_group_1 = logs_batch(vec![(Some("svc-1"), Some(30), 201), (Some("svc-1"), Some(30), 202)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((7, 0), vec![row_group_0.clone()]), ((7, 1), vec![row_group_1.clone()])]),
             open_delays: HashMap::new(),
@@ -1640,9 +1601,9 @@ mod tests {
 
     #[tokio::test]
     async fn merger_preserves_wal_order_when_cluster_opens_finish_out_of_order() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 11)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 21)]);
-        let batch_3 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 31)]);
+        let batch_1 = logs_batch(vec![(Some("svc-1"), Some(30), 11)]);
+        let batch_2 = logs_batch(vec![(Some("svc-1"), Some(30), 21)]);
+        let batch_3 = logs_batch(vec![(Some("svc-1"), Some(30), 31)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([
                 ((10, 0), vec![batch_1.clone()]),
@@ -1667,8 +1628,8 @@ mod tests {
 
     #[tokio::test]
     async fn merger_observer_tracks_opened_and_closed_row_groups() {
-        let batch_1 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(40), 1)]);
-        let batch_2 = logs_batch(vec![(Some("acc-1"), Some("svc-1"), Some(30), 2)]);
+        let batch_1 = logs_batch(vec![(Some("svc-1"), Some(40), 1)]);
+        let batch_2 = logs_batch(vec![(Some("svc-1"), Some(30), 2)]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
             open_delays: HashMap::new(),
@@ -1704,14 +1665,14 @@ mod tests {
     #[tokio::test]
     async fn merger_observer_resets_open_counts_on_cancel() {
         let batch_1 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(60), 1),
-            (Some("acc-1"), Some("svc-1"), Some(40), 3),
-            (Some("acc-1"), Some("svc-1"), Some(20), 5),
+            (Some("svc-1"), Some(60), 1),
+            (Some("svc-1"), Some(40), 3),
+            (Some("svc-1"), Some(20), 5),
         ]);
         let batch_2 = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(50), 2),
-            (Some("acc-1"), Some("svc-1"), Some(30), 4),
-            (Some("acc-1"), Some("svc-1"), Some(10), 6),
+            (Some("svc-1"), Some(50), 2),
+            (Some("svc-1"), Some(30), 4),
+            (Some("svc-1"), Some(10), 6),
         ]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![batch_1.clone()]), ((2, 0), vec![batch_2.clone()])]),
@@ -1760,16 +1721,16 @@ mod tests {
         // cluster A under the (account, service, ts DESC) ordering, but they
         // share account/service so cluster ordering follows ts DESC anyway.
         let cluster_a = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(40), 1),
-            (Some("acc-1"), Some("svc-1"), Some(30), 2),
-            (Some("acc-1"), Some("svc-1"), Some(20), 3),
-            (Some("acc-1"), Some("svc-1"), Some(10), 4),
+            (Some("svc-1"), Some(40), 1),
+            (Some("svc-1"), Some(30), 2),
+            (Some("svc-1"), Some(20), 3),
+            (Some("svc-1"), Some(10), 4),
         ]);
         let cluster_b = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(230), 5),
-            (Some("acc-1"), Some("svc-1"), Some(220), 6),
-            (Some("acc-1"), Some("svc-1"), Some(210), 7),
-            (Some("acc-1"), Some("svc-1"), Some(200), 8),
+            (Some("svc-1"), Some(230), 5),
+            (Some("svc-1"), Some(220), 6),
+            (Some("svc-1"), Some(210), 7),
+            (Some("svc-1"), Some(200), 8),
         ]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![cluster_a.clone()]), ((2, 0), vec![cluster_b.clone()])]),
@@ -1791,7 +1752,7 @@ mod tests {
             .iter()
             .flat_map(|batch| {
                 let col = batch
-                    .column(2)
+                    .column(1)
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .expect("timestamp column");
@@ -1813,7 +1774,7 @@ mod tests {
         // timestamp range must fit inside one of the two source clusters.
         for batch in &batches {
             let col = batch
-                .column(2)
+                .column(1)
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .expect("timestamp column");
@@ -1838,12 +1799,12 @@ mod tests {
         // planner-side constant through the merger's test scope.
         const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
         let before = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(MICROS_PER_DAY - 10), 1),
-            (Some("acc-1"), Some("svc-1"), Some(MICROS_PER_DAY - 20), 2),
+            (Some("svc-1"), Some(MICROS_PER_DAY - 10), 1),
+            (Some("svc-1"), Some(MICROS_PER_DAY - 20), 2),
         ]);
         let after = logs_batch(vec![
-            (Some("acc-1"), Some("svc-1"), Some(MICROS_PER_DAY + 20), 3),
-            (Some("acc-1"), Some("svc-1"), Some(MICROS_PER_DAY + 10), 4),
+            (Some("svc-1"), Some(MICROS_PER_DAY + 20), 3),
+            (Some("svc-1"), Some(MICROS_PER_DAY + 10), 4),
         ]);
         let queue_reader = Arc::new(FakeQueueReader {
             batches: HashMap::from([((1, 0), vec![before.clone()]), ((2, 0), vec![after.clone()])]),
@@ -1859,24 +1820,9 @@ mod tests {
     #[test]
     fn cluster_builder_forms_overlap_chain() {
         let segments = vec![
-            plan_with_range(
-                1,
-                0,
-                key(Some("acc-1"), Some("svc-a"), Some(50)),
-                key(Some("acc-1"), Some("svc-a"), Some(30)),
-            ),
-            plan_with_range(
-                2,
-                0,
-                key(Some("acc-1"), Some("svc-a"), Some(40)),
-                key(Some("acc-1"), Some("svc-a"), Some(20)),
-            ),
-            plan_with_range(
-                3,
-                0,
-                key(Some("acc-1"), Some("svc-a"), Some(25)),
-                key(Some("acc-1"), Some("svc-a"), Some(10)),
-            ),
+            plan_with_range(1, 0, key(Some("svc-a"), Some(50)), key(Some("svc-a"), Some(30))),
+            plan_with_range(2, 0, key(Some("svc-a"), Some(40)), key(Some("svc-a"), Some(20))),
+            plan_with_range(3, 0, key(Some("svc-a"), Some(25)), key(Some("svc-a"), Some(10))),
         ];
 
         assert_eq!(cluster_sizes_from_metadata(segments), vec![3]);
@@ -1885,18 +1831,8 @@ mod tests {
     #[test]
     fn cluster_builder_splits_non_overlapping_row_groups() {
         let segments = vec![
-            plan_with_range(
-                1,
-                0,
-                key(Some("acc-1"), Some("svc-a"), Some(50)),
-                key(Some("acc-1"), Some("svc-a"), Some(40)),
-            ),
-            plan_with_range(
-                2,
-                0,
-                key(Some("acc-1"), Some("svc-b"), Some(30)),
-                key(Some("acc-1"), Some("svc-b"), Some(20)),
-            ),
+            plan_with_range(1, 0, key(Some("svc-a"), Some(50)), key(Some("svc-a"), Some(40))),
+            plan_with_range(2, 0, key(Some("svc-b"), Some(30)), key(Some("svc-b"), Some(20))),
         ];
 
         assert_eq!(cluster_sizes_from_metadata(segments), vec![1, 1]);
@@ -1911,8 +1847,8 @@ mod tests {
             segments.push(plan_with_range(
                 u64::try_from(idx + 1).expect("segment offset"),
                 0,
-                key(Some("acc-1"), Some("svc-a"), Some(start)),
-                key(Some("acc-1"), Some("svc-a"), Some(80)),
+                key(Some("svc-a"), Some(start)),
+                key(Some("svc-a"), Some(80)),
             ));
         }
         for idx in 0..2 {
@@ -1920,8 +1856,8 @@ mod tests {
             segments.push(plan_with_range(
                 u64::try_from(idx + 10).expect("segment offset"),
                 0,
-                key(Some("acc-1"), Some("svc-b"), Some(start)),
-                key(Some("acc-1"), Some("svc-b"), Some(60)),
+                key(Some("svc-b"), Some(start)),
+                key(Some("svc-b"), Some(60)),
             ));
         }
         for idx in 0..10 {
@@ -1929,8 +1865,8 @@ mod tests {
             segments.push(plan_with_range(
                 u64::try_from(idx + 20).expect("segment offset"),
                 0,
-                key(Some("acc-2"), Some("svc-c"), Some(start)),
-                key(Some("acc-2"), Some("svc-c"), Some(30)),
+                key(Some("svc-c"), Some(start)),
+                key(Some("svc-c"), Some(30)),
             ));
         }
 
@@ -1940,23 +1876,12 @@ mod tests {
     #[tokio::test]
     async fn merger_rejects_incompatible_boundary_key_structure() {
         let plan = PlannedRowGroupRead::from_segments(&[
-            plan_with_range(
-                1,
-                0,
-                key(Some("acc-1"), Some("svc-1"), Some(20)),
-                key(Some("acc-1"), Some("svc-1"), Some(10)),
-            ),
+            plan_with_range(1, 0, key(Some("svc-1"), Some(20)), key(Some("svc-1"), Some(10))),
             plan_with_range(
                 2,
                 0,
-                RowGroupBoundaryKey::new(vec![
-                    boundary_component_string(Some("acc-2".to_string()), false, true),
-                    boundary_component_string(Some("svc-2".to_string()), false, true),
-                ]),
-                RowGroupBoundaryKey::new(vec![
-                    boundary_component_string(Some("acc-2".to_string()), false, true),
-                    boundary_component_string(Some("svc-2".to_string()), false, true),
-                ]),
+                RowGroupBoundaryKey::new(vec![boundary_component_string(Some("svc-2".to_string()), false, true)]),
+                RowGroupBoundaryKey::new(vec![boundary_component_string(Some("svc-2".to_string()), false, true)]),
             ),
         ]);
 
@@ -1985,18 +1910,8 @@ mod tests {
     #[tokio::test]
     async fn merger_rejects_duplicate_row_group_positions_in_read_plan() {
         let plan = PlannedRowGroupRead::from_segments(&[
-            plan_with_range(
-                42,
-                0,
-                key(Some("acc-1"), Some("svc-1"), Some(50)),
-                key(Some("acc-1"), Some("svc-1"), Some(40)),
-            ),
-            plan_with_range(
-                42,
-                0,
-                key(Some("acc-1"), Some("svc-1"), Some(30)),
-                key(Some("acc-1"), Some("svc-1"), Some(20)),
-            ),
+            plan_with_range(42, 0, key(Some("svc-1"), Some(50)), key(Some("svc-1"), Some(40))),
+            plan_with_range(42, 0, key(Some("svc-1"), Some(30)), key(Some("svc-1"), Some(20))),
         ]);
 
         let Err(err) = RowGroupsMerger::new_with_plan(
@@ -2026,10 +1941,10 @@ mod tests {
 
     #[test]
     fn cluster_builder_keeps_distinct_row_groups_with_equal_min_key() {
-        let same_min = key(Some("acc-1"), Some("svc-a"), Some(50));
+        let same_min = key(Some("svc-a"), Some(50));
         let segments = vec![
-            plan_with_range(7, 0, same_min.clone(), key(Some("acc-1"), Some("svc-a"), Some(40))),
-            plan_with_range(7, 1, same_min, key(Some("acc-1"), Some("svc-a"), Some(30))),
+            plan_with_range(7, 0, same_min.clone(), key(Some("svc-a"), Some(40))),
+            plan_with_range(7, 1, same_min, key(Some("svc-a"), Some(30))),
         ];
 
         assert_eq!(cluster_sizes_from_metadata(segments), vec![2]);

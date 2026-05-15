@@ -190,7 +190,6 @@ pub async fn write_test_spans_with_properties(
     // below via the `by_name` map so row order survives any reordering of
     // the iceberg schema fields.
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(vec![tenant_id, tenant_id, tenant_id]));
-    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
     let service_name: ArrayRef = Arc::new(StringArray::from(vec![
         Some("frontend"),
         Some("frontend"),
@@ -291,7 +290,6 @@ pub async fn write_test_spans_with_properties(
     // Assemble columns in schema order.
     let mut by_name: std::collections::HashMap<&str, ArrayRef> = std::collections::HashMap::new();
     by_name.insert("tenant_id", tenant_id_arr);
-    by_name.insert("cloud_account_id", cloud_account_id);
     by_name.insert("service_name", service_name);
     by_name.insert("trace_id", trace_id);
     by_name.insert("span_id", span_id);

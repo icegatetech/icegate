@@ -98,9 +98,9 @@ mod tests {
 
     fn minimal_boundary_payload() -> String {
         serialize_row_group_boundary_range(&RowGroupBoundaryRange {
-            names: Arc::from(["cloud_account_id".to_string()]),
-            min_key: RowGroupBoundaryKey::new(vec![boundary_component_string(Some("acc".to_string()), false, true)]),
-            max_key: RowGroupBoundaryKey::new(vec![boundary_component_string(Some("acc".to_string()), false, true)]),
+            names: Arc::from(["service_name".to_string()]),
+            min_key: RowGroupBoundaryKey::new(vec![boundary_component_string(Some("svc".to_string()), false, true)]),
+            max_key: RowGroupBoundaryKey::new(vec![boundary_component_string(Some("svc".to_string()), false, true)]),
         })
         .expect("serialize metadata")
     }
