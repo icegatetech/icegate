@@ -259,14 +259,8 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
     let writer = QueueWriter::new(config, store.clone());
     let handle = writer.start(rx);
 
-    let batch_a = common::logs_batch(&[
-        (Some("acc-1"), Some("svc-2"), Some(40), 1),
-        (Some("acc-1"), Some("svc-2"), Some(30), 2),
-    ]);
-    let batch_b = common::logs_batch(&[
-        (Some("acc-2"), Some("svc-1"), Some(20), 3),
-        (Some("acc-2"), Some("svc-1"), Some(10), 4),
-    ]);
+    let batch_a = common::logs_batch(&[(Some("svc-2"), Some(40), 1), (Some("svc-2"), Some(30), 2)]);
+    let batch_b = common::logs_batch(&[(Some("svc-1"), Some(20), 3), (Some("svc-1"), Some(10), 4)]);
     let expected_a = common::logs_row_group_boundary_range(&batch_a);
     let expected_b = common::logs_row_group_boundary_range(&batch_b);
 

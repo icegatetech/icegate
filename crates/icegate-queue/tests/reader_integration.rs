@@ -1068,14 +1068,8 @@ async fn test_plan_segments_extracts_all_three_field_types() -> Result<(), Box<d
     // Two row groups with disjoint account / timestamp / boundary — the
     // assertions below pin every extractor result to the *correct*
     // row_group_idx, so any payload-index mismatch surfaces.
-    let batch_a = common::logs_batch(&[
-        (Some("acc-1"), Some("svc-a"), Some(100), 1),
-        (Some("acc-1"), Some("svc-a"), Some(400), 2),
-    ]);
-    let batch_b = common::logs_batch(&[
-        (Some("acc-2"), Some("svc-b"), Some(900), 3),
-        (Some("acc-2"), Some("svc-b"), Some(1_500), 4),
-    ]);
+    let batch_a = common::logs_batch(&[(Some("svc-a"), Some(100), 1), (Some("svc-a"), Some(400), 2)]);
+    let batch_b = common::logs_batch(&[(Some("svc-b"), Some(900), 3), (Some("svc-b"), Some(1_500), 4)]);
     let expected_boundary_a = common::logs_row_group_boundary_range(&batch_a);
     let expected_boundary_b = common::logs_row_group_boundary_range(&batch_b);
 
@@ -1102,9 +1096,9 @@ async fn test_plan_segments_extracts_all_three_field_types() -> Result<(), Box<d
             0,
             &[
                 ExtractField {
-                    name: "account".to_string(),
+                    name: "service".to_string(),
                     extractor: FieldExtractor::ColumnStatsUtf8Singleton {
-                        column_name: "cloud_account_id".to_string(),
+                        column_name: "service_name".to_string(),
                     },
                 },
                 ExtractField {
@@ -1132,17 +1126,17 @@ async fn test_plan_segments_extracts_all_three_field_types() -> Result<(), Box<d
     assert_eq!(by_idx.len(), 2, "row_group_idx must be unique across entries");
 
     let assert_extracted = |idx: usize,
-                            expected_account: &str,
+                            expected_service: &str,
                             expected_range: (i64, i64),
                             expected_boundary: &common::RowGroupBoundaryRange| {
         let entry = by_idx.get(&idx).expect("row_group_idx must be present");
-        let account = entry
+        let service = entry
             .extracted
-            .get("account")
-            .expect("account extractor must populate")
+            .get("service")
+            .expect("service extractor must populate")
             .as_utf8()
-            .expect("account must be utf8");
-        assert_eq!(account, expected_account, "account mismatch at row_group_idx={idx}");
+            .expect("service must be utf8");
+        assert_eq!(service, expected_service, "service mismatch at row_group_idx={idx}");
 
         let timestamp_range = entry
             .extracted
@@ -1168,8 +1162,8 @@ async fn test_plan_segments_extracts_all_three_field_types() -> Result<(), Box<d
         assert_eq!(&parsed, expected_boundary, "boundary mismatch at row_group_idx={idx}");
     };
 
-    assert_extracted(0, "acc-1", (100, 400), &expected_boundary_a);
-    assert_extracted(1, "acc-2", (900, 1_500), &expected_boundary_b);
+    assert_extracted(0, "svc-a", (100, 400), &expected_boundary_a);
+    assert_extracted(1, "svc-b", (900, 1_500), &expected_boundary_b);
 
     Ok(())
 }

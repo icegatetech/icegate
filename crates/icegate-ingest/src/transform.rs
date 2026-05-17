@@ -13,10 +13,7 @@ use arrow::{
     datatypes::{DataType, Schema},
 };
 use iceberg::arrow::schema_to_arrow_schema;
-use icegate_common::{
-    DEFAULT_TENANT_ID,
-    schema::{COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME},
-};
+use icegate_common::{DEFAULT_TENANT_ID, schema::COL_SERVICE_NAME};
 use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
     common::v1::{AnyValue, any_value::Value},
@@ -63,7 +60,6 @@ pub fn spans_arrow_schema() -> Schema {
 ///
 /// * `request` - The OTLP export logs request
 /// * `tenant_id` - Tenant identifier (from request metadata or default)
-/// * `account_id` - Optional account identifier
 ///
 /// # Returns
 ///
@@ -106,7 +102,6 @@ pub fn logs_to_record_batch(
 
     // Initialize builders
     let mut tenant_id_builder = StringBuilder::with_capacity(total_records, total_records * 16);
-    let mut account_id_builder = StringBuilder::with_capacity(total_records, total_records * 16);
     let mut service_name_builder = StringBuilder::with_capacity(total_records, total_records * 32);
     let mut timestamp_builder = Vec::with_capacity(total_records);
     let mut observed_timestamp_builder = Vec::with_capacity(total_records);
@@ -140,10 +135,6 @@ pub fn logs_to_record_batch(
             .iter()
             .find(|kv| kv.key == "service.name")
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
-        let cloud_account_id = resource_attrs
-            .iter()
-            .find(|kv| kv.key == "cloud.account.id")
-            .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
         for scope_logs in &resource_logs.scope_logs {
             let scope_attrs = scope_logs.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
@@ -151,13 +142,6 @@ pub fn logs_to_record_batch(
             for log_record in &scope_logs.log_records {
                 // tenant_id
                 tenant_id_builder.append_value(tenant);
-
-                // account_id (optional - null if not provided)
-                if let Some(ref acc) = cloud_account_id {
-                    account_id_builder.append_value(acc);
-                } else {
-                    account_id_builder.append_null();
-                }
 
                 // service_name
                 if let Some(ref svc) = service_name {
@@ -211,9 +195,9 @@ pub fn logs_to_record_batch(
                 //
                 // Resource flattening additionally skips the OTLP keys whose
                 // normalised form collides with a promoted top-level column
-                // (`service.name` → `service_name`, `cloud.account.id` →
-                // `cloud_account_id`). Without the skip these would be written
-                // to the MAP a second time, polluting the per-row group key
+                // (`service.name` → `service_name`). Without the skip these
+                // would be written to the MAP a second time, polluting the
+                // per-row group key
                 // dictionary. Scope and log-record attributes are not filtered
                 // — a user-supplied `service_name` log attribute (rare, but
                 // semantically meaningful as an override) still flows through.
@@ -230,7 +214,6 @@ pub fn logs_to_record_batch(
     let schema = Arc::new(schema);
     let columns: Vec<ArrayRef> = vec![
         Arc::new(tenant_id_builder.finish()),
-        Arc::new(account_id_builder.finish()),
         Arc::new(service_name_builder.finish()),
         Arc::new(TimestampMicrosecondArray::from(timestamp_builder)),
         Arc::new(TimestampMicrosecondArray::from(observed_timestamp_builder)),
@@ -312,7 +295,6 @@ pub fn spans_to_record_batch(
     // Top-level column builders. Events and links are written as all-null
     // placeholders; Tasks 14 and 15 replace these with real list builders.
     let mut tenant_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
-    let mut cloud_account_id_builder = StringBuilder::with_capacity(total_spans, total_spans * 16);
     let mut service_name_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
     let mut trace_id_builder = FixedSizeBinaryBuilder::with_capacity(total_spans, 16);
     let mut span_id_builder = FixedSizeBinaryBuilder::with_capacity(total_spans, 8);
@@ -452,10 +434,6 @@ pub fn spans_to_record_batch(
             .iter()
             .find(|kv| kv.key == "service.name")
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
-        let cloud_account_id = resource_attrs
-            .iter()
-            .find(|kv| kv.key == "cloud.account.id")
-            .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
         for scope_spans in &resource_spans.scope_spans {
             for span in &scope_spans.spans {
@@ -502,7 +480,7 @@ pub fn spans_to_record_batch(
                 // public per-builder truncate API, so reordering puts the
                 // fallible builders ahead of the infallible ones — any
                 // (post-validation, unreachable) failure here leaves
-                // tenant/account/service untouched and avoids row
+                // tenant/service untouched and avoids row
                 // misalignment. `?` converts the never-firing
                 // `ArrowError` into `IngestError::Arrow` — a hard,
                 // surface-able error rather than a silent panic if the
@@ -515,10 +493,6 @@ pub fn spans_to_record_batch(
                 }
 
                 tenant_id_builder.append_value(tenant);
-                match cloud_account_id.as_deref() {
-                    Some(acc) => cloud_account_id_builder.append_value(acc),
-                    None => cloud_account_id_builder.append_null(),
-                }
                 match service_name.as_deref() {
                     Some(svc) => service_name_builder.append_value(svc),
                     None => service_name_builder.append_null(),
@@ -744,7 +718,6 @@ pub fn spans_to_record_batch(
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(tenant_id_builder.finish()),
-        Arc::new(cloud_account_id_builder.finish()),
         Arc::new(service_name_builder.finish()),
         Arc::new(trace_id_builder.finish()),
         Arc::new(span_id_builder.finish()),
@@ -986,7 +959,7 @@ fn extract_map_fields_from_nested_struct(
 /// resource flattening to keep the attributes MAP free of redundant copies
 /// — both to shrink Parquet pages and to keep the row-group key dictionary
 /// uncluttered.
-const LOG_PROMOTED_RESOURCE_KEYS: &[&str] = &[COL_SERVICE_NAME, COL_CLOUD_ACCOUNT_ID];
+const LOG_PROMOTED_RESOURCE_KEYS: &[&str] = &[COL_SERVICE_NAME];
 
 /// Adds flattened attributes to the map builder with key normalization.
 ///
@@ -1275,7 +1248,7 @@ mod tests {
 
         let batch = batch.expect("batch should exist");
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 11);
+        assert_eq!(batch.num_columns(), 10);
     }
 
     /// The logs ingest path must NOT mirror indexed top-level columns into
@@ -1364,14 +1337,6 @@ mod tests {
             .expect("StringArray");
         assert_eq!(severity.value(0), "ERROR");
 
-        let cloud_account = batch
-            .column_by_name("cloud_account_id")
-            .expect("cloud_account_id col")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-        assert_eq!(cloud_account.value(0), "acc-1");
-
         // Pull the row's attribute MAP into a BTreeMap for assertions.
         let attrs_map = batch
             .column_by_name("attributes")
@@ -1393,6 +1358,11 @@ mod tests {
         // The user-supplied log attribute survives unchanged.
         assert_eq!(pairs.get("foo"), Some(&"bar".to_string()));
 
+        // `cloud.account.id` is no longer a promoted top-level column —
+        // it flows into the attributes MAP via the resource flattening pass
+        // like any other resource attribute (normalised dots → underscores).
+        assert_eq!(pairs.get("cloud_account_id"), Some(&"acc-1".to_string()));
+
         // Indexed-column mirrors must NOT appear in the attributes MAP:
         //
         // - `trace_id` and `span_id`: removed by deleting
@@ -1400,19 +1370,11 @@ mod tests {
         //   top-level fields, never resource attributes).
         // - `severity_text` and `level`: same — they came from the deleted
         //   helper, not from any OTLP attribute key.
-        // - `service_name` and `cloud_account_id`: would otherwise be
-        //   normalised in by `add_flattened_attributes` (`service.name` →
-        //   `service_name`, `cloud.account.id` → `cloud_account_id`). Now
-        //   suppressed via `LOG_PROMOTED_RESOURCE_KEYS` to keep the per-row-
+        // - `service_name`: would otherwise be normalised in by
+        //   `add_flattened_attributes` (`service.name` → `service_name`).
+        //   Suppressed via `LOG_PROMOTED_RESOURCE_KEYS` to keep the per-row-
         //   group key dictionary free of redundant entries.
-        for mirror in [
-            "trace_id",
-            "span_id",
-            "severity_text",
-            "level",
-            "service_name",
-            "cloud_account_id",
-        ] {
+        for mirror in ["trace_id", "span_id", "severity_text", "level", "service_name"] {
             assert!(
                 !pairs.contains_key(mirror),
                 "mirror `{mirror}` must not appear in attributes MAP, got pairs: {pairs:?}"
@@ -1916,15 +1878,7 @@ mod tests {
         // Post-split invariant: indexed-column mirror keys (underscore form) must
         // NOT leak into either attribute map. Consumers read from the top-level
         // schema columns (service_name, trace_id, ...) instead.
-        for mirror in [
-            "service_name",
-            "cloud_account_id",
-            "trace_id",
-            "span_id",
-            "parent_span_id",
-            "kind",
-            "name",
-        ] {
+        for mirror in ["service_name", "trace_id", "span_id", "parent_span_id", "kind", "name"] {
             assert!(
                 !resource_pairs.contains_key(mirror),
                 "mirror `{mirror}` must not appear in resource_attributes"
@@ -2209,7 +2163,6 @@ mod tests {
             "kind",
             "status_code",
             "name",
-            "cloud_account_id",
         ] {
             assert!(
                 !resource_row.iter().any(|(k, _)| k == mirror),

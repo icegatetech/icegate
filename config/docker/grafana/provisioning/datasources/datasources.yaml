@@ -13,6 +13,12 @@ datasources:
     url: http://prometheus:9090
     isDefault: false
     editable: false
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://query:3200
+    isDefault: false
+    editable: false
   - name: Jaeger
     type: jaeger
     access: proxy

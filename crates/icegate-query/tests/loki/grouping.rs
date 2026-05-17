@@ -50,14 +50,6 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         "test-tenant",
         "test-tenant",
     ]));
-    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-    ]));
     let service_name: ArrayRef = Arc::new(StringArray::from(vec![
         Some("api"),
         Some("api"),
@@ -106,7 +98,7 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(10);
+    let attributes_field = arrow_schema.field(9);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -212,7 +204,6 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         arrow_schema.clone(),
         vec![
             tenant_id,
-            cloud_account_id,
             service_name,
             timestamp,
             observed_timestamp,
@@ -398,10 +389,10 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
         .await?;
     write_grouping_test_logs(&table, &catalog).await?;
 
-    // Query: sum by (service_name, cloud_account_id) (avg_over_time({service_name="api"} | unwrap value [1m]) by (cloud_account_id))
+    // Query: sum by (service_name, node) (avg_over_time({service_name="api"} | unwrap value [1m]) by (node))
     // Tests same-type grouping (By + By)
-    // Expected behavior: inner By(cloud_account_id) and outer By(service_name, cloud_account_id) are merged (union)
-    // Result: By(service_name, cloud_account_id) - both labels present in output
+    // Expected behavior: inner By(node) and outer By(service_name, node) are merged (union)
+    // Result: By(service_name, node) - both labels present in output
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
@@ -409,7 +400,7 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
         .query(&[
             (
                 "query",
-                "sum by (service_name, cloud_account_id) (avg_over_time({service_name=\"api\"} | unwrap value [1m]) by (cloud_account_id))",
+                "sum by (service_name, node) (avg_over_time({service_name=\"api\"} | unwrap value [1m]) by (node))",
             ),
             ("step", "60s"),
         ])
@@ -435,11 +426,8 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
         println!("Series metric labels: {:?}", metric.keys().collect::<Vec<_>>());
 
         // Both labels from outer By should be present
-        // cloud_account_id
-        assert!(
-            metric.contains_key("cloud_account_id"),
-            "cloud_account_id should be present in output"
-        );
+        // node
+        assert!(metric.contains_key("node"), "node should be present in output");
 
         // service_name (output as "service")
         assert!(
@@ -447,8 +435,8 @@ async fn test_same_type_grouping_by_merge() -> Result<(), Box<dyn std::error::Er
             "service_name should be present in output"
         );
 
-        // Other labels (pod, instance, node) should NOT be present
-        for label in &["pod", "instance", "node"] {
+        // Other labels (pod, instance) should NOT be present
+        for label in &["pod", "instance"] {
             assert!(
                 !metric.contains_key(*label),
                 "{} label should not appear in result",
@@ -616,7 +604,7 @@ async fn test_attribute_map_grouping() -> Result<(), Box<dyn std::error::Error>>
     write_grouping_test_logs(&table, &catalog).await?;
 
     // Test 1: Group by mix of indexed column (service_name) and attribute MAP labels (pod, node)
-    // Query: sum by (service_name, pod, node) (sum_over_time({cloud_account_id="acc-1"} | unwrap value [1m]))
+    // Query: sum by (service_name, pod, node) (sum_over_time({severity_text="INFO"} | unwrap value [1m]))
     // - service_name is an indexed column
     // - pod and node are from the attributes MAP
     // Note: Using sum_over_time with unwrap because attribute MAP filtering is only implemented
@@ -628,7 +616,7 @@ async fn test_attribute_map_grouping() -> Result<(), Box<dyn std::error::Error>>
         .query(&[
             (
                 "query",
-                "sum by (service_name, pod, node) (sum_over_time({cloud_account_id=\"acc-1\"} | unwrap value [1m]))",
+                "sum by (service_name, pod, node) (sum_over_time({severity_text=\"INFO\"} | unwrap value [1m]))",
             ),
             ("step", "60s"),
         ])
@@ -701,7 +689,7 @@ async fn test_attribute_map_grouping() -> Result<(), Box<dyn std::error::Error>>
         .query(&[
             (
                 "query",
-                "sum by (pod, instance) (sum_over_time({cloud_account_id=\"acc-1\"} | unwrap value [1m]))",
+                "sum by (pod, instance) (sum_over_time({severity_text=\"INFO\"} | unwrap value [1m]))",
             ),
             ("step", "60s"),
         ])
@@ -798,13 +786,6 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         Some("api"),
     ]));
 
-    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-    ]));
-
     let severity_text: ArrayRef = Arc::new(StringArray::from(vec![
         Some("INFO"),
         Some("INFO"),
@@ -824,7 +805,7 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(10);
+    let attributes_field = arrow_schema.field(9);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -866,7 +847,6 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         arrow_schema.clone(),
         vec![
             tenant_id,
-            cloud_account_id,
             service_name,
             timestamps,
             observed_timestamp,
@@ -896,7 +876,7 @@ async fn test_vector_aggregation_without_grouping_collapses_series() -> Result<(
         .await?;
     write_grouping_test_logs(&table, &catalog).await?;
 
-    // Query: sum(count_over_time({cloud_account_id="acc-1"}[1m]))
+    // Query: sum(count_over_time({severity_text="INFO"}[1m]))
     // This has no `by` or `without` clause, so all series should be collapsed.
     // The test data has 6 logs with different service_name, pod, node, instance values.
     // Without grouping, sum should combine them all into a single series.
@@ -905,7 +885,7 @@ async fn test_vector_aggregation_without_grouping_collapses_series() -> Result<(
         .get(format!("{}/loki/api/v1/query_range", server.base_url))
         .header("X-Scope-OrgID", "test-tenant")
         .query(&[
-            ("query", "sum(count_over_time({cloud_account_id=\"acc-1\"}[1m]))"),
+            ("query", "sum(count_over_time({severity_text=\"INFO\"}[1m]))"),
             ("step", "60s"),
         ])
         .send()
@@ -994,7 +974,7 @@ async fn test_vector_aggregation_with_grouping_preserves_series() -> Result<(), 
         .await?;
     write_grouping_test_logs(&table, &catalog).await?;
 
-    // Query: sum by (service_name) (count_over_time({cloud_account_id="acc-1"}[1m]))
+    // Query: sum by (service_name) (count_over_time({severity_text="INFO"}[1m]))
     // With `by (service_name)`, we expect separate series for "api" and "backend"
     let resp = server
         .client
@@ -1003,7 +983,7 @@ async fn test_vector_aggregation_with_grouping_preserves_series() -> Result<(), 
         .query(&[
             (
                 "query",
-                "sum by (service_name) (count_over_time({cloud_account_id=\"acc-1\"}[1m]))",
+                "sum by (service_name) (count_over_time({severity_text=\"INFO\"}[1m]))",
             ),
             ("step", "60s"),
         ])

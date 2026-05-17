@@ -24,8 +24,7 @@
 //! given the column's cardinality and value distribution. Low-cardinality
 //! enums (`severity_text`, `kind`, `status_code`, `metric_type`,
 //! `is_monotonic`, `aggregation_temporality`), leading sort-key strings
-//! (`cloud_account_id`, `service_name`, `metric_name`,
-//! `service_instance_id`), and small-range ints
+//! (`service_name`, `metric_name`, `service_instance_id`), and small-range ints
 //! (`flags`, `dropped_*_count`, `scale`, `*_offset`) are deliberately
 //! omitted — dictionary already wins for those.
 //!
@@ -37,9 +36,8 @@
 //! set for that column and the corresponding Grafana picker goes blank.
 //! The canonical "enumerated string columns" list is whatever
 //! `crate::tempo::metadata::target_column_for_tag` resolves to a STRING
-//! column — currently the spans `name` intrinsic, plus `service_name`
-//! and `cloud_account_id`. Treat that mapping as load-bearing when
-//! adding new entries here.
+//! column — currently the spans `name` intrinsic, plus `service_name`.
+//! Treat that mapping as load-bearing when adding new entries here.
 //!
 //! Encodings used:
 //! - `DELTA_BINARY_PACKED` (INT32/INT64): timestamps, durations, monotonic
@@ -75,7 +73,7 @@ use crate::schema::{
 
 /// Encoding overrides for the `logs` table.
 ///
-/// Sort order: `cloud_account_id, service_name, timestamp DESC`. Sort-key
+/// Sort order: `service_name, timestamp DESC`. Sort-key
 /// strings stay on dictionary; timestamps get `DELTA_BINARY_PACKED`;
 /// `trace_id`/`span_id` get `DELTA_BYTE_ARRAY` (see module-level docs for
 /// why).
@@ -89,7 +87,7 @@ pub const LOGS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 
 /// Encoding overrides for the `spans` table.
 ///
-/// Sort order: `cloud_account_id, service_name, timestamp DESC`.
+/// Sort order: `service_name, trace_id, timestamp DESC`.
 /// `trace_id`/`span_id`/`parent_span_id` get `DELTA_BYTE_ARRAY` for the
 /// same reason as logs — adjacent rows of a trace cluster together inside
 /// the (service, timestamp) bucket.
@@ -113,7 +111,7 @@ pub const SPANS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 
 /// Encoding overrides for the `events` table.
 ///
-/// Sort order: `cloud_account_id, service_name, timestamp DESC`.
+/// Sort order: `service_name, timestamp DESC`.
 /// `trace_id`/`span_id` get `DELTA_BYTE_ARRAY` — same reasoning as logs.
 pub const EVENTS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
     (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
@@ -125,8 +123,8 @@ pub const EVENTS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 
 /// Encoding overrides for the `metrics` table.
 ///
-/// Sort order: `cloud_account_id, metric_name, service_name,
-/// service_instance_id, timestamp DESC`. Float-valued metric columns
+/// Sort order: `metric_name, service_name, service_instance_id, timestamp DESC`.
+/// Float-valued metric columns
 /// get `BYTE_STREAM_SPLIT` to expose byte-plane locality to ZSTD.
 pub const METRICS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
     (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),

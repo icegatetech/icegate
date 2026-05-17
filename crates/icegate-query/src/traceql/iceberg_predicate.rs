@@ -21,7 +21,6 @@
 //!
 //! Pushdownable:
 //! - `service.name` / `resource.service.name` → `service_name` column.
-//! - `cloud.account.id` / `resource.cloud.account.id` → `cloud_account_id`.
 //! - Intrinsic `name` → `name` column.
 //! - Intrinsic `traceID`, attribute `trace.id` → `trace_id` column.
 //! - Intrinsic `spanID`, attribute `span.id` → `span_id` column.
@@ -60,8 +59,7 @@
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::Datum;
 use icegate_common::schema::{
-    COL_CLOUD_ACCOUNT_ID, COL_KIND, COL_NAME, COL_PARENT_SPAN_ID, COL_SERVICE_NAME, COL_SPAN_ID, COL_STATUS_CODE,
-    COL_TRACE_ID,
+    COL_KIND, COL_NAME, COL_PARENT_SPAN_ID, COL_SERVICE_NAME, COL_SPAN_ID, COL_STATUS_CODE, COL_TRACE_ID,
 };
 
 use super::common::{ComparisonOp, FieldRef, IntrinsicField, LiteralValue, Scope};
@@ -262,7 +260,6 @@ fn indexed_column_for(field: &FieldRef) -> Option<&'static str> {
 fn indexed_resource_attribute(name: &str) -> Option<&'static str> {
     match name {
         "service.name" => Some(COL_SERVICE_NAME),
-        "cloud.account.id" => Some(COL_CLOUD_ACCOUNT_ID),
         // `resource.X` lookups for keys that aren't promoted to a
         // top-level column live only in `resource_attributes` (MAP).
         // Dropped — over-approximation.
@@ -304,8 +301,8 @@ fn datum_for(field: &FieldRef, value: &LiteralValue) -> Option<Datum> {
         // Returning None drops the predicate so the query degrades to
         // an over-approximation rather than a planner type error.
         (FieldRef::Intrinsic(IntrinsicField::Status | IntrinsicField::Kind), LiteralValue::String(_)) => None,
-        // String columns: `name`, `service_name`, `cloud_account_id`,
-        // `trace_id`, `span_id`, `parent_span_id`. RHS must be a string.
+        // String columns: `name`, `service_name`, `trace_id`, `span_id`,
+        // `parent_span_id`. RHS must be a string.
         (_, LiteralValue::String(s)) => Some(Datum::string(s.clone())),
         // Anything else (Float, Bytes, Bool, Duration, Nil, enum-on-non-enum,
         // int-on-string-column) drops.
@@ -340,10 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn pushes_resource_cloud_account_id_eq() {
+    fn drops_resource_cloud_account_id_eq() {
+        // `cloud.account.id` no longer maps to a dedicated top-level
+        // column (GH-140) — the resource attribute now lives only in
+        // the `resource_attributes` MAP, which iceberg cannot prune on.
+        // The translator must therefore drop the conjunct (AlwaysTrue),
+        // not invent a phantom `cloud_account_id` column.
         let p = translate(r#"{ resource.cloud.account.id = "123" }"#);
         let s = dbg(&p);
-        assert!(s.contains("cloud_account_id"), "missing column: {s}");
+        assert!(!s.contains("cloud_account_id"), "must not push: {s}");
+        assert!(matches!(p, Predicate::AlwaysTrue), "expected AlwaysTrue, got: {s}");
     }
 
     #[test]

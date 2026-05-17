@@ -56,11 +56,11 @@ pub struct TagsQueryParams {
     pub end: Option<i64>,
     /// Optional `TraceQL` filter restricting the candidate row-group
     /// set before tag discovery. Indexed conjuncts (`service.name`,
-    /// `cloud.account.id`, `name`, `status`, `kind`, `trace.id`,
-    /// `span.id`, `parent.span.id`) are pushed into iceberg as a
-    /// `Predicate`; non-pushdownable clauses (regex, MAP-attribute
-    /// equality, range ops, hierarchy operators, …) are silently
-    /// dropped per the metadata-scan over-approximation contract.
+    /// `name`, `status`, `kind`, `trace.id`, `span.id`, `parent.span.id`)
+    /// are pushed into iceberg as a `Predicate`; non-pushdownable clauses
+    /// (regex, MAP-attribute equality, range ops, hierarchy operators, …)
+    /// are silently dropped per the metadata-scan over-approximation
+    /// contract.
     /// Malformed input returns HTTP 400.
     #[serde(default)]
     pub q: Option<String>,

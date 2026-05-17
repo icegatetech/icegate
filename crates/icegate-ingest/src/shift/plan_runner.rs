@@ -552,22 +552,17 @@ mod tests {
             .insert(PLAN_FIELD_BOUNDARY_RANGE.to_string(), ExtractedValue::Utf8(payload));
     }
 
-    /// Build a single-component sort-key boundary `(account, service, ts DESC)`
+    /// Build a single-component sort-key boundary `(service, ts DESC)`
     /// where `ts` carries the same physical value in `min_key` and `max_key`.
-    fn point_boundary_payload(account: &str, service: &str, ts: i64) -> String {
+    fn point_boundary_payload(service: &str, ts: i64) -> String {
         let key = || {
             crate::wal::RowGroupBoundaryKey::new(vec![
-                crate::wal::test_utils::boundary_component_string(Some(account.to_string()), false, true),
                 crate::wal::test_utils::boundary_component_string(Some(service.to_string()), false, true),
                 crate::wal::test_utils::boundary_component_timestamp_micros(Some(ts), true, true),
             ])
         };
         serialize_row_group_boundary_range(&crate::wal::RowGroupBoundaryRange {
-            names: Arc::from([
-                "cloud_account_id".to_string(),
-                "service_name".to_string(),
-                "timestamp".to_string(),
-            ]),
+            names: Arc::from(["service_name".to_string(), "timestamp".to_string()]),
             min_key: key(),
             max_key: key(),
         })
@@ -602,7 +597,7 @@ mod tests {
         // Two entries: first valid, second with empty tenant_id. The plan must
         // surface the error and submit zero shift tasks even though the first
         // row group on its own would have been schedulable.
-        let payload = point_boundary_payload("acc-1", "svc-1", 10);
+        let payload = point_boundary_payload("svc-1", 10);
         let plan = icegate_queue::SegmentsPlan {
             entries: vec![
                 plan_entry(Some("tenant-a"), 7, 0, 1, Some(payload.clone())),
@@ -644,7 +639,7 @@ mod tests {
         let runner = test_runner(FakeQueueReader);
         let manager = RecordingManager::new();
         let mut plan = single_row_group_plan();
-        set_boundary(&mut plan.entries[0], point_boundary_payload("acc-1", "svc-2", 30));
+        set_boundary(&mut plan.entries[0], point_boundary_payload("svc-2", 30));
 
         let (task_ids, _) = runner
             .schedule_shift_tasks(&manager, plan, &CancellationToken::new())
@@ -658,7 +653,7 @@ mod tests {
         let runner = test_runner(FakeQueueReader);
         let manager = RecordingManager::new();
         let mut plan = single_row_group_plan();
-        set_boundary(&mut plan.entries[0], point_boundary_payload("acc-1", "svc-2", 30));
+        set_boundary(&mut plan.entries[0], point_boundary_payload("svc-2", 30));
 
         runner
             .schedule_shift_tasks(&manager, plan, &CancellationToken::new())
@@ -675,7 +670,7 @@ mod tests {
     async fn schedule_shift_tasks_handles_mixed_partition_buckets_in_single_pass() {
         let runner = test_runner(FakeQueueReader);
         let manager = RecordingManager::new();
-        let payload = point_boundary_payload("acc-1", "svc-1", 10);
+        let payload = point_boundary_payload("svc-1", 10);
         let plan = icegate_queue::SegmentsPlan {
             entries: vec![
                 plan_entry(Some("tenant-a"), 7, 0, 1, Some(payload.clone())),
@@ -696,26 +691,19 @@ mod tests {
         assert_eq!(summary.n_chunks, 2);
     }
 
-    /// Build a `(account, service, ts DESC)` boundary range with single-value
-    /// account/service slots, used to simulate a sorted WAL row group inside
-    /// a single service.
-    fn timestamp_boundary(account: &str, service: &str, min_ts: i64, max_ts: i64) -> String {
-        // Sort key: account ASC, service ASC, ts DESC (per logs schema).
+    /// Build a `(service, ts DESC)` boundary range with single-value service
+    /// slot, used to simulate a sorted WAL row group inside a single service.
+    fn timestamp_boundary(service: &str, min_ts: i64, max_ts: i64) -> String {
+        // Sort key: service ASC, ts DESC (per logs schema).
         // Under DESC ordering, the row's MIN value sits at max_ts and the MAX
         // value at min_ts.
         serialize_row_group_boundary_range(&crate::wal::RowGroupBoundaryRange {
-            names: Arc::from([
-                "cloud_account_id".to_string(),
-                "service_name".to_string(),
-                "timestamp".to_string(),
-            ]),
+            names: Arc::from(["service_name".to_string(), "timestamp".to_string()]),
             min_key: crate::wal::RowGroupBoundaryKey::new(vec![
-                crate::wal::test_utils::boundary_component_string(Some(account.to_string()), false, true),
                 crate::wal::test_utils::boundary_component_string(Some(service.to_string()), false, true),
                 crate::wal::test_utils::boundary_component_timestamp_micros(Some(max_ts), true, true),
             ]),
             max_key: crate::wal::RowGroupBoundaryKey::new(vec![
-                crate::wal::test_utils::boundary_component_string(Some(account.to_string()), false, true),
                 crate::wal::test_utils::boundary_component_string(Some(service.to_string()), false, true),
                 crate::wal::test_utils::boundary_component_timestamp_micros(Some(min_ts), true, true),
             ]),
@@ -800,7 +788,7 @@ mod tests {
                     1,
                     usize::try_from(svc * 10 + idx).expect("idx"),
                     1024 * 1024,
-                    Some(timestamp_boundary("acc-1", &service, min_ts, max_ts)),
+                    Some(timestamp_boundary(&service, min_ts, max_ts)),
                     Some((min_ts, max_ts)),
                 ));
             }

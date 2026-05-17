@@ -442,7 +442,7 @@ mod tests {
     use icegate_common::{
         ICEGATE_NAMESPACE,
         catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
-        schema::{COL_CLOUD_ACCOUNT_ID, COL_SERVICE_NAME, COL_TENANT_ID, COL_TIMESTAMP},
+        schema::{COL_SERVICE_NAME, COL_TENANT_ID, COL_TIMESTAMP},
     };
     use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
     use icegate_queue::{RowGroupPlanEntry, SegmentsPlan};
@@ -880,7 +880,6 @@ mod tests {
 
     fn test_batch(value: i64) -> arrow::record_batch::RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("value", DataType::Int64, false),
@@ -888,7 +887,6 @@ mod tests {
         arrow::record_batch::RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec![Some("acc")])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("svc")])) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![Some(1)])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![value])) as ArrayRef,
@@ -898,11 +896,8 @@ mod tests {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn logs_batch_for_shift(
-        rows: Vec<(Option<&str>, Option<&str>, Option<i64>, i64)>,
-    ) -> arrow::record_batch::RecordBatch {
+    fn logs_batch_for_shift(rows: Vec<(Option<&str>, Option<i64>, i64)>) -> arrow::record_batch::RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("value", DataType::Int64, false),
@@ -911,18 +906,13 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(
-                    rows.iter()
-                        .map(|(cloud_account_id, _, _, _)| *cloud_account_id)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(StringArray::from(
-                    rows.iter().map(|(_, service_name, _, _)| *service_name).collect::<Vec<_>>(),
+                    rows.iter().map(|(service_name, _, _)| *service_name).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(
-                    rows.iter().map(|(_, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
+                    rows.iter().map(|(_, timestamp, _)| *timestamp).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Arc::new(Int64Array::from(
-                    rows.iter().map(|(_, _, _, value)| *value).collect::<Vec<_>>(),
+                    rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
                 )) as ArrayRef,
             ],
         )
@@ -934,14 +924,14 @@ mod tests {
         timestamp_micros: i64,
         value: i64,
     ) -> arrow::record_batch::RecordBatch {
-        logs_batch_for_shift(vec![(Some("acc"), Some(service_name), Some(timestamp_micros), value)])
+        logs_batch_for_shift(vec![(Some(service_name), Some(timestamp_micros), value)])
     }
 
     fn values_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
         batches
             .iter()
             .flat_map(|batch| {
-                let values = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("int64 array");
+                let values = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("int64 array");
                 (0..values.len()).map(|idx| values.value(idx)).collect::<Vec<_>>()
             })
             .collect()
@@ -970,7 +960,7 @@ mod tests {
             .map(|row_group| {
                 let stats = row_group
                     .columns()
-                    .get(1)
+                    .first()
                     .and_then(|column| column.statistics())
                     .expect("service_name stats");
                 let Statistics::ByteArray(stats) = stats else {
@@ -1018,9 +1008,7 @@ mod tests {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn logs_ingest_batch(
-        rows: Vec<(&str, Option<&str>, Option<&str>, Option<i64>, i64)>,
-    ) -> arrow::record_batch::RecordBatch {
+    fn logs_ingest_batch(rows: Vec<(&str, Option<&str>, Option<i64>, i64)>) -> arrow::record_batch::RecordBatch {
         fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> Field {
             Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
@@ -1030,30 +1018,24 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             field_with_id(COL_TENANT_ID, DataType::Utf8, false, 1),
-            field_with_id(COL_CLOUD_ACCOUNT_ID, DataType::Utf8, true, 2),
-            field_with_id(COL_SERVICE_NAME, DataType::Utf8, true, 3),
-            field_with_id(COL_TIMESTAMP, DataType::Timestamp(TimeUnit::Microsecond, None), true, 4),
-            field_with_id("row_id", DataType::Int64, false, 5),
+            field_with_id(COL_SERVICE_NAME, DataType::Utf8, true, 2),
+            field_with_id(COL_TIMESTAMP, DataType::Timestamp(TimeUnit::Microsecond, None), true, 3),
+            field_with_id("row_id", DataType::Int64, false, 4),
         ]));
         arrow::record_batch::RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(
-                    rows.iter().map(|(tenant_id, _, _, _, _)| *tenant_id).collect::<Vec<_>>(),
+                    rows.iter().map(|(tenant_id, _, _, _)| *tenant_id).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Arc::new(StringArray::from(
-                    rows.iter()
-                        .map(|(_, cloud_account_id, _, _, _)| *cloud_account_id)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(StringArray::from(
-                    rows.iter().map(|(_, _, service_name, _, _)| *service_name).collect::<Vec<_>>(),
+                    rows.iter().map(|(_, service_name, _, _)| *service_name).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(
-                    rows.iter().map(|(_, _, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
+                    rows.iter().map(|(_, _, timestamp, _)| *timestamp).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Arc::new(Int64Array::from(
-                    rows.iter().map(|(_, _, _, _, row_id)| *row_id).collect::<Vec<_>>(),
+                    rows.iter().map(|(_, _, _, row_id)| *row_id).collect::<Vec<_>>(),
                 )) as ArrayRef,
             ],
         )
@@ -1064,7 +1046,7 @@ mod tests {
         batches
             .iter()
             .flat_map(|batch| {
-                let row_ids = batch.column(4).as_any().downcast_ref::<Int64Array>().expect("row_id");
+                let row_ids = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("row_id");
                 (0..batch.num_rows()).map(|row_idx| row_ids.value(row_idx)).collect::<Vec<_>>()
             })
             .collect()
@@ -1285,16 +1267,19 @@ mod tests {
                         icegate_queue::ExtractedValue::Utf8(payload),
                     );
                 }
-                // Extract physical timestamp min/max from the batch column (index 3).
-                // All test timestamps are tiny values (< 1 second) so they always
-                // fall within day 0; a TimestampMicrosRange is required because
-                // CURRENT_PLANNER_PARTITION_SPEC has required=true for the day field.
+                // Extract physical timestamp min/max from the batch column (index 2).
+                // Test fixtures (`logs_ingest_batch`) use a 4-column
+                // (tenant_id, service_name, timestamp, row_id) schema. All
+                // test timestamps are tiny values (< 1 second) so they
+                // always fall within day 0; a TimestampMicrosRange is
+                // required because CURRENT_PLANNER_PARTITION_SPEC has
+                // required=true for the day field.
                 let ts_col = row_group
                     .batch
-                    .column(3)
+                    .column(2)
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
-                    .expect("timestamp column at index 3");
+                    .expect("timestamp column at index 2");
                 let mut valid_ts = (0..ts_col.len()).filter(|&i| ts_col.is_valid(i)).map(|i| ts_col.value(i));
                 if let Some(first) = valid_ts.next() {
                     let (min_ts, max_ts) = valid_ts.fold((first, first), |(mn, mx), v| (mn.min(v), mx.max(v)));
@@ -1342,10 +1327,9 @@ mod tests {
             .with_schema_id(1)
             .with_fields(vec![
                 NestedField::required(1, COL_TENANT_ID, Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::optional(2, COL_CLOUD_ACCOUNT_ID, Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::optional(3, COL_SERVICE_NAME, Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::required(4, COL_TIMESTAMP, Type::Primitive(PrimitiveType::Timestamp)).into(),
-                NestedField::required(5, "row_id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, COL_SERVICE_NAME, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, COL_TIMESTAMP, Type::Primitive(PrimitiveType::Timestamp)).into(),
+                NestedField::required(4, "row_id", Type::Primitive(PrimitiveType::Long)).into(),
             ])
             .build()
             .expect("e2e logs schema");
@@ -1376,7 +1360,6 @@ mod tests {
     #[derive(Debug, Eq, PartialEq)]
     struct LogOutputRow {
         tenant_id: String,
-        cloud_account_id: Option<String>,
         service_name: Option<String>,
         timestamp: i64,
         row_id: i64,
@@ -1396,12 +1379,6 @@ mod tests {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .expect("tenant_id string");
-                let cloud_account_ids = batch
-                    .column_by_name(COL_CLOUD_ACCOUNT_ID)
-                    .expect("cloud_account_id column")
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("cloud_account_id string");
                 let service_names = batch
                     .column_by_name(COL_SERVICE_NAME)
                     .expect("service_name column")
@@ -1424,7 +1401,6 @@ mod tests {
                 (0..batch.num_rows())
                     .map(|row_idx| LogOutputRow {
                         tenant_id: tenant_ids.value(row_idx).to_string(),
-                        cloud_account_id: nullable_string_value(cloud_account_ids, row_idx),
                         service_name: nullable_string_value(service_names, row_idx),
                         timestamp: timestamps.value(row_idx),
                         row_id: row_ids.value(row_idx),
@@ -1435,9 +1411,8 @@ mod tests {
     }
 
     fn log_sort_key_cmp(left: &LogOutputRow, right: &LogOutputRow) -> std::cmp::Ordering {
-        left.cloud_account_id
-            .cmp(&right.cloud_account_id)
-            .then_with(|| left.service_name.cmp(&right.service_name))
+        left.service_name
+            .cmp(&right.service_name)
             .then_with(|| right.timestamp.cmp(&left.timestamp))
     }
 
@@ -1499,7 +1474,7 @@ mod tests {
 
             let service_stats = row_group
                 .columns()
-                .get(2)
+                .get(1)
                 .and_then(|column| column.statistics())
                 .expect("service_name statistics");
             let Statistics::ByteArray(service_stats) = service_stats else {
@@ -1608,14 +1583,8 @@ mod tests {
             batches_by_offset: HashMap::from([(
                 1,
                 vec![
-                    logs_batch_for_shift(vec![
-                        (Some("acc-1"), Some("svc-3"), Some(30), 1),
-                        (Some("acc-1"), Some("svc-4"), Some(20), 2),
-                    ]),
-                    logs_batch_for_shift(vec![
-                        (Some("acc-1"), Some("svc-2"), Some(40), 3),
-                        (Some("acc-1"), Some("svc-5"), Some(10), 4),
-                    ]),
+                    logs_batch_for_shift(vec![(Some("svc-3"), Some(30), 1), (Some("svc-4"), Some(20), 2)]),
+                    logs_batch_for_shift(vec![(Some("svc-2"), Some(40), 3), (Some("svc-5"), Some(10), 4)]),
                 ],
             )]),
             delay_by_offset: HashMap::new(),
@@ -1635,14 +1604,8 @@ mod tests {
         )
         .expect("non-zero output_batch_size must be accepted");
         let segment_1 = vec![
-            logs_batch_for_shift(vec![
-                (Some("acc-1"), Some("svc-3"), Some(30), 1),
-                (Some("acc-1"), Some("svc-4"), Some(20), 2),
-            ]),
-            logs_batch_for_shift(vec![
-                (Some("acc-1"), Some("svc-2"), Some(40), 3),
-                (Some("acc-1"), Some("svc-5"), Some(10), 4),
-            ]),
+            logs_batch_for_shift(vec![(Some("svc-3"), Some(30), 1), (Some("svc-4"), Some(20), 2)]),
+            logs_batch_for_shift(vec![(Some("svc-2"), Some(40), 3), (Some("svc-5"), Some(10), 4)]),
         ];
         let input = ShiftInput {
             segments: vec![SegmentToRead {
@@ -1672,14 +1635,8 @@ mod tests {
             batches_by_offset: HashMap::from([(
                 1,
                 vec![
-                    logs_batch_for_shift(vec![
-                        (Some("acc-1"), Some("svc-3"), Some(30), 1),
-                        (Some("acc-1"), Some("svc-4"), Some(20), 2),
-                    ]),
-                    logs_batch_for_shift(vec![
-                        (Some("acc-1"), Some("svc-2"), Some(40), 3),
-                        (Some("acc-1"), Some("svc-5"), Some(10), 4),
-                    ]),
+                    logs_batch_for_shift(vec![(Some("svc-3"), Some(30), 1), (Some("svc-4"), Some(20), 2)]),
+                    logs_batch_for_shift(vec![(Some("svc-2"), Some(40), 3), (Some("svc-5"), Some(10), 4)]),
                 ],
             )]),
             delay_by_offset: HashMap::new(),
@@ -1699,14 +1656,8 @@ mod tests {
         )
         .expect("non-zero output_batch_size must be accepted");
         let segment_1 = vec![
-            logs_batch_for_shift(vec![
-                (Some("acc-1"), Some("svc-3"), Some(30), 1),
-                (Some("acc-1"), Some("svc-4"), Some(20), 2),
-            ]),
-            logs_batch_for_shift(vec![
-                (Some("acc-1"), Some("svc-2"), Some(40), 3),
-                (Some("acc-1"), Some("svc-5"), Some(10), 4),
-            ]),
+            logs_batch_for_shift(vec![(Some("svc-3"), Some(30), 1), (Some("svc-4"), Some(20), 2)]),
+            logs_batch_for_shift(vec![(Some("svc-2"), Some(40), 3), (Some("svc-5"), Some(10), 4)]),
         ];
         let input = ShiftInput {
             segments: vec![SegmentToRead {
@@ -1933,28 +1884,28 @@ mod tests {
         let max_active_reads = Arc::new(AtomicUsize::new(0));
         let segments = [
             vec![logs_batch_for_shift(vec![
-                (Some("acc"), Some("svc"), Some(100), 1),
-                (Some("acc"), Some("svc"), Some(70), 2),
+                (Some("svc"), Some(100), 1),
+                (Some("svc"), Some(70), 2),
             ])],
             vec![logs_batch_for_shift(vec![
-                (Some("acc"), Some("svc"), Some(95), 3),
-                (Some("acc"), Some("svc"), Some(65), 4),
+                (Some("svc"), Some(95), 3),
+                (Some("svc"), Some(65), 4),
             ])],
             vec![logs_batch_for_shift(vec![
-                (Some("acc"), Some("svc"), Some(90), 5),
-                (Some("acc"), Some("svc"), Some(60), 6),
+                (Some("svc"), Some(90), 5),
+                (Some("svc"), Some(60), 6),
             ])],
             vec![logs_batch_for_shift(vec![
-                (Some("acc"), Some("svc"), Some(85), 7),
-                (Some("acc"), Some("svc"), Some(55), 8),
+                (Some("svc"), Some(85), 7),
+                (Some("svc"), Some(55), 8),
             ])],
             vec![logs_batch_for_shift(vec![
-                (Some("acc"), Some("svc"), Some(80), 9),
-                (Some("acc"), Some("svc"), Some(50), 10),
+                (Some("svc"), Some(80), 9),
+                (Some("svc"), Some(50), 10),
             ])],
             vec![logs_batch_for_shift(vec![
-                (Some("acc"), Some("svc"), Some(75), 11),
-                (Some("acc"), Some("svc"), Some(45), 12),
+                (Some("svc"), Some(75), 11),
+                (Some("svc"), Some(45), 12),
             ])],
         ];
         let queue_reader = Arc::new(FakeQueueReader {
@@ -2351,19 +2302,19 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn run_end_to_end_writes_rows_sorted_in_actual_parquet_files() {
         let ingest_segment_100 = logs_ingest_batch(vec![
-            ("tenant-b", Some("acc-2"), Some("svc-z"), Some(10), 900),
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 101),
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 102),
-            ("tenant-b", Some("acc-2"), Some("svc-y"), Some(20), 901),
-            ("tenant-a", Some("acc-1"), Some("svc-0"), Some(110), 103),
-            ("tenant-a", Some("acc-2"), Some("svc-a"), Some(50), 104),
+            ("tenant-b", Some("svc-z"), Some(10), 900),
+            ("tenant-a", Some("svc-1"), Some(100), 101),
+            ("tenant-a", Some("svc-1"), Some(100), 102),
+            ("tenant-b", Some("svc-y"), Some(20), 901),
+            ("tenant-a", Some("svc-0"), Some(110), 103),
+            ("tenant-a", Some("svc-a"), Some(50), 104),
         ]);
         let ingest_segment_101 = logs_ingest_batch(vec![
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 201),
-            ("tenant-b", Some("acc-2"), Some("svc-x"), Some(30), 902),
-            ("tenant-a", Some("acc-1"), Some("svc-2"), Some(90), 202),
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 203),
-            ("tenant-b", Some("acc-1"), Some("svc-a"), Some(70), 903),
+            ("tenant-a", Some("svc-1"), Some(100), 201),
+            ("tenant-b", Some("svc-x"), Some(30), 902),
+            ("tenant-a", Some("svc-2"), Some(90), 202),
+            ("tenant-a", Some("svc-1"), Some(100), 203),
+            ("tenant-b", Some("svc-a"), Some(70), 903),
         ]);
         let prepared_100 = sort_logs(&ingest_segment_100, 2, None)
             .expect("prepare WAL segment 100")
@@ -2510,19 +2461,19 @@ mod tests {
     #[tokio::test]
     async fn run_end_to_end_mixed_partition_planning_and_shift_merge_preserves_boundaries_and_order() {
         let ingest_segment_100 = logs_ingest_batch(vec![
-            ("tenant-b", Some("acc-2"), Some("svc-z"), Some(10), 900),
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 101),
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 102),
-            ("tenant-b", Some("acc-2"), Some("svc-y"), Some(20), 901),
-            ("tenant-a", Some("acc-1"), Some("svc-0"), Some(110), 103),
-            ("tenant-a", Some("acc-2"), Some("svc-a"), Some(50), 104),
+            ("tenant-b", Some("svc-z"), Some(10), 900),
+            ("tenant-a", Some("svc-1"), Some(100), 101),
+            ("tenant-a", Some("svc-1"), Some(100), 102),
+            ("tenant-b", Some("svc-y"), Some(20), 901),
+            ("tenant-a", Some("svc-0"), Some(110), 103),
+            ("tenant-a", Some("svc-a"), Some(50), 104),
         ]);
         let ingest_segment_101 = logs_ingest_batch(vec![
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 201),
-            ("tenant-b", Some("acc-2"), Some("svc-x"), Some(30), 902),
-            ("tenant-a", Some("acc-1"), Some("svc-2"), Some(90), 202),
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 203),
-            ("tenant-b", Some("acc-1"), Some("svc-a"), Some(70), 903),
+            ("tenant-a", Some("svc-1"), Some(100), 201),
+            ("tenant-b", Some("svc-x"), Some(30), 902),
+            ("tenant-a", Some("svc-2"), Some(90), 202),
+            ("tenant-a", Some("svc-1"), Some(100), 203),
+            ("tenant-b", Some("svc-a"), Some(70), 903),
         ]);
         let prepared_100 = sort_logs(&ingest_segment_100, 2, None)
             .expect("prepare WAL segment 100")
@@ -2661,12 +2612,12 @@ mod tests {
     #[tokio::test]
     async fn shift_task_rolls_over_data_files_when_writer_budget_is_pathologically_small() {
         let ingest_segment = logs_ingest_batch(vec![
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 101),
-            ("tenant-a", Some("acc-1"), Some("svc-1"), Some(100), 102),
-            ("tenant-a", Some("acc-1"), Some("svc-0"), Some(110), 103),
-            ("tenant-a", Some("acc-1"), Some("svc-2"), Some(120), 104),
-            ("tenant-a", Some("acc-1"), Some("svc-3"), Some(130), 105),
-            ("tenant-a", Some("acc-1"), Some("svc-4"), Some(140), 106),
+            ("tenant-a", Some("svc-1"), Some(100), 101),
+            ("tenant-a", Some("svc-1"), Some(100), 102),
+            ("tenant-a", Some("svc-0"), Some(110), 103),
+            ("tenant-a", Some("svc-2"), Some(120), 104),
+            ("tenant-a", Some("svc-3"), Some(130), 105),
+            ("tenant-a", Some("svc-4"), Some(140), 106),
         ]);
         let prepared = sort_logs(&ingest_segment, 2, None)
             .expect("prepare WAL segment")

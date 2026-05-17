@@ -175,7 +175,6 @@ pub async fn write_test_logs_for_tenant(
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(vec![tenant_id, tenant_id, tenant_id]));
-    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
     let service_name_arr: ArrayRef = Arc::new(StringArray::from(vec![
         Some(service_name),
         Some(service_name),
@@ -205,7 +204,7 @@ pub async fn write_test_logs_for_tenant(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(10);
+    let attributes_field = arrow_schema.field(9);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -270,7 +269,6 @@ pub async fn write_test_logs_for_tenant(
         arrow_schema.clone(),
         vec![
             tenant_id_arr,
-            cloud_account_id,
             service_name_arr,
             timestamp,
             observed_timestamp,
@@ -322,7 +320,6 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         .as_micros() as i64;
 
     let tenant_id: ArrayRef = Arc::new(StringArray::from(vec!["test-tenant", "test-tenant", "test-tenant"]));
-    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
     let service_name: ArrayRef = Arc::new(StringArray::from(vec![
         Some("frontend"),
         Some("frontend"),
@@ -352,7 +349,7 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(10);
+    let attributes_field = arrow_schema.field(9);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -434,7 +431,6 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         arrow_schema.clone(),
         vec![
             tenant_id,
-            cloud_account_id,
             service_name,
             timestamp,
             observed_timestamp,

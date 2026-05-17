@@ -21,11 +21,11 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, TimeZone, Utc};
 use iceberg::expr::{Predicate, Reference};
-use icegate_common::schema::{
-    COL_CLOUD_ACCOUNT_ID, COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES,
-    COL_SPAN_ID, COL_TRACE_ID, SPAN_INDEXED_ATTRIBUTE_COLUMNS, TRACEQL_INTRINSIC_TAGS,
-};
 use icegate_common::schema::{COL_KIND, COL_STATUS_CODE};
+use icegate_common::schema::{
+    COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES, COL_SPAN_ID,
+    COL_TRACE_ID, SPAN_INDEXED_ATTRIBUTE_COLUMNS, TRACEQL_INTRINSIC_TAGS,
+};
 use icegate_common::{ICEGATE_NAMESPACE, SPANS_TABLE};
 
 use super::error::{TempoError, TempoResult};
@@ -51,10 +51,7 @@ const VALUE_TYPE_KEYWORD: &str = "keyword";
 /// the physical column name `service_name`. The reverse mapping
 /// (`OTel` name → column) used by tag-value lookup lives in
 /// [`map_attribute_to_column`].
-const RESOURCE_TOP_LEVEL_TAGS: &[(&str, &str)] = &[
-    ("service.name", COL_SERVICE_NAME),
-    ("cloud.account.id", COL_CLOUD_ACCOUNT_ID),
-];
+const RESOURCE_TOP_LEVEL_TAGS: &[(&str, &str)] = &[("service.name", COL_SERVICE_NAME)];
 
 /// Metadata-scan config for the `resource_attributes` map.
 ///
@@ -73,9 +70,9 @@ const SPANS_RESOURCE_CONFIG: MetadataScanConfig = MetadataScanConfig {
 /// Metadata-scan config for the `span_attributes` map.
 ///
 /// `indexed_columns` is empty by design: the only top-level string columns
-/// on the spans table (`cloud_account_id`, `service_name`, `name`) belong
-/// to the `resource` scope or are exposed as `TraceQL` intrinsics — they
-/// must not leak into `span` scope under their physical column names.
+/// on the spans table (`service_name`, `name`) belong to the `resource`
+/// scope or are exposed as `TraceQL` intrinsics — they must not leak into
+/// `span` scope under their physical column names.
 const SPANS_SPAN_CONFIG: MetadataScanConfig = MetadataScanConfig {
     indexed_columns: &[],
     label_aliases: &[],
@@ -498,12 +495,11 @@ async fn scan_values_either(
 
 /// Map a dotted `OTel` attribute key to a top-level column, when one exists.
 ///
-/// `service.name` → `service_name`; `cloud.account.id` → `cloud_account_id`.
-/// Unmapped keys go through as-is and fall back to the MAP lookup path.
+/// `service.name` → `service_name`. Unmapped keys go through as-is and fall
+/// back to the MAP lookup path.
 fn map_attribute_to_column(key: &str) -> Option<&'static str> {
     match key {
         "service.name" => Some(COL_SERVICE_NAME),
-        "cloud.account.id" => Some(COL_CLOUD_ACCOUNT_ID),
         "trace.id" => Some(COL_TRACE_ID),
         "span.id" => Some(COL_SPAN_ID),
         "parent.span.id" => Some(COL_PARENT_SPAN_ID),
