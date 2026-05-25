@@ -36,6 +36,12 @@ tempo:
   host: 0.0.0.0
   port: 3200
 
+flight_sql:
+  enabled: true
+  host: 0.0.0.0
+  port: 8815
+  max_message_size: 16777216
+
 tracing:
   enabled: true
   service_name: icegate-query

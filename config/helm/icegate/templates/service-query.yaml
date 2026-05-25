@@ -1,4 +1,4 @@
-{{- if and .Values.query.enabled (or .Values.query.loki.enabled .Values.query.prometheus.enabled .Values.query.tempo.enabled .Values.query.metrics.enabled) -}}
+{{- if and .Values.query.enabled (or .Values.query.loki.enabled .Values.query.prometheus.enabled .Values.query.tempo.enabled .Values.query.flightSql.enabled .Values.query.metrics.enabled) -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -31,6 +31,12 @@ spec:
     - name: tempo
       port: {{ .Values.query.tempo.port }}
       targetPort: tempo
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.query.flightSql.enabled }}
+    - name: flight-sql
+      port: {{ .Values.query.flightSql.port }}
+      targetPort: flight-sql
       protocol: TCP
     {{- end }}
     {{- if .Values.query.metrics.enabled }}

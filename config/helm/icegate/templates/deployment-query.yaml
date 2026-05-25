@@ -53,6 +53,11 @@ spec:
               containerPort: {{ .Values.query.tempo.port }}
               protocol: TCP
             {{- end }}
+            {{- if .Values.query.flightSql.enabled }}
+            - name: flight-sql
+              containerPort: {{ .Values.query.flightSql.port }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.query.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.query.metrics.port }}

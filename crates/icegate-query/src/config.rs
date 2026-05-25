@@ -11,7 +11,10 @@ use icegate_common::{
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 
-use super::{engine::QueryEngineConfig, loki::LokiConfig, prometheus::PrometheusConfig, tempo::TempoConfig};
+use super::{
+    engine::QueryEngineConfig, flight_sql::FlightSqlConfig, loki::LokiConfig, prometheus::PrometheusConfig,
+    tempo::TempoConfig,
+};
 use crate::error::Result;
 
 /// Query binary configuration
@@ -37,6 +40,8 @@ pub struct QueryConfig {
     pub prometheus: PrometheusConfig,
     /// Tempo API server
     pub tempo: TempoConfig,
+    /// Apache Arrow Flight SQL gRPC server
+    pub flight_sql: FlightSqlConfig,
     /// Tracing configuration
     #[serde(default)]
     pub tracing: TracingConfig,
@@ -72,11 +77,18 @@ impl QueryConfig {
         self.loki.validate()?;
         self.prometheus.validate()?;
         self.tempo.validate()?;
+        self.flight_sql.validate()?;
         self.tracing.validate()?;
         self.metrics.validate()?;
 
         // Check for port conflicts among enabled servers
-        check_port_conflicts(&[&self.loki, &self.prometheus, &self.tempo, &self.metrics])?;
+        check_port_conflicts(&[
+            &self.loki,
+            &self.prometheus,
+            &self.tempo,
+            &self.flight_sql,
+            &self.metrics,
+        ])?;
 
         Ok(())
     }

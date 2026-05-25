@@ -55,6 +55,7 @@ icegate-queue = { path = "crates/icegate-queue" }
 
 # Arrow ecosystem (must match iceberg's version)
 arrow = { version = "57.0", default-features = false, features = ["prettyprint"] }
+arrow-flight = { version = "57.0", default-features = false, features = ["flight-sql"] }
 parquet = { version = "57.0", default-features = false, features = ["arrow", "object_store", "zstd"] }
 object_store = { version = "0.12", features = ["aws"] }
 opendal = { version = "0.55", features = ["services-s3", "services-fs", "layers-otel-trace", "layers-otel-metrics"]}
@@ -86,10 +87,12 @@ iceberg-datafusion = { version = "0.9.0" }
 # DataFusion
 datafusion = "52.2"
 datafusion-tracing = "52.0"
+datafusion-flight-sql-server = "=0.4.15"
 
 # Async runtime
 tokio = { version = "1.48.0", features = ["full", "tracing"] }
 tokio-util = "0.7"
+tokio-stream = "0.1"
 futures = "0.3.31"
 
 # CLI
@@ -136,6 +139,7 @@ regex = "1.12"
 # Utilities
 itoa = "1"
 bytes = "1.11.1"
+base64 = "0.22"
 dashmap = "6.1"
 lru = "0.16"
 url = "2"

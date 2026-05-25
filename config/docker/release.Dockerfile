@@ -18,10 +18,16 @@ ARG TARGETARCH
 # Install both cross-compilation toolchains unconditionally.
 # The unused one adds ~60MB but keeps the logic simple and allows
 # building for any target from any host (amd64 CI or arm64 Mac).
+# `protobuf-compiler` provides `protoc`; `libprotobuf-dev` ships the
+# well-known `.proto` files (any.proto, empty.proto, ...) under
+# `/usr/include/google/protobuf/` that the `substrait` build script
+# imports from. Both are required by `datafusion-substrait`
+# (transitive of `datafusion-flight-sql-server`).
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && apt-get install -y --no-install-recommends \
       gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
       gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+      protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN <<EOF

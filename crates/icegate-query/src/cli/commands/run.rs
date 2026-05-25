@@ -40,7 +40,7 @@ async fn shutdown_signal() {
 /// Execute the run command
 ///
 /// Starts all enabled query servers and runs until Ctrl+C
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Load configuration
     let config = QueryConfig::from_file(&config_path)?;
@@ -164,6 +164,15 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         let tempo_config = config.tempo.clone();
         let token = cancel_token.clone();
         let handle = tokio::spawn(async move { crate::tempo::run(engine, tempo_config, token).await });
+        handles.push(handle);
+    }
+
+    if config.flight_sql.enabled {
+        let engine = Arc::clone(&query_engine);
+        let flight_sql_config = config.flight_sql.clone();
+        let token = cancel_token.clone();
+        let m = Arc::clone(&query_metrics);
+        let handle = tokio::spawn(async move { crate::flight_sql::run(engine, flight_sql_config, token, m).await });
         handles.push(handle);
     }
 
