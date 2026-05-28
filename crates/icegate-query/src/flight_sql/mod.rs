@@ -17,7 +17,6 @@
 mod config;
 mod provider;
 mod server;
-mod service;
 mod tenant_catalog;
 mod tenant_id;
 

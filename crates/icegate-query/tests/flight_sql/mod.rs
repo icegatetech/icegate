@@ -5,4 +5,3 @@ mod metadata;
 mod read_only;
 mod smoke;
 mod tenant;
-mod transaction;

@@ -1,6 +1,6 @@
 //! Flight SQL gRPC server bootstrap.
 //!
-//! Spins up a tonic server that wraps
+//! Spins up a tonic server that hosts the upstream
 //! `datafusion_flight_sql_server::service::FlightSqlService` with our
 //! tenant-aware [`IceGateSessionStateProvider`]. Wiring is intentionally
 //! identical to the HTTP servers ([`crate::loki::server::run`]) so the
@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::FlightSqlConfig;
 use super::provider::IceGateSessionStateProvider;
-use super::service::IceGateFlightSqlService;
 use crate::{engine::QueryEngine, infra::metrics::QueryMetrics};
 
 /// Build the SQL execution options enforced on every client query.
@@ -78,11 +77,7 @@ pub async fn run_with_port_tx(
     }
 
     let provider = Box::new(IceGateSessionStateProvider::new(engine));
-    let inner = FlightSqlService::new_with_provider(provider).with_sql_options(read_only_sql_options());
-    // Wrap to stub out BeginTransaction/EndTransaction so read-only
-    // clients that always issue them (DuckDB duckhog, some JDBC drivers,
-    // ADBC) don't fail before they can run a query.
-    let service = IceGateFlightSqlService::new(inner);
+    let service = FlightSqlService::new_with_provider(provider).with_sql_options(read_only_sql_options());
     let svc = FlightServiceServer::new(service)
         .max_decoding_message_size(config.max_message_size)
         .max_encoding_message_size(config.max_message_size);

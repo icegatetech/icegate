@@ -81,7 +81,6 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
 hex = { workspace = true }
-base64 = { workspace = true }
 
 # Date and time
 chrono = { workspace = true }
