@@ -59,6 +59,11 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         None
     };
 
+    // Cancellation token for coordinated shutdown. Created before the catalog
+    // so the S3 catalog's CAS/transient retry loops abort promptly on SIGINT/
+    // SIGTERM instead of running to their retry budget during shutdown.
+    let cancel_token = CancellationToken::new();
+
     // Initialize catalog
     tracing::info!("Initializing catalog");
     let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
@@ -69,7 +74,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         icegate_common::register_foyer_metrics(cache, &runtime.meter());
     }
 
-    let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache, cancel_token.clone()).await?;
 
     tracing::info!("Catalog initialized successfully");
 
@@ -112,9 +117,6 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         Arc::new(wal_reader),
     ));
     query_engine.start_background_refresh();
-
-    // Create cancellation token for coordinated shutdown
-    let cancel_token = CancellationToken::new();
 
     tracing::info!("Query engine initialized successfully");
 

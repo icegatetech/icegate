@@ -51,7 +51,7 @@ struct CachedProvider {
 /// # Usage
 ///
 /// ```ignore
-/// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
+/// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache, shutdown_token).await?;
 /// let reader = Arc::new(ParquetQueueReader::new(prefix, store.clone(), batch_size)?);
 /// let engine = Arc::new(QueryEngine::new(catalog, config, store, reader));
 ///

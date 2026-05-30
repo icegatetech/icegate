@@ -39,3 +39,5 @@ S3Catalog (iceberg::Catalog)
 ## Important Instructions
 - The component is under active development, not in prod. Backward compatibility is not necessary.
 - The work with the metadata of the table **MUST** be carried out strictly according to the Iceberg specification.
+- Responsibility **MUST** be strictly divided into layers according to the Layers and Responsibilities section.
+- Domain entities **SHOULD NOT** depend on other layers.

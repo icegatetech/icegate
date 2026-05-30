@@ -81,7 +81,7 @@ impl TestServer {
             port: actual_port,
         };
 
-        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop()).await?;
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new()).await?;
 
         let namespace_ident = iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
         if !catalog.namespace_exists(&namespace_ident).await? {

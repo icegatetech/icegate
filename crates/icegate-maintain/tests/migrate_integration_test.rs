@@ -16,6 +16,7 @@ use std::{
 };
 
 use icegate_common::{
+    CancellationToken,
     catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
     testing::{MinIOContainer, create_s3_bucket},
 };
@@ -150,7 +151,7 @@ async fn test_migrate_create_tables() {
 
     println!("Creating catalog with config: {:?}", config);
 
-    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
         .await
         .expect("Failed to create catalog");
 
@@ -190,7 +191,7 @@ async fn test_migrate_create_tables() {
 async fn test_migrate_create_tables_dry_run() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
         .await
         .expect("Failed to create catalog");
 
@@ -218,7 +219,7 @@ async fn test_migrate_create_tables_dry_run() {
 async fn test_migrate_create_tables_idempotent() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
         .await
         .expect("Failed to create catalog");
 
@@ -244,7 +245,7 @@ async fn test_migrate_create_tables_idempotent() {
 async fn test_migrate_upgrade_schemas() {
     let (_minio, _iceberg, config) = setup_containers().await;
 
-    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop())
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
         .await
         .expect("Failed to create catalog");
 

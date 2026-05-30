@@ -90,6 +90,9 @@ pub use storage::{
     StorageConfig, build_storage_cache, create_local_store, create_memory_store, create_object_store, create_s3_store,
     register_foyer_metrics,
 };
+// Re-exported so `CatalogBuilder::from_config` callers can name the shutdown
+// token type without a direct `tokio-util` dependency.
+pub use tokio_util::sync::CancellationToken;
 pub use tracing::{
     TracingConfig, TracingGuard, add_span_link, add_span_links, extract_current_trace_context, init_tracing,
     traceparent_to_context,

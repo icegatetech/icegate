@@ -31,9 +31,10 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use iceberg::{NamespaceIdent, TableIdent};
+    use uuid::Uuid;
 
     use super::*;
-    use crate::model::{CatalogRoot, TableEntry, TableKey};
+    use crate::model::{CatalogRoot, CatalogTableLink, TableId, TableKey, TableMetadataLocation};
 
     fn sample_root() -> CatalogRoot {
         let mut root = CatalogRoot::default();
@@ -41,9 +42,11 @@ mod tests {
         root.create_namespace(&namespace, std::collections::HashMap::new());
         root.link_table(
             TableKey::from_ident(&TableIdent::new(namespace, "tbl".to_string())),
-            TableEntry::new(
-                "table-id".to_string(),
-                "s3://bucket/warehouse/catalog/tables/table-id/metadata/00000-uuid.metadata.json".to_string(),
+            CatalogTableLink::new(
+                TableId::from(Uuid::from_u128(1)),
+                TableMetadataLocation::new(
+                    "s3://bucket/warehouse/catalog/tables/table-id/metadata/00000-uuid.metadata.json".to_string(),
+                ),
             ),
         )
         .expect("create root entry");
