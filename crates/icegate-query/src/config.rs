@@ -40,7 +40,12 @@ pub struct QueryConfig {
     pub prometheus: PrometheusConfig,
     /// Tempo API server
     pub tempo: TempoConfig,
-    /// Apache Arrow Flight SQL gRPC server
+    /// Apache Arrow Flight SQL gRPC server.
+    ///
+    /// Optional: when the `flight_sql` block is absent the server defaults
+    /// to disabled, so configs written before Flight SQL existed keep
+    /// parsing instead of failing on a missing field.
+    #[serde(default)]
     pub flight_sql: FlightSqlConfig,
     /// Tracing configuration
     #[serde(default)]

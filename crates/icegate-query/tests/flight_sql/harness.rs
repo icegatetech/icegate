@@ -55,6 +55,10 @@ pub struct TestServer {
     pub channel: Channel,
     pub cancel_token: CancellationToken,
     server_handle: tokio::task::JoinHandle<()>,
+    /// Owns the temporary warehouse directory; held purely for its
+    /// `Drop`, which removes the directory when the server is dropped.
+    #[allow(dead_code)]
+    temp_dir: tempfile::TempDir,
 }
 
 impl TestServer {
@@ -114,10 +118,6 @@ impl TestServer {
             .expect("Timed out waiting for Flight SQL server to start")
             .expect("Failed to receive port from server");
 
-        // Keep the warehouse directory alive for the lifetime of the
-        // process; cargo cleans `/tmp` between runs.
-        Box::leak(Box::new(warehouse_path));
-
         let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{actual_port}"))?;
         let channel = endpoint.connect().await?;
 
@@ -126,6 +126,9 @@ impl TestServer {
                 channel,
                 cancel_token,
                 server_handle,
+                // Own the temp dir so it is cleaned up when the server is
+                // dropped instead of leaked for the whole process.
+                temp_dir: warehouse_path,
             },
             catalog,
         ))
@@ -144,9 +147,21 @@ impl TestServer {
     }
 
     /// Shutdown the server, draining the spawn task.
-    pub async fn shutdown(self) {
+    ///
+    /// Surfaces a panic from the server task and fails on timeout rather
+    /// than swallowing both, so a crashing or hung server can't silently
+    /// pass the test (and leak the background task).
+    pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.server_handle).await;
+        match tokio::time::timeout(Duration::from_secs(5), &mut self.server_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
+            Ok(Err(join_err)) => panic!("Flight SQL server task failed to join: {join_err}"),
+            Err(_elapsed) => {
+                self.server_handle.abort();
+                panic!("Flight SQL server did not shut down within 5s");
+            }
+        }
     }
 }
 
@@ -264,7 +279,9 @@ pub async fn write_test_logs_for_tenant(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(10);
+    let attributes_field = arrow_schema
+        .field_with_name("attributes")
+        .expect("logs schema must contain an `attributes` field");
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),

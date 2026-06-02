@@ -6,7 +6,7 @@
     clippy::uninlined_format_args
 )]
 
-use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
+use icegate_common::{DEFAULT_TENANT_ID, ICEGATE_NAMESPACE, LOGS_TABLE};
 
 use super::harness::{TestServer, count_from_batches, execute_sql, write_test_logs_for_tenant};
 
@@ -43,11 +43,24 @@ async fn each_tenant_sees_only_their_own_rows() -> Result<(), Box<dyn std::error
 
 #[tokio::test]
 async fn missing_tenant_header_falls_back_to_default_tenant() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, _catalog) = TestServer::start().await?;
+    let (server, catalog) = TestServer::start().await?;
+
+    // Seed rows under the default tenant. An empty table returns 0 for
+    // every tenant, so without seeded data this test would pass even if
+    // the fallback were broken. With data present, a headerless client
+    // must resolve to DEFAULT_TENANT_ID to see exactly these rows.
+    let table_ident = iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?;
+    let table = catalog.load_table(&table_ident).await?;
+    write_test_logs_for_tenant(&table, &catalog, DEFAULT_TENANT_ID, "default-service", "Default").await?;
+
     // No tenant header — provider falls back to DEFAULT_TENANT_ID ("default").
     let mut client = server.client(None);
     let batches = execute_sql(&mut client, "SELECT count(*) FROM iceberg.icegate.logs").await?;
-    assert_eq!(count_from_batches(&batches), 0);
+    assert_eq!(
+        count_from_batches(&batches),
+        3,
+        "headerless client must fall back to the default tenant and see its 3 rows"
+    );
     server.shutdown().await;
     Ok(())
 }

@@ -66,7 +66,10 @@ impl FlightSqlConfig {
 impl Default for FlightSqlConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Opt-in: an absent `flight_sql` block (or one omitting
+            // `enabled`) leaves the endpoint off rather than binding an
+            // unauthenticated listener by surprise.
+            enabled: false,
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
@@ -93,9 +96,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_enabled_on_8815() {
+    fn default_is_disabled_on_8815() {
         let cfg = FlightSqlConfig::default();
-        assert!(cfg.enabled);
+        // Default is disabled so omitting the block can't surprise-bind an
+        // unauthenticated endpoint; the transport defaults are still set.
+        assert!(!cfg.enabled);
         assert_eq!(cfg.port, DEFAULT_PORT);
         assert_eq!(cfg.host, DEFAULT_HOST);
         assert_eq!(cfg.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
@@ -124,6 +129,7 @@ mod tests {
     #[test]
     fn validate_rejects_zero_max_message_size() {
         let cfg = FlightSqlConfig {
+            enabled: true,
             max_message_size: 0,
             ..FlightSqlConfig::default()
         };

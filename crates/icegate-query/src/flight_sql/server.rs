@@ -7,7 +7,7 @@
 //! same orchestration logic in `cli::commands::run` can drive every
 //! server with a single pattern.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::execution::context::SQLOptions;
@@ -66,8 +66,11 @@ pub async fn run_with_port_tx(
     port_tx: Option<oneshot::Sender<u16>>,
     _metrics: Arc<QueryMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    let listener = TcpListener::bind(addr).await?;
+    // Bind via the `(host, port)` tuple so tonic resolves hostnames and
+    // IPv6 literals through `ToSocketAddrs`. Parsing a `"host:port"`
+    // string into a `SocketAddr` only accepts numeric IPs and would
+    // reject `localhost` or a bracketless IPv6 host.
+    let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(addr = %local_addr, "Flight SQL gRPC server listening");
     if let Some(tx) = port_tx {

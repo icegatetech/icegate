@@ -40,7 +40,6 @@ async fn shutdown_signal() {
 /// Execute the run command
 ///
 /// Starts all enabled query servers and runs until Ctrl+C
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Load configuration
     let config = QueryConfig::from_file(&config_path)?;
@@ -125,56 +124,14 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         }),
     );
 
-    // Spawn server tasks
-    let mut handles = Vec::new();
-
-    // Metrics server
-    if let Some(ref runtime) = metrics_runtime {
-        let metrics_config = config.metrics.clone();
-        let token = cancel_token.clone();
-        let registry = runtime.registry();
-        let handle = tokio::spawn(async move {
-            run_metrics_server(metrics_config, registry, token)
-                .await
-                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
-        });
-        handles.push(handle);
-    }
-
-    // Query servers
-    if config.loki.enabled {
-        let engine = Arc::clone(&query_engine);
-        let loki_config = config.loki.clone();
-        let token = cancel_token.clone();
-        let m = Arc::clone(&query_metrics);
-        let handle = tokio::spawn(async move { crate::loki::run(engine, loki_config, token, m).await });
-        handles.push(handle);
-    }
-
-    if config.prometheus.enabled {
-        let engine = Arc::clone(&query_engine);
-        let prom_config = config.prometheus.clone();
-        let token = cancel_token.clone();
-        let handle = tokio::spawn(async move { crate::prometheus::run(engine, prom_config, token).await });
-        handles.push(handle);
-    }
-
-    if config.tempo.enabled {
-        let engine = Arc::clone(&query_engine);
-        let tempo_config = config.tempo.clone();
-        let token = cancel_token.clone();
-        let handle = tokio::spawn(async move { crate::tempo::run(engine, tempo_config, token).await });
-        handles.push(handle);
-    }
-
-    if config.flight_sql.enabled {
-        let engine = Arc::clone(&query_engine);
-        let flight_sql_config = config.flight_sql.clone();
-        let token = cancel_token.clone();
-        let m = Arc::clone(&query_metrics);
-        let handle = tokio::spawn(async move { crate::flight_sql::run(engine, flight_sql_config, token, m).await });
-        handles.push(handle);
-    }
+    // Spawn one task per enabled server (metrics + each query API).
+    let handles = spawn_servers(
+        &config,
+        &query_engine,
+        &query_metrics,
+        metrics_runtime.as_ref(),
+        &cancel_token,
+    );
 
     if handles.is_empty() {
         tracing::warn!("No query servers are enabled in configuration");
@@ -184,6 +141,108 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     tracing::info!("All enabled query servers started");
     tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
+    let failure = await_shutdown(handles, &cancel_token).await;
+
+    if let Some(err) = failure {
+        io_cache.close().await;
+        drop(tracing_guard);
+        return Err(err);
+    }
+
+    tracing::info!("All query servers stopped gracefully");
+
+    // Gracefully close the IO cache to drain foyer's background flusher tasks.
+    // This prevents "sending on a closed channel" errors during runtime teardown.
+    io_cache.close().await;
+
+    // Keep tracing guard alive until the very end
+    drop(tracing_guard);
+
+    Ok(())
+}
+
+/// Join handle for a spawned server task.
+///
+/// Every server (metrics + each query API) is normalised to this single
+/// output type so [`await_shutdown`] can drain them through one
+/// `FuturesUnordered`.
+type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+
+/// Spawn one async task per enabled server, returning their join handles.
+///
+/// The metrics server's error is boxed to match the query servers' return
+/// type so the caller can treat every handle uniformly. Returns an empty
+/// vector when no server is enabled.
+fn spawn_servers(
+    config: &QueryConfig,
+    query_engine: &Arc<QueryEngine>,
+    query_metrics: &Arc<QueryMetrics>,
+    metrics_runtime: Option<&Arc<MetricsRuntime>>,
+    cancel_token: &CancellationToken,
+) -> Vec<ServerHandle> {
+    let mut handles = Vec::new();
+
+    // Metrics server
+    if let Some(runtime) = metrics_runtime {
+        let metrics_config = config.metrics.clone();
+        let token = cancel_token.clone();
+        let registry = runtime.registry();
+        handles.push(tokio::spawn(async move {
+            run_metrics_server(metrics_config, registry, token)
+                .await
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+        }));
+    }
+
+    // Query servers
+    if config.loki.enabled {
+        let engine = Arc::clone(query_engine);
+        let loki_config = config.loki.clone();
+        let token = cancel_token.clone();
+        let m = Arc::clone(query_metrics);
+        handles.push(tokio::spawn(async move {
+            crate::loki::run(engine, loki_config, token, m).await
+        }));
+    }
+
+    if config.prometheus.enabled {
+        let engine = Arc::clone(query_engine);
+        let prom_config = config.prometheus.clone();
+        let token = cancel_token.clone();
+        handles.push(tokio::spawn(async move {
+            crate::prometheus::run(engine, prom_config, token).await
+        }));
+    }
+
+    if config.tempo.enabled {
+        let engine = Arc::clone(query_engine);
+        let tempo_config = config.tempo.clone();
+        let token = cancel_token.clone();
+        handles.push(tokio::spawn(async move {
+            crate::tempo::run(engine, tempo_config, token).await
+        }));
+    }
+
+    if config.flight_sql.enabled {
+        let engine = Arc::clone(query_engine);
+        let flight_sql_config = config.flight_sql.clone();
+        let token = cancel_token.clone();
+        let m = Arc::clone(query_metrics);
+        handles.push(tokio::spawn(async move {
+            crate::flight_sql::run(engine, flight_sql_config, token, m).await
+        }));
+    }
+
+    handles
+}
+
+/// Drive all server tasks until shutdown, returning the first failure.
+///
+/// Waits for a shutdown signal (SIGINT/SIGTERM) or for any task to exit,
+/// then cancels the shared token and drains the rest. A task that exits
+/// before the signal — or returns an error, or fails to join — is recorded
+/// as the failure to propagate.
+async fn await_shutdown(handles: Vec<ServerHandle>, cancel_token: &CancellationToken) -> Option<QueryError> {
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -230,20 +289,5 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         }
     }
 
-    if let Some(err) = failure {
-        io_cache.close().await;
-        drop(tracing_guard);
-        return Err(err);
-    }
-
-    tracing::info!("All query servers stopped gracefully");
-
-    // Gracefully close the IO cache to drain foyer's background flusher tasks.
-    // This prevents "sending on a closed channel" errors during runtime teardown.
-    io_cache.close().await;
-
-    // Keep tracing guard alive until the very end
-    drop(tracing_guard);
-
-    Ok(())
+    failure
 }

@@ -19,7 +19,7 @@ The Flight SQL endpoint exposes the IceGate data lake as a generic SQL warehouse
 
 ### Address & catalog layout
 
-```
+```text
 grpc://<host>:8815                  # plaintext gRPC (TLS terminated at the gateway)
 catalog:   iceberg
 schema:    icegate

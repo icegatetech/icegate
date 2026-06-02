@@ -23,6 +23,14 @@ async fn select_one_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(batch.num_columns(), 1);
+    // Assert the scalar value round-trips, not just the batch shape.
+    let value = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("SELECT 1 should produce an Int64 column")
+        .value(0);
+    assert_eq!(value, 1, "SELECT 1 must round-trip the literal value 1");
 
     server.shutdown().await;
     Ok(())
