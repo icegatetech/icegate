@@ -13,7 +13,7 @@ use axum::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use iceberg::expr::Predicate;
-use icegate_common::{DEFAULT_TENANT_ID, TENANT_ID_HEADER, is_valid_tenant_id};
+use icegate_common::{TENANT_ID_HEADER, resolve_tenant_id};
 use serde_json::json;
 
 use super::{
@@ -42,11 +42,7 @@ use crate::{error::QueryError, traceql::iceberg_predicate::translate_query_to_pr
 /// ingest-path behaviour so that data is always queryable under the same
 /// tenant that was used during ingestion.
 fn extract_tenant_id(headers: &HeaderMap) -> String {
-    headers
-        .get(TENANT_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| is_valid_tenant_id(s))
-        .map_or_else(|| DEFAULT_TENANT_ID.to_string(), String::from)
+    resolve_tenant_id(headers.get(TENANT_ID_HEADER).and_then(|v| v.to_str().ok()))
 }
 
 /// Convert a Unix epoch second value into a UTC `DateTime`.

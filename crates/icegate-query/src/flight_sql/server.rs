@@ -2,10 +2,18 @@
 //!
 //! Spins up a tonic server that hosts the upstream
 //! `datafusion_flight_sql_server::service::FlightSqlService` with our
-//! tenant-aware [`IceGateSessionStateProvider`]. Wiring is intentionally
-//! identical to the HTTP servers ([`crate::loki::server::run`]) so the
-//! same orchestration logic in `cli::commands::run` can drive every
-//! server with a single pattern.
+//! tenant-aware [`IceGateSessionStateProvider`]. Wiring mirrors the HTTP
+//! servers ([`crate::loki::server::run`]) so the orchestration logic in
+//! `cli::commands::run` can drive every server with one pattern.
+//!
+//! Unlike the HTTP servers, no [`crate::infra::metrics::QueryMetrics`] is
+//! threaded in: the upstream `FlightSqlService` owns the request and
+//! query-execution loop and exposes no hook to record the per-query
+//! metrics (parse / plan / execute / rows / bytes) the HTTP handlers
+//! emit. Wiring meaningful Flight SQL metrics needs an upstream hook or a
+//! dedicated gRPC middleware layer and is tracked as a follow-up; an
+//! unused `QueryMetrics` argument is deliberately not carried here so the
+//! signature doesn't imply observability that isn't wired.
 
 use std::sync::Arc;
 
@@ -18,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::FlightSqlConfig;
 use super::provider::IceGateSessionStateProvider;
-use crate::{engine::QueryEngine, infra::metrics::QueryMetrics};
+use crate::engine::QueryEngine;
 
 /// Build the SQL execution options enforced on every client query.
 ///
@@ -46,9 +54,8 @@ pub async fn run(
     engine: Arc<QueryEngine>,
     config: FlightSqlConfig,
     cancel_token: CancellationToken,
-    metrics: Arc<QueryMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(engine, config, cancel_token, None, metrics).await
+    run_with_port_tx(engine, config, cancel_token, None).await
 }
 
 /// Variant of [`run`] that publishes the actually bound port on a
@@ -64,7 +71,6 @@ pub async fn run_with_port_tx(
     config: FlightSqlConfig,
     cancel_token: CancellationToken,
     port_tx: Option<oneshot::Sender<u16>>,
-    _metrics: Arc<QueryMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Bind via the `(host, port)` tuple so tonic resolves hostnames and
     // IPv6 literals through `ToSocketAddrs`. Parsing a `"host:port"`
@@ -95,20 +101,4 @@ pub async fn run_with_port_tx(
 
     tracing::info!("Flight SQL server stopped");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_only_options_block_ddl_and_dml() {
-        let opts = read_only_sql_options();
-        // The fields are private but `SQLOptions` implements `Debug` —
-        // verify via the public verifier method which short-circuits on
-        // disallowed statements. A round-trip through a parsed plan is
-        // covered in the integration tests; this is a sanity check that
-        // the builder calls didn't get accidentally re-ordered.
-        let _ = opts; // ensures the builder constructs without panicking
-    }
 }

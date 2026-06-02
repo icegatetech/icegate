@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::Query as QueryExtra;
-use icegate_common::{DEFAULT_TENANT_ID, TENANT_ID_HEADER, is_valid_tenant_id};
+use icegate_common::{TENANT_ID_HEADER, resolve_tenant_id};
 
 use super::{
     error::{LokiError, LokiResult},
@@ -32,11 +32,7 @@ use crate::{error::QueryError, infra::metrics::QueryRequestRecorder};
 /// ingest-path behaviour so that data is always queryable under the same
 /// tenant that was used during ingestion.
 fn extract_tenant_id(headers: &HeaderMap) -> String {
-    headers
-        .get(TENANT_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| is_valid_tenant_id(s))
-        .map_or_else(|| DEFAULT_TENANT_ID.to_string(), String::from)
+    resolve_tenant_id(headers.get(TENANT_ID_HEADER).and_then(|v| v.to_str().ok()))
 }
 
 // ============================================================================

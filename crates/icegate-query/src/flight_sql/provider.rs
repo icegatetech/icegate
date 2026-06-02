@@ -26,7 +26,6 @@ use datafusion::catalog::CatalogProvider;
 use datafusion::execution::context::SessionState;
 use datafusion::prelude::SessionContext;
 use datafusion_flight_sql_server::session::SessionStateProvider;
-use icegate_common::ICEBERG_CATALOG;
 use tonic::{Request, Status};
 
 use super::tenant_catalog::TenantScopedCatalogProvider;
@@ -59,8 +58,11 @@ impl SessionStateProvider for IceGateSessionStateProvider {
             .create_session()
             .await
             .map_err(|err| Status::internal(format!("flight-sql: session creation failed: {err}")))?;
-        install_tenant_scope(&ctx, &tenant_id)
-            .await
+        // The engine registers the iceberg catalog under its configured
+        // `catalog_name` (default `iceberg`); look it up under the same
+        // name rather than a hardcoded constant so a non-default catalog
+        // name doesn't break every request.
+        install_tenant_scope(&ctx, &self.engine.config().catalog_name, &tenant_id)
             .map_err(|err| Status::internal(format!("flight-sql: tenant scope installation failed: {err}")))?;
         Ok(ctx.state())
     }
@@ -68,28 +70,26 @@ impl SessionStateProvider for IceGateSessionStateProvider {
 
 /// Install the tenant-scoped catalog wrapper on this session.
 ///
-/// Runs inside the session bootstrap path, *before* the
-/// `FlightSqlService::with_sql_options` read-only guard kicks in, so
-/// the `SET` statement here is permitted regardless of the SQL options
-/// applied to user-submitted queries.
-async fn install_tenant_scope(ctx: &SessionContext, tenant_id: &str) -> Result<(), datafusion::error::DataFusionError> {
-    // Turn on `information_schema` so BI tools that introspect via
-    // `SHOW TABLES` / `SELECT * FROM information_schema.tables` work
-    // out of the box.
-    ctx.sql("SET datafusion.catalog.information_schema = true").await?;
-
-    // Wrap the iceberg catalog so every table it surfaces has the
-    // tenant predicate injected into `scan()` at the `TableProvider`
-    // layer AND the `tenant_id` column hidden from the schema. This
-    // is the entire tenancy surface — no shortcut views, no alternate
-    // path, just the wrapped catalog.
-    let inner_catalog = ctx.catalog(ICEBERG_CATALOG).ok_or_else(|| {
+/// `information_schema` is enabled once on the engine's `SessionConfig`
+/// (see [`QueryEngine::create_session`]), so there is no per-request
+/// `SET` statement here — only the catalog swap, which is synchronous.
+fn install_tenant_scope(
+    ctx: &SessionContext,
+    catalog_name: &str,
+    tenant_id: &str,
+) -> Result<(), datafusion::error::DataFusionError> {
+    // Wrap the iceberg catalog so every table it surfaces enforces the
+    // tenant predicate at the row level inside `scan()` AND hides the
+    // `tenant_id` column from the schema. This is the entire tenancy
+    // surface — no shortcut views, no alternate path, just the wrapped
+    // catalog.
+    let inner_catalog = ctx.catalog(catalog_name).ok_or_else(|| {
         datafusion::error::DataFusionError::Internal(format!(
-            "iceberg catalog `{ICEBERG_CATALOG}` not registered on the session"
+            "iceberg catalog `{catalog_name}` not registered on the session"
         ))
     })?;
     let wrapped: Arc<dyn CatalogProvider> = Arc::new(TenantScopedCatalogProvider::new(inner_catalog, tenant_id));
-    ctx.register_catalog(ICEBERG_CATALOG, wrapped);
+    ctx.register_catalog(catalog_name, wrapped);
     Ok(())
 }
 

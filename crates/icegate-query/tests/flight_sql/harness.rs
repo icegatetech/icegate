@@ -9,7 +9,8 @@
     clippy::expect_used,
     clippy::print_stdout,
     clippy::uninlined_format_args,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
 )]
 
 use std::sync::Arc;
@@ -44,6 +45,9 @@ use icegate_query::{
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
+
+/// Severity values cycled across written log rows.
+const SEVERITIES: [&str; 3] = ["INFO", "WARN", "ERROR"];
 
 /// Connected Flight SQL test server.
 ///
@@ -101,13 +105,11 @@ impl TestServer {
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let server_handle = tokio::spawn(async move {
-            let disabled_metrics = Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
             icegate_query::flight_sql::run_with_port_tx(
                 server_engine,
                 flight_sql_config,
                 cancel_token_clone,
                 Some(port_tx),
-                disabled_metrics,
             )
             .await
             .unwrap();
@@ -227,11 +229,8 @@ pub fn count_from_batches(batches: &[RecordBatch]) -> i64 {
 
 /// Write three rows of log data for the given tenant.
 ///
-/// Schema layout follows `icegate_common::schema::logs_schema`; the
-/// helper is intentionally narrower than the production-quality writer
-/// in `tests/loki/harness.rs` — Flight SQL tests only need enough rows
-/// to assert tenant isolation, not full attribute-key coverage.
-#[allow(clippy::too_many_lines)]
+/// Thin wrapper over [`write_logs_file`] for the common single-tenant
+/// case; preserves the original call shape used across the tenant tests.
 pub async fn write_test_logs_for_tenant(
     table: &Table,
     catalog: &Arc<dyn Catalog>,
@@ -239,41 +238,67 @@ pub async fn write_test_logs_for_tenant(
     service_name: &str,
     body_prefix: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    write_logs_file(
+        table,
+        catalog,
+        &[tenant_id, tenant_id, tenant_id],
+        service_name,
+        body_prefix,
+    )
+    .await
+}
+
+/// Write one log row per entry in `tenant_ids` into a SINGLE Parquet data
+/// file and commit it.
+///
+/// When the slice holds more than one distinct tenant the rows are
+/// *co-located in one file*, so file-level statistics for `tenant_id` span
+/// every tenant present — isolation then cannot come from file/row-group
+/// pruning and must be enforced by the wrapper's row-level filter. That is
+/// exactly the production WAL hot-segment layout the tenant wrapper has to
+/// defend against.
+///
+/// Schema layout follows `icegate_common::schema::logs_schema`; the helper
+/// is intentionally narrower than the production writer in
+/// `tests/loki/harness.rs` — Flight SQL tests only need enough rows to
+/// assert tenant isolation, not full attribute-key coverage.
+#[allow(clippy::too_many_lines)]
+pub async fn write_logs_file(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_ids: &[&str],
+    service_name: &str,
+    body_prefix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    let row_count = tenant_ids.len();
     let unique_suffix = format!(
         "{}-{}",
-        tenant_id,
+        tenant_ids.first().copied().unwrap_or("empty"),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
     );
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
 
-    let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(vec![tenant_id, tenant_id, tenant_id]));
-    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")]));
-    let service_name_arr: ArrayRef = Arc::new(StringArray::from(vec![
-        Some(service_name),
-        Some(service_name),
-        Some(service_name),
-    ]));
-    let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
-        now_micros,
-        now_micros - 1000,
-        now_micros - 2000,
-    ]));
-    let observed_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
-        now_micros,
-        now_micros - 1000,
-        now_micros - 2000,
-    ]));
-    let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
-        now_micros, now_micros, now_micros,
-    ]));
-    let severity_text: ArrayRef = Arc::new(StringArray::from(vec![Some("INFO"), Some("WARN"), Some("ERROR")]));
-    let body: ArrayRef = Arc::new(StringArray::from(vec![
-        Some(format!("{} message 1", body_prefix)),
-        Some(format!("{} message 2", body_prefix)),
-        Some(format!("{} message 3", body_prefix)),
-    ]));
+    let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids.to_vec()));
+    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"); row_count]));
+    let service_name_arr: ArrayRef = Arc::new(StringArray::from(vec![Some(service_name); row_count]));
+
+    let timestamps: Vec<i64> = (0..row_count).map(|i| now_micros - (i as i64) * 1000).collect();
+    let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps.clone()));
+    let observed_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps));
+    let ingested_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![now_micros; row_count]));
+
+    let severity_text: ArrayRef = Arc::new(StringArray::from(
+        (0..row_count)
+            .map(|i| Some(SEVERITIES[i % SEVERITIES.len()]))
+            .collect::<Vec<_>>(),
+    ));
+    let body: ArrayRef = Arc::new(StringArray::from(
+        (0..row_count)
+            .map(|i| Some(format!("{body_prefix} message {}", i + 1)))
+            .collect::<Vec<_>>(),
+    ));
 
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
@@ -298,30 +323,30 @@ pub async fn write_test_logs_for_tenant(
     let mut attributes_builder = MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new())
         .with_keys_field(key_field)
         .with_values_field(value_field);
-    for _ in 0..3 {
+    for tenant_id in tenant_ids {
         attributes_builder.keys().append_value("tenant_marker");
         attributes_builder.values().append_value(tenant_id);
         attributes_builder.append(true)?;
     }
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
+    // Distinct trace/span ids per row, derived from the row index so the
+    // values stay unique without a fixed lookup table.
     let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
-    for tid in [
-        "0102030405060708090a0b0c0d0e0f10",
-        "1112131415161718191a1b1c1d1e1f20",
-        "2122232425262728292a2b2c2d2e2f30",
-    ] {
-        trace_id_builder.append_value(hex::decode(tid)?.as_slice())?;
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
+    for i in 0..row_count {
+        let mut trace = [0u8; 16];
+        let mut span = [0u8; 8];
+        trace[0] = i as u8;
+        span[0] = i as u8;
+        trace_id_builder.append_value(trace)?;
+        span_id_builder.append_value(span)?;
     }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
-    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
-    for sid in ["0102030405060708", "1112131415161718", "2122232425262728"] {
-        span_id_builder.append_value(hex::decode(sid)?.as_slice())?;
-    }
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
     let batch = RecordBatch::try_new(
-        arrow_schema.clone(),
+        arrow_schema,
         vec![
             tenant_id_arr,
             cloud_account_id,
@@ -355,8 +380,7 @@ pub async fn write_test_logs_for_tenant(
     let data_files = data_file_writer.close().await?;
 
     let tx = Transaction::new(table);
-    let action = tx.fast_append();
-    let action = action.add_data_files(data_files);
+    let action = tx.fast_append().add_data_files(data_files);
     let tx = action.apply(Transaction::new(table))?;
     tx.commit(&**catalog).await?;
     Ok(())

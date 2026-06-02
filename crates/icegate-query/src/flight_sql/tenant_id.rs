@@ -6,32 +6,28 @@
 //! arbitrary gRPC header (ADBC, JDBC, `grpcurl -H`, the ADBC-backed
 //! Apache Arrow Flight SQL ODBC driver) can supply it.
 //!
-//! Invalid values fall back to [`DEFAULT_TENANT_ID`]. There is no
-//! password verification — the Flight SQL endpoint trusts the gateway in
-//! front of it, exactly like the existing HTTP servers do with the
-//! `X-Scope-OrgID` header.
+//! Invalid values fall back to the default tenant. There is no password
+//! verification — the Flight SQL endpoint trusts the gateway in front of
+//! it, exactly like the existing HTTP servers do with the `X-Scope-OrgID`
+//! header. The validate-or-default policy is shared with the HTTP paths
+//! via [`icegate_common::resolve_tenant_id`].
 
-use icegate_common::{DEFAULT_TENANT_ID, TENANT_ID_HEADER, is_valid_tenant_id};
+use icegate_common::TENANT_ID_HEADER;
 use tonic::metadata::MetadataMap;
 
 /// Resolve the tenant identifier for this request.
 ///
-/// Reads `x-scope-orgid`; returns [`DEFAULT_TENANT_ID`] when the header
-/// is absent or malformed.
+/// Reads `x-scope-orgid`; returns the default tenant when the header is
+/// absent or malformed. Extracts the raw gRPC metadata value and defers
+/// the validate-or-default decision to [`icegate_common::resolve_tenant_id`]
+/// so every protocol shares one policy.
 pub(super) fn resolve_tenant_id(metadata: &MetadataMap) -> String {
-    tenant_from_scope_header(metadata).unwrap_or_else(|| DEFAULT_TENANT_ID.to_owned())
-}
-
-fn tenant_from_scope_header(metadata: &MetadataMap) -> Option<String> {
-    metadata
-        .get(TENANT_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| is_valid_tenant_id(s))
-        .map(str::to_owned)
+    icegate_common::resolve_tenant_id(metadata.get(TENANT_ID_HEADER).and_then(|v| v.to_str().ok()))
 }
 
 #[cfg(test)]
 mod tests {
+    use icegate_common::DEFAULT_TENANT_ID;
     use tonic::metadata::AsciiMetadataKey;
 
     use super::*;

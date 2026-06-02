@@ -1035,7 +1035,10 @@ impl Accumulator for WelfordGridAccumulator {
                             #[allow(clippy::cast_precision_loss)]
                             let new_mean = self.means[i].mul_add(n_a as f64, other_mean * n_b as f64) / n_ab as f64;
                             #[allow(clippy::cast_precision_loss)]
-                            let new_m2 = self.m2s[i] + other_m2 + delta * delta * n_a as f64 * n_b as f64 / n_ab as f64;
+                            // Fuse the final multiply-add (single rounding), matching the
+                            // streaming `update` path's `mul_add` and the `new_mean` line above.
+                            let new_m2 =
+                                (delta * delta).mul_add(n_a as f64 * n_b as f64 / n_ab as f64, self.m2s[i] + other_m2);
                             self.counts[i] = n_ab;
                             self.means[i] = new_mean;
                             self.m2s[i] = new_m2;

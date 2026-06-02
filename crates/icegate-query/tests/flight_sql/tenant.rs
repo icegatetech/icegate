@@ -8,7 +8,7 @@
 
 use icegate_common::{DEFAULT_TENANT_ID, ICEGATE_NAMESPACE, LOGS_TABLE};
 
-use super::harness::{TestServer, count_from_batches, execute_sql, write_test_logs_for_tenant};
+use super::harness::{TestServer, count_from_batches, execute_sql, write_logs_file, write_test_logs_for_tenant};
 
 #[tokio::test]
 async fn each_tenant_sees_only_their_own_rows() -> Result<(), Box<dyn std::error::Error>> {
@@ -150,6 +150,48 @@ async fn tenant_id_is_hidden_from_schema_introspection() -> Result<(), Box<dyn s
     assert!(
         !pretty.contains("tenant_id"),
         "information_schema.columns must hide tenant_id, got:\n{pretty}"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn co_located_tenants_in_one_file_stay_isolated() -> Result<(), Box<dyn std::error::Error>> {
+    // The strongest isolation check: two tenants' rows live in the SAME
+    // data file, so the file's `tenant_id` statistics span both tenants
+    // and no file/row-group pruning can separate them. Isolation here can
+    // only come from the wrapper's row-level `FilterExec` — the exact
+    // guarantee that protects un-partitioned WAL hot segments in
+    // production. This runs through the full SQL planner + optimizer, so
+    // it also proves the optimizer doesn't drop the injected filter.
+    let (server, catalog) = TestServer::start().await?;
+
+    let table_ident = iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?;
+    let table = catalog.load_table(&table_ident).await?;
+    write_logs_file(
+        &table,
+        &catalog,
+        &["tenant-alpha", "tenant-alpha", "tenant-beta"],
+        "shared-service",
+        "Mixed",
+    )
+    .await?;
+
+    let mut client_alpha = server.client(Some("tenant-alpha"));
+    let batches = execute_sql(&mut client_alpha, "SELECT count(*) FROM iceberg.icegate.logs").await?;
+    assert_eq!(
+        count_from_batches(&batches),
+        2,
+        "tenant-alpha must see only its two rows from the shared file"
+    );
+
+    let mut client_beta = server.client(Some("tenant-beta"));
+    let batches = execute_sql(&mut client_beta, "SELECT count(*) FROM iceberg.icegate.logs").await?;
+    assert_eq!(
+        count_from_batches(&batches),
+        1,
+        "tenant-beta must see only its one row, never tenant-alpha's co-located rows"
     );
 
     server.shutdown().await;

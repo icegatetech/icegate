@@ -227,9 +227,11 @@ fn spawn_servers(
         let engine = Arc::clone(query_engine);
         let flight_sql_config = config.flight_sql.clone();
         let token = cancel_token.clone();
-        let m = Arc::clone(query_metrics);
+        // No `QueryMetrics`: the upstream Flight SQL service owns the
+        // request loop and exposes no per-query metrics hook (see
+        // `flight_sql::server`).
         handles.push(tokio::spawn(async move {
-            crate::flight_sql::run(engine, flight_sql_config, token, m).await
+            crate::flight_sql::run(engine, flight_sql_config, token).await
         }));
     }
 

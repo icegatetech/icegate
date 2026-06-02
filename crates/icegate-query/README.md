@@ -53,7 +53,10 @@ Defense-in-depth wrapped around the iceberg catalog:
 
 ### Read-only
 
-DDL (`CREATE`/`DROP`/`ALTER`) and DML (`INSERT`/`UPDATE`/`DELETE`) are rejected by DataFusion `SQLOptions` after parsing but before execution. `EXPLAIN`, `SHOW`, and `SET` are allowed.
+DDL (`CREATE`/`DROP`/`ALTER`) and DML (`INSERT`/`UPDATE`/`DELETE`) submitted as SQL text or prepared statements are rejected by DataFusion `SQLOptions` after parsing but before execution. `EXPLAIN`, `SHOW`, and `SET` are allowed.
+
+The upstream service applies that `SQLOptions` check only on the SQL and prepared-statement paths, not on the `CommandStatementSubstraitPlan` (Substrait) path. Read-only-ness there does not depend on `SQLOptions`: the engine's `TableProvider`s are read-only (no `insert_into`/`delete`/`update`), so a write expressed as a Substrait plan is still rejected at execution.
+Tenant isolation holds on every path — Substrait plans resolve tables through the same tenant-scoped catalog wrapper.
 
 The Flight SQL `BeginTransaction` / `EndTransaction` actions are not implemented — the upstream service returns `Unimplemented`. The endpoint is stateless and read-only; no transactional semantics exist to engage.
 
