@@ -248,13 +248,26 @@ impl TableProvider for TenantScopedTableProvider {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        // Per-column statistics from the inner provider are indexed
-        // by the original schema. Returning them as-is would point
-        // optimizers at a column layout that no longer matches the
-        // schema we advertise. Returning `None` keeps planning safe;
-        // the iceberg-datafusion provider rarely emits column stats
-        // for analytics queries today, so the lost optimization hints
-        // are negligible.
-        None
+        // Per-column statistics from the inner provider are positional
+        // over the original schema, which still carries `tenant_id`.
+        // Re-project them through the same `filtered_idx -> original_idx`
+        // map that `scan()` uses so the surviving column stats line up
+        // with the N-1 column schema we advertise and the `tenant_id`
+        // entry is dropped. Row and byte totals are column-agnostic and
+        // pass through unchanged; the tenant predicate injected in
+        // `scan()` refines the row count at execution time.
+        let mut stats = self.inner.statistics()?;
+        // `Statistics::project` indexes `column_statistics` positionally
+        // and panics on an out-of-bounds index, so only re-project when
+        // the inner provider emitted a full per-column vector aligned
+        // with its schema. The common "row count only" case carries an
+        // empty vector: keep the totals but drop the (absent) column
+        // stats rather than risk a positional mismatch or a panic.
+        if stats.column_statistics.len() == self.inner.schema().fields().len() {
+            Some(stats.project(Some(&self.index_map.to_vec())))
+        } else {
+            stats.column_statistics = Vec::new();
+            Some(stats)
+        }
     }
 }
