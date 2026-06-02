@@ -45,13 +45,18 @@ async fn each_tenant_sees_only_their_own_rows() -> Result<(), Box<dyn std::error
 async fn missing_tenant_header_falls_back_to_default_tenant() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start().await?;
 
-    // Seed rows under the default tenant. An empty table returns 0 for
-    // every tenant, so without seeded data this test would pass even if
-    // the fallback were broken. With data present, a headerless client
-    // must resolve to DEFAULT_TENANT_ID to see exactly these rows.
+    // Seed rows under the default tenant AND a non-default tenant. A table
+    // holding only default-tenant rows can't distinguish correct scoping
+    // from an unscoped leak — both return 3. With a second tenant present,
+    // a broken fallback that returned unscoped results would see all 6
+    // rows; only a fallback that resolves to DEFAULT_TENANT_ID sees exactly
+    // the 3 default rows.
     let table_ident = iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?;
     let table = catalog.load_table(&table_ident).await?;
     write_test_logs_for_tenant(&table, &catalog, DEFAULT_TENANT_ID, "default-service", "Default").await?;
+
+    let table = catalog.load_table(&table_ident).await?;
+    write_test_logs_for_tenant(&table, &catalog, "tenant-other", "other-service", "Other").await?;
 
     // No tenant header — provider falls back to DEFAULT_TENANT_ID ("default").
     let mut client = server.client(None);
@@ -59,7 +64,7 @@ async fn missing_tenant_header_falls_back_to_default_tenant() -> Result<(), Box<
     assert_eq!(
         count_from_batches(&batches),
         3,
-        "headerless client must fall back to the default tenant and see its 3 rows"
+        "headerless client must fall back to the default tenant and see only its 3 rows"
     );
     server.shutdown().await;
     Ok(())

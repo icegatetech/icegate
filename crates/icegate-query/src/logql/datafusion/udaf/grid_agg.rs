@@ -1825,6 +1825,63 @@ mod tests {
     }
 
     #[test]
+    fn test_welford_merge_matches_single_pass() {
+        // The distributed plan splits a partition into partial aggregates
+        // combined later via `merge_batch`. A single accumulator over the
+        // whole dataset and a merge of two partials over disjoint halves
+        // must agree — this locks in the Chan et al. parallel combination
+        // math (the `new_m2` `mul_add`) on the merge path.
+        //
+        // Grid has a single bucket at 100 with range 200, so every
+        // timestamp below maps into bucket 0.
+        let ctx = test_ctx(100, 100, 100, 200, 0);
+
+        // Extract bucket 0's value from a grid accumulator's `List` output.
+        let bucket0 = |result: ScalarValue| -> f64 {
+            if let ScalarValue::List(list) = result {
+                let arr = list.value(0);
+                arr.as_any().downcast_ref::<Float64Array>().unwrap().value(0)
+            } else {
+                panic!("expected List result");
+            }
+        };
+
+        // Full dataset processed in one streaming pass.
+        let mut full = WelfordGridAccumulator::new(ctx.clone(), true);
+        let ts_full = Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 30, 40, 50, 60])) as ArrayRef;
+        let vals_full = Arc::new(Float64Array::from(vec![2.0, 4.0, 4.0, 4.0, 5.0, 9.0])) as ArrayRef;
+        full.update_batch(&[ts_full, vals_full]).unwrap();
+
+        // The same data split across two partial accumulators.
+        let mut partial_a = WelfordGridAccumulator::new(ctx.clone(), true);
+        let ts_a = Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 30])) as ArrayRef;
+        let vals_a = Arc::new(Float64Array::from(vec![2.0, 4.0, 4.0])) as ArrayRef;
+        partial_a.update_batch(&[ts_a, vals_a]).unwrap();
+
+        let mut partial_b = WelfordGridAccumulator::new(ctx.clone(), true);
+        let ts_b = Arc::new(TimestampMicrosecondArray::from(vec![40, 50, 60])) as ArrayRef;
+        let vals_b = Arc::new(Float64Array::from(vec![4.0, 5.0, 9.0])) as ArrayRef;
+        partial_b.update_batch(&[ts_b, vals_b]).unwrap();
+
+        // Combine the partials through the merge path: the first merge hits
+        // the `n_a == 0` copy branch, the second the parallel-combine branch
+        // that fuses `new_m2` with `mul_add`.
+        let mut merged = WelfordGridAccumulator::new(ctx, true);
+        for partial in [&mut partial_a, &mut partial_b] {
+            let state = partial.state().unwrap();
+            let arrays: Vec<ArrayRef> = state.iter().map(ScalarValue::to_array).collect::<Result<_>>().unwrap();
+            merged.merge_batch(&arrays).unwrap();
+        }
+
+        let full_var = bucket0(full.evaluate().unwrap());
+        let merged_var = bucket0(merged.evaluate().unwrap());
+        assert!(
+            (full_var - merged_var).abs() < 1e-9,
+            "merged variance {merged_var} must match single-pass {full_var}"
+        );
+    }
+
+    #[test]
     fn test_empty_buckets_are_null() {
         // Grid: [0, 100, 200], but only ts=150 → matches [200] only
         let ctx = test_ctx(0, 200, 100, 100, 0);

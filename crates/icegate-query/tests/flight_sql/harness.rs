@@ -331,16 +331,15 @@ pub async fn write_logs_file(
     let attributes: ArrayRef = Arc::new(attributes_builder.finish());
 
     // Distinct trace/span ids per row, derived from the row index so the
-    // values stay unique without a fixed lookup table.
+    // values stay unique without a fixed lookup table. The full index is
+    // encoded little-endian (a `u128` fills the 16-byte trace id, a `u64`
+    // the 8-byte span id) so ids don't collide once `row_count` exceeds
+    // 256 — a single-byte index would wrap.
     let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
     let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
     for i in 0..row_count {
-        let mut trace = [0u8; 16];
-        let mut span = [0u8; 8];
-        trace[0] = i as u8;
-        span[0] = i as u8;
-        trace_id_builder.append_value(trace)?;
-        span_id_builder.append_value(span)?;
+        trace_id_builder.append_value((i as u128).to_le_bytes())?;
+        span_id_builder.append_value((i as u64).to_le_bytes())?;
     }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
