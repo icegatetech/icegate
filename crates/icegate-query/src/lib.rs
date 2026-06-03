@@ -14,6 +14,9 @@ pub mod engine;
 /// Infrastructure: metrics, observability helpers.
 pub mod infra;
 
+/// Flight SQL gRPC server (Apache Arrow Flight SQL)
+pub mod flight_sql;
+
 /// Loki API server (LogQL)
 pub mod loki;
 

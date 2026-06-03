@@ -947,7 +947,7 @@ impl Accumulator for WelfordGridAccumulator {
                 #[allow(clippy::cast_precision_loss)]
                 let new_mean = self.means[j] + delta / self.counts[j] as f64;
                 let delta2 = val - new_mean;
-                self.m2s[j] += delta * delta2;
+                self.m2s[j] = delta.mul_add(delta2, self.m2s[j]);
                 self.means[j] = new_mean;
             }
         }
@@ -1035,7 +1035,10 @@ impl Accumulator for WelfordGridAccumulator {
                             #[allow(clippy::cast_precision_loss)]
                             let new_mean = self.means[i].mul_add(n_a as f64, other_mean * n_b as f64) / n_ab as f64;
                             #[allow(clippy::cast_precision_loss)]
-                            let new_m2 = self.m2s[i] + other_m2 + delta * delta * n_a as f64 * n_b as f64 / n_ab as f64;
+                            // Fuse the final multiply-add (single rounding), matching the
+                            // streaming `update` path's `mul_add` and the `new_mean` line above.
+                            let new_m2 =
+                                (delta * delta).mul_add(n_a as f64 * n_b as f64 / n_ab as f64, self.m2s[i] + other_m2);
                             self.counts[i] = n_ab;
                             self.means[i] = new_mean;
                             self.m2s[i] = new_m2;
@@ -1819,6 +1822,63 @@ mod tests {
             let f64_arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
             assert_eq!(f64_arr.value(0), 25.0);
         }
+    }
+
+    #[test]
+    fn test_welford_merge_matches_single_pass() {
+        // The distributed plan splits a partition into partial aggregates
+        // combined later via `merge_batch`. A single accumulator over the
+        // whole dataset and a merge of two partials over disjoint halves
+        // must agree — this locks in the Chan et al. parallel combination
+        // math (the `new_m2` `mul_add`) on the merge path.
+        //
+        // Grid has a single bucket at 100 with range 200, so every
+        // timestamp below maps into bucket 0.
+        let ctx = test_ctx(100, 100, 100, 200, 0);
+
+        // Extract bucket 0's value from a grid accumulator's `List` output.
+        let bucket0 = |result: ScalarValue| -> f64 {
+            if let ScalarValue::List(list) = result {
+                let arr = list.value(0);
+                arr.as_any().downcast_ref::<Float64Array>().unwrap().value(0)
+            } else {
+                panic!("expected List result");
+            }
+        };
+
+        // Full dataset processed in one streaming pass.
+        let mut full = WelfordGridAccumulator::new(ctx.clone(), true);
+        let ts_full = Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 30, 40, 50, 60])) as ArrayRef;
+        let vals_full = Arc::new(Float64Array::from(vec![2.0, 4.0, 4.0, 4.0, 5.0, 9.0])) as ArrayRef;
+        full.update_batch(&[ts_full, vals_full]).unwrap();
+
+        // The same data split across two partial accumulators.
+        let mut partial_a = WelfordGridAccumulator::new(ctx.clone(), true);
+        let ts_a = Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 30])) as ArrayRef;
+        let vals_a = Arc::new(Float64Array::from(vec![2.0, 4.0, 4.0])) as ArrayRef;
+        partial_a.update_batch(&[ts_a, vals_a]).unwrap();
+
+        let mut partial_b = WelfordGridAccumulator::new(ctx.clone(), true);
+        let ts_b = Arc::new(TimestampMicrosecondArray::from(vec![40, 50, 60])) as ArrayRef;
+        let vals_b = Arc::new(Float64Array::from(vec![4.0, 5.0, 9.0])) as ArrayRef;
+        partial_b.update_batch(&[ts_b, vals_b]).unwrap();
+
+        // Combine the partials through the merge path: the first merge hits
+        // the `n_a == 0` copy branch, the second the parallel-combine branch
+        // that fuses `new_m2` with `mul_add`.
+        let mut merged = WelfordGridAccumulator::new(ctx, true);
+        for partial in [&mut partial_a, &mut partial_b] {
+            let state = partial.state().unwrap();
+            let arrays: Vec<ArrayRef> = state.iter().map(ScalarValue::to_array).collect::<Result<_>>().unwrap();
+            merged.merge_batch(&arrays).unwrap();
+        }
+
+        let full_var = bucket0(full.evaluate().unwrap());
+        let merged_var = bucket0(merged.evaluate().unwrap());
+        assert!(
+            (full_var - merged_var).abs() < 1e-9,
+            "merged variance {merged_var} must match single-pass {full_var}"
+        );
     }
 
     #[test]

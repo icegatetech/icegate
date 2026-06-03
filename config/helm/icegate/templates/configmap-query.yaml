@@ -69,6 +69,11 @@ data:
       enabled: {{ .Values.query.tempo.enabled }}
       host: "0.0.0.0"
       port: {{ .Values.query.tempo.port }}
+    flight_sql:
+      enabled: {{ .Values.query.flightSql.enabled | default false }}
+      host: "0.0.0.0"
+      port: {{ .Values.query.flightSql.port | default 8815 }}
+      max_message_size: {{ .Values.query.flightSql.maxMessageSize | default 16777216 | int }}
     metrics:
       enabled: {{ .Values.query.metrics.enabled }}
       host: "0.0.0.0"

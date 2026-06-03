@@ -238,10 +238,17 @@ impl QueryEngine {
     /// Returns an error if the catalog provider cannot be created
     #[tracing::instrument(skip(self))]
     pub async fn create_session(&self) -> Result<SessionContext> {
-        // Build session config from engine config
+        // Build session config from engine config.
+        //
+        // `information_schema` is enabled here once, on the session config,
+        // rather than via a per-request `SET datafusion.catalog.information_schema`
+        // statement: it lets Flight SQL BI tools introspect via `SHOW TABLES`
+        // / `information_schema.*`, and is a harmless no-op for the HTTP query
+        // paths that never read those virtual tables.
         let session_config = SessionConfig::new()
             .with_batch_size(self.config.batch_size)
-            .with_target_partitions(self.config.target_partitions);
+            .with_target_partitions(self.config.target_partitions)
+            .with_information_schema(true);
 
         // Instrument DataFusion execution plans with tracing spans.
         let options = InstrumentationOptions::builder().record_metrics(true).build();

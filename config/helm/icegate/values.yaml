@@ -133,6 +133,12 @@ query:
     enabled: true
     port: 3200
 
+  ## Apache Arrow Flight SQL API (gRPC)
+  flightSql:
+    enabled: true
+    port: 8815
+    maxMessageSize: 16777216
+
   ## Prometheus metrics endpoint
   metrics:
     enabled: true

@@ -40,6 +40,21 @@ pub fn is_valid_tenant_id(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Resolve a tenant identifier from an optional raw header value.
+///
+/// Returns the value when present and valid per [`is_valid_tenant_id`],
+/// otherwise [`DEFAULT_TENANT_ID`]. This is the single fallback policy
+/// shared by every query protocol (Loki, Tempo, Flight SQL); callers only
+/// differ in how they pull the raw string out of their header/metadata
+/// map, so centralising the validate-or-default step here keeps tenant
+/// resolution defined in exactly one place.
+#[must_use]
+pub fn resolve_tenant_id(header_value: Option<&str>) -> String {
+    header_value
+        .filter(|value| is_valid_tenant_id(value))
+        .map_or_else(|| DEFAULT_TENANT_ID.to_string(), String::from)
+}
+
 /// Topic name for logs in the WAL queue.
 pub const LOGS_TOPIC: &str = "logs";
 
@@ -116,5 +131,17 @@ mod tests {
         assert!(!is_valid_tenant_id("has.dot"));
         assert!(!is_valid_tenant_id("emoji\u{1F600}"));
         assert!(!is_valid_tenant_id("tab\there"));
+    }
+
+    #[test]
+    fn resolve_tenant_id_honours_valid_value() {
+        assert_eq!(resolve_tenant_id(Some("tenant-a")), "tenant-a");
+    }
+
+    #[test]
+    fn resolve_tenant_id_falls_back_on_absent_or_invalid() {
+        assert_eq!(resolve_tenant_id(None), DEFAULT_TENANT_ID);
+        assert_eq!(resolve_tenant_id(Some("has space")), DEFAULT_TENANT_ID);
+        assert_eq!(resolve_tenant_id(Some("")), DEFAULT_TENANT_ID);
     }
 }

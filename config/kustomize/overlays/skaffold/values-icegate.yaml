@@ -61,6 +61,10 @@ query:
   tempo:
     enabled: true
     port: 3200
+  flightSql:
+    enabled: true
+    port: 8815
+    maxMessageSize: 16777216
   tracing:
     enabled: true
     otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317
