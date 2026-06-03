@@ -281,7 +281,6 @@ pub async fn write_logs_file(
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids.to_vec()));
-    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![Some("acc-1"); row_count]));
     let service_name_arr: ArrayRef = Arc::new(StringArray::from(vec![Some(service_name); row_count]));
 
     let timestamps: Vec<i64> = (0..row_count).map(|i| now_micros - (i as i64) * 1000).collect();
@@ -348,7 +347,6 @@ pub async fn write_logs_file(
         arrow_schema,
         vec![
             tenant_id_arr,
-            cloud_account_id,
             service_name_arr,
             timestamp,
             observed_timestamp,
