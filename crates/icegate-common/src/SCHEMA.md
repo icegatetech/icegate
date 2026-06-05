@@ -256,7 +256,7 @@ Combines all metric types (gauge, sum, histogram, exponential_histogram, summary
 CREATE TABLE iceberg.triplecloud.metrics (
     -- Multi-tenancy field
     tenant_id VARCHAR NOT NULL,
-    service_name VARCHAR NOT NULL,
+    service_name VARCHAR,     -- Optional for flexibility
     service_instance_id VARCHAR,     -- Optional for flexibility
 
     -- Timestamp fields

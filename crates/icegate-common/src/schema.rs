@@ -681,7 +681,7 @@ pub fn metrics_schema() -> Result<Schema> {
                 "tenant_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            Arc::new(NestedField::required(
+            Arc::new(NestedField::optional(
                 2,
                 "service_name",
                 Type::Primitive(PrimitiveType::String),

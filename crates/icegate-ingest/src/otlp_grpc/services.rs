@@ -11,7 +11,10 @@ use opentelemetry_proto::tonic::collector::{
     logs::v1::{
         ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_server::LogsService,
     },
-    metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse, metrics_service_server::MetricsService},
+    metrics::v1::{
+        ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+        metrics_service_server::MetricsService,
+    },
     trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse, trace_service_server::TraceService},
 };
 use prost::Message;
@@ -26,6 +29,7 @@ use crate::{
 
 const SIGNAL_LOGS: &str = "logs";
 const SIGNAL_TRACES: &str = "traces";
+const SIGNAL_METRICS: &str = "metrics";
 const PROTOCOL_GRPC: &str = "grpc";
 const ENCODING_PROTOBUF: &str = "protobuf";
 const STATUS_OK: &str = "ok";
@@ -323,24 +327,48 @@ fn grpc_partial_success_from_drops(
 impl MetricsService for OtlpGrpcService {
     /// Handle OTLP metrics export request.
     ///
-    /// # TODO
-    /// - Parse OTLP metrics from request
-    /// - Handle different metric types (gauge, sum, histogram, summary)
-    /// - Transform to Iceberg schema format (from schema.rs)
-    /// - Write metrics to Iceberg metrics table via catalog
-    /// - Handle batching and backpressure
-    /// - Return partial success for rejected metrics
-    #[tracing::instrument(
-        skip(self, _request),
-        fields(method = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export")
-    )]
+    /// Transforms OTLP metric data points to an Arrow `RecordBatch` and writes
+    /// to the WAL queue. Strict-conformance transform drops surface as
+    /// `ExportMetricsPartialSuccess.rejected_data_points`.
+    #[tracing::instrument(name = "export_metrics", skip(self, request))]
     async fn export(
         &self,
-        _request: Request<ExportMetricsServiceRequest>,
+        request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        Err(Status::unimplemented(
-            "OTLP metrics ingestion: Parse OTLP → transform → write to Iceberg",
-        ))
+        debug!("Start handle OTLP GRPC metrics request");
+        let request_size = request.get_ref().encoded_len();
+        let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_METRICS, ENCODING_PROTOBUF);
+        request_metrics.record_request_size(request_size);
+
+        let tenant_id = extract_tenant_id(&request);
+        let export_request = request.into_inner();
+
+        let span = tracing::Span::current();
+        let transform_start = Instant::now();
+        let (batch_opt, drops) = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| transform::metrics_to_record_batch(&export_request, tenant_id.as_deref()))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
+        .map_err(|e| Status::from(GrpcError(e)))?;
+        request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_METRICS, STATUS_OK);
+
+        let payload = crate::otlp_metrics_partial::write_metrics_batch_to_wal(
+            &self.write_channel,
+            &request_metrics,
+            batch_opt,
+            drops,
+            self.wal_row_group_size,
+        )
+        .await
+        .map_err(|err| Status::from(GrpcError(err)))?;
+
+        Ok(Response::new(ExportMetricsServiceResponse {
+            partial_success: payload.map(|(rejected_data_points, error_message)| ExportMetricsPartialSuccess {
+                rejected_data_points,
+                error_message,
+            }),
+        }))
     }
 }
 
@@ -520,6 +548,52 @@ mod tests {
 
         let service = test_service(tx);
         let response = TraceService::export(&service, Request::new(request))
+            .await
+            .expect("grpc ok")
+            .into_inner();
+        writer.await.expect("writer");
+        assert!(response.partial_success.is_none());
+    }
+
+    #[tokio::test]
+    async fn export_metrics_returns_success_on_wal_ack() {
+        use opentelemetry_proto::tonic::collector::metrics::v1::{
+            ExportMetricsServiceRequest, metrics_service_server::MetricsService,
+        };
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+        };
+
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "cpu".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1_700_000_000_000_000_000,
+                                value: Some(number_data_point::Value::AsDouble(1.0)),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let (tx, mut rx) = channel(1);
+        let writer = tokio::spawn(async move {
+            let req = rx.recv().await.expect("write request");
+            assert_eq!(req.topic, icegate_common::METRICS_TOPIC);
+            let total = req.row_groups.iter().map(|rg| rg.batch.num_rows()).sum::<usize>();
+            req.response_tx.send(WriteResult::success(1, total, None)).expect("ack");
+        });
+
+        let service = test_service(tx);
+        let response = MetricsService::export(&service, Request::new(request))
             .await
             .expect("grpc ok")
             .into_inner();

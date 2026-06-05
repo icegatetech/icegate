@@ -15,6 +15,7 @@ pub(crate) use metadata::deserialize_row_group_boundary_range;
 #[cfg(test)]
 pub(crate) use metadata::serialize_row_group_boundary_range;
 pub(crate) use sorter::sort_logs;
+pub(crate) use sorter::sort_metrics;
 pub(crate) use sorter::sort_spans;
 #[cfg(test)]
 pub(crate) use test_utils::logs_row_group_boundary_range_from_batch;
