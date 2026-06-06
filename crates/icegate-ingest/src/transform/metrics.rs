@@ -77,10 +77,6 @@ const AGG_TEMPORALITY_CUMULATIVE: &str = "CUMULATIVE";
 const SERVICE_NAME_KEY: &str = "service.name";
 const SERVICE_INSTANCE_ID_KEY: &str = "service.instance.id";
 
-/// `OTel` default stored when a resource carries no `service.name`. `service_name`
-/// is a required column on the metrics table, so it must never be null.
-const UNKNOWN_SERVICE: &str = "unknown_service";
-
 /// Promoted keys suppressed from the merged `attributes` MAP at the resource
 /// level so they are not stored twice (once in the column, once in the map) —
 /// mirrors the logs `LOG_PROMOTED_RESOURCE_KEYS` rule. A more specific
@@ -114,6 +110,33 @@ fn convert_buckets(buckets: &exponential_histogram_data_point::Buckets) -> crate
         .map(|c| u64_to_i64(*c, "exponential_histogram.bucket_count"))
         .collect::<crate::error::Result<Vec<_>>>()?;
     Ok((buckets.offset, counts))
+}
+
+/// Minimum/maximum exponential-histogram `scale` accepted, per the `OpenTelemetry`
+/// data model (Base2 Exponential Histogram: `MaxScale = 20`; the reference minimum
+/// is `-10`, beyond which `base = 2^(2^-scale)` overflows `f64`). The wire protocol
+/// leaves `scale` unrestricted, so this is a data-model conformance bound enforced
+/// as a counted drop, not a hard error.
+const EXP_HISTOGRAM_SCALE_MIN: i32 = -10;
+const EXP_HISTOGRAM_SCALE_MAX: i32 = 20;
+
+/// True if `value` is present and non-finite (`NaN` or +/-Inf). Such values must
+/// never be stored, so the carrying data point is dropped as a strict-conformance
+/// violation.
+fn is_non_finite(value: Option<f64>) -> bool {
+    value.is_some_and(|v| !v.is_finite())
+}
+
+/// Whether a standard histogram's `bucket_counts`/`explicit_bounds` lengths are
+/// consistent per OTLP: `bucket_counts` carries exactly one more element than
+/// `explicit_bounds` (the implicit overflow bucket to +infinity); both empty is the
+/// only valid zero-length case.
+const fn histogram_buckets_consistent(bucket_counts: usize, explicit_bounds: usize) -> bool {
+    if bucket_counts == 0 {
+        explicit_bounds == 0
+    } else {
+        bucket_counts == explicit_bounds + 1
+    }
 }
 
 /// Map an OTLP `AggregationTemporality` discriminant to its stored string.
@@ -155,6 +178,8 @@ fn data_point_count(data: &metric::Data) -> usize {
 /// which stores underscore-normalised keys; any metrics query layer must look
 /// attributes up by their dotted key.
 fn merge_point_attributes(base: &BTreeMap<String, String>, data_point: &[KeyValue]) -> BTreeMap<String, String> {
+    // TODO(low): `data_point` is frequently empty (all dimensions live at resource/scope
+    // level), making this clone redundant; returning `Cow::Borrowed(base)` would avoid it.
     let mut merged = base.clone();
     for kv in data_point {
         for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
@@ -164,10 +189,26 @@ fn merge_point_attributes(base: &BTreeMap<String, String>, data_point: &[KeyValu
     merged
 }
 
+/// Flatten `Metric.metadata` (OTLP `KeyValue`s) into a deduped, dotted-key map.
+///
+/// Metric-level metadata is shared by every data point of the metric, so it is
+/// flattened once per metric (mirroring [`merge_point_attributes`] for the
+/// data-point attributes). A `BTreeMap` yields sorted, de-duplicated keys, which
+/// a `MAP<String,String>` column requires.
+fn flatten_metric_metadata(metadata: &[KeyValue]) -> BTreeMap<String, String> {
+    let mut flattened = BTreeMap::new();
+    for kv in metadata {
+        for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
+            flattened.insert(key, value);
+        }
+    }
+    flattened
+}
+
 /// Per-row context shared by every data point under one resource+scope+metric.
 struct RowContext<'a> {
     tenant: &'a str,
-    service_name: &'a str,
+    service_name: Option<&'a str>,
     service_instance_id: Option<&'a str>,
     metric_name: &'a str,
     description: &'a str,
@@ -175,6 +216,8 @@ struct RowContext<'a> {
     /// Pre-flattened resource+scope attributes shared by every data point under
     /// this resource/scope (see [`merge_point_attributes`]).
     base_attributes: &'a BTreeMap<String, String>,
+    /// Flattened `Metric.metadata`, shared by every data point of this metric.
+    metadata: &'a BTreeMap<String, String>,
     ingested: i64,
 }
 
@@ -214,6 +257,7 @@ struct MetricColumns {
     quantile_values: ListBuilder<StructBuilder>,
     flags: Int32Builder,
     exemplars: ListBuilder<StructBuilder>,
+    metadata: MapBuilder<StringBuilder, StringBuilder>,
     schema: Arc<Schema>,
 }
 
@@ -232,10 +276,14 @@ impl MetricColumns {
         let (exemplar_el, exemplar_fields) = list_struct_fields(&schema, "exemplars")?;
         let (exemplar_attr_key, exemplar_attr_val) =
             extract_map_fields_from_nested_struct(&exemplar_fields, "attributes")?;
+        let (metadata_key, metadata_val) = extract_map_fields_from_schema_named(&schema, "metadata")?;
 
         let attributes = MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
             .with_keys_field(attr_key)
             .with_values_field(attr_val);
+        let metadata = MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
+            .with_keys_field(metadata_key)
+            .with_values_field(metadata_val);
 
         // quantile struct: (quantile: Double, value: Double) in schema order.
         let quantile_values = ListBuilder::new(StructBuilder::new(
@@ -300,6 +348,7 @@ impl MetricColumns {
             quantile_values,
             flags: Int32Builder::with_capacity(capacity),
             exemplars,
+            metadata,
             schema,
         })
     }
@@ -343,6 +392,7 @@ impl MetricColumns {
             Arc::new(self.quantile_values.finish()),
             Arc::new(self.flags.finish()),
             Arc::new(self.exemplars.finish()),
+            Arc::new(self.metadata.finish()),
         ];
         RecordBatch::try_new(self.schema, columns).map_err(|e| {
             tracing::error!("Failed to create metrics RecordBatch: {e}");
@@ -364,7 +414,10 @@ impl MetricColumns {
         flags: Option<i32>,
     ) -> crate::error::Result<()> {
         self.tenant_id.append_value(ctx.tenant);
-        self.service_name.append_value(ctx.service_name);
+        match ctx.service_name {
+            Some(name) => self.service_name.append_value(name),
+            None => self.service_name.append_null(),
+        }
         match ctx.service_instance_id {
             Some(v) => self.service_instance_id.append_value(v),
             None => self.service_instance_id.append_null(),
@@ -392,6 +445,11 @@ impl MetricColumns {
             self.attributes.values().append_value(value);
         }
         self.attributes.append(true)?;
+        for (key, value) in ctx.metadata {
+            self.metadata.keys().append_value(key);
+            self.metadata.values().append_value(value);
+        }
+        self.metadata.append(true)?;
         match flags {
             Some(f) => self.flags.append_value(f),
             None => self.flags.append_null(),
@@ -612,6 +670,11 @@ impl MetricColumns {
                     continue;
                 }
             };
+            // A non-finite (NaN or +/-Inf) double must not be stored; drop the point.
+            if is_non_finite(value_double) {
+                drops += 1;
+                continue;
+            }
             // Out-of-range flags are a strict-conformance drop, counted like a
             // value-less point rather than failing the whole request.
             let Ok(flags) = optional_flags(dp.flags) else {
@@ -650,6 +713,11 @@ impl MetricColumns {
                     continue;
                 }
             };
+            // A non-finite (NaN or +/-Inf) double must not be stored; drop the point.
+            if is_non_finite(value_double) {
+                drops += 1;
+                continue;
+            }
             // Out-of-range flags are a strict-conformance drop, counted like a
             // value-less point rather than failing the whole request.
             let Ok(flags) = optional_flags(dp.flags) else {
@@ -693,6 +761,17 @@ impl MetricColumns {
                 drops += 1;
                 continue;
             };
+            // Value invariants: `bucket_counts` must be exactly one longer than
+            // `explicit_bounds` (OTLP), and every stored double must be finite.
+            if !histogram_buckets_consistent(dp.bucket_counts.len(), dp.explicit_bounds.len())
+                || is_non_finite(dp.sum)
+                || is_non_finite(dp.min)
+                || is_non_finite(dp.max)
+                || dp.explicit_bounds.iter().any(|bound| !bound.is_finite())
+            {
+                drops += 1;
+                continue;
+            }
             let attributes = merge_point_attributes(ctx.base_attributes, &dp.attributes);
             let timestamp = timestamp_or_default(dp.time_unix_nano, ctx.ingested);
             let start = optional_micros(dp.start_time_unix_nano);
@@ -732,6 +811,17 @@ impl MetricColumns {
                 drops += 1;
                 continue;
             };
+            // Value invariants: `scale` within the OTel data-model range and every
+            // stored double finite.
+            if !(EXP_HISTOGRAM_SCALE_MIN..=EXP_HISTOGRAM_SCALE_MAX).contains(&dp.scale)
+                || is_non_finite(dp.sum)
+                || is_non_finite(dp.min)
+                || is_non_finite(dp.max)
+                || !dp.zero_threshold.is_finite()
+            {
+                drops += 1;
+                continue;
+            }
             let attributes = merge_point_attributes(ctx.base_attributes, &dp.attributes);
             let timestamp = timestamp_or_default(dp.time_unix_nano, ctx.ingested);
             let start = optional_micros(dp.start_time_unix_nano);
@@ -772,6 +862,17 @@ impl MetricColumns {
                 drops += 1;
                 continue;
             };
+            // Value invariants: `sum` finite and every quantile within [0, 1] with a
+            // finite value.
+            if !dp.sum.is_finite()
+                || dp
+                    .quantile_values
+                    .iter()
+                    .any(|q| !(0.0..=1.0).contains(&q.quantile) || !q.value.is_finite())
+            {
+                drops += 1;
+                continue;
+            }
             let attributes = merge_point_attributes(ctx.base_attributes, &dp.attributes);
             let timestamp = timestamp_or_default(dp.time_unix_nano, ctx.ingested);
             let start = optional_micros(dp.start_time_unix_nano);
@@ -831,11 +932,12 @@ pub fn metrics_to_record_batch(
 
     for rm in &request.resource_metrics {
         let resource_attrs = rm.resource.as_ref().map_or(&empty, |r| &r.attributes);
+        // Absent `service.name` stores null (the column is optional), matching the
+        // logs and spans transforms; no synthetic default is substituted.
         let service_name = resource_attrs
             .iter()
             .find(|kv| kv.key == SERVICE_NAME_KEY)
-            .and_then(|kv| extract_string_value(kv.value.as_ref()))
-            .unwrap_or_else(|| UNKNOWN_SERVICE.to_string());
+            .and_then(|kv| extract_string_value(kv.value.as_ref()));
         let service_instance_id = resource_attrs
             .iter()
             .find(|kv| kv.key == SERVICE_INSTANCE_ID_KEY)
@@ -852,14 +954,16 @@ pub fn metrics_to_record_batch(
                     // No data oneof => no data points; nothing to reject.
                     continue;
                 };
+                let metadata = flatten_metric_metadata(&metric.metadata);
                 let ctx = RowContext {
                     tenant,
-                    service_name: &service_name,
+                    service_name: service_name.as_deref(),
                     service_instance_id: service_instance_id.as_deref(),
                     metric_name: &metric.name,
                     description: &metric.description,
                     unit: &metric.unit,
                     base_attributes: &base_attributes,
+                    metadata: &metadata,
                     ingested,
                 };
                 match data {
@@ -886,8 +990,8 @@ mod tests {
     #[test]
     fn metrics_arrow_schema_has_expected_columns() {
         let schema = metrics_arrow_schema().expect("metrics arrow schema");
-        // 31 top-level fields per metrics_schema() (field ids 1..=31).
-        assert_eq!(schema.fields().len(), 31);
+        // 32 top-level fields per metrics_schema() (field ids 1..=31 plus `metadata` at id 50).
+        assert_eq!(schema.fields().len(), 32);
         for name in [
             "tenant_id",
             "service_name",
@@ -920,6 +1024,7 @@ mod tests {
             "quantile_values",
             "flags",
             "exemplars",
+            "metadata",
         ] {
             assert!(schema.field_with_name(name).is_ok(), "missing column {name}");
         }
@@ -1009,7 +1114,7 @@ mod tests {
         let batch = batch.expect("batch");
         assert_eq!(drops, 0);
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 31);
+        assert_eq!(batch.num_columns(), 32);
 
         let metric_type = batch
             .column_by_name("metric_type")
@@ -1034,6 +1139,35 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("i64");
         assert!(value_int.is_null(0));
+    }
+
+    #[test]
+    fn metric_metadata_populates_metadata_column() {
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", "svc")],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "m".to_string(),
+                        metadata: vec![kv("unit_family", "time"), kv("origin", "sdk")],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![gauge_double_dp(1.0)],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        let batch = batch.expect("batch");
+        let metadata = map_pairs(&batch, "metadata");
+        assert_eq!(metadata.get("unit_family"), Some(&"time".to_string()));
+        assert_eq!(metadata.get("origin"), Some(&"sdk".to_string()));
     }
 
     #[test]
@@ -1084,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_service_name_defaults_to_unknown_service() {
+    fn missing_service_name_stores_null() {
         let request = request_with(
             metric::Data::Gauge(Gauge {
                 data_points: vec![gauge_double_dp(1.0)],
@@ -1100,9 +1234,8 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("utf8");
-        // `service_name` is a required column: absent service.name -> "unknown_service" (never null).
-        assert!(!service_name.is_null(0));
-        assert_eq!(service_name.value(0), "unknown_service");
+        // `service_name` is optional: an absent `service.name` stores null, matching logs and spans.
+        assert!(service_name.is_null(0));
     }
 
     #[test]
@@ -1639,6 +1772,121 @@ mod tests {
         let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
         let batch = batch.expect("batch");
         assert_eq!(batch.num_rows(), 1);
+        assert_eq!(drops, 1);
+    }
+
+    #[test]
+    fn histogram_bucket_bounds_mismatch_is_dropped() {
+        use opentelemetry_proto::tonic::metrics::v1::{AggregationTemporality, Histogram, HistogramDataPoint};
+
+        // bucket_counts must have exactly one more element than explicit_bounds;
+        // here 3 != 1 + 1, so the point is an invalid-value drop.
+        let request = request_with(
+            metric::Data::Histogram(Histogram {
+                data_points: vec![HistogramDataPoint {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    count: 6,
+                    bucket_counts: vec![1, 2, 3],
+                    explicit_bounds: vec![5.0],
+                    ..Default::default()
+                }],
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            }),
+            "m",
+            vec![kv("service.name", "svc")],
+        );
+        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        assert!(batch.is_none());
+        assert_eq!(drops, 1);
+    }
+
+    #[test]
+    fn non_finite_gauge_value_is_dropped() {
+        let request = request_with(
+            metric::Data::Gauge(Gauge {
+                data_points: vec![gauge_double_dp(f64::NAN)],
+            }),
+            "m",
+            vec![kv("service.name", "svc")],
+        );
+        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        assert!(batch.is_none());
+        assert_eq!(drops, 1);
+    }
+
+    #[test]
+    fn non_finite_histogram_sum_is_dropped() {
+        use opentelemetry_proto::tonic::metrics::v1::{AggregationTemporality, Histogram, HistogramDataPoint};
+
+        // Valid buckets (len 1 == 0 + 1) isolate the drop to the non-finite sum.
+        let request = request_with(
+            metric::Data::Histogram(Histogram {
+                data_points: vec![HistogramDataPoint {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    count: 1,
+                    sum: Some(f64::INFINITY),
+                    bucket_counts: vec![1],
+                    explicit_bounds: vec![],
+                    ..Default::default()
+                }],
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            }),
+            "m",
+            vec![kv("service.name", "svc")],
+        );
+        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        assert!(batch.is_none());
+        assert_eq!(drops, 1);
+    }
+
+    #[test]
+    fn summary_quantile_out_of_range_is_dropped() {
+        use opentelemetry_proto::tonic::metrics::v1::{Summary, SummaryDataPoint, summary_data_point::ValueAtQuantile};
+
+        // A quantile outside [0, 1] is an invalid-value drop.
+        let request = request_with(
+            metric::Data::Summary(Summary {
+                data_points: vec![SummaryDataPoint {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    count: 10,
+                    sum: 5.0,
+                    quantile_values: vec![ValueAtQuantile {
+                        quantile: 1.5,
+                        value: 2.0,
+                    }],
+                    ..Default::default()
+                }],
+            }),
+            "m",
+            vec![kv("service.name", "svc")],
+        );
+        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        assert!(batch.is_none());
+        assert_eq!(drops, 1);
+    }
+
+    #[test]
+    fn exponential_histogram_scale_out_of_range_is_dropped() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            AggregationTemporality, ExponentialHistogram, ExponentialHistogramDataPoint,
+        };
+
+        // scale far outside the OTel data-model range [-10, 20] is an invalid-value drop.
+        let request = request_with(
+            metric::Data::ExponentialHistogram(ExponentialHistogram {
+                data_points: vec![ExponentialHistogramDataPoint {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    count: 1,
+                    scale: 1000,
+                    ..Default::default()
+                }],
+                aggregation_temporality: AggregationTemporality::Delta as i32,
+            }),
+            "m",
+            vec![kv("service.name", "svc")],
+        );
+        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
 

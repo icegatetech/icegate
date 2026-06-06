@@ -1,6 +1,6 @@
 //! OTLP to Arrow transform utilities (shared by gRPC and HTTP).
 //!
-//! Split by signal: `logs` and `spans` each own their schema accessor and
+//! Split by signal: `logs`, `metrics`, and `spans` each own their schema accessor and
 //! `*_to_record_batch` entry point. Shared attribute-flattening, map-field, and
 //! byte-validation helpers live in `attributes`.
 

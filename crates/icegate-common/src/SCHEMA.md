@@ -251,6 +251,10 @@ COMMENT ON TABLE iceberg.triplecloud.events IS
 Based on OpenTelemetry Metric and DataPoint messages from `opentelemetry/proto/metrics/v1/metrics.proto`.
 Combines all metric types (gauge, sum, histogram, exponential_histogram, summary) into a single table.
 
+Data points that fail strict OTLP validation (unset value, unspecified aggregation temporality,
+out-of-range count/flags, non-finite value, inconsistent histogram buckets, quantile outside `[0, 1]`,
+or out-of-range exponential-histogram scale) are dropped at ingest and reported via OTLP partial success.
+
 ```sql
 -- Create the metrics table
 CREATE TABLE iceberg.triplecloud.metrics (
@@ -315,7 +319,10 @@ CREATE TABLE iceberg.triplecloud.metrics (
         span_id VARBINARY,                -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8))
         trace_id VARBINARY,               -- 16-byte W3C trace ID (FIXED_LEN_BYTE_ARRAY(16))
         attributes MAP(VARCHAR, VARCHAR)
-    ))
+    )),
+
+    -- OTLP Metric.metadata (additional KeyValue metadata describing the metric)
+    metadata MAP(VARCHAR, VARCHAR)
 )
 WITH (
     format = 'PARQUET',

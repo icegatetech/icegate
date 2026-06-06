@@ -9,9 +9,8 @@ use axum::{
     http::{HeaderMap, header::CONTENT_TYPE},
     response::IntoResponse,
 };
-use icegate_common::{LOGS_TOPIC, TENANT_ID_HEADER, is_valid_tenant_id};
+use icegate_common::{TENANT_ID_HEADER, is_valid_tenant_id};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use tracing::debug;
 
 use super::{
     error::{OtlpError, OtlpResult},
@@ -32,9 +31,7 @@ const CONTENT_TYPE_JSON: &str = "application/json";
 const SIGNAL_LOGS: &str = "logs";
 const SIGNAL_TRACES: &str = "traces";
 const PROTOCOL_HTTP: &str = "http";
-const WAL_REASON_CHANNEL_CLOSED: &str = "channel_closed";
 const STATUS_OK: &str = "ok";
-const STATUS_ERROR: &str = "error";
 
 /// Extract tenant ID from HTTP headers.
 ///
@@ -57,7 +54,6 @@ fn extract_tenant_id(headers: &HeaderMap) -> Option<String> {
 ///
 /// Transforms OTLP log records to Arrow `RecordBatch` and writes to the WAL
 /// queue.
-#[allow(clippy::cast_possible_wrap)]
 #[tracing::instrument(skip(state, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_LOGS))]
 pub async fn ingest_logs(
     State(state): State<OtlpHttpState>,
@@ -92,77 +88,17 @@ pub async fn ingest_logs(
     })
     .await??;
     request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
-    let Some(batch) = batch else {
-        // No records to process - return success with 0 rejected
-        request_metrics.record_records_per_request(0);
-        request_metrics.finish_ok();
-        return Ok(Json(ExportLogsResponse::default()));
-    };
+    let payload =
+        crate::wal::write_logs_batch_to_wal(&state.write_channel, &request_metrics, batch, state.wal_row_group_size)
+            .await
+            .map_err(OtlpError)?;
 
-    let record_count = batch.num_rows();
-    debug!(records = record_count, "Transformed OTLP logs to RecordBatch");
-    request_metrics.record_records_per_request(record_count);
-
-    let trace_context = icegate_common::extract_current_trace_context();
-    let prepare_start = Instant::now();
-    let prepared = crate::wal::sort_logs(&batch, state.wal_row_group_size, trace_context).map_err(|e| {
-        request_metrics.finish_error();
-        OtlpError(e)
-    })?;
-    request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
-    let Some(prepared) = prepared else {
-        request_metrics.finish_ok();
-        return Ok(Json(ExportLogsResponse::default()));
-    };
-
-    let enqueue_start = Instant::now();
-    let pending = crate::wal::submit_sorted_rows_to_wal(&state.write_channel, prepared)
-        .await
-        .map_err(|e| {
-            request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
-            request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
-            request_metrics.finish_error();
-            OtlpError(e)
-        })?;
-    request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_OK);
-
-    let ack_start = Instant::now();
-    let ack_outcome = pending.wait_for_ack().await.map_err(|e| {
-        request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
-        request_metrics.finish_error();
-        OtlpError(e)
-    })?;
-
-    match ack_outcome {
-        crate::wal::WalAckOutcome::Success(write_result) => {
-            if let Some(trace_context) = write_result.trace_context.as_deref() {
-                icegate_common::add_span_link(trace_context);
-            }
-            debug!(
-                offset = write_result.offset.unwrap_or_default(),
-                records = write_result.records,
-                "Logs written to WAL"
-            );
-            request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_OK);
-            request_metrics.finish_ok();
-            Ok(Json(ExportLogsResponse::default()))
-        }
-        crate::wal::WalAckOutcome::Partial(partial) => {
-            if let Some(trace_context) = partial.trace_context.as_deref() {
-                icegate_common::add_span_link(trace_context);
-            }
-            request_metrics.record_wal_ack_duration(ack_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
-            request_metrics.finish_partial();
-            Ok(Json(ExportLogsResponse {
-                partial_success: Some(LogsPartialSuccess {
-                    rejected_log_records: i64::try_from(partial.rejected_records).map_err(|_| {
-                        OtlpError(IngestError::Validation("Rejected logs count exceeds i64".to_string()))
-                    })?,
-                    error_message: Some(partial.reason),
-                }),
-            }))
-        }
-    }
+    Ok(Json(ExportLogsResponse {
+        partial_success: payload.map(|(rejected_log_records, message)| LogsPartialSuccess {
+            rejected_log_records,
+            error_message: Some(message),
+        }),
+    }))
 }
 
 /// Decode an OTLP export request body as protobuf or JSON, selected by the
@@ -192,7 +128,6 @@ where
 /// Transforms OTLP spans to Arrow `RecordBatch` and writes to the WAL queue.
 /// Transform-time drops (invalid `trace_id`/`span_id`) surface as
 /// `partial_success.rejected_spans`.
-#[allow(clippy::too_many_lines)]
 #[tracing::instrument(skip(state, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_TRACES))]
 pub async fn ingest_traces(
     State(state): State<OtlpHttpState>,
@@ -228,105 +163,21 @@ pub async fn ingest_traces(
     .await??;
     request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_TRACES, STATUS_OK);
 
-    let Some(batch) = batch_opt else {
-        // No valid spans - return success with any transform-time drops as rejected.
-        request_metrics.record_records_per_request(0);
-        crate::otlp_traces_partial::finish_metrics_with_drops(&request_metrics, drops);
-        return Ok(Json(ExportTracesResponse {
-            partial_success: partial_success_from_drops(drops)?,
-        }));
-    };
+    let payload = crate::wal::write_traces_batch_to_wal(
+        &state.write_channel,
+        &request_metrics,
+        batch_opt,
+        drops,
+        state.wal_row_group_size,
+    )
+    .await
+    .map_err(OtlpError)?;
 
-    let record_count = batch.num_rows();
-    debug!(records = record_count, "Transformed OTLP spans to RecordBatch");
-    request_metrics.record_records_per_request(record_count);
-
-    let trace_context = icegate_common::extract_current_trace_context();
-    let prepare_start = Instant::now();
-    let prepared = crate::wal::sort_spans(&batch, state.wal_row_group_size, trace_context).map_err(|e| {
-        request_metrics.finish_error();
-        OtlpError(e)
-    })?;
-    request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_TRACES, STATUS_OK);
-    let Some(prepared) = prepared else {
-        crate::otlp_traces_partial::finish_metrics_with_drops(&request_metrics, drops);
-        return Ok(Json(ExportTracesResponse {
-            partial_success: partial_success_from_drops(drops)?,
-        }));
-    };
-
-    let enqueue_start = Instant::now();
-    let pending = crate::wal::submit_sorted_rows_to_wal(&state.write_channel, prepared)
-        .await
-        .map_err(|e| {
-            request_metrics.record_wal_enqueue_duration(
-                enqueue_start.elapsed(),
-                icegate_common::SPANS_TOPIC,
-                STATUS_ERROR,
-            );
-            request_metrics.add_wal_queue_unavailable(icegate_common::SPANS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
-            request_metrics.finish_error();
-            OtlpError(e)
-        })?;
-    request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), icegate_common::SPANS_TOPIC, STATUS_OK);
-
-    let ack_start = Instant::now();
-    let ack_outcome = pending.wait_for_ack().await.map_err(|e| {
-        request_metrics.record_wal_ack_duration(ack_start.elapsed(), icegate_common::SPANS_TOPIC, STATUS_ERROR);
-        request_metrics.finish_error();
-        OtlpError(e)
-    })?;
-
-    match ack_outcome {
-        crate::wal::WalAckOutcome::Success(write_result) => {
-            if let Some(ctx) = write_result.trace_context.as_deref() {
-                icegate_common::add_span_link(ctx);
-            }
-            debug!(
-                offset = write_result.offset.unwrap_or_default(),
-                records = write_result.records,
-                "Spans written to WAL"
-            );
-            request_metrics.record_wal_ack_duration(ack_start.elapsed(), icegate_common::SPANS_TOPIC, STATUS_OK);
-            crate::otlp_traces_partial::finish_metrics_with_drops(&request_metrics, drops);
-            Ok(Json(ExportTracesResponse {
-                partial_success: partial_success_from_drops(drops)?,
-            }))
-        }
-        crate::wal::WalAckOutcome::Partial(partial) => {
-            if let Some(ctx) = partial.trace_context.as_deref() {
-                icegate_common::add_span_link(ctx);
-            }
-            request_metrics.record_wal_ack_duration(ack_start.elapsed(), icegate_common::SPANS_TOPIC, STATUS_ERROR);
-            request_metrics.finish_partial();
-            let combined = drops.checked_add(partial.rejected_records).ok_or_else(|| {
-                OtlpError(IngestError::Validation(
-                    "Rejected spans count exceeds usize::MAX".to_string(),
-                ))
-            })?;
-            let rejected = i64::try_from(combined)
-                .map_err(|_| OtlpError(IngestError::Validation("Rejected spans count exceeds i64".to_string())))?;
-            Ok(Json(ExportTracesResponse {
-                partial_success: Some(TracesPartialSuccess {
-                    rejected_spans: rejected,
-                    error_message: Some(crate::otlp_traces_partial::compose_partial_reason(
-                        &partial.reason,
-                        drops,
-                    )),
-                }),
-            }))
-        }
-    }
-}
-
-/// Build a `TracesPartialSuccess` from transform-time drops, or `None` if there were none.
-fn partial_success_from_drops(drops: usize) -> OtlpResult<Option<TracesPartialSuccess>> {
-    let Some(rejected) = crate::otlp_traces_partial::rejected_spans_from_drops(drops).map_err(OtlpError)? else {
-        return Ok(None);
-    };
-    Ok(Some(TracesPartialSuccess {
-        rejected_spans: rejected,
-        error_message: Some(crate::otlp_traces_partial::INVALID_TRACE_MSG.to_string()),
+    Ok(Json(ExportTracesResponse {
+        partial_success: payload.map(|(rejected_spans, message)| TracesPartialSuccess {
+            rejected_spans,
+            error_message: Some(message),
+        }),
     }))
 }
 
@@ -370,7 +221,7 @@ pub async fn ingest_metrics(
     .await??;
     request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_METRICS, STATUS_OK);
 
-    let payload = crate::otlp_metrics_partial::write_metrics_batch_to_wal(
+    let payload = crate::wal::write_metrics_batch_to_wal(
         &state.write_channel,
         &request_metrics,
         batch_opt,

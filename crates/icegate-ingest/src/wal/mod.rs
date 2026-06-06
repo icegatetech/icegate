@@ -1,3 +1,4 @@
+mod batch;
 mod boundary;
 mod columns;
 mod metadata;
@@ -6,6 +7,7 @@ mod sorter;
 pub(crate) mod test_utils;
 mod writer;
 
+pub(crate) use batch::{write_logs_batch_to_wal, write_metrics_batch_to_wal, write_traces_batch_to_wal};
 pub(crate) use boundary::compare_option_ord;
 pub(crate) use boundary::{
     RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue,

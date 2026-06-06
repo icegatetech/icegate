@@ -1,9 +1,9 @@
-//! Shared helpers for composing OTLP traces partial-success responses.
+//! Helpers for composing OTLP traces partial-success responses.
 //!
-//! Transform-time drops (invalid `trace_id` / `span_id`) and WAL-side
-//! partial failures both contribute to `rejected_spans`. The HTTP and gRPC
-//! handlers share the conversion and message formatting so the two
-//! protocols stay in lockstep.
+//! Transform-time drops (invalid `trace_id` / `span_id`) and WAL-side partial
+//! failures both contribute to `rejected_spans`. The HTTP and gRPC handlers
+//! share these so the two protocols stay in lockstep; the WAL-write
+//! orchestration that consumes them lives in [`crate::wal`].
 
 use crate::error::IngestError;
 use crate::infra::metrics::OtlpRequestRecorder;
@@ -24,7 +24,7 @@ const DROP_NOUN: &str = "span(s)";
 /// mathematically-unreachable i64 overflow path (a 64-bit platform with
 /// more than `i64::MAX` dropped spans), surfacing the cause to the caller.
 pub fn rejected_spans_from_drops(drops: usize) -> Result<Option<i64>, IngestError> {
-    crate::otlp_partial::rejected_from_drops(drops, COUNT_NOUN)
+    super::rejected_from_drops(drops, COUNT_NOUN)
 }
 
 /// Finish request metrics with status "partial" when there are transform-time
@@ -34,7 +34,7 @@ pub fn rejected_spans_from_drops(drops: usize) -> Result<Option<i64>, IngestErro
 /// on any drop count > 0 so Grafana panels for `status="partial"` reflect
 /// every path where some spans failed validation.
 pub fn finish_metrics_with_drops(request_metrics: &OtlpRequestRecorder, drops: usize) {
-    crate::otlp_partial::finish_with_drops(request_metrics, drops);
+    super::finish_with_drops(request_metrics, drops);
 }
 
 /// Compose a combined error message when both transform-time drops and a
@@ -46,7 +46,13 @@ pub fn finish_metrics_with_drops(request_metrics: &OtlpRequestRecorder, drops: u
 /// When `drops == 0` the WAL reason is returned verbatim so existing
 /// WAL-only failures keep their original wording.
 pub fn compose_partial_reason(wal_reason: &str, drops: usize) -> String {
-    crate::otlp_partial::compose_partial_reason(wal_reason, drops, DROP_NOUN, INVALID_TRACE_MSG)
+    super::compose_partial_reason(wal_reason, drops, DROP_NOUN, INVALID_TRACE_MSG)
+}
+
+/// Partial-success payload from transform-time drops alone: `Some((rejected,
+/// message))` when `drops > 0`, otherwise `None`.
+pub(crate) fn partial_from_drops(drops: usize) -> Result<Option<(i64, String)>, IngestError> {
+    Ok(rejected_spans_from_drops(drops)?.map(|rejected| (rejected, INVALID_TRACE_MSG.to_string())))
 }
 
 #[cfg(test)]

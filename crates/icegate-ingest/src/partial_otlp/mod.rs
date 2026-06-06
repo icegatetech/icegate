@@ -2,9 +2,13 @@
 //!
 //! Transform-time drops (strict-conformance rejections) and WAL-side partial
 //! failures both contribute to the per-signal `rejected_*` count. The per-signal
-//! modules ([`crate::otlp_metrics_partial`], [`crate::otlp_traces_partial`])
-//! wrap these with their own message constants and nouns so the HTTP and gRPC
-//! handlers stay in lockstep across signals.
+//! submodules ([`metrics`], [`traces`]) wrap these primitives with their own
+//! message constants and nouns so the HTTP and gRPC handlers stay in lockstep
+//! across signals. The WAL-write orchestration that consumes these helpers lives
+//! in [`crate::wal`].
+
+pub(crate) mod metrics;
+pub(crate) mod traces;
 
 use crate::error::IngestError;
 use crate::infra::metrics::OtlpRequestRecorder;

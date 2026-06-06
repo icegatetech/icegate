@@ -425,6 +425,8 @@ fn flatten_any_value(prefix: &str, value: Option<&AnyValue>) -> Vec<(String, Str
 /// Primitive values yield a single pair `(prefix, stringified_value)`.
 /// Arrays are stringified (not flattened) since they have no indexable keys.
 pub(crate) fn flatten_any_value_dotted(prefix: &str, value: Option<&AnyValue>) -> Vec<(String, String)> {
+    // TODO(low): the primitive (general) case heap-allocates a single-element `Vec`
+    // per attribute on the hot ingest path; a callback/`SmallVec` API would avoid it.
     let mut result = Vec::new();
     let Some(v) = value else {
         return result;
