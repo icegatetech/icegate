@@ -5,7 +5,7 @@ use arrow::{
     compute::take,
     record_batch::RecordBatch,
 };
-use icegate_common::{LOGS_TOPIC, SPANS_TOPIC};
+use icegate_common::{LOGS_TOPIC, METRICS_TOPIC, SPANS_TOPIC};
 use icegate_queue::{PreparedWalRowGroup, WriteRequest};
 
 use super::{
@@ -144,6 +144,21 @@ pub(crate) fn sort_spans(
     )
 }
 
+/// Prepare WAL batches for one metrics ingest request.
+pub(crate) fn sort_metrics(
+    batch: &RecordBatch,
+    row_group_size: usize,
+    trace_context: Option<String>,
+) -> Result<Option<PreparedWalWrite>> {
+    prepare(
+        SortColumnsDescriptor::metrics()?,
+        METRICS_TOPIC,
+        batch,
+        row_group_size,
+        trace_context,
+    )
+}
+
 fn prepare(
     descriptor: &'static SortColumnsDescriptor,
     topic: &'static str,
@@ -201,7 +216,7 @@ mod tests {
     };
     use icegate_queue::{WriteResult, channel};
 
-    use super::{WalSorter, sort_logs, sort_spans};
+    use super::{WalSorter, sort_logs, sort_metrics, sort_spans};
     use crate::error::IngestError;
     use crate::wal::{
         RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue, SortColumnsDescriptor, WalAckOutcome,
@@ -796,6 +811,61 @@ mod tests {
             .map(|i| {
                 rg_a.batch
                     .column(4)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("row_id")
+                    .value(i)
+            })
+            .collect();
+        assert_eq!(row_ids, vec![3, 2]);
+    }
+
+    #[test]
+    fn sort_metrics_produces_metrics_topic_and_tenant_homogeneous_groups() {
+        use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        // Minimal batch with the columns the metrics sort descriptor needs:
+        // tenant_id, service_name, service_instance_id, metric_name, timestamp.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("service_instance_id", DataType::Utf8, true),
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("row_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["tenant-b", "tenant-a", "tenant-a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["svc", "svc", "svc"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("i-1"), Some("i-1"), Some("i-1")])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["m2", "m1", "m1"])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(30), Some(10), Some(20)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+        )
+        .expect("metrics batch");
+
+        let prepared = sort_metrics(&batch, 8, None)
+            .expect("prepare wal write")
+            .expect("prepared wal write");
+
+        assert_eq!(prepared.write_request.topic, icegate_common::METRICS_TOPIC);
+        assert_eq!(prepared.write_request.row_groups.len(), 2); // tenant-a (2 rows) + tenant-b (1 row)
+
+        // tenant-a rows share metric_name "m1"; sorted by timestamp DESC -> row_id 3 (ts=20) before row_id 2 (ts=10).
+        let rg_a = prepared
+            .write_request
+            .row_groups
+            .iter()
+            .find(|rg| rg.batch.num_rows() == 2)
+            .expect("tenant-a group");
+        let row_ids: Vec<i64> = (0..rg_a.batch.num_rows())
+            .map(|i| {
+                rg_a.batch
+                    .column(5)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .expect("row_id")

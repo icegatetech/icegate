@@ -61,6 +61,9 @@ pub const LOGS_TOPIC: &str = "logs";
 /// Topic name for spans in the WAL queue.
 pub const SPANS_TOPIC: &str = "spans";
 
+/// Topic name for metrics in the WAL queue.
+pub const METRICS_TOPIC: &str = "metrics";
+
 /// Iceberg snapshot summary key for the last committed WAL queue offset.
 ///
 /// Written by the Shifter after each WAL-to-Iceberg commit and read by the

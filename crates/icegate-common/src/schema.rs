@@ -618,6 +618,16 @@ pub fn metrics_schema() -> Result<Schema> {
         )),
     ));
 
+    // Create Map<String, String> for metric metadata (field IDs: 51, 52)
+    let metadata_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(51, "key", Type::Primitive(PrimitiveType::String))),
+        Arc::new(NestedField::required(
+            52,
+            "value",
+            Type::Primitive(PrimitiveType::String),
+        )),
+    ));
+
     // Create Map<String, String> for exemplar attributes (field IDs: 34, 35)
     let exemplar_attributes_map = Type::Map(MapType::new(
         Arc::new(NestedField::required(34, "key", Type::Primitive(PrimitiveType::String))),
@@ -681,7 +691,7 @@ pub fn metrics_schema() -> Result<Schema> {
                 "tenant_id",
                 Type::Primitive(PrimitiveType::String),
             )),
-            Arc::new(NestedField::required(
+            Arc::new(NestedField::optional(
                 2,
                 "service_name",
                 Type::Primitive(PrimitiveType::String),
@@ -837,6 +847,8 @@ pub fn metrics_schema() -> Result<Schema> {
                     true,
                 )))),
             )),
+            // OTLP Metric.metadata: additional KeyValue metadata describing the metric.
+            Arc::new(NestedField::optional(50, "metadata", metadata_map)),
         ])
         .build()?;
 
@@ -1201,13 +1213,15 @@ mod tests {
     fn test_metrics_schema() {
         let schema = metrics_schema().expect("Failed to create metrics schema");
         // highest_field_id includes nested field IDs from Maps, Lists, and Structs.
-        // Top-level fields occupy 1..=31; nested IDs continue at 32 with no gaps.
-        assert_eq!(schema.highest_field_id(), 49);
+        // Top-level fields occupy 1..=31; nested IDs run 32..=49; the appended
+        // `metadata` map adds field 50 (key 51, value 52).
+        assert_eq!(schema.highest_field_id(), 52);
         assert!(schema.field_by_name("metric_name").is_some());
         assert!(schema.field_by_name("metric_type").is_some());
         assert!(schema.field_by_name("value_double").is_some());
         assert!(schema.field_by_name("bucket_counts").is_some());
         assert!(schema.field_by_name("exemplars").is_some());
+        assert!(schema.field_by_name("metadata").is_some());
         assert!(
             schema.field_by_name("cloud_account_id").is_none(),
             "cloud_account_id must be gone"
@@ -1299,5 +1313,14 @@ mod tests {
         };
         assert_eq!(ex_attr_map.key_field.id, 34);
         assert_eq!(ex_attr_map.value_field.id, 35);
+
+        // metadata Map<String,String>: parent=50, key=51, value=52.
+        let metadata = schema.field_by_name("metadata").expect("metadata field");
+        assert_eq!(metadata.id, 50);
+        let Type::Map(meta_map) = &*metadata.field_type else {
+            panic!("metadata must be Map");
+        };
+        assert_eq!(meta_map.key_field.id, 51);
+        assert_eq!(meta_map.value_field.id, 52);
     }
 }
