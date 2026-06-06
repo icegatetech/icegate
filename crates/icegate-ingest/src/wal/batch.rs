@@ -235,13 +235,16 @@ pub async fn write_metrics_batch_to_wal(
     let prepared = sort_metrics(&batch, wal_row_group_size, trace_context).inspect_err(|_| {
         request_metrics.finish_error();
     })?;
-    request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_METRICS, STATUS_OK);
     // A non-empty batch always yields at least one row group; treat its absence
-    // as an internal invariant violation instead of silently succeeding.
+    // as an internal invariant violation instead of silently succeeding. Record
+    // the OK sort timing only after this check passes, so the invariant-violation
+    // path emits `finish_error()` alone rather than a conflicting `status="ok"`
+    // sort sample (mirrors the `sort_metrics` error branch above).
     let prepared = prepared.ok_or_else(|| {
         request_metrics.finish_error();
         IngestError::Validation("metrics WAL preparation produced no row groups for a non-empty batch".to_string())
     })?;
+    request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_METRICS, STATUS_OK);
 
     let enqueue_start = Instant::now();
     let pending = submit_sorted_rows_to_wal(write_channel, prepared).await.inspect_err(|_| {
