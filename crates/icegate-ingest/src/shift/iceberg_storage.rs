@@ -10,7 +10,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::{
-    Catalog, NamespaceIdent, TableIdent,
+    Catalog, TableIdent,
     spec::DataFile,
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
@@ -27,8 +27,9 @@ pub use icegate_common::iceberg_write::WrittenDataFiles;
 /// rolling writer from this failover policy.
 pub use icegate_common::iceberg_write::writer_max_parquet_bytes;
 use icegate_common::{
-    ICEGATE_NAMESPACE, WAL_OFFSET_PROPERTY,
+    WAL_OFFSET_PROPERTY,
     iceberg_write::{WriteConfig, write_record_batches_to_parquet},
+    icegate_table_ident,
     parquet_writer::ColumnEncoding,
     retrier::{Retrier, RetrierConfig},
 };
@@ -106,7 +107,8 @@ impl IcebergStorage {
         bloom_filter_columns: &'static [&'static str],
         column_encodings: &'static [ColumnEncoding],
     ) -> Self {
-        let table_ident = TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.into());
+        let table = table.into();
+        let table_ident = icegate_table_ident(&table);
         Self {
             loader: TableLoader::new(catalog, table_ident, shift_config.write.table_cache_ttl_secs),
             row_group_size: shift_config.write.row_group_size,

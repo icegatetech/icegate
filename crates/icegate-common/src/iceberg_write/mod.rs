@@ -158,7 +158,9 @@ impl LocationGenerator for TrackingLocationGenerator {
 /// * `cfg` - Scalar write configuration (row-group/page sizes, rollover
 ///   budget, bloom-filter columns, encoding overrides).
 /// * `batches` - Merge-ordered source batches to encode.
-/// * `cancel_token` - Cooperative cancellation; checked between batches.
+/// * `cancel_token` - Cooperative cancellation; checked between source batches
+///   and between per-partition writes (an in-flight write/close await is not
+///   itself interruptible).
 ///
 /// # Returns
 ///
@@ -275,6 +277,16 @@ async fn write_parquet_files_once(
                 .ok_or_else(|| CommonError::Write("partitioned batch count overflow".to_string()))?;
 
             for (partition_key, partition_batch) in partitioned_batches {
+                // Re-check cancellation between partition writes too, not only
+                // between source batches: a batch may split into many partitions,
+                // and an individual `fanout_writer.write`/`close` await is not
+                // itself cancellation-aware, so this bounds how much of a
+                // cancelled batch still gets uploaded.
+                if cancel_token.is_cancelled() {
+                    return Err(CommonError::Write(
+                        "shift task cancelled during parquet write".to_string(),
+                    ));
+                }
                 let partition_path = partition_key.to_path();
                 let span = tracing::info_span!(
                     "iceberg_partition_write",

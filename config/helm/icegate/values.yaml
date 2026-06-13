@@ -446,12 +446,14 @@ compact:
     maxSkippableTailFiles: 0
     ## Period of the discovery loop, in seconds.
     scanIntervalSecs: 300
+    ## Deadline for a single rewrite task (merge + encode + commit), in seconds.
+    ## Kept separate from scanIntervalSecs so a long-running rewrite is not
+    ## declared expired and duplicated by another worker (default: 1 hour).
+    rewriteTimeoutSecs: 3600
     ## Number of concurrent rewrite workers.
     workerCount: 2
     ## Jobmanager worker poll interval, in milliseconds.
     pollIntervalMs: 1000
-    ## Bounded commit retries on an ingest write conflict (advisory).
-    maxCommitRetries: 5
     ## Parquet row group size, in rows.
     rowGroupSize: 20000
     ## Maximum Parquet data page size, in bytes.

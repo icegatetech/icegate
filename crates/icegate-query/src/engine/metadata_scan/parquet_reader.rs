@@ -30,9 +30,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use iceberg::arrow::ArrowFileReader;
 use iceberg::expr::{Predicate, PredicateOperator};
-use iceberg::io::{FileIO, FileMetadata};
+use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{Datum, PrimitiveLiteral};
+use icegate_common::parquet_source::open_arrow_file_reader;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::basic::Type as PhysicalType;
 use parquet::column::page::{Page, PageReader};
@@ -56,12 +57,9 @@ pub async fn open_file_direct(
     file_io: &FileIO,
     task: &FileScanTask,
 ) -> Result<(ArrowFileReader, Arc<ParquetMetaData>), MetadataScanError> {
-    let input = file_io.new_input(&task.data_file_path).map_err(MetadataScanError::Iceberg)?;
-    let reader = input.reader().await.map_err(MetadataScanError::Iceberg)?;
-    let meta = FileMetadata {
-        size: task.file_size_in_bytes,
-    };
-    let mut arrow_reader = ArrowFileReader::new(meta, reader);
+    let mut arrow_reader = open_arrow_file_reader(file_io, &task.data_file_path, task.file_size_in_bytes)
+        .await
+        .map_err(MetadataScanError::Iceberg)?;
 
     let metadata = arrow_reader.get_metadata(None).await?;
 
@@ -80,13 +78,9 @@ pub async fn open_builder(
     file_io: &FileIO,
     task: &FileScanTask,
 ) -> Result<ParquetRecordBatchStreamBuilder<ArrowFileReader>, MetadataScanError> {
-    let input = file_io.new_input(&task.data_file_path).map_err(MetadataScanError::Iceberg)?;
-    let reader = input.reader().await.map_err(MetadataScanError::Iceberg)?;
-
-    let meta = FileMetadata {
-        size: task.file_size_in_bytes,
-    };
-    let arrow_reader = ArrowFileReader::new(meta, reader);
+    let arrow_reader = open_arrow_file_reader(file_io, &task.data_file_path, task.file_size_in_bytes)
+        .await
+        .map_err(MetadataScanError::Iceberg)?;
 
     Ok(ParquetRecordBatchStreamBuilder::new(arrow_reader).await?)
 }

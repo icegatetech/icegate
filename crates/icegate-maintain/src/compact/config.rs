@@ -216,16 +216,19 @@ pub struct CompactionConfig {
     /// Period of the discovery loop, in seconds (maps to the jobmanager
     /// iteration interval).
     pub scan_interval_secs: u64,
+    /// Deadline for a single REWRITE task (merge + encode + commit), in seconds.
+    ///
+    /// Kept separate from [`Self::scan_interval_secs`] so a rewrite that
+    /// legitimately runs longer than the discovery period is not declared
+    /// expired — which would let another worker pick it up and duplicate the
+    /// in-flight rewrite. Size it to a worst-case group: reading
+    /// `max_group_input_bytes` of Parquet, k-way-merging, re-encoding, and
+    /// committing.
+    pub rewrite_timeout_secs: u64,
     /// Number of concurrent rewrite tasks (jobmanager `JobsManagerConfig.worker_count`).
     pub worker_count: usize,
     /// Jobmanager worker poll interval, in milliseconds.
     pub poll_interval_ms: u64,
-    /// Bounded number of commit retries on an ingest write conflict.
-    ///
-    /// Retained for configuration compatibility; the replace commit now retries
-    /// internally inside [`iceberg::transaction::Transaction::commit`], so this
-    /// value is currently advisory and not consumed by the rewrite executor.
-    pub max_commit_retries: usize,
     /// Parquet row group size, in rows.
     pub row_group_size: usize,
     /// Maximum Parquet data page size, in bytes.
@@ -250,9 +253,9 @@ impl Default for CompactionConfig {
             min_input_files: 4,
             max_skippable_tail_files: 0,
             scan_interval_secs: 300,
+            rewrite_timeout_secs: 3_600,
             worker_count: default_worker_count(),
             poll_interval_ms: 1_000,
-            max_commit_retries: 5,
             row_group_size: 20_000,
             data_page_size_limit_bytes: 2 * 1024 * 1024,
             logs_enabled: true,

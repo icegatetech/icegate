@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Duration as ChronoDuration;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use iceberg::Catalog;
 use icegate_common::iceberg_write::WriteConfig;
 use icegate_common::manifest_scan::list_data_files_with_stats;
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
@@ -49,7 +49,7 @@ use icegate_common::parquet_encoding::{
     METRICS_COLUMN_ENCODINGS, SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
 };
 use icegate_common::parquet_writer::ColumnEncoding;
-use icegate_common::{EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE};
+use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE, icegate_table_ident};
 use icegate_jobmanager::registry::TaskExecutorFn;
 use icegate_jobmanager::{
     CachedStorage, Error as JobError, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry, JobManager,
@@ -187,7 +187,7 @@ impl PlanExecutor {
     /// cannot be held across the `.await` points without making the future
     /// `!Send`).
     async fn run_plan(&self, task: &dyn ImmutableTask, manager: &dyn JobManager) -> std::result::Result<(), JobError> {
-        let table_ident = table_ident(self.spec.table);
+        let table_ident = icegate_table_ident(self.spec.table);
         let table = self
             .catalog
             .load_table(&table_ident)
@@ -363,6 +363,12 @@ impl Compactor {
     /// # Errors
     ///
     /// Same as [`Self::new`].
+    ///
+    /// This is a test seam: production callers use [`Self::new`]. It stays `pub`
+    /// only so the end-to-end integration test (a separate crate) can drive a
+    /// single deterministic cycle, and is `#[doc(hidden)]` so it does not appear
+    /// in the public API docs.
+    #[doc(hidden)]
     pub async fn new_with_max_iterations(
         catalog: Arc<dyn Catalog>,
         config: &CompactionConfig,
@@ -382,7 +388,11 @@ impl Compactor {
             min_input_files: config.min_input_files,
             max_skippable_tail_files: config.max_skippable_tail_files,
         };
-        let rewrite_timeout = scan_interval(config)?;
+        // The REWRITE task deadline is its own knob, NOT the discovery period: a
+        // rewrite that legitimately runs longer than one scan interval must not
+        // be declared expired (which would let another worker duplicate it). The
+        // iteration interval is the discovery cadence.
+        let rewrite_timeout = rewrite_timeout(config)?;
         let iteration_interval = scan_interval(config)?;
 
         let mut job_defs: Vec<JobDefinition> = Vec::with_capacity(specs.len());
@@ -502,26 +512,39 @@ fn rewrite_executor_fn(rewrite_executor: Arc<RewriteTaskExecutor>) -> TaskExecut
     })
 }
 
-/// Build the [`TableIdent`] for a table name inside the `icegate` namespace.
-fn table_ident(table: &str) -> TableIdent {
-    TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.to_string())
-}
-
 /// Convert the compaction `scan_interval_secs` into a positive [`ChronoDuration`]
-/// for both the jobmanager iteration interval and the per-REWRITE task timeout.
+/// for the jobmanager iteration (discovery) interval.
 ///
 /// # Errors
 ///
 /// Returns [`MaintainError::Config`] if the configured interval is zero or
 /// overflows an `i64` number of seconds.
 fn scan_interval(config: &CompactionConfig) -> Result<ChronoDuration> {
-    if config.scan_interval_secs == 0 {
-        return Err(MaintainError::Config(
-            "compaction.scan_interval_secs must be greater than zero".to_string(),
-        ));
+    positive_duration(config.scan_interval_secs, "compaction.scan_interval_secs")
+}
+
+/// Convert the compaction `rewrite_timeout_secs` into a positive
+/// [`ChronoDuration`] for the per-REWRITE (and initial PLAN) task deadline.
+///
+/// # Errors
+///
+/// Returns [`MaintainError::Config`] if the configured timeout is zero or
+/// overflows an `i64` number of seconds.
+fn rewrite_timeout(config: &CompactionConfig) -> Result<ChronoDuration> {
+    positive_duration(config.rewrite_timeout_secs, "compaction.rewrite_timeout_secs")
+}
+
+/// Convert a positive seconds count into a [`ChronoDuration`], rejecting zero
+/// and `i64` overflow. `field` names the config key for the error message.
+///
+/// # Errors
+///
+/// Returns [`MaintainError::Config`] if `secs` is zero or exceeds `i64`.
+fn positive_duration(secs: u64, field: &str) -> Result<ChronoDuration> {
+    if secs == 0 {
+        return Err(MaintainError::Config(format!("{field} must be greater than zero")));
     }
-    let secs = i64::try_from(config.scan_interval_secs)
-        .map_err(|_| MaintainError::Config("compaction.scan_interval_secs exceeds i64".to_string()))?;
+    let secs = i64::try_from(secs).map_err(|_| MaintainError::Config(format!("{field} exceeds i64")))?;
     Ok(ChronoDuration::seconds(secs))
 }
 

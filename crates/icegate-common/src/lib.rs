@@ -24,6 +24,21 @@ pub const EVENTS_TABLE_FQN: &str = "iceberg.icegate.events";
 /// Fully qualified table name for metrics (`iceberg.icegate.metrics`).
 pub const METRICS_TABLE_FQN: &str = "iceberg.icegate.metrics";
 
+/// Build the [`iceberg::TableIdent`] for a table name inside the IceGate
+/// namespace ([`ICEGATE_NAMESPACE`]).
+///
+/// Every IceGate table lives in the same namespace, so the
+/// `TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE…), table…)` construction
+/// was repeated across the ingest shift, compaction, and migrate paths. Defining
+/// it once keeps namespace resolution in a single place.
+#[must_use]
+pub fn icegate_table_ident(table: &str) -> iceberg::TableIdent {
+    iceberg::TableIdent::new(
+        iceberg::NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()),
+        table.to_string(),
+    )
+}
+
 /// Default tenant ID when not provided in request metadata.
 pub const DEFAULT_TENANT_ID: &str = "default";
 
@@ -86,6 +101,8 @@ pub mod merge;
 pub mod metrics;
 /// Per-column Parquet encoding overrides shared across writers.
 pub mod parquet_encoding;
+/// Shared opener for reading existing Iceberg Parquet data files.
+pub mod parquet_source;
 /// Parquet `WriterProperties` builder shared by ingest writers.
 ///
 /// Consumes the per-column encoding lists from [`parquet_encoding`].

@@ -27,13 +27,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use iceberg::Catalog;
 use iceberg::spec::DataFile;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use icegate_common::ICEGATE_NAMESPACE;
 use icegate_common::iceberg_write::{WriteConfig, write_record_batches_to_parquet};
-use icegate_common::manifest_scan::{DataFileStats, decode_data_file_envelope, list_data_files_with_stats};
+use icegate_common::icegate_table_ident;
+use icegate_common::manifest_scan::{DataFileStats, decode_data_file_envelope, list_data_files_in_partition};
 use icegate_common::merge::sort_key::{
     RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, SortColumnsDescriptor,
 };
@@ -164,7 +164,7 @@ impl RewriteExecutor {
     /// or if the replace commit fails (including a removed input that is no
     /// longer live, which the transaction surfaces as a `DataInvalid` error).
     pub async fn execute(&self, input: &RewriteInput, cancel: &CancellationToken) -> Result<RewriteOutcome> {
-        let table_ident = table_ident(&input.table);
+        let table_ident = icegate_table_ident(&input.table);
 
         // Step 1: load the table FRESH. The transaction commit reloads it again
         // and guards concurrency itself, so this load only needs to be recent
@@ -174,7 +174,7 @@ impl RewriteExecutor {
         // Step 2: enumerate the partition's live data files and match the planned
         // input paths. A missing input means a sibling compactor already took it;
         // abort before doing any merge/write work.
-        let Some(matched) = self.match_inputs(&table, &input.input_file_paths).await? else {
+        let Some(matched) = self.match_inputs(&table, &input.partition_key, &input.input_file_paths).await? else {
             self.metrics.record_commit_aborted(&input.table);
             return Ok(RewriteOutcome::Aborted);
         };
@@ -196,6 +196,15 @@ impl RewriteExecutor {
         let rows = written.rows_written;
         let added = written.data_files;
         let output_bytes: u64 = added.iter().map(DataFile::file_size_in_bytes).sum();
+
+        // If the matched inputs held zero rows the merge produces no output
+        // files. The replace transaction rejects an empty added-file set, so
+        // committing would fail the task on a no-op; treat it as a clean abort
+        // instead (the next scan re-derives a group from whatever remains).
+        if added.is_empty() {
+            self.metrics.record_commit_aborted(&input.table);
+            return Ok(RewriteOutcome::Aborted);
+        }
 
         // Step 5: content invariants. A violation rejects the rewrite BEFORE any
         // commit; the freshly written orphan output files are cleaned up by the
@@ -247,8 +256,16 @@ impl RewriteExecutor {
     /// `input_file_paths`, ordered by sort-key `min_key` (the merge/position
     /// order). Returns `None` if ANY requested path is absent (a sibling
     /// compactor already rewrote it).
-    async fn match_inputs(&self, table: &Table, input_file_paths: &[String]) -> Result<Option<Vec<DataFileStats>>> {
-        let all_stats = list_data_files_with_stats(table, self.descriptor).await?;
+    async fn match_inputs(
+        &self,
+        table: &Table,
+        partition_key: &str,
+        input_file_paths: &[String],
+    ) -> Result<Option<Vec<DataFileStats>>> {
+        // Enumerate only this group's partition: every planned input belongs to
+        // it, so a table-wide scan would re-decode the bounds of every other
+        // partition's files on every fanned-out REWRITE task for nothing.
+        let all_stats = list_data_files_in_partition(table, self.descriptor, partition_key).await?;
 
         // Index live files by path so each requested input is a single lookup.
         // Keyed by an owned `String` because the value owns the path the key
@@ -314,11 +331,6 @@ impl RewriteExecutor {
     }
 }
 
-/// Build the [`TableIdent`] for a table name inside the `icegate` namespace.
-fn table_ident(table: &str) -> TableIdent {
-    TableIdent::new(NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), table.to_string())
-}
-
 /// Borrow a data file's path as the map key.
 fn path_key(stats: &DataFileStats) -> &str {
     stats.data_file.file_path()
@@ -344,8 +356,10 @@ fn path_key(stats: &DataFileStats) -> &str {
 ///
 /// # Errors
 ///
-/// Returns [`MaintainError::Config`] if either invariant is violated, or an
-/// enumeration/decode error if an output file's bounds cannot be read.
+/// Returns [`MaintainError::InvariantViolation`] if either invariant is violated
+/// (a data-corruption signal kept distinct from configuration errors), or a
+/// [`MaintainError::Config`] enumeration/decode error if an output file's bounds
+/// cannot be read.
 fn verify_content_invariants(
     table: &Table,
     descriptor: &SortColumnsDescriptor,
@@ -356,7 +370,7 @@ fn verify_content_invariants(
     let removed_rows: u64 = removed.iter().map(DataFile::record_count).sum();
     let added_rows: u64 = added.iter().map(DataFile::record_count).sum();
     if removed_rows != added_rows {
-        return Err(MaintainError::Config(format!(
+        return Err(MaintainError::InvariantViolation(format!(
             "rewrite row-count invariant violated: inputs hold {removed_rows} rows but outputs hold {added_rows}"
         )));
     }
@@ -382,7 +396,7 @@ fn verify_content_invariants(
         // Non-empty inputs but empty outputs with an equal row count is
         // impossible (it would imply 0 rows on both sides, handled above), so an
         // empty output here is a genuine invariant violation.
-        return Err(MaintainError::Config(
+        return Err(MaintainError::InvariantViolation(
             "rewrite envelope invariant violated: inputs are non-empty but outputs produced no files".to_string(),
         ));
     };
@@ -404,7 +418,7 @@ fn verify_content_invariants(
     // false positive this guards against. The error still pinpoints the first
     // genuinely conflicting column and its values for fast diagnosis.
     if let Some(idx) = first_envelope_conflict(&inputs_union.min_key, &outputs_union.min_key)? {
-        return Err(MaintainError::Config(format!(
+        return Err(MaintainError::InvariantViolation(format!(
             "rewrite envelope invariant violated: output minimum sort key differs from input minimum \
              ({} input file(s) -> {} output file(s); {})",
             removed.len(),
@@ -413,7 +427,7 @@ fn verify_content_invariants(
         )));
     }
     if let Some(idx) = first_envelope_conflict(&inputs_union.max_key, &outputs_union.max_key)? {
-        return Err(MaintainError::Config(format!(
+        return Err(MaintainError::InvariantViolation(format!(
             "rewrite envelope invariant violated: output maximum sort key differs from input maximum \
              ({} input file(s) -> {} output file(s); {})",
             removed.len(),

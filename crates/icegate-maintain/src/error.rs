@@ -23,6 +23,13 @@ pub enum MaintainError {
     /// Migration requires operator intervention (e.g. manual table drop).
     #[error("migration requires manual intervention: {0}")]
     Migration(String),
+
+    /// A data-integrity invariant was violated (e.g. a compaction rewrite
+    /// changed the row count or sort-key envelope). Distinct from [`Self::Config`]
+    /// so a corruption signal is never confused with a misconfiguration and can
+    /// be alerted on or branched on separately.
+    #[error("data invariant violated: {0}")]
+    InvariantViolation(String),
 }
 
 impl From<icegate_common::error::CommonError> for MaintainError {

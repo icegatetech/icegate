@@ -18,9 +18,9 @@ data:
       min_input_files: {{ .Values.compact.compaction.minInputFiles }}
       max_skippable_tail_files: {{ .Values.compact.compaction.maxSkippableTailFiles }}
       scan_interval_secs: {{ .Values.compact.compaction.scanIntervalSecs }}
+      rewrite_timeout_secs: {{ .Values.compact.compaction.rewriteTimeoutSecs }}
       worker_count: {{ .Values.compact.compaction.workerCount }}
       poll_interval_ms: {{ .Values.compact.compaction.pollIntervalMs }}
-      max_commit_retries: {{ .Values.compact.compaction.maxCommitRetries }}
       row_group_size: {{ .Values.compact.compaction.rowGroupSize }}
       data_page_size_limit_bytes: {{ .Values.compact.compaction.dataPageSizeLimitBytes | int }}
       logs_enabled: {{ .Values.compact.compaction.tables.logs }}

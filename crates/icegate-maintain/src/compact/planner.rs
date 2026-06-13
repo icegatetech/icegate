@@ -5,7 +5,7 @@
 //! *rewrite groups*. Each group is a set of input files in one partition that a
 //! later PLAN executor (Task 4.4) rewrites into approximately one output file.
 //!
-//! The algorithm is four stages:
+//! The algorithm is five stages:
 //! 1. **Group** files by partition key, so a rewrite never spans partitions.
 //! 2. **Skip healthy partitions.** A partition with few files and no
 //!    significant tail of sub-target files is left untouched.
@@ -16,6 +16,12 @@
 //!    rewrite produces non-overlapping outputs.
 //! 4. **Bin-pack** each cluster by input-byte budget into one or more groups, so
 //!    no single rewrite reads more than the configured cap.
+//! 5. **Drop non-beneficial groups.** A group of a single file rewrites it
+//!    1-to-1 with no file-count reduction; emitting it would make every scan
+//!    re-rewrite the same file forever (a partition of disjoint, already-large
+//!    files would never converge). Only groups of two or more files — which
+//!    actually merge — are kept; a partition left with no such group is counted
+//!    as skipped, not compacted.
 //!
 //! The planner is generic over [`PlannableFile`] so its logic is unit-testable
 //! against a fake file without constructing an [`iceberg::spec::DataFile`].
@@ -84,10 +90,11 @@ pub struct PlannerLimits {
 /// partition-level skip accounting the PLAN telemetry records.
 ///
 /// The two counters are complementary over the table's partitions: every
-/// partition is either *skipped* (left untouched as healthy, contributing no
-/// group) or *compacted* (it produced at least one rewrite group). A non-healthy
-/// partition always yields a group, so `partitions_compacted` equals the number
-/// of distinct partition keys appearing across [`groups`](Self::groups).
+/// partition is either *skipped* (contributing no group) or *compacted* (it
+/// produced at least one rewrite group). A partition is skipped both when it is
+/// healthy and when clustering leaves only non-beneficial single-file groups, so
+/// `partitions_compacted` equals the number of distinct partition keys appearing
+/// across [`groups`](Self::groups).
 ///
 /// `Default` is hand-written (not derived) so it never requires `F: Default`:
 /// `F` is a [`PlannableFile`] data-file type that has no meaningful default.
@@ -115,11 +122,12 @@ impl<F> Default for PlanOutcome<F> {
 /// Group, select, and bin-pack files into rewrite groups, one per output file.
 ///
 /// Returns a [`PlanOutcome`]: the rewrite groups plus how many partitions were
-/// compacted versus skipped. Every group is non-empty, and all files in a group
-/// share the same [`PlannableFile::partition_key`]. A partition may yield zero
-/// groups (it was skipped as healthy) or several (a large or wide-overlap
-/// partition split by the byte budget). The caller maps each returned group to a
-/// rewrite input from the underlying files' paths.
+/// compacted versus skipped. Every group holds at least two files (single-file
+/// groups are dropped — see the module docs), and all files in a group share the
+/// same [`PlannableFile::partition_key`]. A partition may yield zero groups (it
+/// was skipped as healthy, or clustering left only single-file groups) or several
+/// (a large or wide-overlap partition split by the byte budget). The caller maps
+/// each returned group to a rewrite input from the underlying files' paths.
 ///
 /// Generic over [`PlannableFile`] so the grouping, skip, clustering, and
 /// bin-packing logic is exercised in unit tests without building real Iceberg
@@ -134,15 +142,28 @@ pub fn plan_rewrite_groups<F: PlannableFile>(files: Vec<F>, cfg: &PlannerLimits)
             outcome.partitions_skipped += 1;
             continue;
         }
-        // A non-healthy partition always emits at least one group below, so it
-        // counts as compacted exactly once here.
-        outcome.partitions_compacted += 1;
         // Cluster transitively-overlapping files so each cluster's rewrite
         // output occupies a disjoint sort-key range, then split each cluster by
         // the input-byte budget. `swept_line_cluster` stable-sorts by `min_key`,
         // so both the clustering and the resulting groups are deterministic.
+        let mut partition_groups: Vec<Vec<F>> = Vec::new();
         for cluster in swept_line_cluster(partition_files, PlannableFile::boundary_range) {
-            bin_pack_into(cluster, cfg.max_group_input_bytes, &mut outcome.groups);
+            bin_pack_into(cluster, cfg.max_group_input_bytes, &mut partition_groups);
+        }
+        // Keep only groups that actually merge (>= 2 files). A single-file group
+        // rewrites one file 1-to-1 with no benefit, so emitting it would make
+        // every scan re-rewrite the same file forever — the re-compaction loop a
+        // partition of disjoint, already-large files would otherwise spin in.
+        // Dropping single-file groups leaves such files untouched.
+        partition_groups.retain(|group| group.len() >= 2);
+        if partition_groups.is_empty() {
+            // Nothing beneficial to do (only lone/disjoint files survived):
+            // report the partition as skipped so the telemetry matches the
+            // "no rewrite scheduled" outcome.
+            outcome.partitions_skipped += 1;
+        } else {
+            outcome.partitions_compacted += 1;
+            outcome.groups.append(&mut partition_groups);
         }
     }
     outcome
@@ -343,17 +364,18 @@ mod tests {
 
     #[test]
     fn bin_packs_by_input_budget_into_multiple_groups() {
-        // Five disjoint small files of 60 KiB each = 300 KiB > 250 KiB cap, all
-        // in one partition. They cluster into nothing (disjoint) but the planner
-        // still rewrites them because the partition is unhealthy (5 sub-target
-        // files > tail tolerance). Bin-packing by the 250 KiB budget must split
-        // them into more than one group, each <= the cap.
+        // Six transitively-overlapping 60 KiB files = 360 KiB > 250 KiB cap, all
+        // in one partition. They cluster into one overlap chain that the 250 KiB
+        // budget must split into more than one group, each <= the cap. Every kept
+        // group still merges two or more files, so none is dropped as
+        // non-beneficial.
         let files = vec![
-            file("t/1", 60_000, 10, 20),
-            file("t/1", 60_000, 30, 40),
-            file("t/1", 60_000, 50, 60),
-            file("t/1", 60_000, 70, 80),
-            file("t/1", 60_000, 90, 100),
+            file("t/1", 60_000, 10, 100),
+            file("t/1", 60_000, 20, 110),
+            file("t/1", 60_000, 30, 120),
+            file("t/1", 60_000, 40, 130),
+            file("t/1", 60_000, 50, 140),
+            file("t/1", 60_000, 60, 150),
         ];
         let cfg = limits();
         let groups = plan_rewrite_groups(files, &cfg).groups;
@@ -363,60 +385,60 @@ mod tests {
             "input exceeding the group budget must split into multiple groups"
         );
         for group in &groups {
+            assert!(group.len() >= 2, "a kept group must merge at least two files");
             let summed: u64 = group.iter().map(PlannableFile::size_bytes).sum();
             assert!(
                 summed <= cfg.max_group_input_bytes,
                 "each group's summed input bytes ({summed}) must stay within the budget"
             );
         }
-        // No file is dropped.
+        // The chain is one cluster that bin-packs without dropping any file.
         let total: usize = groups.iter().map(Vec::len).sum();
-        assert_eq!(total, 5, "every input file must appear in exactly one group");
+        assert_eq!(total, 6, "every input file must appear in exactly one group");
     }
 
     #[test]
-    fn oversized_single_file_forms_its_own_group() {
-        // Within one disjoint-overlap cluster, a file larger than the group
-        // budget must form its own group rather than being merged or dropped.
-        // Three files of 60/300/60 KiB chain-overlap into one cluster; the
-        // 300 KiB file alone exceeds the 250 KiB cap, so bin-packing must emit
-        // it on its own. Two extra disjoint small files push the partition's
-        // file_count past min_input_files so it is not skipped as healthy.
+    fn disjoint_partition_is_skipped_to_avoid_recompaction_loop() {
+        // A partition with more than `min_input_files` files — so the count check
+        // marks it unhealthy — whose files are all disjoint AND already at or
+        // above target. Each file forms its own single-file cluster, so there is
+        // nothing to merge. The planner must emit NO rewrite group and count the
+        // partition as skipped; otherwise every scan would rewrite these files
+        // 1-to-1 forever (the re-compaction loop this guards against).
         let files = vec![
-            file("t/1", 60_000, 10, 25),
-            file("t/1", 300_000, 20, 50),
-            file("t/1", 60_000, 45, 60),
-            file("t/1", 60_000, 100, 110),
-            file("t/1", 60_000, 200, 210),
+            file("t/1", 120_000, 10, 20),
+            file("t/1", 130_000, 30, 40),
+            file("t/1", 140_000, 50, 60),
+            file("t/1", 150_000, 70, 80),
+            file("t/1", 160_000, 90, 100),
         ];
-        let cfg = limits();
-        let groups = plan_rewrite_groups(files, &cfg).groups;
-
-        let solo = groups
-            .iter()
-            .find(|group| group.iter().any(|f| f.size_bytes() == 300_000))
-            .expect("the oversized file must appear in some group");
-        assert_eq!(
-            solo.len(),
-            1,
-            "a file larger than the budget must occupy a group by itself"
+        let outcome = plan_rewrite_groups(files, &limits());
+        assert!(
+            outcome.groups.is_empty(),
+            "a partition of disjoint, already-large files must produce no rewrite groups"
         );
-        // Nothing is lost: all five files are emitted across the groups.
-        let total: usize = groups.iter().map(Vec::len).sum();
-        assert_eq!(total, 5, "every input file must appear in exactly one group");
+        assert_eq!(
+            outcome.partitions_skipped, 1,
+            "such a partition is skipped, not compacted"
+        );
+        assert_eq!(
+            outcome.partitions_compacted, 0,
+            "no partition is compacted when nothing can be merged"
+        );
     }
 
     #[test]
     fn respects_partition_boundaries() {
-        // Two partitions, each unhealthy on its own (5 sub-target files). Files
-        // from different partitions must never share a group, even when their
-        // sort-key ranges overlap across partitions.
+        // Two partitions, each unhealthy on its own (5 overlapping sub-target
+        // files). Files from different partitions must never share a group, even
+        // when their sort-key ranges overlap across partitions.
         let mut files = Vec::new();
-        for i in 0..5 {
-            let lo = i * 10;
-            files.push(file("t/1", 60_000, lo, lo + 5));
-            // Identical ranges in a different partition.
-            files.push(file("t/2", 60_000, lo, lo + 5));
+        for _ in 0..5 {
+            // Identical, fully-overlapping ranges so each partition's five files
+            // cluster into one mergeable group; the same ranges appear in both
+            // partitions to prove cross-partition files never share a group.
+            files.push(file("t/1", 40_000, 0, 50));
+            files.push(file("t/2", 40_000, 0, 50));
         }
         let outcome = plan_rewrite_groups(files, &limits());
         assert_eq!(

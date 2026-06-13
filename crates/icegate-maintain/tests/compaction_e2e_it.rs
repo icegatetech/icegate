@@ -328,9 +328,10 @@ fn compaction_config(conn: &MinioConn) -> CompactionConfig {
         max_skippable_tail_files: 0,
         // Tight loop so the single iteration runs promptly.
         scan_interval_secs: 1,
+        // Generous rewrite deadline so the merge is never declared expired.
+        rewrite_timeout_secs: 600,
         worker_count: 1,
         poll_interval_ms: 100,
-        max_commit_retries: 5,
         row_group_size: 20_000,
         data_page_size_limit_bytes: 2 * 1024 * 1024,
         logs_enabled: true,

@@ -22,8 +22,11 @@
 //! first). This guarantees `min_key <= max_key` for every file.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use iceberg::spec::{Datum, Literal, PrimitiveLiteral, PrimitiveType, Struct};
+use futures::{StreamExt, TryStreamExt};
+use iceberg::io::FileIO;
+use iceberg::spec::{DataContentType, Datum, Literal, ManifestFile, PrimitiveLiteral, PrimitiveType, Struct};
 use iceberg::{spec::DataFile, table::Table};
 
 use crate::Error;
@@ -101,6 +104,15 @@ struct ResolvedSortColumn<'descriptor> {
     column: &'descriptor SortColumnDescriptor,
 }
 
+/// Upper bound on how many manifests are loaded and decoded concurrently.
+///
+/// Manifest loads are independent object-store reads, so fanning them out hides
+/// per-manifest latency; the cap keeps a wide manifest tree from issuing an
+/// unbounded number of reads at once. Results are still assembled in
+/// manifest-list order (see [`collect_data_file_stats`]) so enumeration stays
+/// deterministic.
+const MANIFEST_READ_CONCURRENCY: usize = 8;
+
 /// Enumerate all data files in the table's current snapshot with sort-key bounds.
 ///
 /// For each data file, decodes the sort-key columns' min/max from the manifest
@@ -120,6 +132,41 @@ pub async fn list_data_files_with_stats(
     table: &Table,
     descriptor: &SortColumnsDescriptor,
 ) -> Result<Vec<DataFileStats>> {
+    collect_data_file_stats(table, descriptor, None).await
+}
+
+/// Enumerate only the data files belonging to one `(tenant, day)` partition.
+///
+/// Identical to [`list_data_files_with_stats`] but skips — without decoding
+/// their sort-key bounds — every alive data file whose partition key differs
+/// from `partition_key`. The compaction REWRITE task uses this to re-check the
+/// liveness of one planner group's files without re-decoding the bounds of every
+/// file in the whole table on every fanned-out task.
+///
+/// # Errors
+///
+/// Same as [`list_data_files_with_stats`].
+pub async fn list_data_files_in_partition(
+    table: &Table,
+    descriptor: &SortColumnsDescriptor,
+    partition_key: &str,
+) -> Result<Vec<DataFileStats>> {
+    collect_data_file_stats(table, descriptor, Some(partition_key)).await
+}
+
+/// Walk the current snapshot's manifests and collect [`DataFileStats`], loading
+/// the manifests concurrently while preserving manifest-list order.
+///
+/// `partition_filter`, when set, keeps only files in that partition; matching is
+/// done on the cheap partition-key string before the (more expensive) bound
+/// decode, so a filtered scan never decodes files it will discard. Only live
+/// [`DataContentType::Data`] entries participate — delete-file manifests are
+/// skipped so they are never opened as data by the merger.
+async fn collect_data_file_stats(
+    table: &Table,
+    descriptor: &SortColumnsDescriptor,
+    partition_filter: Option<&str>,
+) -> Result<Vec<DataFileStats>> {
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
         // No committed snapshot yet: nothing to enumerate.
@@ -130,38 +177,77 @@ pub async fn list_data_files_with_stats(
     // bounds maps are keyed by field id, so this is the only name resolution we
     // need before walking the (potentially many) manifest entries.
     let resolved = resolve_sort_columns(metadata.current_schema(), descriptor)?;
+    // Resolve the sort-column names once; every file's envelope shares the same
+    // `Arc<[String]>`, so the per-file work is an Arc refcount bump rather than a
+    // fresh allocation of the name vector.
+    let names = descriptor.column_names();
 
     let file_io = table.file_io();
     let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
 
+    // Build one load+decode future per manifest eagerly, then drive them with a
+    // bounded-concurrency, ORDER-PRESERVING `buffered` stream so the flattened
+    // output stays deterministic for a fixed snapshot (downstream grouping and
+    // clustering rely on that stable order). Collecting the futures first avoids
+    // a stream-`map` closure whose borrowed-future signature the borrow checker
+    // cannot prove general over the manifest reference's lifetime.
+    let manifest_futures: Vec<_> = manifest_list
+        .entries()
+        .iter()
+        .map(|manifest_file| process_manifest(manifest_file, file_io, &resolved, &names, partition_filter))
+        .collect();
+    let per_manifest: Vec<Vec<DataFileStats>> = futures::stream::iter(manifest_futures)
+        .buffered(MANIFEST_READ_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    Ok(per_manifest.into_iter().flatten().collect())
+}
+
+/// Load one manifest and decode its live DATA-file entries into
+/// [`DataFileStats`], applying the optional partition filter.
+///
+/// Factored out of [`collect_data_file_stats`] so the concurrent
+/// [`futures::stream::StreamExt::buffered`] driver maps over a named future with
+/// concrete lifetimes (an inline async closure trips the borrow checker's
+/// higher-ranked lifetime inference here).
+async fn process_manifest(
+    manifest_file: &ManifestFile,
+    file_io: &FileIO,
+    resolved: &[ResolvedSortColumn<'_>],
+    names: &Arc<[String]>,
+    partition_filter: Option<&str>,
+) -> Result<Vec<DataFileStats>> {
+    let manifest = manifest_file.load_manifest(file_io).await?;
     let mut stats = Vec::new();
-    for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file.load_manifest(file_io).await?;
-        for entry in manifest.entries() {
-            // Skip entries that the snapshot has logically deleted; only files
-            // alive at the current snapshot participate in compaction.
-            if !entry.is_alive() {
+    for entry in manifest.entries() {
+        // Only files alive at the current snapshot participate.
+        if !entry.is_alive() {
+            continue;
+        }
+        let data_file = entry.data_file();
+        // Compaction merges DATA files only; positional/equality delete files
+        // must never be opened as data by the merger.
+        if data_file.content_type() != DataContentType::Data {
+            continue;
+        }
+        let partition_key = partition_key_string(data_file.partition());
+        if let Some(target) = partition_filter {
+            if partition_key != target {
                 continue;
             }
-            let data_file = entry.data_file();
-            let (min_key, max_key) =
-                decode_boundary_keys(&resolved, data_file.lower_bounds(), data_file.upper_bounds())?;
-            // Pair the decoded keys with the sort-column names to form the
-            // file's inclusive sort-order envelope, and derive a stable
-            // partition key the planner groups by.
-            let boundary_range = RowGroupBoundaryRange {
-                names: descriptor.column_names(),
+        }
+        let (min_key, max_key) = decode_boundary_keys(resolved, data_file.lower_bounds(), data_file.upper_bounds())?;
+        stats.push(DataFileStats {
+            data_file: data_file.clone(),
+            partition_key,
+            boundary_range: RowGroupBoundaryRange {
+                names: names.clone(),
                 min_key,
                 max_key,
-            };
-            stats.push(DataFileStats {
-                data_file: data_file.clone(),
-                partition_key: partition_key_string(data_file.partition()),
-                boundary_range,
-            });
-        }
+            },
+        });
     }
-
     Ok(stats)
 }
 
@@ -243,6 +329,20 @@ fn resolve_sort_columns<'descriptor>(
 /// field id is absent from a bounds map (for example an all-null optional
 /// column, which Iceberg omits from the bounds map) yields a component with
 /// `value: None`.
+///
+/// # Known limitation (clustering quality, not correctness)
+///
+/// Iceberg manifest bounds describe only the NON-NULL values in a file. For a
+/// file that mixes nulls with values in a `nulls-first` sort column (e.g.
+/// `logs.service_name`), the decoded `min_key` therefore reports the smallest
+/// non-null value even though the file's true sort-order range begins at NULL
+/// (which sorts first). The planner's overlap clustering can then judge two
+/// files that overlap only in their NULL region as disjoint and place them in
+/// separate rewrite groups. This only weakens compaction/pruning — each group is
+/// still rewritten correctly and in place, so no row is lost, duplicated, or
+/// reordered. A precise fix would need a distinct "null present" marker in the
+/// boundary component (one that does not collide with the `None`-is-absent-bound
+/// identity the rewrite envelope invariant depends on), which is deferred.
 fn decode_boundary_keys(
     resolved: &[ResolvedSortColumn<'_>],
     lower_bounds: &HashMap<i32, Datum>,

@@ -18,23 +18,23 @@
 //!
 //! Files are opened by path through the table's
 //! [`FileIO`](iceberg::io::FileIO) — the same object-store handle the writer
-//! used — so the source never assumes a local filesystem. The read mirrors the
-//! query crate's parquet opener
-//! (`icegate_query::engine::metadata_scan::parquet_reader`): `new_input(path)` →
-//! `metadata()` + `reader()` → [`ArrowFileReader`] →
-//! [`ParquetRecordBatchStreamBuilder`]. All read failures map to
-//! [`Error::CompactRead`], the compaction read-path error variant.
+//! used — so the source never assumes a local filesystem. Opening goes through
+//! the shared [`open_arrow_file_reader`] helper (the same opener the query
+//! crate's metadata scan uses): `new_input(path)` → `reader()` →
+//! [`ArrowFileReader`](iceberg::arrow::ArrowFileReader) built from the file's
+//! already-known size → [`ParquetRecordBatchStreamBuilder`]. All read failures
+//! map to [`Error::CompactRead`], the compaction read-path error variant.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
-use iceberg::arrow::ArrowFileReader;
-use iceberg::io::{FileIO, FileMetadata};
+use iceberg::io::FileIO;
 use icegate_common::Error;
 use icegate_common::error::Result;
 use icegate_common::iceberg_write::CommonRecordBatchStream;
 use icegate_common::merge::{MergeInput, MergeSource};
+use icegate_common::parquet_source::open_arrow_file_reader;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use tokio_util::sync::CancellationToken;
 
@@ -100,9 +100,8 @@ impl MergeSource for IcebergMergeSource {
     ///
     /// Returns [`Error::CompactRead`] if `input.position` has no registered
     /// path, if `cancel` is already triggered, if the file cannot be opened /
-    /// stat-ed / read through [`FileIO`], if the Parquet footer cannot be
-    /// decoded, or (lazily, while streaming) if any record batch fails to
-    /// decode.
+    /// read through [`FileIO`], if the Parquet footer cannot be decoded, or
+    /// (lazily, while streaming) if any record batch fails to decode.
     async fn open(&self, input: &MergeInput, cancel: &CancellationToken) -> Result<CommonRecordBatchStream> {
         // Fail fast before issuing any object-store I/O if the merge was already
         // cancelled.
@@ -114,24 +113,13 @@ impl MergeSource for IcebergMergeSource {
 
         let path = self.path_for(input.position)?;
 
-        // Open the data file through the table's FileIO (same object-store
-        // handle the writer used), mirroring the query crate's parquet opener:
-        // new_input -> metadata (footer size) -> reader -> ArrowFileReader ->
-        // ParquetRecordBatchStreamBuilder.
-        let input_file = self
-            .file_io
-            .new_input(path)
+        // Open the data file through the table's FileIO (same object-store handle
+        // the writer used) via the shared opener. The file size is already known
+        // from the planned `MergeInput`, so the opener builds the footer metadata
+        // from it rather than issuing a separate stat round-trip per file.
+        let arrow_reader = open_arrow_file_reader(&self.file_io, path, input.bytes)
+            .await
             .map_err(|err| Error::CompactRead(format!("failed to open data file '{path}': {err}")))?;
-        let file_metadata: FileMetadata = input_file
-            .metadata()
-            .await
-            .map_err(|err| Error::CompactRead(format!("failed to stat data file '{path}': {err}")))?;
-        let reader = input_file
-            .reader()
-            .await
-            .map_err(|err| Error::CompactRead(format!("failed to read data file '{path}': {err}")))?;
-
-        let arrow_reader = ArrowFileReader::new(file_metadata, reader);
         let parquet_stream = ParquetRecordBatchStreamBuilder::new(arrow_reader)
             .await
             .map_err(|err| Error::CompactRead(format!("failed to read parquet metadata for '{path}': {err}")))?
