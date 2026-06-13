@@ -8,10 +8,11 @@ pub(crate) mod test_utils;
 mod writer;
 
 pub(crate) use batch::{write_logs_batch_to_wal, write_metrics_batch_to_wal, write_traces_batch_to_wal};
-pub(crate) use boundary::compare_option_ord;
-pub(crate) use boundary::{
-    RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue,
-};
+pub(crate) use boundary::RowGroupBoundaryRange;
+// `RowGroupBoundaryKey` / `RowGroupBoundaryValue` are only named from `#[cfg(test)]`
+// code in `sorter` and `shift`; their runtime use goes through `RowGroupBoundaryRange`.
+#[cfg(test)]
+pub(crate) use boundary::{RowGroupBoundaryKey, RowGroupBoundaryValue};
 pub(crate) use columns::{SortColumnCache, SortColumnsDescriptor};
 pub(crate) use metadata::deserialize_row_group_boundary_range;
 #[cfg(test)]

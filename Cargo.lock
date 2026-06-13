@@ -3813,8 +3813,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b795ef2e2197596efad630c5e8cc4b4ebdfc488c02dadc709bef0416e1ffd49"
+source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#da2cad4a18965bfdaeadeb1f6f8c7fd78e7189c5"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -3867,8 +3866,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0146d632865e179b14b79064a0eb976edda890199879264133c44e101371f98"
+source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#da2cad4a18965bfdaeadeb1f6f8c7fd78e7189c5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3884,8 +3882,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "892fe71df3f5d1707c7ede042545051aca659a8a4a8ca828c5a13064338f56fc"
+source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#da2cad4a18965bfdaeadeb1f6f8c7fd78e7189c5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3905,8 +3902,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-s3tables"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3bb0ad272c33f2d724ff2a4f0cade646fcebfb9d67358897310e85f3d5d7927"
+source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#da2cad4a18965bfdaeadeb1f6f8c7fd78e7189c5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3919,8 +3915,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be3e981027526bdb23a4318b1016c1f68142ef11b414ba732eb7cd3f8313857f"
+source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#da2cad4a18965bfdaeadeb1f6f8c7fd78e7189c5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3936,8 +3931,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b8745ded8db2a4c2febc84ce2d5e9aaf5e2a1c0c9f6a82a1ea8134691e30a0b"
+source = "git+https://github.com/icegatetech/iceberg-rust?branch=develop#da2cad4a18965bfdaeadeb1f6f8c7fd78e7189c5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3993,6 +3987,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-catalog-s3tables",
  "icegate-catalog-s3",
+ "icegate-common",
  "object_store",
  "object_store_opendal",
  "opendal",
@@ -4018,6 +4013,7 @@ dependencies = [
  "tracing-subscriber",
  "typetag",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4089,17 +4085,28 @@ dependencies = [
 name = "icegate-maintain"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
  "clap",
+ "futures",
  "iceberg",
+ "icegate-catalog-s3",
  "icegate-common",
+ "icegate-jobmanager",
+ "opentelemetry",
+ "parquet",
  "serde",
+ "serde_json",
  "serde_yaml",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

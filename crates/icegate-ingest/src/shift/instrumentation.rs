@@ -142,7 +142,11 @@ impl RowGroupsMergerObserverWithMetrics {
 }
 
 impl RowGroupsMergerObserver for RowGroupsMergerObserverWithMetrics {
-    fn on_row_group_opened(&self, segment_offset: u64, row_group_idx: usize, bytes: u64) {
+    fn on_input_opened(&self, position: u128, bytes: u64) {
+        // Decode the merger's opaque position back to WAL coordinates so the
+        // per-row-group lifetime map key and structured logs stay identical to
+        // the pre-refactor behavior.
+        let (segment_offset, row_group_idx) = crate::shift::row_groups_merger::wal_decode_position(position);
         let bytes_i64 = i64::try_from(bytes).unwrap_or(i64::MAX);
         let previous = self
             .opened_at
@@ -161,8 +165,9 @@ impl RowGroupsMergerObserver for RowGroupsMergerObserverWithMetrics {
             .add_row_groups_merger_open_row_group_bytes(bytes_i64, self.topic.as_str());
     }
 
-    fn on_row_group_closed(&self, segment_offset: u64, row_group_idx: usize, bytes: u64) {
-        // Use the same i64::MAX saturation as on_row_group_opened so open/close updates stay symmetric even if bytes does not fit i64.
+    fn on_input_closed(&self, position: u128, bytes: u64) {
+        let (segment_offset, row_group_idx) = crate::shift::row_groups_merger::wal_decode_position(position);
+        // Use the same i64::MAX saturation as on_input_opened so open/close updates stay symmetric even if bytes does not fit i64.
         let bytes_i64 = i64::try_from(bytes).unwrap_or(i64::MAX);
         let opened_at = self
             .opened_at

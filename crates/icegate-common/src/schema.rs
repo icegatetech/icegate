@@ -419,10 +419,6 @@ pub fn spans_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
 /// - `trace_id` (ascending) - groups spans by trace for reconstruction
 /// - `timestamp` (descending)
 pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
-    let service_name_field = schema
-        .field_by_name("service_name")
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'service_name' not found in spans schema"))?;
-
     let trace_id_field = schema
         .field_by_name("trace_id")
         .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'trace_id' not found in spans schema"))?;
@@ -433,12 +429,6 @@ pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
 
     let sort_order = SortOrder::builder()
         .with_order_id(2)
-        .with_sort_field(SortField {
-            source_id: service_name_field.id,
-            transform: Transform::Identity,
-            direction: SortDirection::Ascending,
-            null_order: iceberg::spec::NullOrder::First,
-        })
         .with_sort_field(SortField {
             source_id: trace_id_field.id,
             transform: Transform::Identity,

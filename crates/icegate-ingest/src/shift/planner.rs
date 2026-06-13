@@ -23,6 +23,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use icegate_common::merge::cluster::swept_line_cluster as common_swept_line_cluster;
 use icegate_queue::{ExtractedValue, RowGroupPlanEntry};
 use tokio_util::sync::CancellationToken;
 
@@ -467,88 +468,29 @@ fn sort_by_min_key(row_groups: &mut [PlanRowGroup]) {
     row_groups.sort_by(|left, right| left.boundary_range.min_key.compare(&right.boundary_range.min_key));
 }
 
-/// Internal accumulator for a swept-line cluster.
-struct ClusterAcc {
-    row_groups: Vec<PlanRowGroup>,
-    /// Index into `row_groups` of the element whose `max_key` is the current
-    /// cluster maximum. Storing an index avoids cloning the boundary key on
-    /// every extension — only the usize is updated.
-    running_max_key_idx: usize,
-    total_bytes: u64,
-}
-
-/// Group transitively overlapping row groups into clusters using a swept-line
-/// pass over `min_key`-sorted input.
+/// Group transitively overlapping row groups into clusters using the shared
+/// swept-line pass in [`icegate_common::merge::cluster`].
 ///
-/// Two row groups overlap when `b.min_key <= cluster.running_max_key`. The
-/// `running_max_key` is the maximum `max_key` observed so far inside the
-/// current cluster — ensuring that A overlaps B and B overlaps C transitively
-/// flushes both into the same cluster.
+/// Two row groups overlap when `b.min_key <= cluster.running_max_key` (the
+/// maximum `max_key` observed so far inside the current cluster), so A–B and
+/// B–C overlaps transitively flush into one cluster. The shared routine
+/// guarantees the strict between-cluster invariant
+/// `clusters[i].running_max_key < clusters[i+1].min_key`.
 ///
-/// Invariant: between any two consecutive output clusters
-/// `clusters[i].running_max_key < clusters[i+1].min_key` (strict).
+/// The common routine returns bare `Vec<PlanRowGroup>` groups; this adapter
+/// projects each row group to its `boundary_range` and re-attaches the
+/// per-cluster `total_bytes` that downstream bin-packing relies on.
 fn swept_line_cluster(row_groups: Vec<PlanRowGroup>) -> Vec<Cluster> {
-    use std::cmp::Ordering;
-
-    let mut clusters: Vec<Cluster> = Vec::new();
-    let mut current: Option<ClusterAcc> = None;
-    for rg in row_groups {
-        match current.as_mut() {
-            None => {
-                current = Some(ClusterAcc {
-                    running_max_key_idx: 0,
-                    total_bytes: rg.row_group_bytes,
-                    row_groups: vec![rg],
-                });
+    common_swept_line_cluster(row_groups, |rg: &PlanRowGroup| &rg.boundary_range)
+        .into_iter()
+        .map(|group| {
+            let total_bytes = group.iter().map(|rg| rg.row_group_bytes).fold(0u64, u64::saturating_add);
+            Cluster {
+                row_groups: group,
+                total_bytes,
             }
-            Some(acc) => {
-                // Compute the overlap order; borrow ends at block boundary so
-                // we can mutate `acc.row_groups` afterwards.
-                let order = {
-                    let running_max = &acc.row_groups[acc.running_max_key_idx].boundary_range.max_key;
-                    rg.boundary_range.min_key.compare(running_max)
-                };
-                if matches!(order, Ordering::Less | Ordering::Equal) {
-                    // Determine whether the incoming RG extends the cluster
-                    // maximum; borrow ends before the push below.
-                    let extends_max = {
-                        let running_max = &acc.row_groups[acc.running_max_key_idx].boundary_range.max_key;
-                        rg.boundary_range.max_key.compare(running_max) == Ordering::Greater
-                    };
-                    if extends_max {
-                        // After push, `rg` will sit at the current length.
-                        acc.running_max_key_idx = acc.row_groups.len();
-                    }
-                    acc.total_bytes = acc.total_bytes.saturating_add(rg.row_group_bytes);
-                    acc.row_groups.push(rg);
-                } else {
-                    // Invariant: we are inside the `Some(acc)` arm above, so
-                    // `current` must still be `Some`. The `else` arm makes
-                    // the invariant explicit — silently dropping `rg` would
-                    // lose data and is unreachable on this branch.
-                    let Some(finished) = current.take() else {
-                        unreachable!("current is Some on the Greater branch");
-                    };
-                    clusters.push(Cluster {
-                        row_groups: finished.row_groups,
-                        total_bytes: finished.total_bytes,
-                    });
-                    current = Some(ClusterAcc {
-                        running_max_key_idx: 0,
-                        total_bytes: rg.row_group_bytes,
-                        row_groups: vec![rg],
-                    });
-                }
-            }
-        }
-    }
-    if let Some(acc) = current {
-        clusters.push(Cluster {
-            row_groups: acc.row_groups,
-            total_bytes: acc.total_bytes,
-        });
-    }
-    clusters
+        })
+        .collect()
 }
 
 /// Bin-pack clusters greedily into shift-task chunks.

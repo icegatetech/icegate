@@ -134,3 +134,33 @@ migrate:
     endpoints:
       - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
       - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
+
+## Compaction (long-running `maintain run` service)
+compact:
+  enabled: true
+  replicaCount: 1
+  waitForDependencies:
+    enabled: true
+    endpoints:
+      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
+      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
+  compaction:
+    scanIntervalSecs: 60
+    workerCount: 2
+    jobsStorage:
+      endpoint: http://minio.infra.svc.cluster.local.:9000
+      bucket: jobs
+      prefix: compactor
+      useSsl: false
+      jobStateCodec: json
+      requestTimeoutSecs: 5
+  tracing:
+    otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317
+  rustLog: "info,icegate_maintain=debug,icegate_jobmanager=debug,icegate_common=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi

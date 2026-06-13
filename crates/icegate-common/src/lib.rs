@@ -76,6 +76,12 @@ pub mod catalog;
 pub mod config;
 /// Error types for common operations.
 pub mod error;
+/// Shared Iceberg Parquet write pipeline (Arrow batches → data files).
+pub mod iceberg_write;
+/// Snapshot data-file enumeration with decoded sort-key bounds (compaction).
+pub mod manifest_scan;
+/// Sort-merge primitives shared across ingest, the Shifter, and compaction.
+pub mod merge;
 /// Prometheus metrics utilities.
 pub mod metrics;
 /// Per-column Parquet encoding overrides shared across writers.
@@ -100,7 +106,8 @@ pub mod testing;
 // Re-export commonly used types
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle};
 pub use config::{ServerConfig, check_port_conflicts, load_config_file};
-pub use error::Result;
+pub use error::{CommonError as Error, Result};
+pub use manifest_scan::{DataFileStats, list_data_files_with_stats};
 pub use metrics::{MetricsConfig, MetricsRuntime, run_metrics_server};
 pub use retrier::{Retrier, RetrierConfig, RetryError};
 pub use storage::{

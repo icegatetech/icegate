@@ -18,6 +18,7 @@ testing = ["testcontainers", "aws-config", "aws-sdk-s3"]
 
 [dependencies]
 # Iceberg
+arrow = { workspace = true }
 iceberg = { workspace = true }
 icegate-catalog-s3 = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
@@ -30,6 +31,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 
 # Storage
 object_store = { workspace = true }
@@ -73,4 +75,12 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 
 [dev-dependencies]
-arrow = { workspace = true }
+# Self-reference with `testing` enabled so integration tests under `tests/`
+# can reach `icegate_common::testing` (MinIO container + S3 bucket helpers).
+# Cargo unifies this with the library build for test targets only.
+icegate-common = { path = ".", features = ["testing"] }
+# Parquet-compaction manifest-scan integration test: seed data files via the
+# owned S3 catalog + Iceberg writer, then enumerate them with bounds.
+icegate-catalog-s3 = { workspace = true }
+testcontainers = { workspace = true }
+futures = { workspace = true }

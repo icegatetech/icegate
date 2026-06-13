@@ -79,6 +79,13 @@ impl From<icegate_common::error::CommonError> for IngestError {
             CommonError::Iceberg(e) => Self::Iceberg(e),
             CommonError::Io(e) => Self::Io(e),
             CommonError::ObjectStore(e) => Self::Config(format!("object store error: {e}")),
+            // Write-pipeline messages (cancellation, overflow, partition split)
+            // originated as `IngestError::Shift` before the pipeline moved to
+            // `icegate_common`; preserve that mapping on the way back.
+            // Write-pipeline and compaction-read messages both surface as a
+            // shift-side failure (the latter is not produced on the ingest path
+            // but the conversion must stay exhaustive).
+            CommonError::Write(msg) | CommonError::CompactRead(msg) => Self::Shift(msg),
         }
     }
 }

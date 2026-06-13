@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use icegate_common::retrier::{Retrier, RetrierConfig};
 use icegate_jobmanager::{Error, ImmutableTask, JobManager};
 use icegate_queue::{QueueReader, Topic};
@@ -15,7 +16,8 @@ use super::{
     executor::{TaskStatus, parse_task_input},
     iceberg_storage::Storage,
     row_groups_merger::{
-        NoopRowGroupsMergerObserver, RowGroupsMerger, RowGroupsMergerObserver, SortedBatchMergerConfig,
+        NoopRowGroupsMergerObserver, RowGroupsMerger, RowGroupsMergerObserver, SortedBatchMergerConfig, WalMergeSource,
+        wal_inputs_from_segments,
     },
 };
 use crate::wal::SortColumnsDescriptor;
@@ -327,26 +329,63 @@ where
         segments: &[SegmentToRead],
         cancel_token: &CancellationToken,
     ) -> Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError> {
+        let source = Arc::new(WalMergeSource::new(
+            Arc::clone(&self.queue_reader) as Arc<dyn QueueReader>,
+            self.topic.clone(),
+        ));
         let mut merger = RowGroupsMerger::new(
-            Arc::clone(&self.queue_reader),
-            segments,
+            source,
+            wal_inputs_from_segments(segments),
             SortedBatchMergerConfig {
                 row_group_size: self.output_batch_size,
                 read_parallelism: self.segment_read_parallelism,
-                topic: self.topic.clone(),
                 cancel_token: cancel_token.clone(),
                 sort_descriptor: self.sort_descriptor,
             },
         )
-        .map_err(ShiftWriteError::queue_read)?
+        .map_err(|err| ShiftWriteError::queue_read(bridge_merge_error(err, cancel_token)))?
         .with_observer(Arc::clone(&self.row_groups_merger_observer));
-        merger.prefetch_first_group().await.map_err(ShiftWriteError::queue_read)?;
-        let merged_stream = merger.into_stream();
+        merger
+            .prefetch_first_group()
+            .await
+            .map_err(|err| ShiftWriteError::queue_read(bridge_merge_error(err, cancel_token)))?;
+
+        // The shared merger yields `icegate_common::Error`; bridge it back to
+        // `IngestError` for the storage write pipeline, re-detecting
+        // cancellation via the shared token so a cancelled merge still surfaces
+        // as `IngestError::Cancelled` (the merger has no `Cancelled` variant of
+        // its own).
+        let write_cancel_token = cancel_token.clone();
+        let merged_stream = merger
+            .into_stream()
+            .map_err(move |err| bridge_merge_error(err, &write_cancel_token))
+            .boxed();
         self.storage
             .write_record_batches(merged_stream, cancel_token)
             .await
             .map_err(ShiftWriteError::from)
     }
+}
+
+/// Bridge a merger `icegate_common::Error` back into `IngestError`.
+///
+/// The merger collapses every failure (including cancellation and WAL reads)
+/// into `icegate_common::Error::Write`. To preserve the Shifter's typed failure
+/// accounting, this reclassifies that flat error:
+///
+/// 1. If the shared cancel token fired, report `IngestError::Cancelled` (the
+///    merger has no `Cancelled` variant of its own).
+/// 2. Else, if the failure was stamped by [`WalMergeSource`], report
+///    `IngestError::ShiftQueueRead` so the `QueueRead` failure reason survives.
+/// 3. Otherwise fall back to the standard `From` mapping (`Write` -> `Shift`).
+fn bridge_merge_error(err: icegate_common::Error, cancel_token: &CancellationToken) -> crate::error::IngestError {
+    if cancel_token.is_cancelled() {
+        return crate::error::IngestError::Cancelled;
+    }
+    if super::row_groups_merger::is_wal_source_error(&err) {
+        return crate::error::IngestError::ShiftQueueRead(err.to_string());
+    }
+    err.into()
 }
 
 struct ShiftWriteError {

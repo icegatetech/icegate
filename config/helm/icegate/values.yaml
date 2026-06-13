@@ -411,6 +411,108 @@ migrate:
     #  - http://rustfs-svc:9000/health/ready
 
 ## ---------------------------------------------------------------------------
+## Compaction component (long-running `maintain run` service)
+## ---------------------------------------------------------------------------
+## Rewrites small Parquet data files in the Iceberg tables into fewer, larger
+## files. Runs as a Deployment that loops on `compaction.scanIntervalSecs`.
+##
+## Disabled by default: the `maintain run` binary always initialises tracing and
+## refuses to start without an OTLP endpoint, so enabling compaction REQUIRES
+## setting `compact.tracing.otlpEndpoint` (a Helm `required` guard enforces it).
+compact:
+  enabled: false
+  ## Replicas may be scaled out. The jobmanager distributes rewrite tasks across
+  ## all workers in any pod via shared S3 job-state with compare-and-swap, and
+  ## commits use optimistic concurrency, so parallel instances are safe. Prefer
+  ## scaling `compaction.workerCount` (in-process parallelism) first; add
+  ## replicas for more throughput. All workers on a table contend on a single
+  ## job-state object, so horizontal returns taper as replicas grow.
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/icegatetech/icegate-maintain
+    tag: ""  # defaults to Chart.appVersion
+    pullPolicy: IfNotPresent
+
+  ## Compaction tuning (maps to the binary's CompactionConfig).
+  compaction:
+    ## Desired OUTPUT Parquet file size, in bytes (default: 128 MiB).
+    targetFileSizeBytes: 134217728
+    ## Hard cap on a rewrite group's summed INPUT bytes (bin-packing budget, default: 256 MiB).
+    maxGroupInputBytes: 268435456
+    ## Skip a partition with at most this many files and no sub-target tail.
+    minInputFiles: 4
+    ## Tolerated number of sub-target files when deciding to skip a partition.
+    maxSkippableTailFiles: 0
+    ## Period of the discovery loop, in seconds.
+    scanIntervalSecs: 300
+    ## Number of concurrent rewrite workers.
+    workerCount: 2
+    ## Jobmanager worker poll interval, in milliseconds.
+    pollIntervalMs: 1000
+    ## Bounded commit retries on an ingest write conflict (advisory).
+    maxCommitRetries: 5
+    ## Parquet row group size, in rows.
+    rowGroupSize: 20000
+    ## Maximum Parquet data page size, in bytes.
+    dataPageSizeLimitBytes: 2097152
+    ## Per-table compaction toggles.
+    tables:
+      logs: true
+      spans: true
+      events: true
+      metrics: true
+    ## Jobs-state storage (S3), same shape ingest's shift uses. Credentials are
+    ## taken from the AWS env vars injected into the pod, not configured here.
+    jobsStorage:
+      ## Defaults to storage.s3.endpoint when empty.
+      endpoint: ""
+      bucket: jobs
+      prefix: compactor
+      region: ""  # defaults to aws.region
+      useSsl: false
+      jobStateCodec: json
+      requestTimeoutSecs: 5
+
+  ## OpenTelemetry tracing. The OTLP endpoint is mandatory (see note above):
+  ## it is exported as OTEL_EXPORTER_OTLP_ENDPOINT (gRPC, e.g. host:4317).
+  tracing:
+    otlpEndpoint: ""
+
+  ## RUST_LOG level
+  rustLog: "info"
+
+  ## Extra environment variables
+  extraEnv: []
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  ## Liveness probe override. The compactor exposes no HTTP endpoint, so it is
+  ## empty by default — the Deployment restarts the container if the process
+  ## exits. Provide an exec/tcpSocket probe here to override.
+  livenessProbe: {}
+
+  ## Wait for catalog and storage to be ready before starting the compactor.
+  ## Uses a busybox init container to poll the endpoints.
+  waitForDependencies:
+    enabled: false
+    image: busybox:1.37
+    ## Endpoints to poll (HTTP GET). Compaction starts only when all return 2xx.
+    endpoints: []
+    #  - http://nessie:19120/api/v2/config
+    #  - http://minio:9000/minio/health/ready
+
+## ---------------------------------------------------------------------------
 ## ServiceMonitor (Prometheus Operator)
 ## ---------------------------------------------------------------------------
 serviceMonitor:

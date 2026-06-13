@@ -36,3 +36,12 @@ OTLP HTTP (port {{ .Values.ingest.otlpHttp.port }}):
 {{- end }}
 
 {{- end }}
+
+{{- if .Values.compact.enabled }}
+
+=== Compaction Service ===
+
+Long-running Parquet compaction (rewrites small data files into larger ones,
+scanning every {{ .Values.compact.compaction.scanIntervalSecs }}s). It has no API; follow its progress with:
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/component=compact -f
+{{- end }}

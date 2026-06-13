@@ -8,6 +8,8 @@ use std::path::Path;
 use icegate_common::{CatalogConfig, StorageConfig};
 use serde::{Deserialize, Serialize};
 
+use crate::compact::config::CompactionConfig;
+
 /// Maintain binary configuration
 ///
 /// Root configuration struct for the maintain binary. Contains catalog and
@@ -18,6 +20,12 @@ pub struct MaintainConfig {
     pub catalog: CatalogConfig,
     /// Storage backend configuration
     pub storage: StorageConfig,
+    /// Parquet compaction configuration
+    ///
+    /// Defaulted when absent from the config file so existing migrate configs
+    /// (which have no `compaction` key) continue to load unchanged.
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 impl MaintainConfig {

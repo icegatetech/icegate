@@ -71,6 +71,30 @@ use crate::schema::{
     COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE, COL_VALUE_DOUBLE, COL_ZERO_COUNT, COL_ZERO_THRESHOLD,
 };
 
+/// Bloom-filter columns for the `logs` table.
+///
+/// Equality-predicate lookups (trace-by-id, `{trace_id="..."}`) skip whole
+/// row groups via these high-cardinality columns.
+pub const LOGS_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
+
+/// Bloom-filter columns for the `spans` table.
+///
+/// Equality-predicate lookups (Tempo trace-by-id) skip whole row groups via
+/// these high-cardinality columns.
+pub const SPANS_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
+
+/// Bloom-filter columns for the `events` table.
+///
+/// Equality-predicate lookups skip whole row groups via these
+/// high-cardinality columns.
+pub const EVENTS_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
+
+/// Bloom-filter columns for the `metrics` table.
+///
+/// Metrics has no equality-predicate id lookups, so it carries no bloom
+/// filters.
+pub const METRICS_BLOOM_COLUMNS: &[&str] = &[];
+
 /// Encoding overrides for the `logs` table.
 ///
 /// Sort order: `service_name, timestamp DESC`. Sort-key
@@ -138,3 +162,18 @@ pub const METRICS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
     (COL_MAX, Encoding::BYTE_STREAM_SPLIT),
     (COL_ZERO_THRESHOLD, Encoding::BYTE_STREAM_SPLIT),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        COL_SPAN_ID, COL_TRACE_ID, EVENTS_BLOOM_COLUMNS, LOGS_BLOOM_COLUMNS, METRICS_BLOOM_COLUMNS, SPANS_BLOOM_COLUMNS,
+    };
+
+    #[test]
+    fn bloom_columns_are_per_table() {
+        assert_eq!(LOGS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
+        assert_eq!(SPANS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
+        assert_eq!(EVENTS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
+        assert!(METRICS_BLOOM_COLUMNS.is_empty());
+    }
+}
