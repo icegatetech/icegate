@@ -56,7 +56,7 @@ The tables use the following Parquet optimizations:
 
 **Sorting Strategy (table-specific):**
 - **Logs/Events:** `service_name` + `timestamp DESC` - Groups by service, recent-first
-- **Spans:** `trace_id` + `timestamp DESC` - Groups by service and trace, recent-first
+- **Spans:** `trace_id` + `timestamp DESC` - Groups by trace, recent-first
 - **Metrics:** `metric_name` + `service_name` + `service_instance_id` + `timestamp DESC` - Groups by metric, service, and service instance, recent-first
 
 ---
@@ -481,7 +481,7 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 **Version:** 1.3
 **Last Updated:** 2026-05-12
 **Schema Source:** `src/common/schema.rs`
-**Notable Changes in v1.3:**
+**Notable Changes in v1.4:**
 - Updated sort orders to drop the leading `cloud_account_id`:
     - Spans: `trace_id` → `timestamp DESC`
 

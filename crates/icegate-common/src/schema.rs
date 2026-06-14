@@ -177,7 +177,6 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// - day(`timestamp`)
 ///
 /// # Sorting
-/// - `service_name` (ascending)
 /// - `trace_id` (ascending) - groups spans by trace for reconstruction
 /// - `timestamp` (descending)
 #[allow(clippy::too_many_lines)]
@@ -415,7 +414,6 @@ pub fn spans_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
 /// Creates sort order for spans table.
 ///
 /// Sorts by:
-/// - `service_name` (ascending)
 /// - `trace_id` (ascending) - groups spans by trace for reconstruction
 /// - `timestamp` (descending)
 pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {

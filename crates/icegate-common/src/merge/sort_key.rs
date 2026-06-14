@@ -304,8 +304,20 @@ impl SortColumnCache {
     /// # Errors
     ///
     /// Returns an error if the two caches do not share the same sort-column
-    /// types in the same order.
+    /// arity (number of columns) or column types in the same order.
     pub fn compare_row(&self, left_row_idx: usize, right: &Self, right_row_idx: usize) -> Result<Ordering> {
+        // Guard against differing arity before zipping: `zip` stops at the
+        // shorter side, so without this check two caches of unequal column
+        // count whose shared prefix compares equal would wrongly report
+        // `Ordering::Equal`. Mirrors `RowGroupBoundaryKey::validate_compatible_structure`.
+        if self.columns.len() != right.columns.len() {
+            return Err(Error::Write(format!(
+                "incompatible sort-column cache arity: column count differs ({}, {})",
+                self.columns.len(),
+                right.columns.len()
+            )));
+        }
+
         for (left, right) in self.columns.iter().zip(right.columns.iter()) {
             let ordering = left.compare_other(left_row_idx, right, right_row_idx)?;
             if ordering != Ordering::Equal {

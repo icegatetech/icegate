@@ -80,11 +80,13 @@ antlr4rust = "0.5"
 
 # Sourced from the icegatetech/iceberg-rust fork (0.9.0 base + the `rewrite_files`
 # transaction action that compaction commits through a generic `dyn Catalog`).
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
-iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
-iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", branch = "develop" }
+# Pinned to an immutable rev (not a branch) for reproducible builds; bump the SHA
+# deliberately when adopting fork updates rather than letting `develop` float.
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
+iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
+iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
 
 # DataFusion
 datafusion = "52.2"

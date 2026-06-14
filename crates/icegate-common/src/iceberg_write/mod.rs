@@ -13,10 +13,10 @@
 //! Both the ingest shift path and the compaction path use this entry point so
 //! the Arrow → Parquet encoding policy lives in exactly one place.
 
-use std::{collections::HashSet, pin::Pin, sync::Arc};
+use std::{collections::HashSet, panic::AssertUnwindSafe, pin::Pin, sync::Arc};
 
 use arrow::record_batch::RecordBatch;
-use futures::{Stream, TryStreamExt};
+use futures::{FutureExt, Stream, TryStreamExt};
 use iceberg::{
     arrow::RecordBatchPartitionSplitter,
     io::FileIO,
@@ -257,7 +257,15 @@ async fn write_parquet_files_once(
     )
     .map_err(CommonError::Iceberg)?;
 
-    let write_result = async {
+    // Run the encoding pipeline under `catch_unwind` so a panic on the blocking
+    // thread (e.g. inside Parquet encoding or `FanoutWriter::close`) still
+    // triggers cleanup of the partially written data files before unwinding.
+    // Without this the unwind would skip the cleanup below and leak orphaned
+    // objects, breaking the documented "deleted on any error, including a panic"
+    // guarantee. `AssertUnwindSafe` is sound here: after catching we only run
+    // cleanup (which tolerates a poisoned `generated_paths` mutex) and re-raise
+    // the original panic, preserving the caller's panic-to-error mapping.
+    let write_result = AssertUnwindSafe(async {
         let mut rows_written = 0usize;
         let mut partitioned_batches_total = 0usize;
         while let Some(batch) = batches.try_next().await? {
@@ -315,14 +323,25 @@ async fn write_parquet_files_once(
             data_files,
             rows_written,
         })
-    }
+    })
+    .catch_unwind()
     .await;
 
-    if write_result.is_err() {
-        cleanup_generated_data_files(&table_file_io, &generated_paths).await;
+    match write_result {
+        Ok(result) => {
+            if result.is_err() {
+                cleanup_generated_data_files(&table_file_io, &generated_paths).await;
+            }
+            result
+        }
+        // A panic on the blocking thread must still clean up the partial writes
+        // before unwinding, otherwise the orphaned objects leak. Re-raise the
+        // panic so the caller still surfaces it as `CommonError::Write`.
+        Err(panic_payload) => {
+            cleanup_generated_data_files(&table_file_io, &generated_paths).await;
+            std::panic::resume_unwind(panic_payload);
+        }
     }
-
-    write_result
 }
 
 async fn cleanup_generated_data_files(file_io: &FileIO, generated_paths: &Arc<std::sync::Mutex<Vec<String>>>) {

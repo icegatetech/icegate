@@ -309,8 +309,8 @@ impl PlannerConfig {
 
 /// End-to-end planner pipeline for row groups with precomputed partition buckets.
 ///
-/// Pipeline: `partition_by_bucket` → per-partition-bucket(`sort_by_min_key` →
-/// `swept_line_cluster` → `bin_pack` → `tail_merge`).
+/// Pipeline: `partition_by_bucket` → per-partition-bucket(`swept_line_cluster`
+/// → `bin_pack` → `tail_merge`).
 ///
 /// Row groups are first split by abstract [`PartitionBucket`] so that the
 /// algorithm never bin-packs or tail-merges row groups that belong to different
@@ -432,15 +432,15 @@ struct BucketStats {
 ///
 /// Returns an error if `cancel_token` is cancelled before any phase.
 fn plan_bucket(
-    mut row_groups: Vec<PlanRowGroup>,
+    row_groups: Vec<PlanRowGroup>,
     limits: &PlannerConfig,
     cancel_token: &CancellationToken,
 ) -> Result<(Vec<PlannedChunk>, BucketStats)> {
     // TODO(high): try to reduce row group iterations
 
-    check_cancelled(cancel_token, "sort")?;
-    sort_by_min_key(&mut row_groups);
     check_cancelled(cancel_token, "swept_line_cluster")?;
+    // `swept_line_cluster` stable-sorts its input by `min_key` internally, so no
+    // separate pre-sort is needed here.
     let clusters = swept_line_cluster(row_groups);
     let n_clusters = clusters.len();
     let max_cluster_bytes = clusters.iter().map(|c| c.total_bytes).max().unwrap_or_default();
@@ -457,15 +457,6 @@ fn plan_bucket(
             max_cluster_bytes,
         },
     ))
-}
-
-/// Stable-sort row groups by `min_key` under the table's sort order.
-///
-/// Stability matters: ties on `min_key` (e.g., two row groups starting at the
-/// same `(account, service)` prefix) must keep their input order so the test
-/// surface is deterministic.
-fn sort_by_min_key(row_groups: &mut [PlanRowGroup]) {
-    row_groups.sort_by(|left, right| left.boundary_range.min_key.compare(&right.boundary_range.min_key));
 }
 
 /// Group transitively overlapping row groups into clusters using the shared
@@ -683,7 +674,7 @@ mod tests {
 
     use super::{
         Cluster, PartitionBucket, PartitionValue, PlanRowGroup, PlannedChunk, PlannerConfig, RowGroupPartition,
-        bin_pack, partition_by_bucket, sort_by_min_key, swept_line_cluster, tail_merge,
+        bin_pack, partition_by_bucket, swept_line_cluster, tail_merge,
     };
     use crate::{
         error::IngestError,
@@ -747,27 +738,6 @@ mod tests {
 
     fn limits_with_upper(lower: u64, upper: u64, max_rg: usize) -> PlannerConfig {
         PlannerConfig::from_bounds(lower, upper, max_rg)
-    }
-
-    // ---- sort_by_min_key ----
-
-    #[test]
-    fn sort_orders_by_min_key_ascending() {
-        let mut rgs = vec![rg(0, 2, 1, 30, 40), rg(0, 0, 1, 10, 20), rg(0, 1, 1, 20, 30)];
-        sort_by_min_key(&mut rgs);
-        assert_eq!(rg_idxs_vec(&rgs), vec![(0, 0), (0, 1), (0, 2)]);
-    }
-
-    #[test]
-    fn sort_is_stable_on_equal_min_keys() {
-        let mut rgs = vec![rg(0, 0, 1, 10, 20), rg(1, 5, 1, 10, 50), rg(2, 7, 1, 10, 30)];
-        sort_by_min_key(&mut rgs);
-        // Inputs all share min_key=10 — stable sort must preserve the input order.
-        assert_eq!(rg_idxs_vec(&rgs), vec![(0, 0), (1, 5), (2, 7)]);
-    }
-
-    fn rg_idxs_vec(rgs: &[PlanRowGroup]) -> Vec<(u64, usize)> {
-        rgs.iter().map(|r| (r.wal_offset, r.row_group_idx)).collect()
     }
 
     fn cluster(row_groups: Vec<PlanRowGroup>) -> Cluster {
