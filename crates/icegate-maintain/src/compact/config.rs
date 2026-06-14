@@ -213,6 +213,15 @@ pub struct CompactionConfig {
     pub min_input_files: usize,
     /// Tolerated number of sub-target files when deciding to skip a partition.
     pub max_skippable_tail_files: usize,
+    /// Largest-to-smallest size ratio allowed within one rewrite group.
+    ///
+    /// A file is merged with a larger one only when it is at least
+    /// `1 / max_merge_size_ratio` of the group's largest file, so a small file is
+    /// not repeatedly re-read into a much larger one; smaller files are merged
+    /// with each other instead. The gate only applies while the group's largest
+    /// file is at or above [`Self::target_file_size_bytes`]. Must be at least 1;
+    /// a value of 0 is rejected when the compactor is constructed.
+    pub max_merge_size_ratio: u64,
     /// Period of the discovery loop, in seconds (maps to the jobmanager
     /// iteration interval).
     pub scan_interval_secs: u64,
@@ -252,6 +261,7 @@ impl Default for CompactionConfig {
             max_group_input_bytes: 256 * 1024 * 1024,
             min_input_files: 4,
             max_skippable_tail_files: 0,
+            max_merge_size_ratio: 2,
             scan_interval_secs: 300,
             rewrite_timeout_secs: 3_600,
             worker_count: default_worker_count(),
@@ -278,6 +288,7 @@ mod tests {
         assert!(c.max_group_input_bytes >= c.target_file_size_bytes);
         assert_eq!(c.min_input_files, 4);
         assert_eq!(c.max_skippable_tail_files, 0);
+        assert_eq!(c.max_merge_size_ratio, 2);
         assert!(c.logs_enabled && c.spans_enabled && c.events_enabled && c.metrics_enabled);
     }
 

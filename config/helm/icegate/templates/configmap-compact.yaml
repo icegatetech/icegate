@@ -17,6 +17,7 @@ data:
       max_group_input_bytes: {{ .Values.compact.compaction.maxGroupInputBytes | int }}
       min_input_files: {{ .Values.compact.compaction.minInputFiles }}
       max_skippable_tail_files: {{ .Values.compact.compaction.maxSkippableTailFiles }}
+      max_merge_size_ratio: {{ .Values.compact.compaction.maxMergeSizeRatio }}
       scan_interval_secs: {{ .Values.compact.compaction.scanIntervalSecs }}
       rewrite_timeout_secs: {{ .Values.compact.compaction.rewriteTimeoutSecs }}
       worker_count: {{ .Values.compact.compaction.workerCount }}

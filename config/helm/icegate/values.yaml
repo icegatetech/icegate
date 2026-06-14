@@ -444,6 +444,14 @@ compact:
     minInputFiles: 4
     ## Tolerated number of sub-target files when deciding to skip a partition.
     maxSkippableTailFiles: 0
+    ## Largest-to-smallest size ratio allowed within one rewrite group. A file is
+    ## merged with a larger one only when it is at least 1/ratio of the group's
+    ## largest file, so a small file is not repeatedly re-read into a much larger
+    ## one. Smaller files merge with each other instead. The gate only applies
+    ## while the group's largest file is at or above targetFileSizeBytes; below
+    ## target, files merge regardless of skew. Must be at least 1 (0 is rejected
+    ## at startup).
+    maxMergeSizeRatio: 2
     ## Period of the discovery loop, in seconds.
     scanIntervalSecs: 300
     ## Deadline for a single rewrite task (merge + encode + commit), in seconds.

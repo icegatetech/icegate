@@ -326,6 +326,8 @@ fn compaction_config(conn: &MinioConn) -> CompactionConfig {
         // so the partition is always selected for rewrite.
         min_input_files: 2,
         max_skippable_tail_files: 0,
+        // Equal-size seed files, so the default 2x ratio keeps them in one group.
+        max_merge_size_ratio: 2,
         // Tight loop so the single iteration runs promptly.
         scan_interval_secs: 1,
         // Generous rewrite deadline so the merge is never declared expired.

@@ -381,12 +381,21 @@ impl Compactor {
             ));
         }
         config.jobs_storage.validate()?;
+        // A size-merge ratio of 0 is meaningless (no file can be `>= 0`x the
+        // largest), so reject it at startup rather than silently relying on the
+        // planner's defensive clamp.
+        if config.max_merge_size_ratio == 0 {
+            return Err(MaintainError::Config(
+                "max_merge_size_ratio must be greater than or equal to 1".to_string(),
+            ));
+        }
 
         let planner_limits = PlannerLimits {
             target_file_size_bytes: config.target_file_size_bytes,
             max_group_input_bytes: config.max_group_input_bytes,
             min_input_files: config.min_input_files,
             max_skippable_tail_files: config.max_skippable_tail_files,
+            max_merge_size_ratio: config.max_merge_size_ratio,
         };
         // The REWRITE task deadline is its own knob, NOT the discovery period: a
         // rewrite that legitimately runs longer than one scan interval must not
