@@ -31,6 +31,7 @@ use icegate_common::{
     iceberg_write::{WriteConfig, write_record_batches_to_parquet},
     icegate_table_ident,
     parquet_writer::ColumnEncoding,
+    resolve_wal_offset,
     retrier::{Retrier, RetrierConfig},
 };
 use tokio::sync::RwLock;
@@ -128,16 +129,16 @@ impl IcebergStorage {
         self.retry(cancel_token, || self.loader.load_fresh()).await
     }
 
-    /// Returns the last committed WAL offset from the Iceberg snapshot summary.
+    /// Returns the last committed WAL offset from the Iceberg snapshot history.
+    ///
+    /// Resolves the offset via [`resolve_wal_offset`], which walks the snapshot
+    /// parent chain. Reading only the current snapshot would be wrong: compaction
+    /// commits `replace` snapshots that omit [`WAL_OFFSET_PROPERTY`], so after a
+    /// compaction the current snapshot has no offset and the Shifter would resume
+    /// from 0, re-committing the whole WAL and duplicating every committed row.
     pub async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
         let table = self.load_table_fresh(cancel_token).await?;
-        Ok(table.metadata().current_snapshot().and_then(|snapshot| {
-            snapshot
-                .summary()
-                .additional_properties
-                .get(WAL_OFFSET_PROPERTY)
-                .and_then(|v| v.parse::<u64>().ok())
-        }))
+        Ok(resolve_wal_offset(table.metadata())?)
     }
 
     /// Builds Iceberg data files from parquet file paths by reading parquet metadata.

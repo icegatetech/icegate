@@ -37,6 +37,24 @@ pub enum CommonError {
     #[error("compaction read error: {0}")]
     CompactRead(String),
 
+    /// WAL-offset resolution error while walking the snapshot parent chain for
+    /// the [`WAL_OFFSET_PROPERTY`](crate::WAL_OFFSET_PROPERTY). Raised when the
+    /// table HAS snapshots but the offset cannot be resolved, in any of:
+    /// * the chain reaches the root without any snapshot carrying the offset
+    ///   (the most common case — a snapshot bypassed the Shifter-sets /
+    ///   compaction-propagates invariant);
+    /// * a recorded offset value cannot be parsed as a `u64`;
+    /// * a snapshot references a `parent_snapshot_id` absent from the metadata;
+    /// * a cyclic `parent_snapshot_id` chain (corrupt metadata);
+    /// * the walk exceeds its depth cap.
+    ///
+    /// Surfaced as a hard error rather than a silent `None` because a wrong
+    /// boundary (offset 0) would re-shift the WAL and duplicate every committed
+    /// row. A freshly created table with no snapshot legitimately resolves to
+    /// `None` and is NOT this error.
+    #[error("wal offset resolution error: {0}")]
+    WalOffset(String),
+
     /// I/O error (file reading).
     #[error("io error: {0}")]
     Io(#[from] io::Error),

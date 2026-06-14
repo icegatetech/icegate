@@ -32,12 +32,12 @@ use iceberg::spec::DataFile;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use icegate_common::iceberg_write::{WriteConfig, write_record_batches_to_parquet};
-use icegate_common::icegate_table_ident;
 use icegate_common::manifest_scan::{DataFileStats, decode_data_file_envelope, list_data_files_in_partition};
 use icegate_common::merge::sort_key::{
     RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, SortColumnsDescriptor,
 };
 use icegate_common::merge::{MergeInput, RowGroupsMerger, SortedBatchMergerConfig};
+use icegate_common::{WAL_OFFSET_PROPERTY, icegate_table_ident};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
@@ -211,14 +211,46 @@ impl RewriteExecutor {
         // writer's orphan cleanup on a later failure path / GC.
         verify_content_invariants(&table, self.descriptor, &removed, &added)?;
 
+        // Observability for the carry-forward invariant: `inherit_summary_property`
+        // is a SILENT no-op when the base snapshot carries no offset, which (under
+        // Nessie's severed parent chain) produces an unrecoverable offset-less
+        // replace. Warn so the breakage is visible at its origin rather than only
+        // later as a Shifter/query WAL-offset gate failure. The value actually
+        // committed is still resolved against the FRESH base under the commit's
+        // optimistic retry, so this is a heads-up, not the committed source of truth.
+        if !table
+            .metadata()
+            .current_snapshot()
+            .is_some_and(|snapshot| snapshot.summary().additional_properties.contains_key(WAL_OFFSET_PROPERTY))
+        {
+            tracing::warn!(
+                table = input.table.as_str(),
+                partition = input.partition_key.as_str(),
+                "compaction base snapshot carries no {WAL_OFFSET_PROPERTY}; the replace snapshot will \
+                 inherit none and the Shifter/query WAL-offset gate may fail until a shift commit \
+                 restamps it"
+            );
+        }
+
         // Step 6: atomically swap the inputs for the outputs in one `replace`
         // snapshot. `Transaction::commit` does the optimistic retry internally.
+        //
+        // Carry the Shifter's WAL offset forward onto the new `replace` snapshot,
+        // UNCHANGED. A `replace` snapshot otherwise drops the property, and the
+        // Nessie REST catalog returns only the current snapshot with no parent
+        // chain — so an offset missing from the current snapshot is unrecoverable
+        // and the Shifter would resume from 0, re-committing the whole WAL.
+        // `inherit_summary_property` resolves the value at snapshot-production
+        // time from the snapshot this rewrite actually supersedes, so the
+        // commit's internal optimistic retry uses the FRESH base after any racing
+        // shift commit — never a value frozen here before that race.
         let input_files = removed.len();
         let tx = Transaction::new(&table);
         let tx = tx
             .rewrite_files()
             .add_data_files(added)
             .delete_files(removed)
+            .inherit_summary_property(WAL_OFFSET_PROPERTY)
             .apply(tx)
             .map_err(MaintainError::from)?;
         // The `compact_commit` span (a child of `compact_rewrite`) covers the

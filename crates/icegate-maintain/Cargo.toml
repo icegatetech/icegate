@@ -58,6 +58,12 @@ opentelemetry = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 
+# Memory allocator: the long-running `run` compaction service retains memory
+# across many rewrite cycles, so use jemalloc (as ingest/query do) to avoid the
+# glibc-malloc arena fragmentation that otherwise grows container RSS without
+# bound. Only linked on Linux; see the `#[global_allocator]` in `main.rs`.
+tikv-jemallocator = { workspace = true }
+
 [dev-dependencies]
 icegate-common = { workspace = true, features = ["testing"] }
 # Integration tests seed tables over MinIO through the concrete S3 catalog and

@@ -43,6 +43,12 @@ spec:
             - /etc/icegate/maintain.yaml
           securityContext:
             {{- include "icegate.containerSecurityContext" . | nindent 12 }}
+          {{- if .Values.compact.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.compact.metrics.port }}
+              protocol: TCP
+          {{- end }}
           env:
             {{- include "icegate.awsEnv" . | nindent 12 }}
             - name: RUST_LOG

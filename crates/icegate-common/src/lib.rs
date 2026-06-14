@@ -115,6 +115,8 @@ pub mod schema;
 pub mod storage;
 /// OpenTelemetry tracing configuration and utilities.
 pub mod tracing;
+/// Compaction-safe resolution of the last committed WAL offset from snapshots.
+pub mod wal_offset;
 
 /// Testing utilities (available only with `testing` feature).
 #[cfg(feature = "testing")]
@@ -136,6 +138,7 @@ pub use tracing::{
     TracingConfig, TracingGuard, add_span_link, add_span_links, extract_current_trace_context, init_tracing,
     traceparent_to_context,
 };
+pub use wal_offset::resolve_wal_offset;
 
 #[cfg(test)]
 mod tests {

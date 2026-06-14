@@ -35,4 +35,9 @@ data:
         use_ssl: {{ .Values.compact.compaction.jobsStorage.useSsl }}
         job_state_codec: {{ .Values.compact.compaction.jobsStorage.jobStateCodec }}
         request_timeout_secs: {{ .Values.compact.compaction.jobsStorage.requestTimeoutSecs }}
+    metrics:
+      enabled: {{ .Values.compact.metrics.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.compact.metrics.port }}
+      path: {{ .Values.compact.metrics.path | quote }}
 {{- end }}

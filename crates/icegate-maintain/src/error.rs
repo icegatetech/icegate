@@ -44,6 +44,7 @@ impl From<icegate_common::error::CommonError> for MaintainError {
             CommonError::ObjectStore(e) => Self::Config(format!("object store error: {e}")),
             CommonError::Write(msg) => Self::Config(format!("write error: {msg}")),
             CommonError::CompactRead(msg) => Self::Config(format!("compaction read error: {msg}")),
+            CommonError::WalOffset(msg) => Self::Config(format!("wal offset error: {msg}")),
         }
     }
 }

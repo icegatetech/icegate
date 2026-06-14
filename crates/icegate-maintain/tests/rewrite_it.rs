@@ -43,6 +43,7 @@ use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
+use icegate_common::WAL_OFFSET_PROPERTY;
 use icegate_common::catalog::IoHandle;
 use icegate_common::iceberg_write::WriteConfig;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
@@ -232,6 +233,20 @@ async fn fast_append(catalog: &S3Catalog, ident: &TableIdent, data_files: Vec<Da
     let table = catalog.load_table(ident).await.unwrap();
     let tx = Transaction::new(&table);
     let action = tx.fast_append().add_data_files(data_files);
+    let tx = action.apply(tx).unwrap();
+    tx.commit(catalog).await.unwrap();
+}
+
+/// Commit data files with a `fast_append` that ALSO stamps the WAL offset onto
+/// the snapshot summary, mirroring the Shifter's commit. Used to seed the base
+/// snapshot a compaction must carry the offset forward from.
+async fn fast_append_with_offset(catalog: &S3Catalog, ident: &TableIdent, data_files: Vec<DataFile>, offset: u64) {
+    let table = catalog.load_table(ident).await.unwrap();
+    let tx = Transaction::new(&table);
+    let action = tx
+        .fast_append()
+        .add_data_files(data_files)
+        .set_snapshot_properties(HashMap::from([(WAL_OFFSET_PROPERTY.to_string(), offset.to_string())]));
     let tx = action.apply(tx).unwrap();
     tx.commit(catalog).await.unwrap();
 }
@@ -433,5 +448,97 @@ async fn rewrite_executor_compacts_partition_preserving_rows_and_order() {
     assert_eq!(
         physical_after, expected_sorted,
         "post-rewrite physical order must be globally sorted by (service_name ASC, timestamp DESC)"
+    );
+}
+
+/// The compaction `replace` snapshot MUST carry the Shifter's WAL offset forward
+/// (via `inherit_summary_property`). Without it, after a compaction the current
+/// snapshot would carry no offset and — under Nessie's severed parent chain —
+/// the Shifter would resume from 0 and re-commit the entire WAL, duplicating
+/// every row. This guards that the upstream-fork `inherit_summary_property`
+/// behaviour the fix relies on does not silently regress on a fork bump.
+#[tokio::test]
+#[ignore = "requires Docker (MinIO); run with --ignored"]
+async fn rewrite_carries_wal_offset_property_forward() {
+    const SEED_OFFSET: u64 = 4242;
+
+    let (_minio, conn) = setup_minio().await;
+    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let ident = create_logs_table(&catalog).await;
+    let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
+
+    // Seed several small files in one partition (enough for the planner to
+    // compact), committed in one snapshot stamped with the WAL offset.
+    let table = catalog.load_table(&ident).await.unwrap();
+    let files_rows: Vec<Vec<(&str, i64)>> = vec![
+        vec![("svc-a", DAY_MICROS + 30), ("svc-c", DAY_MICROS + 50)],
+        vec![("svc-b", DAY_MICROS + 40), ("svc-d", DAY_MICROS + 60)],
+        vec![("svc-a", DAY_MICROS + 20), ("svc-c", DAY_MICROS + 15)],
+    ];
+    let mut seeded_files: Vec<DataFile> = Vec::new();
+    let mut unique_offset = 0usize;
+    for rows in &files_rows {
+        let file = write_one_file(&table, logs_batch(rows, unique_offset)).await;
+        unique_offset += rows.len();
+        seeded_files.push(file);
+    }
+    fast_append_with_offset(&catalog, &ident, seeded_files, SEED_OFFSET).await;
+
+    // Precondition: the base snapshot carries the offset.
+    let before = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(
+        before
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties
+            .get(WAL_OFFSET_PROPERTY)
+            .map(String::as_str),
+        Some(SEED_OFFSET.to_string().as_str()),
+        "base snapshot must carry the seeded offset",
+    );
+
+    // Build and run one rewrite over the seeded partition.
+    let mut stats: Vec<DataFileStats> = list_data_files_with_stats(&before, descriptor).await.expect("list stats");
+    stats.sort_by(|left, right| left.min_key().compare(right.min_key()));
+    let partition_key = stats[0].partition_key().to_string();
+    let input_file_paths: Vec<String> = stats.iter().map(|s| s.data_file.file_path().to_string()).collect();
+
+    let write_cfg = WriteConfig {
+        row_group_size: 20_000,
+        data_page_size_limit_bytes: 2 * 1024 * 1024,
+        max_file_size_bytes: TARGET_FILE_SIZE_BYTES,
+        bloom_filter_columns: LOGS_BLOOM_COLUMNS,
+        column_encodings: LOGS_COLUMN_ENCODINGS,
+    };
+    let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
+    let executor = RewriteExecutor::new(dyn_catalog, write_cfg, descriptor, CompactMetrics::new());
+    let rewrite_input = RewriteInput {
+        table: TABLE.to_string(),
+        partition_key,
+        input_file_paths,
+    };
+    let cancel = CancellationToken::new();
+    let outcome = executor.execute(&rewrite_input, &cancel).await.expect("execute rewrite");
+    assert!(
+        matches!(outcome, RewriteOutcome::Committed { .. }),
+        "rewrite must commit, not abort",
+    );
+
+    // THE ASSERTION: the new `replace` snapshot carries the SAME offset forward.
+    let after = catalog.load_table(&ident).await.unwrap();
+    let carried = after
+        .metadata()
+        .current_snapshot()
+        .unwrap()
+        .summary()
+        .additional_properties
+        .get(WAL_OFFSET_PROPERTY)
+        .cloned();
+    assert_eq!(
+        carried.as_deref(),
+        Some(SEED_OFFSET.to_string().as_str()),
+        "compaction replace snapshot must carry the WAL offset forward",
     );
 }

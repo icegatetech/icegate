@@ -10,3 +10,31 @@ storage:
     bucket: warehouse
     region: us-east-1
     endpoint: http://minio:9000
+
+# Compaction config for the long-running `compact` service (`maintain run`).
+# Ignored by the one-shot `migrate create` command, which shares this file.
+compaction:
+  # Shorter discovery loop than the 300s default so the demo stack compacts
+  # promptly enough to populate the compaction dashboard.
+  scan_interval_secs: 60
+  # Lowered from the default 4 so the small demo dataset triggers rewrites.
+  min_input_files: 2
+  logs_enabled: true
+  spans_enabled: true
+  events_enabled: true
+  metrics_enabled: true
+  jobs_storage:
+    endpoint: http://minio:9000
+    bucket: jobs
+    prefix: compactor
+    region: us-east-1
+    use_ssl: false
+    job_state_codec: json
+    request_timeout_secs: 5
+
+# Prometheus metrics endpoint. Scraped by the `compact` job in prometheus.yml.
+metrics:
+  enabled: true
+  host: 0.0.0.0
+  port: 9091
+  path: /metrics

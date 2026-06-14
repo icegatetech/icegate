@@ -476,6 +476,21 @@ compact:
       jobStateCodec: json
       requestTimeoutSecs: 5
 
+  ## Prometheus metrics endpoint. When enabled, the long-running `run` service
+  ## installs the global meter provider (so the compactor's CompactMetrics
+  ## record) and serves /metrics on this port. Scraped by the per-component
+  ## ServiceMonitor (see serviceMonitor.* below) when that is enabled.
+  metrics:
+    enabled: true
+    port: 9091
+    path: /metrics
+
+  ## Kubernetes Service exposing the metrics port. Created only when
+  ## metrics.enabled — the compactor has no other inbound endpoint.
+  service:
+    type: ClusterIP
+    annotations: {}
+
   ## OpenTelemetry tracing. The OTLP endpoint is mandatory (see note above):
   ## it is exported as OTEL_EXPORTER_OTLP_ENDPOINT (gRPC, e.g. host:4317).
   tracing:
@@ -499,9 +514,9 @@ compact:
   tolerations: []
   affinity: {}
 
-  ## Liveness probe override. The compactor exposes no HTTP endpoint, so it is
-  ## empty by default — the Deployment restarts the container if the process
-  ## exits. Provide an exec/tcpSocket probe here to override.
+  ## Liveness probe override. Empty by default — the Deployment restarts the
+  ## container if the process exits. When metrics.enabled, the /metrics endpoint
+  ## (metrics.port) can back an httpGet/tcpSocket probe; set one here to override.
   livenessProbe: {}
 
   ## Wait for catalog and storage to be ready before starting the compactor.
