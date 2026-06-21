@@ -41,6 +41,10 @@ pub(crate) const WAL_SOURCE_ERROR_PREFIX: &str = "wal merge source:";
 /// `(segment_offset, row_group_idx)` lexicographic tie-break exactly: the
 /// `segment_offset` occupies the high bits and the `row_group_idx` the low
 /// [`WAL_ROW_GROUP_IDX_BITS`] bits.
+///
+/// 32 bits is ample: it caps `row_group_idx` at ~4.3 billion, and a single WAL
+/// segment never holds anywhere near that many row groups, so the pack never
+/// truncates a real index.
 const WAL_ROW_GROUP_IDX_BITS: u32 = 32;
 
 /// Low-bit mask isolating the row-group index inside a packed merge `position`.

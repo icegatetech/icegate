@@ -21,7 +21,8 @@ flowchart LR
     CFG[CompactionConfig] --> CMP[Compactor service]
     CMP --> J1[job: logs]
     CMP --> J2[job: spans]
-    CMP --> J3[job: events / metrics]
+    CMP --> J3[job: events]
+    CMP --> J4[job: metrics]
     J1 --> P[PLAN task<br/>enumerate + plan groups]
     P -->|fan out one per group| R1[REWRITE task]
     P --> R2[REWRITE task]
@@ -103,7 +104,7 @@ These are two different questions that happen to share the same `largest / 2`
 line under the defaults (`ratio = 2`). The difference is **what** is measured
 against the line:
 
-```
+```text
 largest = 200K
 
   ratio gate  -> asks EACH file:            absorb gate -> asks the SUM of smalls:
@@ -129,7 +130,7 @@ absorb still triggers at `sum >= largest/2`.
 One partition, `target = 100K`, `ratio = 2`, `budget = 250K`, `min_input_files =
 4`. Six files (the sort-key ranges are shown but no longer affect grouping):
 
-```
+```text
 input                 split by size (stage 3)        bin-pack + drop (stage 4)
 200K [10-40]   ┐      tier {200K}              ->     dropped (lone, left alone)
  60K [12-38]   │

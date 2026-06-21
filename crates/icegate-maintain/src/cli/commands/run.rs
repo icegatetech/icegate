@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, run_metrics_server};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{compact::Compactor, config::MaintainConfig, error::MaintainError};
@@ -53,8 +54,13 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     let compactor = Compactor::new(catalog, &config.compaction).await?;
     let handle = compactor.start()?;
     tracing::info!("compaction maintenance service started");
-    shutdown_signal().await;
-    tracing::info!("shutdown signal received, draining compaction workers");
+
+    // Wait for shutdown, but watch the metrics server task at the same time: it
+    // only resolves before a shutdown signal if it failed to start (e.g. its port
+    // is already bound). Surfacing that here aborts the service immediately rather
+    // than deferring the error until shutdown, which could be days later.
+    let (metrics_server, metrics_startup_error) = wait_for_shutdown(metrics_server).await;
+    tracing::info!("draining compaction workers");
     handle.shutdown().await?;
 
     // Stop the metrics server and wait for it to unbind before the runtime (and
@@ -68,7 +74,55 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
         }
     }
     drop(metrics_runtime);
+
+    // Report a metrics startup failure only after the compaction workers have
+    // drained and the runtime has been dropped, so shutdown still runs in order.
+    if let Some(err) = metrics_startup_error {
+        return Err(err);
+    }
     Ok(())
+}
+
+/// Block until a shutdown signal arrives, while also watching the spawned
+/// metrics server task.
+///
+/// [`run_metrics_server`] runs until its cancellation token fires, so its task
+/// only finishes *before* a shutdown signal when it failed to start (typically a
+/// `TcpListener::bind` failure on an already-used port). Racing the two lets the
+/// service fail fast on that startup error instead of deferring it to shutdown.
+///
+/// Returns the still-pending metrics handle (so the caller can stop it
+/// gracefully) together with the startup error, if the task ended early with one.
+async fn wait_for_shutdown(
+    metrics_server: Option<JoinHandle<icegate_common::error::Result<()>>>,
+) -> (
+    Option<JoinHandle<icegate_common::error::Result<()>>>,
+    Option<MaintainError>,
+) {
+    let Some(mut server) = metrics_server else {
+        shutdown_signal().await;
+        return (None, None);
+    };
+
+    tokio::select! {
+        () = shutdown_signal() => (Some(server), None),
+        joined = &mut server => {
+            // The metrics task ended before shutdown: a startup failure. The
+            // handle is now consumed, so return `None` in its place.
+            let error = match joined {
+                Ok(Ok(())) => {
+                    tracing::warn!("metrics server stopped before shutdown signal");
+                    None
+                }
+                Ok(Err(err)) => Some(MaintainError::from(err)),
+                Err(join_err) => {
+                    tracing::error!("metrics server task failed to join: {join_err}");
+                    None
+                }
+            };
+            (None, error)
+        }
+    }
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
