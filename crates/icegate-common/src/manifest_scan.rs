@@ -332,6 +332,10 @@ fn resolve_sort_columns<'descriptor>(
 ///
 /// # Known limitation (clustering quality, not correctness)
 ///
+/// TODO(compaction-null-bounds): Track null presence separately before relying
+/// on manifest bounds for overlap clustering if a table adds a nullable,
+/// nulls-first sort column whose files can mix null and non-null values.
+///
 /// Iceberg manifest bounds describe only the NON-NULL values in a file. For a
 /// file that mixes nulls with values in a `nulls-first` sort column (e.g.
 /// `logs.service_name`), the decoded `min_key` therefore reports the smallest

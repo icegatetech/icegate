@@ -1,51 +1,47 @@
-//! Compaction planner: group, skip, cluster, size-split, and bin-pack data files.
+//! Compaction planner: group, skip, size-split, and bin-pack data files.
 //!
 //! Given a table's data files (each carrying its `(tenant, day)` partition key,
 //! byte size, and decoded sort-key envelope), [`plan_rewrite_groups`] produces
 //! *rewrite groups*. Each group is a set of input files in one partition that a
 //! later REWRITE task rewrites into approximately one output file.
 //!
-//! The algorithm is six stages:
+//! The algorithm is four stages:
 //! 1. **Group** files by partition key, so a rewrite never spans partitions.
 //! 2. **Skip healthy partitions.** A partition with few files and no
 //!    significant tail of sub-target files is left untouched.
-//! 3. **Cluster** the remaining files by transitive sort-key overlap
-//!    ([`swept_line_cluster`](icegate_common::merge::cluster::swept_line_cluster)),
-//!    so each cluster spans one contiguous sort-key range.
-//! 4. **Split each cluster by size** (`split_cluster_by_size`) so a small file is
-//!    not merged into a much larger, *near-target* one — which would re-read the
-//!    large file for little gain. The gate engages only while a tier's largest
-//!    file is at or above [`PlannerLimits::target_file_size_bytes`]; once the
-//!    largest remaining file is itself sub-target, re-reading it is cheap and the
-//!    whole remainder is merged. Above target, files within a
+//! 3. **Split each partition's files by size** (`split_by_size`) so a
+//!    small file is not merged into a much larger, *near-target* one — which
+//!    would re-read the large file for little gain. The gate engages only while a
+//!    tier's largest file is at or above [`PlannerLimits::target_file_size_bytes`];
+//!    once the largest remaining file is itself sub-target, re-reading it is cheap
+//!    and the whole remainder is merged. Above target, files within a
 //!    [`PlannerLimits::max_merge_size_ratio`] factor of the largest stay together
 //!    and smaller files split into lower size tiers, unless they collectively
-//!    reach at least half the largest file *and* the cluster fits one rewrite
-//!    group (then absorbing them is worthwhile). Excluding an overlapping large
-//!    file trades some sort-key pruning for much lower read/write amplification.
-//! 5. **Bin-pack** each size group by input-byte budget into one or more groups,
-//!    so no single rewrite reads more than the configured cap.
-//! 6. **Drop non-beneficial groups.** A group of a single file rewrites it
-//!    1-to-1 with no file-count reduction; emitting it would make every scan
-//!    re-rewrite the same file forever (a partition of disjoint, already-large
-//!    files would never converge). Only groups of two or more files — which
-//!    actually merge — are kept; a partition left with no such group is counted
-//!    as skipped, not compacted.
+//!    reach at least half the largest file *and* the partition fits one rewrite
+//!    group (then absorbing them is worthwhile). The planner does NOT cluster by
+//!    sort-key overlap, so files with disjoint sort-key ranges may share a group;
+//!    the REWRITE k-way merge still produces a sorted output.
+//! 4. **Bin-pack** each size group by input-byte budget into one or more groups,
+//!    so no single rewrite reads more than the configured cap, then **drop
+//!    non-beneficial groups**. A group of a single file rewrites it 1-to-1 with
+//!    no file-count reduction; emitting it would make every scan re-rewrite the
+//!    same file forever. Only groups of two or more files — which actually merge
+//!    — are kept; a partition left with no such group is counted as skipped, not
+//!    compacted.
 //!
 //! The planner is generic over [`PlannableFile`] so its logic is unit-testable
 //! against a fake file without constructing an [`iceberg::spec::DataFile`].
 
 use icegate_common::manifest_scan::DataFileStats;
-use icegate_common::merge::cluster::swept_line_cluster;
-use icegate_common::merge::sort_key::RowGroupBoundaryRange;
 
 /// A file the planner can reason about: its partition, byte size, and sort-key
 /// envelope.
 ///
 /// Implemented by [`icegate_common::manifest_scan::DataFileStats`] in
 /// production and by a fake in unit tests. The planner inspects only these
-/// three projections; everything else about a file (path, record count) is the
-/// caller's concern when it maps a returned group to a rewrite input.
+/// two projections; everything else about a file (path, record count, sort-key
+/// envelope) is the caller's concern when it maps a returned group to a rewrite
+/// input.
 pub trait PlannableFile {
     /// Stable `(tenant, day)` partition key. Files sharing this key may be
     /// grouped together; files with different keys never share a group.
@@ -53,10 +49,6 @@ pub trait PlannableFile {
 
     /// On-disk size of the file in bytes, used for the bin-packing budget.
     fn size_bytes(&self) -> u64;
-
-    /// Inclusive sort-key envelope used to cluster transitively-overlapping
-    /// files.
-    fn boundary_range(&self) -> &RowGroupBoundaryRange;
 }
 
 /// Plan over real Iceberg data files enumerated by the manifest scan. Each
@@ -71,10 +63,6 @@ impl PlannableFile for DataFileStats {
     fn size_bytes(&self) -> u64 {
         self.size_bytes()
     }
-
-    fn boundary_range(&self) -> &RowGroupBoundaryRange {
-        self.boundary_range()
-    }
 }
 
 /// Tunable limits that decide which partitions to skip and how large a rewrite
@@ -84,7 +72,7 @@ pub struct PlannerLimits {
     /// A file at or above this size is considered already "large enough"; files
     /// below it are sub-target candidates for compaction.
     pub target_file_size_bytes: u64,
-    /// Maximum summed input bytes a single rewrite group may read. A cluster
+    /// Maximum summed input bytes a single rewrite group may read. A size tier
     /// larger than this is split into multiple groups.
     pub max_group_input_bytes: u64,
     /// A partition with at most this many files is a skip candidate (subject to
@@ -95,7 +83,7 @@ pub struct PlannerLimits {
     pub max_skippable_tail_files: usize,
     /// Largest-to-smallest size ratio allowed within one rewrite group.
     ///
-    /// A file joins the cluster's largest only when its size times this ratio is
+    /// A file joins the largest file's tier only when its size times this ratio is
     /// at least the largest (i.e. it is no more than `ratio` times smaller);
     /// smaller files form their own size tier. Must be at least 1: a value of 0
     /// is rejected at startup (`Compactor::new_with_max_iterations`) and, as a
@@ -109,9 +97,9 @@ pub struct PlannerLimits {
 /// The two counters are complementary over the table's partitions: every
 /// partition is either *skipped* (contributing no group) or *compacted* (it
 /// produced at least one rewrite group). A partition is skipped both when it is
-/// healthy and when clustering leaves only non-beneficial single-file groups, so
-/// `partitions_compacted` equals the number of distinct partition keys appearing
-/// across [`groups`](Self::groups).
+/// healthy and when size-splitting leaves only non-beneficial single-file groups,
+/// so `partitions_compacted` equals the number of distinct partition keys
+/// appearing across [`groups`](Self::groups).
 ///
 /// `Default` is hand-written (not derived) so it never requires `F: Default`:
 /// `F` is a [`PlannableFile`] data-file type that has no meaningful default.
@@ -142,11 +130,11 @@ impl<F> Default for PlanOutcome<F> {
 /// compacted versus skipped. Every group holds at least two files (single-file
 /// groups are dropped — see the module docs), and all files in a group share the
 /// same [`PlannableFile::partition_key`]. A partition may yield zero groups (it
-/// was skipped as healthy, or clustering left only single-file groups) or several
-/// (a large or wide-overlap partition split by the byte budget). The caller maps
-/// each returned group to a rewrite input from the underlying files' paths.
+/// was skipped as healthy, or size-splitting left only single-file groups) or
+/// several (a large or skewed partition split by the byte budget). The caller
+/// maps each returned group to a rewrite input from the underlying files' paths.
 ///
-/// Generic over [`PlannableFile`] so the grouping, skip, clustering, and
+/// Generic over [`PlannableFile`] so the grouping, skip, size-split, and
 /// bin-packing logic is exercised in unit tests without building real Iceberg
 /// data files. See the module docs for the staged algorithm.
 #[must_use]
@@ -159,22 +147,20 @@ pub fn plan_rewrite_groups<F: PlannableFile>(files: Vec<F>, cfg: &PlannerLimits)
             outcome.partitions_skipped += 1;
             continue;
         }
-        // Cluster transitively-overlapping files, split each cluster into
-        // size-similar tiers so a small file is not merged into a much larger
-        // one, then bin-pack each tier by the input-byte budget.
-        // `swept_line_cluster` stable-sorts by `min_key`, so the clustering and
-        // the resulting groups are deterministic.
+        // Split the partition's files into size-similar tiers so a small file is
+        // not merged into a much larger one, then bin-pack each tier by the
+        // input-byte budget. `group_by_partition` preserves first-seen order, so
+        // the resulting groups are deterministic. There is no sort-key clustering:
+        // files with disjoint ranges may share a group, and the REWRITE k-way
+        // merge still produces a sorted output.
         let mut partition_groups: Vec<Vec<F>> = Vec::new();
-        for cluster in swept_line_cluster(partition_files, PlannableFile::boundary_range) {
-            for size_group in split_cluster_by_size(cluster, cfg) {
-                bin_pack_into(size_group, cfg.max_group_input_bytes, &mut partition_groups);
-            }
+        for size_group in split_by_size(partition_files, cfg) {
+            bin_pack_into(size_group, cfg.max_group_input_bytes, &mut partition_groups);
         }
         // Keep only groups that actually merge (>= 2 files). A single-file group
         // rewrites one file 1-to-1 with no benefit, so emitting it would make
-        // every scan re-rewrite the same file forever — the re-compaction loop a
-        // partition of disjoint, already-large files would otherwise spin in.
-        // Dropping single-file groups leaves such files untouched.
+        // every scan re-rewrite the same file forever. Dropping single-file
+        // groups leaves such files untouched.
         partition_groups.retain(|group| group.len() >= 2);
         if partition_groups.is_empty() {
             // Nothing beneficial to do (only lone/disjoint files survived):
@@ -226,18 +212,18 @@ fn is_healthy<F: PlannableFile>(partition_files: &[F], cfg: &PlannerLimits) -> b
     sub_target <= cfg.max_skippable_tail_files
 }
 
-/// Pack `cluster` files (kept in cluster order) into rewrite groups whose summed
-/// [`PlannableFile::size_bytes`] stays at or below `max_group_input_bytes`,
+/// Pack a size tier's `files` (kept in input order) into rewrite groups whose
+/// summed [`PlannableFile::size_bytes`] stays at or below `max_group_input_bytes`,
 /// appending each finished group to `out`.
 ///
 /// A new group is started when adding the next file would exceed the cap; a
 /// single file larger than the cap forms its own group rather than being
-/// dropped. The cluster is assumed non-empty (`swept_line_cluster` never emits
-/// empty clusters), so at least one group is produced.
-fn bin_pack_into<F: PlannableFile>(cluster: Vec<F>, max_group_input_bytes: u64, out: &mut Vec<Vec<F>>) {
+/// dropped. The input (a size tier from `split_by_size`) is assumed
+/// non-empty, so at least one group is produced.
+fn bin_pack_into<F: PlannableFile>(files: Vec<F>, max_group_input_bytes: u64, out: &mut Vec<Vec<F>>) {
     let mut current: Vec<F> = Vec::new();
     let mut current_bytes: u64 = 0;
-    for file in cluster {
+    for file in files {
         let file_bytes = file.size_bytes();
         // Start a new group when the running group is non-empty and appending
         // this file would push it over the cap. `saturating_add` keeps the
@@ -254,9 +240,9 @@ fn bin_pack_into<F: PlannableFile>(cluster: Vec<F>, max_group_input_bytes: u64, 
     }
 }
 
-/// Absorb a cluster's smaller files into its largest only when they collectively
-/// reach `1 / LARGE_FILE_ABSORB_DENOMINATOR` (one half, e.g.) of the largest file's
-/// size.
+/// Absorb the partition's smaller files into the largest only when they
+/// collectively reach `1 / LARGE_FILE_ABSORB_DENOMINATOR` (one half) of the
+/// largest file's size.
 ///
 /// The threshold is applied as a multiplier on the *small* side —
 /// `sum_small * LARGE_FILE_ABSORB_DENOMINATOR >= largest` — so the comparison
@@ -266,9 +252,11 @@ fn bin_pack_into<F: PlannableFile>(cluster: Vec<F>, max_group_input_bytes: u64, 
 /// promote it to config only if a workload needs a tunable absorb point.
 const LARGE_FILE_ABSORB_DENOMINATOR: u64 = 2;
 
-/// Split one overlap `cluster` into size-similar tiers so a small file is never
+/// Split a partition's `files` into size-similar tiers so a small file is never
 /// merged into a much larger, *near-target* one (which would re-read the large
-/// file for little gain).
+/// file for little gain). The planner no longer clusters by sort-key overlap, so
+/// these are all of a partition's files; the REWRITE k-way merge sorts the output
+/// regardless of how they are grouped here.
 ///
 /// The gate only protects files that are expensive to re-read: it engages a tier
 /// only while that tier's largest file is at or above
@@ -282,24 +270,24 @@ const LARGE_FILE_ABSORB_DENOMINATOR: u64 = 2;
 /// `ratio` factor of the tier's largest (`size * ratio >= largest`); smaller
 /// files drop into lower tiers. The whole remainder is absorbed into the large
 /// file instead — bypassing the gate — when the smaller files collectively reach
-/// at least half the largest AND the cluster fits one rewrite group
+/// at least half the largest AND the partition fits one rewrite group
 /// (`total <= max_group_input_bytes`). The fit check matters: without it the
-/// byte-budget bin-packer could re-split an "absorbed" cluster and strand a file
+/// byte-budget bin-packer could re-split an "absorbed" group and strand a file
 /// in a single-file group that is then dropped, so the absorb would silently
 /// fail to merge anything.
 ///
-/// Each returned tier preserves the input's (sort-key) order, so a later
-/// `bin_pack_into` still splits along sort order. A tier holding a single file is
-/// emitted as-is and dropped downstream by the single-file-group filter. `ratio`
-/// is clamped to at least 1 (it is also rejected at startup; see
+/// Each returned tier preserves the input order, so a later `bin_pack_into`
+/// splits along that order. A tier holding a single file is emitted as-is and
+/// dropped downstream by the single-file-group filter. `ratio` is clamped to at
+/// least 1 (it is also rejected at startup; see
 /// `Compactor::new_with_max_iterations`). The split is iterative, so stack use is
-/// constant regardless of how many size tiers a cluster spans.
-fn split_cluster_by_size<F: PlannableFile>(cluster: Vec<F>, cfg: &PlannerLimits) -> Vec<Vec<F>> {
+/// constant regardless of how many size tiers the partition spans.
+fn split_by_size<F: PlannableFile>(files: Vec<F>, cfg: &PlannerLimits) -> Vec<Vec<F>> {
     // A ratio below 1 is meaningless (a file can never be `>= ratio`x the
     // largest); clamp so the function stays total even if startup validation is
     // bypassed (e.g. a future direct caller).
     let ratio = cfg.max_merge_size_ratio.max(1);
-    let mut remaining = cluster;
+    let mut remaining = files;
     let mut tiers: Vec<Vec<F>> = Vec::new();
     loop {
         // A lone file is its own tier (dropped downstream as a single-file
@@ -353,9 +341,9 @@ fn split_cluster_by_size<F: PlannableFile>(cluster: Vec<F>, cfg: &PlannerLimits)
             return tiers;
         }
         if total <= cfg.max_group_input_bytes && sum_small.saturating_mul(LARGE_FILE_ABSORB_DENOMINATOR) >= largest {
-            // The small files reach half the largest and the whole cluster fits
-            // one rewrite group, so absorbing them is worthwhile and bin-packing
-            // will keep them together (nothing stranded): keep the cluster whole.
+            // The small files reach half the largest and the whole set fits one
+            // rewrite group, so absorbing them is worthwhile and bin-packing will
+            // keep them together (nothing stranded): keep the set whole.
             tiers.push(remaining);
             return tiers;
         }
@@ -374,21 +362,14 @@ fn split_cluster_by_size<F: PlannableFile>(cluster: Vec<F>, cfg: &PlannerLimits)
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use icegate_common::merge::sort_key::{
-        RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue,
-    };
-
     use super::{PlannableFile, PlannerLimits, plan_rewrite_groups};
 
-    /// A unit-test stand-in for a planner input, carrying just the three
+    /// A unit-test stand-in for a planner input, carrying just the two
     /// projections [`PlannableFile`] exposes. Building these avoids constructing
     /// real [`iceberg::spec::DataFile`]s in planner tests.
     struct FakeFile {
         partition: String,
         size: u64,
-        range: RowGroupBoundaryRange,
     }
 
     impl PlannableFile for FakeFile {
@@ -399,32 +380,12 @@ mod tests {
         fn size_bytes(&self) -> u64 {
             self.size
         }
-
-        fn boundary_range(&self) -> &RowGroupBoundaryRange {
-            &self.range
-        }
     }
 
-    /// Build a single-timestamp-column boundary range `[lo, hi]`, mirroring the
-    /// pattern used by the `cluster` module tests.
-    fn range(lo: i64, hi: i64) -> RowGroupBoundaryRange {
-        let comp = |v: i64| RowGroupBoundaryComponent {
-            value: Some(RowGroupBoundaryValue::TimestampMicros(v)),
-            descending: false,
-            nulls_first: true,
-        };
-        RowGroupBoundaryRange {
-            names: Arc::from(vec!["timestamp".to_string()]),
-            min_key: RowGroupBoundaryKey::new(vec![comp(lo)]),
-            max_key: RowGroupBoundaryKey::new(vec![comp(hi)]),
-        }
-    }
-
-    fn file(partition: &str, size: u64, lo: i64, hi: i64) -> FakeFile {
+    fn file(partition: &str, size: u64) -> FakeFile {
         FakeFile {
             partition: partition.to_string(),
             size,
-            range: range(lo, hi),
         }
     }
 
@@ -445,11 +406,7 @@ mod tests {
     fn skips_healthy_partition() {
         // 3 files (<= min_input_files = 4), all at/above target, so there is no
         // sub-target tail. The partition is healthy and yields no groups.
-        let files = vec![
-            file("t/1", 120_000, 10, 20),
-            file("t/1", 130_000, 30, 40),
-            file("t/1", 110_000, 50, 60),
-        ];
+        let files = vec![file("t/1", 120_000), file("t/1", 130_000), file("t/1", 110_000)];
         let outcome = plan_rewrite_groups(files, &limits());
         assert!(
             outcome.groups.is_empty(),
@@ -473,11 +430,11 @@ mod tests {
         // (not the fit guard) is what leaves the large file out: it is dropped as
         // a lone group and only the smalls merge.
         let files = vec![
-            file("t/1", 200_000, 10, 40),
-            file("t/1", 20_000, 11, 39),
-            file("t/1", 20_000, 12, 38),
-            file("t/1", 20_000, 13, 37),
-            file("t/1", 20_000, 14, 36),
+            file("t/1", 200_000),
+            file("t/1", 20_000),
+            file("t/1", 20_000),
+            file("t/1", 20_000),
+            file("t/1", 20_000),
         ];
         let outcome = plan_rewrite_groups(
             files,
@@ -502,11 +459,11 @@ mod tests {
         // large file's size, absorbing them is worthwhile: the whole cluster
         // merges (120 KiB + four 20 KiB = 200 KiB, smalls 80 KiB >= 60 KiB).
         let files = vec![
-            file("t/1", 120_000, 10, 40),
-            file("t/1", 20_000, 11, 39),
-            file("t/1", 20_000, 12, 38),
-            file("t/1", 20_000, 13, 37),
-            file("t/1", 20_000, 14, 36),
+            file("t/1", 120_000),
+            file("t/1", 20_000),
+            file("t/1", 20_000),
+            file("t/1", 20_000),
+            file("t/1", 20_000),
         ];
         let outcome = plan_rewrite_groups(files, &limits());
         assert_eq!(outcome.groups.len(), 1);
@@ -520,17 +477,17 @@ mod tests {
 
     #[test]
     fn size_gate_splits_cluster_into_size_tiers() {
-        // One overlap cluster spanning three size tiers must split into one
+        // One partition's files spanning three size tiers must split into one
         // group per tier, never mixing far-apart sizes. A 1 KiB target keeps
         // every file over target so the size gate (not the sub-target shortcut)
         // governs, isolating pure size-tiering.
         let files = vec![
-            file("t/1", 120_000, 10, 60),
-            file("t/1", 60_000, 11, 59),
-            file("t/1", 20_000, 12, 58),
-            file("t/1", 20_000, 13, 57),
-            file("t/1", 4_000, 14, 56),
-            file("t/1", 4_000, 15, 55),
+            file("t/1", 120_000),
+            file("t/1", 60_000),
+            file("t/1", 20_000),
+            file("t/1", 20_000),
+            file("t/1", 4_000),
+            file("t/1", 4_000),
         ];
         let outcome = plan_rewrite_groups(
             files,
@@ -563,7 +520,7 @@ mod tests {
         // A 50 KiB file overlapping a 120 KiB file is below 120/2, so at the
         // default 2x ratio neither file merges (both dropped as lone groups);
         // at a 3x ratio 50 KiB is comparable and the pair merges.
-        let make = || vec![file("t/1", 120_000, 10, 40), file("t/1", 50_000, 12, 38)];
+        let make = || vec![file("t/1", 120_000), file("t/1", 50_000)];
         let base = PlannerLimits {
             target_file_size_bytes: 100_000,
             max_group_input_bytes: 250_000,
@@ -592,11 +549,7 @@ mod tests {
         // A misconfigured ratio of 0 is clamped to 1 (only equal-or-larger files
         // share a tier) rather than panicking or merging everything: the two
         // equal 100 KiB files merge and the 20 KiB file is left out.
-        let files = vec![
-            file("t/1", 100_000, 10, 40),
-            file("t/1", 100_000, 11, 39),
-            file("t/1", 20_000, 12, 38),
-        ];
+        let files = vec![file("t/1", 100_000), file("t/1", 100_000), file("t/1", 20_000)];
         let limits = PlannerLimits {
             target_file_size_bytes: 100_000,
             max_group_input_bytes: 250_000,
@@ -621,11 +574,11 @@ mod tests {
         // overlapping cluster merges into one group instead of splitting by
         // relative size (which would leave the partition permanently fragmented).
         let files = vec![
-            file("t/1", 90_000, 10, 40),
-            file("t/1", 20_000, 11, 39),
-            file("t/1", 20_000, 12, 38),
-            file("t/1", 4_000, 13, 37),
-            file("t/1", 4_000, 14, 36),
+            file("t/1", 90_000),
+            file("t/1", 20_000),
+            file("t/1", 20_000),
+            file("t/1", 4_000),
+            file("t/1", 4_000),
         ];
         let outcome = plan_rewrite_groups(files, &limits());
         assert_eq!(outcome.groups.len(), 1, "all sub-target files merge into one group");
@@ -643,10 +596,10 @@ mod tests {
         // guard instead tiers, so all three similar 60 KiB files merge and none
         // is stranded; the 200 KiB file is left alone.
         let files = vec![
-            file("t/1", 60_000, 10, 40),
-            file("t/1", 200_000, 11, 39),
-            file("t/1", 60_000, 12, 38),
-            file("t/1", 60_000, 13, 37),
+            file("t/1", 60_000),
+            file("t/1", 200_000),
+            file("t/1", 60_000),
+            file("t/1", 60_000),
         ];
         let outcome = plan_rewrite_groups(files, &limits());
         assert_eq!(outcome.groups.len(), 1, "the three similar 60 KiB files merge");
@@ -671,11 +624,11 @@ mod tests {
         // themselves. (Three smalls make the partition unhealthy: 3 > the tail
         // tolerance of 2.)
         let files = vec![
-            file("t/1", 200_000, 10, 40),
-            file("t/1", 160_000, 11, 39),
-            file("t/1", 60_000, 12, 38),
-            file("t/1", 60_000, 13, 37),
-            file("t/1", 60_000, 14, 36),
+            file("t/1", 200_000),
+            file("t/1", 160_000),
+            file("t/1", 60_000),
+            file("t/1", 60_000),
+            file("t/1", 60_000),
         ];
         let outcome = plan_rewrite_groups(files, &limits());
         assert_eq!(outcome.groups.len(), 1, "only the three similar small files merge");
@@ -700,11 +653,7 @@ mod tests {
         // Smalls sum to exactly half the largest (2 * 30 KiB = 60 KiB == 120/2),
         // tripping the `>=` threshold: the whole cluster is absorbed.
         let at_half = plan_rewrite_groups(
-            vec![
-                file("t/1", 120_000, 10, 40),
-                file("t/1", 30_000, 12, 38),
-                file("t/1", 30_000, 13, 37),
-            ],
+            vec![file("t/1", 120_000), file("t/1", 30_000), file("t/1", 30_000)],
             &base,
         );
         assert_eq!(at_half.groups.len(), 1, "smalls at exactly half are absorbed");
@@ -717,11 +666,7 @@ mod tests {
         // One KiB less of smalls (59 KiB, 59 * 2 = 118 < 120) misses the
         // threshold, so the large file is left out and only the smalls merge.
         let below_half = plan_rewrite_groups(
-            vec![
-                file("t/1", 120_000, 10, 40),
-                file("t/1", 29_000, 12, 38),
-                file("t/1", 30_000, 13, 37),
-            ],
+            vec![file("t/1", 120_000), file("t/1", 29_000), file("t/1", 30_000)],
             &base,
         );
         assert_eq!(below_half.groups.len(), 1, "below half, only the smalls merge");
@@ -738,9 +683,9 @@ mod tests {
         // and is dropped, so the partition yields no group.
         let mut files = Vec::new();
         let mut size = 1_u64;
-        for i in 0_i64..16 {
+        for _ in 0..16 {
             size = size.saturating_mul(4); // 4, 16, 64, ... strictly super-increasing
-            files.push(file("t/1", size, 10 + i, 100 - i)); // all overlapping
+            files.push(file("t/1", size));
         }
         let limits = PlannerLimits {
             target_file_size_bytes: 1,
@@ -759,18 +704,17 @@ mod tests {
 
     #[test]
     fn bin_packs_by_input_budget_into_multiple_groups() {
-        // Six transitively-overlapping 60 KiB files = 360 KiB > 250 KiB cap, all
-        // in one partition. They cluster into one overlap chain that the 250 KiB
-        // budget must split into more than one group, each <= the cap. Every kept
-        // group still merges two or more files, so none is dropped as
-        // non-beneficial.
+        // Six 60 KiB files = 360 KiB > 250 KiB cap, all in one partition and all
+        // sub-target, so they form a single size tier that the 250 KiB budget must
+        // split into more than one group, each <= the cap. Every kept group still
+        // merges two or more files, so none is dropped as non-beneficial.
         let files = vec![
-            file("t/1", 60_000, 10, 100),
-            file("t/1", 60_000, 20, 110),
-            file("t/1", 60_000, 30, 120),
-            file("t/1", 60_000, 40, 130),
-            file("t/1", 60_000, 50, 140),
-            file("t/1", 60_000, 60, 150),
+            file("t/1", 60_000),
+            file("t/1", 60_000),
+            file("t/1", 60_000),
+            file("t/1", 60_000),
+            file("t/1", 60_000),
+            file("t/1", 60_000),
         ];
         let cfg = limits();
         let groups = plan_rewrite_groups(files, &cfg).groups;
@@ -787,38 +731,52 @@ mod tests {
                 "each group's summed input bytes ({summed}) must stay within the budget"
             );
         }
-        // The chain is one cluster that bin-packs without dropping any file.
+        // One sub-target tier that bin-packs without dropping any file.
         let total: usize = groups.iter().map(Vec::len).sum();
         assert_eq!(total, 6, "every input file must appear in exactly one group");
     }
 
     #[test]
-    fn disjoint_partition_is_skipped_to_avoid_recompaction_loop() {
-        // A partition with more than `min_input_files` files — so the count check
-        // marks it unhealthy — whose files are all disjoint AND already at or
-        // above target. Each file forms its own single-file cluster, so there is
-        // nothing to merge. The planner must emit NO rewrite group and count the
-        // partition as skipped; otherwise every scan would rewrite these files
-        // 1-to-1 forever (the re-compaction loop this guards against).
+    fn disjoint_large_files_merge_now_that_clustering_is_removed() {
+        // Five files in one partition, all OVER target and with DISJOINT sort-key
+        // ranges. Without the sort-key clustering stage they are size-split as one
+        // set: all are within the 2x ratio (so a single tier), and bin-packing by
+        // the 250 KiB budget merges the first pair that fits (120 + 130 KiB). The
+        // remaining lone files are dropped by the single-file-group filter, so the
+        // partition is COMPACTED (one merging group), not skipped.
+        //
+        // This pins the accepted behavior change from removing clustering: before,
+        // each disjoint file was its own cluster and the whole partition was
+        // skipped; now disjoint over-target files can be merged into one output
+        // (weaker sort-key pruning) in exchange for a simpler pipeline. The
+        // single-file-group filter still prevents an infinite 1-to-1 rewrite loop.
         let files = vec![
-            file("t/1", 120_000, 10, 20),
-            file("t/1", 130_000, 30, 40),
-            file("t/1", 140_000, 50, 60),
-            file("t/1", 150_000, 70, 80),
-            file("t/1", 160_000, 90, 100),
+            file("t/1", 120_000),
+            file("t/1", 130_000),
+            file("t/1", 140_000),
+            file("t/1", 150_000),
+            file("t/1", 160_000),
         ];
         let outcome = plan_rewrite_groups(files, &limits());
+        assert_eq!(
+            outcome.partitions_compacted, 1,
+            "the partition now compacts instead of being skipped"
+        );
+        assert_eq!(
+            outcome.groups.len(),
+            1,
+            "one budget-fitting pair merges; the remaining lone files are dropped"
+        );
+        let group = &outcome.groups[0];
+        assert_eq!(group.len(), 2, "exactly the first within-budget pair merges");
+        let merged: u64 = group.iter().map(PlannableFile::size_bytes).sum();
         assert!(
-            outcome.groups.is_empty(),
-            "a partition of disjoint, already-large files must produce no rewrite groups"
+            merged <= limits().max_group_input_bytes,
+            "the merged group respects the byte budget"
         );
-        assert_eq!(
-            outcome.partitions_skipped, 1,
-            "such a partition is skipped, not compacted"
-        );
-        assert_eq!(
-            outcome.partitions_compacted, 0,
-            "no partition is compacted when nothing can be merged"
+        assert!(
+            group.iter().all(|f| f.size_bytes() >= limits().target_file_size_bytes),
+            "over-target files were merged — the pruning trade-off of removing clustering"
         );
     }
 
@@ -832,8 +790,8 @@ mod tests {
             // Identical, fully-overlapping ranges so each partition's five files
             // cluster into one mergeable group; the same ranges appear in both
             // partitions to prove cross-partition files never share a group.
-            files.push(file("t/1", 40_000, 0, 50));
-            files.push(file("t/2", 40_000, 0, 50));
+            files.push(file("t/1", 40_000));
+            files.push(file("t/2", 40_000));
         }
         let outcome = plan_rewrite_groups(files, &limits());
         assert_eq!(

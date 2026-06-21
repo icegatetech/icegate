@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::Catalog;
+use iceberg::io::FileIO;
 use iceberg::spec::DataFile;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -47,9 +48,9 @@ use crate::compact::metrics::CompactMetrics;
 use crate::error::{MaintainError, Result};
 
 /// Upper bound on how many data files the merger opens concurrently while
-/// building one overlap cluster. The rewrite group is small (a handful of
-/// sub-target files), so the input count caps it; this constant only prevents a
-/// pathologically wide cluster from opening an unbounded number of object-store
+/// rewriting one group. The rewrite group is small (a handful of sub-target
+/// files), so the input count caps it; this constant only prevents a
+/// pathologically wide group from opening an unbounded number of object-store
 /// reads at once.
 const MAX_READ_PARALLELISM: usize = 8;
 
@@ -207,9 +208,14 @@ impl RewriteExecutor {
         }
 
         // Step 5: content invariants. A violation rejects the rewrite BEFORE any
-        // commit; the freshly written orphan output files are cleaned up by the
-        // writer's orphan cleanup on a later failure path / GC.
-        verify_content_invariants(&table, self.descriptor, &removed, &added)?;
+        // commit, so the freshly written output files are definitely unreferenced
+        // and safe to delete. The shared writer only cleans up failures that occur
+        // inside the write pipeline; after it returns successfully ownership of
+        // pre-commit cleanup belongs to this executor.
+        if let Err(error) = verify_content_invariants(&table, self.descriptor, &removed, &added) {
+            cleanup_uncommitted_data_files(table.file_io(), &added).await;
+            return Err(error);
+        }
 
         // Observability for the carry-forward invariant: `inherit_summary_property`
         // is a SILENT no-op when the base snapshot carries no offset, which (under
@@ -366,6 +372,25 @@ impl RewriteExecutor {
 /// Borrow a data file's path as the map key.
 fn path_key(stats: &DataFileStats) -> &str {
     stats.data_file.file_path()
+}
+
+/// Best-effort deletion of successfully written data files that were rejected
+/// before the Iceberg transaction was committed.
+///
+/// Cleanup failures are logged without replacing the validation error that
+/// caused the rewrite to abort. This helper must not be used after an ambiguous
+/// catalog commit failure because the commit may have succeeded remotely.
+async fn cleanup_uncommitted_data_files(file_io: &FileIO, data_files: &[DataFile]) {
+    for data_file in data_files {
+        let path = data_file.file_path();
+        if let Err(error) = file_io.delete(path).await {
+            tracing::warn!(
+                path,
+                error = %error,
+                "failed to cleanup compaction output rejected before commit"
+            );
+        }
+    }
 }
 
 /// Verify the two REWRITE content invariants (§9) against the inputs.
