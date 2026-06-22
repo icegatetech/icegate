@@ -3954,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "icegate-catalog-s3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3976,7 +3976,7 @@ dependencies = [
 
 [[package]]
 name = "icegate-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4022,7 +4022,7 @@ dependencies = [
 
 [[package]]
 name = "icegate-ingest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4061,7 +4061,7 @@ dependencies = [
 
 [[package]]
 name = "icegate-jobmanager"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4087,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "icegate-maintain"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "iceberg",
@@ -4104,7 +4104,7 @@ dependencies = [
 
 [[package]]
 name = "icegate-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "antlr4rust",
  "arrow-flight",
@@ -4149,7 +4149,7 @@ dependencies = [
 
 [[package]]
 name = "icegate-queue"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "async-trait",
