@@ -127,7 +127,11 @@ pub fn operations_to_record_batch(
     }
 
     if non_llm_skipped > 0 {
-        tracing::debug!(non_llm_skipped, "Skipped non-LLM spans during operations projection");
+        tracing::debug!(
+            non_llm_skipped,
+            llm_rows = rows.len(),
+            "Skipped non-LLM spans during operations projection"
+        );
     }
 
     let row_count = rows.len();
@@ -281,6 +285,7 @@ pub fn operations_to_record_batch(
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(tenant_id_b.finish()),
+        Arc::new(conversation_id_b.finish()),
         Arc::new(trace_id_b.finish()),
         Arc::new(span_id_b.finish()),
         Arc::new(parent_span_id_b.finish()),
@@ -314,7 +319,6 @@ pub fn operations_to_record_batch(
         Arc::new(Int64Array::from(reasoning_tokens_b)),
         Arc::new(Int64Array::from(cache_creation_input_tokens_b)),
         Arc::new(Int64Array::from(cache_read_input_tokens_b)),
-        Arc::new(conversation_id_b.finish()),
         Arc::new(user_id_b.finish()),
         Arc::new(tool_name_b.finish()),
         Arc::new(tool_call_id_b.finish()),

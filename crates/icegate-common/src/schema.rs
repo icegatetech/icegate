@@ -433,178 +433,184 @@ pub fn operations_schema() -> Result<Schema> {
                 "tenant_id",
                 Type::Primitive(PrimitiveType::String),
             )),
+            // ── conversation ─────────────────────────────────────────────
+            // Leading identity column (placed before `trace_id`): groups a
+            // multi-turn conversation's operations across traces. Sourced from
+            // `gen_ai.conversation.id` / session id; NULL when absent.
+            Arc::new(NestedField::optional(
+                2,
+                "conversation_id",
+                Type::Primitive(PrimitiveType::String),
+            )),
             // ── identity ─────────────────────────────────────────────────
             // Trace context stored as raw fixed-length bytes — see logs/spans
             // schema rationale. Hex encode/decode at API boundaries only.
+            // `trace_id` mirrors `spans.trace_id` byte-for-byte and shares its
+            // field ID (3) so operations join to spans on `trace_id`.
             Arc::new(NestedField::required(
-                2,
+                3,
                 "trace_id",
                 Type::Primitive(PrimitiveType::Fixed(16)),
             )),
             Arc::new(NestedField::required(
-                3,
+                4,
                 "span_id",
                 Type::Primitive(PrimitiveType::Fixed(8)),
             )),
             Arc::new(NestedField::optional(
-                4,
+                5,
                 "parent_span_id",
                 Type::Primitive(PrimitiveType::Fixed(8)),
             )),
             Arc::new(NestedField::optional(
-                5,
+                6,
                 "service_name",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
-                6,
+                7,
                 "scope_name",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
-                7,
+                8,
                 "scope_version",
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── timing ───────────────────────────────────────────────────
             Arc::new(NestedField::required(
-                8,
+                9,
                 "timestamp",
                 Type::Primitive(PrimitiveType::Timestamp),
             )),
             Arc::new(NestedField::required(
-                9,
+                10,
                 "end_timestamp",
                 Type::Primitive(PrimitiveType::Timestamp),
             )),
             Arc::new(NestedField::required(
-                10,
+                11,
                 "duration_micros",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::required(
-                11,
+                12,
                 "ingested_timestamp",
                 Type::Primitive(PrimitiveType::Timestamp),
             )),
             // ── discrimination ───────────────────────────────────────────
             Arc::new(NestedField::required(
-                12,
+                13,
                 "operation_name",
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── provider / model ─────────────────────────────────────────
             Arc::new(NestedField::optional(
-                13,
+                14,
                 "provider_name",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
-                14,
+                15,
                 "request_model",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
-                15,
+                16,
                 "response_model",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
-                16,
+                17,
                 "response_id",
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── sampling ─────────────────────────────────────────────────
             Arc::new(NestedField::optional(
-                17,
+                18,
                 "temperature",
                 Type::Primitive(PrimitiveType::Double),
             )),
             Arc::new(NestedField::optional(
-                18,
+                19,
                 "top_p",
                 Type::Primitive(PrimitiveType::Double),
             )),
-            Arc::new(NestedField::optional(19, "top_k", Type::Primitive(PrimitiveType::Long))),
+            Arc::new(NestedField::optional(20, "top_k", Type::Primitive(PrimitiveType::Long))),
             Arc::new(NestedField::optional(
-                20,
+                21,
                 "max_tokens",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
-                21,
+                22,
                 "frequency_penalty",
                 Type::Primitive(PrimitiveType::Double),
             )),
             Arc::new(NestedField::optional(
-                22,
+                23,
                 "presence_penalty",
                 Type::Primitive(PrimitiveType::Double),
             )),
-            Arc::new(NestedField::optional(23, "seed", Type::Primitive(PrimitiveType::Long))),
+            Arc::new(NestedField::optional(24, "seed", Type::Primitive(PrimitiveType::Long))),
             Arc::new(NestedField::optional(
-                24,
+                25,
                 "stream",
                 Type::Primitive(PrimitiveType::Boolean),
             )),
             Arc::new(NestedField::optional(
-                25,
+                26,
                 "choice_count",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
-                26,
+                27,
                 "output_type",
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
-                27,
+                28,
                 "reasoning_effort",
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── response ─────────────────────────────────────────────────
             Arc::new(NestedField::optional(
-                28,
+                29,
                 "time_to_first_chunk_ms",
                 Type::Primitive(PrimitiveType::Long),
             )),
             // ── tokens ───────────────────────────────────────────────────
             Arc::new(NestedField::optional(
-                29,
+                30,
                 "input_tokens",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
-                30,
+                31,
                 "output_tokens",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
-                31,
+                32,
                 "total_tokens",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
-                32,
+                33,
                 "reasoning_tokens",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
-                33,
+                34,
                 "cache_creation_input_tokens",
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
-                34,
+                35,
                 "cache_read_input_tokens",
                 Type::Primitive(PrimitiveType::Long),
             )),
             // ── identity context ─────────────────────────────────────────
-            Arc::new(NestedField::optional(
-                35,
-                "conversation_id",
-                Type::Primitive(PrimitiveType::String),
-            )),
             Arc::new(NestedField::optional(
                 36,
                 "user_id",
