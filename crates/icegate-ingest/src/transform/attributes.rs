@@ -140,6 +140,23 @@ pub(crate) fn u64_to_i64(value: u64, context: &'static str) -> crate::error::Res
         .map_err(|_| crate::error::IngestError::Validation(format!("{context} exceeds i64::MAX: {value}")))
 }
 
+/// Name the OTLP `AnyValue` variant without echoing its payload.
+///
+/// Strict-parse validation errors are logged at `debug` when the operations
+/// projection drops a row; embedding the raw value would spill prompt text,
+/// ids, or other user data into logs, so report only the variant name.
+const fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::StringValue(_) => "string",
+        Value::BoolValue(_) => "bool",
+        Value::IntValue(_) => "int",
+        Value::DoubleValue(_) => "double",
+        Value::ArrayValue(_) => "array",
+        Value::KvlistValue(_) => "kvlist",
+        Value::BytesValue(_) => "bytes",
+    }
+}
+
 /// Strictly extract an `i64` from an OTLP `AnyValue`.
 ///
 /// Returns `Ok(None)` when the attribute is absent. Accepts an OTLP
@@ -161,9 +178,10 @@ pub(crate) fn extract_i64(value: Option<&AnyValue>, context: &'static str) -> cr
         Value::StringValue(s) => s
             .parse::<i64>()
             .map(Some)
-            .map_err(|_| crate::error::IngestError::Validation(format!("{context} is not a valid i64: {s}"))),
+            .map_err(|_| crate::error::IngestError::Validation(format!("{context} is not a valid i64"))),
         other => Err(crate::error::IngestError::Validation(format!(
-            "{context} expected int, found {other:?}"
+            "{context} expected int, found {}",
+            value_type_name(other)
         ))),
     }
 }
@@ -183,18 +201,31 @@ pub(crate) fn extract_f64(value: Option<&AnyValue>, context: &'static str) -> cr
         return Ok(None);
     };
     match inner {
-        Value::DoubleValue(d) => Ok(Some(*d)),
+        Value::DoubleValue(d) if d.is_finite() => Ok(Some(*d)),
+        // Non-finite doubles (NaN, +/-inf) would saturate to garbage when later
+        // scaled and cast to an integer timing column, so reject them here (D6).
+        Value::DoubleValue(_) => Err(crate::error::IngestError::Validation(format!(
+            "{context} must be a finite f64"
+        ))),
         // `i64` -> `f64` widening is intentional and never wraps; large
         // integers lose mantissa precision but that is acceptable for sampling
         // parameters which are small.
         #[allow(clippy::cast_precision_loss)]
         Value::IntValue(i) => Ok(Some(*i as f64)),
-        Value::StringValue(s) => s
-            .parse::<f64>()
-            .map(Some)
-            .map_err(|_| crate::error::IngestError::Validation(format!("{context} is not a valid f64: {s}"))),
+        Value::StringValue(s) => {
+            let parsed = s
+                .parse::<f64>()
+                .map_err(|_| crate::error::IngestError::Validation(format!("{context} is not a valid f64")))?;
+            if !parsed.is_finite() {
+                return Err(crate::error::IngestError::Validation(format!(
+                    "{context} must be a finite f64"
+                )));
+            }
+            Ok(Some(parsed))
+        }
         other => Err(crate::error::IngestError::Validation(format!(
-            "{context} expected double, found {other:?}"
+            "{context} expected double, found {}",
+            value_type_name(other)
         ))),
     }
 }
@@ -214,7 +245,8 @@ pub(crate) fn extract_bool(value: Option<&AnyValue>, context: &'static str) -> c
     match inner {
         Value::BoolValue(b) => Ok(Some(*b)),
         other => Err(crate::error::IngestError::Validation(format!(
-            "{context} expected bool, found {other:?}"
+            "{context} expected bool, found {}",
+            value_type_name(other)
         ))),
     }
 }
@@ -253,7 +285,8 @@ pub(crate) fn extract_string_list(
             Ok(Some(out))
         }
         other => Err(crate::error::IngestError::Validation(format!(
-            "{context} expected array, found {other:?}"
+            "{context} expected array, found {}",
+            value_type_name(other)
         ))),
     }
 }
@@ -932,6 +965,24 @@ mod tests {
             value: Some(Value::StringValue("hot".to_string())),
         };
         assert!(extract_f64(Some(&bad), "ctx").is_err());
+    }
+
+    #[test]
+    fn extract_f64_rejects_non_finite() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let double = AnyValue {
+                value: Some(Value::DoubleValue(value)),
+            };
+            assert!(extract_f64(Some(&double), "ctx").is_err());
+        }
+
+        // Non-finite values arriving as stringified numbers must be rejected too.
+        for repr in ["nan", "inf", "-inf", "infinity"] {
+            let parsed = AnyValue {
+                value: Some(Value::StringValue(repr.to_string())),
+            };
+            assert!(extract_f64(Some(&parsed), "ctx").is_err());
+        }
     }
 
     #[test]

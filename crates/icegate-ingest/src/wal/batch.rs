@@ -68,11 +68,17 @@ pub async fn write_logs_batch_to_wal(
     let prepared = sort_logs(&batch, wal_row_group_size, trace_context).inspect_err(|_| {
         request_metrics.finish_error();
     })?;
+    // A non-empty batch always yields at least one row group; treat its absence
+    // as an internal invariant violation instead of silently succeeding, so valid
+    // log records cannot disappear without an error. Record the OK sort timing
+    // only after this check passes, so the invariant-violation path emits
+    // `finish_error()` alone rather than a conflicting `status="ok"` sort sample
+    // (mirrors the metrics WAL path).
+    let prepared = prepared.ok_or_else(|| {
+        request_metrics.finish_error();
+        IngestError::Validation("logs WAL preparation produced no row groups for a non-empty batch".to_string())
+    })?;
     request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
-    let Some(prepared) = prepared else {
-        request_metrics.finish_ok();
-        return Ok(None);
-    };
 
     let enqueue_start = Instant::now();
     let pending = submit_sorted_rows_to_wal(write_channel, prepared).await.inspect_err(|_| {
@@ -150,11 +156,17 @@ pub async fn write_traces_batch_to_wal(
     let prepared = sort_spans(&batch, wal_row_group_size, trace_context).inspect_err(|_| {
         request_metrics.finish_error();
     })?;
+    // A non-empty batch always yields at least one row group; treat its absence
+    // as an internal invariant violation instead of silently succeeding, so valid
+    // spans cannot disappear without an error. Record the OK sort timing only
+    // after this check passes, so the invariant-violation path emits
+    // `finish_error()` alone rather than a conflicting `status="ok"` sort sample
+    // (mirrors the metrics WAL path).
+    let prepared = prepared.ok_or_else(|| {
+        request_metrics.finish_error();
+        IngestError::Validation("traces WAL preparation produced no row groups for a non-empty batch".to_string())
+    })?;
     request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_TRACES, STATUS_OK);
-    let Some(prepared) = prepared else {
-        partial_otlp::traces::finish_metrics_with_drops(request_metrics, drops);
-        return partial_otlp::traces::partial_from_drops(drops);
-    };
 
     let enqueue_start = Instant::now();
     let pending = submit_sorted_rows_to_wal(write_channel, prepared).await.inspect_err(|_| {
@@ -334,11 +346,17 @@ pub async fn write_operations_batch_to_wal(
     let prepared = sort_operations(&batch, wal_row_group_size, trace_context).inspect_err(|_| {
         request_metrics.finish_error();
     })?;
+    // A non-empty batch always yields at least one row group; treat its absence
+    // as an internal invariant violation instead of silently succeeding, so valid
+    // operation rows cannot disappear without an error. Record the OK sort timing
+    // only after this check passes, so the invariant-violation path emits
+    // `finish_error()` alone rather than a conflicting `status="ok"` sort sample
+    // (mirrors the metrics WAL path).
+    let prepared = prepared.ok_or_else(|| {
+        request_metrics.finish_error();
+        IngestError::Validation("operations WAL preparation produced no row groups for a non-empty batch".to_string())
+    })?;
     request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_OPERATIONS, STATUS_OK);
-    let Some(prepared) = prepared else {
-        partial_otlp::traces::finish_metrics_with_drops(request_metrics, drops);
-        return partial_otlp::traces::partial_from_drops(drops);
-    };
 
     let enqueue_start = Instant::now();
     let pending = submit_sorted_rows_to_wal(write_channel, prepared).await.inspect_err(|_| {

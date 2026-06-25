@@ -12,10 +12,6 @@ use crate::transform::attributes::extract_string_value;
 pub(crate) struct Traceloop;
 
 impl OperationConvention for Traceloop {
-    fn id(&self) -> &'static str {
-        "traceloop"
-    }
-
     fn marker_keys(&self) -> &'static [&'static str] {
         &["traceloop.span.kind"]
     }

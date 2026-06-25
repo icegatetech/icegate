@@ -422,7 +422,14 @@ fn resolve_json(view: &AttributeView, field: OperationField) -> Option<String> {
 ///
 /// Returns `IngestError::Validation` when a present value fails strict parsing.
 fn resolve_token(view: &AttributeView, field: OperationField, context: &'static str) -> Result<Option<i64>> {
-    resolve_i64(view, field, context)
+    // Token counts are non-negative by contract; a negative value would skew
+    // downstream usage aggregation, so drop the row instead of persisting it.
+    match resolve_i64(view, field, context)? {
+        Some(value) if value < 0 => Err(crate::error::IngestError::Validation(format!(
+            "{context} must be non-negative: {value}"
+        ))),
+        other => Ok(other),
+    }
 }
 
 /// Project one OTLP span (+ scope + tenant) into an optional operations row.
@@ -491,20 +498,46 @@ pub(crate) fn project_operation_row(
         None => None,
     };
 
+    // `ServerPort` is a `FieldType::I32Count`: non-negative. Mirror the
+    // `embedding_dimensions` conversion above (u32 first) so a negative port is
+    // rejected rather than silently stored.
     let server_port = match resolve_i64(&view, OperationField::ServerPort, "server_port")? {
-        Some(value) => Some(
-            i32::try_from(value)
-                .map_err(|_| crate::error::IngestError::Validation(format!("server_port out of i32 range: {value}")))?,
-        ),
+        Some(value) => {
+            let as_u32 = u32::try_from(value)
+                .map_err(|_| crate::error::IngestError::Validation(format!("server_port out of u32 range: {value}")))?;
+            Some(u32_count_to_i32(as_u32, "server_port")?)
+        }
         None => None,
     };
 
-    let time_to_first_chunk_ms =
-        resolve_f64(&view, OperationField::TimeToFirstChunkMs, "time_to_first_chunk_ms")?.map(|seconds| {
+    // A finite, non-negative duration is the only valid input; a direct `as i64`
+    // cast would otherwise turn NaN into 0 and saturate infinities/overflow into
+    // nonsense latencies, so validate before converting seconds to millis.
+    let time_to_first_chunk_ms = match resolve_f64(&view, OperationField::TimeToFirstChunkMs, "time_to_first_chunk_ms")?
+    {
+        Some(seconds) if !seconds.is_finite() || seconds < 0.0 => {
+            return Err(crate::error::IngestError::Validation(format!(
+                "time_to_first_chunk_ms must be a finite non-negative duration: {seconds}"
+            )));
+        }
+        Some(seconds) => {
+            let millis = seconds * 1000.0;
+            // `i64::MAX as f64` rounds to 2^63; `>=` rejects anything that would
+            // overflow the truncating cast below (including a `*1000.0` that
+            // pushed a large-but-finite value to infinity).
+            #[allow(clippy::cast_precision_loss)]
+            let max_millis = i64::MAX as f64;
+            if millis >= max_millis {
+                return Err(crate::error::IngestError::Validation(format!(
+                    "time_to_first_chunk_ms out of range: {seconds}"
+                )));
+            }
             #[allow(clippy::cast_possible_truncation)]
-            let millis = (seconds * 1000.0) as i64;
-            millis
-        });
+            let millis = millis as i64;
+            Some(millis)
+        }
+        None => None,
+    };
 
     Ok(Some(OperationRow {
         tenant_id: tenant_id.to_string(),

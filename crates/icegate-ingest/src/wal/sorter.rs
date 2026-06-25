@@ -901,20 +901,35 @@ mod tests {
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("row_id", DataType::Int64, false),
         ]));
-        let trace_a1: [u8; 16] = [b'a', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let trace_a2: [u8; 16] = [b'a', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // tenant-a carries two rows sharing `trace_high` (to exercise the
+        // `timestamp DESC` tiebreaker) plus one row on the lower `trace_low` (to
+        // exercise the leading `trace_id ASC` leg). A wrong direction on either
+        // leg changes the expected `row_id` order, so both are guarded.
+        let trace_low: [u8; 16] = [b'a', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_high: [u8; 16] = [b'a', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let trace_b: [u8; 16] = [b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let trace_id_arr = FixedSizeBinaryArray::try_from_iter(
-            [trace_a1.as_slice(), trace_a2.as_slice(), trace_b.as_slice()].into_iter(),
+            [
+                trace_high.as_slice(),
+                trace_high.as_slice(),
+                trace_low.as_slice(),
+                trace_b.as_slice(),
+            ]
+            .into_iter(),
         )
         .expect("trace_id array");
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["tenant-a", "tenant-a", "tenant-b"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["tenant-a", "tenant-a", "tenant-a", "tenant-b"])) as ArrayRef,
                 Arc::new(trace_id_arr) as ArrayRef,
-                Arc::new(TimestampMicrosecondArray::from(vec![Some(10), Some(20), Some(30)])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(10),
+                    Some(20),
+                    Some(5),
+                    Some(30),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 4, 3])) as ArrayRef,
             ],
         )
         .expect("operations batch");
@@ -930,7 +945,7 @@ mod tests {
             .write_request
             .row_groups
             .iter()
-            .find(|rg| rg.batch.num_rows() == 2)
+            .find(|rg| rg.batch.num_rows() == 3)
             .expect("tenant-a group");
         let row_ids: Vec<i64> = (0..rg_a.batch.num_rows())
             .map(|i| {
@@ -942,6 +957,8 @@ mod tests {
                     .value(i)
             })
             .collect();
-        assert_eq!(row_ids, vec![1, 2]);
+        // trace_low (row_id 4) sorts ahead of trace_high; within trace_high the
+        // later timestamp (row_id 2, ts=20) precedes the earlier (row_id 1, ts=10).
+        assert_eq!(row_ids, vec![4, 2, 1]);
     }
 }

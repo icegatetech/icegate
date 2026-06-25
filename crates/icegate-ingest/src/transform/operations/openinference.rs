@@ -11,10 +11,6 @@ use crate::transform::attributes::extract_string_value;
 pub(crate) struct OpenInference;
 
 impl OperationConvention for OpenInference {
-    fn id(&self) -> &'static str {
-        "openinference"
-    }
-
     fn marker_keys(&self) -> &'static [&'static str] {
         &["openinference.span.kind", "llm.model_name", "llm.system"]
     }

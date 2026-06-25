@@ -11,10 +11,6 @@ use crate::transform::attributes::extract_string_value;
 pub(crate) struct OtelGenAi;
 
 impl OperationConvention for OtelGenAi {
-    fn id(&self) -> &'static str {
-        "otel_genai"
-    }
-
     fn marker_keys(&self) -> &'static [&'static str] {
         &["gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.system"]
     }

@@ -614,7 +614,7 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 
 **Version:** 1.4
 **Last Updated:** 2026-06-25
-**Schema Source:** `src/common/schema.rs`
+**Schema Source:** `crates/icegate-common/src/schema.rs`
 
 **Notable Changes in v1.4:**
 - Added the `operations` table (5th physical table): a typed columnar projection over the LLM/GenAI subset of `spans` (1:1 by `span_id`), partitioned `tenant_id` + `day(timestamp)`, sorted `trace_id` + `timestamp DESC` (no `service_name` leg; D10).

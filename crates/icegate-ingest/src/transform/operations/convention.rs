@@ -12,11 +12,6 @@ use super::traceloop::Traceloop;
 /// entirely static tables — and appending one entry to [`CONVENTIONS`]; the core
 /// driver, schema, WAL, and shift wiring stay untouched (spec D9 / section 6).
 pub(crate) trait OperationConvention: Send + Sync {
-    /// Stable id for metrics and tests, e.g. `"otel_genai"`.
-    // Only used in tests.
-    #[allow(dead_code)]
-    fn id(&self) -> &'static str;
-
     /// Marker attribute keys. A span qualifies as an operation iff ANY
     /// registered convention reports a present marker; the section 4 filter is
     /// the union of every adapter's markers.
@@ -55,8 +50,7 @@ fn flatten_field_keys(
 /// section 4 materialization filter). Order is registry order with first
 /// occurrence kept; duplicates from shared keys are dropped. Free function over
 /// the convention slice for stub-based unit testing.
-// Only used in tests (via marker_filter).
-#[allow(dead_code)]
+#[cfg(test)]
 fn union_markers(conventions: &[&dyn OperationConvention]) -> Vec<&'static str> {
     let mut seen = Vec::new();
     for convention in conventions {
@@ -148,8 +142,7 @@ pub(crate) fn field_precedence(field: OperationField) -> &'static [(&'static str
 
 /// Returns the deduplicated union of every registered convention's marker keys —
 /// the section 4 materialization filter. Computed over [`CONVENTIONS`].
-// Only used in tests; production qualifies spans via CONVENTIONS.iter()...marker_keys() directly.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn marker_filter() -> Vec<&'static str> {
     union_markers(CONVENTIONS)
 }
@@ -164,10 +157,6 @@ mod tests {
     struct StubA;
 
     impl OperationConvention for StubA {
-        fn id(&self) -> &'static str {
-            "stub_a"
-        }
-
         fn marker_keys(&self) -> &'static [&'static str] {
             &["a.marker", "shared.marker"]
         }
@@ -189,10 +178,6 @@ mod tests {
     struct StubB;
 
     impl OperationConvention for StubB {
-        fn id(&self) -> &'static str {
-            "stub_b"
-        }
-
         fn marker_keys(&self) -> &'static [&'static str] {
             &["b.marker", "shared.marker"]
         }

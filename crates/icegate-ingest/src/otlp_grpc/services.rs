@@ -187,8 +187,9 @@ impl TraceService for OtlpGrpcService {
                 )
                 .await
                 {
+                    // `write_operations_batch_to_wal` already records the terminal
+                    // error status on every failure path; do not finish again here.
                     tracing::error!(error = %err, "Failed to write operations batch to WAL (best-effort)");
-                    operations_metrics.finish_with_status(STATUS_ERROR);
                 }
             }
             Err(err) => {
