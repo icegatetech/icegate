@@ -15,6 +15,7 @@ use crate::error::{IngestError, Result};
 static LOGS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
 static SPANS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
 static METRICS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
+static OPERATIONS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SortColumnDescriptor {
@@ -57,6 +58,15 @@ impl SortColumnsDescriptor {
         }
     }
 
+    pub(crate) fn operations() -> Result<&'static Self> {
+        match OPERATIONS_SORT_DESCRIPTOR.get_or_init(|| Self::try_from_operations().map_err(|err| err.to_string())) {
+            Ok(descriptor) => Ok(descriptor),
+            Err(message) => Err(IngestError::Config(format!(
+                "failed to initialize operations sort descriptor: {message}"
+            ))),
+        }
+    }
+
     pub(crate) fn columns(&self) -> &[SortColumnDescriptor] {
         self.columns.as_slice()
     }
@@ -81,6 +91,12 @@ impl SortColumnsDescriptor {
     fn try_from_metrics() -> Result<Self> {
         let schema = icegate_common::schema::metrics_schema()?;
         let sort_order = icegate_common::schema::metrics_sort_order(&schema)?;
+        Self::try_from_schema_sort_order(&schema, &sort_order)
+    }
+
+    fn try_from_operations() -> Result<Self> {
+        let schema = icegate_common::schema::operations_schema()?;
+        let sort_order = icegate_common::schema::operations_sort_order(&schema)?;
         Self::try_from_schema_sort_order(&schema, &sort_order)
     }
 
@@ -459,6 +475,36 @@ mod tests {
         let schema = icegate_common::schema::metrics_schema().expect("metrics schema");
         let sort_order = icegate_common::schema::metrics_sort_order(&schema).expect("metrics sort order");
         let descriptor = SortColumnsDescriptor::metrics().expect("metrics descriptor");
+
+        assert_eq!(descriptor.columns().len(), sort_order.fields.len());
+
+        for (descriptor_column, sort_field) in descriptor.columns().iter().zip(&sort_order.fields) {
+            let schema_field = resolve_sort_schema_field(&schema, sort_field).expect("sort field must resolve");
+            assert_eq!(descriptor_column.column_name, schema_field.name);
+            assert_eq!(
+                descriptor_column.primitive_type,
+                schema_field
+                    .field_type
+                    .as_primitive_type()
+                    .expect("sort field must be primitive")
+                    .clone()
+            );
+            assert_eq!(
+                descriptor_column.descending,
+                matches!(sort_field.direction, SortDirection::Descending)
+            );
+            assert_eq!(
+                descriptor_column.nulls_first,
+                matches!(sort_field.null_order, NullOrder::First)
+            );
+        }
+    }
+
+    #[test]
+    fn operations_sort_descriptor_matches_operations_sort_order() {
+        let schema = icegate_common::schema::operations_schema().expect("operations schema");
+        let sort_order = icegate_common::schema::operations_sort_order(&schema).expect("operations sort order");
+        let descriptor = SortColumnsDescriptor::operations().expect("operations descriptor");
 
         assert_eq!(descriptor.columns().len(), sort_order.fields.len());
 

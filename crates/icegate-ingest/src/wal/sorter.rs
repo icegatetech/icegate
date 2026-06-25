@@ -5,7 +5,7 @@ use arrow::{
     compute::take,
     record_batch::RecordBatch,
 };
-use icegate_common::{LOGS_TOPIC, METRICS_TOPIC, SPANS_TOPIC};
+use icegate_common::{LOGS_TOPIC, METRICS_TOPIC, OPERATIONS_TOPIC, SPANS_TOPIC};
 use icegate_queue::{PreparedWalRowGroup, WriteRequest};
 
 use super::{
@@ -159,6 +159,21 @@ pub(crate) fn sort_metrics(
     )
 }
 
+/// Prepare WAL batches for one operations ingest request.
+pub(crate) fn sort_operations(
+    batch: &RecordBatch,
+    row_group_size: usize,
+    trace_context: Option<String>,
+) -> Result<Option<PreparedWalWrite>> {
+    prepare(
+        SortColumnsDescriptor::operations()?,
+        OPERATIONS_TOPIC,
+        batch,
+        row_group_size,
+        trace_context,
+    )
+}
+
 fn prepare(
     descriptor: &'static SortColumnsDescriptor,
     topic: &'static str,
@@ -216,7 +231,7 @@ mod tests {
     };
     use icegate_queue::{WriteResult, channel};
 
-    use super::{WalSorter, sort_logs, sort_metrics, sort_spans};
+    use super::{WalSorter, sort_logs, sort_metrics, sort_operations, sort_spans};
     use crate::error::IngestError;
     use crate::wal::{
         RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue, SortColumnsDescriptor, WalAckOutcome,
@@ -873,5 +888,60 @@ mod tests {
             })
             .collect();
         assert_eq!(row_ids, vec![3, 2]);
+    }
+
+    #[test]
+    fn sort_operations_produces_operations_topic_and_tenant_homogeneous_groups() {
+        // Operations sort order is (trace_id asc, timestamp desc) with no
+        // service_name leg, so a minimal batch only needs tenant_id, trace_id,
+        // and timestamp. `trace_id` is `FIXED_LEN_BYTE_ARRAY(16)` in storage.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("row_id", DataType::Int64, false),
+        ]));
+        let trace_a1: [u8; 16] = [b'a', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_a2: [u8; 16] = [b'a', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_b: [u8; 16] = [b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let trace_id_arr = FixedSizeBinaryArray::try_from_iter(
+            [trace_a1.as_slice(), trace_a2.as_slice(), trace_b.as_slice()].into_iter(),
+        )
+        .expect("trace_id array");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["tenant-a", "tenant-a", "tenant-b"])) as ArrayRef,
+                Arc::new(trace_id_arr) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(10), Some(20), Some(30)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+        )
+        .expect("operations batch");
+
+        let prepared = sort_operations(&batch, 8, None)
+            .expect("prepare wal write")
+            .expect("prepared wal write");
+
+        assert_eq!(prepared.write_request.topic, icegate_common::OPERATIONS_TOPIC);
+        assert_eq!(prepared.write_request.row_groups.len(), 2);
+
+        let rg_a = prepared
+            .write_request
+            .row_groups
+            .iter()
+            .find(|rg| rg.batch.num_rows() == 2)
+            .expect("tenant-a group");
+        let row_ids: Vec<i64> = (0..rg_a.batch.num_rows())
+            .map(|i| {
+                rg_a.batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("row_id")
+                    .value(i)
+            })
+            .collect();
+        assert_eq!(row_ids, vec![1, 2]);
     }
 }

@@ -30,8 +30,10 @@ const CONTENT_TYPE_JSON: &str = "application/json";
 
 const SIGNAL_LOGS: &str = "logs";
 const SIGNAL_TRACES: &str = "traces";
+const SIGNAL_OPERATIONS: &str = "operations";
 const PROTOCOL_HTTP: &str = "http";
 const STATUS_OK: &str = "ok";
+const STATUS_ERROR: &str = "error";
 
 /// Extract tenant ID from HTTP headers.
 ///
@@ -154,13 +156,20 @@ pub async fn ingest_traces(
 
     let tenant_id = extract_tenant_id(&headers);
 
-    // Transform OTLP spans to Arrow RecordBatch (offload to blocking thread).
+    // Transform OTLP spans AND derived operations in ONE blocking offload.
+    // Spans are authoritative; operations are best-effort.
     let span = tracing::Span::current();
     let transform_start = Instant::now();
-    let (batch_opt, drops) = tokio::task::spawn_blocking(move || {
-        span.in_scope(|| transform::spans_to_record_batch(&export_request, tenant_id.as_deref()))
+    let (spans_result, operations_result) = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| {
+            let spans = transform::spans_to_record_batch(&export_request, tenant_id.as_deref());
+            let operations = transform::operations_to_record_batch(&export_request, tenant_id.as_deref());
+            (spans, operations)
+        })
     })
-    .await??;
+    .await?;
+    // Spans transform error fails the whole request (authoritative signal).
+    let (batch_opt, drops) = spans_result.map_err(OtlpError)?;
     request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_TRACES, STATUS_OK);
 
     let payload = crate::wal::write_traces_batch_to_wal(
@@ -172,6 +181,30 @@ pub async fn ingest_traces(
     )
     .await
     .map_err(OtlpError)?;
+
+    // Best-effort operations write: never fails the traces response. On any
+    // error (transform or WAL) log it and bump the operations error counter.
+    let operations_metrics = OtlpRequestRecorder::new(&state.metrics, PROTOCOL_HTTP, SIGNAL_OPERATIONS, encoding);
+    match operations_result {
+        Ok((operations_batch_opt, operations_drops)) => {
+            if let Err(err) = crate::wal::write_operations_batch_to_wal(
+                &state.write_channel,
+                &operations_metrics,
+                operations_batch_opt,
+                operations_drops,
+                state.wal_row_group_size,
+            )
+            .await
+            {
+                tracing::error!(error = %err, "Failed to write operations batch to WAL (best-effort)");
+                operations_metrics.finish_with_status(STATUS_ERROR);
+            }
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "Failed to transform operations from spans (best-effort)");
+            operations_metrics.finish_with_status(STATUS_ERROR);
+        }
+    }
 
     Ok(Json(ExportTracesResponse {
         partial_success: payload.map(|(rejected_spans, message)| TracesPartialSuccess {
@@ -262,9 +295,11 @@ mod tests {
     use axum::body::Bytes;
     use icegate_queue::{WriteResult, channel};
     use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest,
         common::v1::{AnyValue, KeyValue, any_value::Value},
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
         resource::v1::Resource,
+        trace::v1::{ResourceSpans, ScopeSpans, Span},
     };
     use prost::Message;
 
@@ -452,11 +487,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_traces_returns_success_on_wal_ack() {
-        use opentelemetry_proto::tonic::{
-            collector::trace::v1::ExportTraceServiceRequest,
-            trace::v1::{ResourceSpans, ScopeSpans, Span},
-        };
-
         let request = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 resource: Some(Resource {
@@ -508,11 +538,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_traces_returns_partial_success_for_transform_drops() {
-        use opentelemetry_proto::tonic::{
-            collector::trace::v1::ExportTraceServiceRequest,
-            trace::v1::{ResourceSpans, ScopeSpans, Span},
-        };
-
         // Two spans: one valid, one with zero trace_id (dropped).
         let request = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
@@ -690,6 +715,103 @@ mod tests {
         let body = Bytes::from(metrics_gauge_request().encode_to_vec());
         let result = ingest_metrics(State(test_state(tx)), HeaderMap::new(), body).await;
         assert!(result.is_err());
+    }
+
+    fn traces_request_one_llm_one_plain() -> ExportTraceServiceRequest {
+        let llm_span = Span {
+            trace_id: vec![1u8; 16],
+            span_id: vec![1u8; 8],
+            parent_span_id: vec![],
+            trace_state: String::new(),
+            name: "chat".to_string(),
+            kind: 0,
+            start_time_unix_nano: 1_000_000,
+            end_time_unix_nano: 2_000_000,
+            attributes: vec![KeyValue {
+                key: "gen_ai.operation.name".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue("chat".to_string())),
+                }),
+            }],
+            dropped_attributes_count: 0,
+            events: vec![],
+            dropped_events_count: 0,
+            links: vec![],
+            dropped_links_count: 0,
+            status: None,
+            flags: 0,
+        };
+        let plain_span = Span {
+            trace_id: vec![1u8; 16],
+            span_id: vec![2u8; 8],
+            parent_span_id: vec![1u8; 8],
+            trace_state: String::new(),
+            name: "db.query".to_string(),
+            kind: 0,
+            start_time_unix_nano: 1_000_000,
+            end_time_unix_nano: 2_000_000,
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            events: vec![],
+            dropped_events_count: 0,
+            links: vec![],
+            dropped_links_count: 0,
+            status: None,
+            flags: 0,
+        };
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![llm_span, plain_span],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_traces_succeeds_when_operations_write_fails() {
+        // Spans (authoritative, first write) ack success; operations (second
+        // write) hits a closed receiver. The HTTP response must still be Ok and
+        // carry no partial_success (best-effort operations, D8).
+        let (tx, mut rx) = channel(2);
+        let writer = tokio::spawn(async move {
+            let spans_req = rx.recv().await.expect("spans write request");
+            assert_eq!(spans_req.topic, icegate_common::SPANS_TOPIC);
+            let total = spans_req.row_groups.iter().map(|rg| rg.batch.num_rows()).sum::<usize>();
+            spans_req
+                .response_tx
+                .send(WriteResult::success(1, total, None))
+                .expect("spans ack");
+            let ops_req = rx.recv().await.expect("operations write request");
+            assert_eq!(ops_req.topic, icegate_common::OPERATIONS_TOPIC);
+            drop(ops_req);
+        });
+
+        let state = OtlpHttpState {
+            write_channel: tx,
+            wal_row_group_size: 4,
+            metrics: OtlpMetrics::new_disabled(),
+        };
+        let mut body = Vec::new();
+        traces_request_one_llm_one_plain().encode(&mut body).expect("encode request");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF.parse().expect("content type"));
+
+        let response = ingest_traces(State(state), headers, axum::body::Bytes::from(body))
+            .await
+            .expect("traces response must be OK even when operations write fails");
+        writer.await.expect("writer task");
+
+        assert!(response.0.partial_success.is_none());
     }
 
     #[tokio::test]

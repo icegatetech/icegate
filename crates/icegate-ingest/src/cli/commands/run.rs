@@ -10,10 +10,13 @@ use std::{
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use icegate_common::{
-    IoHandle, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, MetricsRuntime, SPANS_TABLE, SPANS_TOPIC,
+    IoHandle, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, MetricsRuntime, OPERATIONS_TABLE, OPERATIONS_TOPIC,
+    SPANS_TABLE, SPANS_TOPIC,
     catalog::CatalogBuilder,
     create_object_store,
-    parquet_encoding::{LOGS_COLUMN_ENCODINGS, METRICS_COLUMN_ENCODINGS, SPANS_COLUMN_ENCODINGS},
+    parquet_encoding::{
+        LOGS_COLUMN_ENCODINGS, METRICS_COLUMN_ENCODINGS, OPERATIONS_COLUMN_ENCODINGS, SPANS_COLUMN_ENCODINGS,
+    },
     run_metrics_server,
     schema::{COL_SPAN_ID, COL_TRACE_ID},
 };
@@ -414,11 +417,13 @@ async fn run_services(
     let wal_bloom_filter_columns = std::collections::HashMap::from([
         (LOGS_TOPIC.to_string(), TRACE_LOOKUP_BLOOM_COLUMNS),
         (SPANS_TOPIC.to_string(), TRACE_LOOKUP_BLOOM_COLUMNS),
+        (OPERATIONS_TOPIC.to_string(), TRACE_LOOKUP_BLOOM_COLUMNS),
     ]);
     let wal_column_encodings = std::collections::HashMap::from([
         (LOGS_TOPIC.to_string(), LOGS_COLUMN_ENCODINGS),
         (SPANS_TOPIC.to_string(), SPANS_COLUMN_ENCODINGS),
         (METRICS_TOPIC.to_string(), METRICS_COLUMN_ENCODINGS),
+        (OPERATIONS_TOPIC.to_string(), OPERATIONS_COLUMN_ENCODINGS),
     ]);
     let writer = QueueWriter::new(queue_config.clone(), queue_writer_store)
         .with_events(Arc::new(wal_writer_metrics))
@@ -492,6 +497,15 @@ async fn run_services(
             planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
             bloom_filter_columns: &[],
             column_encodings: METRICS_COLUMN_ENCODINGS,
+        },
+        ShiftJobSpec {
+            job_name: "shift_operations",
+            topic: OPERATIONS_TOPIC,
+            table: OPERATIONS_TABLE,
+            descriptor: SortColumnsDescriptor::operations()?,
+            planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
+            bloom_filter_columns: TRACE_LOOKUP_BLOOM_COLUMNS,
+            column_encodings: OPERATIONS_COLUMN_ENCODINGS,
         },
     ];
 

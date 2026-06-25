@@ -138,3 +138,58 @@ pub const METRICS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
     (COL_MAX, Encoding::BYTE_STREAM_SPLIT),
     (COL_ZERO_THRESHOLD, Encoding::BYTE_STREAM_SPLIT),
 ];
+
+/// Encoding overrides for the `operations` table.
+///
+/// Sort order: `trace_id, timestamp DESC`. A trace's operation rows cluster
+/// contiguously inside the (`trace_id`, `timestamp`) bucket, so `trace_id`/`span_id`
+/// get `DELTA_BYTE_ARRAY` for the same reason as spans; timestamps and
+/// `duration_micros` get `DELTA_BINARY_PACKED`; the high-cardinality free-form
+/// `status_message` gets `DELTA_LENGTH_BYTE_ARRAY`.
+///
+/// `operation_name`, `provider_name`, and `request_model` are intentionally
+/// absent: they are low-cardinality enums surfaced through tag-value
+/// enumeration, and the metadata scan reads only dictionary pages. Forcing a
+/// non-dict encoding would empty their Grafana pickers. See the module-level
+/// "Hard exclusion" docs.
+pub const OPERATIONS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
+    (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_INGESTED_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+    (COL_DURATION_MICROS, Encoding::DELTA_BINARY_PACKED),
+    (COL_STATUS_MESSAGE, Encoding::DELTA_LENGTH_BYTE_ARRAY),
+    (COL_TRACE_ID, Encoding::DELTA_BYTE_ARRAY),
+    (COL_SPAN_ID, Encoding::DELTA_BYTE_ARRAY),
+];
+
+#[cfg(test)]
+mod operations_encoding_tests {
+    use parquet::basic::Encoding;
+
+    use super::OPERATIONS_COLUMN_ENCODINGS;
+    use crate::schema::{
+        COL_DURATION_MICROS, COL_INGESTED_TIMESTAMP, COL_SPAN_ID, COL_STATUS_MESSAGE, COL_TIMESTAMP, COL_TRACE_ID,
+    };
+
+    #[test]
+    fn operations_encodings_match_spec() {
+        // The six pinned columns and their exact encodings (TRI-72 §5).
+        let expected = [
+            (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+            (COL_INGESTED_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
+            (COL_DURATION_MICROS, Encoding::DELTA_BINARY_PACKED),
+            (COL_STATUS_MESSAGE, Encoding::DELTA_LENGTH_BYTE_ARRAY),
+            (COL_TRACE_ID, Encoding::DELTA_BYTE_ARRAY),
+            (COL_SPAN_ID, Encoding::DELTA_BYTE_ARRAY),
+        ];
+        assert_eq!(OPERATIONS_COLUMN_ENCODINGS, expected.as_slice());
+
+        // Low-cardinality enums stay on the parquet dictionary default so the
+        // metadata-scan tag-values path keeps reading dictionary pages.
+        for excluded in ["operation_name", "provider_name", "request_model"] {
+            assert!(
+                !OPERATIONS_COLUMN_ENCODINGS.iter().any(|(name, _)| *name == excluded),
+                "{excluded} must stay on dictionary (absent from OPERATIONS_COLUMN_ENCODINGS)"
+            );
+        }
+    }
+}

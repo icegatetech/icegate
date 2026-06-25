@@ -140,6 +140,124 @@ pub(crate) fn u64_to_i64(value: u64, context: &'static str) -> crate::error::Res
         .map_err(|_| crate::error::IngestError::Validation(format!("{context} exceeds i64::MAX: {value}")))
 }
 
+/// Strictly extract an `i64` from an OTLP `AnyValue`.
+///
+/// Returns `Ok(None)` when the attribute is absent. Accepts an OTLP
+/// `IntValue` directly, or a `StringValue` that parses cleanly as `i64`
+/// (some SDKs stringify numbers). Any other variant, or an unparseable
+/// numeric string, returns `Err(IngestError::Validation)` so the operations
+/// projection drops the row instead of emitting a corrupt typed column (D6).
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` if the value is present but is neither an
+/// integer nor a string that parses as `i64`.
+pub(crate) fn extract_i64(value: Option<&AnyValue>, context: &'static str) -> crate::error::Result<Option<i64>> {
+    let Some(inner) = value.and_then(|a| a.value.as_ref()) else {
+        return Ok(None);
+    };
+    match inner {
+        Value::IntValue(i) => Ok(Some(*i)),
+        Value::StringValue(s) => s
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| crate::error::IngestError::Validation(format!("{context} is not a valid i64: {s}"))),
+        other => Err(crate::error::IngestError::Validation(format!(
+            "{context} expected int, found {other:?}"
+        ))),
+    }
+}
+
+/// Strictly extract an `f64` from an OTLP `AnyValue`.
+///
+/// Returns `Ok(None)` when absent. Accepts `DoubleValue`, widens an
+/// `IntValue` losslessly, or parses a `StringValue`. Any other variant, or an
+/// unparseable string, returns `Err(IngestError::Validation)` (D6).
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` if the value is present but is neither a
+/// number nor a string that parses as `f64`.
+pub(crate) fn extract_f64(value: Option<&AnyValue>, context: &'static str) -> crate::error::Result<Option<f64>> {
+    let Some(inner) = value.and_then(|a| a.value.as_ref()) else {
+        return Ok(None);
+    };
+    match inner {
+        Value::DoubleValue(d) => Ok(Some(*d)),
+        // `i64` -> `f64` widening is intentional and never wraps; large
+        // integers lose mantissa precision but that is acceptable for sampling
+        // parameters which are small.
+        #[allow(clippy::cast_precision_loss)]
+        Value::IntValue(i) => Ok(Some(*i as f64)),
+        Value::StringValue(s) => s
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| crate::error::IngestError::Validation(format!("{context} is not a valid f64: {s}"))),
+        other => Err(crate::error::IngestError::Validation(format!(
+            "{context} expected double, found {other:?}"
+        ))),
+    }
+}
+
+/// Strictly extract a `bool` from an OTLP `AnyValue`.
+///
+/// Returns `Ok(None)` when absent. Accepts only a `BoolValue`; a stringified
+/// `"true"` is rejected to keep parsing unambiguous (D6).
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` if the value is present but is not a bool.
+pub(crate) fn extract_bool(value: Option<&AnyValue>, context: &'static str) -> crate::error::Result<Option<bool>> {
+    let Some(inner) = value.and_then(|a| a.value.as_ref()) else {
+        return Ok(None);
+    };
+    match inner {
+        Value::BoolValue(b) => Ok(Some(*b)),
+        other => Err(crate::error::IngestError::Validation(format!(
+            "{context} expected bool, found {other:?}"
+        ))),
+    }
+}
+
+/// Strictly extract a `Vec<String>` from an OTLP `ArrayValue` of strings.
+///
+/// Returns `Ok(None)` when absent (so the caller stores a NULL list, not an
+/// empty list). Requires an `ArrayValue` whose every element is a
+/// `StringValue`; a scalar or any non-string element returns
+/// `Err(IngestError::Validation)` (D6).
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` if the value is present but is not an
+/// array of strings.
+pub(crate) fn extract_string_list(
+    value: Option<&AnyValue>,
+    context: &'static str,
+) -> crate::error::Result<Option<Vec<String>>> {
+    let Some(inner) = value.and_then(|a| a.value.as_ref()) else {
+        return Ok(None);
+    };
+    match inner {
+        Value::ArrayValue(arr) => {
+            let mut out = Vec::with_capacity(arr.values.len());
+            for item in &arr.values {
+                match item.value.as_ref() {
+                    Some(Value::StringValue(s)) => out.push(s.clone()),
+                    _ => {
+                        return Err(crate::error::IngestError::Validation(format!(
+                            "{context} array elements must be strings"
+                        )));
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        other => Err(crate::error::IngestError::Validation(format!(
+            "{context} expected array, found {other:?}"
+        ))),
+    }
+}
+
 /// Map field names matching the Iceberg `MAP<String,String>` Arrow layout.
 pub(crate) fn map_field_names() -> MapFieldNames {
     MapFieldNames {
@@ -760,5 +878,118 @@ mod tests {
 
         assert_eq!(map.get("http.method"), Some(&"POST".to_string()));
         assert_eq!(map.get("http.details.status"), Some(&"200".to_string()));
+    }
+
+    #[test]
+    fn extract_i64_parses_int_and_numeric_string() {
+        let int_val = AnyValue {
+            value: Some(Value::IntValue(42)),
+        };
+        assert_eq!(extract_i64(Some(&int_val), "ctx").expect("ok"), Some(42));
+
+        let str_val = AnyValue {
+            value: Some(Value::StringValue("128".to_string())),
+        };
+        assert_eq!(extract_i64(Some(&str_val), "ctx").expect("ok"), Some(128));
+
+        assert_eq!(extract_i64(None, "ctx").expect("ok"), None);
+    }
+
+    #[test]
+    fn extract_i64_rejects_non_numeric() {
+        let bad = AnyValue {
+            value: Some(Value::StringValue("hot".to_string())),
+        };
+        assert!(extract_i64(Some(&bad), "ctx").is_err());
+
+        let wrong_variant = AnyValue {
+            value: Some(Value::BoolValue(true)),
+        };
+        assert!(extract_i64(Some(&wrong_variant), "ctx").is_err());
+    }
+
+    #[test]
+    fn extract_f64_parses_double_int_and_string() {
+        let dbl = AnyValue {
+            value: Some(Value::DoubleValue(0.7)),
+        };
+        assert!((extract_f64(Some(&dbl), "ctx").expect("ok").expect("some") - 0.7).abs() < f64::EPSILON);
+
+        let int_val = AnyValue {
+            value: Some(Value::IntValue(2)),
+        };
+        assert!((extract_f64(Some(&int_val), "ctx").expect("ok").expect("some") - 2.0).abs() < f64::EPSILON);
+
+        let str_val = AnyValue {
+            value: Some(Value::StringValue("1.5".to_string())),
+        };
+        assert!((extract_f64(Some(&str_val), "ctx").expect("ok").expect("some") - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn extract_f64_rejects_non_numeric() {
+        let bad = AnyValue {
+            value: Some(Value::StringValue("hot".to_string())),
+        };
+        assert!(extract_f64(Some(&bad), "ctx").is_err());
+    }
+
+    #[test]
+    fn extract_bool_parses_bool_only() {
+        let b = AnyValue {
+            value: Some(Value::BoolValue(true)),
+        };
+        assert_eq!(extract_bool(Some(&b), "ctx").expect("ok"), Some(true));
+        assert_eq!(extract_bool(None, "ctx").expect("ok"), None);
+    }
+
+    #[test]
+    fn extract_bool_rejects_non_bool() {
+        let bad = AnyValue {
+            value: Some(Value::StringValue("true".to_string())),
+        };
+        assert!(extract_bool(Some(&bad), "ctx").is_err());
+    }
+
+    #[test]
+    fn extract_string_list_collects_strings() {
+        use opentelemetry_proto::tonic::common::v1::ArrayValue;
+
+        let arr = AnyValue {
+            value: Some(Value::ArrayValue(ArrayValue {
+                values: vec![
+                    AnyValue {
+                        value: Some(Value::StringValue("stop1".to_string())),
+                    },
+                    AnyValue {
+                        value: Some(Value::StringValue("stop2".to_string())),
+                    },
+                ],
+            })),
+        };
+        assert_eq!(
+            extract_string_list(Some(&arr), "ctx").expect("ok"),
+            Some(vec!["stop1".to_string(), "stop2".to_string()])
+        );
+        assert_eq!(extract_string_list(None, "ctx").expect("ok"), None);
+    }
+
+    #[test]
+    fn extract_string_list_rejects_non_array_and_non_string_elements() {
+        use opentelemetry_proto::tonic::common::v1::ArrayValue;
+
+        let not_array = AnyValue {
+            value: Some(Value::StringValue("single".to_string())),
+        };
+        assert!(extract_string_list(Some(&not_array), "ctx").is_err());
+
+        let mixed = AnyValue {
+            value: Some(Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(Value::IntValue(1)),
+                }],
+            })),
+        };
+        assert!(extract_string_list(Some(&mixed), "ctx").is_err());
     }
 }

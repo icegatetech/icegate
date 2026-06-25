@@ -7,7 +7,9 @@ mod sorter;
 pub(crate) mod test_utils;
 mod writer;
 
-pub(crate) use batch::{write_logs_batch_to_wal, write_metrics_batch_to_wal, write_traces_batch_to_wal};
+pub(crate) use batch::{
+    write_logs_batch_to_wal, write_metrics_batch_to_wal, write_operations_batch_to_wal, write_traces_batch_to_wal,
+};
 pub(crate) use boundary::compare_option_ord;
 pub(crate) use boundary::{
     RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue,
@@ -18,6 +20,7 @@ pub(crate) use metadata::deserialize_row_group_boundary_range;
 pub(crate) use metadata::serialize_row_group_boundary_range;
 pub(crate) use sorter::sort_logs;
 pub(crate) use sorter::sort_metrics;
+pub(crate) use sorter::sort_operations;
 pub(crate) use sorter::sort_spans;
 #[cfg(test)]
 pub(crate) use test_utils::logs_row_group_boundary_range_from_batch;

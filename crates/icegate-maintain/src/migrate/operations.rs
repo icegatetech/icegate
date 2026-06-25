@@ -4,11 +4,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use icegate_common::{
-    EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE,
+    EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE,
     schema::{
         events_partition_spec, events_schema, events_sort_order, logs_partition_spec, logs_schema, logs_sort_order,
-        metrics_partition_spec, metrics_schema, metrics_sort_order, spans_partition_spec, spans_schema,
-        spans_sort_order,
+        metrics_partition_spec, metrics_schema, metrics_sort_order, operations_partition_spec, operations_schema,
+        operations_sort_order, spans_partition_spec, spans_schema, spans_sort_order,
     },
 };
 
@@ -39,7 +39,7 @@ struct TableDefinition {
 
 /// Build table definitions from schema module
 fn build_table_definitions() -> Result<Vec<TableDefinition>> {
-    let mut definitions = Vec::with_capacity(4);
+    let mut definitions = Vec::with_capacity(5);
 
     // Logs table
     let logs = logs_schema()?;
@@ -85,6 +85,17 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         sort_order: metrics_sort,
     });
 
+    // Operations table (LLM/GenAI projection over spans — the 5th physical table).
+    let operations = operations_schema()?;
+    let operations_partition = operations_partition_spec(&operations)?;
+    let operations_sort = operations_sort_order(&operations)?;
+    definitions.push(TableDefinition {
+        name: OPERATIONS_TABLE,
+        schema: operations,
+        partition_spec: operations_partition,
+        sort_order: operations_sort,
+    });
+
     Ok(definitions)
 }
 
@@ -95,6 +106,7 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
 /// - spans: Distributed trace spans
 /// - events: Semantic events extracted from logs
 /// - metrics: All metric types (gauge, sum, histogram, summary)
+/// - operations: LLM/`GenAI` typed projection over spans
 ///
 /// Each table is created with appropriate partition specs and sort orders
 /// for optimal query performance.
@@ -426,6 +438,35 @@ mod tests {
         assert!(msg.contains("logs"));
         assert!(msg.contains("spans"));
         assert!(msg.contains("drop the tables manually"));
+    }
+
+    #[test]
+    fn build_table_definitions_includes_operations_table() {
+        let definitions = build_table_definitions().expect("build table definitions");
+        // Phase 5 adds the 5th physical table; all four prior tables plus
+        // operations must be present.
+        assert_eq!(definitions.len(), 5);
+
+        let names: Vec<&str> = definitions.iter().map(|def| def.name).collect();
+        assert!(names.contains(&LOGS_TABLE));
+        assert!(names.contains(&SPANS_TABLE));
+        assert!(names.contains(&EVENTS_TABLE));
+        assert!(names.contains(&METRICS_TABLE));
+        assert!(
+            names.contains(&OPERATIONS_TABLE),
+            "operations table must be registered for migrate create/upgrade"
+        );
+
+        // The operations definition must carry the schema_id(5) schema and the
+        // tenant_id + day(timestamp) partition spec so `migrate create` builds
+        // the table the shift planner expects.
+        let operations = definitions
+            .iter()
+            .find(|def| def.name == OPERATIONS_TABLE)
+            .expect("operations definition present");
+        assert_eq!(operations.schema.schema_id(), 5);
+        assert_eq!(operations.partition_spec.spec_id(), 5);
+        assert_eq!(operations.sort_order.order_id, 5);
     }
 
     #[test]
