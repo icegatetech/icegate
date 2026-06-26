@@ -35,18 +35,6 @@ pub(crate) fn boundary_component_timestamp_micros(
     }
 }
 
-pub(crate) fn boundary_component_fixed_bytes(
-    value: Option<Vec<u8>>,
-    descending: bool,
-    nulls_first: bool,
-) -> RowGroupBoundaryComponent {
-    RowGroupBoundaryComponent {
-        value: value.map(RowGroupBoundaryValue::FixedBytes),
-        descending,
-        nulls_first,
-    }
-}
-
 /// Build a [`RowGroupBoundaryRange`] from the first and last row of a sorted logs batch.
 ///
 /// # Errors
@@ -68,8 +56,13 @@ pub(crate) fn logs_row_group_boundary_range_from_batch(batch: &RecordBatch) -> R
         max_key,
     };
     range.validate().map_err(|err| match err {
-        IngestError::Shift(message) => IngestError::Shift(format!("invalid WAL row-group boundary range: {message}")),
-        other => other,
+        // `RowGroupBoundaryRange::validate` reports invalid ranges as
+        // `CommonError::Write`; preserve the original `IngestError::Shift`
+        // wrapping and message prefix for callers.
+        icegate_common::error::CommonError::Write(message) => {
+            IngestError::Shift(format!("invalid WAL row-group boundary range: {message}"))
+        }
+        other => other.into(),
     })?;
     Ok(range)
 }

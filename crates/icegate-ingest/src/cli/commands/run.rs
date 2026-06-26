@@ -13,9 +13,11 @@ use icegate_common::{
     IoHandle, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, MetricsRuntime, SPANS_TABLE, SPANS_TOPIC,
     catalog::CatalogBuilder,
     create_object_store,
-    parquet_encoding::{LOGS_COLUMN_ENCODINGS, METRICS_COLUMN_ENCODINGS, SPANS_COLUMN_ENCODINGS},
+    parquet_encoding::{
+        LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, METRICS_BLOOM_COLUMNS, METRICS_COLUMN_ENCODINGS,
+        SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
+    },
     run_metrics_server,
-    schema::{COL_SPAN_ID, COL_TRACE_ID},
 };
 use icegate_queue::{NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel};
 use object_store::ObjectStore;
@@ -34,16 +36,6 @@ use crate::{
     shift::{ShiftJobSpec, Shifter},
     wal::SortColumnsDescriptor,
 };
-
-/// Columns that should get a Parquet bloom filter on every shift write.
-///
-/// `trace_id` / `span_id` are queried with equality predicates by Tempo
-/// trace-by-id (spans) and the planned log-by-trace lookup (logs); a
-/// bloom filter on these high-cardinality columns lets the reader skip
-/// whole row groups in milliseconds. Both shift jobs use the same list
-/// today; if a future table needs a different policy, declare a
-/// dedicated constant alongside this one.
-const TRACE_LOOKUP_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
 
 struct ShiftRuntimeHandle {
     shutdown_tx: mpsc::Sender<()>,
@@ -406,14 +398,14 @@ async fn run_services(
         },
     );
     // Match the per-table bloom-filter policy used by the iceberg
-    // shift writer (see `TRACE_LOOKUP_BLOOM_COLUMNS` and
-    // `ShiftJobSpec::bloom_filter_columns`) so equality lookups on
+    // shift writer (see `parquet_encoding::{LOGS,SPANS}_BLOOM_COLUMNS`
+    // and `ShiftJobSpec::bloom_filter_columns`) so equality lookups on
     // `trace_id` / `span_id` skip row groups in fresh WAL data too —
     // the query engine reads from both WAL and Iceberg, and Tempo
     // trace-by-id / Loki LogQL `{trace_id="..."}` hit either.
     let wal_bloom_filter_columns = std::collections::HashMap::from([
-        (LOGS_TOPIC.to_string(), TRACE_LOOKUP_BLOOM_COLUMNS),
-        (SPANS_TOPIC.to_string(), TRACE_LOOKUP_BLOOM_COLUMNS),
+        (LOGS_TOPIC.to_string(), LOGS_BLOOM_COLUMNS),
+        (SPANS_TOPIC.to_string(), SPANS_BLOOM_COLUMNS),
     ]);
     let wal_column_encodings = std::collections::HashMap::from([
         (LOGS_TOPIC.to_string(), LOGS_COLUMN_ENCODINGS),
@@ -472,7 +464,7 @@ async fn run_services(
             table: LOGS_TABLE,
             descriptor: SortColumnsDescriptor::logs()?,
             planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
-            bloom_filter_columns: TRACE_LOOKUP_BLOOM_COLUMNS,
+            bloom_filter_columns: LOGS_BLOOM_COLUMNS,
             column_encodings: LOGS_COLUMN_ENCODINGS,
         },
         ShiftJobSpec {
@@ -481,7 +473,7 @@ async fn run_services(
             table: SPANS_TABLE,
             descriptor: SortColumnsDescriptor::spans()?,
             planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
-            bloom_filter_columns: TRACE_LOOKUP_BLOOM_COLUMNS,
+            bloom_filter_columns: SPANS_BLOOM_COLUMNS,
             column_encodings: SPANS_COLUMN_ENCODINGS,
         },
         ShiftJobSpec {
@@ -490,7 +482,7 @@ async fn run_services(
             table: METRICS_TABLE,
             descriptor: SortColumnsDescriptor::metrics()?,
             planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
-            bloom_filter_columns: &[],
+            bloom_filter_columns: METRICS_BLOOM_COLUMNS,
             column_encodings: METRICS_COLUMN_ENCODINGS,
         },
     ];

@@ -24,7 +24,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::union::UnionExec;
 use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
-use icegate_common::WAL_OFFSET_PROPERTY;
+use icegate_common::resolve_wal_offset;
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
@@ -319,63 +319,29 @@ impl IcegateTableProvider {
 
 /// Extract the WAL boundary offset from Iceberg snapshot history.
 ///
-/// Walks the snapshot parent chain looking for the `icegate.queue.offset`
-/// property. The property may be absent from the current snapshot because
-/// compaction creates snapshots without it.
+/// Delegates to [`resolve_wal_offset`], which walks the snapshot parent chain
+/// looking for the `icegate.queue.offset` property. The property may be absent
+/// from the current snapshot because compaction creates `replace` snapshots
+/// without it, so the walk skips past them to the Shifter commit that recorded
+/// it. The Shifter resolves the offset through the SAME helper, keeping the
+/// WAL/Iceberg boundary identical on both the read and write sides.
 ///
 /// # Returns
 ///
 /// * `Ok(Some(offset))` — found the WAL boundary offset
-/// * `Ok(None)` — no snapshots exist (fresh system: read all WAL segments)
+/// * `Ok(None)` — the table has NO current snapshot (a freshly created table
+///   never shifted to): read all WAL segments from offset 0. This is the ONLY
+///   `Ok(None)` case — a table that has snapshots but no recorded offset does
+///   NOT fall through to `None`; it errors via the gate below.
 ///
 /// # Errors
 ///
-/// Returns `DataFusionError` if the snapshot walk limit is reached without
-/// finding the offset, which would cause offset=0 and data duplication.
+/// Returns `DataFusionError` when the table HAS snapshots but the offset cannot
+/// be resolved — found nowhere in the reachable chain, a malformed value, a
+/// missing parent snapshot, a cyclic chain, or the walk depth cap. Reading all
+/// WAL segments in those cases (offset=0) would duplicate every committed row in
+/// query results, so the scan fails loudly instead.
 #[tracing::instrument(level = "debug", skip(table))]
 fn extract_wal_offset(table: &Table) -> DFResult<Option<u64>> {
-    /// Safety cap to prevent unbounded snapshot chain walks (e.g. a cycle or
-    /// an unexpectedly deep history).
-    const MAX_SNAPSHOT_WALK: u32 = 1000;
-
-    let metadata = table.metadata();
-    let Some(mut snapshot) = metadata.current_snapshot() else {
-        return Ok(None);
-    };
-    let mut walked = 0u32;
-    loop {
-        if let Some(raw_value) = snapshot.summary().additional_properties.get(WAL_OFFSET_PROPERTY) {
-            let offset: u64 = raw_value.parse().map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Malformed {WAL_OFFSET_PROPERTY} value {raw_value:?} in snapshot {}: {e}",
-                    snapshot.snapshot_id(),
-                ))
-            })?;
-            tracing::debug!(
-                snapshots_walked = walked,
-                offset,
-                "Found WAL offset in snapshot history"
-            );
-            return Ok(Some(offset));
-        }
-        walked += 1;
-        if walked >= MAX_SNAPSHOT_WALK {
-            return Err(DataFusionError::Execution(format!(
-                "Snapshot walk limit ({MAX_SNAPSHOT_WALK}) reached without finding WAL offset; \
-                 cannot determine safe boundary — aborting to prevent data duplication"
-            )));
-        }
-        // Walk to parent snapshot; None means the chain ended without the property
-        let Some(parent_id) = snapshot.parent_snapshot_id() else {
-            return Ok(None);
-        };
-        let Some(parent) = metadata.snapshot_by_id(parent_id) else {
-            return Err(DataFusionError::Execution(format!(
-                "Iceberg metadata inconsistency: snapshot {} references parent snapshot {parent_id} \
-                 which does not exist in table metadata",
-                snapshot.snapshot_id(),
-            )));
-        };
-        snapshot = parent;
-    }
+    resolve_wal_offset(table.metadata()).map_err(|e| DataFusionError::Execution(e.to_string()))
 }

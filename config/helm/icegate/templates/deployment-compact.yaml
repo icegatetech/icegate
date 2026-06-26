@@ -1,0 +1,96 @@
+{{- if .Values.compact.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "compact") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "compact") | nindent 4 }}
+spec:
+  replicas: {{ .Values.compact.replicaCount }}
+  # Compaction is distributed, not singleton: the jobmanager coordinates PLAN and
+  # REWRITE tasks through shared S3 job-state using ETag compare-and-swap, and
+  # every replace commit uses optimistic concurrency (a rewrite whose input was
+  # already taken by a sibling aborts cleanly and the next scan re-plans). So
+  # replicas can run in parallel and overlap freely during a rolling update —
+  # the default RollingUpdate strategy is safe; no Recreate is needed.
+  selector:
+    matchLabels:
+      {{- include "icegate.selectorLabels" (dict "context" . "component" "compact") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-compact.yaml") . | sha256sum }}
+      labels:
+        {{- include "icegate.componentLabels" (dict "context" . "component" "compact") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icegate.serviceAccountName" . }}
+      securityContext:
+        {{- include "icegate.podSecurityContext" . | nindent 8 }}
+      {{- include "icegate.waitForDeps" (dict "context" . "config" .Values.compact.waitForDependencies) | nindent 6 }}
+      containers:
+        - name: compact
+          image: {{ include "icegate.image" (dict "image" .Values.compact.image "tag" .Chart.AppVersion) }}
+          imagePullPolicy: {{ .Values.compact.image.pullPolicy }}
+          command:
+            - /usr/local/bin/entrypoint
+            - run
+            - --config
+            - /etc/icegate/maintain.yaml
+          securityContext:
+            {{- include "icegate.containerSecurityContext" . | nindent 12 }}
+          {{- if .Values.compact.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.compact.metrics.port }}
+              protocol: TCP
+          {{- end }}
+          env:
+            {{- include "icegate.awsEnv" . | nindent 12 }}
+            - name: RUST_LOG
+              value: {{ .Values.compact.rustLog | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: icegate-maintain
+            # The `maintain run` service always initialises tracing and refuses to
+            # start without an OTLP endpoint (it carries no tracing config block),
+            # so this env var is required whenever compaction is enabled.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ required "compact.tracing.otlpEndpoint is required when compact.enabled is true: the maintain run service refuses to start without an OTLP endpoint" .Values.compact.tracing.otlpEndpoint | quote }}
+            {{- with .Values.compact.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.compact.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.compact.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/icegate
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "icegate.componentName" (dict "context" . "component" "compact") }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.compact.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.compact.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.compact.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -56,7 +56,7 @@ The tables use the following Parquet optimizations:
 
 **Sorting Strategy (table-specific):**
 - **Logs/Events:** `service_name` + `timestamp DESC` - Groups by service, recent-first
-- **Spans:** `service_name` + `trace_id` + `timestamp DESC` - Groups by service and trace, recent-first
+- **Spans:** `trace_id` + `timestamp DESC` - Groups by trace, recent-first
 - **Metrics:** `metric_name` + `service_name` + `service_instance_id` + `timestamp DESC` - Groups by metric, service, and service instance, recent-first
 
 ---
@@ -175,7 +175,7 @@ CREATE TABLE iceberg.triplecloud.spans (
 WITH (
     format = 'PARQUET',
     partitioning = ARRAY['tenant_id', 'day(timestamp)'],
-    sorted_by = ARRAY['service_name', 'trace_id', 'timestamp DESC'],  -- Recent-first within service and trace
+    sorted_by = ARRAY['trace_id', 'timestamp DESC'],  -- Recent-first within service and trace
     compression_codec = 'ZSTD',
     format_version = 2
 );
@@ -481,12 +481,11 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 **Version:** 1.3
 **Last Updated:** 2026-05-12
 **Schema Source:** `src/common/schema.rs`
-
 **Notable Changes in v1.3:**
 - Removed `cloud_account_id` column from logs, spans, events, and metrics tables.
 - Updated sort orders to drop the leading `cloud_account_id`:
   - Logs/Events: `service_name` → `timestamp DESC`
-  - Spans: `service_name` → `trace_id` → `timestamp DESC`
+  - Spans: `trace_id` → `timestamp DESC` (also drops `service_name` from the sort)
   - Metrics: `metric_name` → `service_name` → `service_instance_id` → `timestamp DESC`
 - Top-level field IDs shifted down by one to fill the slot freed by `cloud_account_id`; nested-type IDs (maps, lists, struct children) shift accordingly with no gaps.
 - `cloud.account.id` resource attribute now lives in the generic attributes MAP only.

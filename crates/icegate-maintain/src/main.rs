@@ -6,18 +6,29 @@
 
 use clap::Parser;
 use icegate_common::{TracingConfig, init_tracing};
-use icegate_maintain::cli::Cli;
+use icegate_maintain::cli::{Cli, Commands};
+
+// Use jemalloc on Linux for the long-running `run` compaction service: glibc's
+// default malloc fragments its per-thread arenas across repeated rewrite cycles
+// and rarely returns memory to the OS, producing the staircase RSS growth seen
+// in the container. jemalloc reclaims aggressively via background threads.
+// Mirrors the ingest and query binaries.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing via the shared initializer (JSON format, no OTEL export)
+    // Parse CLI arguments first so tracing can be gated on the subcommand.
+    let cli = Cli::parse();
+
+    // The one-shot `migrate` commands keep tracing disabled (they report via
+    // their own stdout/stderr output), while the long-running `run` service
+    // must enable tracing so its spans and logs are emitted.
     let _guard = init_tracing(&TracingConfig {
-        enabled: false,
+        enabled: matches!(cli.command, Commands::Run { .. }),
         ..TracingConfig::default()
     })?;
-
-    // Parse CLI arguments
-    let cli = Cli::parse();
 
     // Execute command
     if let Err(e) = cli.execute().await {

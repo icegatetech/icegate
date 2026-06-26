@@ -171,4 +171,73 @@ mod tests {
             "dictionary encoding leaked through despite set_column_dictionary_enabled(false): {encodings:?}"
         );
     }
+
+    /// A `FixedSizeBinary(16)` `trace_id` written with the full production policy
+    /// (`DELTA_BYTE_ARRAY` encoding + bloom filter) must emit EXACT min/max
+    /// statistics.
+    ///
+    /// This is the property the compaction pipeline depends on: iceberg-rust's
+    /// `MinMaxColAggregator` records a column's manifest lower/upper bound ONLY
+    /// when the parquet statistic reports `*_is_exact()`. A missing `trace_id`
+    /// bound makes a data file's sort-key envelope start with a null component,
+    /// which both isolates the file during overlap clustering (single-file
+    /// rewrites) and breaks query pruning on `trace_id`. `trace_id` is 16 bytes —
+    /// far below parquet's 64-byte default statistics-truncation length — so its
+    /// statistic is stored verbatim and stays exact; this test pins that so a
+    /// future encoding/statistics change can't silently drop the bound. (Older
+    /// data files that predate this policy may still lack the bound; the
+    /// compaction invariant tolerates that, see `icegate-maintain`'s
+    /// `first_envelope_conflict`.)
+    #[test]
+    fn build_writer_properties_emits_exact_statistics_for_fixed16_trace_id() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "trace_id",
+            DataType::FixedSizeBinary(16),
+            false,
+        )]));
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(4, 16);
+        for i in 0u8..4 {
+            let mut bytes = [0u8; 16];
+            // Vary the leading bytes so min and max are distinct, non-trivial
+            // 16-byte values (mirroring real trace ids).
+            bytes[0] = i.wrapping_mul(40);
+            bytes[15] = i;
+            builder.append_value(bytes).expect("append 16-byte value");
+        }
+        let array: ArrayRef = Arc::new(builder.finish());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).expect("record batch");
+
+        // Exactly the production spans policy for trace_id: bloom filter + the
+        // DELTA_BYTE_ARRAY encoding override.
+        let props = build_writer_properties(
+            /* row_group_size */ 16,
+            /* data_page_size_limit_bytes */ 1 << 20,
+            /* bloom_filter_columns */ &["trace_id"],
+            /* column_encodings */ &[("trace_id", Encoding::DELTA_BYTE_ARRAY)],
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).expect("ArrowWriter");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+
+        let file_reader = SerializedFileReader::new(Bytes::from(buf)).expect("file reader");
+        let row_group = file_reader.get_row_group(0).expect("row group 0");
+        let statistics = row_group
+            .metadata()
+            .column(0)
+            .statistics()
+            .expect("trace_id column must carry statistics");
+
+        // EXACT min and max are what make iceberg-rust record the manifest bound.
+        assert!(
+            statistics.min_is_exact(),
+            "trace_id min statistic must be exact so the manifest lower bound is recorded"
+        );
+        assert!(
+            statistics.max_is_exact(),
+            "trace_id max statistic must be exact so the manifest upper bound is recorded"
+        );
+    }
 }

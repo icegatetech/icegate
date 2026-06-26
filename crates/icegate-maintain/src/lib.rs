@@ -5,6 +5,8 @@ pub mod error;
 
 /// CLI for maintain binary.
 pub mod cli;
+/// Parquet compaction operations.
+pub mod compact;
 /// Configuration for maintain binary.
 pub mod config;
 /// Schema migration operations.
