@@ -177,16 +177,33 @@ impl PlanExecutor {
     /// If the table has no current snapshot (freshly created, never committed
     /// to) or the planner finds no work, the task completes with no REWRITE
     /// tasks submitted.
-    async fn run(&self, task: &dyn ImmutableTask, manager: &dyn JobManager) -> std::result::Result<(), JobError> {
+    async fn run(
+        &self,
+        task: &dyn ImmutableTask,
+        manager: &dyn JobManager,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(), JobError> {
         let span = info_span!("compact_plan", table = self.spec.table);
-        self.run_plan(task, manager).instrument(span).await
+        self.run_plan(task, manager, cancel).instrument(span).await
     }
 
     /// The instrumented body of [`Self::run`], split out so the `compact_plan`
     /// span wraps the whole async future (an [`tracing::Span::entered`] guard
     /// cannot be held across the `.await` points without making the future
     /// `!Send`).
-    async fn run_plan(&self, task: &dyn ImmutableTask, manager: &dyn JobManager) -> std::result::Result<(), JobError> {
+    ///
+    /// `cancel` is checked before each potentially slow step (table load, data
+    /// file enumeration) and before fanning out each REWRITE task, so a shutdown
+    /// stops the PLAN promptly. A cancelled PLAN returns an error rather than
+    /// completing, leaving the immutable PLAN task to be re-run on the next
+    /// discovery cycle — planning is idempotent, so re-enumerating is safe.
+    async fn run_plan(
+        &self,
+        task: &dyn ImmutableTask,
+        manager: &dyn JobManager,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(), JobError> {
+        cancelled_if_set(cancel)?;
         let table_ident = icegate_table_ident(self.spec.table);
         let table = self
             .catalog
@@ -205,6 +222,7 @@ impl PlanExecutor {
             return manager.complete_task(task.id(), Vec::new());
         }
 
+        cancelled_if_set(cancel)?;
         let stats = list_data_files_with_stats(&table, self.spec.descriptor)
             .await
             .map_err(|e| JobError::TaskExecution(format!("failed to enumerate data files: {e}")))?;
@@ -221,6 +239,10 @@ impl PlanExecutor {
         );
 
         for group in outcome.groups {
+            // Stop fanning out promptly on shutdown. Tasks already submitted stay
+            // queued; the immutable PLAN task re-runs next cycle and re-derives the
+            // remaining groups.
+            cancelled_if_set(cancel)?;
             // Every file in a planner group shares a partition key; an empty
             // group never occurs (`plan_rewrite_groups` only emits non-empty
             // groups), but guard defensively rather than index blindly.
@@ -242,6 +264,13 @@ impl PlanExecutor {
             };
             let payload = serde_json::to_vec(&rewrite_input)
                 .map_err(|e| JobError::TaskExecution(format!("failed to serialize rewrite input: {e}")))?;
+            // TODO(med): the serialized payload embeds every input file path, so a
+            // group with very many files can exceed the jobmanager's per-task
+            // `max_input_bytes` and fail `add_task` (failing the whole PLAN task).
+            // The byte-budget bin-packer bounds a group's summed *bytes*, not its
+            // file *count*, so a partition of many tiny files can still produce a
+            // large path list. Cap files-per-group (or chunk the payload) so a
+            // pathological partition degrades gracefully instead of erroring.
             let rewrite_task =
                 TaskDefinition::new(TaskCode::new(COMPACT_REWRITE_TASK_CODE), payload, self.rewrite_timeout)?;
             manager.add_task(rewrite_task)?;
@@ -374,19 +403,16 @@ impl Compactor {
         config: &CompactionConfig,
         max_iterations: Option<u64>,
     ) -> Result<Self> {
+        // Validate every tunable (and the job-state storage) up front. Each field
+        // is `#[serde(default)]`, so a malformed config loads with zeros that
+        // would otherwise silently disable compaction (e.g. a zero
+        // `max_group_input_bytes` drops every group, or a zero `max_merge_size_ratio`
+        // relies on the planner's defensive clamp) instead of erroring here.
+        config.validate()?;
         let specs = enabled_specs(config)?;
         if specs.is_empty() {
             return Err(MaintainError::Config(
                 "no compaction tables enabled: at least one of logs/spans/events/metrics must be enabled".to_string(),
-            ));
-        }
-        config.jobs_storage.validate()?;
-        // A size-merge ratio of 0 is meaningless (no file can be `>= 0`x the
-        // largest), so reject it at startup rather than silently relying on the
-        // planner's defensive clamp.
-        if config.max_merge_size_ratio == 0 {
-            return Err(MaintainError::Config(
-                "max_merge_size_ratio must be greater than or equal to 1".to_string(),
             ));
         }
 
@@ -455,7 +481,7 @@ impl Compactor {
         let registry_dyn: Arc<dyn JobDefinitionRegistry> = job_registry.clone();
         let s3_storage = Arc::new(
             S3Storage::new(
-                config.jobs_storage.to_s3_storage_config()?,
+                config.jobsmanager.storage.to_s3_storage_config()?,
                 registry_dyn,
                 metrics.clone(),
             )
@@ -465,9 +491,9 @@ impl Compactor {
         let cached_storage = Arc::new(CachedStorage::new(s3_storage, metrics.clone()));
 
         let manager_config = JobsManagerConfig {
-            worker_count: config.worker_count,
+            worker_count: config.jobsmanager.worker_count,
             worker_config: WorkerConfig {
-                poll_interval: std::time::Duration::from_millis(config.poll_interval_ms),
+                poll_interval: std::time::Duration::from_millis(config.jobsmanager.poll_interval_ms),
                 ..Default::default()
             },
         };
@@ -505,9 +531,9 @@ impl CompactorHandle {
 /// the closure clones the `Arc<PlanExecutor>` and reads the task input via the
 /// [`ImmutableTask`] trait, exactly like ingest's shift executor.
 fn plan_executor_fn(plan_executor: Arc<PlanExecutor>) -> TaskExecutorFn {
-    Arc::new(move |task, manager, _cancel| {
+    Arc::new(move |task, manager, cancel| {
         let plan_executor = Arc::clone(&plan_executor);
-        Box::pin(async move { plan_executor.run(task.as_ref(), manager).await })
+        Box::pin(async move { plan_executor.run(task.as_ref(), manager, &cancel).await })
     })
 }
 
@@ -529,7 +555,10 @@ fn rewrite_executor_fn(rewrite_executor: Arc<RewriteTaskExecutor>) -> TaskExecut
 /// Returns [`MaintainError::Config`] if the configured interval is zero or
 /// overflows an `i64` number of seconds.
 fn scan_interval(config: &CompactionConfig) -> Result<ChronoDuration> {
-    positive_duration(config.scan_interval_secs, "compaction.scan_interval_secs")
+    positive_duration(
+        config.jobsmanager.scan_interval_secs,
+        "compaction.jobsmanager.scan_interval_secs",
+    )
 }
 
 /// Convert the compaction `rewrite_timeout_secs` into a positive
@@ -563,4 +592,17 @@ fn positive_duration(secs: u64, field: &str) -> Result<ChronoDuration> {
 /// their own error wrapper.
 fn map_job_error<E: std::fmt::Display>(error: E) -> MaintainError {
     MaintainError::Config(error.to_string())
+}
+
+/// Return a task error if `cancel` has been triggered, so a PLAN task stops at
+/// the next checkpoint on shutdown.
+///
+/// The jobmanager has no cancellation-specific outcome, so a cancelled task
+/// surfaces as a [`JobError::TaskExecution`] (the same channel the REWRITE path
+/// uses); the immutable PLAN task is simply re-run on the next discovery cycle.
+fn cancelled_if_set(cancel: &CancellationToken) -> std::result::Result<(), JobError> {
+    if cancel.is_cancelled() {
+        return Err(JobError::TaskExecution("compaction plan cancelled".to_string()));
+    }
+    Ok(())
 }

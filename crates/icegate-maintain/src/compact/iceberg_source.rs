@@ -33,7 +33,7 @@ use iceberg::io::FileIO;
 use icegate_common::Error;
 use icegate_common::error::Result;
 use icegate_common::iceberg_write::CommonRecordBatchStream;
-use icegate_common::merge::{MergeInput, MergeSource};
+use icegate_common::merge::{MergeInput, MergePosition, MergeSource};
 use icegate_common::parquet_source::open_arrow_file_reader;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use tokio_util::sync::CancellationToken;
@@ -52,7 +52,7 @@ pub struct IcebergMergeSource {
     file_io: FileIO,
     /// Map from a merge input's opaque `position` to the data-file path the
     /// rewrite task assigned it, in sorted input order.
-    paths_by_position: HashMap<u128, String>,
+    paths_by_position: HashMap<MergePosition, String>,
 }
 
 impl IcebergMergeSource {
@@ -63,7 +63,7 @@ impl IcebergMergeSource {
     /// alongside the [`MergeInput`]s it hands to the merger); an `open` call for
     /// an absent position fails with [`Error::CompactRead`].
     #[must_use]
-    pub const fn new(file_io: FileIO, paths_by_position: HashMap<u128, String>) -> Self {
+    pub const fn new(file_io: FileIO, paths_by_position: HashMap<MergePosition, String>) -> Self {
         Self {
             file_io,
             paths_by_position,
@@ -77,7 +77,7 @@ impl IcebergMergeSource {
     /// Returns [`Error::CompactRead`] if the position is not present in the map,
     /// which indicates the rewrite task built the [`MergeInput`]s and the
     /// position→path map inconsistently.
-    fn path_for(&self, position: u128) -> Result<&str> {
+    fn path_for(&self, position: MergePosition) -> Result<&str> {
         self.paths_by_position.get(&position).map(String::as_str).ok_or_else(|| {
             Error::CompactRead(format!(
                 "no data-file path registered for merge input position {position}"
@@ -160,7 +160,7 @@ mod tests {
     use icegate_common::merge::sort_key::{
         RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue,
     };
-    use icegate_common::merge::{MergeInput, MergeSource};
+    use icegate_common::merge::{MergeInput, MergePosition, MergeSource};
     use tokio_util::sync::CancellationToken;
 
     use super::IcebergMergeSource;
@@ -182,7 +182,7 @@ mod tests {
     }
 
     fn merge_input(position: u128) -> MergeInput {
-        MergeInput::new(position, 1, dummy_boundary_range())
+        MergeInput::new(MergePosition::new(position), 1, dummy_boundary_range())
     }
 
     #[tokio::test]
@@ -206,7 +206,7 @@ mod tests {
         // it short-circuits with a compaction read error.
         let file_io = FileIO::new_with_memory();
         let mut paths = HashMap::new();
-        paths.insert(0u128, "memory://does-not-matter.parquet".to_string());
+        paths.insert(MergePosition::new(0), "memory://does-not-matter.parquet".to_string());
         let source = IcebergMergeSource::new(file_io, paths);
 
         let cancel = CancellationToken::new();
@@ -226,7 +226,7 @@ mod tests {
         let file_io = FileIO::new_with_memory();
         let mut paths = HashMap::new();
         paths.insert(
-            0u128,
+            MergePosition::new(0),
             "memory://nonexistent/icegate-compact-missing.parquet".to_string(),
         );
         let source = IcebergMergeSource::new(file_io, paths);

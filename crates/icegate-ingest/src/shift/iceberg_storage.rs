@@ -176,12 +176,13 @@ impl IcebergStorage {
             column_encodings: self.column_encodings,
         };
 
-        // Bridge the stream's error type: ingest yields `IngestError`, the
-        // common pipeline wants `icegate_common::Error`. The orphan rule and
-        // dependency direction forbid a `From<IngestError> for
-        // icegate_common::Error` impl, so map explicitly at the call site.
-        // TODO: Task 1.6 makes the merger natively yield `icegate_common::Error`,
-        // dropping this bridge.
+        // Bridge the stream's error type: this method accepts an `IngestError`
+        // stream (the production shift path deliberately reclassifies the shared
+        // merger's `icegate_common::Error` back to `IngestError` for typed
+        // Cancelled/queue-read accounting before calling here), while the common
+        // pipeline wants `icegate_common::Error`. The orphan rule and dependency
+        // direction forbid a `From<IngestError> for icegate_common::Error` impl,
+        // so map explicitly at the call site.
         let common_stream = batches.map_err(|e| icegate_common::Error::Write(e.to_string())).boxed();
 
         // `?` converts the returned `icegate_common::Error` into `IngestError`

@@ -43,7 +43,7 @@ use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
 use icegate_common::catalog::IoHandle;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::{SortColumnCache, SortColumnsDescriptor};
-use icegate_common::merge::{MergeInput, RowGroupsMerger, SortedBatchMergerConfig};
+use icegate_common::merge::{MergeInput, MergePosition, RowGroupsMerger, SortedBatchMergerConfig};
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
 use icegate_common::testing::{MinIOContainer, create_s3_bucket};
 use icegate_maintain::compact::iceberg_source::IcebergMergeSource;
@@ -294,10 +294,10 @@ async fn iceberg_merge_source_interleaves_two_overlapping_sorted_files() {
     // Assign positions in sorted-by-min_key order (the rewrite task's contract).
     stats.sort_by(|a, b| a.min_key().compare(b.min_key()));
 
-    let mut paths_by_position: HashMap<u128, String> = HashMap::new();
+    let mut paths_by_position: HashMap<MergePosition, String> = HashMap::new();
     let mut inputs: Vec<MergeInput> = Vec::with_capacity(stats.len());
     for (position, stat) in stats.iter().enumerate() {
-        let position = position as u128;
+        let position = MergePosition::new(position as u128);
         paths_by_position.insert(position, stat.data_file.file_path().to_string());
         inputs.push(MergeInput::new(
             position,

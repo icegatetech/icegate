@@ -90,27 +90,27 @@ impl JobsStorageConfig {
     pub fn validate(&self) -> Result<(), MaintainError> {
         if self.endpoint.trim().is_empty() {
             return Err(MaintainError::Config(
-                "compaction.jobs_storage.endpoint cannot be empty".to_string(),
+                "compaction.jobsmanager.storage.endpoint cannot be empty".to_string(),
             ));
         }
         if self.bucket.trim().is_empty() {
             return Err(MaintainError::Config(
-                "compaction.jobs_storage.bucket cannot be empty".to_string(),
+                "compaction.jobsmanager.storage.bucket cannot be empty".to_string(),
             ));
         }
         if self.prefix.trim().is_empty() {
             return Err(MaintainError::Config(
-                "compaction.jobs_storage.prefix cannot be empty".to_string(),
+                "compaction.jobsmanager.storage.prefix cannot be empty".to_string(),
             ));
         }
         if self.region.trim().is_empty() {
             return Err(MaintainError::Config(
-                "compaction.jobs_storage.region cannot be empty".to_string(),
+                "compaction.jobsmanager.storage.region cannot be empty".to_string(),
             ));
         }
         if self.request_timeout_secs == 0 {
             return Err(MaintainError::Config(
-                "compaction.jobs_storage.request_timeout_secs must be greater than zero".to_string(),
+                "compaction.jobsmanager.storage.request_timeout_secs must be greater than zero".to_string(),
             ));
         }
         Ok(())
@@ -147,7 +147,7 @@ impl JobsStorageConfig {
         Self::resolve_credential(
             self.access_key_id.as_deref(),
             "AWS_ACCESS_KEY_ID",
-            "compaction.jobs_storage.access_key_id",
+            "compaction.jobsmanager.storage.access_key_id",
         )
     }
 
@@ -155,7 +155,7 @@ impl JobsStorageConfig {
         Self::resolve_credential(
             self.secret_access_key.as_deref(),
             "AWS_SECRET_ACCESS_KEY",
-            "compaction.jobs_storage.secret_access_key",
+            "compaction.jobsmanager.storage.secret_access_key",
         )
     }
 
@@ -191,6 +191,64 @@ fn default_worker_count() -> usize {
     std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get().div_ceil(2))
 }
 
+/// Jobs-manager settings for the compaction service.
+///
+/// Mirrors ingest's `shift::config::ShiftJobsManagerConfig` so both background
+/// loops expose operators the same
+/// `jobsmanager.{worker_count, poll_interval_ms, scan_interval_secs, storage}`
+/// shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionJobsManagerConfig {
+    /// Number of concurrent rewrite tasks (jobmanager `JobsManagerConfig.worker_count`).
+    pub worker_count: usize,
+    /// Jobmanager worker poll interval, in milliseconds.
+    pub poll_interval_ms: u64,
+    /// Period of the discovery loop, in seconds (maps to the jobmanager
+    /// iteration interval).
+    pub scan_interval_secs: u64,
+    /// Jobs-state storage (S3), the same shape ingest's shift uses.
+    pub storage: JobsStorageConfig,
+}
+
+impl Default for CompactionJobsManagerConfig {
+    fn default() -> Self {
+        Self {
+            worker_count: default_worker_count(),
+            poll_interval_ms: 1_000,
+            scan_interval_secs: 300,
+            storage: JobsStorageConfig::default(),
+        }
+    }
+}
+
+impl CompactionJobsManagerConfig {
+    /// Validate the jobs-manager tunables and the job-state storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintainError::Config`] if a tunable is zero or the
+    /// [`JobsStorageConfig`] is invalid.
+    pub fn validate(&self) -> Result<(), MaintainError> {
+        if self.worker_count == 0 {
+            return Err(MaintainError::Config(
+                "compaction.jobsmanager.worker_count must be greater than zero".to_string(),
+            ));
+        }
+        if self.poll_interval_ms == 0 {
+            return Err(MaintainError::Config(
+                "compaction.jobsmanager.poll_interval_ms must be greater than zero".to_string(),
+            ));
+        }
+        if self.scan_interval_secs == 0 {
+            return Err(MaintainError::Config(
+                "compaction.jobsmanager.scan_interval_secs must be greater than zero".to_string(),
+            ));
+        }
+        self.storage.validate()
+    }
+}
+
 /// Configuration for the Parquet compaction process.
 ///
 /// Controls how small Parquet data files in Iceberg tables are discovered,
@@ -222,22 +280,15 @@ pub struct CompactionConfig {
     /// file is at or above [`Self::target_file_size_bytes`]. Must be at least 1;
     /// a value of 0 is rejected when the compactor is constructed.
     pub max_merge_size_ratio: u64,
-    /// Period of the discovery loop, in seconds (maps to the jobmanager
-    /// iteration interval).
-    pub scan_interval_secs: u64,
     /// Deadline for a single REWRITE task (merge + encode + commit), in seconds.
     ///
-    /// Kept separate from [`Self::scan_interval_secs`] so a rewrite that
-    /// legitimately runs longer than the discovery period is not declared
-    /// expired — which would let another worker pick it up and duplicate the
-    /// in-flight rewrite. Size it to a worst-case group: reading
+    /// Kept separate from [`CompactionJobsManagerConfig::scan_interval_secs`] so a
+    /// rewrite that legitimately runs longer than the discovery period is not
+    /// declared expired — which would let another worker pick it up and duplicate
+    /// the in-flight rewrite. Size it to a worst-case group: reading
     /// `max_group_input_bytes` of Parquet, k-way-merging, re-encoding, and
     /// committing.
     pub rewrite_timeout_secs: u64,
-    /// Number of concurrent rewrite tasks (jobmanager `JobsManagerConfig.worker_count`).
-    pub worker_count: usize,
-    /// Jobmanager worker poll interval, in milliseconds.
-    pub poll_interval_ms: u64,
     /// Parquet row group size, in rows.
     pub row_group_size: usize,
     /// Maximum Parquet data page size, in bytes.
@@ -250,8 +301,9 @@ pub struct CompactionConfig {
     pub events_enabled: bool,
     /// Whether compaction is enabled for the `metrics` table.
     pub metrics_enabled: bool,
-    /// Jobs-state storage (S3), the same shape ingest's shift uses.
-    pub jobs_storage: JobsStorageConfig,
+    /// Jobs-manager settings (worker pool, discovery interval, job-state storage),
+    /// nested to mirror ingest's `shift.jobsmanager`.
+    pub jobsmanager: CompactionJobsManagerConfig,
 }
 
 impl Default for CompactionConfig {
@@ -262,18 +314,70 @@ impl Default for CompactionConfig {
             min_input_files: 4,
             max_skippable_tail_files: 0,
             max_merge_size_ratio: 2,
-            scan_interval_secs: 300,
             rewrite_timeout_secs: 3_600,
-            worker_count: default_worker_count(),
-            poll_interval_ms: 1_000,
             row_group_size: 20_000,
             data_page_size_limit_bytes: 2 * 1024 * 1024,
             logs_enabled: true,
             spans_enabled: true,
             events_enabled: true,
             metrics_enabled: true,
-            jobs_storage: JobsStorageConfig::default(),
+            jobsmanager: CompactionJobsManagerConfig::default(),
         }
+    }
+}
+
+impl CompactionConfig {
+    /// Validate the compaction tunables and the job-state storage config.
+    ///
+    /// Every field is `#[serde(default)]`, so a malformed config file loads
+    /// silently with zeros in places that make the planner degenerate rather
+    /// than erroring. This catches those up front. For example a
+    /// `max_group_input_bytes` of 0 makes [`crate::compact::planner`] place every
+    /// file in its own single-file group, all of which it drops as
+    /// non-beneficial — so the service would run forever compacting nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintainError::Config`] if any tunable is out of range or the
+    /// [`JobsStorageConfig`] is invalid.
+    pub fn validate(&self) -> Result<(), MaintainError> {
+        if self.target_file_size_bytes == 0 {
+            return Err(MaintainError::Config(
+                "compaction.target_file_size_bytes must be greater than zero".to_string(),
+            ));
+        }
+        // A group budget below the target file size can never bin-pack enough
+        // input to produce a target-sized output, so compaction could never reach
+        // its goal. This also rejects the `max_group_input_bytes = 0` case
+        // (0 < any positive target), which would otherwise silently disable all
+        // compaction.
+        if self.max_group_input_bytes < self.target_file_size_bytes {
+            return Err(MaintainError::Config(format!(
+                "compaction.max_group_input_bytes ({}) must be at least target_file_size_bytes ({})",
+                self.max_group_input_bytes, self.target_file_size_bytes
+            )));
+        }
+        if self.max_merge_size_ratio == 0 {
+            return Err(MaintainError::Config(
+                "compaction.max_merge_size_ratio must be greater than or equal to 1".to_string(),
+            ));
+        }
+        if self.rewrite_timeout_secs == 0 {
+            return Err(MaintainError::Config(
+                "compaction.rewrite_timeout_secs must be greater than zero".to_string(),
+            ));
+        }
+        if self.row_group_size == 0 {
+            return Err(MaintainError::Config(
+                "compaction.row_group_size must be greater than zero".to_string(),
+            ));
+        }
+        if self.data_page_size_limit_bytes == 0 {
+            return Err(MaintainError::Config(
+                "compaction.data_page_size_limit_bytes must be greater than zero".to_string(),
+            ));
+        }
+        self.jobsmanager.validate()
     }
 }
 
@@ -295,6 +399,76 @@ mod tests {
     #[test]
     fn default_worker_count_matches_available_parallelism() {
         let c = CompactionConfig::default();
-        assert_eq!(c.worker_count, default_worker_count());
+        assert_eq!(c.jobsmanager.worker_count, default_worker_count());
+    }
+
+    /// Defaults plus a populated job-state storage. The default `JobsStorageConfig`
+    /// has empty endpoint/bucket (a real deployment must set them), so a bare
+    /// default does not validate; tests of the numeric tunables start from here.
+    fn valid_config() -> CompactionConfig {
+        CompactionConfig {
+            jobsmanager: CompactionJobsManagerConfig {
+                storage: JobsStorageConfig {
+                    endpoint: "http://minio:9000".to_string(),
+                    bucket: "jobs".to_string(),
+                    ..JobsStorageConfig::default()
+                },
+                ..CompactionJobsManagerConfig::default()
+            },
+            ..CompactionConfig::default()
+        }
+    }
+
+    #[test]
+    fn valid_config_passes_validation() {
+        assert!(valid_config().validate().is_ok());
+    }
+
+    #[test]
+    fn zero_max_group_input_bytes_is_rejected() {
+        // Sergey's example: a zero budget silently disables all compaction.
+        let config = CompactionConfig {
+            max_group_input_bytes: 0,
+            ..valid_config()
+        };
+        assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+    }
+
+    #[test]
+    fn max_group_input_below_target_is_rejected() {
+        let config = CompactionConfig {
+            target_file_size_bytes: 128 * 1024 * 1024,
+            max_group_input_bytes: 64 * 1024 * 1024,
+            ..valid_config()
+        };
+        assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+    }
+
+    #[test]
+    fn zero_target_file_size_is_rejected() {
+        let config = CompactionConfig {
+            target_file_size_bytes: 0,
+            ..valid_config()
+        };
+        assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+    }
+
+    #[test]
+    fn zero_size_merge_ratio_is_rejected() {
+        let config = CompactionConfig {
+            max_merge_size_ratio: 0,
+            ..valid_config()
+        };
+        assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+    }
+
+    #[test]
+    fn invalid_jobs_storage_is_rejected() {
+        // The bare default has empty storage endpoint/bucket, which must fail
+        // through the delegated JobsStorageConfig::validate().
+        assert!(matches!(
+            CompactionConfig::default().validate(),
+            Err(MaintainError::Config(_))
+        ));
     }
 }

@@ -23,11 +23,12 @@
 //!    the REWRITE k-way merge still produces a sorted output.
 //! 4. **Bin-pack** each size group by input-byte budget into one or more groups,
 //!    so no single rewrite reads more than the configured cap, then **drop
-//!    non-beneficial groups**. A group of a single file rewrites it 1-to-1 with
-//!    no file-count reduction; emitting it would make every scan re-rewrite the
-//!    same file forever. Only groups of two or more files — which actually merge
-//!    — are kept; a partition left with no such group is counted as skipped, not
-//!    compacted.
+//!    non-beneficial groups**. A group is beneficial only if it both merges two
+//!    or more files AND reduces the file count (`ceil(sum_bytes / target) < len`).
+//!    A single-file group, or a group of files each already at or above target
+//!    (`N` in → `N` out), reduces nothing; emitting it would make every scan
+//!    re-rewrite the same files forever. Such groups are dropped; a partition left
+//!    with no beneficial group is counted as skipped, not compacted.
 //!
 //! The planner is generic over [`PlannableFile`] so its logic is unit-testable
 //! against a fake file without constructing an [`iceberg::spec::DataFile`].
@@ -127,12 +128,13 @@ impl<F> Default for PlanOutcome<F> {
 /// Group, select, and bin-pack files into rewrite groups, one per output file.
 ///
 /// Returns a [`PlanOutcome`]: the rewrite groups plus how many partitions were
-/// compacted versus skipped. Every group holds at least two files (single-file
-/// groups are dropped — see the module docs), and all files in a group share the
-/// same [`PlannableFile::partition_key`]. A partition may yield zero groups (it
-/// was skipped as healthy, or size-splitting left only single-file groups) or
-/// several (a large or skewed partition split by the byte budget). The caller
-/// maps each returned group to a rewrite input from the underlying files' paths.
+/// compacted versus skipped. Every group holds at least two files AND reduces the
+/// partition's file count (non-reducing groups are dropped — see the module docs),
+/// and all files in a group share the same [`PlannableFile::partition_key`]. A
+/// partition may yield zero groups (it was skipped as healthy, or size-splitting
+/// left only non-reducing groups) or several (a large or skewed partition split by
+/// the byte budget). The caller maps each returned group to a rewrite input from
+/// the underlying files' paths.
 ///
 /// Generic over [`PlannableFile`] so the grouping, skip, size-split, and
 /// bin-packing logic is exercised in unit tests without building real Iceberg
@@ -157,11 +159,14 @@ pub fn plan_rewrite_groups<F: PlannableFile>(files: Vec<F>, cfg: &PlannerLimits)
         for size_group in split_by_size(partition_files, cfg) {
             bin_pack_into(size_group, cfg.max_group_input_bytes, &mut partition_groups);
         }
-        // Keep only groups that actually merge (>= 2 files). A single-file group
-        // rewrites one file 1-to-1 with no benefit, so emitting it would make
-        // every scan re-rewrite the same file forever. Dropping single-file
-        // groups leaves such files untouched.
-        partition_groups.retain(|group| group.len() >= 2);
+        // Keep only groups that actually MERGE (>= 2 files) AND REDUCE the file
+        // count. A single-file group rewrites 1-to-1; a group whose inputs are
+        // each already at or above target re-rolls N input files into N
+        // target-sized outputs (no reduction). Either way, emitting it would make
+        // every scan re-select and re-rewrite the same files forever — an
+        // infinite loop that burns CPU/IO and never converges. `reduces_file_count`
+        // predicts the output count from the re-roll at `target_file_size_bytes`.
+        partition_groups.retain(|group| group.len() >= 2 && reduces_file_count(group, cfg.target_file_size_bytes));
         if partition_groups.is_empty() {
             // Nothing beneficial to do (only lone/disjoint files survived):
             // report the partition as skipped so the telemetry matches the
@@ -238,6 +243,29 @@ fn bin_pack_into<F: PlannableFile>(files: Vec<F>, max_group_input_bytes: u64, ou
     if !current.is_empty() {
         out.push(current);
     }
+}
+
+/// Whether rewriting `group` would actually reduce the partition's file count.
+///
+/// A REWRITE re-rolls the group's summed bytes into `target_file_size_bytes`-sized
+/// outputs, so it emits roughly `ceil(sum_bytes / target)` files. Merging is only
+/// worthwhile when that is strictly fewer than the inputs. The canonical
+/// non-reducing case is a group of files each already at or above target: `N`
+/// inputs re-roll into `N` outputs, the planner re-selects them on the next scan,
+/// and compaction loops forever without converging. Two sub-target files whose
+/// sum still exceeds one target file (e.g. two 60% files → 120% → two outputs)
+/// are the same no-reduction trap. This predicate drops both.
+///
+/// `target_file_size_bytes` is validated `> 0` at startup
+/// ([`crate::compact::config::CompactionConfig::validate`]); it is clamped to 1
+/// here so the function stays total if a direct caller bypasses that.
+fn reduces_file_count<F: PlannableFile>(group: &[F], target_file_size_bytes: u64) -> bool {
+    let target = target_file_size_bytes.max(1);
+    let sum_bytes = group.iter().map(PlannableFile::size_bytes).fold(0u64, u64::saturating_add);
+    // Predicted outputs after re-rolling at the target size. `usize -> u64` for
+    // the count comparison is lossless on every supported (<= 64-bit) target.
+    let predicted_outputs = sum_bytes.div_ceil(target);
+    predicted_outputs < group.len() as u64
 }
 
 /// Absorb the partition's smaller files into the largest only when they
@@ -476,11 +504,14 @@ mod tests {
     }
 
     #[test]
-    fn size_gate_splits_cluster_into_size_tiers() {
-        // One partition's files spanning three size tiers must split into one
-        // group per tier, never mixing far-apart sizes. A 1 KiB target keeps
-        // every file over target so the size gate (not the sub-target shortcut)
-        // governs, isolating pure size-tiering.
+    fn over_target_files_of_distinct_sizes_are_left_untouched() {
+        // One partition's files span several distinct OVER-target size tiers. The
+        // size gate splits them so a small file is never merged into a much larger
+        // one, but every resulting tier is made of files that are each already at
+        // or above target — merging them re-rolls N inputs into N target-sized
+        // outputs (no reduction). So the file-count-reduction filter drops every
+        // group and the partition is skipped. A 1 KiB target keeps every file over
+        // target so the size gate (not the sub-target shortcut) governs.
         let files = vec![
             file("t/1", 120_000),
             file("t/1", 60_000),
@@ -496,31 +527,27 @@ mod tests {
                 ..limits()
             },
         );
-        assert_eq!(outcome.groups.len(), 3, "three size tiers yield three groups");
-
-        let mut tier_sizes: Vec<Vec<u64>> = outcome
-            .groups
-            .iter()
-            .map(|group| {
-                let mut sizes: Vec<u64> = group.iter().map(PlannableFile::size_bytes).collect();
-                sizes.sort_unstable();
-                sizes
-            })
-            .collect();
-        tier_sizes.sort();
-        assert_eq!(
-            tier_sizes,
-            vec![vec![4_000, 4_000], vec![20_000, 20_000], vec![60_000, 120_000],],
-            "each group holds exactly one size tier"
+        assert!(
+            outcome.groups.is_empty(),
+            "merging over-target files yields no file-count reduction, so none is rewritten"
         );
+        assert_eq!(outcome.partitions_skipped, 1);
+        assert_eq!(outcome.partitions_compacted, 0);
     }
 
     #[test]
     fn size_ratio_controls_comparability() {
-        // A 50 KiB file overlapping a 120 KiB file is below 120/2, so at the
-        // default 2x ratio neither file merges (both dropped as lone groups);
-        // at a 3x ratio 50 KiB is comparable and the pair merges.
-        let make = || vec![file("t/1", 120_000), file("t/1", 50_000)];
+        // A 150 KiB over-target file alongside two 20 KiB sub-target files. The
+        // ratio decides whether the small files are "comparable" enough to merge
+        // INTO the large one (a reducing group), versus being peeled off and
+        // merged on their own while the large file is left untouched:
+        //  - at ratio 2 the 20 KiB files are too small (20 * 2 = 40 < 150), so they
+        //    peel into their own tier and merge alone (the absorb mass rule also
+        //    fails: 2 * 20 = 40 < 150/2), leaving the 150 KiB file out.
+        //  - at ratio 8 the 20 KiB files are comparable (20 * 8 = 160 >= 150), so
+        //    all three share one tier and merge into a single group that re-rolls
+        //    190 KiB -> ceil(190/100) = 2 files (3 -> 2, a reduction).
+        let make = || vec![file("t/1", 150_000), file("t/1", 20_000), file("t/1", 20_000)];
         let base = PlannerLimits {
             target_file_size_bytes: 100_000,
             max_group_input_bytes: 250_000,
@@ -530,41 +557,59 @@ mod tests {
         };
 
         let strict = plan_rewrite_groups(make(), &base);
+        assert_eq!(strict.groups.len(), 1, "at ratio 2 only the two small files merge");
+        assert_eq!(strict.groups[0].len(), 2, "the 150 KiB file is left out at ratio 2");
         assert!(
-            strict.groups.is_empty(),
-            "at ratio 2 the 50 KiB file is too small to join the 120 KiB file"
+            strict.groups[0].iter().all(|f| f.size_bytes() == 20_000),
+            "the over-target file is not pulled into the small-file group at ratio 2"
         );
 
         let loose = PlannerLimits {
-            max_merge_size_ratio: 3,
+            max_merge_size_ratio: 8,
             ..base
         };
         let merged = plan_rewrite_groups(make(), &loose);
-        assert_eq!(merged.groups.len(), 1, "at ratio 3 the two files merge");
-        assert_eq!(merged.groups[0].len(), 2);
+        assert_eq!(merged.groups.len(), 1, "at ratio 8 all three files share a tier");
+        assert_eq!(
+            merged.groups[0].len(),
+            3,
+            "at ratio 8 the small files are comparable enough to absorb the large one"
+        );
     }
 
     #[test]
     fn size_ratio_zero_is_treated_as_one() {
-        // A misconfigured ratio of 0 is clamped to 1 (only equal-or-larger files
-        // share a tier) rather than panicking or merging everything: the two
-        // equal 100 KiB files merge and the 20 KiB file is left out.
-        let files = vec![file("t/1", 100_000), file("t/1", 100_000), file("t/1", 20_000)];
-        let limits = PlannerLimits {
+        // A misconfigured ratio of 0 is clamped to 1 rather than making every file
+        // (including the largest) "small" — which would peel an empty comparable
+        // tier and loop forever. With the clamp, a 120 KiB over-target file and two
+        // 30 KiB files behave exactly as at ratio 1: the smalls reach half the
+        // largest (2 * 30 = 60 == 120/2), so the absorb fires and all three merge
+        // into one reducing group (180 KiB -> ceil(180/100) = 2 files, 3 -> 2).
+        let make = || vec![file("t/1", 120_000), file("t/1", 30_000), file("t/1", 30_000)];
+        let zero = PlannerLimits {
             target_file_size_bytes: 100_000,
             max_group_input_bytes: 250_000,
             min_input_files: 1,
             max_skippable_tail_files: 0,
             max_merge_size_ratio: 0,
         };
-        let outcome = plan_rewrite_groups(files, &limits);
+        let one = PlannerLimits {
+            max_merge_size_ratio: 1,
+            ..zero
+        };
+
+        let zero_outcome = plan_rewrite_groups(make(), &zero);
         assert_eq!(
-            outcome.groups.len(),
+            zero_outcome.groups.len(),
             1,
-            "the two equal files merge, the small one is left out"
+            "ratio 0 must not hang or silently merge nothing"
         );
-        assert_eq!(outcome.groups[0].len(), 2);
-        assert!(outcome.groups[0].iter().all(|f| f.size_bytes() == 100_000));
+        assert_eq!(zero_outcome.groups[0].len(), 3, "all three files merge as at ratio 1");
+
+        // Clamping to 1 means ratio 0 produces exactly the ratio-1 plan.
+        let one_outcome = plan_rewrite_groups(make(), &one);
+        assert_eq!(one_outcome.groups.len(), zero_outcome.groups.len());
+        assert_eq!(one_outcome.groups[0].len(), zero_outcome.groups[0].len());
     }
 
     #[test]
@@ -704,11 +749,15 @@ mod tests {
 
     #[test]
     fn bin_packs_by_input_budget_into_multiple_groups() {
-        // Six 60 KiB files = 360 KiB > 250 KiB cap, all in one partition and all
+        // Eight 60 KiB files = 480 KiB > 250 KiB cap, all in one partition and all
         // sub-target, so they form a single size tier that the 250 KiB budget must
-        // split into more than one group, each <= the cap. Every kept group still
-        // merges two or more files, so none is dropped as non-beneficial.
+        // split into more than one group (four files each, 240 KiB <= cap). Each
+        // four-file group re-rolls to ceil(240/100) = 3 target-sized outputs
+        // (4 -> 3), so it reduces the file count and is kept — none is dropped as
+        // non-beneficial.
         let files = vec![
+            file("t/1", 60_000),
+            file("t/1", 60_000),
             file("t/1", 60_000),
             file("t/1", 60_000),
             file("t/1", 60_000),
@@ -731,53 +780,41 @@ mod tests {
                 "each group's summed input bytes ({summed}) must stay within the budget"
             );
         }
-        // One sub-target tier that bin-packs without dropping any file.
+        // Two reducing sub-target tiers that bin-pack without dropping any file.
         let total: usize = groups.iter().map(Vec::len).sum();
-        assert_eq!(total, 6, "every input file must appear in exactly one group");
+        assert_eq!(total, 8, "every input file must appear in exactly one group");
     }
 
     #[test]
-    fn disjoint_large_files_merge_now_that_clustering_is_removed() {
-        // Five files in one partition, all OVER target and with DISJOINT sort-key
-        // ranges. Without the sort-key clustering stage they are size-split as one
-        // set: all are within the 2x ratio (so a single tier), and bin-packing by
-        // the 250 KiB budget merges the first pair that fits (120 + 130 KiB). The
-        // remaining lone files are dropped by the single-file-group filter, so the
-        // partition is COMPACTED (one merging group), not skipped.
-        //
-        // This pins the accepted behavior change from removing clustering: before,
-        // each disjoint file was its own cluster and the whole partition was
-        // skipped; now disjoint over-target files can be merged into one output
-        // (weaker sort-key pruning) in exchange for a simpler pipeline. The
-        // single-file-group filter still prevents an infinite 1-to-1 rewrite loop.
-        let files = vec![
-            file("t/1", 120_000),
-            file("t/1", 130_000),
-            file("t/1", 140_000),
-            file("t/1", 150_000),
-            file("t/1", 160_000),
-        ];
-        let outcome = plan_rewrite_groups(files, &limits());
-        assert_eq!(
-            outcome.partitions_compacted, 1,
-            "the partition now compacts instead of being skipped"
-        );
-        assert_eq!(
-            outcome.groups.len(),
-            1,
-            "one budget-fitting pair merges; the remaining lone files are dropped"
-        );
-        let group = &outcome.groups[0];
-        assert_eq!(group.len(), 2, "exactly the first within-budget pair merges");
-        let merged: u64 = group.iter().map(PlannableFile::size_bytes).sum();
-        assert!(
-            merged <= limits().max_group_input_bytes,
-            "the merged group respects the byte budget"
+    fn at_target_files_are_not_rewritten_without_reduction() {
+        // The infinite-loop guard Sergey flagged. A partition with more than
+        // `min_input_files` files that are each already AT target. They bin-pack
+        // into a group of two, but that group re-rolls 2 x 128 KiB into 2
+        // target-sized outputs (no reduction). Without the file-count-reduction
+        // filter the planner would emit the group, the REWRITE would replace 2
+        // files with 2 files, and the next scan would re-select the same shape —
+        // forever. The filter drops every non-reducing group, so the partition is
+        // skipped and the loop never starts.
+        let files = vec![file("t/1", 128_000), file("t/1", 128_000), file("t/1", 128_000)];
+        let outcome = plan_rewrite_groups(
+            files,
+            &PlannerLimits {
+                target_file_size_bytes: 128_000,
+                max_group_input_bytes: 256_000,
+                min_input_files: 1,
+                max_skippable_tail_files: 0,
+                max_merge_size_ratio: 2,
+            },
         );
         assert!(
-            group.iter().all(|f| f.size_bytes() >= limits().target_file_size_bytes),
-            "over-target files were merged — the pruning trade-off of removing clustering"
+            outcome.groups.is_empty(),
+            "at-target files must not be rewritten: merging them does not reduce the file count"
         );
+        assert_eq!(
+            outcome.partitions_skipped, 1,
+            "the partition is skipped, breaking the loop"
+        );
+        assert_eq!(outcome.partitions_compacted, 0);
     }
 
     #[test]

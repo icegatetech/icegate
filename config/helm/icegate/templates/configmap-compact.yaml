@@ -18,24 +18,25 @@ data:
       min_input_files: {{ .Values.compact.compaction.minInputFiles }}
       max_skippable_tail_files: {{ .Values.compact.compaction.maxSkippableTailFiles }}
       max_merge_size_ratio: {{ .Values.compact.compaction.maxMergeSizeRatio }}
-      scan_interval_secs: {{ .Values.compact.compaction.scanIntervalSecs }}
       rewrite_timeout_secs: {{ .Values.compact.compaction.rewriteTimeoutSecs }}
-      worker_count: {{ .Values.compact.compaction.workerCount }}
-      poll_interval_ms: {{ .Values.compact.compaction.pollIntervalMs }}
       row_group_size: {{ .Values.compact.compaction.rowGroupSize }}
       data_page_size_limit_bytes: {{ .Values.compact.compaction.dataPageSizeLimitBytes | int }}
       logs_enabled: {{ .Values.compact.compaction.tables.logs }}
       spans_enabled: {{ .Values.compact.compaction.tables.spans }}
       events_enabled: {{ .Values.compact.compaction.tables.events }}
       metrics_enabled: {{ .Values.compact.compaction.tables.metrics }}
-      jobs_storage:
-        endpoint: {{ .Values.compact.compaction.jobsStorage.endpoint | default .Values.storage.s3.endpoint | quote }}
-        bucket: {{ .Values.compact.compaction.jobsStorage.bucket | quote }}
-        prefix: {{ .Values.compact.compaction.jobsStorage.prefix | quote }}
-        region: {{ .Values.compact.compaction.jobsStorage.region | default .Values.aws.region | quote }}
-        use_ssl: {{ .Values.compact.compaction.jobsStorage.useSsl }}
-        job_state_codec: {{ .Values.compact.compaction.jobsStorage.jobStateCodec }}
-        request_timeout_secs: {{ .Values.compact.compaction.jobsStorage.requestTimeoutSecs }}
+      jobsmanager:
+        scan_interval_secs: {{ .Values.compact.compaction.jobsmanager.scanIntervalSecs }}
+        worker_count: {{ .Values.compact.compaction.jobsmanager.workerCount }}
+        poll_interval_ms: {{ .Values.compact.compaction.jobsmanager.pollIntervalMs }}
+        storage:
+          endpoint: {{ .Values.compact.compaction.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          bucket: {{ .Values.compact.compaction.jobsmanager.storage.bucket | quote }}
+          prefix: {{ .Values.compact.compaction.jobsmanager.storage.prefix | quote }}
+          region: {{ .Values.compact.compaction.jobsmanager.storage.region | default .Values.aws.region | quote }}
+          use_ssl: {{ .Values.compact.compaction.jobsmanager.storage.useSsl }}
+          job_state_codec: {{ .Values.compact.compaction.jobsmanager.storage.jobStateCodec }}
+          request_timeout_secs: {{ .Values.compact.compaction.jobsmanager.storage.requestTimeoutSecs }}
     metrics:
       enabled: {{ .Values.compact.metrics.enabled }}
       host: "0.0.0.0"

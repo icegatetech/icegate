@@ -24,7 +24,7 @@
 //! BEFORE writing or committing: the next planning scan will re-derive a group
 //! from whatever files remain.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -37,7 +37,7 @@ use icegate_common::manifest_scan::{DataFileStats, decode_data_file_envelope, li
 use icegate_common::merge::sort_key::{
     RowGroupBoundaryComponent, RowGroupBoundaryKey, RowGroupBoundaryRange, SortColumnsDescriptor,
 };
-use icegate_common::merge::{MergeInput, RowGroupsMerger, SortedBatchMergerConfig};
+use icegate_common::merge::{MergeInput, MergePosition, RowGroupsMerger, SortedBatchMergerConfig};
 use icegate_common::{WAL_OFFSET_PROPERTY, icegate_table_ident};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -251,14 +251,28 @@ impl RewriteExecutor {
         // commit's internal optimistic retry uses the FRESH base after any racing
         // shift commit — never a value frozen here before that race.
         let input_files = removed.len();
+        // The output files are already written to object storage. If the replace
+        // is rejected (apply) or fails to commit, they leak as orphans unless we
+        // delete them, so capture their paths before `add_data_files` consumes
+        // `added`.
+        let output_paths: Vec<String> = added.iter().map(|file| file.file_path().to_string()).collect();
         let tx = Transaction::new(&table);
-        let tx = tx
+        let pending = tx
             .rewrite_files()
             .add_data_files(added)
             .delete_files(removed)
             .inherit_summary_property(WAL_OFFSET_PROPERTY)
-            .apply(tx)
-            .map_err(MaintainError::from)?;
+            .apply(tx);
+        let tx = match pending {
+            Ok(tx) => tx,
+            Err(error) => {
+                // `apply` only assembles the replace action locally, so a failure
+                // here means nothing was committed and the outputs are
+                // unambiguously unreferenced — safe to delete.
+                cleanup_orphaned_outputs(table.file_io(), &output_paths).await;
+                return Err(MaintainError::from(error));
+            }
+        };
         // The `compact_commit` span (a child of `compact_rewrite`) covers the
         // commit's internal optimistic-concurrency retry loop. Instrument the
         // commit future rather than entering a guard, which would otherwise be
@@ -268,10 +282,16 @@ impl RewriteExecutor {
             table = input.table.as_str(),
             partition = input.partition_key.as_str()
         );
-        tx.commit(self.catalog.as_ref())
-            .instrument(commit_span)
-            .await
-            .map_err(MaintainError::from)?;
+        if let Err(error) = tx.commit(self.catalog.as_ref()).instrument(commit_span).await {
+            // A commit failure is AMBIGUOUS: the catalog may have applied the
+            // replace remotely before the error surfaced, so the outputs cannot be
+            // deleted blindly (that could remove files the new snapshot
+            // references). Reload and delete only the outputs the table does NOT
+            // reference.
+            self.cleanup_orphans_after_failed_commit(&input.table, &input.partition_key, &output_paths)
+                .await;
+            return Err(MaintainError::from(error));
+        }
 
         self.metrics.record_rewrite_committed(
             &input.table,
@@ -288,6 +308,52 @@ impl RewriteExecutor {
             input_bytes,
             output_bytes,
         })
+    }
+
+    /// After an ambiguous commit failure, best-effort delete the freshly written
+    /// outputs that the table does NOT reference.
+    ///
+    /// The commit may have been applied remotely before the error surfaced, so
+    /// blindly deleting `output_paths` could remove files the new snapshot
+    /// references. Reload the table and keep any output that is now live (its
+    /// file names are unique to this rewrite, so a live output means the commit
+    /// took effect); delete only the rest. If the reload or enumeration fails,
+    /// leave everything in place — a leftover orphan is reclaimable by a later
+    /// orphan-file sweep, but deleting referenced data is not recoverable.
+    async fn cleanup_orphans_after_failed_commit(
+        &self,
+        table_name: &str,
+        partition_key: &str,
+        output_paths: &[String],
+    ) {
+        let table = match self.catalog.load_table(&icegate_table_ident(table_name)).await {
+            Ok(table) => table,
+            Err(error) => {
+                tracing::warn!(
+                    table = table_name,
+                    error = %error,
+                    "could not reload table to clean up compaction outputs after a failed commit; leaving them in place"
+                );
+                return;
+            }
+        };
+        let live: HashSet<String> = match list_data_files_in_partition(&table, self.descriptor, partition_key).await {
+            Ok(stats) => stats.iter().map(|stat| stat.data_file.file_path().to_string()).collect(),
+            Err(error) => {
+                tracing::warn!(
+                    table = table_name,
+                    error = %error,
+                    "could not enumerate partition to clean up compaction outputs after a failed commit; leaving them in place"
+                );
+                return;
+            }
+        };
+        let orphans: Vec<String> = output_paths
+            .iter()
+            .filter(|path| !live.contains(path.as_str()))
+            .cloned()
+            .collect();
+        cleanup_orphaned_outputs(table.file_io(), &orphans).await;
     }
 
     /// Enumerate the table's live data files and return the ones matching
@@ -339,12 +405,12 @@ impl RewriteExecutor {
         matched: &[DataFileStats],
         cancel: &CancellationToken,
     ) -> Result<icegate_common::iceberg_write::CommonRecordBatchStream> {
-        let mut paths_by_position: HashMap<u128, String> = HashMap::with_capacity(matched.len());
+        let mut paths_by_position: HashMap<MergePosition, String> = HashMap::with_capacity(matched.len());
         let mut inputs: Vec<MergeInput> = Vec::with_capacity(matched.len());
         for (index, stats) in matched.iter().enumerate() {
             // `position = index` is safe: `matched` is already in `min_key`
             // order, and the index is far below `u128::MAX`.
-            let position = index as u128;
+            let position = MergePosition::new(index as u128);
             paths_by_position.insert(position, stats.data_file.file_path().to_string());
             inputs.push(MergeInput::new(
                 position,
@@ -388,6 +454,24 @@ async fn cleanup_uncommitted_data_files(file_io: &FileIO, data_files: &[DataFile
                 path,
                 error = %error,
                 "failed to cleanup compaction output rejected before commit"
+            );
+        }
+    }
+}
+
+/// Best-effort deletion of orphaned compaction output files by path.
+///
+/// Used on the apply/commit failure paths where the outputs are already written
+/// but `added` has been consumed by the transaction, so only paths remain.
+/// Cleanup failures are logged and otherwise ignored so they never mask the
+/// original error.
+async fn cleanup_orphaned_outputs(file_io: &FileIO, paths: &[String]) {
+    for path in paths {
+        if let Err(error) = file_io.delete(path).await {
+            tracing::warn!(
+                path,
+                error = %error,
+                "failed to delete orphaned compaction output after a failed rewrite"
             );
         }
     }

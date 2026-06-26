@@ -170,26 +170,38 @@ under `compact.compaction`.
 | `min_input_files` | `minInputFiles` | 4 | A partition at or below this is a skip candidate. |
 | `max_skippable_tail_files` | `maxSkippableTailFiles` | 0 | Tolerated sub-target files in a skip candidate. |
 | `max_merge_size_ratio` | `maxMergeSizeRatio` | 2 | Largest-to-smallest size ratio within one group. Must be `>= 1` (rejected at startup otherwise). |
-| `scan_interval_secs` | `scanIntervalSecs` | 300 | Discovery loop period. |
 | `rewrite_timeout_secs` | `rewriteTimeoutSecs` | 3600 | Deadline for one REWRITE task. |
-| `worker_count` | `workerCount` | half of CPUs | Concurrent REWRITE workers. |
 | `{logs,spans,events,metrics}_enabled` | `…Enabled` | true | Per-table toggles. |
+
+Jobs-manager settings are nested under `jobsmanager` (mirroring ingest's
+`shift.jobsmanager`):
+
+| Field (`snake_case`) | Helm (`camelCase`) | Default | Meaning |
+|----------------------|--------------------|---------|---------|
+| `jobsmanager.scan_interval_secs` | `jobsmanager.scanIntervalSecs` | 300 | Discovery loop period. |
+| `jobsmanager.worker_count` | `jobsmanager.workerCount` | half of CPUs | Concurrent REWRITE workers. |
+| `jobsmanager.poll_interval_ms` | `jobsmanager.pollIntervalMs` | 1000 | Jobmanager worker poll interval. |
+| `jobsmanager.storage.*` | `jobsmanager.storage.*` | — | S3 job-state storage (same shape as ingest's shift). |
 
 `LARGE_FILE_ABSORB_DENOMINATOR` (the absorb half-rule) is a module constant, not
 configurable in this iteration.
 
 ## Guarantees and limitations
 
-- **Convergence.** The single-file-group drop (stage 4) guarantees the planner
-  never spins on a file that cannot beneficially merge.
+- **Convergence.** Stage 4 keeps a group only when it actually reduces the
+  partition's file count — `ceil(sum_bytes / target) < group_len`. A single-file
+  group, or a group whose inputs are each already at/above target (`N` in → `N`
+  out), is dropped, so the planner never spins re-rewriting files that cannot
+  beneficially merge.
 - **No cross-partition merges.** All files in a rewrite group share one
   `(tenant, day)` partition.
 - **No sort-key clustering.** Files with disjoint sort-key ranges in the same
   partition may be merged into one output, whose range then spans them — this
-  weakens per-file pruning for that partition, and can merge already-over-target
-  disjoint files (a one-off, slightly wasteful rewrite). The REWRITE k-way merge
-  still produces a sorted output, and the single-file-group drop still prevents an
-  infinite 1-to-1 rewrite loop.
+  weakens per-file pruning for that partition. The REWRITE k-way merge still
+  produces a sorted output. Over-target disjoint files are NOT merged together:
+  re-rolling them at the target size yields no file-count reduction, so the
+  reduction guard drops the group (this is what prevents the infinite re-rewrite
+  loop).
 - **Accepted trade-off.** Leaving an over-target file out of the merge means the
   small files' merged output overlaps it in sort-key range, weakening pruning for
   that partition in exchange for not re-reading the large file.

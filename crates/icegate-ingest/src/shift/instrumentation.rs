@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use icegate_common::merge::MergePosition;
 use icegate_jobmanager::{Error, JobManager};
 use icegate_queue::{ExtractField, QueueReader, RecordBatchStream, SegmentsPlan, Topic};
 use tokio_util::sync::CancellationToken;
@@ -14,7 +15,7 @@ use super::{
     executor::TaskStatus,
     iceberg_storage::{Storage, WrittenDataFiles},
     plan_runner::{PlanTaskResult, PlanTaskRunner},
-    row_groups_merger::RowGroupsMergerObserver,
+    row_groups_merger::{RowGroupsMergerObserver, WalMergePosition},
     shift_runner::{ShiftTaskFailure, ShiftTaskFailureReason, ShiftTaskResult, ShiftTaskRunner},
 };
 use crate::infra::metrics::ShiftMetrics;
@@ -142,11 +143,11 @@ impl RowGroupsMergerObserverWithMetrics {
 }
 
 impl RowGroupsMergerObserver for RowGroupsMergerObserverWithMetrics {
-    fn on_input_opened(&self, position: u128, bytes: u64) {
+    fn on_input_opened(&self, position: MergePosition, bytes: u64) {
         // Decode the merger's opaque position back to WAL coordinates so the
         // per-row-group lifetime map key and structured logs stay identical to
         // the pre-refactor behavior.
-        let (segment_offset, row_group_idx) = crate::shift::row_groups_merger::wal_decode_position(position);
+        let (segment_offset, row_group_idx) = position.to_wal();
         let bytes_i64 = i64::try_from(bytes).unwrap_or(i64::MAX);
         let previous = self
             .opened_at
@@ -165,8 +166,8 @@ impl RowGroupsMergerObserver for RowGroupsMergerObserverWithMetrics {
             .add_row_groups_merger_open_row_group_bytes(bytes_i64, self.topic.as_str());
     }
 
-    fn on_input_closed(&self, position: u128, bytes: u64) {
-        let (segment_offset, row_group_idx) = crate::shift::row_groups_merger::wal_decode_position(position);
+    fn on_input_closed(&self, position: MergePosition, bytes: u64) {
+        let (segment_offset, row_group_idx) = position.to_wal();
         // Use the same i64::MAX saturation as on_input_opened so open/close updates stay symmetric even if bytes does not fit i64.
         let bytes_i64 = i64::try_from(bytes).unwrap_or(i64::MAX);
         let opened_at = self

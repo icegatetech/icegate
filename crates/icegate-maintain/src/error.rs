@@ -12,6 +12,14 @@ pub enum MaintainError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// A storage or data-plane runtime failure: object-store I/O, the Parquet
+    /// write/read pipeline, or WAL-offset resolution. Kept distinct from
+    /// [`Self::Config`] so a transient runtime fault (a failed S3 read, a write
+    /// error mid-rewrite) is never misreported as a misconfiguration and can be
+    /// alerted on or retried separately.
+    #[error("storage error: {0}")]
+    Storage(String),
+
     /// Iceberg catalog/table operations.
     #[error("iceberg error: {0}")]
     Iceberg(#[from] iceberg::Error),
@@ -40,11 +48,11 @@ impl From<icegate_common::error::CommonError> for MaintainError {
             CommonError::Toml(e) => Self::Config(e.to_string()),
             CommonError::Yaml(e) => Self::Config(e.to_string()),
             CommonError::Iceberg(e) => Self::Iceberg(e),
-            CommonError::Io(e) => Self::Config(e.to_string()),
-            CommonError::ObjectStore(e) => Self::Config(format!("object store error: {e}")),
-            CommonError::Write(msg) => Self::Config(format!("write error: {msg}")),
-            CommonError::CompactRead(msg) => Self::Config(format!("compaction read error: {msg}")),
-            CommonError::WalOffset(msg) => Self::Config(format!("wal offset error: {msg}")),
+            CommonError::Io(e) => Self::Storage(e.to_string()),
+            CommonError::ObjectStore(e) => Self::Storage(format!("object store error: {e}")),
+            CommonError::Write(msg) => Self::Storage(format!("write error: {msg}")),
+            CommonError::CompactRead(msg) => Self::Storage(format!("compaction read error: {msg}")),
+            CommonError::WalOffset(msg) => Self::Storage(format!("wal offset error: {msg}")),
         }
     }
 }

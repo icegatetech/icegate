@@ -414,7 +414,7 @@ migrate:
 ## Compaction component (long-running `maintain run` service)
 ## ---------------------------------------------------------------------------
 ## Rewrites small Parquet data files in the Iceberg tables into fewer, larger
-## files. Runs as a Deployment that loops on `compaction.scanIntervalSecs`.
+## files. Runs as a Deployment that loops on `compaction.jobsmanager.scanIntervalSecs`.
 ##
 ## Disabled by default: the `maintain run` binary always initialises tracing and
 ## refuses to start without an OTLP endpoint, so enabling compaction REQUIRES
@@ -424,7 +424,7 @@ compact:
   ## Replicas may be scaled out. The jobmanager distributes rewrite tasks across
   ## all workers in any pod via shared S3 job-state with compare-and-swap, and
   ## commits use optimistic concurrency, so parallel instances are safe. Prefer
-  ## scaling `compaction.workerCount` (in-process parallelism) first; add
+  ## scaling `compaction.jobsmanager.workerCount` (in-process parallelism) first; add
   ## replicas for more throughput. All workers on a table contend on a single
   ## job-state object, so horizontal returns taper as replicas grow.
   replicaCount: 1
@@ -452,16 +452,10 @@ compact:
     ## target, files merge regardless of skew. Must be at least 1 (0 is rejected
     ## at startup).
     maxMergeSizeRatio: 2
-    ## Period of the discovery loop, in seconds.
-    scanIntervalSecs: 300
     ## Deadline for a single rewrite task (merge + encode + commit), in seconds.
-    ## Kept separate from scanIntervalSecs so a long-running rewrite is not
-    ## declared expired and duplicated by another worker (default: 1 hour).
+    ## Kept separate from jobsmanager.scanIntervalSecs so a long-running rewrite is
+    ## not declared expired and duplicated by another worker (default: 1 hour).
     rewriteTimeoutSecs: 3600
-    ## Number of concurrent rewrite workers.
-    workerCount: 2
-    ## Jobmanager worker poll interval, in milliseconds.
-    pollIntervalMs: 1000
     ## Parquet row group size, in rows.
     rowGroupSize: 20000
     ## Maximum Parquet data page size, in bytes.
@@ -472,17 +466,25 @@ compact:
       spans: true
       events: true
       metrics: true
-    ## Jobs-state storage (S3), same shape ingest's shift uses. Credentials are
-    ## taken from the AWS env vars injected into the pod, not configured here.
-    jobsStorage:
-      ## Defaults to storage.s3.endpoint when empty.
-      endpoint: ""
-      bucket: jobs
-      prefix: compactor
-      region: ""  # defaults to aws.region
-      useSsl: false
-      jobStateCodec: json
-      requestTimeoutSecs: 5
+    ## Jobs-manager settings, nested to mirror ingest's shift.jobsmanager.
+    jobsmanager:
+      ## Period of the discovery loop, in seconds.
+      scanIntervalSecs: 300
+      ## Number of concurrent rewrite workers.
+      workerCount: 2
+      ## Jobmanager worker poll interval, in milliseconds.
+      pollIntervalMs: 1000
+      ## Jobs-state storage (S3), same shape ingest's shift uses. Credentials are
+      ## taken from the AWS env vars injected into the pod, not configured here.
+      storage:
+        ## Defaults to storage.s3.endpoint when empty.
+        endpoint: ""
+        bucket: jobs
+        prefix: compactor
+        region: ""  # defaults to aws.region
+        useSsl: false
+        jobStateCodec: json
+        requestTimeoutSecs: 5
 
   ## Prometheus metrics endpoint. When enabled, the long-running `run` service
   ## installs the global meter provider (so the compactor's CompactMetrics

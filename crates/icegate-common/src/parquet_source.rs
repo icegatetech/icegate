@@ -10,6 +10,9 @@
 //! `DataFile::file_size_in_bytes` or a planned `MergeInput`), so the opener
 //! constructs [`FileMetadata`] directly instead of issuing an extra object-store
 //! stat round-trip per file.
+// TODO(med): group the parquet helpers (this file and the other `parquet_*`
+// modules) under a single `parquet` module so the reader/writer/encoding
+// surface lives behind one namespace instead of several sibling files.
 
 use iceberg::arrow::ArrowFileReader;
 use iceberg::io::{FileIO, FileMetadata};

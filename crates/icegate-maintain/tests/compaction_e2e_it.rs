@@ -52,7 +52,7 @@ use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
 use icegate_common::testing::{MinIOContainer, create_s3_bucket};
-use icegate_maintain::compact::config::{CompactionConfig, JobsStorageConfig};
+use icegate_maintain::compact::config::{CompactionConfig, CompactionJobsManagerConfig, JobsStorageConfig};
 use icegate_maintain::compact::{Compactor, CompactorHandle};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::properties::WriterProperties;
@@ -328,19 +328,21 @@ fn compaction_config(conn: &MinioConn) -> CompactionConfig {
         max_skippable_tail_files: 0,
         // Equal-size seed files, so the default 2x ratio keeps them in one group.
         max_merge_size_ratio: 2,
-        // Tight loop so the single iteration runs promptly.
-        scan_interval_secs: 1,
         // Generous rewrite deadline so the merge is never declared expired.
         rewrite_timeout_secs: 600,
-        worker_count: 1,
-        poll_interval_ms: 100,
         row_group_size: 20_000,
         data_page_size_limit_bytes: 2 * 1024 * 1024,
         logs_enabled: true,
         spans_enabled: false,
         events_enabled: false,
         metrics_enabled: false,
-        jobs_storage,
+        jobsmanager: CompactionJobsManagerConfig {
+            // Tight loop so the single iteration runs promptly.
+            scan_interval_secs: 1,
+            worker_count: 1,
+            poll_interval_ms: 100,
+            storage: jobs_storage,
+        },
     }
 }
 

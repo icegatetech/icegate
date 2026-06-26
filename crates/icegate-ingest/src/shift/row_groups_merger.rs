@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use icegate_common::merge::{MergeInput, MergeSource};
+use icegate_common::merge::{MergeInput, MergePosition, MergeSource};
 pub use icegate_common::merge::{
     NoopRowGroupsMergerObserver, RowGroupsMerger, RowGroupsMergerObserver, SortedBatchMergerConfig,
 };
@@ -50,38 +50,55 @@ const WAL_ROW_GROUP_IDX_BITS: u32 = 32;
 /// Low-bit mask isolating the row-group index inside a packed merge `position`.
 const WAL_ROW_GROUP_IDX_MASK: u128 = (1 << WAL_ROW_GROUP_IDX_BITS) - 1;
 
-/// Pack a WAL `(segment_offset, row_group_idx)` pair into the opaque merge
-/// `position`.
+/// WAL-specific (de)coding of a merger [`MergePosition`].
 ///
-/// `position = (segment_offset as u128) << 32 | (row_group_idx as u128)`.
-///
-/// Because `segment_offset` (a `u64`) lands entirely above bit 32 and
-/// `row_group_idx` entirely below it, comparing two packed positions yields the
-/// same order as comparing `(segment_offset, row_group_idx)` lexicographically:
-/// any difference in `segment_offset` dominates the low 32 bits, and equal
-/// `segment_offset`s fall back to comparing `row_group_idx`. This reproduces the
-/// merger's previous `compare_wal_position` tie-break for equal sort keys
-/// exactly, with no overflow (`u64` shifted into bits 32..96 of a `u128`).
-#[must_use]
-pub const fn wal_merge_position(segment_offset: u64, row_group_idx: usize) -> u128 {
-    ((segment_offset as u128) << WAL_ROW_GROUP_IDX_BITS) | (row_group_idx as u128 & WAL_ROW_GROUP_IDX_MASK)
+/// Kept as an extension trait in `icegate-ingest` — rather than inherent methods
+/// on `MergePosition` — so `icegate-common` stays unaware of WAL segment /
+/// row-group coordinates while the packing still reads as `MergePosition`
+/// behavior. Bring it into scope to use [`MergePosition::from_wal`](Self::from_wal)
+/// and [`to_wal`](Self::to_wal).
+pub trait WalMergePosition {
+    /// Pack a WAL `(segment_offset, row_group_idx)` pair into the opaque merge
+    /// position.
+    ///
+    /// `position = (segment_offset as u128) << 32 | (row_group_idx as u128)`.
+    ///
+    /// Because `segment_offset` (a `u64`) lands entirely above bit 32 and
+    /// `row_group_idx` entirely below it, comparing two packed positions yields
+    /// the same order as comparing `(segment_offset, row_group_idx)`
+    /// lexicographically: any difference in `segment_offset` dominates the low 32
+    /// bits, and equal `segment_offset`s fall back to comparing `row_group_idx`.
+    /// This reproduces the merger's previous `compare_wal_position` tie-break for
+    /// equal sort keys exactly, with no overflow (`u64` shifted into bits 32..96
+    /// of a `u128`).
+    fn from_wal(segment_offset: u64, row_group_idx: usize) -> Self;
+
+    /// Decode a packed merge position back into its WAL coordinates.
+    ///
+    /// Inverse of [`from_wal`](Self::from_wal): returns
+    /// `(segment_offset, row_group_idx)`.
+    fn to_wal(self) -> (u64, usize);
 }
 
-/// Decode a packed merge `position` back into its WAL coordinates.
-///
-/// Inverse of [`wal_merge_position`]: returns `(segment_offset, row_group_idx)`.
-///
-/// The two casts are provably lossless for positions produced by
-/// [`wal_merge_position`]: the high part is first masked to 64 bits (so it fits
-/// `u64`) and `row_group_idx` is masked to [`WAL_ROW_GROUP_IDX_BITS`] bits (so
-/// it fits `usize` on every supported 32-/64-bit target). The masks make the
-/// truncation a no-op, hence the scoped allow.
-#[must_use]
-#[allow(clippy::cast_possible_truncation)]
-pub const fn wal_decode_position(position: u128) -> (u64, usize) {
-    let segment_offset = ((position >> WAL_ROW_GROUP_IDX_BITS) & (u64::MAX as u128)) as u64;
-    let row_group_idx = (position & WAL_ROW_GROUP_IDX_MASK) as usize;
-    (segment_offset, row_group_idx)
+impl WalMergePosition for MergePosition {
+    fn from_wal(segment_offset: u64, row_group_idx: usize) -> Self {
+        Self::new(
+            (u128::from(segment_offset) << WAL_ROW_GROUP_IDX_BITS) | (row_group_idx as u128 & WAL_ROW_GROUP_IDX_MASK),
+        )
+    }
+
+    // The two casts are provably lossless for positions produced by `from_wal`:
+    // the high part is first masked to 64 bits (so it fits `u64`) and
+    // `row_group_idx` is masked to `WAL_ROW_GROUP_IDX_BITS` bits (so it fits
+    // `usize` on every supported 32-/64-bit target). The masks make the
+    // truncation a no-op, hence the scoped allow.
+    #[allow(clippy::cast_possible_truncation)]
+    fn to_wal(self) -> (u64, usize) {
+        let position = self.get();
+        let segment_offset = ((position >> WAL_ROW_GROUP_IDX_BITS) & u128::from(u64::MAX)) as u64;
+        let row_group_idx = (position & WAL_ROW_GROUP_IDX_MASK) as usize;
+        (segment_offset, row_group_idx)
+    }
 }
 
 /// Build the merger's flat input list from the Shifter's segment plan.
@@ -98,7 +115,7 @@ pub fn wal_inputs_from_segments(segments: &[super::SegmentToRead]) -> Vec<MergeI
         .iter()
         .flat_map(|segment| {
             segment.row_groups.iter().map(move |row_group| MergeInput {
-                position: wal_merge_position(segment.segment_offset, row_group.row_group_idx),
+                position: MergePosition::from_wal(segment.segment_offset, row_group.row_group_idx),
                 bytes: row_group.row_group_bytes,
                 boundary_range: row_group.boundary_range.clone(),
             })
@@ -131,7 +148,7 @@ impl MergeSource for WalMergeSource {
         input: &MergeInput,
         cancel: &CancellationToken,
     ) -> icegate_common::error::Result<icegate_common::iceberg_write::CommonRecordBatchStream> {
-        let (segment_offset, row_group_idx) = wal_decode_position(input.position);
+        let (segment_offset, row_group_idx) = input.position.to_wal();
         let stream = self
             .queue_reader
             .read_segment(&self.topic, segment_offset, &[row_group_idx], cancel)
@@ -181,7 +198,9 @@ pub(crate) fn is_wal_source_error(err: &icegate_common::error::CommonError) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::{wal_decode_position, wal_merge_position};
+    use icegate_common::merge::MergePosition;
+
+    use super::WalMergePosition;
 
     /// The packed `position` ordering must reproduce the old
     /// `(segment_offset, row_group_idx)` lexicographic tie-break exactly. This
@@ -204,8 +223,8 @@ mod tests {
 
         for &(left_offset, left_idx) in &cases {
             for &(right_offset, right_idx) in &cases {
-                let left = wal_merge_position(left_offset, left_idx);
-                let right = wal_merge_position(right_offset, right_idx);
+                let left = MergePosition::from_wal(left_offset, left_idx);
+                let right = MergePosition::from_wal(right_offset, right_idx);
                 let expected = (left_offset, left_idx).cmp(&(right_offset, right_idx));
                 assert_eq!(
                     left.cmp(&right),
@@ -217,12 +236,12 @@ mod tests {
         }
     }
 
-    /// `wal_decode_position` is the exact inverse of `wal_merge_position`.
+    /// `to_wal` is the exact inverse of `from_wal`.
     #[test]
     fn wal_position_round_trips() {
         for &(offset, idx) in &[(0_u64, 0_usize), (10, 3), (u64::from(u32::MAX), 5), (u64::MAX, 1)] {
-            let packed = wal_merge_position(offset, idx);
-            assert_eq!(wal_decode_position(packed), (offset, idx));
+            let packed = MergePosition::from_wal(offset, idx);
+            assert_eq!(packed.to_wal(), (offset, idx));
         }
     }
 }
