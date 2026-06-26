@@ -31,6 +31,7 @@ static LOGS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor,
 static SPANS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
 static EVENTS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
 static METRICS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
+static OPERATIONS_SORT_DESCRIPTOR: OnceLock<std::result::Result<SortColumnsDescriptor, String>> = OnceLock::new();
 
 /// One sort field compiled from an Iceberg sort order: the source column name,
 /// its primitive type, and the direction / null ordering used when comparing.
@@ -136,6 +137,21 @@ impl SortColumnsDescriptor {
         }
     }
 
+    /// Cached sort descriptor for the `operations` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operations schema/sort order cannot be built or
+    /// contains a non-primitive or unsupported sort field.
+    pub fn operations() -> Result<&'static Self> {
+        match OPERATIONS_SORT_DESCRIPTOR.get_or_init(|| Self::try_from_operations().map_err(|err| err.to_string())) {
+            Ok(descriptor) => Ok(descriptor),
+            Err(message) => Err(Error::Config(format!(
+                "failed to initialize operations sort descriptor: {message}"
+            ))),
+        }
+    }
+
     /// All sort fields in Iceberg sort-order order.
     #[must_use]
     pub fn columns(&self) -> &[SortColumnDescriptor] {
@@ -169,6 +185,12 @@ impl SortColumnsDescriptor {
     fn try_from_metrics() -> Result<Self> {
         let schema = crate::schema::metrics_schema()?;
         let sort_order = crate::schema::metrics_sort_order(&schema)?;
+        Self::try_from_schema_sort_order(&schema, &sort_order)
+    }
+
+    fn try_from_operations() -> Result<Self> {
+        let schema = crate::schema::operations_schema()?;
+        let sort_order = crate::schema::operations_sort_order(&schema)?;
         Self::try_from_schema_sort_order(&schema, &sort_order)
     }
 
@@ -923,6 +945,36 @@ mod tests {
 
         // The events sort order has exactly two fields: service_name, timestamp.
         assert_eq!(descriptor.columns().len(), 2);
+        assert_eq!(descriptor.columns().len(), sort_order.fields.len());
+
+        for (descriptor_column, sort_field) in descriptor.columns().iter().zip(&sort_order.fields) {
+            let schema_field = resolve_sort_schema_field(&schema, sort_field).expect("sort field must resolve");
+            assert_eq!(descriptor_column.column_name, schema_field.name);
+            assert_eq!(
+                descriptor_column.primitive_type,
+                schema_field
+                    .field_type
+                    .as_primitive_type()
+                    .expect("sort field must be primitive")
+                    .clone()
+            );
+            assert_eq!(
+                descriptor_column.descending,
+                matches!(sort_field.direction, SortDirection::Descending)
+            );
+            assert_eq!(
+                descriptor_column.nulls_first,
+                matches!(sort_field.null_order, NullOrder::First)
+            );
+        }
+    }
+
+    #[test]
+    fn operations_sort_descriptor_matches_operations_sort_order() {
+        let schema = crate::schema::operations_schema().expect("operations schema");
+        let sort_order = crate::schema::operations_sort_order(&schema).expect("operations sort order");
+        let descriptor = SortColumnsDescriptor::operations().expect("operations descriptor");
+
         assert_eq!(descriptor.columns().len(), sort_order.fields.len());
 
         for (descriptor_column, sort_field) in descriptor.columns().iter().zip(&sort_order.fields) {
