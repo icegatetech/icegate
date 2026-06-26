@@ -112,7 +112,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -123,7 +123,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2950,7 +2950,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3763,7 +3763,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3813,8 +3813,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b795ef2e2197596efad630c5e8cc4b4ebdfc488c02dadc709bef0416e1ffd49"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=03956eeae771991ebcb2ab3731b76bced0c640ca#03956eeae771991ebcb2ab3731b76bced0c640ca"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -3867,8 +3866,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0146d632865e179b14b79064a0eb976edda890199879264133c44e101371f98"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=03956eeae771991ebcb2ab3731b76bced0c640ca#03956eeae771991ebcb2ab3731b76bced0c640ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3884,8 +3882,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "892fe71df3f5d1707c7ede042545051aca659a8a4a8ca828c5a13064338f56fc"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=03956eeae771991ebcb2ab3731b76bced0c640ca#03956eeae771991ebcb2ab3731b76bced0c640ca"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3905,8 +3902,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-s3tables"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3bb0ad272c33f2d724ff2a4f0cade646fcebfb9d67358897310e85f3d5d7927"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=03956eeae771991ebcb2ab3731b76bced0c640ca#03956eeae771991ebcb2ab3731b76bced0c640ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3919,8 +3915,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be3e981027526bdb23a4318b1016c1f68142ef11b414ba732eb7cd3f8313857f"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=03956eeae771991ebcb2ab3731b76bced0c640ca#03956eeae771991ebcb2ab3731b76bced0c640ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3936,8 +3931,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b8745ded8db2a4c2febc84ce2d5e9aaf5e2a1c0c9f6a82a1ea8134691e30a0b"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=03956eeae771991ebcb2ab3731b76bced0c640ca#03956eeae771991ebcb2ab3731b76bced0c640ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3993,6 +3987,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-catalog-s3tables",
  "icegate-catalog-s3",
+ "icegate-common",
  "object_store",
  "object_store_opendal",
  "opendal",
@@ -4018,6 +4013,7 @@ dependencies = [
  "tracing-subscriber",
  "typetag",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4089,17 +4085,29 @@ dependencies = [
 name = "icegate-maintain"
 version = "0.2.0"
 dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
  "clap",
+ "futures",
  "iceberg",
+ "icegate-catalog-s3",
  "icegate-common",
+ "icegate-jobmanager",
+ "opentelemetry",
+ "parquet",
  "serde",
+ "serde_json",
  "serde_yaml",
  "testcontainers",
  "thiserror 2.0.18",
+ "tikv-jemallocator",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4393,7 +4401,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4816,7 +4824,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5682,7 +5690,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.38",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5720,7 +5728,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -6144,7 +6152,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6215,7 +6223,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6700,7 +6708,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6909,7 +6917,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7883,7 +7891,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

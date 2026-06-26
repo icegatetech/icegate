@@ -19,21 +19,30 @@ path = "src/main.rs"
 
 [dependencies]
 icegate-common = { workspace = true }
+icegate-jobmanager = { path = "../icegate-jobmanager" }
 
 # Iceberg
 iceberg = { workspace = true }
+
+# Arrow ecosystem
+arrow = { workspace = true }
+parquet = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
 
 # CLI
 clap = { workspace = true }
 
 # Configuration
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 
@@ -41,6 +50,23 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Metrics: compaction instruments record to the globally-installed meter
+# provider (no-op when none is set), mirroring ingest's shift metrics.
+opentelemetry = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Memory allocator: the long-running `run` compaction service retains memory
+# across many rewrite cycles, so use jemalloc (as ingest/query do) to avoid the
+# glibc-malloc arena fragmentation that otherwise grows container RSS without
+# bound. Only linked on Linux; see the `#[global_allocator]` in `main.rs`.
+tikv-jemallocator = { workspace = true }
+
 [dev-dependencies]
 icegate-common = { workspace = true, features = ["testing"] }
+# Integration tests seed tables over MinIO through the concrete S3 catalog and
+# then drive compaction against it as an `Arc<dyn Catalog>`.
+icegate-catalog-s3 = { workspace = true }
 testcontainers = { workspace = true }

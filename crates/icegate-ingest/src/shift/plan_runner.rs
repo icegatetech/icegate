@@ -250,7 +250,11 @@ where
             .get_last_offset(cancel_token)
             .await
             .map_err(|e| Error::TaskExecution(format!("failed to read committed offset: {e}")))?
-            .map_or(0, |offset| offset + 1);
+            // Mirror the query side (`extract_wal_offset` caller) exactly: a
+            // saturating step keeps the WAL/Iceberg boundary identical on both
+            // sides and avoids wrapping a near-`u64::MAX` offset back to 0, which
+            // would re-shift the whole queue.
+            .map_or(0, |offset| offset.saturating_add(1));
 
         info!("plan: topic '{}' starting from offset {}", self.topic, start_offset);
 

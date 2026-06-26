@@ -213,8 +213,13 @@ fn row_group_boundary_range_from_cached_columns(
         max_key,
     };
     range.validate().map_err(|err| match err {
-        IngestError::Shift(message) => IngestError::Shift(format!("invalid WAL row-group boundary range: {message}")),
-        other => other,
+        // `RowGroupBoundaryRange::validate` reports invalid ranges as
+        // `CommonError::Write`; preserve the original `IngestError::Shift`
+        // wrapping and message prefix for callers.
+        icegate_common::error::CommonError::Write(message) => {
+            IngestError::Shift(format!("invalid WAL row-group boundary range: {message}"))
+        }
+        other => other.into(),
     })?;
 
     Ok(range)

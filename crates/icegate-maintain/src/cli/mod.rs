@@ -27,6 +27,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: MigrateCommands,
     },
+    /// Run the long-running maintenance service (compaction).
+    Run {
+        /// Path to configuration file
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+    },
 }
 
 /// Migration subcommands
@@ -61,6 +67,24 @@ impl Cli {
     pub async fn execute(self) -> Result<(), MaintainError> {
         match self.command {
             Commands::Migrate { command } => commands::migrate::execute(command).await,
+            Commands::Run { config } => commands::run::execute(config).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn parses_run_subcommand_with_config_path() {
+        let cli = Cli::try_parse_from(["maintain", "run", "-c", "cfg.yaml"])
+            .expect("`maintain run -c cfg.yaml` should parse");
+        let Commands::Run { config } = cli.command else {
+            panic!("expected the Run subcommand variant");
+        };
+        assert_eq!(config, std::path::PathBuf::from("cfg.yaml"));
     }
 }
