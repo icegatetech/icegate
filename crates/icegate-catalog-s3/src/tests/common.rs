@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -23,7 +23,7 @@ use crate::config::S3CatalogConfig;
 use crate::config::cas_retrier_config_default;
 use crate::error::{Error, Result};
 use crate::infra::retrier::Retrier;
-use crate::model::CatalogRoot;
+use crate::root::CatalogRoot;
 use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::s3::S3CatalogStorage;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
@@ -131,8 +131,12 @@ pub(crate) struct TestEnv {
     pub(crate) tables_uri_prefix: String,
 }
 
+/// Start a fresh `MinIO` container with a unique bucket and a raw S3 storage
+/// backend over it. Shared by the raw ([`make_catalog`]) and cached
+/// ([`make_cached_catalog`]) harnesses so the bucket bootstrap lives in one
+/// place.
 #[allow(clippy::expect_used)]
-pub(crate) async fn make_catalog() -> TestEnv {
+async fn bootstrap_minio_storage() -> (testcontainers::ContainerAsync<MinIO>, Arc<S3CatalogStorage>, String) {
     let minio = MinIO::default().start().await.expect("start minio");
     let port = minio.get_host_port_ipv4(9000).await.expect("minio port");
     let endpoint = format!("http://127.0.0.1:{port}");
@@ -147,7 +151,6 @@ pub(crate) async fn make_catalog() -> TestEnv {
     let client = aws_sdk_s3::Client::new(&cfg);
     client.create_bucket().bucket(&bucket).send().await.expect("create bucket");
 
-    let file_io = FileIO::new_with_memory();
     let storage = Arc::new(
         S3CatalogStorage::new(
             &S3CatalogConfig {
@@ -166,13 +169,122 @@ pub(crate) async fn make_catalog() -> TestEnv {
     );
 
     let tables_uri_prefix = format!("s3://{bucket}/warehouse/catalog/tables");
-    let catalog = test_catalog(storage.clone(), file_io, tables_uri_prefix.clone());
+    (minio, storage, tables_uri_prefix)
+}
+
+pub(crate) async fn make_catalog() -> TestEnv {
+    let (minio, storage, tables_uri_prefix) = bootstrap_minio_storage().await;
+    let catalog = test_catalog(storage.clone(), FileIO::new_with_memory(), tables_uri_prefix.clone());
 
     TestEnv {
         _minio: minio,
         catalog,
         s3_storage: storage,
         tables_uri_prefix,
+    }
+}
+
+/// Counters and a catalog over the production composition `Cached(Counting(S3))`.
+///
+/// The counting layer sits between the cache and the real S3 backend so a test
+/// can tell whether a cache revalidation hit a 304 (`not_modified`) or had to
+/// refetch the root body (`loaded`). `s3_storage` is the same raw backend the
+/// cache wraps, exposed so a test can drive an out-of-band writer that bypasses
+/// the cache.
+pub(crate) struct CachedTestEnv {
+    _minio: testcontainers::ContainerAsync<MinIO>,
+    pub(crate) catalog: S3Catalog,
+    pub(crate) counting: Arc<LoadCountingStorage>,
+    pub(crate) s3_storage: Arc<S3CatalogStorage>,
+    pub(crate) tables_uri_prefix: String,
+}
+
+/// Build the production S3 + cache composition over a fresh `MinIO` bucket.
+///
+/// This is the only harness that exercises the real `If-None-Match` round-trip
+/// end-to-end: the cache revalidates against S3, and `object_store` maps a 304
+/// into [`LoadOutcome::NotModified`]. The unit tests in `cached.rs` only simulate
+/// that against an in-memory backend.
+pub(crate) async fn make_cached_catalog() -> CachedTestEnv {
+    let (minio, storage, tables_uri_prefix) = bootstrap_minio_storage().await;
+    let counting = Arc::new(LoadCountingStorage::new(storage.clone()));
+    let counting_dyn: Arc<dyn CatalogStorage> = counting.clone();
+    let cached: Arc<dyn CatalogStorage> = Arc::new(CachedCatalogStorage::new(
+        counting_dyn,
+        S3CatalogConfig::default().metadata_cache_cap,
+    ));
+    let catalog = test_catalog(cached, FileIO::new_with_memory(), tables_uri_prefix.clone());
+
+    CachedTestEnv {
+        _minio: minio,
+        catalog,
+        counting,
+        s3_storage: storage,
+        tables_uri_prefix,
+    }
+}
+
+/// Storage decorator that records how the inner backend answered each
+/// `load_root`, letting cache tests assert a revalidation served a 304 rather
+/// than refetching the root body. Pass-through for every other method.
+pub(crate) struct LoadCountingStorage {
+    inner: Arc<dyn CatalogStorage>,
+    loaded: AtomicUsize,
+    not_modified: AtomicUsize,
+}
+
+impl LoadCountingStorage {
+    fn new(inner: Arc<dyn CatalogStorage>) -> Self {
+        Self {
+            inner,
+            loaded: AtomicUsize::new(0),
+            not_modified: AtomicUsize::new(0),
+        }
+    }
+
+    /// Count of `load_root` calls the inner backend answered with a full body.
+    pub(crate) fn loaded(&self) -> usize {
+        self.loaded.load(Ordering::SeqCst)
+    }
+
+    /// Count of `load_root` calls the inner backend short-circuited with a 304.
+    pub(crate) fn not_modified(&self) -> usize {
+        self.not_modified.load(Ordering::SeqCst)
+    }
+
+    /// Zero both counters so a test can isolate the reads it cares about.
+    pub(crate) fn reset(&self) {
+        self.loaded.store(0, Ordering::SeqCst);
+        self.not_modified.store(0, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl CatalogStorage for LoadCountingStorage {
+    async fn load_root(&self, known: Option<&Version>) -> Result<LoadOutcome> {
+        let outcome = self.inner.load_root(known).await?;
+        match &outcome {
+            LoadOutcome::Loaded { .. } => {
+                self.loaded.fetch_add(1, Ordering::SeqCst);
+            }
+            LoadOutcome::NotModified => {
+                self.not_modified.fetch_add(1, Ordering::SeqCst);
+            }
+            LoadOutcome::Absent => {}
+        }
+        Ok(outcome)
+    }
+
+    async fn save_root(&self, root: Arc<CatalogRoot>, expected: &Version) -> Result<Version> {
+        self.inner.save_root(root, expected).await
+    }
+
+    async fn read_table_metadata(&self, location: &str) -> Result<Arc<TableMetadata>> {
+        self.inner.read_table_metadata(location).await
+    }
+
+    async fn write_table_metadata(&self, location: &str, metadata: &TableMetadata) -> Result<()> {
+        self.inner.write_table_metadata(location, metadata).await
     }
 }
 

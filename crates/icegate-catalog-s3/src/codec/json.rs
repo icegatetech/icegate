@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::codec::CatalogCodec;
 use crate::error::{Error, Result};
-use crate::model::CatalogRoot;
+use crate::root::CatalogRoot;
 
 /// JSON implementation of [`CatalogCodec`].
 #[derive(Debug)]
@@ -34,7 +34,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::model::{CatalogRoot, CatalogTableLink, TableId, TableKey, TableMetadataLocation};
+    use crate::root::{CatalogRoot, CatalogTableLink, TableId, TableKey, TableMetadataLocation};
 
     fn sample_root() -> CatalogRoot {
         let mut root = CatalogRoot::default();

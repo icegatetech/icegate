@@ -1,8 +1,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -14,14 +17,15 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::common::{
-    create_table, make_catalog, make_in_memory_catalog, make_in_memory_catalog_cached,
-    make_in_memory_catalog_with_storage, metadata_version_in, test_schema, update_request,
+    CachedTestEnv, create_table, make_cached_catalog, make_catalog, make_in_memory_catalog,
+    make_in_memory_catalog_cached, make_in_memory_catalog_with_storage, metadata_version_in, test_schema,
+    update_request,
 };
 use crate::catalog::S3Catalog;
 use crate::config::{S3CatalogConfig, cas_retrier_config_default};
 use crate::error::Error;
-use crate::infra::retrier::Retrier;
-use crate::model::{CatalogRoot, CatalogTableLink, IcebergTableMetadata, TableId, TableKey, TableMetadataLocation};
+use crate::infra::retrier::{Retrier, RetrierConfig};
+use crate::root::{CatalogRoot, CatalogTableLink, IcebergTableMetadata, TableId, TableKey, TableMetadataLocation};
 use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
@@ -83,6 +87,13 @@ fn root_namespaces_json(root: &CatalogRoot) -> Value {
 /// then cleared.
 type BeforeSaveRootHook = Box<dyn Fn(&mut CatalogRoot) + Send + Sync>;
 
+/// One-shot async hook fired immediately after a lost-ack `save_root` lands the
+/// caller's root but before it reports the synthetic conflict. Lets a test model
+/// a concurrent writer that advances the table on top of the just-landed head,
+/// so the caller's prepared file becomes an ancestor of the new head before its
+/// retry reloads.
+type AfterLostAckHook = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 struct ConflictOnSaveStorage {
     root: RwLock<Option<(Arc<CatalogRoot>, u64)>>,
     metadata: dashmap::DashMap<String, Bytes>,
@@ -104,6 +115,9 @@ struct ConflictOnSaveStorage {
     /// Conflict-injecting hook. Fires once on the next `save_root` before the
     /// version compare, then is taken out of the slot.
     before_save_root_hook: Mutex<Option<BeforeSaveRootHook>>,
+    /// Concurrent-advance hook. Fires once right after a lost-ack `save_root`
+    /// lands the caller's root, then is taken out of the slot.
+    after_lost_ack_hook: Mutex<Option<AfterLostAckHook>>,
 }
 
 impl ConflictOnSaveStorage {
@@ -116,6 +130,7 @@ impl ConflictOnSaveStorage {
             fail_next_save_roots: AtomicUsize::new(0),
             lost_ack_save_roots: AtomicUsize::new(0),
             before_save_root_hook: Mutex::new(None),
+            after_lost_ack_hook: Mutex::new(None),
         }
     }
 
@@ -140,6 +155,13 @@ impl ConflictOnSaveStorage {
         F: Fn(&mut CatalogRoot) + Send + Sync + 'static,
     {
         *self.before_save_root_hook.lock().await = Some(Box::new(hook));
+    }
+
+    async fn set_after_lost_ack_hook<F>(&self, hook: F)
+    where
+        F: Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static,
+    {
+        *self.after_lost_ack_hook.lock().await = Some(Box::new(hook));
     }
 
     fn metadata_locations(&self) -> Vec<String> {
@@ -202,6 +224,12 @@ impl CatalogStorage for ConflictOnSaveStorage {
                 let next_version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
                 *guard = Some((root, next_version));
                 drop(guard);
+                // Model a concurrent writer that advances the table on top of our
+                // just-landed head before the retry reloads.
+                let hook = self.after_lost_ack_hook.lock().await.take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
                 return Err(Error::CommitConflict);
             }
         }
@@ -1329,11 +1357,23 @@ async fn commit_vs_drop() {
     let drop_op = env.catalog.drop_table(table.identifier());
 
     let (r1, r2) = tokio::join!(commit, drop_op);
-    assert!(r1.is_ok() ^ r2.is_ok());
+    // Unlike the rename races below, `(Ok, Ok)` is a legitimate serialization
+    // here: commit keeps the entry active under the same `table_id`, so if it
+    // wins the first root CAS, `drop_table` rereads the fresh root, still finds
+    // the active entry by `table_id`, and tombstones it — both operations
+    // succeed (commit-happened-before-drop). Only the loser of a *both-active*
+    // race can fail, so at least one operation must succeed.
+    assert!(r1.is_ok() || r2.is_ok());
 
     let root = unwrap_loaded(env.s3_storage.load_root(None).await.expect("load root")).0;
     let key = TableKey::from_ident(table.identifier());
     match (r1, r2) {
+        (Ok(_), Ok(())) => {
+            // commit-happened-before-drop: the table ends tombstoned.
+            let error = env.catalog.load_table(table.identifier()).await.expect_err("dropped table");
+            assert_eq!(error.kind(), ErrorKind::TableNotFound);
+            assert!(root.get_active(&key).is_none());
+        }
         (Ok(response), Err(_)) => {
             let committed = response.into_iter().next().expect("committed table");
             let loaded = env.catalog.load_table(table.identifier()).await.expect("load committed table");
@@ -1344,12 +1384,65 @@ async fn commit_vs_drop() {
             );
         }
         (Err(_), Ok(())) => {
-            let loaded = env.catalog.load_table(table.identifier()).await.expect_err("dropped table");
-            assert_eq!(loaded.kind(), ErrorKind::TableNotFound);
+            let error = env.catalog.load_table(table.identifier()).await.expect_err("dropped table");
+            assert_eq!(error.kind(), ErrorKind::TableNotFound);
             assert!(root.get_active(&key).is_none());
         }
-        _ => unreachable!("exactly one operation must succeed"),
+        (Err(_), Err(_)) => unreachable!("at least one operation must succeed"),
     }
+}
+
+#[tokio::test]
+async fn cached_s3_revalidates_root_via_304() {
+    let env: CachedTestEnv = make_cached_catalog().await;
+    let ns = NamespaceIdent::new("ns1".to_string());
+    // Prime the root cache through the production composition.
+    create_table(&env.catalog, &ns, "tbl").await;
+
+    // Isolate the reads under test from the priming traffic above.
+    env.counting.reset();
+
+    let ident = TableIdent::new(ns, "tbl".to_string());
+    assert!(env.catalog.table_exists(&ident).await.expect("first exists"));
+    assert!(env.catalog.table_exists(&ident).await.expect("second exists"));
+
+    // Each read revalidates the cached root against S3 and receives a 304; the
+    // body is served from cache, so the inner backend never refetches it. This is
+    // the real `If-None-Match` round-trip the feature exists for, end-to-end.
+    assert_eq!(env.counting.not_modified(), 2, "both reads must short-circuit on a 304");
+    assert_eq!(env.counting.loaded(), 0, "a fresh cache must not refetch the root body");
+}
+
+#[tokio::test]
+async fn cached_s3_picks_up_external_root_change() {
+    let env: CachedTestEnv = make_cached_catalog().await;
+    let ns = NamespaceIdent::new("ns1".to_string());
+    // Prime this catalog's cache with the current root.
+    create_table(&env.catalog, &ns, "tbl").await;
+
+    // A second catalog over the SAME bucket, wired straight to raw S3 — it
+    // bypasses the cache under test and bumps the real root etag.
+    let external = test_catalog(
+        env.s3_storage.clone(),
+        FileIO::new_with_memory(),
+        env.tables_uri_prefix.clone(),
+    );
+    create_table(&external, &ns, "tbl_external").await;
+
+    env.counting.reset();
+
+    // The cached catalog still holds the pre-change etag; its conditional read
+    // now misses the 304, refetches the fresh root body, and sees the new table.
+    let external_ident = TableIdent::new(ns, "tbl_external".to_string());
+    assert!(
+        env.catalog.table_exists(&external_ident).await.expect("external table visible"),
+        "cache must revalidate and pick up the externally written root"
+    );
+    assert!(
+        env.counting.loaded() >= 1,
+        "a stale etag must force a root body refetch"
+    );
+    assert_eq!(env.counting.not_modified(), 0, "a stale etag cannot produce a 304");
 }
 
 #[tokio::test]
@@ -1365,6 +1458,9 @@ async fn rename_vs_rename() {
     let r2 = env.catalog.rename_table(table.identifier(), &dest2);
 
     let (v1, v2) = tokio::join!(r1, r2);
+    // Strict XOR holds in both CAS orders here (unlike `commit_vs_drop`): the
+    // winning rename removes the source key from `tables`, so the loser rereads a
+    // root where the source is gone and fails with `TableNotFound`.
     assert!(v1.is_ok() ^ v2.is_ok());
 
     let root = unwrap_loaded(env.s3_storage.load_root(None).await.expect("load root")).0;
@@ -1391,6 +1487,9 @@ async fn rename_vs_drop() {
     let drop_op = env.catalog.drop_table(table.identifier());
 
     let (r1, r2) = tokio::join!(rename, drop_op);
+    // Strict XOR holds in both CAS orders here (unlike `commit_vs_drop`): whoever
+    // wins removes the source key from `tables` (rename moves it, drop tombstones
+    // it), so the loser rereads a root without the source and fails.
     assert!(r1.is_ok() ^ r2.is_ok());
 
     let root = unwrap_loaded(env.s3_storage.load_root(None).await.expect("load root")).0;
@@ -1719,6 +1818,25 @@ async fn prepare_competitor_commit(
     prepared.updated.metadata_location().clone()
 }
 
+/// Publish a competitor commit on top of the table's current head, advancing the
+/// stored root to the new successor. Models a concurrent writer that lands a
+/// fresh version while another commit is mid-retry.
+async fn publish_competitor_commit(storage: &Arc<ConflictOnSaveStorage>, identifier: &TableIdent) {
+    let key = TableKey::from_ident(identifier);
+    let competitor = prepare_competitor_commit(storage, identifier).await;
+    loop {
+        let (root, version) = unwrap_loaded(storage.load_root(None).await.expect("load root"));
+        let mut next_root = (*root).clone();
+        let head = next_root.get_active(&key).expect("active head").clone();
+        next_root
+            .apply_commit(&key, &head, competitor.clone())
+            .expect("advance head to competitor");
+        if storage.save_root(Arc::new(next_root), &version).await.is_ok() {
+            break;
+        }
+    }
+}
+
 #[tokio::test]
 async fn commit_transaction_rebuilds_on_table_state_conflict() {
     // A *table-state* conflict (somebody else moved my target table while I
@@ -1896,6 +2014,80 @@ async fn commit_transaction_converges_after_lost_ack() {
 }
 
 #[tokio::test]
+async fn commit_transaction_treats_landed_commit_in_lineage_as_applied() {
+    // Lost-ack + concurrent advance: our root CAS physically landed (the prepared
+    // N=1 pointer became the head) but the success response was lost and surfaced
+    // as CommitConflict. Before the retry reloaded, a concurrent writer advanced
+    // the table to N=2 on top of our N=1, so our prepared file is now an ancestor
+    // of the head. The retry must recognise it already sits in the head lineage
+    // and report success WITHOUT rebuilding a redundant successor on the newer
+    // head — which would duplicate the update or trip a requirement check on
+    // already-committed state.
+    let storage = Arc::new(ConflictOnSaveStorage::new());
+    let catalog = test_catalog(
+        storage.clone(),
+        FileIO::new_with_memory(),
+        "memory://catalog/tables".to_string(),
+    );
+    let namespace = NamespaceIdent::new("ns1".to_string());
+    let table = create_table(&catalog, &namespace, "tbl").await;
+    let key = TableKey::from_ident(table.identifier());
+
+    storage.lose_ack_on_next_save_root();
+    let hook_storage = storage.clone();
+    let hook_identifier = table.identifier().clone();
+    storage
+        .set_after_lost_ack_hook(move || {
+            let storage = hook_storage.clone();
+            let identifier = hook_identifier.clone();
+            Box::pin(async move {
+                publish_competitor_commit(&storage, &identifier).await;
+            })
+        })
+        .await;
+
+    let updated = catalog
+        .commit_transaction(vec![update_request(&table, "k", "v1").await])
+        .await
+        .expect("commit must treat its landed commit in the head lineage as applied")
+        .into_iter()
+        .next()
+        .expect("one table");
+    let our_location = updated.metadata_location().expect("our location").to_string();
+
+    // We get back our own landed N=1, never a rebuilt successor.
+    assert!(
+        our_location.contains("/metadata/00001-"),
+        "returned table must be our landed N=1, got {our_location}",
+    );
+
+    // The head stays at the concurrent writer's N=2 — never regressed to our N=1,
+    // never rebuilt to N=3.
+    let root = storage.root_state().await;
+    let head_location = root
+        .get_active(&key)
+        .expect("active head")
+        .metadata_location()
+        .as_str()
+        .to_string();
+    assert!(
+        head_location.contains("/metadata/00002-"),
+        "head must remain the concurrent N=2, got {head_location}",
+    );
+
+    let locations = storage.metadata_locations();
+    assert_eq!(
+        locations.len(),
+        3,
+        "exactly three metadata files (00000-, our 00001-, concurrent 00002-) — no N=3 rebuild, got {locations:?}",
+    );
+    assert!(
+        !locations.iter().any(|l| l.contains("/metadata/00003-")),
+        "a redundant successor must not be rebuilt, got {locations:?}",
+    );
+}
+
+#[tokio::test]
 async fn drop_table_converges_after_lost_ack() {
     let storage = Arc::new(ConflictOnSaveStorage::new());
     let catalog = test_catalog(
@@ -1918,6 +2110,29 @@ async fn drop_table_converges_after_lost_ack() {
     assert!(root.get_active(&key).is_none());
     let tombstones = root_tombstones_json(&root).as_object().cloned().expect("tombstones object");
     assert!(tombstones.contains_key(&table_id.to_string()));
+}
+
+#[tokio::test]
+async fn drop_namespace_converges_after_lost_ack() {
+    let storage = Arc::new(ConflictOnSaveStorage::new());
+    let catalog = test_catalog(
+        storage.clone(),
+        FileIO::new_with_memory(),
+        "memory://catalog/tables".to_string(),
+    );
+    let namespace = NamespaceIdent::new("ns1".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    storage.lose_ack_on_next_save_root();
+    catalog
+        .drop_namespace(&namespace)
+        .await
+        .expect("drop must converge on its own landed removal after a lost ack");
+
+    assert!(storage.root_state().await.get_namespace(&namespace).is_none());
 }
 
 #[tokio::test]
@@ -2210,5 +2425,206 @@ async fn commit_transaction_root_cas_conflicts_reload_through_cache() {
             .metadata_location()
             .as_str(),
         updated_location
+    );
+}
+
+#[tokio::test]
+async fn create_table_converges_after_lost_ack() {
+    // Lost-ack convergence for create (symmetric with the commit/drop/rename
+    // lost-ack tests): our root CAS physically landed (the table is now linked)
+    // but the ack was lost and surfaced as CommitConflict. The retry must
+    // recognise its own write — same table_id and metadata_location — and report
+    // success instead of TableAlreadyExists, without writing a second metadata
+    // file.
+    let storage = Arc::new(ConflictOnSaveStorage::new());
+    let catalog = test_catalog(
+        storage.clone(),
+        FileIO::new_with_memory(),
+        "memory://catalog/tables".to_string(),
+    );
+    let namespace = NamespaceIdent::new("ns1".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    storage.lose_ack_on_next_save_root();
+    let created = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder().name("tbl".to_string()).schema(test_schema()).build(),
+        )
+        .await
+        .expect("create must converge on its own landed link after a lost ack");
+    let created_location = created.metadata_location().expect("created metadata location").to_string();
+
+    let key = TableKey::from_ident(created.identifier());
+    let root = storage.root_state().await;
+    assert_eq!(
+        root.get_active(&key)
+            .expect("active table after lost-ack create")
+            .metadata_location()
+            .as_str(),
+        created_location.as_str(),
+    );
+    // The create wrote its metadata once; convergence must not write a second.
+    assert_eq!(
+        storage.metadata_locations().len(),
+        1,
+        "lost-ack convergence must not re-write table metadata"
+    );
+}
+
+#[tokio::test]
+async fn register_table_converges_after_lost_ack() {
+    // Lost-ack convergence for register, mirroring create_table: the retry sees
+    // its own already-linked entry (same table_id and metadata_location) and
+    // converges to success rather than failing TableAlreadyExists.
+    let storage = Arc::new(ConflictOnSaveStorage::new());
+    let catalog = test_catalog(
+        storage.clone(),
+        FileIO::new_with_memory(),
+        "memory://catalog/tables".to_string(),
+    );
+    let namespace = NamespaceIdent::new("ns1".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let table_ident = TableIdent::new(namespace, "registered".to_string());
+    let table_metadata = TableMetadataBuilder::new(
+        test_schema(),
+        UnboundPartitionSpec::default(),
+        SortOrder::unsorted_order(),
+        "memory://catalog/tables/external".to_string(),
+        FormatVersion::V2,
+        HashMap::new(),
+    )
+    .expect("metadata builder")
+    .build()
+    .expect("table metadata")
+    .metadata;
+    let metadata_location = initial_metadata_location(table_metadata.location());
+    storage
+        .write_table_metadata(&metadata_location, &table_metadata)
+        .await
+        .expect("write metadata");
+
+    storage.lose_ack_on_next_save_root();
+    let registered = catalog
+        .register_table(&table_ident, metadata_location.clone())
+        .await
+        .expect("register must converge on its own landed link after a lost ack");
+
+    assert_eq!(registered.metadata_location(), Some(metadata_location.as_str()));
+    let root = storage.root_state().await;
+    assert_eq!(
+        root.get_active(&TableKey::from_ident(&table_ident))
+            .expect("active registered table")
+            .metadata_location()
+            .as_str(),
+        metadata_location.as_str(),
+    );
+}
+
+#[tokio::test]
+async fn create_namespace_does_not_converge_after_lost_ack() {
+    // create_namespace deliberately does NOT converge: it has no stable identity
+    // token to tell a self-retry from a genuine duplicate, so a lost ack on its
+    // own landed write surfaces as a spurious NamespaceAlreadyExists rather than
+    // a silent success. Locks the documented decision in S3Catalog::create_namespace
+    // so a future "converge namespaces too" change cannot pass silently.
+    let storage = Arc::new(ConflictOnSaveStorage::new());
+    let catalog = test_catalog(
+        storage.clone(),
+        FileIO::new_with_memory(),
+        "memory://catalog/tables".to_string(),
+    );
+    let namespace = NamespaceIdent::new("ns1".to_string());
+
+    storage.lose_ack_on_next_save_root();
+    let error = catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect_err("create_namespace must not converge after a lost ack");
+
+    assert_eq!(error.kind(), ErrorKind::NamespaceAlreadyExists);
+    // The landed write is still durable: the namespace exists exactly once.
+    assert!(storage.root_state().await.get_namespace(&namespace).is_some());
+}
+
+#[tokio::test]
+async fn commit_transaction_exhausts_cas_budget_with_max_attempts_error() {
+    // A never-resolving root-CAS conflict must terminate with CasMaxAttempts once
+    // the retry budget is spent — the optimistic loop on this critical path must
+    // not spin forever. Uses a tiny budget plus more synthetic conflicts than it
+    // allows, so the loop can never win.
+    let storage = Arc::new(ConflictOnSaveStorage::new());
+    let small_budget = RetrierConfig {
+        max_attempts: 3,
+        rand_delay: Duration::ZERO,
+        delays: vec![Duration::ZERO],
+    };
+    let catalog = S3Catalog::with_storage(
+        storage.clone(),
+        FileIO::new_with_memory(),
+        "memory://catalog/tables".to_string(),
+        Retrier::new(small_budget),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let namespace = NamespaceIdent::new("ns1".to_string());
+    let table = create_table(&catalog, &namespace, "tbl").await;
+
+    storage.fail_next_n_save_roots(100);
+    let error = catalog
+        .commit_transaction(vec![update_request(&table, "k", "v1").await])
+        .await
+        .expect_err("exhausted CAS budget must fail");
+
+    assert!(matches!(error, Error::CasMaxAttempts));
+}
+
+#[tokio::test]
+async fn concurrent_commits_to_same_table_serialize_on_real_s3() {
+    // Real-S3 guarantee the in-memory hook tests cannot give: many writers
+    // committing to the SAME table concurrently must all succeed via reload +
+    // rebuild, and real S3 conditional-PUT CAS must serialize them with no lost
+    // update — the head advances by exactly the number of writers.
+    let env = make_catalog().await;
+    let ns = NamespaceIdent::new("ns1".to_string());
+    let table = create_table(&env.catalog, &ns, "tbl").await;
+
+    let c0 = env.catalog.commit_transaction(vec![update_request(&table, "k", "v0").await]);
+    let c1 = env.catalog.commit_transaction(vec![update_request(&table, "k", "v1").await]);
+    let c2 = env.catalog.commit_transaction(vec![update_request(&table, "k", "v2").await]);
+    let c3 = env.catalog.commit_transaction(vec![update_request(&table, "k", "v3").await]);
+    let c4 = env.catalog.commit_transaction(vec![update_request(&table, "k", "v4").await]);
+
+    let (r0, r1, r2, r3, r4) = tokio::join!(c0, c1, c2, c3, c4);
+    r0.expect("concurrent commit 0 must eventually succeed");
+    r1.expect("concurrent commit 1 must eventually succeed");
+    r2.expect("concurrent commit 2 must eventually succeed");
+    r3.expect("concurrent commit 3 must eventually succeed");
+    r4.expect("concurrent commit 4 must eventually succeed");
+
+    let loaded = env
+        .catalog
+        .load_table(table.identifier())
+        .await
+        .expect("load after concurrent commits");
+    assert_eq!(
+        metadata_version_in(loaded.metadata_location().expect("loaded location")),
+        5,
+        "real S3 CAS must serialize all writers with no lost update",
+    );
+
+    let root = unwrap_loaded(env.s3_storage.load_root(None).await.expect("load root")).0;
+    assert_eq!(
+        root.get_active(&TableKey::from_ident(table.identifier()))
+            .expect("active root entry")
+            .metadata_location()
+            .as_str(),
+        loaded.metadata_location().expect("loaded metadata location"),
     );
 }

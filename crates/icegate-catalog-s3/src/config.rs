@@ -14,10 +14,11 @@ use crate::infra::retrier::RetrierConfig;
 /// handful of growing backoffs or is escalated to the caller. With `max_attempts`
 /// = 7 the loop sleeps 6 times over the `[50, 100, 200, 500]` curve (the last
 /// delay clamps), so the whole budget is bounded at roughly 2 seconds (worst
-/// case: 50+100+200+500+500+500 ms base plus ≤50 ms jitter each). A hard failure
-/// misclassified as transient — e.g. bad credentials surfaced by `object_store`
-/// as `Generic` — therefore stalls the hot ingest path for seconds, not minutes.
-/// See `error.rs` for that mapping.
+/// case: 50+100+200+500+500+500 ms base plus ≤50 ms jitter each). Permanent auth
+/// failures (403/401) are classified non-retryable and fail fast; only the rare
+/// permanent case hidden inside `Generic` (e.g. 400 or a wrong endpoint) inherits
+/// this curve, so it stalls the hot ingest path for seconds, not minutes. See
+/// `error.rs` for that mapping.
 pub(crate) fn storage_retrier_config_default() -> RetrierConfig {
     RetrierConfig {
         max_attempts: 7,

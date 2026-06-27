@@ -5,7 +5,7 @@ mod codec;
 mod config;
 mod error;
 mod infra;
-mod model;
+mod root;
 mod storage;
 
 #[cfg(test)]

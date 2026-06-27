@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use iceberg::spec::TableMetadata;
 
 use crate::error::Result;
-use crate::model::CatalogRoot;
+use crate::root::CatalogRoot;
 
 pub(crate) mod cached;
 pub(crate) mod s3;

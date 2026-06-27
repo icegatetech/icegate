@@ -23,7 +23,7 @@ use lru::LruCache;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::error::{Error, Result, StorageError};
-use crate::model::CatalogRoot;
+use crate::root::CatalogRoot;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
 /// Snapshot of the catalog root paired with its CAS token.
@@ -61,6 +61,20 @@ impl CachedCatalogStorage {
 #[async_trait]
 impl CatalogStorage for CachedCatalogStorage {
     async fn load_root(&self, known: Option<&Version>) -> Result<LoadOutcome> {
+        // No single-flight coalescing here by design: concurrent loads each issue
+        // their own conditional GET rather than sharing one in-flight request.
+        // This is deliberate, not an oversight. Races are safe NOT because the
+        // cache is monotonic — it isn't: the write below is a last-writer-wins
+        // overwrite with no version compare, so two racing loads can land in
+        // reverse order and leave an older `(version, root)` pair cached than one
+        // already seen. Safety comes from revalidation, not monotonicity: every
+        // read re-checks via `If-None-Match`, so a stale install self-heals on the
+        // next load (the inner returns `Loaded` with the fresh version, never
+        // `NotModified` for a token it no longer holds). The only cost is redundant
+        // conditional GETs on a cold cache; a 304 body is empty and the
+        // per-committer CAS loop is sequential anyway, so coalescing would add a
+        // shared-future barrier for a saving that does not pay for its complexity.
+        //
         // Caller-supplied `known` owns the conditional-read semantics. The
         // cache may substitute its own token only for unconditional callers,
         // where `NotModified` is an implementation detail converted back into

@@ -1,6 +1,6 @@
 //! S3-backed implementation of [`iceberg::Catalog`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -17,28 +17,41 @@ use tokio_util::sync::CancellationToken;
 use crate::config::S3CatalogConfig;
 use crate::error::{Error, Result, StorageError};
 use crate::infra::retrier::Retrier;
-use crate::model::{
-    CatalogRoot, CatalogTableLink, IcebergTableMetadata, MergeTransactionResult, PreparedCommitRef, TableId, TableKey,
-    TableMetadataLocation, TableUpdate,
+use crate::root::{
+    CatalogRoot, CatalogTableLink, IcebergTableMetadata, MergeOutcome, TableId, TableKey, TableMetadataLocation,
+    TableUpdate,
 };
 use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::s3::S3CatalogStorage;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
-/// Per-table state carried across retry rounds inside `commit_transaction`.
+/// One table's commit as it moves through [`S3Catalog::commit_transaction`]'s
+/// retry loop. Holds the immutable request (`identifier`, `requirements`,
+/// `updates`) and the mutable [`CommitStage`] in a single record, so a table's
+/// request and its progress can never drift apart across rounds.
 ///
-/// Lives in `catalog.rs` because the orchestration loop owns these. The domain
-/// layer never sees this type — `commit_transaction` projects each entry into a
-/// [`PreparedCommitRef`] before calling [`CatalogRoot::merge_transaction`].
-pub(crate) struct PendingCommit {
-    pub(crate) identifier: TableIdent,
-    pub(crate) key: TableKey,
-    pub(crate) requirements: Vec<iceberg::TableRequirement>,
-    pub(crate) updates: Vec<iceberg::TableUpdate>,
-    /// `None` until a metadata file has been built and written for this table
-    /// on top of the *currently observed* head. Reset to `None` whenever the
-    /// table moves underneath us, forcing the next round to prepare metadata again.
-    pub(crate) table: Option<TableUpdate>,
+/// Local to `commit_transaction`'s flow; the domain never sees it.
+struct CommitState {
+    identifier: TableIdent,
+    requirements: Vec<iceberg::TableRequirement>,
+    updates: Vec<iceberg::TableUpdate>,
+    stage: CommitStage,
+}
+
+/// Where one table's commit sits in the insertion process — the only field of
+/// [`CommitState`] that changes across retry rounds.
+///
+/// A commit that already landed (lost ack, with or without a concurrent
+/// advance) stays `Pending`: `merge_transaction` skips it without applying, and
+/// `build_tables` reports it from its `TableUpdate`. No separate "applied"
+/// state is needed, because classification happens in the same round as the CAS.
+enum CommitStage {
+    /// Metadata not yet built on the observed head — `load_heads_and_build`
+    /// builds it this round (first round, or after a rebuild reset it here).
+    Unprepared,
+    /// Metadata built and written, ready to merge onto the root. Boxed because
+    /// the prepared metadata dwarfs the unit `Unprepared` variant.
+    Pending(Box<TableUpdate>),
 }
 
 /// S3 catalog implementation based on atomic compare-and-swap updates of the catalog root.
@@ -219,28 +232,29 @@ impl S3Catalog {
             .await?;
 
         let mut slot = result_slot.lock().await;
-        slot.take().ok_or(Error::CasMaxAttempts)
+        // The retrier returned `Ok`, so the success branch ran and filled the slot.
+        // An empty slot here is an invariant breach, not CAS exhaustion (already
+        // propagated via `?` above) — name it as such rather than misreporting.
+        slot.take()
+            .ok_or(Error::Internal("update_root succeeded but result slot was empty"))
     }
 
     /// Multi-table commit with one root compare-and-swap update.
     ///
-    /// Drives a two-level optimistic retry loop:
+    /// Each retry round: load the root, read every table's current head metadata
+    /// (one read per table; unchanged heads hit the metadata cache) and build any
+    /// not-yet-prepared commit on top of it, then let the domain classify the whole
+    /// batch in one pass against the head metadata-logs. The domain links direct
+    /// successors, skips commits that already landed, and returns the rest to
+    /// rebuild. With no rebuilds, the merged root is CAS-published in the same
+    /// round; otherwise the rebuilt keys are reset and the round repeats.
     ///
-    /// 1. **Root CAS conflict** — another writer published a different root in
-    ///    parallel but the tables we touch have not moved. We re-merge our
-    ///    already prepared metadata pointers onto the new root and retry the CAS
-    ///    without re-writing metadata files.
-    /// 2. **Table-state conflict** — another writer published a new metadata
-    ///    version for one of our tables. We drop the stale prepared commit, read
-    ///    the new current metadata, re-validate `TableRequirement`s against it,
-    ///    write a fresh metadata file (N+2), and retry.
+    /// Logical requirement failures (e.g. `AssertRefSnapshotId`) are not retried —
+    /// they propagate as [`Error::Iceberg`].
     ///
-    /// Logical requirement failures (e.g., `AssertRefSnapshotId`) are not
-    /// retried — they propagate as [`Error::Iceberg`].
-    ///
-    /// Each retry round may leave orphaned metadata files behind. Cleanup is
-    /// tracked under the existing GC TODO (historical note); high-conflict
-    /// workloads should run GC periodically.
+    /// Each rebuild round may leave orphaned metadata files behind. Cleanup is
+    /// tracked under the existing GC TODO; high-conflict workloads should run GC
+    /// periodically.
     ///
     /// # Errors
     ///
@@ -252,24 +266,25 @@ impl S3Catalog {
             return Ok(Vec::new());
         }
 
-        let mut initial_commits: Vec<PendingCommit> = Vec::with_capacity(commits.len());
-        let mut seen_keys = HashSet::with_capacity(commits.len());
+        let mut commit_states: HashMap<TableKey, CommitState> = HashMap::with_capacity(commits.len());
         for mut commit in commits {
             let identifier = commit.identifier().clone();
             let key = TableKey::from_ident(&identifier);
-            if !seen_keys.insert(key.clone()) {
+            if commit_states.contains_key(&key) {
                 return Err(Error::CommitConflict);
             }
-            initial_commits.push(PendingCommit {
-                identifier,
+            commit_states.insert(
                 key,
-                requirements: commit.take_requirements(),
-                updates: commit.take_updates(),
-                table: None,
-            });
+                CommitState {
+                    identifier,
+                    requirements: commit.take_requirements(),
+                    updates: commit.take_updates(),
+                    stage: CommitStage::Unprepared,
+                },
+            );
         }
 
-        let commits: Arc<Mutex<Vec<PendingCommit>>> = Arc::new(Mutex::new(initial_commits));
+        let commit_states = Arc::new(Mutex::new(commit_states));
         let storage = Arc::clone(&self.storage);
         let file_io = self.file_io.clone();
         let result_slot: Arc<Mutex<Option<Vec<Table>>>> = Arc::new(Mutex::new(None));
@@ -277,73 +292,73 @@ impl S3Catalog {
         self.retrier
             .retry(
                 {
-                    let commits = Arc::clone(&commits);
+                    let commit_states = Arc::clone(&commit_states);
                     let storage = Arc::clone(&storage);
                     let file_io = file_io.clone();
                     let result_slot = Arc::clone(&result_slot);
                     move || {
-                        let commits = Arc::clone(&commits);
+                        let commit_states = Arc::clone(&commit_states);
                         let storage = Arc::clone(&storage);
                         let file_io = file_io.clone();
                         let result_slot = Arc::clone(&result_slot);
                         async move {
                             let (mut root, version) = Self::load_root_for_mutation(&storage).await?;
 
-                            let mut locked_commits = commits.lock().await;
+                            // Single-flight invariant: the retrier invokes this
+                            // closure strictly sequentially — never two attempts in
+                            // flight — so holding `commit_states` across the whole
+                            // round (reads/writes, merge, CAS) cannot deadlock or
+                            // contend. The lock guards the shared prepared-commit
+                            // state across rounds, not concurrent attempts. If this
+                            // ever moves to parallel/`Send` attempts, the hold span
+                            // below must be narrowed to avoid blocking across I/O.
+                            let mut commit_states = commit_states.lock().await;
 
-                            // Step 1: build metadata files for any commit whose
-                            // prepared table slot is empty (first attempt or rebuilt in
-                            // a previous attempt after a table-state conflict).
-                            Self::prepare_commits(&storage, &mut locked_commits, &root).await?;
+                            // Step 1: read each table's current head, projecting its
+                            // metadata-log to prior locations, and build any
+                            // still-`Unprepared` commit on top of it.
+                            let head_locations =
+                                Self::load_heads_and_build(&storage, &mut commit_states, &root).await?;
 
-                            // Step 2: merge prepared pointers onto the freshly
-                            // loaded root. Stale prepared entries (head moved
-                            // underneath us) come back in `rebuild` — reset
-                            // them to `None` and let the next attempt rebuild.
-                            //
-                            // Project the orchestration-owned `PendingCommit`s
-                            // into domain refs in a scope that ends the immutable
-                            // borrow of `guard` before the `iter_mut` below.
-                            let merge = {
-                                let refs: Vec<PreparedCommitRef<'_>> = locked_commits
-                                    .iter()
-                                    .map(|commit| PreparedCommitRef {
-                                        key: &commit.key,
-                                        table: commit.table.as_ref(),
+                            // Step 2: domain classifies the batch in one pass using
+                            // the head locations. Scope the borrow so it ends before
+                            // any mutation of `commit_states` below.
+                            let outcome = {
+                                let pending: Vec<&TableUpdate> = commit_states
+                                    .values()
+                                    .filter_map(|state| match &state.stage {
+                                        CommitStage::Pending(table) => Some(table.as_ref()),
+                                        CommitStage::Unprepared => None,
                                     })
                                     .collect();
-                                root.merge_transaction(&refs)?
+                                root.merge_transaction(&pending, &head_locations)?
                             };
-                            match merge {
-                                MergeTransactionResult::NeedRebuild(outcome) => {
-                                    for key in outcome.rebuild {
-                                        if let Some(commit) = locked_commits.iter_mut().find(|c| c.key == key) {
-                                            commit.table = None;
-                                        }
+
+                            // Step 3: reset rebuilt keys and retry without CAS. The
+                            // next round rebuilds them on the freshly loaded head.
+                            if let MergeOutcome::Rebuild(keys) = outcome {
+                                for key in keys {
+                                    if let Some(state) = commit_states.get_mut(&key) {
+                                        state.stage = CommitStage::Unprepared;
                                     }
-                                    return Ok((true, ()));
                                 }
-                                MergeTransactionResult::Ready => {}
+                                return Ok((true, ()));
                             }
 
-                            // Step 3: build the response tables from prepared
-                            // state *before* the CAS. The build is a pure,
-                            // in-memory projection (no I/O, no dependency on the
-                            // saved root), so doing it first leaves no fallible
-                            // step between a durable `save_root` and the `Ok`
-                            // return — a committed root must never surface as an
-                            // `Err`. On a root CAS conflict these are discarded
-                            // and the next attempt rebuilds them after re-merging.
-                            let tables = Self::build_tables(&locked_commits, &file_io)?;
+                            // Step 4: build the response tables before the CAS. The
+                            // build is a pure, in-memory projection, so doing it
+                            // first leaves no fallible step between a durable
+                            // `save_root` and the `Ok` return.
+                            let tables = Self::build_tables(&commit_states, &file_io)?;
 
-                            // Step 4: CAS-publish the merged root. On conflict
-                            // we keep prepared metadata intact — the next attempt only
-                            // re-merges them against the new root. Transient
-                            // storage faults are exhausted inside the storage
-                            // layer, so a conflict is the only retry signal here.
+                            // Step 5: CAS-publish the merged root. On conflict we
+                            // keep prepared metadata intact — the next round only
+                            // re-reads heads and re-merges. Transient faults are
+                            // exhausted inside the storage layer, so a conflict is
+                            // the only retry signal here.
                             match storage.save_root(Arc::new(root), &version).await {
                                 Ok(_) => {
-                                    drop(locked_commits);
+                                    drop(commit_states);
                                     *result_slot.lock().await = Some(tables);
                                     Ok((false, ()))
                                 }
@@ -358,48 +373,77 @@ impl S3Catalog {
             .await?;
 
         let mut slot = result_slot.lock().await;
-        slot.take().ok_or(Error::CasMaxAttempts)
+        // See `update_root`: a `None` slot after a successful retry is a broken
+        // invariant, not retry exhaustion.
+        slot.take().ok_or(Error::Internal(
+            "commit_transaction succeeded but tables slot was empty",
+        ))
     }
 
-    async fn prepare_commits(
+    /// Read each commit's current head metadata from `root`, project its
+    /// metadata-log to prior locations, and build any still-`Unprepared` commit on
+    /// top of it.
+    ///
+    /// Returns the head's prior locations per table — the only head data
+    /// [`CatalogRoot::merge_transaction`] needs, to decide whether an already
+    /// written commit landed (our file in the head's lineage) or must rebuild. The
+    /// `metadata_location` in the root entry is just the current head, not its
+    /// version history, so the lineage must be read from the head's metadata file.
+    ///
+    /// One read per table per round; an unchanged head resolves from the metadata
+    /// cache. The build itself is a pure domain projection
+    /// ([`IcebergTableMetadata::prepare_commit`]); only the resulting file write
+    /// touches storage.
+    async fn load_heads_and_build(
         storage: &Arc<dyn CatalogStorage>,
-        commits: &mut [PendingCommit],
+        commit_states: &mut HashMap<TableKey, CommitState>,
         root: &CatalogRoot,
-    ) -> Result<()> {
-        for commit in commits.iter_mut() {
-            if commit.table.is_some() {
-                continue;
+    ) -> Result<HashMap<TableKey, Vec<TableMetadataLocation>>> {
+        let mut head_locations = HashMap::with_capacity(commit_states.len());
+        for (key, state) in commit_states.iter_mut() {
+            let entry = root
+                .get_active(key)
+                .ok_or_else(|| Error::TableNotFound(state.identifier.clone()))?;
+            let persisted = entry.clone();
+            let head_location = entry.metadata_location().clone();
+            // Unchanged heads resolve from the metadata cache on retries.
+            let head_metadata = storage.read_table_metadata(head_location.as_str()).await?;
+
+            if matches!(state.stage, CommitStage::Unprepared) {
+                let built = IcebergTableMetadata::new(head_location, (*head_metadata).clone()).prepare_commit(
+                    state.identifier.clone(),
+                    persisted,
+                    state.requirements.clone(),
+                    state.updates.clone(),
+                )?;
+                storage
+                    .write_table_metadata(built.updated.metadata_location().as_str(), built.updated.metadata())
+                    .await?;
+                state.stage = CommitStage::Pending(Box::new(built));
             }
 
-            let entry = root
-                .get_active(&commit.key)
-                .ok_or_else(|| Error::TableNotFound(commit.identifier.clone()))?;
-            let persisted = entry.clone();
-            let current_location = entry.metadata_location().clone();
-            let current_metadata = storage.read_table_metadata(current_location.as_str()).await?;
-            let table = IcebergTableMetadata::new(current_location, Arc::unwrap_or_clone(current_metadata))
-                .prepare_commit(
-                    commit.identifier.clone(),
-                    persisted,
-                    commit.requirements.clone(),
-                    commit.updates.clone(),
-                )?;
-            storage
-                .write_table_metadata(table.updated.metadata_location().as_str(), table.updated.metadata())
-                .await?;
-            commit.table = Some(table);
+            let prior_locations = head_metadata
+                .metadata_log()
+                .iter()
+                .map(|log_entry| TableMetadataLocation::from(log_entry.metadata_file.as_str()))
+                .collect();
+            head_locations.insert(key.clone(), prior_locations);
         }
-        Ok(())
+        Ok(head_locations)
     }
 
-    fn build_tables(commits: &[PendingCommit], file_io: &FileIO) -> Result<Vec<Table>> {
-        commits
-            .iter()
-            .map(|commit| {
-                let table = commit
-                    .table
-                    .as_ref()
-                    .ok_or_else(|| Error::InvalidMetadata("prepared commit missing on success path".to_string()))?;
+    fn build_tables(commit_states: &HashMap<TableKey, CommitState>, file_io: &FileIO) -> Result<Vec<Table>> {
+        commit_states
+            .values()
+            .map(|state| {
+                let table = match &state.stage {
+                    CommitStage::Pending(table) => table,
+                    CommitStage::Unprepared => {
+                        return Err(Error::InvalidMetadata(
+                            "prepared commit missing on success path".to_string(),
+                        ));
+                    }
+                };
                 Table::builder()
                     .identifier(table.full_name.clone())
                     .metadata_location(table.updated.metadata_location().as_str().to_string())
@@ -515,14 +559,39 @@ impl Catalog for S3Catalog {
     /// Drop an existing namespace.
     ///
     /// The namespace must be empty: no tables and no descendant namespaces.
+    ///
+    /// Lost-ack convergence: a CAS conflict can replay the drop against a root
+    /// where our own successful save already removed the namespace, so the
+    /// replayed `root.drop_namespace` would itself return `NamespaceNotFound`.
+    /// We preflight existence once before the retry loop to keep the strict
+    /// "dropping a never-existent namespace fails" contract, then treat an
+    /// in-loop `NamespaceNotFound` as a converged no-op — the namespace is gone,
+    /// which is exactly this operation's postcondition.
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> IcebergResult<()> {
         let namespace_owned = namespace.clone();
-        let result: Result<()> = self
-            .update_root(move |root| {
-                root.drop_namespace(&namespace_owned)?;
-                Ok(())
+        let result: Result<()> = async {
+            // Preflight: the namespace must exist at the start, or the contract
+            // requires a `NamespaceNotFound` error. Snapshotting existence here
+            // is what lets the in-loop op below safely converge a later
+            // `NamespaceNotFound` (a lost-ack replay) to success instead of
+            // surfacing a spurious error after a durable drop.
+            let root = Self::load_root_for_read(&self.storage).await?;
+            if root.get_namespace(&namespace_owned).is_none() {
+                return Err(Error::NamespaceNotFound(namespace_owned.clone()));
+            }
+            drop(root);
+
+            self.update_root(move |root| match root.drop_namespace(&namespace_owned) {
+                // The drop already landed (our CAS succeeded but its ack was
+                // lost, surfacing as a conflict); the replay sees the namespace
+                // gone. Converge to success rather than re-erroring on the
+                // already-applied effect. `NamespaceNotEmpty` still propagates.
+                Err(Error::NamespaceNotFound(_)) => Ok(()),
+                other => other,
             })
-            .await;
+            .await
+        }
+        .await;
 
         result.map_err(iceberg::Error::from)
     }

@@ -50,6 +50,14 @@ pub enum Error {
     #[error("storage retry attempts exhausted")]
     StorageRetryExhausted,
 
+    /// Internal invariant violation: a should-be-unreachable state was reached.
+    ///
+    /// Distinct from [`Self::CasMaxAttempts`]: the retry loop reported success,
+    /// yet the post-loop state contradicts that. Surfacing this rather than a
+    /// retry-exhaustion error keeps the diagnostic honest if the invariant breaks.
+    #[error("internal invariant violated: {0}")]
+    Internal(&'static str),
+
     /// Upstream Iceberg error.
     #[error("iceberg error: {0}")]
     Iceberg(#[from] iceberg::Error),
@@ -130,13 +138,24 @@ impl From<object_store::Error> for StorageError {
             object_store::Error::NotFound { path, .. } => Self::NotFound(path),
             object_store::Error::Precondition { .. } => Self::PreconditionFailed,
             object_store::Error::AlreadyExists { path, .. } => Self::AlreadyExists(path),
-            // The object_store 0.12 surfaces timeouts, throttling, and 5xx as `Generic`
-            // (the underlying HTTP/SDK error string carries the signal). Treat these
-            // as transient and let the retrier decide. Non-transient `Generic` (auth,
-            // config) is also retried until max_attempts, but the storage I/O backoff
-            // curve (`config::storage_retrier_config_default`) caps that stall at ~2s
-            // worst case, so a hard failure degrades the ingest path for seconds, not
-            // minutes.
+            // Permanent auth failures: `object_store` 0.12 maps S3 403/401 to these
+            // structured variants (see its `RetryError::error`). Classify them
+            // explicitly as non-retryable so bad credentials fail on the first
+            // attempt instead of burning the storage retry budget on every commit.
+            // Matched ahead of the catch-all so a future reordering of the upstream
+            // enum cannot silently reroute auth errors into a retryable arm.
+            object_store::Error::PermissionDenied { .. } | object_store::Error::Unauthenticated { .. } => {
+                Self::Io(error.to_string())
+            }
+            // `object_store` 0.12 collapses 5xx, throttling (429), request timeouts,
+            // and connect/transport faults into `Generic`, with the recoverable
+            // signal living only in the boxed source string — the source is its
+            // crate-private `RetryError`, so the HTTP status is not structurally
+            // reachable for a downcast. The rare permanent cases that also land here
+            // (400 Bad Request, bare redirects, a wrong endpoint) cannot be split out
+            // without string heuristics, so they are treated as transient too; the
+            // capped storage backoff curve (`config::storage_retrier_config_default`)
+            // bounds that misclassification at ~2s worst case, seconds not minutes.
             object_store::Error::Generic { source, .. } => Self::Transient(source.to_string()),
             object_store::Error::JoinError { source } => Self::Transient(source.to_string()),
             other => Self::Io(other.to_string()),
@@ -188,6 +207,10 @@ impl From<Error> for iceberg::Error {
             Error::StorageRetryExhausted => {
                 Self::new(ErrorKind::Unexpected, "storage retry attempts exhausted").with_retryable(true)
             }
+            // Invariant breach, not a transient or conflict condition: never retryable.
+            Error::Internal(reason) => {
+                Self::new(ErrorKind::Unexpected, format!("internal invariant violated: {reason}"))
+            }
         }
     }
 }
@@ -206,9 +229,8 @@ mod tests {
 
     #[test]
     fn object_store_generic_maps_to_transient_retryable() {
-        // `object_store` surfaces timeouts/throttling/5xx as `Generic`; this is
-        // the fail-critical mapping — a drift here silently retries auth/config
-        // failures for seconds (see the comment on the `From` impl).
+        // `object_store` surfaces 5xx/throttling/timeouts as `Generic`; these must
+        // stay retryable so the storage backoff curve can ride out transient faults.
         let storage = StorageError::from(object_store::Error::Generic {
             store: "s3",
             source: boxed_source("throttled"),
@@ -216,6 +238,34 @@ mod tests {
 
         assert!(matches!(storage, StorageError::Transient(_)));
         assert!(storage.is_retryable());
+        assert!(!storage.is_conflict());
+    }
+
+    #[test]
+    fn object_store_permission_denied_maps_to_non_retryable_io() {
+        // S3 403 -> `PermissionDenied`: a permanent auth failure must fail fast,
+        // never inflate into a `StorageRetryExhausted` by burning the retry budget.
+        let storage = StorageError::from(object_store::Error::PermissionDenied {
+            path: "catalog/root.json".to_string(),
+            source: boxed_source("forbidden"),
+        });
+
+        assert!(matches!(storage, StorageError::Io(_)));
+        assert!(!storage.is_retryable());
+        assert!(!storage.is_conflict());
+    }
+
+    #[test]
+    fn object_store_unauthenticated_maps_to_non_retryable_io() {
+        // S3 401 -> `Unauthenticated`: bad/missing credentials are permanent and
+        // must not be retried on the hot ingest path.
+        let storage = StorageError::from(object_store::Error::Unauthenticated {
+            path: "catalog/root.json".to_string(),
+            source: boxed_source("unauthorized"),
+        });
+
+        assert!(matches!(storage, StorageError::Io(_)));
+        assert!(!storage.is_retryable());
         assert!(!storage.is_conflict());
     }
 
@@ -335,6 +385,16 @@ mod tests {
 
         let iceberg_error: iceberg::Error = Error::Cancelled.into();
         assert_eq!(iceberg_error.kind(), ErrorKind::Unexpected);
+    }
+
+    #[test]
+    fn iceberg_mapping_marks_internal_as_non_retryable_unexpected() {
+        // An invariant breach is neither transient nor a conflict: it must not be
+        // retried, and it must stay distinct from CAS exhaustion at the boundary.
+        let iceberg_error: iceberg::Error = Error::Internal("slot empty").into();
+
+        assert_eq!(iceberg_error.kind(), ErrorKind::Unexpected);
+        assert!(!iceberg_error.retryable());
     }
 
     #[test]

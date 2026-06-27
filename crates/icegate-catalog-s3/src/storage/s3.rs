@@ -14,7 +14,7 @@ use crate::codec::CatalogCodec;
 use crate::config::S3CatalogConfig;
 use crate::error::{Error, Result, StorageError};
 use crate::infra::retrier::Retrier;
-use crate::model::CatalogRoot;
+use crate::root::CatalogRoot;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
 const CATALOG_SEGMENT: &str = "catalog";
@@ -351,6 +351,30 @@ mod tests {
             .read_table_metadata("s3://other/warehouse/catalog/tables/a/metadata/00001-uuid.json")
             .await
             .expect_err("wrong bucket must fail");
+
+        assert!(matches!(error, Error::InvalidMetadata(_)));
+    }
+
+    #[tokio::test]
+    async fn read_table_metadata_fails_on_empty_object_key() {
+        // `s3://bucket/` parses to an empty object key; reject it before any GET.
+        let storage = S3CatalogStorage::new(&config(), CancellationToken::new()).expect("storage");
+        let error = storage
+            .read_table_metadata("s3://bucket/")
+            .await
+            .expect_err("empty object key must fail");
+
+        assert!(matches!(error, Error::InvalidMetadata(_)));
+    }
+
+    #[tokio::test]
+    async fn read_table_metadata_fails_on_missing_key_separator() {
+        // `s3://bucket` has no `/` after the bucket, so there is no object key.
+        let storage = S3CatalogStorage::new(&config(), CancellationToken::new()).expect("storage");
+        let error = storage
+            .read_table_metadata("s3://bucket")
+            .await
+            .expect_err("missing key separator must fail");
 
         assert!(matches!(error, Error::InvalidMetadata(_)));
     }

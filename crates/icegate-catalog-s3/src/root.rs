@@ -25,8 +25,9 @@ impl MetadataVersion {
     }
 
     /// Parse metadata version from an Iceberg metadata file location.
-    fn from_location(location: &str) -> Result<Self, Error> {
+    fn from_location(location: &TableMetadataLocation) -> Result<Self, Error> {
         let filename = location
+            .as_str()
             .rsplit('/')
             .next()
             .filter(|segment| !segment.is_empty())
@@ -77,7 +78,7 @@ pub(crate) struct TableUpdate {
     /// Full table identifier (namespace + name).
     pub(crate) full_name: TableIdent,
     /// Root entry this update was prepared against; absent for brand-new tables.
-    pub(crate) persisted: Option<CatalogTableLink>,
+    pub(crate) committed: Option<CatalogTableLink>,
     /// Metadata file written to storage but not yet linked from the root.
     pub(crate) updated: IcebergTableMetadata,
 }
@@ -110,7 +111,7 @@ impl TableUpdate {
         let updated = IcebergTableMetadata::create(creation, uuid)?;
         Ok(Self {
             full_name,
-            persisted: None,
+            committed: None,
             updated,
         })
     }
@@ -130,46 +131,37 @@ impl TableUpdate {
 
     /// Metadata version baked into the updated metadata location.
     fn metadata_version(&self) -> Result<MetadataVersion, Error> {
-        MetadataVersion::from_location(self.updated.metadata_location().as_str())
+        MetadataVersion::from_location(self.updated.metadata_location())
     }
 
-    fn persisted(&self) -> Result<&CatalogTableLink, Error> {
-        self.persisted
+    fn is_already_committed(&self, storage_locations: &[TableMetadataLocation]) -> bool {
+        let prepared_location = self.updated.metadata_location();
+        storage_locations.iter().any(|location| location == prepared_location)
+    }
+
+    fn committed(&self) -> Result<&CatalogTableLink, Error> {
+        self.committed
             .as_ref()
             .ok_or_else(|| Error::InvalidMetadata("prepared commit missing persisted root entry".to_string()))
     }
 }
 
-/// Borrowed view of one table's commit state, passed to
-/// [`CatalogRoot::merge_transaction`].
-///
-/// Keeps the domain layer independent of the orchestration-owned
-/// `PendingCommit` (in `catalog.rs`): the catalog projects each retry-round
-/// entry into this ref so `model.rs` never depends on the upper layer.
-pub(crate) struct PreparedCommitRef<'a> {
-    /// Root key of the table being committed.
-    pub(crate) key: &'a TableKey,
-    /// Metadata file prepared on top of the observed head, or `None` when the
-    /// commit still needs to be prepared before it can be merged.
-    pub(crate) table: Option<&'a TableUpdate>,
-}
-
 /// Outcome of [`CatalogRoot::merge_transaction`].
+///
+/// `merge_transaction` classifies the whole batch in one pass: it links every
+/// direct successor into the root and skips every commit that already landed
+/// (head at our exact file, or head advanced past us with our file in its
+/// metadata-log). Anything it cannot apply is returned in [`Self::Rebuild`] for
+/// the caller to rebuild on the fresh head and retry.
 #[derive(Debug)]
-pub(crate) enum MergeTransactionResult {
-    /// All prepared pointers applied — caller proceeds with `save_root`.
+pub(crate) enum MergeOutcome {
+    /// Every commit was linked or confirmed already landed — the caller builds
+    /// the response tables and CAS-publishes the root.
     Ready,
-    /// Some prepared metadata files are no longer direct successors of the
-    /// current heads. Caller must rebuild the listed entries on top of the
-    /// freshly loaded root and call `merge_transaction` again.
-    NeedRebuild(TransactionMergeOutcome),
-}
-
-/// Listing of prepared commits that must be rebuilt before the next merge attempt.
-#[derive(Debug)]
-pub(crate) struct TransactionMergeOutcome {
-    /// Keys of prepared commits that no longer sit on top of their table's head.
-    pub(crate) rebuild: Vec<TableKey>,
+    /// These keys must be rebuilt on the freshly loaded head before retrying.
+    /// The root may have been partially advanced by the applied subset; the
+    /// caller discards it and reloads.
+    Rebuild(Vec<TableKey>),
 }
 
 /// Domain state that manages Iceberg table metadata updates.
@@ -254,12 +246,12 @@ impl IcebergTableMetadata {
             return Err(Error::InvalidMetadata(format!("empty table location for {full_name}")));
         }
 
-        let metadata_version = MetadataVersion::from_location(self.metadata_location.as_str())?.next()?;
+        let metadata_version = MetadataVersion::from_location(&self.metadata_location)?.next()?;
         let metadata_location = Self::next_metadata_path(build.metadata.location(), metadata_version);
 
         Ok(TableUpdate {
             full_name,
-            persisted: Some(persisted),
+            committed: Some(persisted),
             updated: Self::new(TableMetadataLocation::from(metadata_location), build.metadata),
         })
     }
@@ -307,7 +299,7 @@ impl CatalogTableLink {
     }
 
     fn validate_metadata_location(&self) -> Result<(), Error> {
-        let _ = MetadataVersion::from_location(self.metadata_location.as_str())?;
+        let _ = MetadataVersion::from_location(&self.metadata_location)?;
         Ok(())
     }
 }
@@ -371,6 +363,12 @@ impl From<String> for TableMetadataLocation {
 impl From<&str> for TableMetadataLocation {
     fn from(metadata_location: &str) -> Self {
         Self::new(metadata_location.to_string())
+    }
+}
+
+impl std::fmt::Display for TableMetadataLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -620,80 +618,94 @@ impl CatalogRoot {
         self.validate_new_table_link(&key, &link)
     }
 
-    /// Merge a batch of prepared commits into this root.
+    /// Merge a batch of prepared commits into this root in a single pass.
     ///
-    /// For every entry whose prepared table is absent or whose active root entry
-    /// still has the same table id but no longer points at the commit-base
-    /// metadata location, the key is collected into
-    /// [`TransactionMergeOutcome::rebuild`]. Otherwise the prepared pointer is
-    /// linked via [`Self::apply_commit`].
+    /// `commits` are the prepared `TableUpdate`s (one per table). `head_locations`
+    /// maps each table key to its current head's prior metadata locations (the
+    /// head's metadata-log, projected to locations by the caller; the domain
+    /// performs no I/O). For each commit:
     ///
-    /// Lost-response convergence: when the current head already points at the
-    /// exact metadata file to publish (our own prior CAS physically landed but the
-    /// ack was lost), the commit is treated as applied — no rebuild, no
-    /// advance — so the retry reports success instead of stacking a redundant
-    /// successor. This mirrors the convergence handling in
-    /// [`Self::create_table`] and `register_table`.
+    /// - head already at our exact prepared file → already landed (lost ack), skip;
+    /// - head advanced strictly past our version and our file is in its
+    ///   metadata-log → already landed (lost-ack-advance), skip;
+    /// - head still on our commit base and our file is its direct successor →
+    ///   [`Self::apply_commit`];
+    /// - anything else (foreign winner at our version, non-sequential publish, head
+    ///   moved without our file in its log) → collect into [`MergeOutcome::Rebuild`].
     ///
-    /// When any rebuild is required, the root is left in whatever state the
-    /// already-applied subset produced — the caller must discard this `self`
-    /// and reload the root before retrying.
+    /// Returns [`MergeOutcome::Ready`] when nothing needs rebuilding. When some keys
+    /// rebuild, the already-applied subset has mutated this root — the caller must
+    /// discard it and reload before retrying.
     ///
     /// # Errors
     ///
-    /// Propagates [`Error::CommitConflict`] when the active root entry has a
-    /// different table id, or from [`Self::apply_commit`] when the exact
-    /// commit-base CAS no longer holds. Those are terminal table-state conflicts, not
-    /// rebuild signals.
+    /// - [`Error::TableNotFound`] — no active root entry for a commit's key.
+    /// - [`Error::CommitConflict`] — the active entry has a different table id
+    ///   (ABA recreate), or [`Self::apply_commit`] rejects the link.
     pub(crate) fn merge_transaction(
         &mut self,
-        commits: &[PreparedCommitRef<'_>],
-    ) -> Result<MergeTransactionResult, Error> {
+        commits: &[&TableUpdate],
+        committed_locations: &HashMap<TableKey, Vec<TableMetadataLocation>>,
+    ) -> Result<MergeOutcome, Error> {
         let mut rebuild = Vec::new();
 
-        for commit in commits {
-            let Some(table) = commit.table else {
-                rebuild.push(commit.key.clone());
-                continue;
-            };
-
+        for &table in commits {
+            let key = table.to_key();
             let entry = self
-                .get_active(commit.key)
+                .get_active(&key)
                 .ok_or_else(|| Error::TableNotFound(table.full_name.clone()))?;
-            let persisted = table.persisted()?;
+            let persisted = table.committed()?;
 
             if entry.table_id() != persisted.table_id() {
                 return Err(Error::CommitConflict);
             }
 
-            // Lost-response convergence: the head already points at the exact
-            // UUID-suffixed file we prepared, so our own prior CAS physically
-            // landed and only the ack was lost. Treat as applied — skipping
-            // both the rebuild branch (which would stack a redundant N+2) and
-            // `apply_commit` (which would reject equal versions as a conflict).
+            // Lost-response convergence: head already points at our exact prepared
+            // file — our prior CAS landed, only the ack was lost. Nothing to apply.
             if entry.metadata_location() == table.updated.metadata_location() {
                 continue;
             }
 
+            // Head moved off our commit base. Already landed iff our exact file is
+            // among the head's prior locations (our CAS landed, ack lost, a writer
+            // advanced past it). Membership is a sound verdict only within an
+            // *untruncated* metadata-log. Else rebuild.
+            //
+            // TODO(low): the metadata-log is bounded by
+            // `write.metadata.previous-versions-max` (iceberg default 100) and
+            // drained oldest-first. If our file landed, its ack was lost, AND the
+            // head then advanced by more than that bound before our retry reloaded,
+            // our file is gone from the log and a landed commit is misclassified as
+            // Rebuild (re-apply). icegate rules this out — low per-table write
+            // concurrency, and every commit carries RefSnapshotIdMatch, which turns
+            // the rebuild into a surfaced conflict before any rewrite. Revisit if
+            // either assumption changes. See README.md "Known limitations".
             if entry.metadata_location() != persisted.metadata_location() {
-                rebuild.push(commit.key.clone());
+                if committed_locations
+                    .get(&key)
+                    .is_some_and(|locations| table.is_already_committed(locations))
+                {
+                    continue;
+                }
+                rebuild.push(key);
                 continue;
             }
 
-            let current_version = MetadataVersion::from_location(entry.metadata_location().as_str())?;
+            // Head still on our base: link only a direct successor.
+            let current_version = MetadataVersion::from_location(entry.metadata_location())?;
             let publish_version = table.metadata_version()?;
             if !current_version.is_direct_predecessor_of(publish_version) {
-                rebuild.push(commit.key.clone());
+                rebuild.push(key);
                 continue;
             }
 
-            self.apply_commit(commit.key, persisted, table.updated.metadata_location().clone())?;
+            self.apply_commit(&key, persisted, table.updated.metadata_location().clone())?;
         }
 
         if rebuild.is_empty() {
-            Ok(MergeTransactionResult::Ready)
+            Ok(MergeOutcome::Ready)
         } else {
-            Ok(MergeTransactionResult::NeedRebuild(TransactionMergeOutcome { rebuild }))
+            Ok(MergeOutcome::Rebuild(rebuild))
         }
     }
 
@@ -747,8 +759,8 @@ impl CatalogRoot {
             return Err(Error::CommitConflict);
         }
 
-        let old_version = MetadataVersion::from_location(entry.metadata_location.as_str())?;
-        let new_version = MetadataVersion::from_location(metadata_location.as_str())?;
+        let old_version = MetadataVersion::from_location(&entry.metadata_location)?;
+        let new_version = MetadataVersion::from_location(&metadata_location)?;
         let expected = old_version.as_u32().checked_add(1).ok_or(Error::CommitConflict)?;
         if new_version.as_u32() != expected {
             return Err(Error::CommitConflict);
@@ -894,30 +906,31 @@ mod tests {
 
     #[test]
     fn metadata_version_from_location_parses_valid() {
-        let version =
-            MetadataVersion::from_location("s3://bucket/table/metadata/00042-uuid.json").expect("metadata version");
+        let version = MetadataVersion::from_location(&metadata_location("s3://bucket/table/metadata/00042-uuid.json"))
+            .expect("metadata version");
 
         assert_eq!(version.as_u32(), 42);
     }
 
     #[test]
     fn metadata_version_from_location_fails_on_empty_filename() {
-        let error = MetadataVersion::from_location("s3://bucket/").expect_err("trailing slash must fail");
+        let error =
+            MetadataVersion::from_location(&metadata_location("s3://bucket/")).expect_err("trailing slash must fail");
 
         assert!(matches!(error, Error::InvalidMetadata(_)));
     }
 
     #[test]
     fn metadata_version_from_location_fails_on_missing_dash() {
-        let error =
-            MetadataVersion::from_location("s3://bucket/metadata/nondash.json").expect_err("missing dash must fail");
+        let error = MetadataVersion::from_location(&metadata_location("s3://bucket/metadata/nondash.json"))
+            .expect_err("missing dash must fail");
 
         assert!(matches!(error, Error::InvalidMetadata(_)));
     }
 
     #[test]
     fn metadata_version_from_location_fails_on_nonnumeric_prefix() {
-        let error = MetadataVersion::from_location("s3://bucket/metadata/abc-uuid.json")
+        let error = MetadataVersion::from_location(&metadata_location("s3://bucket/metadata/abc-uuid.json"))
             .expect_err("non-numeric prefix must fail");
 
         assert!(matches!(error, Error::InvalidMetadata(_)));
@@ -925,8 +938,10 @@ mod tests {
 
     #[test]
     fn metadata_version_from_location_parses_metadata_json_suffix() {
-        let version = MetadataVersion::from_location("s3://bucket/table/metadata/00007-uuid.metadata.json")
-            .expect("metadata version with .metadata.json suffix");
+        let version = MetadataVersion::from_location(&metadata_location(
+            "s3://bucket/table/metadata/00007-uuid.metadata.json",
+        ))
+        .expect("metadata version with .metadata.json suffix");
 
         assert_eq!(version.as_u32(), 7);
     }
@@ -1079,7 +1094,7 @@ mod tests {
             .expect("prepare commit");
 
         assert_eq!(prepared.full_name, identifier);
-        let prepared_persisted = prepared.persisted.as_ref().expect("persisted root entry");
+        let prepared_persisted = prepared.committed.as_ref().expect("persisted root entry");
         assert_eq!(prepared_persisted.table_id(), persisted.table_id());
         assert_eq!(prepared_persisted.metadata_location(), persisted.metadata_location());
         assert_eq!(prepared.to_key(), key);
@@ -1102,7 +1117,7 @@ mod tests {
 
         let prepared = TableUpdate {
             full_name: identifier,
-            persisted: None,
+            committed: None,
             updated: IcebergTableMetadata::new(metadata_location(location.clone()), metadata.clone()),
         };
 
@@ -1130,6 +1145,30 @@ mod tests {
             .expect_err("empty table location must fail");
 
         assert!(matches!(error, Error::InvalidMetadata(_)));
+    }
+
+    #[test]
+    fn prepare_commit_fails_when_requirement_check_fails() {
+        // A logical requirement that cannot hold against the current head must
+        // abort prepare_commit before any successor metadata is built. This is the
+        // gate that makes optimistic concurrency safe: a stale base fails the
+        // requirement instead of silently overwriting. It is not a conflict-class
+        // error, so the commit path surfaces it without retrying.
+        let identifier = table_ident(namespace(&["ns"]), "tbl");
+        let active_metadata_location = "memory://catalog/tables/tbl/metadata/00000-initial.metadata.json".to_string();
+        let metadata = test_table_metadata("memory://catalog/tables/tbl");
+        let persisted = CatalogTableLink::new(
+            TableId::from(metadata.uuid()),
+            metadata_location(active_metadata_location.clone()),
+        );
+
+        // `NotExist` (assert-create) requires the table to be absent; checked
+        // against existing metadata it always fails.
+        let error = IcebergTableMetadata::new(metadata_location(active_metadata_location), metadata)
+            .prepare_commit(identifier, persisted, vec![TableRequirement::NotExist], Vec::new())
+            .expect_err("failing requirement must abort prepare_commit");
+
+        assert!(matches!(error, Error::Iceberg(_)));
     }
 
     #[test]
@@ -1222,7 +1261,7 @@ mod tests {
 
         let entry = root.get_active(&key).expect("active entry after recreate");
         assert_eq!(
-            MetadataVersion::from_location(entry.metadata_location().as_str())
+            MetadataVersion::from_location(entry.metadata_location())
                 .expect("metadata version")
                 .as_u32(),
             1
@@ -1427,7 +1466,7 @@ mod tests {
         assert!(!root.tables.contains_key(&src));
         let entry = root.get_active(&dst).expect("active destination");
         assert_eq!(
-            MetadataVersion::from_location(entry.metadata_location().as_str())
+            MetadataVersion::from_location(entry.metadata_location())
                 .expect("metadata version")
                 .as_u32(),
             0
@@ -1457,7 +1496,7 @@ mod tests {
 
         let entry = root.get_active(&key).expect("active entry");
         assert_eq!(
-            MetadataVersion::from_location(entry.metadata_location().as_str())
+            MetadataVersion::from_location(entry.metadata_location())
                 .expect("metadata version")
                 .as_u32(),
             1
@@ -1484,8 +1523,8 @@ mod tests {
 
         assert!(matches!(error, Error::CommitConflict));
         assert_eq!(
-            root.get_active(&key).expect("active entry").metadata_location().as_str(),
-            base_entry.metadata_location().as_str()
+            root.get_active(&key).expect("active entry").metadata_location(),
+            base_entry.metadata_location()
         );
     }
 
@@ -1512,8 +1551,8 @@ mod tests {
 
         assert!(matches!(error, Error::CommitConflict));
         assert_eq!(
-            root.get_active(&key).expect("active entry").metadata_location().as_str(),
-            base_entry.metadata_location().as_str()
+            root.get_active(&key).expect("active entry").metadata_location(),
+            base_entry.metadata_location()
         );
     }
 
@@ -1606,7 +1645,7 @@ mod tests {
         assert!(matches!(error, Error::InvalidMetadata(_)));
         let entry = root.get_active(&key).expect("active entry remains unchanged");
         assert_eq!(
-            MetadataVersion::from_location(entry.metadata_location().as_str())
+            MetadataVersion::from_location(entry.metadata_location())
                 .expect("metadata version")
                 .as_u32(),
             0
@@ -1620,7 +1659,7 @@ mod tests {
     fn prepared_commit(full_name: TableIdent, persisted: CatalogTableLink, updated_location: &str) -> TableUpdate {
         TableUpdate {
             full_name,
-            persisted: Some(persisted),
+            committed: Some(persisted),
             updated: IcebergTableMetadata::new(
                 metadata_location(updated_location),
                 test_table_metadata("memory://catalog/tables/tbl"),
@@ -1635,9 +1674,15 @@ mod tests {
     }
 
     fn active_version(root: &CatalogRoot, key: &TableKey) -> u32 {
-        MetadataVersion::from_location(root.get_active(key).expect("active entry").metadata_location().as_str())
+        MetadataVersion::from_location(root.get_active(key).expect("active entry").metadata_location())
             .expect("metadata version")
             .as_u32()
+    }
+
+    /// Empty head-locations map for merge tests whose classification never reads
+    /// them (direct-successor, lost-ack-exact, foreign-winner, non-sequential).
+    fn empty_head_locations() -> HashMap<TableKey, Vec<TableMetadataLocation>> {
+        HashMap::new()
     }
 
     #[test]
@@ -1650,33 +1695,12 @@ mod tests {
         let base = root.get_active(&key).expect("base entry").clone();
         let update = prepared_commit(table_ident(ns, "tbl"), base, &versioned_location(1));
 
-        let result = root
-            .merge_transaction(&[PreparedCommitRef {
-                key: &key,
-                table: Some(&update),
-            }])
+        let outcome = root
+            .merge_transaction(&[&update], &empty_head_locations())
             .expect("ready merge");
 
-        assert!(matches!(result, MergeTransactionResult::Ready));
+        assert!(matches!(outcome, MergeOutcome::Ready));
         assert_eq!(active_version(&root, &key), 1);
-    }
-
-    #[test]
-    fn merge_transaction_unprepared_entry_needs_rebuild() {
-        let ns = namespace(&["ns"]);
-        let key = table_key(ns.clone(), "tbl");
-        let mut root = CatalogRoot::default();
-        root.create_namespace(&ns, HashMap::new());
-        root.link_table(key.clone(), table_entry(0)).expect("seed table");
-
-        let result = root
-            .merge_transaction(&[PreparedCommitRef { key: &key, table: None }])
-            .expect("merge with empty slot");
-
-        match result {
-            MergeTransactionResult::NeedRebuild(outcome) => assert_eq!(outcome.rebuild, vec![key]),
-            MergeTransactionResult::Ready => panic!("expected NeedRebuild, got Ready"),
-        }
     }
 
     #[test]
@@ -1685,17 +1709,14 @@ mod tests {
         let key = table_key(ns.clone(), "tbl");
         let mut root = CatalogRoot::default();
         root.create_namespace(&ns, HashMap::new());
-        root.link_table(key.clone(), table_entry(0)).expect("seed table");
+        root.link_table(key, table_entry(0)).expect("seed table");
         // ABA recreate: a different table now occupies this key (new table id),
         // so the prepared pointer must be rejected as a hard conflict.
         let persisted = CatalogTableLink::new(table_id(9_999), metadata_location(versioned_location(0)));
         let update = prepared_commit(table_ident(ns, "tbl"), persisted, &versioned_location(1));
 
         let error = root
-            .merge_transaction(&[PreparedCommitRef {
-                key: &key,
-                table: Some(&update),
-            }])
+            .merge_transaction(&[&update], &empty_head_locations())
             .expect_err("table id mismatch must conflict");
 
         assert!(matches!(error, Error::CommitConflict));
@@ -1713,14 +1734,11 @@ mod tests {
         let persisted = CatalogTableLink::new(table_id(2), metadata_location(versioned_location(0)));
         let update = prepared_commit(table_ident(ns, "tbl"), persisted, &versioned_location(1));
 
-        let result = root
-            .merge_transaction(&[PreparedCommitRef {
-                key: &key,
-                table: Some(&update),
-            }])
+        let outcome = root
+            .merge_transaction(&[&update], &empty_head_locations())
             .expect("lost-ack merge");
 
-        assert!(matches!(result, MergeTransactionResult::Ready));
+        assert!(matches!(outcome, MergeOutcome::Ready));
         // Convergence, not advance: the head stays at version 1 (no redundant N+2).
         assert_eq!(active_version(&root, &key), 1);
     }
@@ -1732,7 +1750,8 @@ mod tests {
         let mut root = CatalogRoot::default();
         root.create_namespace(&ns, HashMap::new());
         // Head moved to version 2 (table id 3) under us; the prepared commit was
-        // built against version 1, so it no longer sits on the head.
+        // built against version 1 and publishes version 2, so it is a foreign
+        // winner at our version, not behind it: rebuild outright (no log needed).
         root.link_table(key.clone(), table_entry(2)).expect("seed table");
         let persisted = CatalogTableLink::new(table_id(3), metadata_location(versioned_location(1)));
         let update = prepared_commit(
@@ -1741,16 +1760,64 @@ mod tests {
             "memory://catalog/tables/table-id/metadata/00002-other.metadata.json",
         );
 
-        let result = root
-            .merge_transaction(&[PreparedCommitRef {
-                key: &key,
-                table: Some(&update),
-            }])
+        let outcome = root
+            .merge_transaction(&[&update], &empty_head_locations())
             .expect("head-moved merge");
 
-        match result {
-            MergeTransactionResult::NeedRebuild(outcome) => assert_eq!(outcome.rebuild, vec![key]),
-            MergeTransactionResult::Ready => panic!("expected NeedRebuild, got Ready"),
+        match outcome {
+            MergeOutcome::Rebuild(keys) => assert_eq!(keys, vec![key]),
+            MergeOutcome::Ready => panic!("expected Rebuild, got Ready"),
+        }
+    }
+
+    #[test]
+    fn merge_transaction_head_advanced_ancestor_is_ready() {
+        let ns = namespace(&["ns"]);
+        let key = table_key(ns.clone(), "tbl");
+        let mut root = CatalogRoot::default();
+        root.create_namespace(&ns, HashMap::new());
+        // Head advanced to version 2 after our own version 1 file landed (lost
+        // ack). Our prepared v1 is in the head's metadata-log, so the commit
+        // already landed — Ready, no rebuild, head left untouched.
+        root.link_table(key.clone(), table_entry(2)).expect("seed table");
+        let persisted = CatalogTableLink::new(table_id(3), metadata_location(versioned_location(0)));
+        let update = prepared_commit(table_ident(ns, "tbl"), persisted, &versioned_location(1));
+        let head_locations = HashMap::from([(key.clone(), vec![metadata_location(versioned_location(1))])]);
+
+        let outcome = root
+            .merge_transaction(&[&update], &head_locations)
+            .expect("head-advanced merge");
+
+        assert!(matches!(outcome, MergeOutcome::Ready));
+        // Already landed: head stays at version 2, no redundant successor.
+        assert_eq!(active_version(&root, &key), 2);
+    }
+
+    #[test]
+    fn merge_transaction_head_advanced_orphan_needs_rebuild() {
+        let ns = namespace(&["ns"]);
+        let key = table_key(ns.clone(), "tbl");
+        let mut root = CatalogRoot::default();
+        root.create_namespace(&ns, HashMap::new());
+        // Head advanced to version 2, but a foreign writer published it: our v1 is
+        // absent from the head's metadata-log, so the commit must rebuild.
+        root.link_table(key.clone(), table_entry(2)).expect("seed table");
+        let persisted = CatalogTableLink::new(table_id(3), metadata_location(versioned_location(0)));
+        let update = prepared_commit(table_ident(ns, "tbl"), persisted, &versioned_location(1));
+        let head_locations = HashMap::from([(
+            key.clone(),
+            vec![metadata_location(
+                "memory://catalog/tables/table-id/metadata/00001-other.metadata.json",
+            )],
+        )]);
+
+        let outcome = root
+            .merge_transaction(&[&update], &head_locations)
+            .expect("head-advanced merge");
+
+        match outcome {
+            MergeOutcome::Rebuild(keys) => assert_eq!(keys, vec![key]),
+            MergeOutcome::Ready => panic!("expected Rebuild, got Ready"),
         }
     }
 
@@ -1766,16 +1833,13 @@ mod tests {
         // commit must rebuild even though persisted still matches the head.
         let update = prepared_commit(table_ident(ns, "tbl"), base, &versioned_location(2));
 
-        let result = root
-            .merge_transaction(&[PreparedCommitRef {
-                key: &key,
-                table: Some(&update),
-            }])
+        let outcome = root
+            .merge_transaction(&[&update], &empty_head_locations())
             .expect("non-sequential merge");
 
-        match result {
-            MergeTransactionResult::NeedRebuild(outcome) => assert_eq!(outcome.rebuild, vec![key]),
-            MergeTransactionResult::Ready => panic!("expected NeedRebuild, got Ready"),
+        match outcome {
+            MergeOutcome::Rebuild(keys) => assert_eq!(keys, vec![key]),
+            MergeOutcome::Ready => panic!("expected Rebuild, got Ready"),
         }
     }
 
@@ -1785,23 +1849,21 @@ mod tests {
         let key = table_key(ns.clone(), "tbl");
         let mut root = CatalogRoot::default();
         root.create_namespace(&ns, HashMap::new());
-        // Namespace exists but the table entry does not: a prepared commit
-        // against a vanished table is a hard not-found, not a rebuild signal.
+        // Namespace exists but the table entry does not: a prepared commit against
+        // a vanished table is a hard not-found, not a rebuild signal.
         let persisted = CatalogTableLink::new(table_id(1), metadata_location(versioned_location(0)));
         let update = prepared_commit(table_ident(ns, "tbl"), persisted, &versioned_location(1));
 
         let error = root
-            .merge_transaction(&[PreparedCommitRef {
-                key: &key,
-                table: Some(&update),
-            }])
+            .merge_transaction(&[&update], &empty_head_locations())
             .expect_err("absent entry must fail");
 
         assert!(matches!(error, Error::TableNotFound(_)));
+        let _ = key;
     }
 
     #[test]
-    fn merge_transaction_partial_batch_rebuilds_only_unprepared() {
+    fn merge_transaction_partial_batch_rebuilds_only_stale() {
         let ns = namespace(&["ns"]);
         let key_ready = table_key(ns.clone(), "tbl_ready");
         let key_rebuild = table_key(ns.clone(), "tbl_rebuild");
@@ -1818,24 +1880,22 @@ mod tests {
         )
         .expect("seed rebuild");
         let base_ready = root.get_active(&key_ready).expect("ready base").clone();
-        let update_ready = prepared_commit(table_ident(ns, "tbl_ready"), base_ready, &versioned_location(1));
+        let update_ready = prepared_commit(table_ident(ns.clone(), "tbl_ready"), base_ready, &versioned_location(1));
+        // Non-sequential publish (v0 -> v2) makes this commit stale: rebuild.
+        let base_rebuild = root.get_active(&key_rebuild).expect("rebuild base").clone();
+        let update_rebuild = prepared_commit(
+            table_ident(ns, "tbl_rebuild"),
+            base_rebuild,
+            "memory://catalog/tables/table-rebuild/metadata/00002-uuid.metadata.json",
+        );
 
-        let result = root
-            .merge_transaction(&[
-                PreparedCommitRef {
-                    key: &key_ready,
-                    table: Some(&update_ready),
-                },
-                PreparedCommitRef {
-                    key: &key_rebuild,
-                    table: None,
-                },
-            ])
+        let outcome = root
+            .merge_transaction(&[&update_ready, &update_rebuild], &empty_head_locations())
             .expect("mixed merge");
 
-        match result {
-            MergeTransactionResult::NeedRebuild(outcome) => assert_eq!(outcome.rebuild, vec![key_rebuild]),
-            MergeTransactionResult::Ready => panic!("expected NeedRebuild, got Ready"),
+        match outcome {
+            MergeOutcome::Rebuild(keys) => assert_eq!(keys, vec![key_rebuild]),
+            MergeOutcome::Ready => panic!("expected Rebuild, got Ready"),
         }
         // The ready entry is applied even though the batch needs a rebuild: the
         // caller discards this root, so partial advance is expected and harmless.

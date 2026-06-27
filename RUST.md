@@ -48,10 +48,17 @@ Before completing a task, perform an additional optimization pass to verify the 
 
 ## Documentation
 
-- **MUST** include doc comments for all public functions, structs, enums, and methods
-- **MUST** document function parameters, return values, and errors
+- **MUST** give every public item a doc comment stating its contract; a method whose body is self-evident needs one line, not a paragraph
 - Keep comments up to date with code changes
 - Include examples in doc comments for complex functions
+
+### Comment why, not what
+
+- A comment MUST add what the code cannot state itself: the reason for a decision, a non-obvious invariant or contract, a trap, a cross-reference.
+- **NEVER** restate the body in prose. If deleting the comment loses no information a reader couldn't get from the code, delete it.
+- **Acid test:** a good comment answers a question that arises *after* reading the code. One that answers "what does this line do" is noise — remove it.
+- A shared mechanism is documented **once** at its definition; call sites that use it MUST NOT repeat the explanation (link to it if needed).
+- A doc comment on a `pub` item states the **contract** (guarantees, errors, invariants), not a trace of the implementation. `# Arguments`/`# Returns` blocks are required only when a name or signature is genuinely ambiguous; do not pad self-evident params.
 
 Example doc comment:
 
