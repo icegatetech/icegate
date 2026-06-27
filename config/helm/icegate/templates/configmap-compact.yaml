@@ -25,6 +25,7 @@ data:
       spans_enabled: {{ .Values.compact.compaction.tables.spans }}
       events_enabled: {{ .Values.compact.compaction.tables.events }}
       metrics_enabled: {{ .Values.compact.compaction.tables.metrics }}
+      operations_enabled: {{ .Values.compact.compaction.tables.operations }}
       jobsmanager:
         scan_interval_secs: {{ .Values.compact.compaction.jobsmanager.scanIntervalSecs }}
         worker_count: {{ .Values.compact.compaction.jobsmanager.workerCount }}

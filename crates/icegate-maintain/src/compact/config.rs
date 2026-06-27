@@ -253,9 +253,9 @@ impl CompactionJobsManagerConfig {
 ///
 /// Controls how small Parquet data files in Iceberg tables are discovered,
 /// bin-packed into rewrite groups, and rewritten into fewer, larger files.
-// The four `*_enabled` flags are independent per-table toggles (logs, spans,
-// events, metrics), not a hidden state machine; modelling them as enums would
-// add noise without improving clarity.
+// The five `*_enabled` flags are independent per-table toggles (logs, spans,
+// events, metrics, operations), not a hidden state machine; modelling them as
+// enums would add noise without improving clarity.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -301,6 +301,8 @@ pub struct CompactionConfig {
     pub events_enabled: bool,
     /// Whether compaction is enabled for the `metrics` table.
     pub metrics_enabled: bool,
+    /// Whether compaction is enabled for the `operations` table.
+    pub operations_enabled: bool,
     /// Jobs-manager settings (worker pool, discovery interval, job-state storage),
     /// nested to mirror ingest's `shift.jobsmanager`.
     pub jobsmanager: CompactionJobsManagerConfig,
@@ -321,6 +323,7 @@ impl Default for CompactionConfig {
             spans_enabled: true,
             events_enabled: true,
             metrics_enabled: true,
+            operations_enabled: true,
             jobsmanager: CompactionJobsManagerConfig::default(),
         }
     }
@@ -393,7 +396,7 @@ mod tests {
         assert_eq!(c.min_input_files, 4);
         assert_eq!(c.max_skippable_tail_files, 0);
         assert_eq!(c.max_merge_size_ratio, 2);
-        assert!(c.logs_enabled && c.spans_enabled && c.events_enabled && c.metrics_enabled);
+        assert!(c.logs_enabled && c.spans_enabled && c.events_enabled && c.metrics_enabled && c.operations_enabled);
     }
 
     #[test]

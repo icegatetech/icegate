@@ -20,6 +20,7 @@ compaction:
   spans_enabled: true
   events_enabled: true
   metrics_enabled: true
+  operations_enabled: true
   # Jobs-manager settings, nested to mirror ingest's `shift.jobsmanager`.
   jobsmanager:
     # Shorter discovery loop than the 300s default so the demo stack compacts

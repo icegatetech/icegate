@@ -466,6 +466,7 @@ compact:
       spans: true
       events: true
       metrics: true
+      operations: true
     ## Jobs-manager settings, nested to mirror ingest's shift.jobsmanager.
     jobsmanager:
       ## Period of the discovery loop, in seconds.
