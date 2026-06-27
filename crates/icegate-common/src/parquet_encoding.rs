@@ -24,8 +24,7 @@
 //! given the column's cardinality and value distribution. Low-cardinality
 //! enums (`severity_text`, `kind`, `status_code`, `metric_type`,
 //! `is_monotonic`, `aggregation_temporality`), leading sort-key strings
-//! (`cloud_account_id`, `service_name`, `metric_name`,
-//! `service_instance_id`), and small-range ints
+//! (`service_name`, `metric_name`, `service_instance_id`), and small-range ints
 //! (`flags`, `dropped_*_count`, `scale`, `*_offset`) are deliberately
 //! omitted — dictionary already wins for those.
 //!
@@ -37,9 +36,8 @@
 //! set for that column and the corresponding Grafana picker goes blank.
 //! The canonical "enumerated string columns" list is whatever
 //! `crate::tempo::metadata::target_column_for_tag` resolves to a STRING
-//! column — currently the spans `name` intrinsic, plus `service_name`
-//! and `cloud_account_id`. Treat that mapping as load-bearing when
-//! adding new entries here.
+//! column — currently the spans `name` intrinsic, plus `service_name`.
+//! Treat that mapping as load-bearing when adding new entries here.
 //!
 //! Encodings used:
 //! - `DELTA_BINARY_PACKED` (INT32/INT64): timestamps, durations, monotonic
@@ -73,9 +71,33 @@ use crate::schema::{
     COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE, COL_VALUE_DOUBLE, COL_ZERO_COUNT, COL_ZERO_THRESHOLD,
 };
 
+/// Bloom-filter columns for the `logs` table.
+///
+/// Equality-predicate lookups (trace-by-id, `{trace_id="..."}`) skip whole
+/// row groups via these high-cardinality columns.
+pub const LOGS_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
+
+/// Bloom-filter columns for the `spans` table.
+///
+/// Equality-predicate lookups (Tempo trace-by-id) skip whole row groups via
+/// these high-cardinality columns.
+pub const SPANS_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
+
+/// Bloom-filter columns for the `events` table.
+///
+/// Equality-predicate lookups skip whole row groups via these
+/// high-cardinality columns.
+pub const EVENTS_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
+
+/// Bloom-filter columns for the `metrics` table.
+///
+/// Metrics has no equality-predicate id lookups, so it carries no bloom
+/// filters.
+pub const METRICS_BLOOM_COLUMNS: &[&str] = &[];
+
 /// Encoding overrides for the `logs` table.
 ///
-/// Sort order: `cloud_account_id, service_name, timestamp DESC`. Sort-key
+/// Sort order: `service_name, timestamp DESC`. Sort-key
 /// strings stay on dictionary; timestamps get `DELTA_BINARY_PACKED`;
 /// `trace_id`/`span_id` get `DELTA_BYTE_ARRAY` (see module-level docs for
 /// why).
@@ -89,7 +111,7 @@ pub const LOGS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 
 /// Encoding overrides for the `spans` table.
 ///
-/// Sort order: `cloud_account_id, service_name, timestamp DESC`.
+/// Sort order: `service_name, trace_id, timestamp DESC`.
 /// `trace_id`/`span_id`/`parent_span_id` get `DELTA_BYTE_ARRAY` for the
 /// same reason as logs — adjacent rows of a trace cluster together inside
 /// the (service, timestamp) bucket.
@@ -113,7 +135,7 @@ pub const SPANS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 
 /// Encoding overrides for the `events` table.
 ///
-/// Sort order: `cloud_account_id, service_name, timestamp DESC`.
+/// Sort order: `service_name, timestamp DESC`.
 /// `trace_id`/`span_id` get `DELTA_BYTE_ARRAY` — same reasoning as logs.
 pub const EVENTS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
     (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
@@ -125,8 +147,8 @@ pub const EVENTS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
 
 /// Encoding overrides for the `metrics` table.
 ///
-/// Sort order: `cloud_account_id, metric_name, service_name,
-/// service_instance_id, timestamp DESC`. Float-valued metric columns
+/// Sort order: `metric_name, service_name, service_instance_id, timestamp DESC`.
+/// Float-valued metric columns
 /// get `BYTE_STREAM_SPLIT` to expose byte-plane locality to ZSTD.
 pub const METRICS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
     (COL_TIMESTAMP, Encoding::DELTA_BINARY_PACKED),
@@ -140,3 +162,18 @@ pub const METRICS_COLUMN_ENCODINGS: &[ColumnEncoding] = &[
     (COL_MAX, Encoding::BYTE_STREAM_SPLIT),
     (COL_ZERO_THRESHOLD, Encoding::BYTE_STREAM_SPLIT),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        COL_SPAN_ID, COL_TRACE_ID, EVENTS_BLOOM_COLUMNS, LOGS_BLOOM_COLUMNS, METRICS_BLOOM_COLUMNS, SPANS_BLOOM_COLUMNS,
+    };
+
+    #[test]
+    fn bloom_columns_are_per_table() {
+        assert_eq!(LOGS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
+        assert_eq!(SPANS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
+        assert_eq!(EVENTS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
+        assert!(METRICS_BLOOM_COLUMNS.is_empty());
+    }
+}

@@ -193,10 +193,34 @@ impl IcebergTableMetadata {
     ///
     /// Returns an error if the `TableCreation` is invalid or metadata cannot be built.
     pub(crate) fn create(creation: TableCreation, uuid: Uuid) -> Result<Self, Error> {
-        let metadata = TableMetadataBuilder::from_table_creation(creation)?
+        // `from_table_creation` reassigns every field id to a fresh sequence —
+        // the Iceberg default for a brand-new table. icegate, however, depends
+        // on *fixed* schema field ids end to end: the WAL and the shifter write
+        // Arrow data tagged with the ids from `icegate-common`'s hand-built
+        // schemas, so a reassigned table no longer matches the data written into
+        // it (the shifter fails with "Field id N not found in struct array").
+        // A REST catalog never reassigns — it persists the schema the client
+        // sent verbatim — which is why the same tables work there. Reproduce
+        // that here: re-apply the caller's original schema, partition spec, and
+        // sort order on top of the reassigned skeleton. `add_schema` /
+        // `add_default_*` keep the supplied field ids verbatim (only `new`
+        // reassigns), so the persisted table matches the WAL.
+        let original_schema = creation.schema.clone();
+        let original_spec = creation.partition_spec.clone();
+        let original_sort_order = creation.sort_order.clone();
+
+        let mut builder = TableMetadataBuilder::from_table_creation(creation)?
             .assign_uuid(uuid)
-            .build()?
-            .metadata;
+            .add_current_schema(original_schema)?;
+        if let Some(spec) = original_spec {
+            builder = builder.add_default_partition_spec(spec)?;
+        }
+        if let Some(sort_order) = original_sort_order {
+            builder = builder
+                .add_sort_order(sort_order)?
+                .set_default_sort_order(i64::from(TableMetadataBuilder::LAST_ADDED))?;
+        }
+        let metadata = builder.build()?.metadata;
         let metadata_location = Self::next_metadata_path(metadata.location(), MetadataVersion::initial());
         Ok(Self::new(TableMetadataLocation::from(metadata_location), metadata))
     }
@@ -803,10 +827,12 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use iceberg::TableCreation;
     use iceberg::spec::{
-        FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder, Type, UnboundPartitionSpec,
+        FormatVersion, MapType, NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder, Type,
+        UnboundPartitionSpec,
     };
 
     use super::*;
@@ -937,6 +963,58 @@ mod tests {
             .schema(test_schema())
             .location(location.to_string())
             .build()
+    }
+
+    /// A schema mirroring icegate's interleaved id layout: a `Map` field whose
+    /// nested key/value ids (3/4) sit *between* top-level fields. Iceberg's
+    /// fresh-id reassignment numbers every top-level field before any nested
+    /// one, so it would move the map key/value off 3/4.
+    fn interleaved_map_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "service", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(
+                    2,
+                    "attributes",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::required(3, "key", Type::Primitive(PrimitiveType::String))),
+                        Arc::new(NestedField::required(
+                            4,
+                            "value",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                    )),
+                )
+                .into(),
+                NestedField::required(5, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("schema")
+    }
+
+    #[test]
+    fn create_preserves_caller_field_ids() {
+        // The S3 catalog must persist the schema the caller supplied verbatim
+        // (like a REST catalog), not iceberg's reassigned ids — icegate's
+        // WAL/shifter write Arrow data tagged with the original field ids.
+        let creation = TableCreation::builder()
+            .name("spans".to_string())
+            .schema(interleaved_map_schema())
+            .location("s3://bucket/tables/spans".to_string())
+            .build();
+
+        let state = TableMetadataState::create(creation, Uuid::new_v4()).expect("create table state");
+        let schema = state.metadata().current_schema();
+
+        let attributes = schema.field_by_name("attributes").expect("attributes field");
+        let Type::Map(map) = attributes.field_type.as_ref() else {
+            panic!("attributes field is not a map");
+        };
+        assert_eq!(map.key_field.id, 3, "map key field id must be preserved");
+        assert_eq!(map.value_field.id, 4, "map value field id must be preserved");
+        assert_eq!(schema.field_by_name("service").expect("service field").id, 1);
+        assert_eq!(schema.field_by_name("name").expect("name field").id, 5);
     }
 
     #[test]

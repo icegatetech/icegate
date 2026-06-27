@@ -316,7 +316,7 @@ impl ParseDuration {
                     return None; // Unknown unit
                 };
 
-                total_nanos += num * unit;
+                total_nanos = num.mul_add(unit, total_nanos);
             }
         }
 

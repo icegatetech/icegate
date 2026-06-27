@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92.0"
 authors = ["IceGate Tech"]
@@ -55,6 +55,7 @@ icegate-queue = { path = "crates/icegate-queue" }
 
 # Arrow ecosystem (must match iceberg's version)
 arrow = { version = "57.0", default-features = false, features = ["prettyprint"] }
+arrow-flight = { version = "57.0", default-features = false, features = ["flight-sql"] }
 parquet = { version = "57.0", default-features = false, features = ["arrow", "object_store", "zstd"] }
 object_store = { version = "0.12", features = ["aws"] }
 opendal = { version = "0.55", features = ["services-s3", "services-fs", "layers-otel-trace", "layers-otel-metrics"]}
@@ -77,19 +78,25 @@ tikv-jemallocator = "0.6"
 # ANTLR parser
 antlr4rust = "0.5"
 
-iceberg = { version = "0.9.0" }
-iceberg-catalog-rest = { version = "0.9.0" }
-iceberg-catalog-s3tables = { version = "0.9.0" }
-iceberg-catalog-glue = { version = "0.9.0" }
-iceberg-datafusion = { version = "0.9.0" }
+# Sourced from the icegatetech/iceberg-rust fork (0.9.0 base + the `rewrite_files`
+# transaction action that compaction commits through a generic `dyn Catalog`).
+# Pinned to an immutable rev (not a branch) for reproducible builds; bump the SHA
+# deliberately when adopting fork updates rather than letting `develop` float.
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
+iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
+iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "03956eeae771991ebcb2ab3731b76bced0c640ca" }
 
 # DataFusion
 datafusion = "52.2"
 datafusion-tracing = "52.0"
+datafusion-flight-sql-server = "=0.4.15"
 
 # Async runtime
 tokio = { version = "1.48.0", features = ["full", "tracing"] }
 tokio-util = "0.7"
+tokio-stream = "0.1"
 futures = "0.3.31"
 
 # CLI
@@ -136,6 +143,7 @@ regex = "1.12"
 # Utilities
 itoa = "1"
 bytes = "1.11.1"
+base64 = "0.22"
 dashmap = "6.1"
 lru = "0.16"
 url = "2"

@@ -5,8 +5,10 @@
 
 use std::path::Path;
 
-use icegate_common::{CatalogConfig, StorageConfig};
+use icegate_common::{CatalogConfig, MetricsConfig, StorageConfig};
 use serde::{Deserialize, Serialize};
+
+use crate::compact::config::CompactionConfig;
 
 /// Maintain binary configuration
 ///
@@ -18,6 +20,18 @@ pub struct MaintainConfig {
     pub catalog: CatalogConfig,
     /// Storage backend configuration
     pub storage: StorageConfig,
+    /// Parquet compaction configuration
+    ///
+    /// Defaulted when absent from the config file so existing migrate configs
+    /// (which have no `compaction` key) continue to load unchanged.
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+    /// Prometheus metrics endpoint configuration for the long-running `run`
+    /// service. Disabled by default and ignored by the one-shot `migrate`
+    /// commands; when enabled, `run` installs the global meter provider (so the
+    /// compactor's `CompactMetrics` record) and serves `/metrics`.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 impl MaintainConfig {
@@ -40,6 +54,7 @@ impl MaintainConfig {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.catalog.validate()?;
         self.storage.validate()?;
+        self.metrics.validate()?;
         Ok(())
     }
 }

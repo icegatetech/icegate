@@ -1,8 +1,8 @@
 [package]
 name = "icegate-query"
-description = "Query APIs for IceGate (Loki, Prometheus, Tempo)"
-readme = "../../README.md"
-keywords = ["iceberg", "datafusion", "logql", "observability"]
+description = "Query APIs for IceGate (Loki, Prometheus, Tempo, Flight SQL)"
+readme = "README.md"
+keywords = ["iceberg", "datafusion", "logql", "flight-sql"]
 categories = ["database"]
 version = { workspace = true }
 edition = { workspace = true }
@@ -33,6 +33,14 @@ iceberg-datafusion = { workspace = true }
 # DataFusion
 datafusion = { workspace = true }
 datafusion-tracing = { workspace = true }
+datafusion-flight-sql-server = { workspace = true }
+
+# Arrow Flight (gRPC transport for Flight SQL)
+arrow-flight = { workspace = true }
+
+# gRPC server
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
 
 # Object storage
 object_store = { workspace = true }

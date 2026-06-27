@@ -6,8 +6,8 @@ description: >-
   engine. Data is ingested via OpenTelemetry protocol and queried via
   Loki/Prometheus/Tempo-compatible APIs.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
 home: https://github.com/icegatetech/icegate
 sources:
   - https://github.com/icegatetech/icegate

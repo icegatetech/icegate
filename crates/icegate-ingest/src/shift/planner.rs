@@ -23,6 +23,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use icegate_common::merge::cluster::swept_line_cluster as common_swept_line_cluster;
 use icegate_queue::{ExtractedValue, RowGroupPlanEntry};
 use tokio_util::sync::CancellationToken;
 
@@ -308,8 +309,8 @@ impl PlannerConfig {
 
 /// End-to-end planner pipeline for row groups with precomputed partition buckets.
 ///
-/// Pipeline: `partition_by_bucket` → per-partition-bucket(`sort_by_min_key` →
-/// `swept_line_cluster` → `bin_pack` → `tail_merge`).
+/// Pipeline: `partition_by_bucket` → per-partition-bucket(`swept_line_cluster`
+/// → `bin_pack` → `tail_merge`).
 ///
 /// Row groups are first split by abstract [`PartitionBucket`] so that the
 /// algorithm never bin-packs or tail-merges row groups that belong to different
@@ -431,15 +432,15 @@ struct BucketStats {
 ///
 /// Returns an error if `cancel_token` is cancelled before any phase.
 fn plan_bucket(
-    mut row_groups: Vec<PlanRowGroup>,
+    row_groups: Vec<PlanRowGroup>,
     limits: &PlannerConfig,
     cancel_token: &CancellationToken,
 ) -> Result<(Vec<PlannedChunk>, BucketStats)> {
     // TODO(high): try to reduce row group iterations
 
-    check_cancelled(cancel_token, "sort")?;
-    sort_by_min_key(&mut row_groups);
     check_cancelled(cancel_token, "swept_line_cluster")?;
+    // `swept_line_cluster` stable-sorts its input by `min_key` internally, so no
+    // separate pre-sort is needed here.
     let clusters = swept_line_cluster(row_groups);
     let n_clusters = clusters.len();
     let max_cluster_bytes = clusters.iter().map(|c| c.total_bytes).max().unwrap_or_default();
@@ -458,97 +459,29 @@ fn plan_bucket(
     ))
 }
 
-/// Stable-sort row groups by `min_key` under the table's sort order.
+/// Group transitively overlapping row groups into clusters using the shared
+/// swept-line pass in [`icegate_common::merge::cluster`].
 ///
-/// Stability matters: ties on `min_key` (e.g., two row groups starting at the
-/// same `(account, service)` prefix) must keep their input order so the test
-/// surface is deterministic.
-fn sort_by_min_key(row_groups: &mut [PlanRowGroup]) {
-    row_groups.sort_by(|left, right| left.boundary_range.min_key.compare(&right.boundary_range.min_key));
-}
-
-/// Internal accumulator for a swept-line cluster.
-struct ClusterAcc {
-    row_groups: Vec<PlanRowGroup>,
-    /// Index into `row_groups` of the element whose `max_key` is the current
-    /// cluster maximum. Storing an index avoids cloning the boundary key on
-    /// every extension — only the usize is updated.
-    running_max_key_idx: usize,
-    total_bytes: u64,
-}
-
-/// Group transitively overlapping row groups into clusters using a swept-line
-/// pass over `min_key`-sorted input.
+/// Two row groups overlap when `b.min_key <= cluster.running_max_key` (the
+/// maximum `max_key` observed so far inside the current cluster), so A–B and
+/// B–C overlaps transitively flush into one cluster. The shared routine
+/// guarantees the strict between-cluster invariant
+/// `clusters[i].running_max_key < clusters[i+1].min_key`.
 ///
-/// Two row groups overlap when `b.min_key <= cluster.running_max_key`. The
-/// `running_max_key` is the maximum `max_key` observed so far inside the
-/// current cluster — ensuring that A overlaps B and B overlaps C transitively
-/// flushes both into the same cluster.
-///
-/// Invariant: between any two consecutive output clusters
-/// `clusters[i].running_max_key < clusters[i+1].min_key` (strict).
+/// The common routine returns bare `Vec<PlanRowGroup>` groups; this adapter
+/// projects each row group to its `boundary_range` and re-attaches the
+/// per-cluster `total_bytes` that downstream bin-packing relies on.
 fn swept_line_cluster(row_groups: Vec<PlanRowGroup>) -> Vec<Cluster> {
-    use std::cmp::Ordering;
-
-    let mut clusters: Vec<Cluster> = Vec::new();
-    let mut current: Option<ClusterAcc> = None;
-    for rg in row_groups {
-        match current.as_mut() {
-            None => {
-                current = Some(ClusterAcc {
-                    running_max_key_idx: 0,
-                    total_bytes: rg.row_group_bytes,
-                    row_groups: vec![rg],
-                });
+    common_swept_line_cluster(row_groups, |rg: &PlanRowGroup| &rg.boundary_range)
+        .into_iter()
+        .map(|group| {
+            let total_bytes = group.iter().map(|rg| rg.row_group_bytes).fold(0u64, u64::saturating_add);
+            Cluster {
+                row_groups: group,
+                total_bytes,
             }
-            Some(acc) => {
-                // Compute the overlap order; borrow ends at block boundary so
-                // we can mutate `acc.row_groups` afterwards.
-                let order = {
-                    let running_max = &acc.row_groups[acc.running_max_key_idx].boundary_range.max_key;
-                    rg.boundary_range.min_key.compare(running_max)
-                };
-                if matches!(order, Ordering::Less | Ordering::Equal) {
-                    // Determine whether the incoming RG extends the cluster
-                    // maximum; borrow ends before the push below.
-                    let extends_max = {
-                        let running_max = &acc.row_groups[acc.running_max_key_idx].boundary_range.max_key;
-                        rg.boundary_range.max_key.compare(running_max) == Ordering::Greater
-                    };
-                    if extends_max {
-                        // After push, `rg` will sit at the current length.
-                        acc.running_max_key_idx = acc.row_groups.len();
-                    }
-                    acc.total_bytes = acc.total_bytes.saturating_add(rg.row_group_bytes);
-                    acc.row_groups.push(rg);
-                } else {
-                    // Invariant: we are inside the `Some(acc)` arm above, so
-                    // `current` must still be `Some`. The `else` arm makes
-                    // the invariant explicit — silently dropping `rg` would
-                    // lose data and is unreachable on this branch.
-                    let Some(finished) = current.take() else {
-                        unreachable!("current is Some on the Greater branch");
-                    };
-                    clusters.push(Cluster {
-                        row_groups: finished.row_groups,
-                        total_bytes: finished.total_bytes,
-                    });
-                    current = Some(ClusterAcc {
-                        running_max_key_idx: 0,
-                        total_bytes: rg.row_group_bytes,
-                        row_groups: vec![rg],
-                    });
-                }
-            }
-        }
-    }
-    if let Some(acc) = current {
-        clusters.push(Cluster {
-            row_groups: acc.row_groups,
-            total_bytes: acc.total_bytes,
-        });
-    }
-    clusters
+        })
+        .collect()
 }
 
 /// Bin-pack clusters greedily into shift-task chunks.
@@ -741,7 +674,7 @@ mod tests {
 
     use super::{
         Cluster, PartitionBucket, PartitionValue, PlanRowGroup, PlannedChunk, PlannerConfig, RowGroupPartition,
-        bin_pack, partition_by_bucket, sort_by_min_key, swept_line_cluster, tail_merge,
+        bin_pack, partition_by_bucket, swept_line_cluster, tail_merge,
     };
     use crate::{
         error::IngestError,
@@ -805,27 +738,6 @@ mod tests {
 
     fn limits_with_upper(lower: u64, upper: u64, max_rg: usize) -> PlannerConfig {
         PlannerConfig::from_bounds(lower, upper, max_rg)
-    }
-
-    // ---- sort_by_min_key ----
-
-    #[test]
-    fn sort_orders_by_min_key_ascending() {
-        let mut rgs = vec![rg(0, 2, 1, 30, 40), rg(0, 0, 1, 10, 20), rg(0, 1, 1, 20, 30)];
-        sort_by_min_key(&mut rgs);
-        assert_eq!(rg_idxs_vec(&rgs), vec![(0, 0), (0, 1), (0, 2)]);
-    }
-
-    #[test]
-    fn sort_is_stable_on_equal_min_keys() {
-        let mut rgs = vec![rg(0, 0, 1, 10, 20), rg(1, 5, 1, 10, 50), rg(2, 7, 1, 10, 30)];
-        sort_by_min_key(&mut rgs);
-        // Inputs all share min_key=10 — stable sort must preserve the input order.
-        assert_eq!(rg_idxs_vec(&rgs), vec![(0, 0), (1, 5), (2, 7)]);
-    }
-
-    fn rg_idxs_vec(rgs: &[PlanRowGroup]) -> Vec<(u64, usize)> {
-        rgs.iter().map(|r| (r.wal_offset, r.row_group_idx)).collect()
     }
 
     fn cluster(row_groups: Vec<PlanRowGroup>) -> Cluster {

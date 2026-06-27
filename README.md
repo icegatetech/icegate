@@ -120,6 +120,7 @@ Once running, the following services are available:
 - **Loki API**: `http://localhost:3100` - Query logs using Loki-compatible API ✅ **Currently Supported**
 - **Prometheus API**: `http://localhost:9090` - Query metrics (planned)
 - **Tempo API**: `http://localhost:3200` - Query traces (planned)
+- **Arrow Flight SQL**: `grpc://localhost:8815` - General-purpose SQL over the merged WAL + Iceberg view; read-only, tenant identified by the `x-scope-orgid` gRPC metadata header (defaults to `default`). See [Querying via Flight SQL](#querying-via-flight-sql) below for supported clients.
 
 #### Visualization
 - **Grafana**: `http://localhost:3000` - Dashboard and visualization (no login required)
@@ -149,6 +150,42 @@ make run-docker-analytics-release
 - Send telemetry data to `localhost:4317` (gRPC) or `localhost:4318` (HTTP) using any OpenTelemetry SDK
 - View data in Grafana at `http://localhost:3000`
 - Query data using Loki, Prometheus, or Tempo APIs
+
+## Querying via Flight SQL
+
+IceGate exposes an [Apache Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) gRPC endpoint on `:8815`. Queries run server-side through Apache DataFusion against the merged WAL + Iceberg view, so only result sets cross the wire — aggregations and joins do not pull raw rows to the client. The endpoint is strictly read-only (DDL and DML are rejected) and identifies tenants from the `x-scope-orgid` gRPC metadata header.
+
+### Supported clients
+
+| Client | How |
+|---|---|
+| Python | `pip install adbc-driver-flightsql adbc-driver-manager` |
+| JDBC (dbt, DataGrip, DBeaver, Apache Superset, Metabase) | [`org.apache.arrow:flight-sql-jdbc-driver`](https://central.sonatype.com/artifact/org.apache.arrow/flight-sql-jdbc-driver) |
+| ODBC (Tableau, Power BI, Excel) | [Apache Arrow Flight SQL ODBC Driver](https://github.com/apache/arrow/tree/main/cpp/src/arrow/flight/sql/odbc) |
+| Native | `arrow-flight` C++ / Rust / Go libraries |
+| Loki / Prometheus / Tempo HTTP | Existing endpoints on `:3100` / `:9090` / `:3200` — preferred for those workloads |
+
+### Python example
+
+```python
+import adbc_driver_flightsql.dbapi
+
+conn = adbc_driver_flightsql.dbapi.connect(
+    "grpc://localhost:8815",
+    db_kwargs={"adbc.flight.sql.rpc.call_header.x-scope-orgid": "tenant-alpha"},
+)
+with conn.cursor() as cur:
+    cur.execute("SELECT count(*) FROM iceberg.icegate.logs")
+    print(cur.fetchall())
+```
+
+> [!WARNING]
+> **DuckDB users:** there is no first-party DuckDB Flight SQL extension. Connect either through the Apache Arrow Flight SQL ODBC driver via DuckDB's `odbc` core extension, or through Python with `adbc_driver_flightsql` and import results into DuckDB as Arrow.
+>
+> **Do not use the [`airport`](https://github.com/Query-farm/airport) community extension or [`duckhog`](https://github.com/Hugoberry/duckhog) against IceGate.**
+>
+> - `airport` looks like a Flight SQL client but speaks a different protocol over the same Arrow Flight transport. DuckDB owns the planner and pulls raw rows over the wire, then aggregates locally. On a billion-row observability table a single `count(*) GROUP BY hour` can ship gigabytes to the client. With Flight SQL via ODBC or ADBC, DataFusion aggregates server-side and only the result set crosses the wire.
+> - `duckhog` is an unmaintained third-party Flight SQL client whose quirks (mandatory `BeginTransaction` handshakes, `user=<tenant>` connection-string parameter as identity) IceGate explicitly does not accommodate.
 
 ## Development
 

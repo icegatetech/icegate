@@ -10,8 +10,8 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use icegate_common::schema::{
-    COL_CLOUD_ACCOUNT_ID, COL_DURATION_MICROS, COL_KIND, COL_NAME, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME,
-    COL_SPAN_ATTRIBUTES, COL_SPAN_ID, COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TRACE_ID,
+    COL_DURATION_MICROS, COL_KIND, COL_NAME, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES,
+    COL_SPAN_ID, COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TRACE_ID,
 };
 
 use super::planner::not_implemented;
@@ -125,11 +125,11 @@ pub(crate) fn intrinsic_column(i: IntrinsicField) -> Expr {
 /// - `Scope::Any` (`.name` shorthand) -> `(resource_cmp) OR (span_cmp)`
 /// - `Scope::Event` / `Scope::Link`   -> NULL predicate (v1 unmodelled)
 ///
-/// Well-known indexed resource keys (`service.name`, `cloud.account.id`) are
-/// short-circuited to the corresponding top-level column — but only in the
-/// Resource and Any paths. A query against `span.service.name` would still
-/// go through `span_attributes[service.name]`; that's rare enough that the
-/// lost optimization is acceptable.
+/// Well-known indexed resource keys (`service.name`) are short-circuited
+/// to the corresponding top-level column — but only in the Resource and Any
+/// paths. A query against `span.service.name` would still go through
+/// `span_attributes[service.name]`; that's rare enough that the lost
+/// optimization is acceptable.
 fn attribute_compare(scope: Scope, name: &str, op: ComparisonOp, field: &FieldRef, value: &LiteralValue) -> Expr {
     match scope {
         Scope::Resource | Scope::Parent(ParentScope::Resource) => {
@@ -174,9 +174,9 @@ pub(crate) fn resource_attribute_lhs(name: &str) -> Expr {
 /// LHS expression for a span-scoped attribute lookup.
 ///
 /// No indexed short-circuit: span-scoped keys live only in the per-span
-/// attributes map. (The top-level `service_name` / `cloud_account_id`
-/// columns carry resource-level values, so a `span.service.name` filter
-/// must stay inside `span_attributes`.)
+/// attributes map. (The top-level `service_name` column carries
+/// resource-level values, so a `span.service.name` filter must stay
+/// inside `span_attributes`.)
 pub(crate) fn span_attribute_lhs(name: &str) -> Expr {
     array_element(map_extract(col(COL_SPAN_ATTRIBUTES), lit(name)), lit(1_i64))
 }
@@ -186,13 +186,12 @@ pub(crate) fn span_attribute_lhs(name: &str) -> Expr {
 ///
 /// At ingest time, certain `OTel` resource attributes are promoted to
 /// dedicated columns (see `crates/icegate-ingest/src/transform.rs`):
-/// `service.name` -> `service_name`, `cloud.account.id` -> `cloud_account_id`.
-/// Filtering on the indexed column is dramatically faster because the
-/// attributes MAP is a per-row blob that can't be pruned.
+/// `service.name` -> `service_name`. Filtering on the indexed column is
+/// dramatically faster because the attributes MAP is a per-row blob that
+/// can't be pruned.
 fn indexed_resource_column(name: &str) -> Option<&'static str> {
     match name {
         "service.name" | "resource.service.name" => Some(COL_SERVICE_NAME),
-        "cloud.account.id" | "resource.cloud.account.id" => Some(COL_CLOUD_ACCOUNT_ID),
         _ => None,
     }
 }

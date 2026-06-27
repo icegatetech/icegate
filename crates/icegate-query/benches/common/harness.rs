@@ -187,7 +187,6 @@ pub async fn write_benchmark_logs(
     let time_step = time_range_micros / i64::try_from(count).unwrap_or(1);
 
     let mut tenant_ids = Vec::with_capacity(count);
-    let mut account_ids = Vec::with_capacity(count);
     let mut service_names = Vec::with_capacity(count);
     let mut timestamps = Vec::with_capacity(count);
     let mut observed_timestamps = Vec::with_capacity(count);
@@ -199,7 +198,6 @@ pub async fn write_benchmark_logs(
 
     for (i, body_str) in body_strs.iter().enumerate() {
         tenant_ids.push("test-tenant");
-        account_ids.push(Some("acc-1"));
         service_names.push(Some("api"));
         let ts = now_micros - (i64::try_from(i).unwrap_or(0) * time_step);
         timestamps.push(ts);
@@ -210,7 +208,6 @@ pub async fn write_benchmark_logs(
     }
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids));
-    let account_id_arr: ArrayRef = Arc::new(StringArray::from(account_ids));
     let service_name_arr: ArrayRef = Arc::new(StringArray::from(service_names));
     let timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps));
     let observed_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(observed_timestamps));
@@ -264,7 +261,6 @@ pub async fn write_benchmark_logs(
         arrow_schema.clone(),
         vec![
             tenant_id_arr,
-            account_id_arr,
             service_name_arr,
             timestamp_arr,
             observed_timestamp_arr,
@@ -310,7 +306,6 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
     };
 
     let mut tenant_ids = Vec::with_capacity(count);
-    let mut account_ids = Vec::with_capacity(count);
     let mut service_names = Vec::with_capacity(count);
     let mut timestamps = Vec::with_capacity(count);
     let mut observed_timestamps = Vec::with_capacity(count);
@@ -322,7 +317,6 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
 
     for (i, body_str) in body_strs.iter().enumerate() {
         tenant_ids.push("test-tenant");
-        account_ids.push(Some("acc-1"));
         service_names.push(Some("api"));
         let ts = now_micros - (i64::try_from(i).unwrap_or(0) * time_step);
         timestamps.push(ts);
@@ -333,7 +327,6 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
     }
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids));
-    let account_id_arr: ArrayRef = Arc::new(StringArray::from(account_ids));
     let service_name_arr: ArrayRef = Arc::new(StringArray::from(service_names));
     let timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps));
     let observed_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(observed_timestamps));
@@ -391,7 +384,6 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
         arrow_schema.clone(),
         vec![
             tenant_id_arr,
-            account_id_arr,
             service_name_arr,
             timestamp_arr,
             observed_timestamp_arr,
@@ -426,7 +418,6 @@ pub async fn write_benchmark_logs_with_varied_labels(
     let pods = ["pod-1", "pod-2", "pod-3", "pod-4", "pod-5"];
 
     let mut tenant_ids = Vec::with_capacity(count);
-    let mut account_ids = Vec::with_capacity(count);
     let mut service_names = Vec::with_capacity(count);
     let mut timestamps = Vec::with_capacity(count);
     let mut observed_timestamps = Vec::with_capacity(count);
@@ -438,7 +429,6 @@ pub async fn write_benchmark_logs_with_varied_labels(
 
     for (i, body_str) in body_strs.iter().enumerate() {
         tenant_ids.push("test-tenant");
-        account_ids.push(Some("acc-1"));
         service_names.push(Some("api"));
         let ts = now_micros - (i64::try_from(i).unwrap_or(0) * time_step);
         timestamps.push(ts);
@@ -449,7 +439,6 @@ pub async fn write_benchmark_logs_with_varied_labels(
     }
 
     let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids));
-    let account_id_arr: ArrayRef = Arc::new(StringArray::from(account_ids));
     let service_name_arr: ArrayRef = Arc::new(StringArray::from(service_names));
     let timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps));
     let observed_timestamp_arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(observed_timestamps));
@@ -508,7 +497,6 @@ pub async fn write_benchmark_logs_with_varied_labels(
         arrow_schema.clone(),
         vec![
             tenant_id_arr,
-            account_id_arr,
             service_name_arr,
             timestamp_arr,
             observed_timestamp_arr,

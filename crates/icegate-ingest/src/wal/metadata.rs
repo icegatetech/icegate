@@ -22,10 +22,13 @@ pub(crate) fn deserialize_row_group_boundary_range(metadata: &str) -> Result<Row
     let range: RowGroupBoundaryRange = serde_json::from_value(value)
         .map_err(|err| IngestError::Shift(format!("failed to deserialize WAL row-group metadata: {err}")))?;
     range.validate().map_err(|err| match err {
-        IngestError::Shift(message) => {
+        // `RowGroupBoundaryRange::validate` reports invalid ranges as
+        // `CommonError::Write`; preserve the original `IngestError::Shift`
+        // wrapping and message prefix for callers.
+        icegate_common::error::CommonError::Write(message) => {
             IngestError::Shift(format!("failed to deserialize WAL row-group metadata: {message}"))
         }
-        other => other,
+        other => other.into(),
     })?;
     Ok(range)
 }

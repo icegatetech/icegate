@@ -50,13 +50,6 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
         "test-tenant",
         "test-tenant",
     ]));
-    let cloud_account_id: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-        Some("acc-1"),
-    ]));
     let service_name: ArrayRef = Arc::new(StringArray::from(vec![
         Some("api-server"),
         Some("api-server"),
@@ -100,7 +93,7 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(10);
+    let attributes_field = arrow_schema.field(9);
     let (key_field, value_field) = match attributes_field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
@@ -173,7 +166,6 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
         arrow_schema.clone(),
         vec![
             tenant_id,
-            cloud_account_id,
             service_name,
             timestamp,
             observed_timestamp,

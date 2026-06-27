@@ -5,7 +5,7 @@ use arrow::{
     compute::take,
     record_batch::RecordBatch,
 };
-use icegate_common::{LOGS_TOPIC, SPANS_TOPIC};
+use icegate_common::{LOGS_TOPIC, METRICS_TOPIC, SPANS_TOPIC};
 use icegate_queue::{PreparedWalRowGroup, WriteRequest};
 
 use super::{
@@ -144,6 +144,21 @@ pub(crate) fn sort_spans(
     )
 }
 
+/// Prepare WAL batches for one metrics ingest request.
+pub(crate) fn sort_metrics(
+    batch: &RecordBatch,
+    row_group_size: usize,
+    trace_context: Option<String>,
+) -> Result<Option<PreparedWalWrite>> {
+    prepare(
+        SortColumnsDescriptor::metrics()?,
+        METRICS_TOPIC,
+        batch,
+        row_group_size,
+        trace_context,
+    )
+}
+
 fn prepare(
     descriptor: &'static SortColumnsDescriptor,
     topic: &'static str,
@@ -183,8 +198,13 @@ fn row_group_boundary_range_from_cached_columns(
         max_key,
     };
     range.validate().map_err(|err| match err {
-        IngestError::Shift(message) => IngestError::Shift(format!("invalid WAL row-group boundary range: {message}")),
-        other => other,
+        // `RowGroupBoundaryRange::validate` reports invalid ranges as
+        // `CommonError::Write`; preserve the original `IngestError::Shift`
+        // wrapping and message prefix for callers.
+        icegate_common::error::CommonError::Write(message) => {
+            IngestError::Shift(format!("invalid WAL row-group boundary range: {message}"))
+        }
+        other => other.into(),
     })?;
 
     Ok(range)
@@ -201,7 +221,7 @@ mod tests {
     };
     use icegate_queue::{WriteResult, channel};
 
-    use super::{WalSorter, sort_logs, sort_spans};
+    use super::{WalSorter, sort_logs, sort_metrics, sort_spans};
     use crate::error::IngestError;
     use crate::wal::{
         RowGroupBoundaryKey, RowGroupBoundaryRange, RowGroupBoundaryValue, SortColumnsDescriptor, WalAckOutcome,
@@ -218,7 +238,6 @@ mod tests {
     fn logs_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tenant_id", DataType::Utf8, false),
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("row_id", DataType::Int64, false),
@@ -228,13 +247,6 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec![
                     "tenant-b", "tenant-a", "tenant-a", "tenant-b", "tenant-a",
-                ])) as ArrayRef,
-                Arc::new(StringArray::from(vec![
-                    Some("acc-2"),
-                    Some("acc-2"),
-                    Some("acc-1"),
-                    Some("acc-1"),
-                    None,
                 ])) as ArrayRef,
                 Arc::new(StringArray::from(vec![
                     Some("svc-2"),
@@ -264,23 +276,12 @@ mod tests {
     }
 
     fn row_ids(batch: &RecordBatch) -> Vec<i64> {
-        let row_ids = batch.column(4).as_any().downcast_ref::<Int64Array>().expect("row_id");
+        let row_ids = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("row_id");
         (0..batch.num_rows()).map(|row_idx| row_ids.value(row_idx)).collect()
     }
 
-    fn cloud_account_values(batch: &RecordBatch) -> Vec<Option<String>> {
-        let values = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("cloud_account_id");
-        (0..batch.num_rows())
-            .map(|row_idx| (!values.is_null(row_idx)).then(|| values.value(row_idx).to_string()))
-            .collect()
-    }
-
     fn service_values(batch: &RecordBatch) -> Vec<Option<String>> {
-        let values = batch.column(2).as_any().downcast_ref::<StringArray>().expect("service_name");
+        let values = batch.column(1).as_any().downcast_ref::<StringArray>().expect("service_name");
         (0..batch.num_rows())
             .map(|row_idx| (!values.is_null(row_idx)).then(|| values.value(row_idx).to_string()))
             .collect()
@@ -288,7 +289,7 @@ mod tests {
 
     fn timestamp_values(batch: &RecordBatch) -> Vec<Option<i64>> {
         let values = batch
-            .column(3)
+            .column(2)
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("timestamp");
@@ -298,20 +299,11 @@ mod tests {
     }
 
     fn logs_names() -> std::sync::Arc<[String]> {
-        std::sync::Arc::from([
-            "cloud_account_id".to_string(),
-            "service_name".to_string(),
-            "timestamp".to_string(),
-        ])
+        std::sync::Arc::from(["service_name".to_string(), "timestamp".to_string()])
     }
 
-    fn key(
-        cloud_account_id: Option<&str>,
-        service_name: Option<&str>,
-        timestamp_micros: Option<i64>,
-    ) -> RowGroupBoundaryKey {
+    fn key(service_name: Option<&str>, timestamp_micros: Option<i64>) -> RowGroupBoundaryKey {
         RowGroupBoundaryKey::new(vec![
-            boundary_component_string(cloud_account_id.map(str::to_string), false, true),
             boundary_component_string(service_name.map(str::to_string), false, true),
             boundary_component_timestamp_micros(timestamp_micros, true, true),
         ])
@@ -339,19 +331,15 @@ mod tests {
         let tenant_a = &batches[1].batch;
 
         assert_eq!(
-            cloud_account_values(tenant_a),
-            vec![None, Some("acc-1".to_string()), Some("acc-2".to_string())]
-        );
-        assert_eq!(
             service_values(tenant_a),
             vec![
                 Some("svc-0".to_string()),
-                Some("svc-2".to_string()),
-                Some("svc-1".to_string())
+                Some("svc-1".to_string()),
+                Some("svc-2".to_string())
             ]
         );
-        assert_eq!(timestamp_values(tenant_a), vec![Some(50), Some(30), Some(20)]);
-        assert_eq!(row_ids(tenant_a), vec![4, 2, 1]);
+        assert_eq!(timestamp_values(tenant_a), vec![Some(50), Some(20), Some(30)]);
+        assert_eq!(row_ids(tenant_a), vec![4, 1, 2]);
     }
 
     #[test]
@@ -382,7 +370,6 @@ mod tests {
     fn pre_wal_sorter_preserves_input_order_for_equal_sort_keys() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tenant_id", DataType::Utf8, false),
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("row_id", DataType::Int64, false),
@@ -391,7 +378,6 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(vec!["tenant-a", "tenant-a", "tenant-a"])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1"), Some("acc-1")])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("svc-1"), Some("svc-1"), Some("svc-1")])) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![Some(10), Some(10), Some(10)])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![11, 12, 13])) as ArrayRef,
@@ -409,8 +395,8 @@ mod tests {
     fn pre_wal_sorter_keeps_order_across_multiple_row_groups_for_same_tenant() {
         let batches = WalSorter::new(2).sort(logs_descriptor(), &logs_batch()).expect("sort logs");
 
-        assert_eq!(row_ids(&batches[1].batch), vec![4, 2]);
-        assert_eq!(row_ids(&batches[2].batch), vec![1]);
+        assert_eq!(row_ids(&batches[1].batch), vec![4, 1]);
+        assert_eq!(row_ids(&batches[2].batch), vec![2]);
     }
 
     #[test]
@@ -429,24 +415,24 @@ mod tests {
             ranges[0],
             RowGroupBoundaryRange {
                 names: logs_names(),
-                min_key: key(Some("acc-1"), None, Some(40)),
-                max_key: key(Some("acc-2"), Some("svc-2"), Some(10)),
+                min_key: key(None, Some(40)),
+                max_key: key(Some("svc-2"), Some(10)),
             }
         );
         assert_eq!(
             ranges[1],
             RowGroupBoundaryRange {
                 names: logs_names(),
-                min_key: key(None, Some("svc-0"), Some(50)),
-                max_key: key(Some("acc-1"), Some("svc-2"), Some(30)),
+                min_key: key(Some("svc-0"), Some(50)),
+                max_key: key(Some("svc-1"), Some(20)),
             }
         );
         assert_eq!(
             ranges[2],
             RowGroupBoundaryRange {
                 names: logs_names(),
-                min_key: key(Some("acc-2"), Some("svc-1"), Some(20)),
-                max_key: key(Some("acc-2"), Some("svc-1"), Some(20)),
+                min_key: key(Some("svc-2"), Some(30)),
+                max_key: key(Some("svc-2"), Some(30)),
             }
         );
     }
@@ -456,15 +442,13 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("tenant_id", DataType::Utf8, false),
-                Field::new("cloud_account_id", DataType::Utf8, true),
                 Field::new("service_name", DataType::Utf8, true),
                 Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
                 Field::new("row_id", DataType::Int64, false),
             ])),
             vec![
                 Arc::new(StringArray::from(vec!["tenant-a", "tenant-a", "tenant-a"])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("acc-2"), Some("acc-2"), Some("acc-3")])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("svc-1"), Some("svc-1"), Some("svc-0")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("svc-1"), Some("svc-1"), Some("svc-2")])) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![Some(20), Some(10), Some(30)])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
             ],
@@ -472,8 +456,8 @@ mod tests {
         .expect("sorted logs batch");
         let expected = RowGroupBoundaryRange {
             names: logs_names(),
-            min_key: key(Some("acc-2"), Some("svc-1"), Some(20)),
-            max_key: key(Some("acc-3"), Some("svc-0"), Some(30)),
+            min_key: key(Some("svc-1"), Some(20)),
+            max_key: key(Some("svc-2"), Some(30)),
         };
 
         let range = logs_row_group_boundary_range_from_batch(&batch).expect("boundary range");
@@ -489,14 +473,12 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("tenant_id", DataType::Utf8, false),
-                Field::new("cloud_account_id", DataType::Utf8, true),
                 Field::new("service_name", DataType::Utf8, true),
                 Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
                 Field::new("row_id", DataType::Int64, false),
             ])),
             vec![
                 Arc::new(StringArray::from(vec!["tenant-a", "tenant-a"])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("acc-2"), Some("acc-2")])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("svc-1"), Some("svc-1")])) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![Some(20), Some(10)])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
@@ -513,26 +495,25 @@ mod tests {
 
     #[test]
     fn logs_row_group_boundary_range_preserves_nulls_in_keys() {
-        let batch = logs_batch().slice(4, 1);
+        let batch = logs_batch().slice(3, 1);
         let range = logs_row_group_boundary_range_from_batch(&batch).expect("boundary range");
 
         assert_eq!(range.min_key.components()[0].value, None);
         assert_eq!(range.max_key.components()[0].value, None);
         assert_eq!(
             range.min_key.components()[1].value,
-            Some(RowGroupBoundaryValue::String("svc-0".to_string()))
+            Some(RowGroupBoundaryValue::TimestampMicros(40))
         );
         assert_eq!(
             range.max_key.components()[1].value,
-            Some(RowGroupBoundaryValue::String("svc-0".to_string()))
+            Some(RowGroupBoundaryValue::TimestampMicros(40))
         );
     }
 
     #[test]
-    fn logs_row_group_boundary_range_works_for_equal_account_service_with_timestamp_desc() {
+    fn logs_row_group_boundary_range_works_for_equal_service_with_timestamp_desc() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tenant_id", DataType::Utf8, false),
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("row_id", DataType::Int64, false),
@@ -541,7 +522,6 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(vec!["tenant-a", "tenant-a"])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("acc-1"), Some("acc-1")])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("svc-1"), Some("svc-1")])) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![Some(30), Some(10)])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
@@ -551,11 +531,11 @@ mod tests {
 
         let range = logs_row_group_boundary_range_from_batch(&batch).expect("boundary range");
         assert_eq!(
-            range.min_key.components()[2].value,
+            range.min_key.components()[1].value,
             Some(RowGroupBoundaryValue::TimestampMicros(30))
         );
         assert_eq!(
-            range.max_key.components()[2].value,
+            range.max_key.components()[1].value,
             Some(RowGroupBoundaryValue::TimestampMicros(10))
         );
         assert_ne!(
@@ -574,11 +554,11 @@ mod tests {
     fn deserialize_logs_row_group_metadata_rejects_different_component_count() {
         let err = deserialize_row_group_boundary_range(
             r#"{
-                "names": ["cloud_account_id"],
-                "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
+                "names": ["service_name"],
+                "min_key": {"components":[{"value":{"String":"svc-1"},"descending":false,"nulls_first":true}]},
                 "max_key": {"components":[
-                    {"value":{"String":"acc-1"},"descending":false,"nulls_first":true},
-                    {"value":{"String":"svc-1"},"descending":false,"nulls_first":true}
+                    {"value":{"String":"svc-1"},"descending":false,"nulls_first":true},
+                    {"value":{"String":"svc-2"},"descending":false,"nulls_first":true}
                 ]}
             }"#,
         )
@@ -591,9 +571,9 @@ mod tests {
     fn deserialize_logs_row_group_metadata_rejects_different_component_flags() {
         let err = deserialize_row_group_boundary_range(
             r#"{
-                "names": ["cloud_account_id"],
-                "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
-                "max_key": {"components":[{"value":{"String":"acc-2"},"descending":true,"nulls_first":true}]}
+                "names": ["service_name"],
+                "min_key": {"components":[{"value":{"String":"svc-1"},"descending":false,"nulls_first":true}]},
+                "max_key": {"components":[{"value":{"String":"svc-2"},"descending":true,"nulls_first":true}]}
             }"#,
         )
         .expect_err("metadata must be rejected");
@@ -605,8 +585,8 @@ mod tests {
     fn deserialize_logs_row_group_metadata_rejects_different_component_types() {
         let err = deserialize_row_group_boundary_range(
             r#"{
-                "names": ["cloud_account_id"],
-                "min_key": {"components":[{"value":{"String":"acc-1"},"descending":false,"nulls_first":true}]},
+                "names": ["service_name"],
+                "min_key": {"components":[{"value":{"String":"svc-1"},"descending":false,"nulls_first":true}]},
                 "max_key": {"components":[{"value":{"TimestampMicros":10},"descending":false,"nulls_first":true}]}
             }"#,
         )
@@ -618,14 +598,12 @@ mod tests {
     #[test]
     fn prepare_sorted_logs_for_wal_fails_when_tenant_column_is_missing() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec![Some("acc-1")])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("svc-1")])) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![Some(10)])) as ArrayRef,
             ],
@@ -713,7 +691,6 @@ mod tests {
         // that the pipeline-generalization refactor must preserve.
         let schema = Arc::new(Schema::new(vec![
             Field::new("tenant_id", DataType::Utf8, false),
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("row_id", DataType::Int64, false),
@@ -722,12 +699,6 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(StringArray::from(vec!["tenant-a", "tenant-b", "tenant-a", "tenant-a"])) as ArrayRef,
-                Arc::new(StringArray::from(vec![
-                    Some("acc-1"),
-                    Some("acc-9"),
-                    Some("acc-2"),
-                    Some("acc-1"),
-                ])) as ArrayRef,
                 Arc::new(StringArray::from(vec![
                     Some("svc-x"),
                     Some("svc-q"),
@@ -753,20 +724,20 @@ mod tests {
         assert_eq!(prepared.write_request.row_groups.len(), 2);
         assert_eq!(prepared.records, 4);
 
-        // Tenant-a group: 3 rows, sorted by (cloud_account_id asc, service_name asc, timestamp desc).
+        // Tenant-a group: 3 rows, sorted by (service_name asc, timestamp desc).
         let rg0 = &prepared.write_request.row_groups[0];
         assert_eq!(rg0.batch.num_rows(), 3);
         let row_ids_rg0: Vec<i64> = (0..rg0.batch.num_rows())
             .map(|i| {
                 rg0.batch
-                    .column(4)
+                    .column(3)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .expect("row_id")
                     .value(i)
             })
             .collect();
-        assert_eq!(row_ids_rg0, vec![1, 4, 3]); // acc-1/svc-x/ts=100, acc-1/svc-x/ts=75, acc-2/svc-y/ts=50
+        assert_eq!(row_ids_rg0, vec![1, 4, 3]); // svc-x/ts=100, svc-x/ts=75, svc-y/ts=50
 
         // Tenant-b group: 1 row.
         let rg1 = &prepared.write_request.row_groups[1];
@@ -774,7 +745,7 @@ mod tests {
         let row_ids_rg1: Vec<i64> = (0..rg1.batch.num_rows())
             .map(|i| {
                 rg1.batch
-                    .column(4)
+                    .column(3)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .expect("row_id")
@@ -795,10 +766,9 @@ mod tests {
     #[test]
     fn sort_spans_produces_spans_topic_and_tenant_homogeneous_groups() {
         // Build a minimal batch with only the fields the spans sort descriptor cares about:
-        // tenant_id, cloud_account_id, service_name, trace_id, timestamp.
+        // tenant_id, service_name, trace_id, timestamp.
         let schema = Arc::new(Schema::new(vec![
             Field::new("tenant_id", DataType::Utf8, false),
-            Field::new("cloud_account_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
             // `trace_id` is `FIXED_LEN_BYTE_ARRAY(16)` in storage; use raw
             // 16-byte values so the sort comparator picks the right path.
@@ -820,7 +790,6 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(vec!["tenant-b", "tenant-a", "tenant-a"])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("acc-2"), Some("acc-1"), Some("acc-1")])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("svc-2"), Some("svc-1"), Some("svc-1")])) as ArrayRef,
                 Arc::new(trace_id_arr) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![Some(30), Some(10), Some(20)])) as ArrayRef,
@@ -835,8 +804,63 @@ mod tests {
 
         assert_eq!(prepared.write_request.topic, icegate_common::SPANS_TOPIC);
         assert_eq!(prepared.write_request.row_groups.len(), 2);
-        // Tenant-a group sorted by (cloud_account_id asc, service_name asc, trace_id asc, timestamp desc).
-        // Both rows share acc-1/svc-1, so sort by trace_id asc: row_id 3 (trace-a1), row_id 2 (trace-a2).
+        // Tenant-a group sorted by (service_name asc, trace_id asc, timestamp desc).
+        // Both rows share svc-1, so sort by trace_id asc: row_id 3 (trace-a1), row_id 2 (trace-a2).
+        let rg_a = prepared
+            .write_request
+            .row_groups
+            .iter()
+            .find(|rg| rg.batch.num_rows() == 2)
+            .expect("tenant-a group");
+        let row_ids: Vec<i64> = (0..rg_a.batch.num_rows())
+            .map(|i| {
+                rg_a.batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("row_id")
+                    .value(i)
+            })
+            .collect();
+        assert_eq!(row_ids, vec![3, 2]);
+    }
+
+    #[test]
+    fn sort_metrics_produces_metrics_topic_and_tenant_homogeneous_groups() {
+        use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        // Minimal batch with the columns the metrics sort descriptor needs:
+        // tenant_id, service_name, service_instance_id, metric_name, timestamp.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("service_instance_id", DataType::Utf8, true),
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("row_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["tenant-b", "tenant-a", "tenant-a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["svc", "svc", "svc"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("i-1"), Some("i-1"), Some("i-1")])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["m2", "m1", "m1"])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(30), Some(10), Some(20)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+        )
+        .expect("metrics batch");
+
+        let prepared = sort_metrics(&batch, 8, None)
+            .expect("prepare wal write")
+            .expect("prepared wal write");
+
+        assert_eq!(prepared.write_request.topic, icegate_common::METRICS_TOPIC);
+        assert_eq!(prepared.write_request.row_groups.len(), 2); // tenant-a (2 rows) + tenant-b (1 row)
+
+        // tenant-a rows share metric_name "m1"; sorted by timestamp DESC -> row_id 3 (ts=20) before row_id 2 (ts=10).
         let rg_a = prepared
             .write_request
             .row_groups

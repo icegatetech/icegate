@@ -230,10 +230,7 @@ impl QueueConfig {
         self.common
             .max_row_group_size
             .checked_mul(self.write.records_per_flush_multiplier)
-            .map_or_else(
-                || panic!("validated queue config must not overflow flush_record_limit"),
-                std::convert::identity,
-            )
+            .unwrap_or_else(|| panic!("validated queue config must not overflow flush_record_limit"))
     }
 }
 

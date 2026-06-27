@@ -8,5 +8,6 @@ ignore = [
     "RUSTSEC-2026-0049",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104"
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0185",  # `quinn-proto` via `testcontainers`, wait for new version
 ]
