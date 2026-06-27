@@ -1,6 +1,6 @@
 //! OTLP traces (spans) -> Arrow transform.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::{
     array::{ArrayBuilder, ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringBuilder},
@@ -26,8 +26,17 @@ use super::attributes::{
 /// This should never happen in practice as the schema is statically defined.
 #[allow(clippy::expect_used)]
 pub fn spans_arrow_schema() -> Schema {
-    let iceberg_schema = icegate_common::schema::spans_schema().expect("spans_schema should always be valid");
-    schema_to_arrow_schema(&iceberg_schema).expect("spans schema conversion should succeed")
+    // Cached: the schema is static, but rebuilding it from the Iceberg schema and
+    // converting to Arrow on every request is wasted work (twice per traces
+    // request, alongside operations). Cloning the cached `Schema` is cheap because
+    // Arrow `Fields` are `Arc`-backed.
+    static SCHEMA: OnceLock<Schema> = OnceLock::new();
+    SCHEMA
+        .get_or_init(|| {
+            let iceberg_schema = icegate_common::schema::spans_schema().expect("spans_schema should always be valid");
+            schema_to_arrow_schema(&iceberg_schema).expect("spans schema conversion should succeed")
+        })
+        .clone()
 }
 
 /// Transforms an OTLP traces export request to an Arrow `RecordBatch`.

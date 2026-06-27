@@ -7,9 +7,7 @@ mod sorter;
 pub(crate) mod test_utils;
 mod writer;
 
-pub(crate) use batch::{
-    write_logs_batch_to_wal, write_metrics_batch_to_wal, write_operations_batch_to_wal, write_traces_batch_to_wal,
-};
+pub(crate) use batch::{write_logs_batch_to_wal, write_metrics_batch_to_wal, write_traces_with_operations_to_wal};
 pub(crate) use boundary::RowGroupBoundaryRange;
 // `RowGroupBoundaryKey` / `RowGroupBoundaryValue` are only named from `#[cfg(test)]`
 // code in `sorter` and `shift`; their runtime use goes through `RowGroupBoundaryRange`.

@@ -12,7 +12,7 @@ mod otel;
 mod projection;
 mod traceloop;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float64Array, Int32Builder, Int64Array, ListBuilder, RecordBatch,
@@ -35,8 +35,17 @@ use super::attributes::{extract_string_value, list_element_field, now_micros};
 /// converted to Arrow, which cannot happen in practice.
 #[allow(clippy::expect_used)]
 pub fn operations_arrow_schema() -> Schema {
-    let iceberg_schema = icegate_common::schema::operations_schema().expect("operations_schema should always be valid");
-    schema_to_arrow_schema(&iceberg_schema).expect("operations schema conversion should succeed")
+    // Cached: the schema is static, but rebuilding 60+ Iceberg fields and
+    // converting to Arrow on every request is wasted work. Cloning the cached
+    // `Schema` is cheap because Arrow `Fields` are `Arc`-backed.
+    static SCHEMA: OnceLock<Schema> = OnceLock::new();
+    SCHEMA
+        .get_or_init(|| {
+            let iceberg_schema =
+                icegate_common::schema::operations_schema().expect("operations_schema should always be valid");
+            schema_to_arrow_schema(&iceberg_schema).expect("operations schema conversion should succeed")
+        })
+        .clone()
 }
 
 /// Append one optional `Vec<String>` as a NULL-or-populated list entry.

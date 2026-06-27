@@ -3,6 +3,7 @@
 //! Implements the `OpenTelemetry` Protocol service traits for logs, traces, and
 //! metrics ingestion via gRPC.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use icegate_common::{TENANT_ID_HEADER, is_valid_tenant_id};
@@ -21,6 +22,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
+use crate::error::IngestError;
 use crate::transform;
 use crate::{
     infra::metrics::{OtlpMetrics, OtlpRequestRecorder},
@@ -34,7 +36,6 @@ const SIGNAL_OPERATIONS: &str = "operations";
 const PROTOCOL_GRPC: &str = "grpc";
 const ENCODING_PROTOBUF: &str = "protobuf";
 const STATUS_OK: &str = "ok";
-const STATUS_ERROR: &str = "error";
 
 /// Extract tenant ID from gRPC request metadata.
 ///
@@ -142,61 +143,55 @@ impl TraceService for OtlpGrpcService {
         request_metrics.record_request_size(request_size);
 
         let tenant_id = extract_tenant_id(&request);
-        let export_request = request.into_inner();
+        // Shared across the two parallel transform tasks; `ExportTraceServiceRequest`
+        // is owned plain data (`Send + Sync`), so the `Arc` clone is cheap and no
+        // deep copy of the request is made.
+        let export_request = Arc::new(request.into_inner());
 
-        // Transform OTLP spans AND derived operations in ONE blocking offload.
-        // Spans are authoritative; operations are a best-effort projection
-        // computed from the same request so we pay the spawn_blocking hop once.
+        // Transform spans (authoritative) and derived operations (best-effort) on
+        // separate blocking-pool threads so the two independent CPU passes over the
+        // same request run in parallel instead of back-to-back.
         let span = tracing::Span::current();
         let transform_start = Instant::now();
-        let (spans_batch_opt, operations_result) = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| {
-                let spans = transform::spans_to_record_batch(&export_request, tenant_id.as_deref());
-                let operations = transform::operations_to_record_batch(&export_request, tenant_id.as_deref());
-                (spans, operations)
-            })
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?;
-        // Spans transform error fails the whole request (authoritative signal).
-        let (batch_opt, drops) = spans_batch_opt.map_err(|e| Status::from(GrpcError(e)))?;
+        let spans_task = tokio::task::spawn_blocking({
+            let export_request = Arc::clone(&export_request);
+            let tenant_id = tenant_id.clone();
+            let span = span.clone();
+            move || span.in_scope(|| transform::spans_to_record_batch(&export_request, tenant_id.as_deref()))
+        });
+        let operations_task = tokio::task::spawn_blocking({
+            let export_request = Arc::clone(&export_request);
+            let span = span.clone();
+            move || span.in_scope(|| transform::operations_to_record_batch(&export_request, tenant_id.as_deref()))
+        });
+        let (spans_join, operations_join) = tokio::join!(spans_task, operations_task);
+
+        // Spans transform error (or task panic) fails the whole request.
+        let (batch_opt, drops) = spans_join
+            .map_err(|e| Status::internal(format!("Spans transform task panicked: {e}")))?
+            .map_err(|e| Status::from(GrpcError(e)))?;
         request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_TRACES, STATUS_OK);
 
-        let payload = crate::wal::write_traces_batch_to_wal(
+        // Operations transform is best-effort: a panic degrades to a best-effort
+        // failure (logged downstream) rather than failing the traces request.
+        let operations_result = operations_join.unwrap_or_else(|join_err| Err(IngestError::Join(join_err)));
+
+        // Spans (authoritative) and operations (best-effort) are written with
+        // overlapping WAL acknowledgements; the operations leg can never fail or
+        // alter the traces response.
+        let operations_metrics =
+            OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_OPERATIONS, ENCODING_PROTOBUF);
+        let payload = crate::wal::write_traces_with_operations_to_wal(
             &self.write_channel,
             &request_metrics,
+            &operations_metrics,
             batch_opt,
             drops,
+            operations_result,
             self.wal_row_group_size,
         )
         .await
         .map_err(|err| Status::from(GrpcError(err)))?;
-
-        // Best-effort operations write: never fails the traces response. On any
-        // error (transform or WAL) log it and bump the operations error counter.
-        let operations_metrics =
-            OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_OPERATIONS, ENCODING_PROTOBUF);
-        match operations_result {
-            Ok((operations_batch_opt, operations_drops)) => {
-                if let Err(err) = crate::wal::write_operations_batch_to_wal(
-                    &self.write_channel,
-                    &operations_metrics,
-                    operations_batch_opt,
-                    operations_drops,
-                    self.wal_row_group_size,
-                )
-                .await
-                {
-                    // `write_operations_batch_to_wal` already records the terminal
-                    // error status on every failure path; do not finish again here.
-                    tracing::error!(error = %err, "Failed to write operations batch to WAL (best-effort)");
-                }
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "Failed to transform operations from spans (best-effort)");
-                operations_metrics.finish_with_status(STATUS_ERROR);
-            }
-        }
 
         Ok(Response::new(ExportTraceServiceResponse {
             partial_success: payload.map(|(rejected_spans, error_message)| ExportTracePartialSuccess {

@@ -1,7 +1,7 @@
 //! Merged Iceberg + WAL table provider.
 //!
 //! `IcegateTableProvider` implements `TableProvider` for any WAL-backed table
-//! (currently `logs` and `spans`) and produces a `UnionExec` plan that reads
+//! (currently `logs`, `spans`, `metrics`, and `operations`) and produces a `UnionExec` plan that reads
 //! from both Iceberg (committed data) and WAL (hot segments not yet committed).
 //! The offset boundary is determined by walking the Iceberg snapshot history
 //! for the `icegate.queue.offset` property; the WAL topic to scan is supplied
@@ -43,7 +43,7 @@ pub(super) struct IcegateTableProvider {
     /// Table identifier in the catalog (namespace + name).
     table_ident: TableIdent,
     /// WAL topic to scope segment listing to. By convention this matches the
-    /// Iceberg table name (`logs`, `spans`). Stored as `String` because the
+    /// Iceberg table name (`logs`, `spans`, `metrics`, `operations`). Stored as `String` because the
     /// underlying queue API expects `&Topic = &String`; the allocation
     /// happens once per provider construction.
     topic: String,

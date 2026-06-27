@@ -1,8 +1,8 @@
 //! Custom schema provider for the IceGate namespace.
 //!
-//! Routes WAL-backed tables (logs, spans) to [`IcegateTableProvider`] (merged
-//! Iceberg + WAL) while delegating other tables to the standard
-//! `IcebergStaticTableProvider`.
+//! Routes WAL-backed tables (logs, spans, metrics, operations) to
+//! [`IcegateTableProvider`] (merged Iceberg + WAL) while delegating other
+//! tables to the standard `IcebergStaticTableProvider`.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -23,12 +23,18 @@ use super::table::IcegateTableProvider;
 /// Tables that have a corresponding WAL topic and therefore use the merged
 /// Iceberg + WAL provider. The slice value doubles as the WAL topic name —
 /// table name == topic name by convention. Tables not listed here (e.g.
-/// `events`, `metrics`) fall through to the standard Iceberg-only provider.
-const WAL_MERGED_TABLES: &[&str] = &[icegate_common::LOGS_TOPIC, icegate_common::SPANS_TOPIC];
+/// `events`, which has no WAL topic) fall through to the standard Iceberg-only
+/// provider.
+const WAL_MERGED_TABLES: &[&str] = &[
+    icegate_common::LOGS_TOPIC,
+    icegate_common::SPANS_TOPIC,
+    icegate_common::METRICS_TOPIC,
+    icegate_common::OPERATIONS_TOPIC,
+];
 
 /// Schema provider that substitutes `IcegateTableProvider` for WAL-backed
-/// tables (logs, spans) while using standard Iceberg providers for all other
-/// tables.
+/// tables (logs, spans, metrics, operations) while using standard Iceberg
+/// providers for all other tables.
 pub(super) struct IcegateSchemaProvider {
     /// All tables in the namespace, keyed by name.
     tables: HashMap<String, Arc<dyn TableProvider>>,
@@ -63,7 +69,7 @@ impl IcegateSchemaProvider {
 
         // Load all tables concurrently — each table requires a catalog
         // REST call, so parallelizing cuts wall-clock time significantly.
-        // With only 4 tables, unbounded concurrency is fine.
+        // With only a handful of tables, unbounded concurrency is fine.
         let tables_loaded = try_join_all(table_idents.iter().map(|ident| {
             let name = ident.name().to_string();
             let catalog = Arc::clone(&catalog);
@@ -125,8 +131,10 @@ mod tests {
     /// The dispatch in `IcegateSchemaProvider::try_new` keys off this slice;
     /// removing an entry silently disables WAL merging for that table.
     #[test]
-    fn wal_merged_tables_covers_logs_and_spans() {
+    fn wal_merged_tables_covers_logs_spans_metrics_and_operations() {
         assert!(WAL_MERGED_TABLES.contains(&icegate_common::LOGS_TOPIC));
         assert!(WAL_MERGED_TABLES.contains(&icegate_common::SPANS_TOPIC));
+        assert!(WAL_MERGED_TABLES.contains(&icegate_common::METRICS_TOPIC));
+        assert!(WAL_MERGED_TABLES.contains(&icegate_common::OPERATIONS_TOPIC));
     }
 }
