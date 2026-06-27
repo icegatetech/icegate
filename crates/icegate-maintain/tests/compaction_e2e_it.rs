@@ -115,8 +115,10 @@ async fn build_s3_catalog(conn: &MinioConn) -> S3Catalog {
             secret_access_key: Some(conn.secret_key.clone()),
             warehouse: BUCKET_NAME.to_string(),
             codec: CatalogCodecKind::Json,
+            ..S3CatalogConfig::default()
         },
         file_io,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect("build S3 catalog")

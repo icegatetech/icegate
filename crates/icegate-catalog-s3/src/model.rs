@@ -1004,7 +1004,7 @@ mod tests {
             .location("s3://bucket/tables/spans".to_string())
             .build();
 
-        let state = TableMetadataState::create(creation, Uuid::new_v4()).expect("create table state");
+        let state = IcebergTableMetadata::create(creation, Uuid::new_v4()).expect("create table state");
         let schema = state.metadata().current_schema();
 
         let attributes = schema.field_by_name("attributes").expect("attributes field");

@@ -78,7 +78,7 @@ impl TestServer {
             properties: std::collections::HashMap::default(),
             cache: None,
         };
-        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop()).await?;
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new()).await?;
 
         create_namespace_and_tables(&catalog).await?;
 

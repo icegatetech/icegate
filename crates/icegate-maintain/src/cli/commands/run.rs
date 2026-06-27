@@ -50,7 +50,8 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
         tokio::spawn(async move { run_metrics_server(metrics_config, registry, token).await })
     });
 
-    let catalog = CatalogBuilder::from_config(&config.catalog, &IoHandle::noop()).await?;
+    // TODO(high): add shutdown
+    let catalog = CatalogBuilder::from_config(&config.catalog, &IoHandle::noop(), CancellationToken::new()).await?;
     let compactor = Compactor::new(catalog, &config.compaction).await?;
     let handle = compactor.start()?;
     tracing::info!("compaction maintenance service started");
