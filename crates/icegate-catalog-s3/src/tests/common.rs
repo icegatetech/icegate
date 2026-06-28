@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -20,14 +20,27 @@ use uuid::Uuid;
 use crate::CatalogCodecKind;
 use crate::catalog::S3Catalog;
 use crate::config::S3CatalogConfig;
+use crate::config::cas_retrier_config_default;
 use crate::error::{Error, Result};
-use crate::model::CatalogRoot;
+use crate::infra::retrier::Retrier;
+use crate::root::CatalogRoot;
+use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::s3::S3CatalogStorage;
-use crate::storage::{CatalogStorage, Version};
+use crate::storage::{CatalogStorage, LoadOutcome, Version};
+
+fn test_catalog(storage: Arc<dyn CatalogStorage>, file_io: FileIO, tables_uri_prefix: String) -> S3Catalog {
+    S3Catalog::with_storage(
+        storage,
+        file_io,
+        tables_uri_prefix,
+        Retrier::new(cas_retrier_config_default()),
+        tokio_util::sync::CancellationToken::new(),
+    )
+}
 
 /// In-memory storage backend for unit tests.
 pub(crate) struct InMemoryCatalogStorage {
-    root: RwLock<Option<(CatalogRoot, u64)>>,
+    root: RwLock<Option<(Arc<CatalogRoot>, u64)>>,
     metadata: DashMap<String, Bytes>,
     version: AtomicU64,
 }
@@ -41,19 +54,36 @@ impl InMemoryCatalogStorage {
             version: AtomicU64::new(0),
         }
     }
+
+    pub(crate) fn metadata_locations(&self) -> Vec<String> {
+        let mut locations = self.metadata.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>();
+        locations.sort();
+        locations
+    }
 }
 
 #[async_trait]
 impl CatalogStorage for InMemoryCatalogStorage {
-    async fn load_root(&self) -> Result<(CatalogRoot, Version)> {
+    async fn load_root(&self, known: Option<&Version>) -> Result<LoadOutcome> {
         let guard = self.root.read().await;
-        Ok(match guard.as_ref() {
-            Some((root, version)) => (root.clone(), Version::Etag(version.to_string())),
-            None => (CatalogRoot::default(), Version::Absent),
-        })
+        match guard.as_ref() {
+            Some((root, version)) => {
+                let etag = version.to_string();
+                if let Some(Version::Etag(provided)) = known {
+                    if provided == &etag {
+                        return Ok(LoadOutcome::NotModified);
+                    }
+                }
+                Ok(LoadOutcome::Loaded {
+                    root: Arc::clone(root),
+                    version: Version::Etag(etag),
+                })
+            }
+            None => Ok(LoadOutcome::Absent),
+        }
     }
 
-    async fn save_root(&self, root: CatalogRoot, expected: &Version) -> Result<()> {
+    async fn save_root(&self, root: Arc<CatalogRoot>, expected: &Version) -> Result<Version> {
         let mut guard = self.root.write().await;
         if let Some((_, current_version)) = guard.as_ref() {
             if *expected != Version::Etag(current_version.to_string()) {
@@ -68,17 +98,18 @@ impl CatalogStorage for InMemoryCatalogStorage {
         let next_version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
         *guard = Some((root, next_version));
         drop(guard);
-        Ok(())
+        Ok(Version::Etag(next_version.to_string()))
     }
 
-    async fn read_table_metadata(&self, location: &str) -> Result<TableMetadata> {
+    async fn read_table_metadata(&self, location: &str) -> Result<Arc<TableMetadata>> {
         let payload = self
             .metadata
             .get(location)
             .map(|entry| Bytes::clone(entry.value()))
             .ok_or_else(|| Error::InvalidMetadata(format!("Metadata location not found: {location}")))?;
-        serde_json::from_slice(&payload)
-            .map_err(|error| Error::InvalidMetadata(format!("Invalid table metadata: {error}")))
+        let metadata: TableMetadata = serde_json::from_slice(&payload)
+            .map_err(|error| Error::InvalidMetadata(format!("Invalid table metadata: {error}")))?;
+        Ok(Arc::new(metadata))
     }
 
     async fn write_table_metadata(&self, location: &str, metadata: &TableMetadata) -> Result<()> {
@@ -100,8 +131,12 @@ pub(crate) struct TestEnv {
     pub(crate) tables_uri_prefix: String,
 }
 
+/// Start a fresh `MinIO` container with a unique bucket and a raw S3 storage
+/// backend over it. Shared by the raw ([`make_catalog`]) and cached
+/// ([`make_cached_catalog`]) harnesses so the bucket bootstrap lives in one
+/// place.
 #[allow(clippy::expect_used)]
-pub(crate) async fn make_catalog() -> TestEnv {
+async fn bootstrap_minio_storage() -> (testcontainers::ContainerAsync<MinIO>, Arc<S3CatalogStorage>, String) {
     let minio = MinIO::default().start().await.expect("start minio");
     let port = minio.get_host_port_ipv4(9000).await.expect("minio port");
     let endpoint = format!("http://127.0.0.1:{port}");
@@ -116,22 +151,30 @@ pub(crate) async fn make_catalog() -> TestEnv {
     let client = aws_sdk_s3::Client::new(&cfg);
     client.create_bucket().bucket(&bucket).send().await.expect("create bucket");
 
-    let file_io = FileIO::new_with_memory();
     let storage = Arc::new(
-        S3CatalogStorage::new(&S3CatalogConfig {
-            bucket: bucket.clone(),
-            region: "us-east-1".to_string(),
-            endpoint: Some(endpoint),
-            access_key_id: Some(MINIO_USER.to_string()),
-            secret_access_key: Some(MINIO_PASSWORD.to_string()),
-            warehouse: "warehouse".to_string(),
-            codec: CatalogCodecKind::Json,
-        })
+        S3CatalogStorage::new(
+            &S3CatalogConfig {
+                bucket: bucket.clone(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(endpoint),
+                access_key_id: Some(MINIO_USER.to_string()),
+                secret_access_key: Some(MINIO_PASSWORD.to_string()),
+                warehouse: "warehouse".to_string(),
+                codec: CatalogCodecKind::Json,
+                ..S3CatalogConfig::default()
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .expect("storage"),
     );
 
     let tables_uri_prefix = format!("s3://{bucket}/warehouse/catalog/tables");
-    let catalog = S3Catalog::with_storage(storage.clone(), file_io, tables_uri_prefix.clone());
+    (minio, storage, tables_uri_prefix)
+}
+
+pub(crate) async fn make_catalog() -> TestEnv {
+    let (minio, storage, tables_uri_prefix) = bootstrap_minio_storage().await;
+    let catalog = test_catalog(storage.clone(), FileIO::new_with_memory(), tables_uri_prefix.clone());
 
     TestEnv {
         _minio: minio,
@@ -141,18 +184,144 @@ pub(crate) async fn make_catalog() -> TestEnv {
     }
 }
 
+/// Counters and a catalog over the production composition `Cached(Counting(S3))`.
+///
+/// The counting layer sits between the cache and the real S3 backend so a test
+/// can tell whether a cache revalidation hit a 304 (`not_modified`) or had to
+/// refetch the root body (`loaded`). `s3_storage` is the same raw backend the
+/// cache wraps, exposed so a test can drive an out-of-band writer that bypasses
+/// the cache.
+pub(crate) struct CachedTestEnv {
+    _minio: testcontainers::ContainerAsync<MinIO>,
+    pub(crate) catalog: S3Catalog,
+    pub(crate) counting: Arc<LoadCountingStorage>,
+    pub(crate) s3_storage: Arc<S3CatalogStorage>,
+    pub(crate) tables_uri_prefix: String,
+}
+
+/// Build the production S3 + cache composition over a fresh `MinIO` bucket.
+///
+/// This is the only harness that exercises the real `If-None-Match` round-trip
+/// end-to-end: the cache revalidates against S3, and `object_store` maps a 304
+/// into [`LoadOutcome::NotModified`]. The unit tests in `cached.rs` only simulate
+/// that against an in-memory backend.
+pub(crate) async fn make_cached_catalog() -> CachedTestEnv {
+    let (minio, storage, tables_uri_prefix) = bootstrap_minio_storage().await;
+    let counting = Arc::new(LoadCountingStorage::new(storage.clone()));
+    let counting_dyn: Arc<dyn CatalogStorage> = counting.clone();
+    let cached: Arc<dyn CatalogStorage> = Arc::new(CachedCatalogStorage::new(
+        counting_dyn,
+        S3CatalogConfig::default().metadata_cache_cap,
+    ));
+    let catalog = test_catalog(cached, FileIO::new_with_memory(), tables_uri_prefix.clone());
+
+    CachedTestEnv {
+        _minio: minio,
+        catalog,
+        counting,
+        s3_storage: storage,
+        tables_uri_prefix,
+    }
+}
+
+/// Storage decorator that records how the inner backend answered each
+/// `load_root`, letting cache tests assert a revalidation served a 304 rather
+/// than refetching the root body. Pass-through for every other method.
+pub(crate) struct LoadCountingStorage {
+    inner: Arc<dyn CatalogStorage>,
+    loaded: AtomicUsize,
+    not_modified: AtomicUsize,
+}
+
+impl LoadCountingStorage {
+    fn new(inner: Arc<dyn CatalogStorage>) -> Self {
+        Self {
+            inner,
+            loaded: AtomicUsize::new(0),
+            not_modified: AtomicUsize::new(0),
+        }
+    }
+
+    /// Count of `load_root` calls the inner backend answered with a full body.
+    pub(crate) fn loaded(&self) -> usize {
+        self.loaded.load(Ordering::SeqCst)
+    }
+
+    /// Count of `load_root` calls the inner backend short-circuited with a 304.
+    pub(crate) fn not_modified(&self) -> usize {
+        self.not_modified.load(Ordering::SeqCst)
+    }
+
+    /// Zero both counters so a test can isolate the reads it cares about.
+    pub(crate) fn reset(&self) {
+        self.loaded.store(0, Ordering::SeqCst);
+        self.not_modified.store(0, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl CatalogStorage for LoadCountingStorage {
+    async fn load_root(&self, known: Option<&Version>) -> Result<LoadOutcome> {
+        let outcome = self.inner.load_root(known).await?;
+        match &outcome {
+            LoadOutcome::Loaded { .. } => {
+                self.loaded.fetch_add(1, Ordering::SeqCst);
+            }
+            LoadOutcome::NotModified => {
+                self.not_modified.fetch_add(1, Ordering::SeqCst);
+            }
+            LoadOutcome::Absent => {}
+        }
+        Ok(outcome)
+    }
+
+    async fn save_root(&self, root: Arc<CatalogRoot>, expected: &Version) -> Result<Version> {
+        self.inner.save_root(root, expected).await
+    }
+
+    async fn read_table_metadata(&self, location: &str) -> Result<Arc<TableMetadata>> {
+        self.inner.read_table_metadata(location).await
+    }
+
+    async fn write_table_metadata(&self, location: &str, metadata: &TableMetadata) -> Result<()> {
+        self.inner.write_table_metadata(location, metadata).await
+    }
+}
+
 pub(crate) fn make_in_memory_catalog() -> S3Catalog {
     make_in_memory_catalog_with_storage().0
 }
 
 pub(crate) fn make_in_memory_catalog_with_storage() -> (S3Catalog, Arc<InMemoryCatalogStorage>) {
     let storage = Arc::new(InMemoryCatalogStorage::new());
-    let catalog = S3Catalog::with_storage(
+    let catalog = test_catalog(
         storage.clone(),
         FileIO::new_with_memory(),
         "memory://catalog/tables".to_string(),
     );
     (catalog, storage)
+}
+
+/// In-memory catalog wired through the `CachedCatalogStorage` decorator,
+/// mirroring the production composition where every call goes through the
+/// cache. Used by tests that must exercise the prod-path end-to-end rather
+/// than the raw storage backend.
+pub(crate) fn make_in_memory_catalog_cached() -> S3Catalog {
+    make_in_memory_catalog_cached_with_storage().0
+}
+
+/// Cached production composition plus a handle to the inner in-memory storage.
+///
+/// Concurrency tests assert real catalog state through `inner` — reading the
+/// source of truth directly, bypassing the cache layer under test.
+pub(crate) fn make_in_memory_catalog_cached_with_storage() -> (S3Catalog, Arc<InMemoryCatalogStorage>) {
+    let inner = Arc::new(InMemoryCatalogStorage::new());
+    let cached: Arc<dyn CatalogStorage> = Arc::new(CachedCatalogStorage::new(
+        inner.clone(),
+        S3CatalogConfig::default().metadata_cache_cap,
+    ));
+    let catalog = test_catalog(cached, FileIO::new_with_memory(), "memory://catalog/tables".to_string());
+    (catalog, inner)
 }
 
 #[allow(clippy::expect_used)]
@@ -287,4 +456,15 @@ pub(crate) async fn update_request(table: &Table, key: &str, value: &str) -> Tab
     let capture = CapturingCatalog::new(table);
     tx.commit(&capture).await.expect("commit capture");
     capture.take_commit()
+}
+
+/// Metadata version parsed from a `.../metadata/{NNNNN}-{uuid}.metadata.json`
+/// location. Test-only: keeps tests off the private `model::MetadataVersion`.
+pub(crate) fn metadata_version_in(location: &str) -> u32 {
+    location
+        .rsplit("/metadata/")
+        .next()
+        .and_then(|tail| tail.split('-').next())
+        .and_then(|version| version.parse().ok())
+        .unwrap_or_else(|| panic!("no metadata version in {location}"))
 }

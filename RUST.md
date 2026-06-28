@@ -28,7 +28,6 @@ Before completing a task, perform an additional optimization pass to verify the 
 
 ## Code Style and Formatting
 
-- **MUST** use meaningful, descriptive variable and function names
 - **MUST** follow Rust API Guidelines and idiomatic Rust conventions
 - **MUST** use four spaces for indentation (never tabs)
 - **NEVER** use emoji, or Unicode that emulates emoji (e.g., ✓, ✗). The only exception is when writing tests and testing the impact of multibyte characters.
@@ -36,12 +35,30 @@ Before completing a task, perform an additional optimization pass to verify the 
 - Limit line length to 100 characters (rustfmt default)
 - Assume the user is a Python expert, but a Rust novice. Include additional code comments around Rust-specific nuances that a Python developer may not recognize.
 
+### Naming
+- **Names** of functions, structs, methods, constants, and variables **MUST** give an unambiguous understanding of their responsibility.
+- Name by responsibility and subject, not by the current implementation detail (key, mechanism, storage) — the detail can change and the name would then lie. Disambiguate similar things by subject, not by mechanism.
+- An implementation detail belongs in a name only where it is literally that thing's responsibility at its layer
+- **Functions and methods MUST be `verb_object`** — a verb (the action) plus the noun it acts on. **NEVER** name a function with a bare adjective, participle, or state word: there is no object and the call site is unreadable. Banned: `ensure_staged`, `rebuild_stale`, `validate_inner`. Good: `stage_commits`, `load_root`, `write_table_metadata`. Constructors keep Rust convention: `new`, `with_<thing>`, `from_<source>`, `try_<verb>`.
+- **The verb MUST NOT lie about behavior.** Do not say `rebuild` when the first call builds, nor carry `stale`/`inline`/`tmp` when that is not the contract.
+- **Variables, arguments, and fields MUST be nouns** naming what the value *is* — the type is already in the signature, so the name carries meaning, not the type. An adjective is allowed **only** as a qualifier on a noun (`pending_commits`), **never** standalone. Banned as standalone names: `pending`, `staged`, `current`, `data`, `val`, `tmp`. Collections take a plural noun: `commits`, `tables`.
+- **Booleans MUST read as predicates:** `is_active`, `has_descendants`, `should_retry`.
+- **No abbreviations** except domain-canonical ones (`id`, `uri`, `cas`). The same concept MUST share one name across the codebase; different concepts MUST NOT share a name (do not call it `commits` here and `pending` there).
+- **Acid test:** the name MUST be understandable at the call site without reading the body. `self.stage_commits(&mut commits, &root)` shows both the action (`stage`) and the object (`commits`). If it does not, rename it.
+
 ## Documentation
 
-- **MUST** include doc comments for all public functions, structs, enums, and methods
-- **MUST** document function parameters, return values, and errors
+- **MUST** give every public item a doc comment stating its contract; a method whose body is self-evident needs one line, not a paragraph
 - Keep comments up to date with code changes
 - Include examples in doc comments for complex functions
+
+### Comment why, not what
+
+- A comment MUST add what the code cannot state itself: the reason for a decision, a non-obvious invariant or contract, a trap, a cross-reference.
+- **NEVER** restate the body in prose. If deleting the comment loses no information a reader couldn't get from the code, delete it.
+- **Acid test:** a good comment answers a question that arises *after* reading the code. One that answers "what does this line do" is noise — remove it.
+- A shared mechanism is documented **once** at its definition; call sites that use it MUST NOT repeat the explanation (link to it if needed).
+- A doc comment on a `pub` item states the **contract** (guarantees, errors, invariants), not a trace of the implementation. `# Arguments`/`# Returns` blocks are required only when a name or signature is genuinely ambiguous; do not pad self-evident params.
 
 Example doc comment:
 

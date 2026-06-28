@@ -1353,7 +1353,7 @@ mod tests {
             properties: HashMap::new(),
             cache: None,
         };
-        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop())
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new())
             .await
             .expect("memory catalog");
         let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());

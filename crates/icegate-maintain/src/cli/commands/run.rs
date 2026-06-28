@@ -50,7 +50,13 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
         tokio::spawn(async move { run_metrics_server(metrics_config, registry, token).await })
     });
 
-    let catalog = CatalogBuilder::from_config(&config.catalog, &IoHandle::noop()).await?;
+    // Cancellation token for coordinated shutdown, created before the catalog so
+    // the S3 catalog's CAS/transient retry loops abort promptly on SIGINT/SIGTERM
+    // instead of running to their retry budget while the process is shutting down.
+    // Distinct from `metrics_cancel`, which must outlive the worker drain so
+    // `/metrics` keeps serving until the very end.
+    let cancel_token = CancellationToken::new();
+    let catalog = CatalogBuilder::from_config(&config.catalog, &IoHandle::noop(), cancel_token.clone()).await?;
     let compactor = Compactor::new(catalog, &config.compaction).await?;
     let handle = compactor.start()?;
     tracing::info!("compaction maintenance service started");
@@ -60,6 +66,11 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // is already bound). Surfacing that here aborts the service immediately rather
     // than deferring the error until shutdown, which could be days later.
     let (metrics_server, metrics_startup_error) = wait_for_shutdown(metrics_server).await;
+
+    // Abort in-flight catalog CAS/transient retry loops before draining: a commit
+    // caught mid-retry at SIGTERM stops at the next checkpoint instead of running
+    // out its full retry budget, so the worker drain below completes promptly.
+    cancel_token.cancel();
     tracing::info!("draining compaction workers");
     handle.shutdown().await?;
 

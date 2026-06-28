@@ -191,3 +191,4 @@ The project uses `rustfmt` for code formatting. Configuration is in `rustfmt.tom
 - Format only the affected crate: `cargo +nightly fmt -p <crate>`.
 - All code and comments should be in English only.
 - ALWAYS use the Iceberg schema only from `crates/icegate-common/src/schema.rs`, NEVER hardcode columns in the working code.
+- The project documentation (`docs/`, `Readme.md`, etc.) should not duplicate the code - it is fragile. Documentation should provide a top-level understanding (basic concept, schematics, if applicable, structure, if applicable) and describe non-specific (atypical) nuances.

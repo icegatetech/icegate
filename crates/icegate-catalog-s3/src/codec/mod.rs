@@ -3,7 +3,7 @@
 use bytes::Bytes;
 
 use crate::error::Result;
-use crate::model::CatalogRoot;
+use crate::root::CatalogRoot;
 
 pub(crate) mod json;
 

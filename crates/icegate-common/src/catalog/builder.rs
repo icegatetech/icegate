@@ -11,6 +11,7 @@ use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
 use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
+use tokio_util::sync::CancellationToken;
 
 use super::{CacheConfig, CatalogBackend, CatalogConfig};
 use crate::error::{CommonError, Result};
@@ -37,7 +38,7 @@ use crate::storage::icegate_storage::IceGateStorageFactory;
 /// let io_cache = IoHandle::from_config(
 ///     config.catalog.cache.as_ref(),
 /// ).await?;
-/// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache).await?;
+/// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache, shutdown_token).await?;
 /// // ... run servers ...
 /// // On shutdown:
 /// io_cache.close().await;
@@ -156,10 +157,21 @@ impl CatalogBuilder {
     /// other components (e.g., WAL object store) without coupling its
     /// lifecycle to catalog construction.
     ///
+    /// `cancel_token` is plumbed into retry-aware catalog implementations
+    /// (currently the S3 catalog) so that long-running CAS/transient retry loops
+    /// abort promptly when the process is shutting down. Pass the same token your
+    /// main loop uses to coordinate shutdown; one-shot callers and tests pass
+    /// [`CancellationToken::new()`]. Backends that do not honour cancellation
+    /// (Memory, REST, Glue, `S3Tables`) ignore the token today.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the catalog cannot be created
-    pub async fn from_config(config: &CatalogConfig, io_cache: &IoHandle) -> Result<Arc<dyn Catalog>> {
+    /// Returns an error if the catalog cannot be created.
+    pub async fn from_config(
+        config: &CatalogConfig,
+        io_cache: &IoHandle,
+        cancel_token: CancellationToken,
+    ) -> Result<Arc<dyn Catalog>> {
         match &config.backend {
             CatalogBackend::Memory => Self::create_memory_catalog(config).await,
             CatalogBackend::Rest { uri } => Self::create_rest_catalog(config, uri, io_cache).await,
@@ -169,7 +181,9 @@ impl CatalogBuilder {
             CatalogBackend::Glue { catalog_id } => {
                 Self::create_glue_catalog(config, catalog_id.as_deref(), io_cache).await
             }
-            CatalogBackend::S3 { warehouse } => Self::create_s3_catalog(config, warehouse, io_cache).await,
+            CatalogBackend::S3 { warehouse } => {
+                Self::create_s3_catalog(config, warehouse, io_cache, cancel_token).await
+            }
         }
     }
 
@@ -291,6 +305,7 @@ impl CatalogBuilder {
         config: &CatalogConfig,
         warehouse: &str,
         io_cache: &IoHandle,
+        cancel_token: CancellationToken,
     ) -> Result<Arc<dyn Catalog>> {
         let bucket = config
             .properties
@@ -364,8 +379,10 @@ impl CatalogBuilder {
                 secret_access_key,
                 warehouse: warehouse.to_string(),
                 codec,
+                ..S3CatalogConfig::default()
             },
             file_io,
+            cancel_token,
         )
         .await
         .map_err(|e| CommonError::Config(format!("failed to create s3 catalog: {e}")))?;
@@ -438,9 +455,13 @@ mod tests {
         let bucket = format!("catalog-{}", rand::random::<u64>());
         create_s3_bucket(minio.endpoint(), &bucket).await.expect("create bucket");
 
-        let catalog = CatalogBuilder::from_config(&test_catalog_config(minio.endpoint(), &bucket), &IoHandle::noop())
-            .await
-            .expect("build catalog");
+        let catalog = CatalogBuilder::from_config(
+            &test_catalog_config(minio.endpoint(), &bucket),
+            &IoHandle::noop(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("build catalog");
         let namespace = NamespaceIdent::new("ns1".to_string());
         catalog
             .create_namespace(&namespace, HashMap::new())

@@ -26,6 +26,9 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
 dashmap = { workspace = true }
+lru = { workspace = true }
+tokio-util = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }

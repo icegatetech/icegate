@@ -427,9 +427,14 @@ async fn run_services(
 
     tracing::info!("WAL queue initialized on dedicated runtime");
 
+    // Cancellation token for coordinated shutdown. Created before the catalog
+    // so the S3 catalog's CAS/transient retry loops abort promptly on SIGINT/
+    // SIGTERM instead of running to their retry budget during shutdown.
+    let cancel_token = CancellationToken::new();
+
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
-    let catalog = CatalogBuilder::from_config(&config.catalog, io_cache).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, io_cache, cancel_token.clone()).await?;
     let jobs_storage = config.shift.jobsmanager.storage.to_s3_config()?;
     let shift_config = Arc::new(config.shift.clone());
     let queue_reader_store: Arc<dyn ObjectStore> = metrics_runtime.as_ref().map_or_else(
@@ -518,9 +523,6 @@ async fn run_services(
     );
     let shift_runtime = spawn_shift_runtime(shifter, runtime_plan.shift_threads)?;
     tracing::info!("Shifter started successfully on dedicated runtime");
-
-    // Create a cancellation token for coordinated shutdown
-    let cancel_token = CancellationToken::new();
 
     // Spawn server tasks
     let mut handles = Vec::new();
