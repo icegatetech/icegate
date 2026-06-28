@@ -1,7 +1,7 @@
 //! `OpenInference` semantic-convention adapter.
 
 use super::convention::OperationConvention;
-use super::projection::{AttributeView, FieldType, OperationField};
+use super::projection::{AttributeView, OperationField};
 use crate::transform::attributes::extract_string_value;
 
 /// `OpenInference` (Arize) semantic-convention adapter. Sources `llm.*` token
@@ -15,18 +15,16 @@ impl OperationConvention for OpenInference {
         &["openinference.span.kind", "llm.model_name", "llm.system"]
     }
 
-    fn field_keys(&self, field: OperationField) -> &'static [(&'static str, FieldType)] {
+    fn field_keys(&self, field: OperationField) -> &'static [&'static str] {
         match field {
-            OperationField::RequestModel => &[("llm.model_name", FieldType::Str)],
-            OperationField::InputTokens => &[("llm.token_count.prompt", FieldType::I64)],
-            OperationField::OutputTokens => &[("llm.token_count.completion", FieldType::I64)],
-            OperationField::TotalTokens => &[("llm.token_count.total", FieldType::I64)],
-            OperationField::ReasoningTokens => &[("llm.token_count.completion_details.reasoning", FieldType::I64)],
-            OperationField::CacheCreationInputTokens => {
-                &[("llm.token_count.prompt_details.cache_write", FieldType::I64)]
-            }
-            OperationField::CacheReadInputTokens => &[("llm.token_count.prompt_details.cache_read", FieldType::I64)],
-            OperationField::ConversationId => &[("session.id", FieldType::Str)],
+            OperationField::RequestModel => &["llm.model_name"],
+            OperationField::InputTokens => &["llm.token_count.prompt"],
+            OperationField::OutputTokens => &["llm.token_count.completion"],
+            OperationField::TotalTokens => &["llm.token_count.total"],
+            OperationField::ReasoningTokens => &["llm.token_count.completion_details.reasoning"],
+            OperationField::CacheCreationInputTokens => &["llm.token_count.prompt_details.cache_write"],
+            OperationField::CacheReadInputTokens => &["llm.token_count.prompt_details.cache_read"],
+            OperationField::ConversationId => &["session.id"],
             _ => &[],
         }
     }
@@ -82,33 +80,26 @@ mod tests {
 
     #[test]
     fn request_model_sources_llm_model_name() {
-        let keys: Vec<&str> = OpenInference
-            .field_keys(OperationField::RequestModel)
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
-        assert_eq!(keys, vec!["llm.model_name"]);
+        let keys = OpenInference.field_keys(OperationField::RequestModel);
+        assert_eq!(keys, &["llm.model_name"]);
     }
 
     #[test]
     fn input_tokens_source_oi_token_count() {
         let keys = OpenInference.field_keys(OperationField::InputTokens);
-        assert_eq!(keys, &[("llm.token_count.prompt", FieldType::I64)]);
+        assert_eq!(keys, &["llm.token_count.prompt"]);
     }
 
     #[test]
     fn reasoning_tokens_source_oi_completion_details() {
         let keys = OpenInference.field_keys(OperationField::ReasoningTokens);
-        assert_eq!(
-            keys,
-            &[("llm.token_count.completion_details.reasoning", FieldType::I64)]
-        );
+        assert_eq!(keys, &["llm.token_count.completion_details.reasoning"]);
     }
 
     #[test]
     fn conversation_id_sources_session_id() {
         let keys = OpenInference.field_keys(OperationField::ConversationId);
-        assert_eq!(keys, &[("session.id", FieldType::Str)]);
+        assert_eq!(keys, &["session.id"]);
     }
 
     #[test]

@@ -374,8 +374,9 @@ fn append_opt_str(builder: &mut StringBuilder, value: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, ListArray, StringArray};
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, any_value::Value};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
     use super::operations_to_record_batch;
@@ -385,6 +386,33 @@ mod tests {
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::StringValue(value.to_string())),
+            }),
+        }
+    }
+
+    fn kv_int(key: &str, value: i64) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::IntValue(value)),
+            }),
+        }
+    }
+
+    fn kv_dbl(key: &str, value: f64) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::DoubleValue(value)),
+            }),
+        }
+    }
+
+    fn kv_bool(key: &str, value: bool) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::BoolValue(value)),
             }),
         }
     }
@@ -452,5 +480,118 @@ mod tests {
         let (batch_opt, drops) = operations_to_record_batch(&request, Some("t")).expect("ok");
         assert!(batch_opt.is_none());
         assert_eq!(drops, 0);
+    }
+
+    #[test]
+    fn populated_values_land_in_correctly_named_columns() {
+        // Guards the hand-ordered `columns` vec against the schema: a populated
+        // value of each wire kind (str / f64 / i64 / bool / list / json) must
+        // surface in the column the schema names for it, not a same-typed
+        // neighbour. `column_by_name` resolves through the schema, so a builder
+        // appended at the wrong position would land the value in the wrong column
+        // and fail one of these assertions.
+        let span = span_with(
+            1,
+            vec![
+                kv_str("gen_ai.operation.name", "chat"),
+                kv_str("gen_ai.provider.name", "openai"),
+                kv_str("gen_ai.request.model", "gpt-4o"),
+                kv_str("gen_ai.conversation.id", "conv-123"),
+                kv_dbl("gen_ai.request.temperature", 0.7),
+                kv_int("gen_ai.usage.input_tokens", 12),
+                kv_bool("gen_ai.request.stream", true),
+                KeyValue {
+                    key: "gen_ai.response.finish_reasons".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::ArrayValue(ArrayValue {
+                            values: vec![AnyValue {
+                                value: Some(Value::StringValue("stop".to_string())),
+                            }],
+                        })),
+                    }),
+                },
+                kv_str("gen_ai.input.messages", "hello"),
+            ],
+        );
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![span],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (batch_opt, drops) = operations_to_record_batch(&request, Some("tenant-a")).expect("batch ok");
+        let batch = batch_opt.expect("one llm span -> batch");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(drops, 0);
+
+        let str_col = |name: &str| -> String {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("column {name} present"))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap_or_else(|| panic!("column {name} is Utf8"))
+                .value(0)
+                .to_string()
+        };
+
+        assert_eq!(str_col("tenant_id"), "tenant-a");
+        assert_eq!(str_col("operation_name"), "chat");
+        assert_eq!(str_col("provider_name"), "openai");
+        assert_eq!(str_col("request_model"), "gpt-4o");
+        assert_eq!(str_col("conversation_id"), "conv-123");
+
+        let temperature = batch
+            .column_by_name("temperature")
+            .expect("temperature column present")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("temperature is Float64");
+        assert!((temperature.value(0) - 0.7).abs() < f64::EPSILON);
+
+        let input_tokens = batch
+            .column_by_name("input_tokens")
+            .expect("input_tokens column present")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("input_tokens is Int64");
+        assert_eq!(input_tokens.value(0), 12);
+
+        let stream = batch
+            .column_by_name("stream")
+            .expect("stream column present")
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("stream is Boolean");
+        assert!(stream.value(0));
+
+        let finish_reasons = batch
+            .column_by_name("finish_reasons")
+            .expect("finish_reasons column present")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("finish_reasons is List");
+        let first = finish_reasons.value(0);
+        let reasons = first.as_any().downcast_ref::<StringArray>().expect("list items are Utf8");
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons.value(0), "stop");
+
+        // The JSON content column must be populated (faithful serialization of the
+        // wire value), not null and not misrouted to another string column.
+        let input_messages = batch
+            .column_by_name("input_messages")
+            .expect("input_messages column present")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("input_messages is Utf8");
+        assert!(!input_messages.is_null(0), "input_messages must be populated");
+        assert!(input_messages.value(0).contains("hello"));
     }
 }

@@ -66,6 +66,7 @@ mod tests {
         OtlpHttpState {
             write_channel,
             wal_row_group_size: 4,
+            operations_enabled: true,
             metrics: OtlpMetrics::new_disabled(),
         }
     }

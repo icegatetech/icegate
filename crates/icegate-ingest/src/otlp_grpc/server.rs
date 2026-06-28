@@ -31,12 +31,13 @@ use crate::infra::metrics::OtlpMetrics;
 pub async fn run(
     write_channel: WriteChannel,
     wal_row_group_size: usize,
+    operations_enabled: bool,
     metrics: OtlpMetrics,
     config: OtlpGrpcConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", config.host, config.port).parse()?;
-    let service = OtlpGrpcService::new(write_channel, wal_row_group_size, metrics);
+    let service = OtlpGrpcService::new(write_channel, wal_row_group_size, operations_enabled, metrics);
 
     tracing::info!("Starting OTLP gRPC server on {}", addr);
 

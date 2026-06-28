@@ -541,11 +541,20 @@ async fn run_services(
     if config.otlp_http.enabled {
         let write_channel = write_tx.clone();
         let wal_row_group_size = queue_config.common.max_row_group_size;
+        let operations_enabled = config.operations.enabled;
         let http_config = config.otlp_http.clone();
         let token = cancel_token.clone();
         let metrics = otlp_metrics.clone();
         let handle = tokio::spawn(async move {
-            crate::otlp_http::run(write_channel, wal_row_group_size, metrics, http_config, token).await
+            crate::otlp_http::run(
+                write_channel,
+                wal_row_group_size,
+                operations_enabled,
+                metrics,
+                http_config,
+                token,
+            )
+            .await
         });
         handles.push(handle);
     }
@@ -554,11 +563,20 @@ async fn run_services(
     if config.otlp_grpc.enabled {
         let write_channel = write_tx.clone();
         let wal_row_group_size = queue_config.common.max_row_group_size;
+        let operations_enabled = config.operations.enabled;
         let grpc_config = config.otlp_grpc.clone();
         let token = cancel_token.clone();
         let metrics = otlp_metrics.clone();
         let handle = tokio::spawn(async move {
-            crate::otlp_grpc::run(write_channel, wal_row_group_size, metrics, grpc_config, token).await
+            crate::otlp_grpc::run(
+                write_channel,
+                wal_row_group_size,
+                operations_enabled,
+                metrics,
+                grpc_config,
+                token,
+            )
+            .await
         });
         handles.push(handle);
     }

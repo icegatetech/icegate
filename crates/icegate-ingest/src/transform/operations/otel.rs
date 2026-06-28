@@ -1,7 +1,7 @@
 //! OTEL `GenAI` semantic-convention adapter.
 
 use super::convention::OperationConvention;
-use super::projection::{AttributeView, FieldType, OperationField};
+use super::projection::{AttributeView, OperationField};
 use crate::transform::attributes::extract_string_value;
 
 /// OTEL `GenAI` semantic-convention adapter. Sources the canonical `gen_ai.*`
@@ -15,73 +15,58 @@ impl OperationConvention for OtelGenAi {
         &["gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.system"]
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn field_keys(&self, field: OperationField) -> &'static [(&'static str, FieldType)] {
+    fn field_keys(&self, field: OperationField) -> &'static [&'static str] {
         match field {
-            OperationField::ProviderName => &[
-                ("gen_ai.provider.name", FieldType::Str),
-                ("gen_ai.system", FieldType::Str),
-                ("llm.system", FieldType::Str),
-            ],
-            OperationField::RequestModel => &[
-                ("gen_ai.request.model", FieldType::Str),
-                ("llm.model_name", FieldType::Str),
-            ],
-            OperationField::ResponseModel => &[("gen_ai.response.model", FieldType::Str)],
-            OperationField::ResponseId => &[("gen_ai.response.id", FieldType::Str)],
-            OperationField::Temperature => &[("gen_ai.request.temperature", FieldType::F64)],
-            OperationField::TopP => &[("gen_ai.request.top_p", FieldType::F64)],
-            OperationField::TopK => &[("gen_ai.request.top_k", FieldType::I64)],
-            OperationField::MaxTokens => &[("gen_ai.request.max_tokens", FieldType::I64)],
-            OperationField::FrequencyPenalty => &[("gen_ai.request.frequency_penalty", FieldType::F64)],
-            OperationField::PresencePenalty => &[("gen_ai.request.presence_penalty", FieldType::F64)],
-            OperationField::Seed => &[("gen_ai.request.seed", FieldType::I64)],
-            OperationField::Stream => &[("gen_ai.request.stream", FieldType::Bool)],
-            OperationField::ChoiceCount => &[
-                ("gen_ai.request.choice_count", FieldType::I64),
-                ("gen_ai.request.choice.count", FieldType::I64),
-            ],
-            OperationField::OutputType => &[("gen_ai.output.type", FieldType::Str)],
-            OperationField::ReasoningEffort => &[("gen_ai.request.reasoning_effort", FieldType::Str)],
-            OperationField::StopSequences => &[("gen_ai.request.stop_sequences", FieldType::StrList)],
-            OperationField::TimeToFirstChunkMs => &[("gen_ai.response.time_to_first_chunk", FieldType::F64)],
-            OperationField::FinishReasons => &[("gen_ai.response.finish_reasons", FieldType::StrList)],
-            OperationField::InputTokens => &[("gen_ai.usage.input_tokens", FieldType::I64)],
-            OperationField::OutputTokens => &[("gen_ai.usage.output_tokens", FieldType::I64)],
-            OperationField::TotalTokens => &[("gen_ai.usage.total_tokens", FieldType::I64)],
-            OperationField::ReasoningTokens => &[("gen_ai.usage.reasoning.output_tokens", FieldType::I64)],
+            OperationField::ProviderName => &["gen_ai.provider.name", "gen_ai.system", "llm.system"],
+            OperationField::RequestModel => &["gen_ai.request.model", "llm.model_name"],
+            OperationField::ResponseModel => &["gen_ai.response.model"],
+            OperationField::ResponseId => &["gen_ai.response.id"],
+            OperationField::Temperature => &["gen_ai.request.temperature"],
+            OperationField::TopP => &["gen_ai.request.top_p"],
+            OperationField::TopK => &["gen_ai.request.top_k"],
+            OperationField::MaxTokens => &["gen_ai.request.max_tokens"],
+            OperationField::FrequencyPenalty => &["gen_ai.request.frequency_penalty"],
+            OperationField::PresencePenalty => &["gen_ai.request.presence_penalty"],
+            OperationField::Seed => &["gen_ai.request.seed"],
+            OperationField::Stream => &["gen_ai.request.stream"],
+            OperationField::ChoiceCount => &["gen_ai.request.choice_count", "gen_ai.request.choice.count"],
+            OperationField::OutputType => &["gen_ai.output.type"],
+            OperationField::ReasoningEffort => &["gen_ai.request.reasoning_effort"],
+            OperationField::StopSequences => &["gen_ai.request.stop_sequences"],
+            OperationField::TimeToFirstChunkMs => &["gen_ai.response.time_to_first_chunk"],
+            OperationField::FinishReasons => &["gen_ai.response.finish_reasons"],
+            OperationField::InputTokens => &["gen_ai.usage.input_tokens"],
+            OperationField::OutputTokens => &["gen_ai.usage.output_tokens"],
+            OperationField::TotalTokens => &["gen_ai.usage.total_tokens"],
+            OperationField::ReasoningTokens => &["gen_ai.usage.reasoning.output_tokens"],
             OperationField::CacheCreationInputTokens => &[
-                ("gen_ai.usage.cache_creation.input_tokens", FieldType::I64),
-                ("cache_creation_input_tokens", FieldType::I64),
+                "gen_ai.usage.cache_creation.input_tokens",
+                "cache_creation_input_tokens",
             ],
-            OperationField::CacheReadInputTokens => &[("gen_ai.usage.cache_read.input_tokens", FieldType::I64)],
-            OperationField::ConversationId => &[("gen_ai.conversation.id", FieldType::Str)],
-            OperationField::UserId => &[
-                ("user.id", FieldType::Str),
-                ("gen_ai.user", FieldType::Str),
-                ("llm.user", FieldType::Str),
-            ],
-            OperationField::ToolName => &[("gen_ai.tool.name", FieldType::Str)],
-            OperationField::ToolCallId => &[("gen_ai.tool.call.id", FieldType::Str)],
-            OperationField::ToolType => &[("gen_ai.tool.type", FieldType::Str)],
-            OperationField::ToolDescription => &[("gen_ai.tool.description", FieldType::Str)],
-            OperationField::DataSourceId => &[("gen_ai.data_source.id", FieldType::Str)],
-            OperationField::EmbeddingDimensions => &[("gen_ai.embeddings.dimension.count", FieldType::I32Count)],
-            OperationField::EncodingFormats => &[("gen_ai.request.encoding_formats", FieldType::StrList)],
-            OperationField::ServerAddress => &[("server.address", FieldType::Str)],
-            OperationField::ServerPort => &[("server.port", FieldType::I32Count)],
-            OperationField::ErrorType => &[("error.type", FieldType::Str)],
-            OperationField::AgentId => &[("gen_ai.agent.id", FieldType::Str)],
-            OperationField::AgentName => &[("gen_ai.agent.name", FieldType::Str)],
-            OperationField::AgentVersion => &[("gen_ai.agent.version", FieldType::Str)],
-            OperationField::AgentDescription => &[("gen_ai.agent.description", FieldType::Str)],
-            OperationField::WorkflowName => &[("gen_ai.workflow.name", FieldType::Str)],
-            OperationField::InputMessages => &[("gen_ai.input.messages", FieldType::Json)],
-            OperationField::OutputMessages => &[("gen_ai.output.messages", FieldType::Json)],
-            OperationField::SystemInstructions => &[("gen_ai.system_instructions", FieldType::Json)],
-            OperationField::ToolDefinitions => &[("gen_ai.tool.definitions", FieldType::Json)],
-            OperationField::ToolCallArguments => &[("gen_ai.tool.call.arguments", FieldType::Json)],
-            OperationField::ToolCallResult => &[("gen_ai.tool.call.result", FieldType::Json)],
+            OperationField::CacheReadInputTokens => &["gen_ai.usage.cache_read.input_tokens"],
+            OperationField::ConversationId => &["gen_ai.conversation.id"],
+            OperationField::UserId => &["user.id", "gen_ai.user", "llm.user"],
+            OperationField::ToolName => &["gen_ai.tool.name"],
+            OperationField::ToolCallId => &["gen_ai.tool.call.id"],
+            OperationField::ToolType => &["gen_ai.tool.type"],
+            OperationField::ToolDescription => &["gen_ai.tool.description"],
+            OperationField::DataSourceId => &["gen_ai.data_source.id"],
+            OperationField::EmbeddingDimensions => &["gen_ai.embeddings.dimension.count"],
+            OperationField::EncodingFormats => &["gen_ai.request.encoding_formats"],
+            OperationField::ServerAddress => &["server.address"],
+            OperationField::ServerPort => &["server.port"],
+            OperationField::ErrorType => &["error.type"],
+            OperationField::AgentId => &["gen_ai.agent.id"],
+            OperationField::AgentName => &["gen_ai.agent.name"],
+            OperationField::AgentVersion => &["gen_ai.agent.version"],
+            OperationField::AgentDescription => &["gen_ai.agent.description"],
+            OperationField::WorkflowName => &["gen_ai.workflow.name"],
+            OperationField::InputMessages => &["gen_ai.input.messages"],
+            OperationField::OutputMessages => &["gen_ai.output.messages"],
+            OperationField::SystemInstructions => &["gen_ai.system_instructions"],
+            OperationField::ToolDefinitions => &["gen_ai.tool.definitions"],
+            OperationField::ToolCallArguments => &["gen_ai.tool.call.arguments"],
+            OperationField::ToolCallResult => &["gen_ai.tool.call.result"],
         }
     }
 
@@ -119,36 +104,32 @@ mod tests {
     fn provider_name_field_keys_are_ordered_otel_first() {
         // provider precedence within OTEL: gen_ai.provider.name, then deprecated
         // gen_ai.system, then llm.system (spec section 3 provider_model row).
-        let keys: Vec<&str> = OtelGenAi
-            .field_keys(OperationField::ProviderName)
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
-        assert_eq!(keys, vec!["gen_ai.provider.name", "gen_ai.system", "llm.system"]);
+        let keys = OtelGenAi.field_keys(OperationField::ProviderName);
+        assert_eq!(keys, &["gen_ai.provider.name", "gen_ai.system", "llm.system"]);
     }
 
     #[test]
-    fn temperature_field_key_is_typed_f64() {
+    fn temperature_sourced_from_request_temperature() {
         let keys = OtelGenAi.field_keys(OperationField::Temperature);
-        assert_eq!(keys, &[("gen_ai.request.temperature", FieldType::F64)]);
+        assert_eq!(keys, &["gen_ai.request.temperature"]);
     }
 
     #[test]
-    fn input_tokens_field_key_is_typed_i64() {
+    fn input_tokens_sourced_from_usage_input_tokens() {
         let keys = OtelGenAi.field_keys(OperationField::InputTokens);
-        assert_eq!(keys.first(), Some(&("gen_ai.usage.input_tokens", FieldType::I64)));
+        assert_eq!(keys.first(), Some(&"gen_ai.usage.input_tokens"));
     }
 
     #[test]
-    fn stop_sequences_field_key_is_typed_str_list() {
+    fn stop_sequences_sourced_from_request_stop_sequences() {
         let keys = OtelGenAi.field_keys(OperationField::StopSequences);
-        assert_eq!(keys, &[("gen_ai.request.stop_sequences", FieldType::StrList)]);
+        assert_eq!(keys, &["gen_ai.request.stop_sequences"]);
     }
 
     #[test]
-    fn input_messages_field_key_is_typed_json() {
+    fn input_messages_sourced_from_input_messages() {
         let keys = OtelGenAi.field_keys(OperationField::InputMessages);
-        assert_eq!(keys, &[("gen_ai.input.messages", FieldType::Json)]);
+        assert_eq!(keys, &["gen_ai.input.messages"]);
     }
 
     #[test]

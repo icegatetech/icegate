@@ -1,7 +1,7 @@
 //! Traceloop semantic-convention adapter.
 
 use super::convention::OperationConvention;
-use super::projection::{AttributeView, FieldType, OperationField};
+use super::projection::{AttributeView, OperationField};
 use crate::transform::attributes::extract_string_value;
 
 /// Traceloop (`OpenLLMetry`) semantic-convention adapter. Sources Traceloop's
@@ -16,14 +16,14 @@ impl OperationConvention for Traceloop {
         &["traceloop.span.kind"]
     }
 
-    fn field_keys(&self, field: OperationField) -> &'static [(&'static str, FieldType)] {
+    fn field_keys(&self, field: OperationField) -> &'static [&'static str] {
         match field {
-            OperationField::InputTokens => &[("gen_ai.usage.prompt_tokens", FieldType::I64)],
-            OperationField::OutputTokens => &[("gen_ai.usage.completion_tokens", FieldType::I64)],
-            OperationField::ReasoningTokens => &[("gen_ai.usage.reasoning_tokens", FieldType::I64)],
-            OperationField::CacheReadInputTokens => &[("gen_ai.usage.cache_read_input_tokens", FieldType::I64)],
-            OperationField::Stream => &[("gen_ai.is_streaming", FieldType::Bool)],
-            OperationField::WorkflowName => &[("traceloop.workflow.name", FieldType::Str)],
+            OperationField::InputTokens => &["gen_ai.usage.prompt_tokens"],
+            OperationField::OutputTokens => &["gen_ai.usage.completion_tokens"],
+            OperationField::ReasoningTokens => &["gen_ai.usage.reasoning_tokens"],
+            OperationField::CacheReadInputTokens => &["gen_ai.usage.cache_read_input_tokens"],
+            OperationField::Stream => &["gen_ai.is_streaming"],
+            OperationField::WorkflowName => &["traceloop.workflow.name"],
             _ => &[],
         }
     }
@@ -70,37 +70,37 @@ mod tests {
     #[test]
     fn input_tokens_fallback_to_prompt_tokens() {
         let keys = Traceloop.field_keys(OperationField::InputTokens);
-        assert_eq!(keys, &[("gen_ai.usage.prompt_tokens", FieldType::I64)]);
+        assert_eq!(keys, &["gen_ai.usage.prompt_tokens"]);
     }
 
     #[test]
     fn output_tokens_fallback_to_completion_tokens() {
         let keys = Traceloop.field_keys(OperationField::OutputTokens);
-        assert_eq!(keys, &[("gen_ai.usage.completion_tokens", FieldType::I64)]);
+        assert_eq!(keys, &["gen_ai.usage.completion_tokens"]);
     }
 
     #[test]
     fn reasoning_tokens_fallback_to_flat_key() {
         let keys = Traceloop.field_keys(OperationField::ReasoningTokens);
-        assert_eq!(keys, &[("gen_ai.usage.reasoning_tokens", FieldType::I64)]);
+        assert_eq!(keys, &["gen_ai.usage.reasoning_tokens"]);
     }
 
     #[test]
     fn cache_read_fallback_to_flat_key() {
         let keys = Traceloop.field_keys(OperationField::CacheReadInputTokens);
-        assert_eq!(keys, &[("gen_ai.usage.cache_read_input_tokens", FieldType::I64)]);
+        assert_eq!(keys, &["gen_ai.usage.cache_read_input_tokens"]);
     }
 
     #[test]
     fn stream_fallback_to_is_streaming() {
         let keys = Traceloop.field_keys(OperationField::Stream);
-        assert_eq!(keys, &[("gen_ai.is_streaming", FieldType::Bool)]);
+        assert_eq!(keys, &["gen_ai.is_streaming"]);
     }
 
     #[test]
     fn workflow_name_sources_traceloop_key() {
         let keys = Traceloop.field_keys(OperationField::WorkflowName);
-        assert_eq!(keys, &[("traceloop.workflow.name", FieldType::Str)]);
+        assert_eq!(keys, &["traceloop.workflow.name"]);
     }
 
     #[test]

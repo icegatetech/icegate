@@ -159,31 +159,51 @@ pub async fn ingest_traces(
     // plain data (`Send + Sync`), so the `Arc` clone is cheap (no deep copy).
     let export_request = Arc::new(export_request);
 
-    // Transform spans (authoritative) and derived operations (best-effort) on
-    // separate blocking-pool threads so the two independent CPU passes over the
-    // same request run in parallel instead of back-to-back.
+    // Transform spans (authoritative) on a blocking-pool thread. When the
+    // operations feature is enabled, fork the best-effort operations projection
+    // onto a second blocking thread so the two independent CPU passes over the
+    // same request run in parallel; when disabled, skip the operations transform
+    // entirely (no second span pass, no per-span `AttributeView` allocation) and
+    // write spans only.
     let span = tracing::Span::current();
-    let transform_start = Instant::now();
     let spans_task = tokio::task::spawn_blocking({
         let export_request = Arc::clone(&export_request);
         let tenant_id = tenant_id.clone();
         let span = span.clone();
-        move || span.in_scope(|| transform::spans_to_record_batch(&export_request, tenant_id.as_deref()))
+        move || {
+            // Time the spans transform inside its own blocking task so the traces
+            // transform-duration metric reflects the spans pass alone. Recording
+            // `elapsed()` after the `join!` below would inflate it with the
+            // parallel operations transform (and join scheduling).
+            let transform_start = Instant::now();
+            let result = span.in_scope(|| transform::spans_to_record_batch(&export_request, tenant_id.as_deref()));
+            (result, transform_start.elapsed())
+        }
     });
-    let operations_task = tokio::task::spawn_blocking({
-        let export_request = Arc::clone(&export_request);
-        let span = span.clone();
-        move || span.in_scope(|| transform::operations_to_record_batch(&export_request, tenant_id.as_deref()))
-    });
-    let (spans_join, operations_join) = tokio::join!(spans_task, operations_task);
+
+    // Disabled operations mirror a zero-LLM-span request (`Ok((None, 0))`), so the
+    // WAL writer's operations leg becomes a no-op.
+    let (spans_join, operations_result) = if state.operations_enabled {
+        let operations_task = tokio::task::spawn_blocking({
+            let export_request = Arc::clone(&export_request);
+            let span = span.clone();
+            move || span.in_scope(|| transform::operations_to_record_batch(&export_request, tenant_id.as_deref()))
+        });
+        let (spans_join, operations_join) = tokio::join!(spans_task, operations_task);
+        // Operations transform is best-effort: a panic degrades to a logged
+        // failure rather than failing the traces request.
+        (
+            spans_join,
+            operations_join.unwrap_or_else(|join_err| Err(IngestError::Join(join_err))),
+        )
+    } else {
+        (spans_task.await, Ok((None, 0)))
+    };
 
     // Spans transform error (or task panic) fails the whole request (authoritative).
-    let (batch_opt, drops) = spans_join?.map_err(OtlpError)?;
-    request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_TRACES, STATUS_OK);
-
-    // Operations transform is best-effort: a panic degrades to a best-effort
-    // failure (logged downstream) rather than failing the traces request.
-    let operations_result = operations_join.unwrap_or_else(|join_err| Err(IngestError::Join(join_err)));
+    let (spans_result, spans_transform_elapsed) = spans_join?;
+    let (batch_opt, drops) = spans_result.map_err(OtlpError)?;
+    request_metrics.record_transform_duration(spans_transform_elapsed, SIGNAL_TRACES, STATUS_OK);
 
     // Spans (authoritative) and operations (best-effort) are written with
     // overlapping WAL acknowledgements; the operations leg can never fail or
@@ -346,6 +366,7 @@ mod tests {
         OtlpHttpState {
             write_channel,
             wal_row_group_size: 4,
+            operations_enabled: true,
             metrics: OtlpMetrics::new_disabled(),
         }
     }
@@ -472,6 +493,7 @@ mod tests {
         let state = OtlpHttpState {
             write_channel: tx,
             wal_row_group_size: 0,
+            operations_enabled: true,
             metrics: OtlpMetrics::new_disabled(),
         };
 
@@ -793,6 +815,7 @@ mod tests {
         let state = OtlpHttpState {
             write_channel: tx,
             wal_row_group_size: 4,
+            operations_enabled: true,
             metrics: OtlpMetrics::new_disabled(),
         };
         let mut body = Vec::new();
@@ -807,6 +830,45 @@ mod tests {
         writer.await.expect("writer task");
 
         assert!(response.0.partial_success.is_none());
+    }
+
+    #[tokio::test]
+    async fn ingest_traces_skips_operations_when_disabled() {
+        // With operations disabled, both spans are written to SPANS_TOPIC and no
+        // operations write is submitted. The handler consumes `state`, so its
+        // WriteChannel sender drops on return and the writer's second recv ends.
+        let (tx, mut rx) = channel(2);
+        let writer = tokio::spawn(async move {
+            let req = rx.recv().await.expect("spans write request");
+            assert_eq!(req.topic, icegate_common::SPANS_TOPIC);
+            let rows = req.row_groups.iter().map(|rg| rg.batch.num_rows()).sum::<usize>();
+            req.response_tx.send(WriteResult::success(1, rows, None)).expect("ack");
+            assert!(
+                rx.recv().await.is_none(),
+                "no operations write may be submitted when operations are disabled"
+            );
+            rows
+        });
+
+        let state = OtlpHttpState {
+            write_channel: tx,
+            wal_row_group_size: 4,
+            operations_enabled: false,
+            metrics: OtlpMetrics::new_disabled(),
+        };
+        let mut body = Vec::new();
+        traces_request_one_llm_one_plain().encode(&mut body).expect("encode request");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF.parse().expect("content type"));
+
+        let response = ingest_traces(State(state), headers, axum::body::Bytes::from(body))
+            .await
+            .expect("traces response ok");
+        let spans_rows = writer.await.expect("writer task");
+
+        assert!(response.0.partial_success.is_none());
+        assert_eq!(spans_rows, 2, "both spans are written even with operations disabled");
     }
 
     #[tokio::test]

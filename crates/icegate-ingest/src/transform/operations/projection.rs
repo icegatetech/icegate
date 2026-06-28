@@ -1,9 +1,9 @@
 //! Pure projection types for the `operations` transform.
 //!
 //! This module holds the owned, Arrow-decoupled row type (`OperationRow`), the
-//! logical wire-field enum (`OperationField`), the expected wire-shape enum
-//! (`FieldType`), the borrowing `AttributeView` over a span's attributes, and the
-//! `project_operation_row` driver with its strict typed resolvers.
+//! logical wire-field enum (`OperationField`), the borrowing `AttributeView` over
+//! a span's attributes, and the `project_operation_row` driver with its strict
+//! typed resolvers.
 
 use std::collections::HashMap;
 
@@ -158,27 +158,6 @@ pub(crate) enum OperationField {
     ToolCallArguments,
     /// `tool_call_result` content column.
     ToolCallResult,
-}
-
-/// Expected wire shape of an attribute value, so the resolver strict-parses
-/// uniformly (spec D6). The source `span_attributes` map stringifies everything,
-/// so numeric/bool/list columns are parsed from the raw OTLP `AnyValue`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FieldType {
-    /// Verbatim string value.
-    Str,
-    /// Signed 64-bit integer (`Long`), e.g. tokens, `top_k`, `seed`.
-    I64,
-    /// 64-bit float (`Double`), e.g. `temperature`, `top_p`.
-    F64,
-    /// Boolean, e.g. `stream`.
-    Bool,
-    /// Non-negative `u32` count parsed into the schema's `Int` column.
-    I32Count,
-    /// `List<String>`, e.g. `stop_sequences`, `finish_reasons`.
-    StrList,
-    /// Structured value serialized to faithful JSON (content columns).
-    Json,
 }
 
 /// Owned, Arrow-decoupled projection of one `operations` row.
@@ -337,15 +316,20 @@ fn validate_span_id(bytes: &[u8]) -> Result<[u8; 8]> {
 
 /// Resolve the first present `String` value for `field` across the global
 /// precedence order. Verbatim string columns use this.
-fn resolve_str(view: &AttributeView, field: OperationField) -> Option<String> {
-    for (key, _ty) in field_precedence(field) {
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` if the field's precedence slice is
+/// unavailable (an internal registry invariant; see [`field_precedence`]).
+fn resolve_str(view: &AttributeView, field: OperationField) -> Result<Option<String>> {
+    for &key in field_precedence(field)? {
         if let Some(value) = view.get(key) {
             if let Some(s) = extract_string_value(Some(value)) {
-                return Some(s);
+                return Ok(Some(s));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Resolve the first present `i64` for `field`; strict parse (D6).
@@ -354,7 +338,7 @@ fn resolve_str(view: &AttributeView, field: OperationField) -> Option<String> {
 ///
 /// Returns `IngestError::Validation` when a present value fails strict parsing.
 fn resolve_i64(view: &AttributeView, field: OperationField, context: &'static str) -> Result<Option<i64>> {
-    for (key, _ty) in field_precedence(field) {
+    for &key in field_precedence(field)? {
         if let Some(value) = view.get(key) {
             return extract_i64(Some(value), context);
         }
@@ -368,7 +352,7 @@ fn resolve_i64(view: &AttributeView, field: OperationField, context: &'static st
 ///
 /// Returns `IngestError::Validation` when a present value fails strict parsing.
 fn resolve_f64(view: &AttributeView, field: OperationField, context: &'static str) -> Result<Option<f64>> {
-    for (key, _ty) in field_precedence(field) {
+    for &key in field_precedence(field)? {
         if let Some(value) = view.get(key) {
             return extract_f64(Some(value), context);
         }
@@ -382,7 +366,7 @@ fn resolve_f64(view: &AttributeView, field: OperationField, context: &'static st
 ///
 /// Returns `IngestError::Validation` when a present value fails strict parsing.
 fn resolve_bool(view: &AttributeView, field: OperationField, context: &'static str) -> Result<Option<bool>> {
-    for (key, _ty) in field_precedence(field) {
+    for &key in field_precedence(field)? {
         if let Some(value) = view.get(key) {
             return extract_bool(Some(value), context);
         }
@@ -396,7 +380,7 @@ fn resolve_bool(view: &AttributeView, field: OperationField, context: &'static s
 ///
 /// Returns `IngestError::Validation` when a present value fails strict parsing.
 fn resolve_str_list(view: &AttributeView, field: OperationField, context: &'static str) -> Result<Option<Vec<String>>> {
-    for (key, _ty) in field_precedence(field) {
+    for &key in field_precedence(field)? {
         if let Some(value) = view.get(key) {
             return extract_string_list(Some(value), context);
         }
@@ -405,15 +389,20 @@ fn resolve_str_list(view: &AttributeView, field: OperationField, context: &'stat
 }
 
 /// Resolve the first present JSON-serialized content for `field`.
-fn resolve_json(view: &AttributeView, field: OperationField) -> Option<String> {
-    for (key, _ty) in field_precedence(field) {
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` if the field's precedence slice is
+/// unavailable (an internal registry invariant; see [`field_precedence`]).
+fn resolve_json(view: &AttributeView, field: OperationField) -> Result<Option<String>> {
+    for &key in field_precedence(field)? {
         if let Some(value) = view.get(key) {
             if let Some(json) = serialize_any_value_to_json(Some(value)) {
-                return Some(json);
+                return Ok(Some(json));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Resolve `input_tokens`-style counts via strict `i64` parse.
@@ -498,7 +487,7 @@ pub(crate) fn project_operation_row(
         None => None,
     };
 
-    // `ServerPort` is a `FieldType::I32Count`: non-negative. Mirror the
+    // `ServerPort` is a non-negative count column. Mirror the
     // `embedding_dimensions` conversion above (u32 first) so a negative port is
     // rejected rather than silently stored.
     let server_port = match resolve_i64(&view, OperationField::ServerPort, "server_port")? {
@@ -552,10 +541,10 @@ pub(crate) fn project_operation_row(
         duration_micros,
         ingested_timestamp: ingested_at,
         operation_name,
-        provider_name: resolve_str(&view, OperationField::ProviderName),
-        request_model: resolve_str(&view, OperationField::RequestModel),
-        response_model: resolve_str(&view, OperationField::ResponseModel),
-        response_id: resolve_str(&view, OperationField::ResponseId),
+        provider_name: resolve_str(&view, OperationField::ProviderName)?,
+        request_model: resolve_str(&view, OperationField::RequestModel)?,
+        response_model: resolve_str(&view, OperationField::ResponseModel)?,
+        response_id: resolve_str(&view, OperationField::ResponseId)?,
         temperature: resolve_f64(&view, OperationField::Temperature, "temperature")?,
         top_p: resolve_f64(&view, OperationField::TopP, "top_p")?,
         top_k: resolve_i64(&view, OperationField::TopK, "top_k")?,
@@ -565,8 +554,8 @@ pub(crate) fn project_operation_row(
         seed: resolve_i64(&view, OperationField::Seed, "seed")?,
         stream: resolve_bool(&view, OperationField::Stream, "stream")?,
         choice_count: resolve_i64(&view, OperationField::ChoiceCount, "choice_count")?,
-        output_type: resolve_str(&view, OperationField::OutputType),
-        reasoning_effort: resolve_str(&view, OperationField::ReasoningEffort),
+        output_type: resolve_str(&view, OperationField::OutputType)?,
+        reasoning_effort: resolve_str(&view, OperationField::ReasoningEffort)?,
         stop_sequences: resolve_str_list(&view, OperationField::StopSequences, "stop_sequences")?,
         time_to_first_chunk_ms,
         finish_reasons: resolve_str_list(&view, OperationField::FinishReasons, "finish_reasons")?,
@@ -580,31 +569,31 @@ pub(crate) fn project_operation_row(
             "cache_creation_input_tokens",
         )?,
         cache_read_input_tokens: resolve_token(&view, OperationField::CacheReadInputTokens, "cache_read_input_tokens")?,
-        conversation_id: resolve_str(&view, OperationField::ConversationId),
-        user_id: resolve_str(&view, OperationField::UserId),
-        tool_name: resolve_str(&view, OperationField::ToolName),
-        tool_call_id: resolve_str(&view, OperationField::ToolCallId),
-        tool_type: resolve_str(&view, OperationField::ToolType),
-        tool_description: resolve_str(&view, OperationField::ToolDescription),
-        data_source_id: resolve_str(&view, OperationField::DataSourceId),
+        conversation_id: resolve_str(&view, OperationField::ConversationId)?,
+        user_id: resolve_str(&view, OperationField::UserId)?,
+        tool_name: resolve_str(&view, OperationField::ToolName)?,
+        tool_call_id: resolve_str(&view, OperationField::ToolCallId)?,
+        tool_type: resolve_str(&view, OperationField::ToolType)?,
+        tool_description: resolve_str(&view, OperationField::ToolDescription)?,
+        data_source_id: resolve_str(&view, OperationField::DataSourceId)?,
         embedding_dimensions,
         encoding_formats: resolve_str_list(&view, OperationField::EncodingFormats, "encoding_formats")?,
-        server_address: resolve_str(&view, OperationField::ServerAddress),
+        server_address: resolve_str(&view, OperationField::ServerAddress)?,
         server_port,
         status_code,
         status_message,
-        error_type: resolve_str(&view, OperationField::ErrorType),
-        agent_id: resolve_str(&view, OperationField::AgentId),
-        agent_name: resolve_str(&view, OperationField::AgentName),
-        agent_version: resolve_str(&view, OperationField::AgentVersion),
-        agent_description: resolve_str(&view, OperationField::AgentDescription),
-        workflow_name: resolve_str(&view, OperationField::WorkflowName),
-        input_messages: resolve_json(&view, OperationField::InputMessages),
-        output_messages: resolve_json(&view, OperationField::OutputMessages),
-        system_instructions: resolve_json(&view, OperationField::SystemInstructions),
-        tool_definitions: resolve_json(&view, OperationField::ToolDefinitions),
-        tool_call_arguments: resolve_json(&view, OperationField::ToolCallArguments),
-        tool_call_result: resolve_json(&view, OperationField::ToolCallResult),
+        error_type: resolve_str(&view, OperationField::ErrorType)?,
+        agent_id: resolve_str(&view, OperationField::AgentId)?,
+        agent_name: resolve_str(&view, OperationField::AgentName)?,
+        agent_version: resolve_str(&view, OperationField::AgentVersion)?,
+        agent_description: resolve_str(&view, OperationField::AgentDescription)?,
+        workflow_name: resolve_str(&view, OperationField::WorkflowName)?,
+        input_messages: resolve_json(&view, OperationField::InputMessages)?,
+        output_messages: resolve_json(&view, OperationField::OutputMessages)?,
+        system_instructions: resolve_json(&view, OperationField::SystemInstructions)?,
+        tool_definitions: resolve_json(&view, OperationField::ToolDefinitions)?,
+        tool_call_arguments: resolve_json(&view, OperationField::ToolCallArguments)?,
+        tool_call_result: resolve_json(&view, OperationField::ToolCallResult)?,
     }))
 }
 
@@ -718,16 +707,12 @@ mod tests {
     }
 
     #[test]
-    fn operation_field_and_field_type_are_constructible_and_comparable() {
+    fn operation_field_is_constructible_and_comparable() {
         // OperationField is a plain Copy enum used as a registry lookup key.
         let a = OperationField::ProviderName;
         let b = OperationField::ProviderName;
         assert_eq!(a, b);
         assert_ne!(OperationField::ProviderName, OperationField::RequestModel);
-
-        // FieldType describes the expected wire shape for strict parsing (D6).
-        assert_eq!(FieldType::Str, FieldType::Str);
-        assert_ne!(FieldType::I64, FieldType::F64);
     }
 
     #[test]

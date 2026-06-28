@@ -4,8 +4,9 @@ use std::sync::OnceLock;
 
 use super::openinference::OpenInference;
 use super::otel::OtelGenAi;
-use super::projection::{AttributeView, FieldType, OperationField};
+use super::projection::{AttributeView, OperationField};
 use super::traceloop::Traceloop;
+use crate::error::{IngestError, Result};
 
 /// One client-SDK / semantic-convention family (OTEL `GenAI`, `OpenInference`,
 /// Traceloop, future SDKs). Adding an SDK means implementing this trait — almost
@@ -20,7 +21,7 @@ pub(crate) trait OperationConvention: Send + Sync {
     /// Ordered candidate attribute keys this convention offers for `field`
     /// (most-specific first). Empty slice when this convention does not source
     /// the field.
-    fn field_keys(&self, field: OperationField) -> &'static [(&'static str, FieldType)];
+    fn field_keys(&self, field: OperationField) -> &'static [&'static str];
 
     /// Classifies this convention's span-kind into a canonical `operation_name`,
     /// or `None` when this convention cannot decide (the next adapter then tries).
@@ -35,10 +36,7 @@ pub(crate) static CONVENTIONS: &[&dyn OperationConvention] = &[&OtelGenAi, &Open
 /// precedence-ordered vector, preserving registry order. Pulled out as a free
 /// function (taking the convention slice) so it is unit-testable with stub
 /// adapters independently of [`CONVENTIONS`].
-fn flatten_field_keys(
-    conventions: &[&dyn OperationConvention],
-    field: OperationField,
-) -> Vec<(&'static str, FieldType)> {
+fn flatten_field_keys(conventions: &[&dyn OperationConvention], field: OperationField) -> Vec<&'static str> {
     let mut flattened = Vec::new();
     for convention in conventions {
         flattened.extend_from_slice(convention.field_keys(field));
@@ -118,7 +116,7 @@ const ALL_FIELDS: &[OperationField] = &[
 
 /// Lazily-built global precedence index: one flattened precedence slice per
 /// `OperationField`, indexed by the field's position in [`ALL_FIELDS`].
-type PrecedenceIndex = Vec<Vec<(&'static str, FieldType)>>;
+type PrecedenceIndex = Vec<Vec<&'static str>>;
 
 /// Cached, lazily-initialized per-field precedence index over [`CONVENTIONS`].
 static FIELD_PRECEDENCE: OnceLock<PrecedenceIndex> = OnceLock::new();
@@ -127,17 +125,25 @@ static FIELD_PRECEDENCE: OnceLock<PrecedenceIndex> = OnceLock::new();
 /// convention's candidate keys for that field flattened in registry order, with
 /// the first present key in a span winning. Computed once via `OnceLock`, so the
 /// hot path walks a flat slice with no per-field trait dispatch.
-// Invariant: every OperationField variant is listed in ALL_FIELDS (guarded by the
-// field_precedence_covers_every_field test), so the position lookup never returns None.
-#[allow(clippy::expect_used)]
-pub(crate) fn field_precedence(field: OperationField) -> &'static [(&'static str, FieldType)] {
+///
+/// # Errors
+///
+/// Returns [`IngestError::Validation`] if `field` is absent from [`ALL_FIELDS`]
+/// (or the index has no entry for it). This is an internal registry invariant,
+/// guarded by the `field_precedence_covers_every_field` test; surfacing it as an
+/// error rather than a panic keeps a future enum-drift bug from aborting the
+/// ingest hot path — the affected row is dropped instead.
+pub(crate) fn field_precedence(field: OperationField) -> Result<&'static [&'static str]> {
     let index = FIELD_PRECEDENCE
         .get_or_init(|| ALL_FIELDS.iter().map(|field| flatten_field_keys(CONVENTIONS, *field)).collect());
     let position = ALL_FIELDS
         .iter()
         .position(|candidate| *candidate == field)
-        .expect("every OperationField variant is listed in ALL_FIELDS");
-    &index[position]
+        .ok_or_else(|| IngestError::Validation(format!("operations field {field:?} is missing from ALL_FIELDS")))?;
+    index
+        .get(position)
+        .map(Vec::as_slice)
+        .ok_or_else(|| IngestError::Validation(format!("operations precedence index has no entry for {field:?}")))
 }
 
 /// Returns the deduplicated union of every registered convention's marker keys —
@@ -150,7 +156,7 @@ pub(crate) fn marker_filter() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::operations::projection::{AttributeView, FieldType, OperationField};
+    use crate::transform::operations::projection::{AttributeView, OperationField};
 
     /// First stub convention: sources `ProviderName` from key "a.provider" and
     /// declares marker "a.marker".
@@ -161,9 +167,9 @@ mod tests {
             &["a.marker", "shared.marker"]
         }
 
-        fn field_keys(&self, field: OperationField) -> &'static [(&'static str, FieldType)] {
+        fn field_keys(&self, field: OperationField) -> &'static [&'static str] {
             match field {
-                OperationField::ProviderName => &[("a.provider", FieldType::Str)],
+                OperationField::ProviderName => &["a.provider"],
                 _ => &[],
             }
         }
@@ -182,9 +188,9 @@ mod tests {
             &["b.marker", "shared.marker"]
         }
 
-        fn field_keys(&self, field: OperationField) -> &'static [(&'static str, FieldType)] {
+        fn field_keys(&self, field: OperationField) -> &'static [&'static str] {
             match field {
-                OperationField::ProviderName => &[("b.provider", FieldType::Str)],
+                OperationField::ProviderName => &["b.provider"],
                 _ => &[],
             }
         }
@@ -198,8 +204,7 @@ mod tests {
     fn flatten_precedence_preserves_registry_order() {
         // StubA precedes StubB, so its key for a shared field comes first.
         let stubs: &[&dyn OperationConvention] = &[&StubA, &StubB];
-        let precedence = flatten_field_keys(stubs, OperationField::ProviderName);
-        let keys: Vec<&str> = precedence.iter().map(|(key, _)| *key).collect();
+        let keys = flatten_field_keys(stubs, OperationField::ProviderName);
         assert_eq!(keys, vec!["a.provider", "b.provider"]);
     }
 
@@ -217,17 +222,21 @@ mod tests {
     fn field_precedence_is_cached_and_stable() {
         // The real CONVENTIONS-backed precedence index is computed once and is
         // referentially stable across calls (OnceLock).
-        let first = field_precedence(OperationField::ProviderName);
-        let second = field_precedence(OperationField::ProviderName);
+        let first = field_precedence(OperationField::ProviderName).expect("precedence available");
+        let second = field_precedence(OperationField::ProviderName).expect("precedence available");
         assert!(std::ptr::eq(first.as_ptr(), second.as_ptr()));
     }
 
     #[test]
     fn field_precedence_covers_every_field() {
-        // Guards ALL_FIELDS against enum drift: every variant resolves without
-        // panicking on the .position() lookup inside field_precedence.
+        // Guards ALL_FIELDS against enum drift: every variant resolves to a
+        // precedence slice instead of erroring on the position lookup inside
+        // field_precedence.
         for field in ALL_FIELDS {
-            let _ = field_precedence(*field);
+            assert!(
+                field_precedence(*field).is_ok(),
+                "{field:?} must resolve to a precedence slice"
+            );
         }
     }
 
@@ -254,9 +263,8 @@ mod tests {
     #[test]
     fn input_tokens_precedence_is_otel_then_oi_then_traceloop() {
         let keys: Vec<&str> = field_precedence(OperationField::InputTokens)
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
+            .expect("precedence available")
+            .to_vec();
         assert_eq!(
             keys,
             vec![
@@ -272,9 +280,8 @@ mod tests {
         // Both OTEL (gen_ai.request.model, llm.model_name) and OpenInference
         // (llm.model_name) source RequestModel; OTEL's keys come first.
         let keys: Vec<&str> = field_precedence(OperationField::RequestModel)
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
+            .expect("precedence available")
+            .to_vec();
         assert_eq!(keys.first(), Some(&"gen_ai.request.model"));
         assert!(keys.contains(&"llm.model_name"));
     }
