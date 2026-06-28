@@ -643,13 +643,15 @@ fn decode_envelopes(
 /// the column-wise union of the files' Iceberg manifest bounds — the quantity a
 /// lossless merge provably preserves.
 ///
-/// Iceberg manifest bounds cover only NON-NULL values, so a file whose optional
-/// sort column is entirely null contributes an absent (`None`) bound. Such an
-/// absent bound is the IDENTITY of the per-column fold (see
-/// [`keep_literal_extreme`]): it never becomes a literal extreme, so a column
-/// resolves to `None` only when EVERY file is null for it. This keeps the union
-/// equal to the non-null value range a lossless merge preserves, rather than
-/// letting one all-null input file pull the extreme to null.
+/// Iceberg manifest bounds are OPTIONAL and lossy: a file omits a column's bound
+/// both when the column is entirely null and when parquet marks the stat
+/// non-exact (common for fixed/binary columns like `trace_id`). An absent bound
+/// thus carries no constraint on the column's literal extreme, so it ANNIHILATES
+/// the per-column fold (see [`keep_literal_extreme`]): a column's union extreme
+/// resolves to `None` whenever ANY file omitted that bound. A `None` union
+/// extreme is skipped by [`first_envelope_conflict`], which is precisely what
+/// keeps the equality invariant from firing when the inputs simply did not record
+/// a usable bound for the value the lossless merge later writes out exactly.
 ///
 /// Returns `None` for an empty input (no files ⇒ no envelope). All files must
 /// share the descriptor's column structure (guaranteed: every range is decoded
@@ -768,20 +770,27 @@ fn keep_literal_extreme(
     candidate: &RowGroupBoundaryComponent,
     extreme: Extreme,
 ) -> icegate_common::error::Result<RowGroupBoundaryComponent> {
-    // An ABSENT bound (`value: None`) means the file held no non-null value for
-    // this column: Iceberg omits an all-null column from the manifest
-    // `lower_bounds`/`upper_bounds` maps. A non-existent value is neither a
-    // literal minimum nor a literal maximum, so an absent bound is the IDENTITY
-    // of the fold — when exactly one side is absent keep the present one, and
-    // when both are absent the extreme stays absent. Comparing it as a null that
-    // sorts first/last would instead let a single all-null input file drag the
-    // whole group's union extreme to null, even though the merged output (which
-    // mixes those null rows with valued rows from sibling files) reports a
-    // concrete non-null bound — a FALSE envelope-invariant violation that blocks
-    // a perfectly lossless compaction.
+    // An ABSENT bound (`value: None`) means the file recorded NO bound for this
+    // column: Iceberg omits a column from the manifest `lower_bounds`/`upper_bounds`
+    // maps both for an all-null column AND when parquet marks the stat non-exact
+    // (which it routinely does for fixed/binary columns such as `trace_id`). An
+    // absent bound therefore carries no information about the column's literal
+    // extreme — the file's true extreme could exceed EVERY present bound. For the
+    // equality-based envelope invariant the union extreme must consequently become
+    // UNCONSTRAINED (absent) whenever ANY contributing file omitted the bound:
+    // absence ANNIHILATES the fold, it is not the identity. Keeping the present
+    // sibling instead understates the union extreme — when one input file omits
+    // its `trace_id` upper bound but holds the group's true maximum, the input
+    // union max collapses to a smaller present bound while the losslessly-merged
+    // output records the true (exact) maximum, tripping a FALSE envelope-invariant
+    // violation that wedges every Fixed(16)-sorted table's compaction. A union
+    // extreme that is absent is simply skipped by `first_envelope_conflict`
+    // (which only flags a column when BOTH sides recorded a bound), so this
+    // relaxes the check exactly where the inputs carry no usable bound; the
+    // row-count invariant still independently guards against a lossy merge.
     match (&current.value, &candidate.value) {
-        (None, _) => return Ok(candidate.clone()),
-        (Some(_), None) => return Ok(current.clone()),
+        (None, _) => return Ok(current.clone()),
+        (Some(_), None) => return Ok(candidate.clone()),
         (Some(_), Some(_)) => {}
     }
 
@@ -942,16 +951,14 @@ mod tests {
     /// sort column is NULL — but Iceberg manifest bounds describe only NON-NULL
     /// values: a data file whose `service_name` is entirely null is omitted from
     /// the bounds map and decodes to a `None`-valued component. Such an absent
-    /// bound carries no literal extreme, so it must act as the IDENTITY of the
-    /// column-wise union: the union of a null-only file and a valued file equals
-    /// the valued file's envelope. The merged output mixes the null rows with
-    /// the valued rows, so Iceberg records the non-null minimum as its lower
-    /// bound; the input-union and output-union `min_key`s must therefore agree.
-    /// Treating the absent bound as a null that sorts first would wrongly make
-    /// the input-union minimum null and trip the rewrite envelope invariant on a
-    /// perfectly correct merge (the production `spans` failure this regresses).
+    /// bound carries no constraint, so it ANNIHILATES the column-wise union:
+    /// `service_name`'s union extreme becomes absent because one input file
+    /// omitted it. An absent union extreme is skipped by `first_envelope_conflict`,
+    /// so the invariant does not fire even though the merged output records a
+    /// concrete non-null `service_name` bound — the perfectly-correct merge that
+    /// the production `spans` failure regressed must pass.
     #[test]
-    fn union_envelope_treats_absent_optional_bound_as_identity() {
+    fn union_envelope_tolerates_absent_optional_bound() {
         // Input file A: service_name entirely NULL (bound absent); ts [10, 50].
         // Input file B: service_name [svc-a, svc-c]; ts [5, 70].
         let inputs = vec![
@@ -967,20 +974,14 @@ mod tests {
         let outputs_union = union_envelope(&outputs).expect("ok").expect("non-empty");
 
         assert_eq!(
-            inputs_union
-                .min_key
-                .compare_checked(&outputs_union.min_key)
-                .expect("compatible"),
-            Ordering::Equal,
-            "an all-null optional sort column must not make the union minimum null"
+            first_envelope_conflict(&inputs_union.min_key, &outputs_union.min_key).expect("compatible"),
+            None,
+            "an all-null optional sort column must not trip the envelope invariant on the min side"
         );
         assert_eq!(
-            inputs_union
-                .max_key
-                .compare_checked(&outputs_union.max_key)
-                .expect("compatible"),
-            Ordering::Equal,
-            "the union maximum must equal the valued file's maximum"
+            first_envelope_conflict(&inputs_union.max_key, &outputs_union.max_key).expect("compatible"),
+            None,
+            "the timestamp column (present on both sides) must still agree, and absent service_name is skipped"
         );
     }
 
@@ -1045,6 +1046,71 @@ mod tests {
             first_envelope_conflict(&a, &a).expect("compatible"),
             None,
             "two identical present bounds do not conflict"
+        );
+    }
+
+    /// Build a one-column `trace_id`-shaped envelope (`Fixed(16)` ASC,
+    /// nulls-first) from its literal `(min, max)` bounds, either of which may be
+    /// ABSENT (`None`) to model a data file whose manifest omitted that bound
+    /// (parquet marked the fixed-binary stat non-exact, so iceberg-rust dropped
+    /// it). Mirrors the manifest-scan decode: ASC ⇒ literal min in `min_key`,
+    /// literal max in `max_key`. `validate` is intentionally not called so an
+    /// absent-upper / present-lower file can be represented.
+    fn trace_id_envelope(min: Option<[u8; 16]>, max: Option<[u8; 16]>) -> RowGroupBoundaryRange {
+        let component = |value: Option<[u8; 16]>| RowGroupBoundaryComponent {
+            value: value.map(|bytes| RowGroupBoundaryValue::FixedBytes(bytes.to_vec())),
+            descending: false,
+            nulls_first: true,
+        };
+        RowGroupBoundaryRange {
+            names: Arc::from(["trace_id".to_string()]),
+            min_key: RowGroupBoundaryKey::new(vec![component(min)]),
+            max_key: RowGroupBoundaryKey::new(vec![component(max)]),
+        }
+    }
+
+    /// The production `spans`/`operations` failure: a rewrite group whose leading
+    /// `trace_id` (`Fixed(16)`) sort key is recorded EXACTLY by one input file
+    /// but OMITTED by another that actually holds the group's true maximum.
+    /// Folding the absent bound as the identity understates the input-union max
+    /// to the smaller present bound, while the losslessly-merged output records
+    /// the true (exact) max — a FALSE envelope-invariant violation that wedges
+    /// every Fixed(16)-sorted table's compaction. Because at least one input file
+    /// omitted the bound, the column's input-union extreme is UNCONSTRAINED, so
+    /// the invariant must NOT fire. Uses the byte values from the live failure.
+    #[test]
+    fn union_envelope_tolerates_input_max_understated_by_omitted_binary_bound() {
+        // input=255,144,... in the production error; the file that recorded it.
+        let recorded_max = [255, 144, 0, 138, 103, 237, 33, 106, 50, 153, 156, 110, 138, 241, 3, 58];
+        // output=255,240,... in the production error; the true max, held by the
+        // input file that OMITTED its trace_id bound and surfaced only after the
+        // lossless merge wrote an exact output bound.
+        let true_max = [255, 240, 168, 237, 155, 158, 11, 211, 225, 18, 82, 40, 58, 13, 212, 90];
+        let group_min = [0u8; 16];
+
+        let inputs = vec![
+            // File A: records an exact (but not group-global) trace_id range.
+            trace_id_envelope(Some(group_min), Some(recorded_max)),
+            // File B: trace_id bound omitted entirely (non-exact ⇒ dropped),
+            // yet its rows carry `true_max`.
+            trace_id_envelope(None, None),
+        ];
+        // The merge fuses both files; the output records an exact bound covering
+        // the true group max.
+        let outputs = vec![trace_id_envelope(Some(group_min), Some(true_max))];
+
+        let inputs_union = union_envelope(&inputs).expect("ok").expect("non-empty");
+        let outputs_union = union_envelope(&outputs).expect("ok").expect("non-empty");
+
+        assert_eq!(
+            first_envelope_conflict(&inputs_union.max_key, &outputs_union.max_key).expect("compatible"),
+            None,
+            "an input max understated by an omitted binary bound must not trip the envelope invariant"
+        );
+        assert_eq!(
+            first_envelope_conflict(&inputs_union.min_key, &outputs_union.min_key).expect("compatible"),
+            None,
+            "the min side must likewise tolerate the omitted bound"
         );
     }
 }

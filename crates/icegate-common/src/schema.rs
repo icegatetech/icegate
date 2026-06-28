@@ -396,6 +396,440 @@ pub fn spans_schema() -> Result<Schema> {
     Ok(schema)
 }
 
+/// Creates the Iceberg schema for the `operations` table.
+///
+/// `operations` is a typed columnar projection icegate maintains over the
+/// LLM/GenAI-flavoured subset of trace `spans` (see TRI-72 design). Every span
+/// carrying at least one LLM/GenAI marker attribute is projected into exactly
+/// one `operations` row (1:1 by `span_id`), with `gen_ai.*` / `OpenInference` /
+/// `Traceloop` semantic-convention attributes normalized into typed columns.
+///
+/// # Field IDs
+/// 58 scalar fields occupy IDs 1–58 in declaration order; the three
+/// `List<String>` columns are declared last so their element IDs are
+/// contiguous: `stop_sequences` (59, element 60), `finish_reasons`
+/// (61, element 62), `encoding_formats` (63, element 64).
+/// `highest_field_id() == 64`.
+///
+/// # Partitioning
+/// - `tenant_id` (identity)
+/// - day(`timestamp`)
+///
+/// # Sorting
+/// - `trace_id` (ascending) - clusters a trace's operations together
+/// - `timestamp` (descending) - recent-first ordering
+#[allow(clippy::too_many_lines)]
+pub fn operations_schema() -> Result<Schema> {
+    // Field IDs are hardcoded so reading top-to-bottom gives the assignment
+    // order. The three `List<String>` columns are placed last so their element
+    // IDs (60, 62, 64) stay contiguous after every scalar (1..=58) is assigned.
+    let schema = Schema::builder()
+        .with_schema_id(5)
+        .with_fields(vec![
+            // ── tenancy ──────────────────────────────────────────────────
+            Arc::new(NestedField::required(
+                1,
+                "tenant_id",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── conversation ─────────────────────────────────────────────
+            // Leading identity column (placed before `trace_id`): groups a
+            // multi-turn conversation's operations across traces. Sourced from
+            // `gen_ai.conversation.id` / session id; NULL when absent.
+            Arc::new(NestedField::optional(
+                2,
+                "conversation_id",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── identity ─────────────────────────────────────────────────
+            // Trace context stored as raw fixed-length bytes — see logs/spans
+            // schema rationale. Hex encode/decode at API boundaries only.
+            // `trace_id` mirrors `spans.trace_id` byte-for-byte and shares its
+            // field ID (3) so operations join to spans on `trace_id`.
+            Arc::new(NestedField::required(
+                3,
+                "trace_id",
+                Type::Primitive(PrimitiveType::Fixed(16)),
+            )),
+            Arc::new(NestedField::required(
+                4,
+                "span_id",
+                Type::Primitive(PrimitiveType::Fixed(8)),
+            )),
+            Arc::new(NestedField::optional(
+                5,
+                "parent_span_id",
+                Type::Primitive(PrimitiveType::Fixed(8)),
+            )),
+            Arc::new(NestedField::optional(
+                6,
+                "service_name",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                7,
+                "scope_name",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                8,
+                "scope_version",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── timing ───────────────────────────────────────────────────
+            Arc::new(NestedField::required(
+                9,
+                "timestamp",
+                Type::Primitive(PrimitiveType::Timestamp),
+            )),
+            Arc::new(NestedField::required(
+                10,
+                "end_timestamp",
+                Type::Primitive(PrimitiveType::Timestamp),
+            )),
+            Arc::new(NestedField::required(
+                11,
+                "duration_micros",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::required(
+                12,
+                "ingested_timestamp",
+                Type::Primitive(PrimitiveType::Timestamp),
+            )),
+            // ── discrimination ───────────────────────────────────────────
+            Arc::new(NestedField::required(
+                13,
+                "operation_name",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── provider / model ─────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                14,
+                "provider_name",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                15,
+                "request_model",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                16,
+                "response_model",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                17,
+                "response_id",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── sampling ─────────────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                18,
+                "temperature",
+                Type::Primitive(PrimitiveType::Double),
+            )),
+            Arc::new(NestedField::optional(
+                19,
+                "top_p",
+                Type::Primitive(PrimitiveType::Double),
+            )),
+            Arc::new(NestedField::optional(20, "top_k", Type::Primitive(PrimitiveType::Long))),
+            Arc::new(NestedField::optional(
+                21,
+                "max_tokens",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                22,
+                "frequency_penalty",
+                Type::Primitive(PrimitiveType::Double),
+            )),
+            Arc::new(NestedField::optional(
+                23,
+                "presence_penalty",
+                Type::Primitive(PrimitiveType::Double),
+            )),
+            Arc::new(NestedField::optional(24, "seed", Type::Primitive(PrimitiveType::Long))),
+            Arc::new(NestedField::optional(
+                25,
+                "stream",
+                Type::Primitive(PrimitiveType::Boolean),
+            )),
+            Arc::new(NestedField::optional(
+                26,
+                "choice_count",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                27,
+                "output_type",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                28,
+                "reasoning_effort",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── response ─────────────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                29,
+                "time_to_first_chunk_ms",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            // ── tokens ───────────────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                30,
+                "input_tokens",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                31,
+                "output_tokens",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                32,
+                "total_tokens",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                33,
+                "reasoning_tokens",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                34,
+                "cache_creation_input_tokens",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                35,
+                "cache_read_input_tokens",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            // ── identity context ─────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                36,
+                "user_id",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── tool ─────────────────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                37,
+                "tool_name",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                38,
+                "tool_call_id",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                39,
+                "tool_type",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                40,
+                "tool_description",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── retrieval ────────────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                41,
+                "data_source_id",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── embeddings ───────────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                42,
+                "embedding_dimensions",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            // ── server / status ──────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                43,
+                "server_address",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                44,
+                "server_port",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                45,
+                "status_code",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                46,
+                "status_message",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                47,
+                "error_type",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── agent / workflow ─────────────────────────────────────────
+            Arc::new(NestedField::optional(
+                48,
+                "agent_id",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                49,
+                "agent_name",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                50,
+                "agent_version",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                51,
+                "agent_description",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                52,
+                "workflow_name",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── content (JSON-encoded String) ────────────────────────────
+            Arc::new(NestedField::optional(
+                53,
+                "input_messages",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                54,
+                "output_messages",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                55,
+                "system_instructions",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                56,
+                "tool_definitions",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                57,
+                "tool_call_arguments",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                58,
+                "tool_call_result",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── List<String> columns, placed last for contiguous element IDs ─
+            // Parent 59 / element 60.
+            Arc::new(NestedField::optional(
+                59,
+                "stop_sequences",
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    60,
+                    Type::Primitive(PrimitiveType::String),
+                    true,
+                )))),
+            )),
+            // Parent 61 / element 62.
+            Arc::new(NestedField::optional(
+                61,
+                "finish_reasons",
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    62,
+                    Type::Primitive(PrimitiveType::String),
+                    true,
+                )))),
+            )),
+            // Parent 63 / element 64.
+            Arc::new(NestedField::optional(
+                63,
+                "encoding_formats",
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    64,
+                    Type::Primitive(PrimitiveType::String),
+                    true,
+                )))),
+            )),
+        ])
+        .build()?;
+
+    Ok(schema)
+}
+
+/// Creates partition specification for the operations table.
+///
+/// Partitions by:
+/// - `tenant_id` (identity transform)
+/// - day(`timestamp`) (day transform)
+///
+/// Identical to `spans_partition_spec`; required by the shared shift planner
+/// spec (`CURRENT_PLANNER_PARTITION_SPEC` hardcodes `tenant_id` + `timestamp`).
+pub fn operations_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
+    let spec = PartitionSpec::builder(schema.clone())
+        .with_spec_id(5)
+        .add_partition_field("tenant_id", "tenant_id", Transform::Identity)?
+        .add_partition_field("timestamp", "timestamp_day", Transform::Day)?
+        .build()?;
+
+    Ok(spec)
+}
+
+/// Creates sort order for the operations table.
+///
+/// Sorts by:
+/// - `trace_id` (ascending) - clusters a trace's operations into adjacent
+///   row groups for `findOperationsByTraceId`
+/// - `timestamp` (descending) - recent-first ordering for time-range scans
+///
+/// Deliberately omits `service_name` (which leads `spans_sort_order`): it adds
+/// no pruning value for the operations read patterns and only costs sort work
+/// (D10).
+pub fn operations_sort_order(schema: &Schema) -> Result<SortOrder> {
+    let trace_id_field = schema.field_by_name("trace_id").ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "field 'trace_id' not found in operations schema",
+        )
+    })?;
+
+    let timestamp_field = schema.field_by_name("timestamp").ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "field 'timestamp' not found in operations schema",
+        )
+    })?;
+
+    let sort_order = SortOrder::builder()
+        .with_order_id(5)
+        .with_sort_field(SortField {
+            source_id: trace_id_field.id,
+            transform: Transform::Identity,
+            direction: SortDirection::Ascending,
+            null_order: iceberg::spec::NullOrder::First,
+        })
+        .with_sort_field(SortField {
+            source_id: timestamp_field.id,
+            transform: Transform::Identity,
+            direction: SortDirection::Descending,
+            null_order: iceberg::spec::NullOrder::First,
+        })
+        .build(schema)?;
+
+    Ok(sort_order)
+}
+
 /// Creates partition specification for spans table.
 ///
 /// Partitions by:
@@ -1113,6 +1547,131 @@ mod tests {
         );
         assert!(schema.field_by_name("resource_attributes").is_some());
         assert!(schema.field_by_name("span_attributes").is_some());
+    }
+
+    #[test]
+    fn test_operations_schema() {
+        let schema = operations_schema().expect("Failed to create operations schema");
+        // 58 scalar fields (1..=58) + 3 List<String> columns whose parent/element
+        // IDs run 59..=64. highest_field_id includes list element IDs.
+        assert_eq!(schema.highest_field_id(), 64);
+        assert_eq!(schema.schema_id(), 5);
+        assert!(schema.field_by_name("tenant_id").is_some());
+        assert!(schema.field_by_name("trace_id").is_some());
+        assert!(schema.field_by_name("span_id").is_some());
+        assert!(schema.field_by_name("operation_name").is_some());
+        assert!(schema.field_by_name("stop_sequences").is_some());
+        assert!(schema.field_by_name("finish_reasons").is_some());
+        assert!(schema.field_by_name("encoding_formats").is_some());
+        assert!(
+            schema.field_by_name("cloud_account_id").is_none(),
+            "cloud_account_id must be gone"
+        );
+        // operations stores typed columns only (D5) — no passthrough attribute map.
+        assert!(
+            schema.field_by_name("attributes").is_none(),
+            "operations has no merged `attributes` map"
+        );
+        assert!(
+            schema.field_by_name("span_attributes").is_none(),
+            "operations has no `span_attributes` map"
+        );
+    }
+
+    #[test]
+    fn test_operations_schema_nested_ids_sequential() {
+        use iceberg::spec::Type;
+
+        let schema = operations_schema().expect("Failed to create operations schema");
+
+        // The three List<String> columns are declared last so their parent and
+        // element IDs are contiguous (the PR #146 element-id lesson):
+        //   stop_sequences   parent=59 element=60
+        //   finish_reasons   parent=61 element=62
+        //   encoding_formats parent=63 element=64
+        let stop_sequences = schema.field_by_name("stop_sequences").expect("stop_sequences field");
+        assert_eq!(stop_sequences.id, 59);
+        let Type::List(stop_list) = &*stop_sequences.field_type else {
+            panic!("stop_sequences must be List");
+        };
+        assert_eq!(stop_list.element_field.id, 60);
+        assert_eq!(
+            *stop_list.element_field.field_type,
+            Type::Primitive(iceberg::spec::PrimitiveType::String)
+        );
+
+        let finish_reasons = schema.field_by_name("finish_reasons").expect("finish_reasons field");
+        assert_eq!(finish_reasons.id, 61);
+        let Type::List(finish_list) = &*finish_reasons.field_type else {
+            panic!("finish_reasons must be List");
+        };
+        assert_eq!(finish_list.element_field.id, 62);
+        assert_eq!(
+            *finish_list.element_field.field_type,
+            Type::Primitive(iceberg::spec::PrimitiveType::String)
+        );
+
+        let encoding_formats = schema.field_by_name("encoding_formats").expect("encoding_formats field");
+        assert_eq!(encoding_formats.id, 63);
+        let Type::List(encoding_list) = &*encoding_formats.field_type else {
+            panic!("encoding_formats must be List");
+        };
+        assert_eq!(encoding_list.element_field.id, 64);
+        assert_eq!(
+            *encoding_list.element_field.field_type,
+            Type::Primitive(iceberg::spec::PrimitiveType::String)
+        );
+
+        // The three list element IDs are strictly contiguous after the scalar
+        // block (58): 60, 62, 64 — no gaps that would collide with a future
+        // column or break catalog round-trips.
+        let mut list_element_ids = vec![
+            stop_list.element_field.id,
+            finish_list.element_field.id,
+            encoding_list.element_field.id,
+        ];
+        list_element_ids.sort_unstable();
+        assert_eq!(list_element_ids, vec![60, 62, 64]);
+
+        // Fixed-width identity columns keep the canonical byte widths.
+        let trace_id = schema.field_by_name("trace_id").expect("trace_id field");
+        assert_eq!(
+            *trace_id.field_type,
+            Type::Primitive(iceberg::spec::PrimitiveType::Fixed(16))
+        );
+        let span_id = schema.field_by_name("span_id").expect("span_id field");
+        assert_eq!(
+            *span_id.field_type,
+            Type::Primitive(iceberg::spec::PrimitiveType::Fixed(8))
+        );
+    }
+
+    #[test]
+    fn test_operations_partition_and_sort_build() {
+        let schema = operations_schema().expect("Failed to create operations schema");
+
+        // Partition spec mirrors spans: `tenant_id` identity + `timestamp` day.
+        let partition = operations_partition_spec(&schema).expect("Failed to build operations partition spec");
+        assert_eq!(partition.spec_id(), 5);
+        assert_eq!(partition.fields().len(), 2);
+
+        // Sort order is `trace_id` ASC -> `timestamp` DESC, with NO `service_name` leg (D10).
+        let sort = operations_sort_order(&schema).expect("Failed to build operations sort order");
+        assert_eq!(sort.order_id, 5);
+        assert_eq!(sort.fields.len(), 2);
+
+        let trace_id_id = schema.field_by_name("trace_id").expect("trace_id field").id;
+        let timestamp_id = schema.field_by_name("timestamp").expect("timestamp field").id;
+        let service_name_id = schema.field_by_name("service_name").expect("service_name field").id;
+
+        assert_eq!(sort.fields[0].source_id, trace_id_id);
+        assert_eq!(sort.fields[0].direction, SortDirection::Ascending);
+        assert_eq!(sort.fields[1].source_id, timestamp_id);
+        assert_eq!(sort.fields[1].direction, SortDirection::Descending);
+        assert!(
+            !sort.fields.iter().any(|f| f.source_id == service_name_id),
+            "operations sort order must omit service_name (D10)"
+        );
     }
 
     #[test]

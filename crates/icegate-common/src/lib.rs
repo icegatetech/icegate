@@ -14,6 +14,8 @@ pub const SPANS_TABLE: &str = "spans";
 pub const EVENTS_TABLE: &str = "events";
 /// Table name for metrics.
 pub const METRICS_TABLE: &str = "metrics";
+/// Table name for LLM operations.
+pub const OPERATIONS_TABLE: &str = "operations";
 
 /// Fully qualified table name for logs (`iceberg.icegate.logs`).
 pub const LOGS_TABLE_FQN: &str = "iceberg.icegate.logs";
@@ -23,6 +25,8 @@ pub const SPANS_TABLE_FQN: &str = "iceberg.icegate.spans";
 pub const EVENTS_TABLE_FQN: &str = "iceberg.icegate.events";
 /// Fully qualified table name for metrics (`iceberg.icegate.metrics`).
 pub const METRICS_TABLE_FQN: &str = "iceberg.icegate.metrics";
+/// Fully qualified table name for operations (`iceberg.icegate.operations`).
+pub const OPERATIONS_TABLE_FQN: &str = "iceberg.icegate.operations";
 
 /// Build the [`iceberg::TableIdent`] for a table name inside the IceGate
 /// namespace ([`ICEGATE_NAMESPACE`]).
@@ -78,6 +82,9 @@ pub const SPANS_TOPIC: &str = "spans";
 
 /// Topic name for metrics in the WAL queue.
 pub const METRICS_TOPIC: &str = "metrics";
+
+/// Topic name for operations in the WAL queue.
+pub const OPERATIONS_TOPIC: &str = "operations";
 
 /// Iceberg snapshot summary key for the last committed WAL queue offset.
 ///
@@ -139,6 +146,18 @@ pub use tracing::{
     traceparent_to_context,
 };
 pub use wal_offset::resolve_wal_offset;
+
+#[cfg(test)]
+mod operations_const_tests {
+    use super::{OPERATIONS_TABLE, OPERATIONS_TABLE_FQN, OPERATIONS_TOPIC};
+
+    #[test]
+    fn operations_consts_have_canonical_values() {
+        assert_eq!(OPERATIONS_TABLE, "operations");
+        assert_eq!(OPERATIONS_TABLE_FQN, "iceberg.icegate.operations");
+        assert_eq!(OPERATIONS_TOPIC, "operations");
+    }
+}
 
 #[cfg(test)]
 mod tests {

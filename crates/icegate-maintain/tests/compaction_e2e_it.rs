@@ -336,6 +336,7 @@ fn compaction_config(conn: &MinioConn) -> CompactionConfig {
         spans_enabled: false,
         events_enabled: false,
         metrics_enabled: false,
+        operations_enabled: false,
         jobsmanager: CompactionJobsManagerConfig {
             // Tight loop so the single iteration runs promptly.
             scan_interval_secs: 1,

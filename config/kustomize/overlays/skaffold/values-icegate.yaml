@@ -69,7 +69,7 @@ query:
     enabled: true
     otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317
     sampleRatio: 1.0
-  rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  rustLog: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,opendal::services::s3::backend=info,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
       cpu: "1"
@@ -109,7 +109,7 @@ ingest:
         useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
-  rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=trace,opendal=debug,reqwest_tracing=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=trace,opendal=debug,opendal::services::s3::backend=info,reqwest_tracing=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
       cpu: "2"
@@ -157,7 +157,7 @@ compact:
         requestTimeoutSecs: 5
   tracing:
     otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317
-  rustLog: "info,icegate_maintain=debug,icegate_jobmanager=debug,icegate_common=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  rustLog: "info,icegate_maintain=debug,icegate_jobmanager=debug,icegate_common=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn,opendal::services::s3::backend=info"
   resources:
     requests:
       cpu: "1"

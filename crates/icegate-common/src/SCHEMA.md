@@ -15,6 +15,7 @@ This document contains Trino SQL DDL statements for creating Iceberg tables to s
   - [2. Spans Table (Traces)](#2-spans-table-traces)
   - [3. Events Table](#3-events-table)
   - [4. Metrics Table](#4-metrics-table)
+  - [5. Operations Table](#5-operations-table)
 - [Post-Creation Tasks](#post-creation-tasks)
 - [Type Mappings](#type-mappings)
 - [Migration Guide](#migration-guide)
@@ -58,6 +59,7 @@ The tables use the following Parquet optimizations:
 - **Logs/Events:** `service_name` + `timestamp DESC` - Groups by service, recent-first
 - **Spans:** `trace_id` + `timestamp DESC` - Groups by trace, recent-first
 - **Metrics:** `metric_name` + `service_name` + `service_instance_id` + `timestamp DESC` - Groups by metric, service, and service instance, recent-first
+- **Operations:** `trace_id` + `timestamp DESC` - Groups a trace's LLM operations together, recent-first (no `service_name` leg; D10)
 
 ---
 
@@ -347,6 +349,137 @@ COMMENT ON TABLE iceberg.triplecloud.metrics IS
 
 ---
 
+### 5. Operations Table
+
+A typed columnar projection icegate maintains over the LLM/GenAI-flavoured subset of `spans`.
+Every span carrying at least one LLM/GenAI marker attribute (the union of the OTEL GenAI,
+OpenInference, and Traceloop conventions) is projected into exactly one `operations` row
+(1:1 by `span_id`), with semantic-convention attributes normalized into typed columns.
+
+Spans whose typed attributes fail strict parsing (non-numeric `temperature`, non-bool
+`stream`, token overflow, etc.) are dropped from `operations` at ingest and counted; the
+underlying span still lands in `spans`. The `operations` write is best-effort and never
+fails the traces OTLP response.
+
+```sql
+-- Create the operations table
+CREATE TABLE iceberg.triplecloud.operations (
+    -- Multi-tenancy field
+    tenant_id VARCHAR NOT NULL,
+
+    -- Identity (mirrored from spans / OTLP scope)
+    trace_id VARBINARY NOT NULL,          -- 16-byte W3C trace ID (FIXED_LEN_BYTE_ARRAY(16))
+    span_id VARBINARY NOT NULL,           -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8))
+    parent_span_id VARBINARY,             -- 8-byte; NULL for root
+    service_name VARCHAR,                  -- Optional; no unknown_service default
+    scope_name VARCHAR,                    -- OTLP scope_spans.scope.name
+    scope_version VARCHAR,                 -- OTLP scope_spans.scope.version
+
+    -- Timing
+    timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,       -- span start; partition + sort source
+    end_timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,
+    duration_micros BIGINT NOT NULL,                      -- (end - start).max(0) micros
+    ingested_timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,
+
+    -- Discrimination
+    operation_name VARCHAR NOT NULL,       -- chat | embeddings | retrieval | execute_tool | ... | other
+
+    -- Provider / model
+    provider_name VARCHAR,
+    request_model VARCHAR,
+    response_model VARCHAR,
+    response_id VARCHAR,
+
+    -- Sampling
+    temperature DOUBLE,
+    top_p DOUBLE,
+    top_k BIGINT,
+    max_tokens BIGINT,
+    frequency_penalty DOUBLE,
+    presence_penalty DOUBLE,
+    seed BIGINT,
+    stream BOOLEAN,
+    choice_count BIGINT,
+    output_type VARCHAR,                   -- text | json | image | speech
+    reasoning_effort VARCHAR,
+
+    -- Response
+    time_to_first_chunk_ms BIGINT,         -- source seconds x1000
+
+    -- Tokens (non-negative or NULL; never zero-as-missing)
+    input_tokens BIGINT,
+    output_tokens BIGINT,
+    total_tokens BIGINT,
+    reasoning_tokens BIGINT,
+    cache_creation_input_tokens BIGINT,
+    cache_read_input_tokens BIGINT,
+
+    -- Identity context
+    conversation_id VARCHAR,
+    user_id VARCHAR,
+
+    -- Tool (operation_name = 'execute_tool')
+    tool_name VARCHAR,
+    tool_call_id VARCHAR,
+    tool_type VARCHAR,
+    tool_description VARCHAR,
+
+    -- Retrieval (operation_name = 'retrieval')
+    data_source_id VARCHAR,
+
+    -- Embeddings (operation_name = 'embeddings')
+    embedding_dimensions INTEGER,
+
+    -- Server / status
+    server_address VARCHAR,
+    server_port INTEGER,
+    status_code INTEGER,                   -- OTLP status enum (0=unset->NULL, 1=ok, 2=error)
+    status_message VARCHAR,
+    error_type VARCHAR,
+
+    -- Agent / workflow
+    agent_id VARCHAR,
+    agent_name VARCHAR,
+    agent_version VARCHAR,
+    agent_description VARCHAR,
+    workflow_name VARCHAR,
+
+    -- Content (opt-in; JSON-encoded String; icegate stores raw, trust redacts at app layer)
+    input_messages VARCHAR,
+    output_messages VARCHAR,
+    system_instructions VARCHAR,
+    tool_definitions VARCHAR,
+    tool_call_arguments VARCHAR,
+    tool_call_result VARCHAR,
+
+    -- List columns (placed last for contiguous Iceberg field IDs)
+    stop_sequences ARRAY(VARCHAR),
+    finish_reasons ARRAY(VARCHAR),
+    encoding_formats ARRAY(VARCHAR)        -- float | base64
+)
+WITH (
+    format = 'PARQUET',
+    partitioning = ARRAY['tenant_id', 'day(timestamp)'],
+    sorted_by = ARRAY['trace_id', 'timestamp DESC'],  -- Cluster a trace's operations, recent-first
+    compression_codec = 'ZSTD',
+    format_version = 2
+);
+
+-- Set Iceberg-specific Parquet properties
+ALTER TABLE iceberg.triplecloud.operations SET PROPERTIES
+    'write.parquet.row-group-size-bytes' = '67108864',      -- 64 MB row groups
+    'write.parquet.page-size-bytes' = '1048576',            -- 1 MB page size
+    'write.parquet.page-row-limit' = '20000',               -- 20k rows per page
+    'write.parquet.dict-size-bytes' = '2097152',            -- 2 MB dictionary
+    'write.parquet.compression-codec' = 'zstd';
+
+-- Create table comment
+COMMENT ON TABLE iceberg.triplecloud.operations IS
+    'Typed columnar projection over the LLM/GenAI subset of spans (1:1 by span_id), normalizing gen_ai.* / OpenInference / Traceloop attributes into typed columns';
+```
+
+---
+
 ## Post-Creation Tasks
 
 After creating the tables, run these commands to optimize query performance:
@@ -357,6 +490,7 @@ ANALYZE iceberg.triplecloud.logs;
 ANALYZE iceberg.triplecloud.spans;
 ANALYZE iceberg.triplecloud.events;
 ANALYZE iceberg.triplecloud.metrics;
+ANALYZE iceberg.triplecloud.operations;
 ```
 
 ### Query Examples
@@ -478,9 +612,13 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 
 ---
 
-**Version:** 1.3
-**Last Updated:** 2026-05-12
-**Schema Source:** `src/common/schema.rs`
+**Version:** 1.4
+**Last Updated:** 2026-06-25
+**Schema Source:** `crates/icegate-common/src/schema.rs`
+
+**Notable Changes in v1.4:**
+- Added the `operations` table (5th physical table): a typed columnar projection over the LLM/GenAI subset of `spans` (1:1 by `span_id`), partitioned `tenant_id` + `day(timestamp)`, sorted `trace_id` + `timestamp DESC` (no `service_name` leg; D10).
+
 **Notable Changes in v1.3:**
 - Removed `cloud_account_id` column from logs, spans, events, and metrics tables.
 - Updated sort orders to drop the leading `cloud_account_id`:

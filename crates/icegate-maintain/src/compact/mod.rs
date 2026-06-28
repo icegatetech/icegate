@@ -46,10 +46,11 @@ use icegate_common::manifest_scan::list_data_files_with_stats;
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::parquet_encoding::{
     EVENTS_BLOOM_COLUMNS, EVENTS_COLUMN_ENCODINGS, LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, METRICS_BLOOM_COLUMNS,
-    METRICS_COLUMN_ENCODINGS, SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
+    METRICS_COLUMN_ENCODINGS, OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS, SPANS_BLOOM_COLUMNS,
+    SPANS_COLUMN_ENCODINGS,
 };
 use icegate_common::parquet_writer::ColumnEncoding;
-use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE, icegate_table_ident};
+use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE, icegate_table_ident};
 use icegate_jobmanager::registry::TaskExecutorFn;
 use icegate_jobmanager::{
     CachedStorage, Error as JobError, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry, JobManager,
@@ -149,6 +150,15 @@ fn enabled_specs(config: &CompactionConfig) -> Result<Vec<CompactJobSpec>> {
             descriptor: SortColumnsDescriptor::metrics()?,
             bloom_filter_columns: METRICS_BLOOM_COLUMNS,
             column_encodings: METRICS_COLUMN_ENCODINGS,
+        });
+    }
+    if config.operations_enabled {
+        specs.push(CompactJobSpec {
+            job_name: "compact_operations",
+            table: OPERATIONS_TABLE,
+            descriptor: SortColumnsDescriptor::operations()?,
+            bloom_filter_columns: OPERATIONS_BLOOM_COLUMNS,
+            column_encodings: OPERATIONS_COLUMN_ENCODINGS,
         });
     }
     Ok(specs)
@@ -412,7 +422,8 @@ impl Compactor {
         let specs = enabled_specs(config)?;
         if specs.is_empty() {
             return Err(MaintainError::Config(
-                "no compaction tables enabled: at least one of logs/spans/events/metrics must be enabled".to_string(),
+                "no compaction tables enabled: at least one of logs/spans/events/metrics/operations must be enabled"
+                    .to_string(),
             ));
         }
 

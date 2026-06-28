@@ -15,6 +15,8 @@ pub struct OtlpHttpState {
     pub write_channel: WriteChannel,
     /// Maximum number of rows per WAL row group.
     pub wal_row_group_size: usize,
+    /// Whether to fork the best-effort `operations` projection from traces.
+    pub operations_enabled: bool,
     /// Metrics recorder for OTLP intake.
     pub metrics: OtlpMetrics,
 }
@@ -27,6 +29,7 @@ pub struct OtlpHttpState {
 pub async fn run(
     write_channel: WriteChannel,
     wal_row_group_size: usize,
+    operations_enabled: bool,
     metrics: OtlpMetrics,
     config: OtlpHttpConfig,
     cancel_token: CancellationToken,
@@ -36,6 +39,7 @@ pub async fn run(
     let state = OtlpHttpState {
         write_channel,
         wal_row_group_size,
+        operations_enabled,
         metrics,
     };
 

@@ -3,6 +3,7 @@
 //! Implements the `OpenTelemetry` Protocol service traits for logs, traces, and
 //! metrics ingestion via gRPC.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use icegate_common::{TENANT_ID_HEADER, is_valid_tenant_id};
@@ -21,6 +22,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
+use crate::error::IngestError;
 use crate::transform;
 use crate::{
     infra::metrics::{OtlpMetrics, OtlpRequestRecorder},
@@ -30,6 +32,7 @@ use crate::{
 const SIGNAL_LOGS: &str = "logs";
 const SIGNAL_TRACES: &str = "traces";
 const SIGNAL_METRICS: &str = "metrics";
+const SIGNAL_OPERATIONS: &str = "operations";
 const PROTOCOL_GRPC: &str = "grpc";
 const ENCODING_PROTOBUF: &str = "protobuf";
 const STATUS_OK: &str = "ok";
@@ -58,16 +61,24 @@ pub struct OtlpGrpcService {
     write_channel: WriteChannel,
     /// Maximum number of rows per WAL row group.
     wal_row_group_size: usize,
+    /// Whether to fork the best-effort `operations` projection from traces.
+    operations_enabled: bool,
     /// Metrics recorder for OTLP intake.
     metrics: OtlpMetrics,
 }
 
 impl OtlpGrpcService {
     /// Create a new OTLP gRPC service.
-    pub const fn new(write_channel: WriteChannel, wal_row_group_size: usize, metrics: OtlpMetrics) -> Self {
+    pub const fn new(
+        write_channel: WriteChannel,
+        wal_row_group_size: usize,
+        operations_enabled: bool,
+        metrics: OtlpMetrics,
+    ) -> Self {
         Self {
             write_channel,
             wal_row_group_size,
+            operations_enabled,
             metrics,
         }
     }
@@ -140,24 +151,70 @@ impl TraceService for OtlpGrpcService {
         request_metrics.record_request_size(request_size);
 
         let tenant_id = extract_tenant_id(&request);
-        let export_request = request.into_inner();
+        // Shared across the two parallel transform tasks; `ExportTraceServiceRequest`
+        // is owned plain data (`Send + Sync`), so the `Arc` clone is cheap and no
+        // deep copy of the request is made.
+        let export_request = Arc::new(request.into_inner());
 
-        // Transform OTLP spans to Arrow RecordBatch (offload to blocking thread).
+        // Transform spans (authoritative) on a blocking-pool thread. When the
+        // operations feature is enabled, fork the best-effort operations
+        // projection onto a second blocking thread so the two independent CPU
+        // passes over the same request run in parallel; when disabled, skip the
+        // operations transform entirely (no second span pass, no per-span
+        // `AttributeView` allocation) and write spans only.
         let span = tracing::Span::current();
-        let transform_start = Instant::now();
-        let (batch_opt, drops) = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| transform::spans_to_record_batch(&export_request, tenant_id.as_deref()))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
-        .map_err(|e| Status::from(GrpcError(e)))?;
-        request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_TRACES, STATUS_OK);
+        let spans_task = tokio::task::spawn_blocking({
+            let export_request = Arc::clone(&export_request);
+            let tenant_id = tenant_id.clone();
+            let span = span.clone();
+            move || {
+                // Time the spans transform inside its own blocking task so the
+                // traces transform-duration metric reflects the spans pass alone.
+                // Recording `elapsed()` after the `join!` below would inflate it
+                // with the parallel operations transform (and join scheduling).
+                let transform_start = Instant::now();
+                let result = span.in_scope(|| transform::spans_to_record_batch(&export_request, tenant_id.as_deref()));
+                (result, transform_start.elapsed())
+            }
+        });
 
-        let payload = crate::wal::write_traces_batch_to_wal(
+        // Disabled operations mirror a zero-LLM-span request (`Ok((None, 0))`), so
+        // the WAL writer's operations leg becomes a no-op.
+        let (spans_join, operations_result) = if self.operations_enabled {
+            let operations_task = tokio::task::spawn_blocking({
+                let export_request = Arc::clone(&export_request);
+                let span = span.clone();
+                move || span.in_scope(|| transform::operations_to_record_batch(&export_request, tenant_id.as_deref()))
+            });
+            let (spans_join, operations_join) = tokio::join!(spans_task, operations_task);
+            // Operations transform is best-effort: a panic degrades to a logged
+            // failure rather than failing the traces request.
+            (
+                spans_join,
+                operations_join.unwrap_or_else(|join_err| Err(IngestError::Join(join_err))),
+            )
+        } else {
+            (spans_task.await, Ok((None, 0)))
+        };
+
+        // Spans transform error (or task panic) fails the whole request.
+        let (spans_result, spans_transform_elapsed) =
+            spans_join.map_err(|e| Status::internal(format!("Spans transform task panicked: {e}")))?;
+        let (batch_opt, drops) = spans_result.map_err(|e| Status::from(GrpcError(e)))?;
+        request_metrics.record_transform_duration(spans_transform_elapsed, SIGNAL_TRACES, STATUS_OK);
+
+        // Spans (authoritative) and operations (best-effort) are written with
+        // overlapping WAL acknowledgements; the operations leg can never fail or
+        // alter the traces response.
+        let operations_metrics =
+            OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_OPERATIONS, ENCODING_PROTOBUF);
+        let payload = crate::wal::write_traces_with_operations_to_wal(
             &self.write_channel,
             &request_metrics,
+            &operations_metrics,
             batch_opt,
             drops,
+            operations_result,
             self.wal_row_group_size,
         )
         .await
@@ -270,7 +327,7 @@ mod tests {
     }
 
     fn test_service(write_channel: icegate_queue::WriteChannel) -> OtlpGrpcService {
-        OtlpGrpcService::new(write_channel, 4, OtlpMetrics::new_disabled())
+        OtlpGrpcService::new(write_channel, 4, true, OtlpMetrics::new_disabled())
     }
 
     #[tokio::test]
@@ -337,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn export_logs_returns_internal_when_wal_prepare_fails_in_blocking_worker() {
         let (tx, mut rx) = channel(1);
-        let service = OtlpGrpcService::new(tx, 0, OtlpMetrics::new_disabled());
+        let service = OtlpGrpcService::new(tx, 0, true, OtlpMetrics::new_disabled());
 
         let status = LogsService::export(&service, Request::new(create_test_request()))
             .await
@@ -402,6 +459,185 @@ mod tests {
             .into_inner();
         writer.await.expect("writer");
         assert!(response.partial_success.is_none());
+    }
+
+    /// Build an OTLP traces request with one LLM/GenAI span (carries
+    /// `gen_ai.operation.name`) and one plain non-LLM span. The forked
+    /// transform must produce 2 spans rows and 1 operations row.
+    fn traces_request_one_llm_one_plain() -> opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest
+    {
+        use opentelemetry_proto::tonic::{
+            collector::trace::v1::ExportTraceServiceRequest,
+            common::v1::{AnyValue, KeyValue, any_value::Value},
+            trace::v1::{ResourceSpans, ScopeSpans, Span},
+        };
+
+        let llm_span = Span {
+            trace_id: vec![1u8; 16],
+            span_id: vec![1u8; 8],
+            parent_span_id: vec![],
+            trace_state: String::new(),
+            name: "chat".to_string(),
+            kind: 0,
+            start_time_unix_nano: 1_000_000,
+            end_time_unix_nano: 2_000_000,
+            attributes: vec![KeyValue {
+                key: "gen_ai.operation.name".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue("chat".to_string())),
+                }),
+            }],
+            dropped_attributes_count: 0,
+            events: vec![],
+            dropped_events_count: 0,
+            links: vec![],
+            dropped_links_count: 0,
+            status: None,
+            flags: 0,
+        };
+
+        let plain_span = Span {
+            trace_id: vec![1u8; 16],
+            span_id: vec![2u8; 8],
+            parent_span_id: vec![1u8; 8],
+            trace_state: String::new(),
+            name: "db.query".to_string(),
+            kind: 0,
+            start_time_unix_nano: 1_000_000,
+            end_time_unix_nano: 2_000_000,
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            events: vec![],
+            dropped_events_count: 0,
+            links: vec![],
+            dropped_links_count: 0,
+            status: None,
+            flags: 0,
+        };
+
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![llm_span, plain_span],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn export_traces_succeeds_when_operations_write_fails() {
+        // Spans (authoritative, first write) ack success; the operations write
+        // (second write on the same fanned-out channel) hits a closed receiver.
+        // The traces response must still be OK (best-effort operations, D8).
+        use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
+
+        let (tx, mut rx) = channel(2);
+        let writer = tokio::spawn(async move {
+            let spans_req = rx.recv().await.expect("spans write request");
+            assert_eq!(spans_req.topic, icegate_common::SPANS_TOPIC);
+            let total = spans_req.row_groups.iter().map(|rg| rg.batch.num_rows()).sum::<usize>();
+            spans_req
+                .response_tx
+                .send(WriteResult::success(1, total, None))
+                .expect("spans ack");
+            let ops_req = rx.recv().await.expect("operations write request");
+            assert_eq!(ops_req.topic, icegate_common::OPERATIONS_TOPIC);
+            drop(ops_req);
+        });
+
+        let service = test_service(tx);
+        let response = TraceService::export(&service, Request::new(traces_request_one_llm_one_plain()))
+            .await
+            .expect("traces response must be OK even when operations write fails")
+            .into_inner();
+        writer.await.expect("writer task");
+
+        assert!(response.partial_success.is_none());
+    }
+
+    #[tokio::test]
+    async fn export_traces_writes_two_spans_and_one_operation() {
+        // One request with 1 LLM span + 1 plain span must fan out to 2 spans
+        // rows on SPANS_TOPIC and exactly 1 operations row on OPERATIONS_TOPIC.
+        use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
+
+        let (tx, mut rx) = channel(2);
+        let writer = tokio::spawn(async move {
+            let mut spans_rows: Option<usize> = None;
+            let mut operations_rows: Option<usize> = None;
+
+            for _ in 0..2 {
+                let req = rx.recv().await.expect("write request");
+                let rows = req.row_groups.iter().map(|rg| rg.batch.num_rows()).sum::<usize>();
+                if req.topic == icegate_common::SPANS_TOPIC {
+                    spans_rows = Some(rows);
+                } else if req.topic == icegate_common::OPERATIONS_TOPIC {
+                    operations_rows = Some(rows);
+                } else {
+                    panic!("unexpected topic: {}", req.topic);
+                }
+                req.response_tx.send(WriteResult::success(1, rows, None)).expect("ack");
+            }
+
+            (spans_rows, operations_rows)
+        });
+
+        let service = test_service(tx);
+        let response = TraceService::export(&service, Request::new(traces_request_one_llm_one_plain()))
+            .await
+            .expect("grpc ok")
+            .into_inner();
+        let (spans_rows, operations_rows) = writer.await.expect("writer task");
+
+        assert!(response.partial_success.is_none());
+        assert_eq!(spans_rows, Some(2), "both spans must land on the spans topic");
+        assert_eq!(
+            operations_rows,
+            Some(1),
+            "only the LLM span is projected into operations"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_traces_skips_operations_when_disabled() {
+        // With operations disabled, a request with 1 LLM + 1 plain span must still
+        // write both spans to SPANS_TOPIC and submit NO operations write at all.
+        use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
+
+        let (tx, mut rx) = channel(2);
+        let writer = tokio::spawn(async move {
+            let req = rx.recv().await.expect("spans write request");
+            assert_eq!(req.topic, icegate_common::SPANS_TOPIC);
+            let rows = req.row_groups.iter().map(|rg| rg.batch.num_rows()).sum::<usize>();
+            req.response_tx.send(WriteResult::success(1, rows, None)).expect("ack");
+            // The operations leg must not enqueue a second write when disabled.
+            assert!(
+                rx.recv().await.is_none(),
+                "no operations write may be submitted when operations are disabled"
+            );
+            rows
+        });
+
+        let service = OtlpGrpcService::new(tx, 4, false, OtlpMetrics::new_disabled());
+        let response = TraceService::export(&service, Request::new(traces_request_one_llm_one_plain()))
+            .await
+            .expect("grpc ok")
+            .into_inner();
+        // Drop the service so its WriteChannel sender closes and the writer's second
+        // recv resolves to None.
+        drop(service);
+        let spans_rows = writer.await.expect("writer task");
+
+        assert!(response.partial_success.is_none());
+        assert_eq!(spans_rows, 2, "both spans are written even with operations disabled");
     }
 
     #[tokio::test]

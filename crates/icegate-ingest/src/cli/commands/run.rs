@@ -10,12 +10,13 @@ use std::{
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use icegate_common::{
-    IoHandle, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, MetricsRuntime, SPANS_TABLE, SPANS_TOPIC,
+    IoHandle, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, MetricsRuntime, OPERATIONS_TABLE, OPERATIONS_TOPIC,
+    SPANS_TABLE, SPANS_TOPIC,
     catalog::CatalogBuilder,
     create_object_store,
     parquet_encoding::{
         LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, METRICS_BLOOM_COLUMNS, METRICS_COLUMN_ENCODINGS,
-        SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
+        OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS, SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
     },
     run_metrics_server,
 };
@@ -406,11 +407,13 @@ async fn run_services(
     let wal_bloom_filter_columns = std::collections::HashMap::from([
         (LOGS_TOPIC.to_string(), LOGS_BLOOM_COLUMNS),
         (SPANS_TOPIC.to_string(), SPANS_BLOOM_COLUMNS),
+        (OPERATIONS_TOPIC.to_string(), OPERATIONS_BLOOM_COLUMNS),
     ]);
     let wal_column_encodings = std::collections::HashMap::from([
         (LOGS_TOPIC.to_string(), LOGS_COLUMN_ENCODINGS),
         (SPANS_TOPIC.to_string(), SPANS_COLUMN_ENCODINGS),
         (METRICS_TOPIC.to_string(), METRICS_COLUMN_ENCODINGS),
+        (OPERATIONS_TOPIC.to_string(), OPERATIONS_COLUMN_ENCODINGS),
     ]);
     let writer = QueueWriter::new(queue_config.clone(), queue_writer_store)
         .with_events(Arc::new(wal_writer_metrics))
@@ -485,6 +488,15 @@ async fn run_services(
             bloom_filter_columns: METRICS_BLOOM_COLUMNS,
             column_encodings: METRICS_COLUMN_ENCODINGS,
         },
+        ShiftJobSpec {
+            job_name: "shift_operations",
+            topic: OPERATIONS_TOPIC,
+            table: OPERATIONS_TABLE,
+            descriptor: SortColumnsDescriptor::operations()?,
+            planner_partition_spec: &crate::shift::CURRENT_PLANNER_PARTITION_SPEC,
+            bloom_filter_columns: OPERATIONS_BLOOM_COLUMNS,
+            column_encodings: OPERATIONS_COLUMN_ENCODINGS,
+        },
     ];
 
     let shifter = Shifter::new(
@@ -529,11 +541,20 @@ async fn run_services(
     if config.otlp_http.enabled {
         let write_channel = write_tx.clone();
         let wal_row_group_size = queue_config.common.max_row_group_size;
+        let operations_enabled = config.operations.enabled;
         let http_config = config.otlp_http.clone();
         let token = cancel_token.clone();
         let metrics = otlp_metrics.clone();
         let handle = tokio::spawn(async move {
-            crate::otlp_http::run(write_channel, wal_row_group_size, metrics, http_config, token).await
+            crate::otlp_http::run(
+                write_channel,
+                wal_row_group_size,
+                operations_enabled,
+                metrics,
+                http_config,
+                token,
+            )
+            .await
         });
         handles.push(handle);
     }
@@ -542,11 +563,20 @@ async fn run_services(
     if config.otlp_grpc.enabled {
         let write_channel = write_tx.clone();
         let wal_row_group_size = queue_config.common.max_row_group_size;
+        let operations_enabled = config.operations.enabled;
         let grpc_config = config.otlp_grpc.clone();
         let token = cancel_token.clone();
         let metrics = otlp_metrics.clone();
         let handle = tokio::spawn(async move {
-            crate::otlp_grpc::run(write_channel, wal_row_group_size, metrics, grpc_config, token).await
+            crate::otlp_grpc::run(
+                write_channel,
+                wal_row_group_size,
+                operations_enabled,
+                metrics,
+                grpc_config,
+                token,
+            )
+            .await
         });
         handles.push(handle);
     }

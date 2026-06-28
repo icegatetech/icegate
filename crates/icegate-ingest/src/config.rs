@@ -36,12 +36,44 @@ pub struct IngestConfig {
     pub otlp_http: OtlpHttpConfig,
     /// OTLP gRPC server
     pub otlp_grpc: OtlpGrpcConfig,
+    /// Operations (LLM observability) materialization
+    #[serde(default)]
+    pub operations: OperationsConfig,
     /// Metrics configuration
     #[serde(default)]
     pub metrics: MetricsConfig,
     /// Tracing configuration
     #[serde(default)]
     pub tracing: TracingConfig,
+}
+
+/// Operations (LLM observability) materialization configuration.
+///
+/// `operations` is a best-effort typed projection of LLM/GenAI trace spans
+/// (TRI-72), forked from the traces ingest path. Disabling it skips the
+/// per-request operations transform on the traces hot path entirely — no second
+/// pass over the spans and no per-span `AttributeView` allocation — so
+/// deployments that do not query LLM observability pay none of its cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationsConfig {
+    /// Whether to materialize the `operations` table from trace spans. Defaults
+    /// to `true`, preserving the always-on behaviour when the section is absent.
+    #[serde(default = "default_operations_enabled")]
+    pub enabled: bool,
+}
+
+/// Default for [`OperationsConfig::enabled`]: operations materialization is on
+/// unless a deployment opts out.
+const fn default_operations_enabled() -> bool {
+    true
+}
+
+impl Default for OperationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_operations_enabled(),
+        }
+    }
 }
 
 impl IngestConfig {
