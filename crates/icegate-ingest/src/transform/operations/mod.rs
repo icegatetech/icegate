@@ -113,6 +113,11 @@ pub fn operations_to_record_batch(
     let mut non_llm_skipped: usize = 0;
 
     let empty_attrs: Vec<opentelemetry_proto::tonic::common::v1::KeyValue> = Vec::new();
+    // TODO(low): this is a second full walk of every span, independent of the
+    // `spans_to_record_batch` pass. Fusing both into one iteration would drop the
+    // duplicate walk, but re-serialize the two CPU passes the ingest handlers now
+    // run on separate blocking threads (see `write_traces_with_operations_to_wal`).
+    // Revisit if this walk becomes a measurable ingest hot-path cost.
     for resource_spans in &request.resource_spans {
         let resource_attrs = resource_spans.resource.as_ref().map_or(&empty_attrs, |r| &r.attributes);
         let service_name = resource_attrs

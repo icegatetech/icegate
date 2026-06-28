@@ -136,10 +136,9 @@ static FIELD_PRECEDENCE: OnceLock<PrecedenceIndex> = OnceLock::new();
 pub(crate) fn field_precedence(field: OperationField) -> Result<&'static [&'static str]> {
     let index = FIELD_PRECEDENCE
         .get_or_init(|| ALL_FIELDS.iter().map(|field| flatten_field_keys(CONVENTIONS, *field)).collect());
-    let position = ALL_FIELDS
-        .iter()
-        .position(|candidate| *candidate == field)
-        .ok_or_else(|| IngestError::Validation(format!("operations field {field:?} is missing from ALL_FIELDS")))?;
+    let position = ALL_FIELDS.iter().position(|candidate| *candidate == field).ok_or_else(|| {
+        IngestError::Validation(format!("operations field {field:?} is missing from supported fields"))
+    })?;
     index
         .get(position)
         .map(Vec::as_slice)
