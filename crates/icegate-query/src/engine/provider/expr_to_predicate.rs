@@ -281,6 +281,13 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::Float64(Some(v)) => Some(Datum::double(*v)),
         ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => Some(Datum::string(v.clone())),
         ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
+        // Fixed-width binary columns (e.g. `trace_id` Fixed(16), `span_id`
+        // Fixed(8)). Map to a Fixed-typed `Datum`, NOT `Datum::binary`: the
+        // column's stored min/max bounds are `Fixed(N)`, and Iceberg's `Datum`
+        // ordering only compares Fixed-vs-Fixed. A `Binary` literal would be
+        // incomparable against those bounds, silently disabling metrics
+        // pruning and forcing a full scan.
+        ScalarValue::FixedSizeBinary(_, Some(v)) => Some(Datum::fixed(v.iter().copied())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         #[allow(clippy::cast_possible_truncation)]
         ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
@@ -541,6 +548,33 @@ mod tests {
             .equal_to(Datum::long(1))
             .and(Reference::new("bar").equal_to(Datum::binary(vec![1u8, 2u8])));
         assert_eq!(predicate, expected_predicate);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_fixed_size_binary() {
+        use datafusion::prelude::{col, lit};
+        use datafusion::scalar::ScalarValue;
+
+        // `trace_id`/`span_id` are Iceberg Fixed(N) columns; the Tempo
+        // trace-by-id path builds the literal as ScalarValue::FixedSizeBinary.
+        // It must push down as a Fixed-typed Datum so it stays comparable
+        // against the column's Fixed bounds during metrics pruning.
+        let id = vec![0xEEu8; 16];
+        let expr = col("trace_id").eq(lit(ScalarValue::FixedSizeBinary(16, Some(id.clone()))));
+        let predicate = convert_filters_to_predicate(std::slice::from_ref(&expr)).unwrap();
+        assert_eq!(predicate, Reference::new("trace_id").equal_to(Datum::fixed(id)));
+    }
+
+    #[test]
+    fn test_scalar_value_to_datum_fixed_size_binary() {
+        use datafusion::common::ScalarValue;
+
+        let bytes = vec![1u8, 2u8, 3u8, 4u8];
+        let datum = super::scalar_value_to_datum(&ScalarValue::FixedSizeBinary(4, Some(bytes.clone())));
+        assert_eq!(datum, Some(Datum::fixed(bytes)));
+
+        let datum = super::scalar_value_to_datum(&ScalarValue::FixedSizeBinary(4, None));
+        assert_eq!(datum, None);
     }
 
     #[test]

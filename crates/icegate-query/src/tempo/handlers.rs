@@ -148,6 +148,7 @@ pub async fn get_trace(
     let (default_start, default_end) = default_window(now);
     let start = params.start.map(parse_epoch_seconds).transpose()?.unwrap_or(default_start);
     let end = params.end.map(parse_epoch_seconds).transpose()?.unwrap_or(default_end);
+    validation::validate_trace_id(&trace_id).map_err(TempoError::new)?;
     validation::validate_query_window(start, end).map_err(TempoError::new)?;
 
     let result = fetch(state.engine, &tenant_id, &trace_id, start, end).await?;
