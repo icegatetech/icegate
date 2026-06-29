@@ -2,14 +2,13 @@
 //!
 //! Drives `run_sweep` directly (deterministic, fast) for five targeted tests,
 //! and one end-to-end test that drives the full [`GcRunner`] background loop.
-//! All tests are `#[ignore]`d; run with Docker available:
+//! Each test starts its own `MinIO` container via testcontainers and threads the
+//! container credentials through the storage config, so the suite is
+//! self-contained and needs only a running Docker daemon:
 //!
 //! ```text
-//! cargo test -p icegate-maintain --test gc_sweep_it -- --ignored --nocapture
+//! cargo test -p icegate-maintain --test gc_sweep_it
 //! ```
-//!
-//! If `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are unset, the sweep's object
-//! store can't authenticate and tests panic with an `InvalidAccessKeyId` list error.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
 
@@ -287,19 +286,17 @@ fn append_rows(batch: &RecordBatch, rows: &mut Vec<LogRow>) {
 /// Build the `StorageConfig` that `run_sweep` uses to construct a raw object
 /// store.
 ///
-/// The caller must have `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` set in
-/// the environment before invoking `run_sweep`; `MinIO` always uses
-/// `minioadmin`/`minioadmin`, so run these tests as:
-/// ```text
-/// AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-///   cargo test -p icegate-maintain --test gc_sweep_it -- --ignored
-/// ```
+/// The container credentials are threaded straight into the config, so the sweep
+/// authenticates against this test's `MinIO` without relying on ambient `AWS_*`
+/// environment variables.
 fn gc_storage_config(conn: &MinioConn) -> StorageConfig {
     StorageConfig {
         backend: StorageBackend::S3(S3Config {
             bucket: BUCKET_NAME.to_string(),
             region: "us-east-1".to_string(),
             endpoint: Some(conn.endpoint.clone()),
+            access_key_id: Some(conn.access_key.clone()),
+            secret_access_key: Some(conn.secret_key.clone()),
         }),
     }
 }
@@ -378,7 +375,6 @@ async fn put_leaked_metadata(conn: &MinioConn, catalog: &S3Catalog, ident: &Tabl
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn gc_reclaims_unreferenced_files_and_keeps_live_ones() {
     let (_minio, conn) = setup_minio().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
@@ -429,7 +425,6 @@ async fn gc_reclaims_unreferenced_files_and_keeps_live_ones() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn gc_preserves_everything_inside_the_grace_period() {
     let (_minio, conn) = setup_minio().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
@@ -468,7 +463,6 @@ async fn gc_preserves_everything_inside_the_grace_period() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn gc_dry_run_finds_orphans_but_deletes_nothing() {
     let (_minio, conn) = setup_minio().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
@@ -507,7 +501,6 @@ async fn gc_dry_run_finds_orphans_but_deletes_nothing() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn gc_leaves_metadata_when_metadata_sweeping_is_disabled() {
     let (_minio, conn) = setup_minio().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
@@ -553,7 +546,6 @@ async fn gc_leaves_metadata_when_metadata_sweeping_is_disabled() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn gc_fails_closed_and_deletes_nothing_when_a_manifest_is_unreadable() {
     let (_minio, conn) = setup_minio().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
@@ -611,7 +603,6 @@ async fn gc_fails_closed_and_deletes_nothing_when_a_manifest_is_unreadable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn gc_runner_reclaims_in_the_background() {
     use icegate_maintain::compact::config::{CompactionJobsManagerConfig, JobStateCodec, JobsStorageConfig};
     use icegate_maintain::gc::GcRunner;

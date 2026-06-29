@@ -29,7 +29,7 @@ pub enum StorageBackend {
 }
 
 /// S3 storage configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3Config {
     /// S3 bucket name
     pub bucket: String,
@@ -38,6 +38,33 @@ pub struct S3Config {
     /// Optional custom endpoint (for S3-compatible storage)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Optional explicit access key id. When set together with
+    /// [`Self::secret_access_key`] it takes precedence over the ambient `AWS_*`
+    /// environment / IAM credential chain. Leave unset for IAM role or
+    /// instance-profile auth (the production default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// Optional explicit secret access key, paired with [`Self::access_key_id`].
+    /// Redacted in [`Debug`] output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+}
+
+// Manual `Debug` so an accidental log of a `StorageConfig` can never leak the
+// secret access key; the rest of the fields are non-sensitive.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl StorageConfig {
