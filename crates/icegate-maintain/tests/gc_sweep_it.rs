@@ -637,6 +637,7 @@ async fn gc_runner_reclaims_in_the_background() {
         metrics_enabled: false,
         operations_enabled: false,
         orphans: GcOrphansConfig {
+            enabled: true,
             min_age_secs: 0,
             ..GcOrphansConfig::default()
         },
@@ -679,5 +680,14 @@ async fn gc_runner_reclaims_in_the_background() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+
+    // Count dropping by one proves *an* object went away, not that the orphan
+    // (and not the committed file) was the one deleted. Reload and read back to
+    // confirm the live data survived.
+    let live_table = catalog.load_table(&ident).await.unwrap();
+    let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
+    let rows = read_all_rows(&live_table, descriptor).await;
+    assert!(!rows.is_empty(), "committed rows must remain after background gc");
+
     handle.shutdown().await.expect("shutdown runner");
 }

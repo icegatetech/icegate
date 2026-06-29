@@ -70,7 +70,13 @@ pub fn classify<S: std::hash::BuildHasher>(
     if referenced.contains(key) {
         return Decision::Referenced;
     }
-    let rel = key.strip_prefix(table_prefix).map(|r| r.trim_start_matches('/'));
+    // Require a `/` boundary after the prefix so a sibling key that merely
+    // shares the prefix string (e.g. `icegate/logsdata/...` vs table root
+    // `icegate/logs`) is not mistaken for a table-local object.
+    let rel = key
+        .strip_prefix(table_prefix)
+        .and_then(|r| r.strip_prefix('/'))
+        .map(|r| r.trim_start_matches('/'));
     let class = match rel {
         Some(r) if r.starts_with("data/") => ObjectClass::Data,
         Some(r) if r.starts_with("metadata/") => ObjectClass::Metadata,
@@ -187,6 +193,24 @@ mod tests {
             false,
         );
         assert_eq!(decision, Decision::SkipMetadataDisabled);
+    }
+
+    #[test]
+    fn sibling_prefix_without_boundary_is_unknown_layout() {
+        // `icegate/logsdata/...` shares the table prefix `icegate/logs` as a raw
+        // string but not as a path segment, so it must never be table-local.
+        let set = referenced(&[]);
+        let modified = Utc.timestamp_opt(1_000, 0).unwrap();
+        let cutoff = Utc.timestamp_opt(2_000, 0).unwrap();
+        let decision = classify(
+            "icegate/logsdata/x.parquet",
+            "icegate/logs",
+            &set,
+            modified,
+            cutoff,
+            true,
+        );
+        assert_eq!(decision, Decision::SkipUnknownLayout);
     }
 
     #[test]

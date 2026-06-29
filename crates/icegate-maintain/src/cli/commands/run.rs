@@ -65,10 +65,28 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // Start orphan-file GC alongside compaction when enabled. The runner is
     // dropped after `start()`; the returned handle owns the workers.
     let gc_handle = if config.gc.enabled {
-        let runner = GcRunner::new(Arc::clone(&catalog), &config.storage, &config.gc).await?;
-        let handle = runner.start()?;
-        tracing::info!("orphan-file gc service started");
-        Some(handle)
+        match GcRunner::new(Arc::clone(&catalog), &config.storage, &config.gc)
+            .await
+            .and_then(|runner| runner.start())
+        {
+            Ok(handle) => {
+                tracing::info!("orphan-file gc service started");
+                Some(handle)
+            }
+            // The compactor is already running; a GC startup failure must still
+            // drain it and stop the metrics server before propagating the error.
+            Err(error) => {
+                cancel_token.cancel();
+                if let Err(drain_error) = compactor_handle.shutdown().await {
+                    tracing::error!("compactor drain error after gc startup failure: {drain_error}");
+                }
+                metrics_cancel.cancel();
+                if let Some(server) = metrics_server {
+                    let _ = server.await;
+                }
+                return Err(error);
+            }
+        }
     } else {
         None
     };
@@ -98,8 +116,13 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
             tracing::error!("gc drain error (suppressed by compactor drain failure): {error}");
         }
     }
-    compactor_drain?;
-    gc_drain?;
+    // Defer surfacing a worker-drain failure until the metrics server has been
+    // stopped below, so a drain error never leaks the metrics task. A compactor
+    // failure takes precedence; the GC failure was already logged above.
+    let drain_result = match compactor_drain {
+        Err(error) => Err(error),
+        Ok(()) => gc_drain,
+    };
 
     // Stop the metrics server and wait for it to unbind before the runtime (and
     // its meter provider) drop at end of scope.
@@ -113,8 +136,10 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     }
     drop(metrics_runtime);
 
-    // Report a metrics startup failure only after the compaction workers have
-    // drained and the runtime has been dropped, so shutdown still runs in order.
+    // Surface a worker-drain failure first, then any deferred metrics startup
+    // error — both only after the metrics server has unbound and the runtime has
+    // been dropped, so shutdown still runs in order on either error path.
+    drain_result?;
     if let Some(err) = metrics_startup_error {
         return Err(err);
     }

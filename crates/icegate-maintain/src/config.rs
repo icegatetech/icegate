@@ -99,6 +99,8 @@ storage:
     endpoint: http://minio:9000
 ";
         let config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse migrate-style config");
-        config.validate().expect("migrate-style config (no gc/compaction) must validate");
+        config
+            .validate()
+            .expect("migrate-style config (no gc/compaction) must validate");
     }
 }

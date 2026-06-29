@@ -60,6 +60,14 @@ impl GcOrphansConfig {
                 "gc.orphans.sweep_timeout_secs must be greater than zero".to_string(),
             ));
         }
+        // The sweep converts `min_age_secs` to `i64` to build a grace duration;
+        // reject values that cannot convert so loading fails fast instead of
+        // every sweep failing at runtime.
+        if i64::try_from(self.min_age_secs).is_err() {
+            return Err(MaintainError::Config(
+                "gc.orphans.min_age_secs is too large".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -185,6 +193,15 @@ mod tests {
     fn validate_rejects_empty_jobs_storage() {
         // Default storage has an empty endpoint/bucket.
         assert!(GcConfig::default().validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_min_age_that_overflows_i64() {
+        // The sweep builds a `chrono` duration from `min_age_secs as i64`, so a
+        // value above `i64::MAX` must be rejected at load.
+        let mut config = valid_config();
+        config.orphans.min_age_secs = u64::MAX;
+        assert!(config.validate().is_err());
     }
 
     #[test]

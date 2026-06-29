@@ -88,10 +88,17 @@ pub async fn run_sweep(
     // larger structure, is the live set.
     let mut orphans: Vec<(ObjectPath, u64, ObjectClass)> = Vec::new();
 
-    while let Some(item) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Err(MaintainError::Storage(format!("gc sweep of table '{table}' cancelled")));
-        }
+    loop {
+        // Race the list page against cancellation so a slow or stuck storage
+        // call cannot keep shutdown blocked until the future resolves.
+        let item = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(MaintainError::Storage(format!("gc sweep of table '{table}' cancelled")));
+            }
+            item = stream.next() => item,
+        };
+        let Some(item) = item else { break };
         let meta = item.map_err(|e| MaintainError::Storage(format!("gc list error for table '{table}': {e}")))?;
         summary.scanned += 1;
         // LIST keys are already bucket-relative canonical keys (unlike the full
@@ -114,7 +121,11 @@ pub async fn run_sweep(
                     ObjectClass::Metadata => summary.found_metadata += 1,
                 }
                 metrics.record_orphan_found(table, class);
-                orphans.push((meta.location, meta.size, class));
+                // A dry run returns before deletion, so retaining the path would
+                // only grow memory across a large backlog scan without use.
+                if !cfg.dry_run {
+                    orphans.push((meta.location, meta.size, class));
+                }
             }
         }
     }
@@ -135,7 +146,17 @@ pub async fn run_sweep(
     }))
     .buffer_unordered(cfg.delete_concurrency.max(1));
 
-    while let Some(result) = deletions.next().await {
+    loop {
+        // Keep the delete drain cancellation-aware too, so shutdown short-circuits
+        // promptly instead of waiting on the next in-flight deletion.
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(MaintainError::Storage(format!("gc sweep of table '{table}' cancelled")));
+            }
+            result = deletions.next() => result,
+        };
+        let Some(result) = result else { break };
         match result {
             Ok((size, class)) => {
                 summary.deleted += 1;
