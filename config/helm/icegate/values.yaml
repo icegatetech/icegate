@@ -411,15 +411,17 @@ migrate:
     #  - http://rustfs-svc:9000/health/ready
 
 ## ---------------------------------------------------------------------------
-## Compaction component (long-running `maintain run` service)
+## Maintain component (long-running `maintain run` service)
 ## ---------------------------------------------------------------------------
-## Rewrites small Parquet data files in the Iceberg tables into fewer, larger
-## files. Runs as a Deployment that loops on `compaction.jobsmanager.scanIntervalSecs`.
+## Background maintenance for the Iceberg tables: Parquet compaction (rewrites
+## small data files into fewer, larger ones) and orphan-file GC (reclaims
+## unreferenced S3 objects). Runs as a Deployment; each sub-feature loops on its
+## own `jobsmanager.scanIntervalSecs`.
 ##
 ## Disabled by default: the `maintain run` binary always initialises tracing and
-## refuses to start without an OTLP endpoint, so enabling compaction REQUIRES
-## setting `compact.tracing.otlpEndpoint` (a Helm `required` guard enforces it).
-compact:
+## refuses to start without an OTLP endpoint, so enabling it REQUIRES setting
+## `maintain.tracing.otlpEndpoint` (a Helm `required` guard enforces it).
+maintain:
   enabled: false
   ## Replicas may be scaled out. The jobmanager distributes rewrite tasks across
   ## all workers in any pod via shared S3 job-state with compare-and-swap, and
@@ -482,6 +484,60 @@ compact:
         endpoint: ""
         bucket: jobs
         prefix: compactor
+        region: ""  # defaults to aws.region
+        useSsl: false
+        jobStateCodec: json
+        requestTimeoutSecs: 5
+
+  ## Orphan-file garbage collection (maps to the binary's GcConfig). Reclaims
+  ## physical S3 objects — compaction leftovers and leaked files — that table
+  ## metadata no longer references and that are older than the grace period. It
+  ## runs as its own per-table background loop alongside compaction, with its own
+  ## worker pool and a distinct "gc" job-state prefix so it never contends with
+  ## compaction's state.
+  gc:
+    ## Master switch. Off by default so an upgrade never silently begins
+    ## deleting; an operator opts in explicitly.
+    enabled: false
+    ## Per-table GC toggles.
+    tables:
+      logs: true
+      spans: true
+      events: true
+      metrics: true
+      operations: true
+    ## Orphan-sweep tuning (maps to GcOrphansConfig).
+    orphans:
+      ## Whether the sweep runs; when false the per-table task is a no-op cycle.
+      enabled: true
+      ## Compute and meter orphans but delete nothing (escape hatch).
+      dryRun: false
+      ## Grace period: an object is deletable only if its last_modified is older
+      ## than this. Protects freshly written files and in-flight compaction
+      ## outputs not yet referenced by a manifest (default: 7 days).
+      minAgeSecs: 604800
+      ## Also sweep orphaned Iceberg metadata (manifests, snap-*.avro, superseded
+      ## *.metadata.json); when false, only data/ files are swept.
+      includeMetadata: true
+      ## Max concurrent best-effort object deletions.
+      deleteConcurrency: 16
+      ## Per-table sweep task deadline, in seconds.
+      sweepTimeoutSecs: 3600
+    ## Jobs-manager settings. Reuses compaction's shape but with its own worker
+    ## pool and a distinct "gc" job-state prefix. Credentials come from the pod's
+    ## AWS env vars, not configured here.
+    jobsmanager:
+      ## Period of the per-table GC discovery loop, in seconds (default: daily).
+      scanIntervalSecs: 86400
+      ## Number of concurrent GC workers (GC is I/O-bound and runs infrequently).
+      workerCount: 2
+      ## Jobmanager worker poll interval, in milliseconds.
+      pollIntervalMs: 1000
+      storage:
+        ## Defaults to storage.s3.endpoint when empty.
+        endpoint: ""
+        bucket: jobs
+        prefix: gc
         region: ""  # defaults to aws.region
         useSsl: false
         jobStateCodec: json

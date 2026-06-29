@@ -1,0 +1,22 @@
+{{- if and .Values.maintain.enabled .Values.maintain.metrics.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "maintain") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "maintain") | nindent 4 }}
+  {{- with .Values.maintain.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.maintain.service.type }}
+  selector:
+    {{- include "icegate.selectorLabels" (dict "context" . "component" "maintain") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.maintain.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

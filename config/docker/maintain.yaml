@@ -35,6 +35,38 @@ compaction:
       job_state_codec: json
       request_timeout_secs: 5
 
+# Orphan-file GC for the long-running `maintain run` service. Reclaims physical
+# S3 objects no longer referenced by table metadata and older than the grace
+# period. Aggressive demo settings: sweep every 5 minutes, 10-minute grace
+# (prod defaults are daily / 7 days). Uses its own "gc" job-state prefix so it
+# never collides with compaction's.
+gc:
+  enabled: true
+  logs_enabled: true
+  spans_enabled: true
+  events_enabled: true
+  metrics_enabled: true
+  operations_enabled: true
+  orphans:
+    enabled: true
+    dry_run: false
+    min_age_secs: 600
+    include_metadata: true
+    delete_concurrency: 8
+    sweep_timeout_secs: 600
+  jobsmanager:
+    scan_interval_secs: 300
+    worker_count: 1
+    poll_interval_ms: 1000
+    storage:
+      endpoint: http://minio:9000
+      bucket: jobs
+      prefix: gc
+      region: us-east-1
+      use_ssl: false
+      job_state_codec: json
+      request_timeout_secs: 5
+
 # Prometheus metrics endpoint. Scraped by the `compact` job in prometheus.yml.
 metrics:
   enabled: true

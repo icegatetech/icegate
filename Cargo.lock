@@ -4097,6 +4097,7 @@ dependencies = [
  "icegate-catalog-s3",
  "icegate-common",
  "icegate-jobmanager",
+ "object_store",
  "opentelemetry",
  "parquet",
  "serde",

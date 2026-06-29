@@ -109,10 +109,10 @@ services:
       AWS_REGION: us-east-1
     logging: *fluentd-logging
 
-  # Long-running Parquet compaction service (`maintain run`). Exposes Prometheus
-  # metrics on :9091 (scraped by the `compact` job in prometheus.yml) which feed
-  # the "IceGate Compaction" Grafana dashboard.
-  compact:
+  # Long-running maintenance service (`maintain run`): Parquet compaction +
+  # orphan-file GC. Exposes Prometheus metrics on :9091 (scraped by the
+  # `maintain` job in prometheus.yml) which feed the "IceGate Compaction" dashboard.
+  maintain:
     build:
       context: ../..
       dockerfile: config/docker/Dockerfile

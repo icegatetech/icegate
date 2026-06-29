@@ -9,5 +9,7 @@ pub mod cli;
 pub mod compact;
 /// Configuration for maintain binary.
 pub mod config;
+/// Background orphan-file garbage collection.
+pub mod gc;
 /// Schema migration operations.
 pub mod migrate;
