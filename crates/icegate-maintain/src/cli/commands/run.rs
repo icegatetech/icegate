@@ -1,30 +1,31 @@
 //! Run command implementation
 //!
-//! Starts the long-running maintenance service (Parquet compaction) and runs it
-//! until a shutdown signal (SIGINT or SIGTERM) is received, then drains the
-//! compaction workers gracefully.
+//! Starts the long-running maintenance services (Parquet compaction and, when
+//! enabled, orphan-file GC) and runs them until a shutdown signal (SIGINT or
+//! SIGTERM) is received, then drains both worker pools gracefully.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, run_metrics_server};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{compact::Compactor, config::MaintainConfig, error::MaintainError};
+use crate::{compact::Compactor, config::MaintainConfig, error::MaintainError, gc::GcRunner};
 
 /// Execute the run command.
 ///
 /// Loads the maintain configuration, starts the Prometheus metrics server (when
 /// `metrics.enabled`), builds the Iceberg catalog, starts the compaction
-/// service, and blocks until a shutdown signal arrives. On shutdown the
-/// compaction workers are drained and the metrics server is stopped before
-/// returning.
+/// service and (when `gc.enabled`) the orphan-file GC service, then blocks
+/// until a shutdown signal arrives. On shutdown both worker pools are drained
+/// and the metrics server is stopped before returning.
 ///
 /// # Errors
 ///
 /// Returns [`MaintainError`] if the configuration cannot be loaded, the metrics
-/// runtime cannot be built, the catalog cannot be built, the compactor cannot
-/// start, or the workers stop with an error during shutdown.
+/// runtime cannot be built, the catalog cannot be built, the compactor or GC
+/// runner cannot start, or any worker pool stops with an error during shutdown.
 pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
@@ -57,9 +58,38 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // `/metrics` keeps serving until the very end.
     let cancel_token = CancellationToken::new();
     let catalog = CatalogBuilder::from_config(&config.catalog, &IoHandle::noop(), cancel_token.clone()).await?;
-    let compactor = Compactor::new(catalog, &config.compaction).await?;
-    let handle = compactor.start()?;
+    let compactor = Compactor::new(Arc::clone(&catalog), &config.compaction).await?;
+    let compactor_handle = compactor.start()?;
     tracing::info!("compaction maintenance service started");
+
+    // Start orphan-file GC alongside compaction when enabled. The runner is
+    // dropped after `start()`; the returned handle owns the workers.
+    let gc_handle = if config.gc.enabled {
+        match GcRunner::new(Arc::clone(&catalog), &config.storage, &config.gc)
+            .await
+            .and_then(|runner| runner.start())
+        {
+            Ok(handle) => {
+                tracing::info!("orphan-file gc service started");
+                Some(handle)
+            }
+            // The compactor is already running; a GC startup failure must still
+            // drain it and stop the metrics server before propagating the error.
+            Err(error) => {
+                cancel_token.cancel();
+                if let Err(drain_error) = compactor_handle.shutdown().await {
+                    tracing::error!("compactor drain error after gc startup failure: {drain_error}");
+                }
+                metrics_cancel.cancel();
+                if let Some(server) = metrics_server {
+                    let _ = server.await;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
 
     // Wait for shutdown, but watch the metrics server task at the same time: it
     // only resolves before a shutdown signal if it failed to start (e.g. its port
@@ -71,8 +101,28 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // caught mid-retry at SIGTERM stops at the next checkpoint instead of running
     // out its full retry budget, so the worker drain below completes promptly.
     cancel_token.cancel();
-    tracing::info!("draining compaction workers");
-    handle.shutdown().await?;
+    tracing::info!("draining maintenance workers");
+    // Drain both loops before propagating either error so a compactor drain
+    // failure cannot skip the GC drain.
+    let compactor_drain = compactor_handle.shutdown().await;
+    let gc_drain = match gc_handle {
+        Some(handle) => handle.shutdown().await,
+        None => Ok(()),
+    };
+    // A compactor-drain error below short-circuits before `gc_drain?`, so a
+    // simultaneous GC-drain failure would be lost. Surface it here first.
+    if compactor_drain.is_err() {
+        if let Err(ref error) = gc_drain {
+            tracing::error!("gc drain error (suppressed by compactor drain failure): {error}");
+        }
+    }
+    // Defer surfacing a worker-drain failure until the metrics server has been
+    // stopped below, so a drain error never leaks the metrics task. A compactor
+    // failure takes precedence; the GC failure was already logged above.
+    let drain_result = match compactor_drain {
+        Err(error) => Err(error),
+        Ok(()) => gc_drain,
+    };
 
     // Stop the metrics server and wait for it to unbind before the runtime (and
     // its meter provider) drop at end of scope.
@@ -86,8 +136,10 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     }
     drop(metrics_runtime);
 
-    // Report a metrics startup failure only after the compaction workers have
-    // drained and the runtime has been dropped, so shutdown still runs in order.
+    // Surface a worker-drain failure first, then any deferred metrics startup
+    // error — both only after the metrics server has unbound and the runtime has
+    // been dropped, so shutdown still runs in order on either error path.
+    drain_result?;
     if let Some(err) = metrics_startup_error {
         return Err(err);
     }

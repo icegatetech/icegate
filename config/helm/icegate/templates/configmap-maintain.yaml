@@ -1,4 +1,4 @@
-{{- if .Values.migrate.enabled -}}
+{{- if .Values.maintain.enabled -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,14 +6,67 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "icegate.componentLabels" (dict "context" . "component" "maintain") | nindent 4 }}
-  annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-10"
-    "helm.sh/hook-delete-policy": {{ .Values.migrate.hookDeletePolicy }}
 data:
   maintain.yaml: |
     catalog:
       {{- include "icegate.catalogYaml" . | nindent 6 }}
     storage:
       {{- include "icegate.storageYaml" . | nindent 6 }}
+    compaction:
+      target_file_size_bytes: {{ .Values.maintain.compaction.targetFileSizeBytes | int }}
+      max_group_input_bytes: {{ .Values.maintain.compaction.maxGroupInputBytes | int }}
+      min_input_files: {{ .Values.maintain.compaction.minInputFiles }}
+      max_skippable_tail_files: {{ .Values.maintain.compaction.maxSkippableTailFiles }}
+      max_merge_size_ratio: {{ .Values.maintain.compaction.maxMergeSizeRatio }}
+      rewrite_timeout_secs: {{ .Values.maintain.compaction.rewriteTimeoutSecs }}
+      row_group_size: {{ .Values.maintain.compaction.rowGroupSize }}
+      data_page_size_limit_bytes: {{ .Values.maintain.compaction.dataPageSizeLimitBytes | int }}
+      logs_enabled: {{ .Values.maintain.compaction.tables.logs }}
+      spans_enabled: {{ .Values.maintain.compaction.tables.spans }}
+      events_enabled: {{ .Values.maintain.compaction.tables.events }}
+      metrics_enabled: {{ .Values.maintain.compaction.tables.metrics }}
+      operations_enabled: {{ .Values.maintain.compaction.tables.operations }}
+      jobsmanager:
+        scan_interval_secs: {{ .Values.maintain.compaction.jobsmanager.scanIntervalSecs }}
+        worker_count: {{ .Values.maintain.compaction.jobsmanager.workerCount }}
+        poll_interval_ms: {{ .Values.maintain.compaction.jobsmanager.pollIntervalMs }}
+        storage:
+          endpoint: {{ .Values.maintain.compaction.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          bucket: {{ .Values.maintain.compaction.jobsmanager.storage.bucket | quote }}
+          prefix: {{ .Values.maintain.compaction.jobsmanager.storage.prefix | quote }}
+          region: {{ .Values.maintain.compaction.jobsmanager.storage.region | default .Values.aws.region | quote }}
+          use_ssl: {{ .Values.maintain.compaction.jobsmanager.storage.useSsl }}
+          job_state_codec: {{ .Values.maintain.compaction.jobsmanager.storage.jobStateCodec }}
+          request_timeout_secs: {{ .Values.maintain.compaction.jobsmanager.storage.requestTimeoutSecs }}
+    gc:
+      enabled: {{ .Values.maintain.gc.enabled }}
+      logs_enabled: {{ .Values.maintain.gc.tables.logs }}
+      spans_enabled: {{ .Values.maintain.gc.tables.spans }}
+      events_enabled: {{ .Values.maintain.gc.tables.events }}
+      metrics_enabled: {{ .Values.maintain.gc.tables.metrics }}
+      operations_enabled: {{ .Values.maintain.gc.tables.operations }}
+      orphans:
+        enabled: {{ .Values.maintain.gc.orphans.enabled }}
+        dry_run: {{ .Values.maintain.gc.orphans.dryRun }}
+        min_age_secs: {{ .Values.maintain.gc.orphans.minAgeSecs }}
+        include_metadata: {{ .Values.maintain.gc.orphans.includeMetadata }}
+        delete_concurrency: {{ .Values.maintain.gc.orphans.deleteConcurrency }}
+        sweep_timeout_secs: {{ .Values.maintain.gc.orphans.sweepTimeoutSecs }}
+      jobsmanager:
+        scan_interval_secs: {{ .Values.maintain.gc.jobsmanager.scanIntervalSecs }}
+        worker_count: {{ .Values.maintain.gc.jobsmanager.workerCount }}
+        poll_interval_ms: {{ .Values.maintain.gc.jobsmanager.pollIntervalMs }}
+        storage:
+          endpoint: {{ .Values.maintain.gc.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          bucket: {{ .Values.maintain.gc.jobsmanager.storage.bucket | quote }}
+          prefix: {{ .Values.maintain.gc.jobsmanager.storage.prefix | quote }}
+          region: {{ .Values.maintain.gc.jobsmanager.storage.region | default .Values.aws.region | quote }}
+          use_ssl: {{ .Values.maintain.gc.jobsmanager.storage.useSsl }}
+          job_state_codec: {{ .Values.maintain.gc.jobsmanager.storage.jobStateCodec }}
+          request_timeout_secs: {{ .Values.maintain.gc.jobsmanager.storage.requestTimeoutSecs }}
+    metrics:
+      enabled: {{ .Values.maintain.metrics.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.maintain.metrics.port }}
+      path: {{ .Values.maintain.metrics.path | quote }}
 {{- end }}

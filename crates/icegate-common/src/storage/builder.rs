@@ -68,17 +68,28 @@ pub fn create_s3_store(
         |(b, p)| (b.to_string(), p.to_string()),
     );
 
-    // Get S3 config from storage backend for endpoint/region settings
-    let (endpoint, region) = match backend {
-        Some(StorageBackend::S3(s3_config)) => (s3_config.endpoint.clone(), s3_config.region.clone()),
-        _ => (None, "us-east-1".to_string()),
+    // Get S3 config from the storage backend for endpoint/region and any
+    // explicit credentials the config carries.
+    let (endpoint, region, config_access_key, config_secret_key) = match backend {
+        Some(StorageBackend::S3(s3_config)) => (
+            s3_config.endpoint.clone(),
+            s3_config.region.clone(),
+            s3_config.access_key_id.clone(),
+            s3_config.secret_access_key.clone(),
+        ),
+        _ => (None, "us-east-1".to_string(), None, None),
     };
 
-    // Read AWS credentials from environment (optional for IAM role/instance-profile auth).
-    // Both access_key and secret_key must be set or neither — partial configuration
-    // is an error. session_token is optional but requires both access_key and secret_key.
-    let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|v| !v.is_empty());
-    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok().filter(|v| !v.is_empty());
+    // Resolve credentials: explicit config credentials win, then fall back to the
+    // ambient AWS environment / IAM credential chain (the production default).
+    // Both access_key and secret_key must resolve or neither — partial
+    // configuration is an error. session_token is read from the environment only.
+    let access_key = config_access_key
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|v| !v.is_empty()));
+    let secret_key = config_secret_key
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok().filter(|v| !v.is_empty()));
     let session_token = std::env::var("AWS_SESSION_TOKEN").ok().filter(|v| !v.is_empty());
 
     if access_key.is_some() != secret_key.is_some() {

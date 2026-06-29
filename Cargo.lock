@@ -4097,6 +4097,7 @@ dependencies = [
  "icegate-catalog-s3",
  "icegate-common",
  "icegate-jobmanager",
+ "object_store",
  "opentelemetry",
  "parquet",
  "serde",
@@ -4110,6 +4111,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

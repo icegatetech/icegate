@@ -52,7 +52,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: {{ include "icegate.componentName" (dict "context" . "component" "maintain") }}
+            name: {{ include "icegate.componentName" (dict "context" . "component" "migrate") }}
         - name: tmp
           emptyDir: {}
 {{- end }}

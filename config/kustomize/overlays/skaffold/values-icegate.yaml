@@ -135,8 +135,8 @@ migrate:
       - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
       - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
 
-## Compaction (long-running `maintain run` service)
-compact:
+## Maintain service (long-running `maintain run`: compaction + orphan-file GC)
+maintain:
   enabled: true
   replicaCount: 1
   waitForDependencies:
@@ -152,6 +152,22 @@ compact:
         endpoint: http://minio.infra.svc.cluster.local.:9000
         bucket: jobs
         prefix: compactor
+        useSsl: false
+        jobStateCodec: json
+        requestTimeoutSecs: 5
+  ## Orphan-file GC — enabled with an aggressive dev cadence: sweep every 5
+  ## minutes and reclaim files older than 10 minutes (prod defaults are
+  ## daily / 7 days). Other fields inherit the chart defaults.
+  gc:
+    enabled: true
+    orphans:
+      minAgeSecs: 600
+    jobsmanager:
+      scanIntervalSecs: 300
+      storage:
+        endpoint: http://minio.infra.svc.cluster.local.:9000
+        bucket: jobs
+        prefix: gc
         useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
