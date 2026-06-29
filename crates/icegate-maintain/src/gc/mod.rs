@@ -7,7 +7,7 @@
 
 /// GC configuration: grace period, table list, and scan interval.
 pub mod config;
-/// Pure orphan-classification logic: canonical keys and sweep decisions.
+/// Pure orphan-classification logic: object-key parsing and sweep decisions.
 pub mod decide;
 /// Orphan-sweep instruments recorded to the OpenTelemetry global meter.
 pub mod metrics;
@@ -223,7 +223,12 @@ impl GcRunner {
         }
 
         let job_registry = Arc::new(JobRegistry::new(job_defs).map_err(map_job_error)?);
-        let job_metrics = JobMetrics::new_disabled();
+        // Enable the jobmanager's own metrics (job/task durations and statuses,
+        // task-steal events, optimistic-concurrency save retries, and job-state
+        // storage S3 latency / cache hits): `GcMetrics` covers sweep outcomes but
+        // not this job-execution machinery. Binds to the global meter installed by
+        // `MetricsRuntime`; inert when metrics are disabled (no provider set).
+        let job_metrics = JobMetrics::new(&opentelemetry::global::meter("icegate-maintain"));
         let registry_dyn: Arc<dyn JobDefinitionRegistry> = job_registry.clone();
         let s3_storage = Arc::new(
             S3Storage::new(

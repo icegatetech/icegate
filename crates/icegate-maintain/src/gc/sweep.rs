@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::MaintainError;
 use crate::gc::config::GcOrphansConfig;
-use crate::gc::decide::{Decision, ObjectClass, classify};
+use crate::gc::decide::{Decision, ObjectClass};
 use crate::gc::metrics::GcMetrics;
 use crate::gc::reachable::collect_referenced_paths;
 
@@ -101,11 +101,11 @@ pub async fn run_sweep(
         let Some(item) = item else { break };
         let meta = item.map_err(|e| MaintainError::Storage(format!("gc list error for table '{table}': {e}")))?;
         summary.scanned += 1;
-        // LIST keys are already bucket-relative canonical keys (unlike the full
-        // URIs in reachable.rs), so they compare directly against the referenced
-        // set; see decide::canonicalize_key.
-        match classify(
-            meta.location.as_ref(),
+        // `meta.location` is already a bucket-relative object key; the referenced
+        // set holds the same keys (Iceberg's absolute URIs parsed via
+        // decide::parse_object_key), so the two compare directly as `ObjectPath`.
+        match Decision::classify(
+            &meta.location,
             &prefix,
             &referenced,
             meta.last_modified,

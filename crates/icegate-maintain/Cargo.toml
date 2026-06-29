@@ -29,6 +29,9 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 object_store = { workspace = true }
 
+# URL parsing: reduce Iceberg's absolute file URIs to bucket-relative object keys
+url = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 
