@@ -259,11 +259,25 @@ impl Worker {
             worker_id = %self.id,
             job_code = %job.code(),
             job_id = %job.id(),
+            job_start_at = %job.started_at(),
             iter = job.iter_num()
         )
     )]
     async fn try_process_job(&self, mut job: Job, cancel_token: &CancellationToken) -> bool {
-        if job.is_ready_to_next_iteration() {
+        // The next-iteration gate anchors on the persisted started_at of the current
+        // iteration, which survives process restarts. Log the inputs so a restart that
+        // appears to "shift" the schedule can be traced back to the actual anchor.
+        let ready_for_next = job.is_ready_to_next_iteration();
+        debug!(
+            status = %job.status(),
+            started_at = %job.started_at(),
+            completed_at = ?job.completed_at(),
+            next_start_at = ?job.next_start_at(),
+            ready_for_next,
+            "Evaluating job scheduling on pickup"
+        );
+
+        if ready_for_next {
             job = match self.start_new_job_iteration(job, cancel_token).await {
                 Ok(job) => job,
                 Err(InternalError::Cancelled) => {
@@ -278,9 +292,19 @@ impl Worker {
         } else if job.is_processed() && job.is_iteration_limit_reached() {
             self.update_cache(job.code().clone(), job.version().to_string(), true);
             return false;
+        } else if job.is_processed() {
+            debug!(
+                started_at = %job.started_at(),
+                next_start_at = ?job.next_start_at(),
+                "Job completed; next iteration not yet due, waiting for schedule"
+            );
         }
 
         if job.is_ready_for_processing() {
+            debug!(
+                started_at = %job.started_at(),
+                "Job ready for processing"
+            );
             self.pick_and_execute_task(job, cancel_token).await.unwrap_or_else(|e| {
                 if matches!(e, InternalError::Cancelled) {
                     debug!("Job processing cancelled");
