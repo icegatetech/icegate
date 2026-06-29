@@ -1179,6 +1179,64 @@ mod tests {
     }
 
     #[test]
+    fn test_is_ready_to_next_iteration_anchors_to_restored_started_at() {
+        // Simulates a process restart: the job is reloaded from storage carrying the
+        // started_at of the iteration that already completed. The next-iteration gate
+        // must anchor on that persisted started_at, not on the reload moment, so an
+        // interval that already elapsed before the restart becomes eligible immediately
+        // instead of waiting another full interval from restart time.
+        let task = make_task(Uuid::from_u128(370), "done", TaskStatus::Completed, Vec::new());
+        let started_at = Utc::now() - Duration::seconds(120);
+        let job = Job::restore(
+            Uuid::from_u128(371),
+            JobCode::new("job"),
+            String::new(),
+            1,
+            JobStatus::Completed,
+            vec![task],
+            Uuid::from_u128(372),
+            started_at,
+            None,
+            Some(started_at + Duration::seconds(2)),
+            None,
+            HashMap::new(),
+            None,
+            Some(Duration::seconds(60)),
+            TaskLimits::default(),
+        );
+
+        assert_eq!(job.started_at(), started_at);
+        assert!(job.is_ready_to_next_iteration());
+    }
+
+    #[test]
+    fn test_is_ready_to_next_iteration_waits_from_restored_started_at() {
+        // Counterpart of the restart anchor test: when the persisted started_at is recent,
+        // the gate stays closed for the remainder of the interval regardless of reload time.
+        let task = make_task(Uuid::from_u128(373), "done", TaskStatus::Completed, Vec::new());
+        let started_at = Utc::now() - Duration::seconds(5);
+        let job = Job::restore(
+            Uuid::from_u128(374),
+            JobCode::new("job"),
+            String::new(),
+            1,
+            JobStatus::Completed,
+            vec![task],
+            Uuid::from_u128(375),
+            started_at,
+            None,
+            Some(started_at + Duration::seconds(2)),
+            None,
+            HashMap::new(),
+            None,
+            Some(Duration::seconds(60)),
+            TaskLimits::default(),
+        );
+
+        assert!(!job.is_ready_to_next_iteration());
+    }
+
+    #[test]
     fn test_set_next_start_at_blocks_next_iteration_when_future() {
         let task = make_task(Uuid::from_u128(360), "done", TaskStatus::Completed, Vec::new());
         let mut job = restore_job(
