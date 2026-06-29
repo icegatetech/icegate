@@ -123,6 +123,40 @@ pub fn validate_query_window(start: DateTime<Utc>, end: DateTime<Utc>) -> Result
     Ok(())
 }
 
+/// Length of a canonical `trace_id` path parameter, in hex characters.
+///
+/// `trace_id` is a W3C 16-byte trace identifier stored as Iceberg
+/// `Fixed(16)`, so its hex spelling is exactly 32 characters. IceGate does
+/// not accept the shorter 8-byte form that upstream Tempo left-pads, because
+/// no ingested span can carry one.
+pub const TRACE_ID_HEX_LEN: usize = 32;
+
+/// Validate the `trace_id` path parameter of `/api/traces/{trace_id}`.
+///
+/// The id must be exactly [`TRACE_ID_HEX_LEN`] ASCII hex characters. A
+/// malformed id is rejected with HTTP 400 rather than silently returning an
+/// empty trace, matching the Tempo protocol's bad-request contract for an
+/// unparseable trace id.
+///
+/// # Errors
+///
+/// Returns [`QueryError::Validation`] when the id is not [`TRACE_ID_HEX_LEN`]
+/// characters long or contains a non-hex character.
+pub fn validate_trace_id(trace_id: &str) -> Result<()> {
+    if trace_id.len() != TRACE_ID_HEX_LEN {
+        return Err(QueryError::Validation(format!(
+            "invalid trace_id: expected {TRACE_ID_HEX_LEN} hex characters, got {}",
+            trace_id.len(),
+        )));
+    }
+    if let Some(c) = trace_id.chars().find(|c| !c.is_ascii_hexdigit()) {
+        return Err(QueryError::Validation(format!(
+            "invalid trace_id: non-hex character '{c}'"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a `TraceQL` query string before parsing it.
 ///
 /// # Errors
@@ -236,6 +270,34 @@ mod tests {
         let e = s + MAX_QUERY_WINDOW + Duration::seconds(1);
         let err = validate_query_window(s, e).expect_err("oversized window must reject");
         assert!(matches!(err, QueryError::Validation(_)));
+    }
+
+    #[test]
+    fn trace_id_validator_accepts_canonical_id() {
+        assert!(validate_trace_id("ee2066e01950d8e51a55481d716dc265").is_ok());
+        // Upper-case hex is also valid (hex decode is case-insensitive).
+        assert!(validate_trace_id("EE2066E01950D8E51A55481D716DC265").is_ok());
+    }
+
+    #[test]
+    fn trace_id_validator_rejects_wrong_length() {
+        assert!(matches!(validate_trace_id(""), Err(QueryError::Validation(_))));
+        // 16 hex chars (8-byte form) is rejected — our spans are 16-byte ids.
+        assert!(matches!(
+            validate_trace_id("ee2066e01950d8e5"),
+            Err(QueryError::Validation(_))
+        ));
+        let too_long = "a".repeat(TRACE_ID_HEX_LEN + 1);
+        assert!(matches!(validate_trace_id(&too_long), Err(QueryError::Validation(_))));
+    }
+
+    #[test]
+    fn trace_id_validator_rejects_non_hex() {
+        // 32 chars but with a non-hex character.
+        assert!(matches!(
+            validate_trace_id("zz2066e01950d8e51a55481d716dc265"),
+            Err(QueryError::Validation(_))
+        ));
     }
 
     #[test]

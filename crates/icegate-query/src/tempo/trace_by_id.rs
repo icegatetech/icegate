@@ -52,7 +52,8 @@ pub struct FetchResult {
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::QueryError`] for engine, planning, or
+/// Returns [`crate::error::QueryError::Validation`] if `trace_id` is not
+/// decodable hex, and [`crate::error::QueryError`] for engine, planning, or
 /// execution failures.
 pub async fn fetch(
     engine: Arc<QueryEngine>,
@@ -61,10 +62,13 @@ pub async fn fetch(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> TempoResult<FetchResult> {
-    // `trace_id` arrives from the URL as lowercase hex (32 chars). Decode to
-    // 16 raw bytes and compare against the typed FixedSizeBinary column;
-    // an invalid id yields no matches.
-    let trace_id_bytes = hex::decode(trace_id).unwrap_or_default();
+    // `trace_id` is validated upstream by `validation::validate_trace_id`
+    // (exactly 32 hex chars), so it decodes to exactly 16 raw bytes — the
+    // Fixed(16) column width that keeps the pushed-down literal comparable
+    // against the column's Fixed(16) bounds. Map any residual decode error to
+    // a validation error (HTTP 400) rather than panicking or returning a
+    // misleading empty trace.
+    let trace_id_bytes = hex::decode(trace_id).map_err(|e| QueryError::Validation(format!("invalid trace_id: {e}")))?;
     let trace_id_lit = lit(ScalarValue::FixedSizeBinary(16, Some(trace_id_bytes)));
 
     let session = engine.create_session().await?;
