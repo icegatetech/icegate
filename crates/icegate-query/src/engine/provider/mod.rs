@@ -21,12 +21,14 @@
 mod catalog;
 mod expr_to_predicate;
 mod metrics;
+mod pricing;
 mod scan;
 mod schema;
 mod table;
 
 pub use catalog::IcegateCatalogProvider;
 pub use metrics::{SourceMetrics, extract_source_metrics};
+pub use pricing::{REFERENCE_CATALOG_NAME, reference_catalog};
 
 /// WAL-specific query configuration passed through the provider chain.
 ///

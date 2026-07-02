@@ -22,7 +22,7 @@ use object_store::ObjectStore;
 use tokio::sync::watch;
 
 use super::QueryEngineConfig;
-use super::provider::{IcegateCatalogProvider, WalQueryConfig};
+use super::provider::{IcegateCatalogProvider, REFERENCE_CATALOG_NAME, WalQueryConfig, reference_catalog};
 use crate::error::Result;
 
 /// Fixed DataFusion object store URL for WAL segments.
@@ -275,6 +275,16 @@ impl QueryEngine {
         let provider = self.get_provider().await?;
 
         session_ctx.register_catalog(&self.config.catalog_name, provider);
+
+        // Register the global (non-tenant) LLM pricing reference catalog. Kept out
+        // of the cached (Iceberg-only) provider and installed per session so the
+        // 15s background refresh cannot drop it, and so the Flight SQL tenant-scope
+        // decorator — which only re-registers `self.config.catalog_name` — never
+        // wraps it (a MemTable has no `tenant_id` column and would 500 if wrapped).
+        session_ctx.register_catalog(
+            REFERENCE_CATALOG_NAME,
+            reference_catalog().map_err(|e| crate::error::QueryError::Config(e.to_string()))?,
+        );
 
         Ok(session_ctx)
     }
