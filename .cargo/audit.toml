@@ -10,4 +10,13 @@ ignore = [
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
     "RUSTSEC-2026-0185",  # `quinn-proto` via `testcontainers`, wait for new version
+    # quick-xml <0.41 DoS pair (both fixed in >=0.41.0): 0194 quadratic-time
+    # duplicate-attribute check, 0195 unbounded namespace-declaration allocation.
+    # Transitive only, via object_store / opendal / reqsign parsing S3 XML responses;
+    # input comes from our trusted object store, not from an attacker. No upstream fix
+    # is reachable yet: even the latest object_store 0.14.0 still pins quick-xml ^0.40.1
+    # (also <0.41). Remove once object_store ships quick-xml >=0.41 and we bump the
+    # object_store/datafusion/parquet stack to match.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]

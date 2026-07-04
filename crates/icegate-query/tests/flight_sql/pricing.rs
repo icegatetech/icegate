@@ -14,7 +14,7 @@ async fn standalone_select_on_reference_pricing_works() -> Result<(), Box<dyn st
     let (server, _catalog) = TestServer::start().await?;
     let mut client = server.client(Some("tenant-alpha"));
     let batches = execute_sql(&mut client, "SELECT count(*) FROM reference.llm.pricing").await?;
-    assert_eq!(count_from_batches(&batches), 3);
+    assert_eq!(count_from_batches(&batches), 15);
     server.shutdown().await;
     Ok(())
 }
