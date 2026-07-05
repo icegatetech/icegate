@@ -6,12 +6,10 @@ namespace:
 
 ## Iceberg catalog (shared by all components)
 catalog:
-  backend: rest
-  rest:
-    uri: http://nessie.infra.svc.cluster.local.:19120/iceberg
+  backend: s3
+  s3:
+    warehouse: catalog
   warehouse: "s3://warehouse/"
-  properties:
-    prefix: main
 
 ## Storage configuration
 storage:
@@ -50,7 +48,6 @@ query:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
       - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
   loki:
     enabled: true
@@ -85,7 +82,6 @@ ingest:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
       - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
   otlpHttp:
     enabled: true
@@ -132,7 +128,6 @@ migrate:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
       - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
 
 ## Maintain service (long-running `maintain run`: compaction + orphan-file GC)
@@ -142,7 +137,6 @@ maintain:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
       - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
   compaction:
     jobsmanager:

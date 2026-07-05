@@ -134,6 +134,26 @@ properties:
   {{ $key }}: {{ $val | quote }}
 {{- end }}
 {{- end }}
+{{- else if eq .Values.catalog.backend "s3" -}}
+backend: !s3
+  warehouse: {{ .Values.catalog.s3.warehouse | quote }}
+warehouse: {{ .Values.catalog.warehouse }}
+properties:
+  bucket: {{ .Values.catalog.s3.bucket | default .Values.storage.s3.bucket | quote }}
+  region: {{ .Values.storage.s3.region | quote }}
+  {{- if .Values.storage.s3.endpoint }}
+  endpoint: {{ .Values.storage.s3.endpoint | quote }}
+  {{- end }}
+  {{- with .Values.catalog.s3.codec }}
+  codec: {{ . | quote }}
+  {{- end }}
+  {{- /* Forward user-supplied catalog.properties into FileIO, skipping the
+         structural keys already rendered above to avoid duplicate YAML keys. */}}
+  {{- range $key, $val := .Values.catalog.properties }}
+  {{- if not (has $key (list "bucket" "region" "endpoint" "codec")) }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+  {{- end }}
 {{- end }}
 {{- end }}
 

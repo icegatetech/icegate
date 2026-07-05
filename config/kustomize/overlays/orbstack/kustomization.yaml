@@ -8,7 +8,9 @@ resources:
   # in values-icegate.yaml). This secret depends on that chart being rendered in
   # the same kustomize build.
   - secret-aws.yaml
-  - secret-aws-infra.yaml
+
+helmGlobals:
+  chartHome: ../../../helm
 
 helmCharts:
   - name: minio
@@ -18,16 +20,7 @@ helmCharts:
     namespace: infra
     valuesFile: values-minio.yaml
 
-  - name: nessie
-    repo: https://charts.projectnessie.org
-    version: 0.107.3
-    releaseName: nessie
-    namespace: infra
-    valuesFile: values-nessie.yaml
-
   - name: icegate
-    repo: oci://ghcr.io/icegatetech/charts
-    version: 0.1.1
     releaseName: icegate
     namespace: icegate
     valuesFile: values-icegate.yaml

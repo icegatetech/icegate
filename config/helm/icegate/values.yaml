@@ -19,8 +19,16 @@ serviceAccount:
 
 ## Iceberg catalog configuration (shared by all components)
 catalog:
-  ## Backend type: "rest", "s3tables", or "glue"
-  backend: rest
+  ## Backend type: "s3", "rest", "s3tables", or "glue"
+  backend: s3
+  ## S3 catalog settings (used when backend=s3) — project's own root.json catalog
+  s3:
+    ## S3 key prefix for catalog state (root.json) and warehouse root
+    warehouse: catalog
+    ## Bucket for catalog state; defaults to storage.s3.bucket when empty
+    bucket: ""
+    ## Optional catalog root codec (default: json)
+    # codec: json
   ## REST catalog settings (used when backend=rest)
   rest:
     uri: http://nessie:19120/iceberg
@@ -33,9 +41,11 @@ catalog:
     catalogId: ""
   ## Iceberg warehouse location
   warehouse: "s3://warehouse/"
-  ## Additional catalog properties
-  properties:
-    prefix: main
+  ## Additional catalog properties, merged into the rendered catalog config for
+  ## every backend. Backend-specific: e.g. REST/Nessie reads `prefix: main` here,
+  ## the s3 backend forwards extra keys to FileIO. Structural s3 keys
+  ## (bucket/region/endpoint/codec) come from the dedicated fields above.
+  properties: {}
 
 ## Storage configuration (shared by all components)
 storage:
@@ -201,7 +211,7 @@ query:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Query starts only when all return 2xx.
     endpoints: []
-    #  - http://nessie:19120/api/v2/config
+    #  - http://minio:9000/minio/health/ready
 
   ## Liveness and readiness probe overrides
   livenessProbe:
@@ -358,7 +368,6 @@ ingest:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Ingest starts only when all return 2xx.
     endpoints: []
-    #  - http://nessie:19120/api/v2/config
     #  - http://minio:9000/minio/health/ready
 
   ## Liveness and readiness probe overrides
@@ -407,7 +416,6 @@ migrate:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Migrate starts only when all return 2xx.
     endpoints: []
-    #  - http://nessie:19120/api/v2/config
     #  - http://rustfs-svc:9000/health/ready
 
 ## ---------------------------------------------------------------------------
@@ -593,7 +601,6 @@ maintain:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Compaction starts only when all return 2xx.
     endpoints: []
-    #  - http://nessie:19120/api/v2/config
     #  - http://minio:9000/minio/health/ready
 
 ## ---------------------------------------------------------------------------

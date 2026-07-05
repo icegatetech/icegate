@@ -29,7 +29,7 @@ The system consists of five core components for handling observability data (met
 ### Catalog
 - **Technology**: [Apache Iceberg](https://iceberg.apache.org/)
 - **Purpose**: Organizes the data lake with ACID transaction support
-- **Key Feature**: Custom catalog implementation that doesn't require a dedicated OLTP database while still supporting transactions
+- **Key Feature**: Custom S3-backed catalog (the default) that doesn't require a dedicated OLTP database while still supporting transactions
 
 ### Ingest
 - **Protocol**: [OpenTelemetry](https://opentelemetry.io/)
@@ -128,7 +128,8 @@ Once running, the following services are available:
 #### Infrastructure
 - **MinIO Console**: `http://localhost:9001` - Object storage web interface (login: minioadmin/minioadmin)
 - **MinIO API**: `http://localhost:9000` - S3-compatible object storage API
-- **Nessie API**: `http://localhost:19120` - Iceberg catalog REST API
+
+The default stack uses IceGate's own S3-backed catalog (see [Catalog](#catalog)); no external catalog service is required. A Nessie catalog is started only under the optional `analytics` profile for Trino (see [Additional Profiles](#additional-profiles)).
 
 ### Additional Profiles
 
@@ -144,6 +145,8 @@ make run-docker-core-release
 # Include analytics tools (Trino SQL query engine at http://localhost:8082)
 make run-docker-analytics-release
 ```
+
+The `analytics` profile starts Nessie and Trino. This is a legacy path: Trino reads only through Nessie (Iceberg REST), so it does **not** see tables of the default stack, which live in the S3-backed catalog (see [Catalog](#catalog)). For SQL over the default stack's data, use Arrow Flight SQL at `grpc://localhost:8815`.
 
 ### Next Steps
 

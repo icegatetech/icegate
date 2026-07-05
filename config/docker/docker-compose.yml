@@ -42,15 +42,22 @@ services:
       "
     logging: *fluentd-logging
 
+  # Nessie + Trino form the legacy `analytics` path (opt-in via `--profile analytics`).
+  # The default stack writes to the s3-catalog, which Trino (Iceberg REST only) cannot
+  # read — so Trino sees no data from the default stack without switching icegate to `rest`.
   nessie-init:
     image: busybox
     volumes:
       - nessie-data:/data
     command: ["sh", "-c", "chown -R 10000:10001 /data"]
+    profiles:
+      - analytics
     logging: *fluentd-logging
 
   nessie:
     image: quay.io/projectnessie/nessie:0.105.7
+    profiles:
+      - analytics
     ports:
       - "19120:19120"
     environment:
@@ -99,8 +106,6 @@ services:
     volumes:
       - ./maintain.yaml:/etc/icegate/maintain.yaml:ro
     depends_on:
-      nessie:
-        condition: service_healthy
       minio-init:
         condition: service_completed_successfully
     environment:
@@ -167,6 +172,7 @@ services:
       - "3100:3100"
       - "9090:9090"
       - "3200:3200"
+      - "8815:8815"
     volumes:
       - ./query.yaml:/etc/icegate/query.yaml:ro
     depends_on:
@@ -232,8 +238,8 @@ services:
     volumes:
       - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
     # No depends_on: ingest — collector must bind port 8006 immediately so
-    # short-lived services (minio-init, nessie-init, migrate) can send startup
-    # logs. Retry and queue settings in config.yaml handle ingest unavailability.
+    # short-lived services (minio-init, migrate) can send startup logs.
+    # Retry and queue settings in config.yaml handle ingest unavailability.
     #
     # Use default json-file logging driver to avoid circular dependency
     # (collector cannot forward its own logs to itself).
