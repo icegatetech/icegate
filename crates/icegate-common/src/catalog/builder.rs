@@ -417,6 +417,7 @@ mod tests {
 
     use super::*;
     use crate::error::CommonError;
+    use crate::testing::container::{STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY};
     use crate::testing::{S3TestContainer, create_s3_bucket};
 
     fn test_catalog_config(endpoint: &str, bucket: &str) -> CatalogConfig {
@@ -429,8 +430,8 @@ mod tests {
                 ("bucket".to_string(), bucket.to_string()),
                 ("region".to_string(), "us-east-1".to_string()),
                 ("endpoint".to_string(), endpoint.to_string()),
-                ("access_key_id".to_string(), "rustfsadmin".to_string()),
-                ("secret_access_key".to_string(), "rustfsadmin".to_string()),
+                ("access_key_id".to_string(), STORAGE_ACCESS_KEY.to_string()),
+                ("secret_access_key".to_string(), STORAGE_SECRET_KEY.to_string()),
             ]),
             cache: None,
         }

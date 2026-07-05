@@ -52,6 +52,5 @@ tracing-subscriber = { workspace = true }
 
 
 [dev-dependencies]
-# Testcontainers for the object store
-testcontainers = { workspace = true, features = ["blocking"] }
+# Object-store testcontainer helpers (S3TestContainer)
 icegate-common = { workspace = true, features = ["testing"] }

@@ -23,7 +23,7 @@ spec:
             - -c
             - |
               set -e
-              E=http://rustfs-svc.infra.svc.cluster.local:9000
+              E=http://rustfs-svc.infra.svc.cluster.local.:9000
               until aws --endpoint-url $E s3 ls; do echo waiting for rustfs; sleep 3; done
               aws --endpoint-url $E s3 mb s3://warehouse || true
               aws --endpoint-url $E s3 mb s3://queue || true

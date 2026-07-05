@@ -12,7 +12,7 @@ use aws_sdk_s3::{
 };
 use object_store::{ObjectStore, aws::AmazonS3Builder};
 
-use super::object_store::{STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY};
+use super::container::{STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY};
 
 /// Create an AWS S3 bucket for testing.
 ///

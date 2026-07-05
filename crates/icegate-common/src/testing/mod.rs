@@ -7,9 +7,9 @@
 //! Available only when the `testing` feature is enabled.
 
 /// Object-storage testcontainer setup.
-pub mod object_store;
+pub mod container;
 /// AWS S3 client helpers.
 pub mod s3;
 
-pub use object_store::S3TestContainer;
+pub use container::S3TestContainer;
 pub use s3::{create_s3_bucket, create_s3_object_store};
