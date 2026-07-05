@@ -9,37 +9,44 @@ x-logging: &fluentd-logging
     tag: "docker.{{.Name}}"
 
 services:
-  minio:
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
-    command: server /data --console-address ":9001"
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.8
     ports:
       - "9000:9000"
       - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_VOLUMES: /data
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
     volumes:
-      - minio-data:/data
+      - rustfs-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health/ready"]
       interval: 5s
       timeout: 5s
       retries: 5
     logging: *fluentd-logging
 
-  minio-init:
-    image: minio/mc
+  rustfs-init:
+    image: amazon/aws-cli:2.35.15
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-        mc alias set minio http://minio:9000 minioadmin minioadmin &&
-        mc mb --ignore-existing minio/warehouse &&
-        mc mb --ignore-existing minio/queue &&
-        mc ilm rule add --expire-days 1 minio/queue &&
-        mc mb --ignore-existing minio/jobs
-      "
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_REGION: us-east-1
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://warehouse || true
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://queue || true
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://jobs || true
+        aws --endpoint-url http://rustfs:9000 s3api put-bucket-lifecycle-configuration --bucket queue --lifecycle-configuration '{"Rules":[{"ID":"expire-1d","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":1}}]}'
     logging: *fluentd-logging
 
   # Nessie + Trino form the legacy `analytics` path (opt-in via `--profile analytics`).
@@ -66,15 +73,15 @@ services:
       # Configure default warehouse
       nessie.catalog.default-warehouse: warehouse
       nessie.catalog.warehouses.warehouse.location: s3://warehouse/
-      # S3 configuration for MinIO
-      nessie.catalog.service.s3.default-options.endpoint: http://minio:9000/
+      # S3 configuration for RustFS
+      nessie.catalog.service.s3.default-options.endpoint: http://rustfs:9000/
       nessie.catalog.service.s3.default-options.path-style-access: "true"
       nessie.catalog.service.s3.default-options.region: us-east-1
       # S3 credentials via secret reference
       nessie.catalog.service.s3.default-options.access-key: "urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key"
-      nessie.catalog.secrets.access-key.name: minioadmin
-      nessie.catalog.secrets.access-key.secret: minioadmin
-      # MinIO compatibility
+      nessie.catalog.secrets.access-key.name: rustfsadmin
+      nessie.catalog.secrets.access-key.secret: rustfsadmin
+      # RustFS / AWS SDK v2 compatibility
       AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
       AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
       # RocksDB version store
@@ -83,7 +90,7 @@ services:
     volumes:
       - nessie-data:/data
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
       nessie-init:
         condition: service_completed_successfully
@@ -106,11 +113,11 @@ services:
     volumes:
       - ./maintain.yaml:/etc/icegate/maintain.yaml:ro
     depends_on:
-      minio-init:
+      rustfs-init:
         condition: service_completed_successfully
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_REGION: us-east-1
     logging: *fluentd-logging
 
@@ -131,8 +138,8 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_REGION: us-east-1
       RUST_LOG: "info,icegate_maintain=debug,icegate_jobmanager=debug,icegate_common=debug,aws_sdk_s3=warn,aws_smithy_runtime=warn"
       # `maintain run` initialises tracing and refuses to start without an OTLP endpoint.
@@ -179,8 +186,8 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_REGION: us-east-1
       RUST_LOG: "info,icegate_query=debug,icegate_common=debug,datafusion_tracing=debug,opendal=debug,opendal::services::s3::backend=info,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
@@ -208,8 +215,8 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_REGION: us-east-1
       RUST_LOG: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
@@ -238,7 +245,7 @@ services:
     volumes:
       - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
     # No depends_on: ingest — collector must bind port 8006 immediately so
-    # short-lived services (minio-init, migrate) can send startup logs.
+    # short-lived services (rustfs-init, migrate) can send startup logs.
     # Retry and queue settings in config.yaml handle ingest unavailability.
     #
     # Use default json-file logging driver to avoid circular dependency
@@ -355,11 +362,11 @@ services:
     volumes:
       - ./trino/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_REGION: us-east-1
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
       nessie:
         condition: service_healthy
@@ -374,7 +381,7 @@ services:
     logging: *fluentd-logging
 
 volumes:
-  minio-data:
+  rustfs-data:
   prometheus-data:
   grafana-data:
   nessie-data:

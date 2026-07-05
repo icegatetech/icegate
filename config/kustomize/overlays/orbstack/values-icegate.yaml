@@ -16,7 +16,7 @@ storage:
   s3:
     bucket: warehouse
     region: us-east-1
-    endpoint: http://minio.infra.svc.cluster.local.:9000
+    endpoint: http://rustfs-svc.infra.svc.cluster.local.:9000
 
 ## AWS credentials from existing Secret
 ## Secret keys: aws-access-key-id, aws-secret-access-key (per _helpers.tpl:152-162)
@@ -48,7 +48,7 @@ query:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
+      - http://rustfs-svc.infra.svc.cluster.local.:9000/health/ready
   loki:
     enabled: true
     port: 3100
@@ -78,7 +78,7 @@ ingest:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
+      - http://rustfs-svc.infra.svc.cluster.local.:9000/health/ready
   otlpHttp:
     enabled: true
     port: 4318
@@ -92,7 +92,7 @@ ingest:
   shift:
     jobsmanager:
       storage:
-        endpoint: http://minio.infra.svc.cluster.local.:9000
+        endpoint: http://rustfs-svc.infra.svc.cluster.local.:9000
         bucket: jobs
         prefix: shifter
         useSsl: false
@@ -124,4 +124,4 @@ migrate:
   waitForDependencies:
     enabled: true
     endpoints:
-      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
+      - http://rustfs-svc.infra.svc.cluster.local.:9000/health/ready

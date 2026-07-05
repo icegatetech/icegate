@@ -52,7 +52,7 @@ storage:
   s3:
     bucket: warehouse
     region: us-east-1
-    ## Optional S3-compatible endpoint (e.g. MinIO). Omit for real AWS S3.
+    ## Optional S3-compatible endpoint (e.g. RustFS). Omit for real AWS S3.
     endpoint: ""
 
 ## Queue (WAL) configuration (shared by query and ingest)
@@ -211,7 +211,7 @@ query:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Query starts only when all return 2xx.
     endpoints: []
-    #  - http://minio:9000/minio/health/ready
+    #  - http://rustfs-svc:9000/health/ready
 
   ## Liveness and readiness probe overrides
   livenessProbe:
@@ -368,7 +368,7 @@ ingest:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Ingest starts only when all return 2xx.
     endpoints: []
-    #  - http://minio:9000/minio/health/ready
+    #  - http://rustfs-svc:9000/health/ready
 
   ## Liveness and readiness probe overrides
   livenessProbe:
@@ -601,7 +601,7 @@ maintain:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Compaction starts only when all return 2xx.
     endpoints: []
-    #  - http://minio:9000/minio/health/ready
+    #  - http://rustfs-svc:9000/health/ready
 
 ## ---------------------------------------------------------------------------
 ## ServiceMonitor (Prometheus Operator)

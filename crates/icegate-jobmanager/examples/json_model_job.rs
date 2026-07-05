@@ -30,8 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup Storage
     let s3_config = S3StorageConfig {
         endpoint: "http://localhost:9000".to_string(),
-        access_key_id: "minioadmin".to_string(),
-        secret_access_key: "minioadmin".to_string(),
+        access_key_id: "rustfsadmin".to_string(),
+        secret_access_key: "rustfsadmin".to_string(),
         bucket_name: "jobs".to_string(),
         use_ssl: false,
         region: "us-east-1".to_string(),

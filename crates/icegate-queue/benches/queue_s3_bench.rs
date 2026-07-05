@@ -1,11 +1,11 @@
-//! Queue benchmarks with `MinIO` for S3 operations.
+//! Queue benchmarks with an S3-compatible object store for S3 operations.
 //!
 //! Benchmarks cover:
 //! 1. Write performance (small batches, large batches, concurrent topics)
 //! 2. Read performance (list segments, read single segment, plan segments)
 //! 3. End-to-end (write then read)
 //!
-//! A single `MinIO` container is shared across all benchmark groups to avoid
+//! A single object-storage container is shared across all benchmark groups to avoid
 //! repeated container startup overhead.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout, missing_docs)]
@@ -15,7 +15,7 @@ use std::{sync::Arc, time::Duration};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
-use icegate_common::testing::{MinIOContainer, create_s3_bucket, create_s3_object_store};
+use icegate_common::testing::{S3TestContainer, create_s3_bucket, create_s3_object_store};
 use icegate_queue::{
     NoopQueueWriterEvents, ParquetQueueReader, PreparedWalRowGroup, QueueConfig, QueueWriter, WriteRequest, channel,
 };
@@ -25,14 +25,14 @@ use tokio_util::sync::CancellationToken;
 mod common;
 use common::data::{generate_batches_for_throughput, generate_batches_with_grouping};
 
-/// Helper to setup `MinIO`, create bucket, and return object store.
-async fn setup_minio_and_bucket(bucket_name: &str) -> (MinIOContainer, Arc<dyn object_store::ObjectStore>) {
-    let minio = MinIOContainer::start().await.expect("Failed to start MinIO");
-    create_s3_bucket(minio.endpoint(), bucket_name)
+/// Helper to setup object store, create bucket, and return object store.
+async fn setup_object_store_and_bucket(bucket_name: &str) -> (S3TestContainer, Arc<dyn object_store::ObjectStore>) {
+    let store_container = S3TestContainer::start().await.expect("Failed to start object storage");
+    create_s3_bucket(store_container.endpoint(), bucket_name)
         .await
         .expect("Failed to create bucket");
-    let store = create_s3_object_store(minio.endpoint(), bucket_name).expect("Failed to create object store");
-    (minio, store)
+    let store = create_s3_object_store(store_container.endpoint(), bucket_name).expect("Failed to create object store");
+    (store_container, store)
 }
 
 /// Helper to start queue writer and return writer handle and write channel.
@@ -61,15 +61,15 @@ async fn write_batch(tx: &icegate_queue::WriteChannel, topic: &str, batch: arrow
     response_rx.await.expect("Failed to receive write result");
 }
 
-/// All queue benchmarks sharing a single `MinIO` container.
+/// All queue benchmarks sharing a single object-storage container.
 fn queue_benchmarks(c: &mut Criterion) {
     /// Counter for unique e2e topic names across iterations.
     static E2E_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Single MinIO container for all benchmark groups
-    let (minio, store) = rt.block_on(async { setup_minio_and_bucket("bench").await });
+    // Single object-storage container for all benchmark groups
+    let (store_container, store) = rt.block_on(async { setup_object_store_and_bucket("bench").await });
 
     // --- Group 1: Write Performance ---
     {
@@ -236,9 +236,9 @@ fn queue_benchmarks(c: &mut Criterion) {
         drop(group);
     }
 
-    // Cleanup: drop MinIO within the runtime context
+    // Cleanup: drop the object store container within the runtime context
     rt.block_on(async {
-        drop(minio);
+        drop(store_container);
     });
 }
 

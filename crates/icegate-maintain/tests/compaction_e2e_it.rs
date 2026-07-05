@@ -1,5 +1,5 @@
 //! End-to-end integration test for the compaction [`Compactor`] service against
-//! `MinIO` (§13).
+//! the object store (§13).
 //!
 //! Seeds a `logs` table with SIX small, internally-sorted data files in ONE
 //! `(tenant, day)` partition, each committed in its own `fast_append` so they
@@ -17,10 +17,10 @@
 //! * the post-compaction files' `[min_key, max_key]` sort-key ranges are
 //!   pairwise NON-overlapping.
 //!
-//! Marked `#[ignore]`; run with Docker available:
+//! Requires Docker (a prerequisite):
 //!
 //! ```text
-//! cargo test -p icegate-maintain --test compaction_e2e_it -- --ignored --nocapture
+//! cargo test -p icegate-maintain --test compaction_e2e_it -- --nocapture
 //! ```
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
@@ -51,7 +51,7 @@ use icegate_common::catalog::IoHandle;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_common::testing::{MinIOContainer, create_s3_bucket};
+use icegate_common::testing::{S3TestContainer, create_s3_bucket};
 use icegate_maintain::compact::config::{CompactionConfig, CompactionJobsManagerConfig, JobsStorageConfig};
 use icegate_maintain::compact::{Compactor, CompactorHandle};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -74,28 +74,28 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Interval between data-file-count polls while waiting for the cycle to land.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Connection parameters for a running `MinIO`.
+/// Connection parameters for a running object store.
 #[derive(Clone)]
-struct MinioConn {
+struct StorageConn {
     endpoint: String,
     access_key: String,
     secret_key: String,
 }
 
-/// Stand up `MinIO` and capture its connection parameters.
-async fn setup_minio() -> (MinIOContainer, MinioConn) {
-    let minio = MinIOContainer::builder().start().await.expect("start MinIO");
-    create_s3_bucket(minio.endpoint(), BUCKET_NAME).await.expect("create bucket");
-    let conn = MinioConn {
-        endpoint: minio.endpoint().to_string(),
-        access_key: minio.username().to_string(),
-        secret_key: minio.password().to_string(),
+/// Stand up object storage and capture its connection parameters.
+async fn setup_object_store() -> (S3TestContainer, StorageConn) {
+    let store = S3TestContainer::start().await.expect("start object storage");
+    create_s3_bucket(store.endpoint(), BUCKET_NAME).await.expect("create bucket");
+    let conn = StorageConn {
+        endpoint: store.endpoint().to_string(),
+        access_key: store.username().to_string(),
+        secret_key: store.password().to_string(),
     };
-    (minio, conn)
+    (store, conn)
 }
 
-/// Build a concrete [`S3Catalog`] against `MinIO` (cribbed from `rewrite_it.rs`).
-async fn build_s3_catalog(conn: &MinioConn) -> S3Catalog {
+/// Build a concrete [`S3Catalog`] against the object store (cribbed from `rewrite_it.rs`).
+async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
     let io = IoHandle::noop();
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("warehouse".to_string(), format!("s3://{BUCKET_NAME}"));
@@ -306,8 +306,8 @@ async fn data_file_count(table: &Table, descriptor: &SortColumnsDescriptor) -> u
 
 /// Build a compaction config that compacts ONLY `logs`, eagerly (so the small
 /// seeded partition is never skipped as healthy), packs the whole partition into
-/// a single rewrite group, and points its job-state storage at `MinIO`.
-fn compaction_config(conn: &MinioConn) -> CompactionConfig {
+/// a single rewrite group, and points its job-state storage at the object store.
+fn compaction_config(conn: &StorageConn) -> CompactionConfig {
     let jobs_storage = JobsStorageConfig {
         endpoint: conn.endpoint.clone(),
         bucket: BUCKET_NAME.to_string(),
@@ -374,9 +374,8 @@ async fn wait_for_file_count_drop(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn compactor_compacts_partition_end_to_end() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
     let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");

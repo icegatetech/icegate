@@ -8,9 +8,10 @@ use std::{
 };
 
 use chrono::Duration as ChronoDuration;
+use icegate_common::testing::S3TestContainer;
 use tokio_util::sync::CancellationToken;
 
-use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
+use super::common::manager_env::ManagerEnv;
 use crate::storage::Storage;
 use crate::{
     CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
@@ -26,8 +27,8 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected_attempts: u32 = 4;
 
-    // 1. Start MinIO
-    let minio_env = MinIOEnv::new().await?;
+    // 1. Start object storage
+    let store = S3TestContainer::start().await?;
 
     // 2. Track task execution attempts
     let attempt_count = Arc::new(AtomicU32::new(0));
@@ -71,9 +72,9 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Arc::new(
         S3Storage::new(
             S3StorageConfig {
-                endpoint: minio_env.endpoint().to_string(),
-                access_key_id: minio_env.username().to_string(),
-                secret_access_key: minio_env.password().to_string(),
+                endpoint: store.endpoint().to_string(),
+                access_key_id: store.username().to_string(),
+                secret_access_key: store.password().to_string(),
                 bucket_name: "test-jobs".to_string(),
                 use_ssl: false,
                 region: "us-east-1".to_string(),

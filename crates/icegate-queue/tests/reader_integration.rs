@@ -1,4 +1,4 @@
-//! Integration tests for `ParquetQueueReader` with MinIO/S3.
+//! Integration tests for `ParquetQueueReader` with an S3-compatible object store.
 
 mod common;
 
@@ -372,7 +372,7 @@ impl ObjectStore for DelayedObjectStore {
 
 #[tokio::test]
 async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write 5 segments
     let config = QueueConfig::new("queue");
@@ -413,7 +413,7 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write 5 segments (offsets 0-4)
     let config = QueueConfig::new("queue");
@@ -453,7 +453,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
 
 #[tokio::test]
 async fn test_list_empty_topic() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let reader = ParquetQueueReader::new("queue", store, 8192)?;
     let cancel = CancellationToken::new();
@@ -465,7 +465,7 @@ async fn test_list_empty_topic() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write phase
     let config = QueueConfig::new("queue");
@@ -511,7 +511,7 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_read_segment_uses_configured_record_batch_size() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write phase: one WAL segment with one row group of 25 rows.
     let config = QueueConfig::new("queue");
@@ -556,7 +556,7 @@ async fn test_read_segment_uses_configured_record_batch_size() -> Result<(), Box
 
 #[tokio::test]
 async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write a single segment (will have 1 row group)
     let config = QueueConfig::new("queue");
@@ -600,7 +600,7 @@ async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error
 
 #[tokio::test]
 async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write multiple batches - each batch will have 1 row group
     let config = QueueConfig::new("queue");
@@ -660,7 +660,7 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
 
 #[tokio::test]
 async fn test_plan_segments_parallelism_preserves_plan_result() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+    let (_store, base_store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -758,7 +758,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result() -> Result<(), Bo
 #[tokio::test]
 async fn test_plan_segments_parallelism_preserves_plan_result_with_skewed_metadata_delays()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+    let (_store, base_store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -851,7 +851,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_with_skewed_metada
 #[tokio::test]
 async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metadata_path()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+    let (_store, base_store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue").with_max_row_group_size(2);
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -946,7 +946,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metada
 #[tokio::test]
 async fn test_plan_segments_parallel_fails_fast_on_metadata_error_without_partial_plan()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+    let (_store, base_store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -997,7 +997,7 @@ async fn test_plan_segments_parallel_fails_fast_on_metadata_error_without_partia
 #[tokio::test]
 async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_without_waiting_for_first()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, base_store, _bucket) = common::setup_queue_test().await?;
+    let (_store, base_store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -1058,7 +1058,7 @@ async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_with
 /// stats across row groups.
 #[tokio::test]
 async fn test_plan_segments_extracts_all_three_field_types() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue").with_flush_interval_ms(50);
     let (tx, rx) = channel(config.common.channel_capacity);

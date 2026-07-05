@@ -76,7 +76,7 @@ aws-sdk-s3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Self-reference with `testing` enabled so integration tests under `tests/`
-# can reach `icegate_common::testing` (MinIO container + S3 bucket helpers).
+# can reach `icegate_common::testing` (object-storage container + S3 bucket helpers).
 # Cargo unifies this with the library build for test targets only.
 icegate-common = { path = ".", features = ["testing"] }
 # Parquet-compaction manifest-scan integration test: seed data files via the

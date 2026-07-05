@@ -126,8 +126,8 @@ Once running, the following services are available:
 - **Grafana**: `http://localhost:3000` - Dashboard and visualization (no login required)
 
 #### Infrastructure
-- **MinIO Console**: `http://localhost:9001` - Object storage web interface (login: minioadmin/minioadmin)
-- **MinIO API**: `http://localhost:9000` - S3-compatible object storage API
+- **RustFS Console**: `http://localhost:9001` - Object storage web interface (login: rustfsadmin/rustfsadmin)
+- **RustFS API**: `http://localhost:9000` - S3-compatible object storage API
 
 The default stack uses IceGate's own S3-backed catalog (see [Catalog](#catalog)); no external catalog service is required. A Nessie catalog is started only under the optional `analytics` profile for Trino (see [Additional Profiles](#additional-profiles)).
 

@@ -8,86 +8,20 @@ resources:
   # in values-icegate.yaml). This secret depends on that chart being rendered in
   # the same kustomize build.
   - secret-aws.yaml
+  - job-rustfs-init.yaml
 
 helmGlobals:
   chartHome: ../../../helm
 
 helmCharts:
-  - name: minio
-    repo: https://charts.min.io
-    version: 5.4.0
-    releaseName: minio
+  - name: rustfs
+    repo: https://charts.rustfs.com/
+    version: 0.8.0
+    releaseName: rustfs
     namespace: infra
-    valuesFile: values-minio.yaml
+    valuesFile: values-rustfs.yaml
 
   - name: icegate
     releaseName: icegate
     namespace: icegate
     valuesFile: values-icegate.yaml
-
-# Force namespace on resources from charts that omit metadata.namespace.
-patches:
-  # MinIO → infra
-  - target:
-      name: minio-sa
-      kind: ServiceAccount
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: ConfigMap
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: Secret
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio-console
-      kind: Service
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: PersistentVolumeClaim
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio
-      kind: Deployment
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio-post-job
-      kind: Job
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra
-  - target:
-      name: minio-cluster
-      kind: Probe
-    patch: |
-      - op: add
-        path: /metadata/namespace
-        value: infra

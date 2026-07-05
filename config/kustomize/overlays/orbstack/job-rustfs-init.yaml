@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rustfs-init
+  namespace: infra
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: rustfs-init
+          image: amazon/aws-cli:2.35.15
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: rustfsadmin
+            - name: AWS_SECRET_ACCESS_KEY
+              value: rustfsadmin
+            - name: AWS_REGION
+              value: us-east-1
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              E=http://rustfs-svc.infra.svc.cluster.local:9000
+              until aws --endpoint-url $E s3 ls; do echo waiting for rustfs; sleep 3; done
+              aws --endpoint-url $E s3 mb s3://warehouse || true
+              aws --endpoint-url $E s3 mb s3://queue || true
+              aws --endpoint-url $E s3 mb s3://jobs || true
+              aws --endpoint-url $E s3api put-bucket-lifecycle-configuration --bucket queue \
+                --lifecycle-configuration '{"Rules":[{"ID":"expire-1d","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":1}}]}'

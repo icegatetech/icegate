@@ -5,7 +5,6 @@ use std::sync::OnceLock;
 use tracing_subscriber::{EnvFilter, fmt};
 
 pub mod manager_env;
-pub mod minio_env;
 pub mod storage_wrapper;
 
 pub fn init_tracing() {

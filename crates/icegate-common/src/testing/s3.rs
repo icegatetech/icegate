@@ -1,4 +1,4 @@
-//! AWS S3 client helpers for testing with MinIO.
+//! AWS S3 client helpers for testing with an S3-compatible object store.
 
 use std::{
     sync::Arc,
@@ -12,13 +12,13 @@ use aws_sdk_s3::{
 };
 use object_store::{ObjectStore, aws::AmazonS3Builder};
 
-use super::minio::{MINIO_ROOT_PASSWORD, MINIO_ROOT_USER};
+use super::object_store::{STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY};
 
 /// Create an AWS S3 bucket for testing.
 ///
 /// # Arguments
 ///
-/// * `endpoint` - The S3-compatible endpoint URL (e.g., `MinIO` endpoint)
+/// * `endpoint` - The S3-compatible endpoint URL (e.g., the object store's endpoint)
 /// * `bucket_name` - The name of the bucket to create
 ///
 /// # Errors
@@ -27,8 +27,8 @@ use super::minio::{MINIO_ROOT_PASSWORD, MINIO_ROOT_USER};
 pub async fn create_s3_bucket(endpoint: &str, bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Creating S3 bucket: {}", bucket_name);
 
-    // Configure AWS SDK client for MinIO
-    let creds = Credentials::new(MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, None, None, "static");
+    // Configure AWS SDK client for the object store
+    let creds = Credentials::new(STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY, None, None, "static");
     let shared_config = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .credentials_provider(SharedCredentialsProvider::new(creds))
@@ -65,11 +65,11 @@ pub async fn create_s3_bucket(endpoint: &str, bucket_name: &str) -> Result<(), B
     Ok(())
 }
 
-/// Create an `ObjectStore` configured for S3-compatible storage (e.g., `MinIO`).
+/// Create an `ObjectStore` configured for S3-compatible storage.
 ///
 /// # Arguments
 ///
-/// * `endpoint` - The S3-compatible endpoint URL (e.g., `MinIO` endpoint)
+/// * `endpoint` - The S3-compatible endpoint URL (e.g., the object store's endpoint)
 /// * `bucket` - The bucket name to use
 ///
 /// # Errors
@@ -85,8 +85,8 @@ pub fn create_s3_object_store(
         .with_bucket_name(bucket)
         .with_region("us-east-1")
         .with_endpoint(endpoint)
-        .with_access_key_id(MINIO_ROOT_USER)
-        .with_secret_access_key(MINIO_ROOT_PASSWORD)
+        .with_access_key_id(STORAGE_ACCESS_KEY)
+        .with_secret_access_key(STORAGE_SECRET_KEY)
         .with_allow_http(true)
         .build()?;
 

@@ -5,12 +5,12 @@ catalog:
   properties:
     bucket: warehouse
     region: us-east-1
-    endpoint: http://minio:9000
+    endpoint: http://rustfs:9000
     # Catalog creds are set inline (unlike storage, which uses AWS_* env) to
     # de-risk first run: the catalog's S3 client and its FileIO are a separate
     # path from storage, so explicit dev creds guarantee both are authenticated.
-    access_key_id: minioadmin
-    secret_access_key: minioadmin
+    access_key_id: rustfsadmin
+    secret_access_key: rustfsadmin
   cache:
     memory_size_mb: 1024
     disk_dir: /tmp/icegate/cache
@@ -26,7 +26,7 @@ storage:
   backend: !s3
     bucket: warehouse
     region: us-east-1
-    endpoint: http://minio:9000
+    endpoint: http://rustfs:9000
 
 loki:
   enabled: true

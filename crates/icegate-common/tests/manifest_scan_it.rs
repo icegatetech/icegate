@@ -1,14 +1,14 @@
 //! Integration test for [`icegate_common::list_data_files_with_stats`].
 //!
-//! Stands up `MinIO` and the owned `S3Catalog`, creates the `logs` table, seeds
+//! Stands up an object store and the owned `S3Catalog`, creates the `logs` table, seeds
 //! TWO data files in one `(tenant_id, day)` partition via parquet-write +
 //! `Transaction::fast_append`, then enumerates them with decoded sort-key
 //! bounds and asserts the per-file envelope shape and ordering.
 //!
-//! The `MinIO` + S3 catalog + writer harness is cribbed from the Phase-0
+//! The object store + S3 catalog + writer harness is cribbed from the Phase-0
 //! compaction spike (`icegate-maintain`'s `compaction_replace_spike_test`),
-//! trimmed to seeding and reading. Marked `#[ignore]` because it needs Docker;
-//! run with `cargo test -p icegate-common --test manifest_scan_it -- --ignored`.
+//! trimmed to seeding and reading. Requires Docker (a prerequisite) to run the
+//! object-storage container.
 // Test-only seed harness: small row-index casts to fixed-width byte/timestamp
 // fillers are inherent to building the Arrow batch and cannot overflow at the
 // row counts used here.
@@ -42,7 +42,7 @@ use icegate_common::catalog::IoHandle;
 use icegate_common::list_data_files_with_stats;
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_common::testing::{MinIOContainer, create_s3_bucket};
+use icegate_common::testing::{S3TestContainer, create_s3_bucket};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
@@ -51,29 +51,29 @@ const NAMESPACE: &str = "icegate";
 const TABLE: &str = "logs";
 const TENANT: &str = "tenant-a";
 
-/// Connection parameters for a running MinIO.
-struct MinioConn {
+/// Connection parameters for a running object store.
+struct StorageConn {
     endpoint: String,
     access_key: String,
     secret_key: String,
 }
 
-/// Stand up MinIO and capture its connection parameters. No Nessie: the
+/// Stand up object storage and capture its connection parameters. No Nessie: the
 /// `S3Catalog` stores `root.json` in the same bucket via compare-and-swap.
-async fn setup_minio() -> (MinIOContainer, MinioConn) {
-    let minio = MinIOContainer::builder().start().await.expect("start MinIO");
-    create_s3_bucket(minio.endpoint(), BUCKET_NAME).await.expect("create bucket");
-    let conn = MinioConn {
-        endpoint: minio.endpoint().to_string(),
-        access_key: minio.username().to_string(),
-        secret_key: minio.password().to_string(),
+async fn setup_object_store() -> (S3TestContainer, StorageConn) {
+    let store = S3TestContainer::start().await.expect("start object storage");
+    create_s3_bucket(store.endpoint(), BUCKET_NAME).await.expect("create bucket");
+    let conn = StorageConn {
+        endpoint: store.endpoint().to_string(),
+        access_key: store.username().to_string(),
+        secret_key: store.password().to_string(),
     };
-    (minio, conn)
+    (store, conn)
 }
 
-/// Build a concrete [`S3Catalog`] against MinIO with a `FileIO` over the same
+/// Build a concrete [`S3Catalog`] against the object store with a `FileIO` over the same
 /// OpenDAL S3 backend the production builder uses.
-async fn build_s3_catalog(conn: &MinioConn) -> S3Catalog {
+async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
     let io = IoHandle::noop();
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("warehouse".to_string(), format!("s3://{BUCKET_NAME}"));
@@ -206,9 +206,8 @@ async fn commit_fast_append(catalog: &S3Catalog, ident: &TableIdent, data_files:
 }
 
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn list_data_files_with_stats_enumerates_two_seeded_files() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = build_s3_catalog(&conn).await;
 
     // --- create namespace + logs table -------------------------------------

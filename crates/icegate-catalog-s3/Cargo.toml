@@ -31,8 +31,7 @@ tokio-util = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true, features = ["minio"] }
+icegate-common = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }

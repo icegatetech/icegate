@@ -11,7 +11,7 @@ kustomize/
     ├── skaffold/          # Local development (local Helm chart)
     ├── orbstack/          # Local development (OCI Helm chart)
     ├── external-s3/       # K3s with external S3 + Nessie
-    └── aws-glue/          # AWS with Glue catalog (no MinIO/Nessie)
+    └── aws-glue/          # AWS with Glue catalog (no RustFS/Nessie)
 ```
 
 ## Base
@@ -27,9 +27,9 @@ All observability resources are deployed to the `observability` namespace. Infra
 
 ### `skaffold`
 
-Self-contained local development overlay. Deploys the full stack — IceGate (from the local Helm chart at `config/helm/icegate/`), MinIO, Nessie, and the observability base — so changes to chart templates are picked up immediately without publishing to OCI.
+Self-contained local development overlay. Deploys the full stack — IceGate (from the local Helm chart at `config/helm/icegate/`), RustFS, Nessie, and the observability base — so changes to chart templates are picked up immediately without publishing to OCI.
 
-**Includes:** IceGate (local chart), MinIO (S3-compatible storage), Nessie (Iceberg REST catalog), observability stack, AWS secrets, icegate namespace.
+**Includes:** IceGate (local chart), RustFS (S3-compatible storage), Nessie (Iceberg REST catalog), observability stack, AWS secrets, icegate namespace.
 
 **Deploy (preferred):**
 
@@ -48,7 +48,7 @@ kustomize build --enable-helm config/kustomize/overlays/skaffold | kubectl apply
 
 Local development overlay for OrbStack Kubernetes. Deploys everything via kustomize, including the IceGate chart from the OCI registry (`oci://ghcr.io/icegatetech/charts`).
 
-**Includes:** MinIO, Nessie, IceGate (OCI chart), observability stack, AWS secrets.
+**Includes:** RustFS, Nessie, IceGate (OCI chart), observability stack, AWS secrets.
 
 **Deploy:**
 
@@ -58,7 +58,7 @@ kustomize build --enable-helm config/kustomize/overlays/orbstack | kubectl apply
 
 ### `external-s3`
 
-For K3s clusters with an external S3-compatible endpoint. Runs Nessie locally but does not deploy MinIO — storage points to an external S3 bucket.
+For K3s clusters with an external S3-compatible endpoint. Runs Nessie locally but does not deploy RustFS — storage points to an external S3 bucket.
 
 **Includes:** Nessie, IceGate (OCI chart), observability stack, AWS secrets. Exposes Grafana and Ingest services via Tailscale.
 
@@ -70,7 +70,7 @@ kustomize build --enable-helm config/kustomize/overlays/external-s3 | kubectl ap
 
 ### `aws-glue`
 
-For AWS deployments using Glue as the Iceberg catalog. No MinIO or Nessie — uses real AWS S3 and Glue directly.
+For AWS deployments using Glue as the Iceberg catalog. No RustFS or Nessie — uses real AWS S3 and Glue directly.
 
 **Includes:** IceGate (OCI chart), observability stack, AWS secrets. Exposes Grafana and Ingest services via Tailscale.
 

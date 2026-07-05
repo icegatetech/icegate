@@ -52,5 +52,6 @@ tracing-subscriber = { workspace = true }
 
 
 [dev-dependencies]
-# Testcontainers for MinIO
+# Testcontainers for the object store
 testcontainers = { workspace = true, features = ["blocking"] }
+icegate-common = { workspace = true, features = ["testing"] }

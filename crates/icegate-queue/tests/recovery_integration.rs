@@ -1,4 +1,4 @@
-//! Integration tests for `QueueWriter` offset recovery with MinIO/S3.
+//! Integration tests for `QueueWriter` offset recovery with an S3-compatible object store.
 
 mod common;
 
@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn test_recovery_empty_store() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Create writer and recover on empty store
     let config = QueueConfig::new("queue");
@@ -43,7 +43,7 @@ async fn test_recovery_empty_store() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
     let batch = common::test_batch(10, 1)?;
 
     // First writer: write 3 segments (offsets 0, 1, 2)
@@ -103,7 +103,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
 
 #[tokio::test]
 async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
     let batch = common::test_batch(10, 1)?;
 
     // First writer: write to multiple topics
@@ -227,7 +227,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
 
 #[tokio::test]
 async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
     let batch = common::test_batch(10, 1)?;
 
     // First writer: write with custom base_path
