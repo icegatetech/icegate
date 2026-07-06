@@ -21,3 +21,20 @@ helmCharts:
     releaseName: icegate
     namespace: icegate
     valuesFile: values-icegate.yaml
+
+patches:
+  # The RustFS chart ships an unconditional `helm.sh/hook: test` Pod
+  # (rustfs-test-connection). kustomize renders hooks via `helm template`, so it
+  # is applied as a plain Pod and fails deploy stabilization by wget-ing RustFS
+  # before it is ready. The chart exposes no flag to disable it, so drop it here.
+  - target:
+      kind: Pod
+      name: rustfs-test-connection
+      namespace: infra
+    patch: |
+      $patch: delete
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: rustfs-test-connection
+        namespace: infra

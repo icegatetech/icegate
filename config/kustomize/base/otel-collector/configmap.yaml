@@ -99,7 +99,21 @@ data:
                 parse_from: attributes.trace_id
               span_id:
                 parse_from: attributes.span_id
-            output: set-severity
+            output: route-by-shape
+          # Only IceGate's tracing `.json()` logs carry a nested `fields` object.
+          # Other producers scraped from /var/log/pods parse as JSON but have no
+          # `fields`: RustFS pretty-text lines whose continuation happens to start
+          # with `{`, plus Grafana/Prometheus/etc. JSON. Those used to error the
+          # `check-message`/`use-fields` operators below ("cannot fetch message
+          # from <nil>", "field does not exist: attributes.fields"). Route only
+          # `fields`-bearing entries into the IceGate pipeline; everything else
+          # falls through to rename-attributes and is ingested with its body as-is.
+          - type: router
+            id: route-by-shape
+            default: rename-attributes
+            routes:
+              - output: set-severity
+                expr: 'attributes.fields != nil'
           # Map level field to OTEL severity
           - type: severity_parser
             id: set-severity
