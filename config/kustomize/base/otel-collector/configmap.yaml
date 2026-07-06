@@ -226,6 +226,12 @@ data:
           - sources:
               - from: connection
 
+      # KEEP DEFAULT (send_batch_size 8192, no max). Do NOT tune the batch to
+      # work around ingest: IceGate must accept a stock, untuned OpenTelemetry
+      # Collector out of the box so users' default configs work from the start.
+      # If ingest can't process a default-sized OTLP/HTTP batch in time, fix it
+      # in ingest (payload limits / concurrent processing), not here.
+      # See icegatetech/icegate#158.
       batch: {}
 
       # Shared environment/demo labels. Added to both logs and traces.
@@ -260,8 +266,17 @@ data:
             action: upsert
 
     exporters:
+      # KEEP DEFAULT PARAMETERS (no timeout / sending_queue / retry_on_failure /
+      # compression overrides). IceGate must work with a stock, untuned
+      # OpenTelemetry Collector so users' default configurations work from the
+      # start; the fix for large/slow OTLP/HTTP batches belongs in icegate-ingest
+      # (payload limits / concurrent processing), NOT in special-casing this
+      # exporter. See icegatetech/icegate#158.
       otlp_http:
-        endpoint: http://icegate-ingest.icegate.svc.cluster.local.:4318
+        # No trailing dot on the host: the dot defeats ndots DNS search-path
+        # caching and caused intermittent "no such host"/"connection refused"
+        # here. This is an endpoint-correctness fix, not a tuning parameter.
+        endpoint: http://icegate-ingest.icegate.svc.cluster.local:4318
         compression: none
         headers:
           X-Scope-OrgID: demo
