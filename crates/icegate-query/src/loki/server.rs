@@ -2,6 +2,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
+use icegate_common::MemoryPressure;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -27,8 +28,9 @@ pub async fn run(
     config: LokiConfig,
     cancel_token: CancellationToken,
     metrics: Arc<QueryMetrics>,
+    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(engine, config, cancel_token, None, metrics).await
+    run_with_port_tx(engine, config, cancel_token, None, metrics, pressure).await
 }
 
 /// Run the Loki HTTP server with optional port notification
@@ -45,12 +47,13 @@ pub async fn run_with_port_tx(
     cancel_token: CancellationToken,
     port_tx: Option<oneshot::Sender<u16>>,
     metrics: Arc<QueryMetrics>,
+    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
     let state = LokiState { engine, metrics };
 
-    let app = super::routes::routes(state);
+    let app = super::routes::routes(state, pressure);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;

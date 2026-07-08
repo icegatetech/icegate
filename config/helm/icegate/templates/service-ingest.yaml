@@ -1,4 +1,4 @@
-{{- if and .Values.ingest.enabled (or .Values.ingest.otlpGrpc.enabled .Values.ingest.otlpHttp.enabled .Values.ingest.metrics.enabled .Values.ingest.tokioConsole.enabled) -}}
+{{- if and .Values.ingest.enabled (or .Values.ingest.otlpGrpc.enabled .Values.ingest.otlpHttp.enabled .Values.ingest.metrics.enabled) -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -31,12 +31,6 @@ spec:
     - name: metrics
       port: {{ .Values.ingest.metrics.port }}
       targetPort: metrics
-      protocol: TCP
-    {{- end }}
-    {{- if .Values.ingest.tokioConsole.enabled }}
-    - name: tokio-console
-      port: {{ .Values.ingest.tokioConsole.port }}
-      targetPort: tokio-console
       protocol: TCP
     {{- end }}
 {{- end }}

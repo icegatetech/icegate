@@ -13,19 +13,12 @@ repository = { workspace = true }
 [lints]
 workspace = true
 
-[features]
-# Enable the tokio-console instrumentation layer for the ingest binary. Build the
-# image with this feature to profile async task poll times / detect reactor
-# stalls. Requires `--cfg tokio_unstable` (already set in the container images).
-# Off by default (debug/profiling tool with runtime overhead).
-tokio-console = ["icegate-common/tokio-console"]
-
 [[bin]]
 name = "ingest"
 path = "src/main.rs"
 
 [dependencies]
-icegate-common = { workspace = true }
+icegate-common = { workspace = true, features = ["shed-tonic"] }
 icegate-jobmanager = { path = "../icegate-jobmanager" }
 icegate-queue = { path = "../icegate-queue" }
 

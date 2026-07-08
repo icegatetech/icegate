@@ -3,7 +3,9 @@
 use std::{path::PathBuf, sync::Arc};
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, create_object_store, run_metrics_server};
+use icegate_common::{
+    CatalogBuilder, IoHandle, MemoryPressure, MetricsRuntime, create_object_store, run_metrics_server,
+};
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
@@ -62,6 +64,10 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // so the S3 catalog's CAS/transient retry loops abort promptly on SIGINT/
     // SIGTERM instead of running to their retry budget during shutdown.
     let cancel_token = CancellationToken::new();
+
+    // Process-wide memory-pressure guard shared by every server task. Inert
+    // (never sheds) when no finite cgroup limit exists (dev/CI/bare-metal).
+    let pressure = MemoryPressure::spawn(config.memory_pressure.clone(), cancel_token.clone());
 
     // Initialize catalog
     tracing::info!("Initializing catalog");
@@ -133,6 +139,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         &query_metrics,
         metrics_runtime.as_ref(),
         &cancel_token,
+        &pressure,
     );
 
     if handles.is_empty() {
@@ -181,6 +188,7 @@ fn spawn_servers(
     query_metrics: &Arc<QueryMetrics>,
     metrics_runtime: Option<&Arc<MetricsRuntime>>,
     cancel_token: &CancellationToken,
+    pressure: &MemoryPressure,
 ) -> Vec<ServerHandle> {
     let mut handles = Vec::new();
 
@@ -202,8 +210,9 @@ fn spawn_servers(
         let loki_config = config.loki.clone();
         let token = cancel_token.clone();
         let m = Arc::clone(query_metrics);
+        let pressure = pressure.clone();
         handles.push(tokio::spawn(async move {
-            crate::loki::run(engine, loki_config, token, m).await
+            crate::loki::run(engine, loki_config, token, m, pressure).await
         }));
     }
 
@@ -211,8 +220,9 @@ fn spawn_servers(
         let engine = Arc::clone(query_engine);
         let prom_config = config.prometheus.clone();
         let token = cancel_token.clone();
+        let pressure = pressure.clone();
         handles.push(tokio::spawn(async move {
-            crate::prometheus::run(engine, prom_config, token).await
+            crate::prometheus::run(engine, prom_config, token, pressure).await
         }));
     }
 
@@ -220,8 +230,9 @@ fn spawn_servers(
         let engine = Arc::clone(query_engine);
         let tempo_config = config.tempo.clone();
         let token = cancel_token.clone();
+        let pressure = pressure.clone();
         handles.push(tokio::spawn(async move {
-            crate::tempo::run(engine, tempo_config, token).await
+            crate::tempo::run(engine, tempo_config, token, pressure).await
         }));
     }
 
@@ -229,11 +240,12 @@ fn spawn_servers(
         let engine = Arc::clone(query_engine);
         let flight_sql_config = config.flight_sql.clone();
         let token = cancel_token.clone();
+        let pressure = pressure.clone();
         // No `QueryMetrics`: the upstream Flight SQL service owns the
         // request loop and exposes no per-query metrics hook (see
         // `flight_sql::server`).
         handles.push(tokio::spawn(async move {
-            crate::flight_sql::run(engine, flight_sql_config, token).await
+            crate::flight_sql::run(engine, flight_sql_config, token, pressure).await
         }));
     }
 

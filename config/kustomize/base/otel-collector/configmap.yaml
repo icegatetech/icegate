@@ -94,6 +94,11 @@ data:
           # demo datasources.
           - type: json_parser
             id: parse-json-body
+            # Best-effort JSON detection: the `^\{`-only router gate cannot tell
+            # real JSON from `{`-prefixed non-JSON (RustFS/Grafana/etc. lines).
+            # Failures fall through to rename-attributes and are still ingested,
+            # so demote them to debug instead of flooding error logs.
+            on_error: send_quiet
             trace:
               trace_id:
                 parse_from: attributes.trace_id

@@ -14,9 +14,6 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM --platform=$BUILDPLATFORM chef AS builder
 ARG TARGETARCH
-# Optional extra Cargo features, e.g. `icegate-ingest/tokio-console` (set per
-# image in skaffold.yaml). Empty by default — no behaviour change.
-ARG CARGO_FEATURES=""
 
 # Install both cross-compilation toolchains unconditionally.
 # The unused one adds ~60MB but keeps the logic simple and allows
@@ -63,7 +60,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN <<EOF
 set -eu
 RUST_TARGET=$(cat /tmp/rust-target)
-cargo build --release --target "${RUST_TARGET}" --workspace --bins ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+cargo build --release --target "${RUST_TARGET}" --workspace --bins
 mkdir -p /app/output
 cp /app/target/${RUST_TARGET}/release/query    /app/output/
 cp /app/target/${RUST_TARGET}/release/ingest   /app/output/

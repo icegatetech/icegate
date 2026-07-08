@@ -110,6 +110,7 @@ impl TestServer {
                 flight_sql_config,
                 cancel_token_clone,
                 Some(port_tx),
+                icegate_common::MemoryPressure::inert(),
             )
             .await
             .unwrap();

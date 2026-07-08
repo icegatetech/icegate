@@ -6,7 +6,8 @@
 use std::path::Path;
 
 use icegate_common::{
-    CatalogConfig, MetricsConfig, StorageConfig, TracingConfig, check_port_conflicts, load_config_file,
+    CatalogConfig, MemoryPressureConfig, MetricsConfig, StorageConfig, TracingConfig, check_port_conflicts,
+    load_config_file,
 };
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,9 @@ pub struct QueryConfig {
     /// Prometheus metrics configuration
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Memory-pressure request-shedding guard configuration
+    #[serde(default)]
+    pub memory_pressure: MemoryPressureConfig,
 }
 
 impl QueryConfig {
@@ -85,6 +89,7 @@ impl QueryConfig {
         self.flight_sql.validate()?;
         self.tracing.validate()?;
         self.metrics.validate()?;
+        self.memory_pressure.validate()?;
 
         // Check for port conflicts among enabled servers
         check_port_conflicts(&[
@@ -96,5 +101,30 @@ impl QueryConfig {
         ])?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::QueryError;
+
+    /// An out-of-range watermark must surface through `QueryConfig::validate`
+    /// as a `CommonError::Config` mapped to `QueryError::Config`. The `expect`
+    /// on the unmutated config proves the failure is attributable solely to
+    /// the `memory_pressure` block, not an unrelated default.
+    #[test]
+    fn invalid_memory_pressure_watermark_is_rejected() {
+        let mut config = QueryConfig::default();
+        // `QueryConfig::default()` is not valid as-is: `queue.common.base_path`
+        // is empty and `tracing` defaults to enabled without an OTLP endpoint.
+        // Satisfy both so the baseline validates and the only failure the
+        // mutation below can introduce comes from the `memory_pressure` block.
+        config.queue.common.base_path = "s3://warehouse/queue".to_string();
+        config.tracing.enabled = false;
+        config.validate().expect("baseline config should validate");
+        // 0 < low < high <= 1 is violated: high > 1.0.
+        config.memory_pressure.high_watermark = 1.5;
+        assert!(matches!(config.validate(), Err(QueryError::Config(_))));
     }
 }

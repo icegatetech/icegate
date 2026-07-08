@@ -18,7 +18,7 @@ name = "query"
 path = "src/main.rs"
 
 [dependencies]
-icegate-common = { workspace = true }
+icegate-common = { workspace = true, features = ["shed-tonic"] }
 icegate-queue = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }
@@ -98,3 +98,4 @@ reqwest = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

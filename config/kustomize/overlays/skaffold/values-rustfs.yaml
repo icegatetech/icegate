@@ -32,6 +32,11 @@ config:
   rustfs:
     # Disable the logs PVC for dev (only the data PVC remains).
     obs_log_directory: ""
+    # With obs_log_directory empty, RustFS logs every request as an info-level
+    # JSON line to stdout; the OTLP collector ships those to Loki (millions of
+    # lines/hour under WAL churn). warn drops the per-request info flood while
+    # keeping warnings and errors. Maps to RUSTFS_OBS_LOGGER_LEVEL (RUST_LOG syntax).
+    log_level: "warn"
     # Push object-store metrics to the cluster OTLP collector (RustFS exposes no
     # Prometheus scrape endpoint / ServiceMonitor).
     obs_endpoint:

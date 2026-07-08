@@ -5,8 +5,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-#[cfg(feature = "tokio-console")]
-use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use opentelemetry::global;
@@ -33,39 +31,10 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use crate::error::{CommonError, Result};
 
 /// Build the default event filter for the fmt and `OTel` layers: honor `RUST_LOG`
-/// if set, otherwise `info`. Applied as a *per-layer* filter (not a global one)
-/// so the optional tokio-console layer can bypass it and still receive tokio's
-/// `TRACE`-level task/runtime events.
+/// if set, otherwise `info`. Applied as a *per-layer* filter so the fmt and `OTel`
+/// layers each carry their own filtering independently.
 fn default_env_filter() -> tracing_subscriber::EnvFilter {
     tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
-}
-
-/// Spawn the tokio-console gRPC server (a background task) and return its
-/// `tracing` layer. Added to the registry without an app-level filter so it
-/// receives tokio's `TRACE`-level task/runtime events; the fmt and `OTel` layers
-/// carry their own per-layer filters and are unaffected.
-///
-/// Binds `0.0.0.0:6669` so a `tokio-console` client can reach it across the pod
-/// boundary. Requires the binary to be built with `--cfg tokio_unstable` (set in
-/// the container images) and tokio's `tracing` feature. Gated by the
-/// `tokio-console` cargo feature.
-#[cfg(feature = "tokio-console")]
-fn spawn_tokio_console_layer<S>() -> impl Layer<S>
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-{
-    // Honor `TOKIO_CONSOLE_BIND` (set from the Helm chart's
-    // `ingest.tokioConsole.port`) so the served port always matches the exposed
-    // container/Service port. Fall back to all interfaces on the conventional
-    // tokio-console port so a client can reach it across the pod boundary.
-    let addr = std::env::var("TOKIO_CONSOLE_BIND")
-        .ok()
-        .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
-        .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 6669)));
-    console_subscriber::ConsoleLayer::builder()
-        .server_addr(addr)
-        .retention(Duration::from_mins(3))
-        .spawn()
 }
 
 /// `OpenTelemetry` tracing configuration.
@@ -364,10 +333,7 @@ impl Visit for JsonValueVisitor {
 pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
     // If tracing is disabled, just initialize basic logging without OpenTelemetry
     if !config.enabled {
-        let registry = tracing_subscriber::registry();
-        #[cfg(feature = "tokio-console")]
-        let registry = registry.with(spawn_tokio_console_layer());
-        registry
+        tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
                     .event_format(TraceContextJsonFormatter)
@@ -439,10 +405,7 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
     // `config/kustomize/base/otel-collector/configmap.yaml`) then
     // lifts those JSON fields into the OTLP log record's dedicated
     // trace context fields, completing the trace ↔ logs correlation.
-    let registry = tracing_subscriber::registry();
-    #[cfg(feature = "tokio-console")]
-    let registry = registry.with(spawn_tokio_console_layer());
-    registry
+    tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .event_format(TraceContextJsonFormatter)

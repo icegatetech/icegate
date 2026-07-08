@@ -335,15 +335,6 @@ ingest:
     port: 9091
     path: /metrics
 
-  ## tokio-console instrumentation server (async task debugger / profiler).
-  ## Off by default: requires the ingest image built with the
-  ## `icegate-ingest/tokio-console` cargo feature (see skaffold.yaml
-  ## `CARGO_FEATURES`) and adds runtime overhead. When enabled, exposes the
-  ## console gRPC server on this port for a `tokio-console` client.
-  tokioConsole:
-    enabled: false
-    port: 6669
-
   ## OpenTelemetry tracing
   tracing:
     enabled: true

@@ -90,12 +90,6 @@ ingest:
   otlpGrpc:
     enabled: true
     port: 4317
-  ## tokio-console async task debugger. Ingest image is built with the
-  ## icegate-ingest/tokio-console feature (skaffold.yaml CARGO_FEATURES, shared
-  ## across profiles); this exposes its server on port 6669.
-  tokioConsole:
-    enabled: true
-    port: 6669
   tracing:
     enabled: true
     otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317

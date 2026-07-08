@@ -94,9 +94,6 @@ ingest:
   otlpGrpc:
     enabled: true
     port: 4317
-  tokioConsole:
-    enabled: true
-    port: 6669
   tracing:
     enabled: true
     otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317

@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 
+use icegate_common::MemoryPressure;
 use icegate_queue::WriteChannel;
 use tokio_util::sync::CancellationToken;
 
@@ -33,6 +34,7 @@ pub async fn run(
     metrics: OtlpMetrics,
     config: OtlpHttpConfig,
     cancel_token: CancellationToken,
+    memory_pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
@@ -43,7 +45,7 @@ pub async fn run(
         metrics,
     };
 
-    let app = super::routes::routes(state, config.max_body_bytes);
+    let app = super::routes::routes(state, config.max_body_bytes, memory_pressure);
 
     tracing::info!("OTLP HTTP server listening on {}", addr);
 

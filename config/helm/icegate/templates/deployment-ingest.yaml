@@ -53,21 +53,12 @@ spec:
               containerPort: {{ .Values.ingest.metrics.port }}
               protocol: TCP
             {{- end }}
-            {{- if .Values.ingest.tokioConsole.enabled }}
-            - name: tokio-console
-              containerPort: {{ .Values.ingest.tokioConsole.port }}
-              protocol: TCP
-            {{- end }}
           env:
             {{- include "icegate.awsEnv" . | nindent 12 }}
             - name: RUST_LOG
               value: {{ .Values.ingest.rustLog | quote }}
             - name: OTEL_SERVICE_NAME
               value: icegate-ingest
-            {{- if .Values.ingest.tokioConsole.enabled }}
-            - name: TOKIO_CONSOLE_BIND
-              value: "0.0.0.0:{{ .Values.ingest.tokioConsole.port }}"
-            {{- end }}
             {{- with .Values.ingest.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

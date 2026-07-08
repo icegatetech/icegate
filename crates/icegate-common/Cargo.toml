@@ -15,11 +15,9 @@ workspace = true
 
 [features]
 testing = ["testcontainers", "aws-config", "aws-sdk-s3"]
-# Enable the tokio-console instrumentation layer in `init_tracing`. Requires the
-# binary to be built with `--cfg tokio_unstable` (already set in the container
-# images) and tokio's `tracing` feature. Off by default: it is a debug/profiling
-# tool with runtime overhead, opted into for a purpose-built image.
-tokio-console = ["dep:console-subscriber"]
+# gRPC request-shedding interceptor. Only `icegate-query`/`icegate-ingest` (which
+# already depend on tonic) opt in; keeps `icegate-maintain`/jobmanager off tonic.
+shed-tonic = ["dep:tonic"]
 
 [dependencies]
 # Iceberg
@@ -69,16 +67,12 @@ opentelemetry-resource-detectors = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-prometheus = { workspace = true }
 prometheus = { workspace = true }
+# gRPC adapter only (feature `shed-tonic`); workspace pins 0.14.
+tonic = { workspace = true, optional = true }
 
 # OpenTelemetry tracing
 tracing-opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
-
-# tokio-console instrumentation (optional; enabled by the `tokio-console` feature).
-# Requires `--cfg tokio_unstable` at build time and tokio's `tracing` feature.
-# 0.5 tracks console-api 0.9 — must match the `tokio-console` CLIENT (0.1.14+
-# needs console-api ^0.9); an older server returns gRPC UNIMPLEMENTED to the client.
-console-subscriber = { version = "0.5", optional = true }
 
 # Testing utilities (optional feature)
 testcontainers = { workspace = true, optional = true }
@@ -89,9 +83,11 @@ aws-sdk-s3 = { workspace = true, optional = true }
 # Self-reference with `testing` enabled so integration tests under `tests/`
 # can reach `icegate_common::testing` (object-storage container + S3 bucket helpers).
 # Cargo unifies this with the library build for test targets only.
-icegate-common = { path = ".", features = ["testing"] }
+icegate-common = { path = ".", features = ["testing", "shed-tonic"] }
 # Parquet-compaction manifest-scan integration test: seed data files via the
 # owned S3 catalog + Iceberg writer, then enumerate them with bounds.
 icegate-catalog-s3 = { workspace = true }
 testcontainers = { workspace = true }
 futures = { workspace = true }
+tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
