@@ -35,7 +35,7 @@ const CONTENT_TYPE_JSON: &str = "application/json";
 /// main runtime at low CPU limits, which stalls every other in-flight request's
 /// ack polling and response write. Smaller bodies decode inline because the
 /// `spawn_blocking` hand-off would cost more than the decode itself (GH-158).
-const DECODE_OFFLOAD_THRESHOLD_BYTES: usize = 0;
+const DECODE_OFFLOAD_THRESHOLD_BYTES: usize = 64 * 1024;
 
 const SIGNAL_LOGS: &str = "logs";
 const SIGNAL_TRACES: &str = "traces";
