@@ -9,6 +9,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG PROFILE=release
+# Optional extra Cargo features for the build, e.g.
+# `--build-arg CARGO_FEATURES=icegate-ingest/tokio-console` to produce a
+# tokio-console-instrumented ingest image. Empty by default (no behaviour change).
+ARG CARGO_FEATURES=""
 # `protobuf-compiler` provides `protoc`; `libprotobuf-dev` ships the
 # well-known `.proto` files (any.proto, empty.proto, ...) imported by
 # the `substrait` build script (transitive of
@@ -18,10 +22,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
 ENV RUSTFLAGS="--cfg tokio_unstable"
-RUN cargo chef cook $([ "$PROFILE" = "release" ] && echo "--release") --recipe-path recipe.json
+RUN cargo chef cook $([ "$PROFILE" = "release" ] && echo "--release") \
+    $([ -n "$CARGO_FEATURES" ] && echo "--features $CARGO_FEATURES") --recipe-path recipe.json
 COPY ./crates ./crates
 COPY Cargo.toml Cargo.lock ./
-RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") --workspace --bins
+RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") \
+    $([ -n "$CARGO_FEATURES" ] && echo "--features $CARGO_FEATURES") --workspace --bins
 
 FROM debian:bookworm-slim
 ARG PROFILE=release

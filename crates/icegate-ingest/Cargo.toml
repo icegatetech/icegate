@@ -13,6 +13,13 @@ repository = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Enable the tokio-console instrumentation layer for the ingest binary. Build the
+# image with this feature to profile async task poll times / detect reactor
+# stalls. Requires `--cfg tokio_unstable` (already set in the container images).
+# Off by default (debug/profiling tool with runtime overhead).
+tokio-console = ["icegate-common/tokio-console"]
+
 [[bin]]
 name = "ingest"
 path = "src/main.rs"
@@ -78,3 +85,6 @@ flate2 = "1"
 zstd = "0.13"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# `test-util` enables the paused-clock (`start_paused`) test runtime used to
+# exercise the WAL ack-timeout backpressure path without real-time waits.
+tokio = { workspace = true, features = ["test-util"] }

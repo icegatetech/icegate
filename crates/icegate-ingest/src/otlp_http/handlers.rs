@@ -29,6 +29,14 @@ const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
 /// Content type for JSON.
 const CONTENT_TYPE_JSON: &str = "application/json";
 
+/// OTLP/HTTP bodies at or above this size decode on the blocking pool instead of
+/// inline on the reactor. A multi-MB protobuf decode would otherwise monopolize
+/// a reactor worker thread — severe head-of-line blocking on the single-thread
+/// main runtime at low CPU limits, which stalls every other in-flight request's
+/// ack polling and response write. Smaller bodies decode inline because the
+/// `spawn_blocking` hand-off would cost more than the decode itself (GH-158).
+const DECODE_OFFLOAD_THRESHOLD_BYTES: usize = 0;
+
 const SIGNAL_LOGS: &str = "logs";
 const SIGNAL_TRACES: &str = "traces";
 const SIGNAL_OPERATIONS: &str = "operations";
@@ -70,13 +78,11 @@ pub async fn ingest_logs(
     let encoding = otlp_encoding_from_content_type(content_type);
     let request_metrics = OtlpRequestRecorder::new(&state.metrics, PROTOCOL_HTTP, SIGNAL_LOGS, encoding);
     request_metrics.record_request_size(body.len());
+    tracing::debug!(bytes = body.len(), "received OTLP/HTTP request");
 
-    // Parse the request based on content type
-    let export_request = request_metrics
-        // TODO(med): Add a check - if the request size is not large, then we do not go into a separate thread. With small volumes, the overhead on the stream will not cover the costs.
-        .record_decode(content_type, || {
-            parse_otlp_request::<ExportLogsServiceRequest>(content_type, &body)
-        })
+    // Decode the request body; large bodies decode off the reactor (see `decode_otlp_body`).
+    let export_request: ExportLogsServiceRequest = decode_otlp_body(&request_metrics, content_type, &body)
+        .await
         .map_err(OtlpError::from)?;
 
     let tenant_id = extract_tenant_id(&headers);
@@ -121,6 +127,39 @@ where
     }
 }
 
+/// Decode an OTLP export body, offloading the CPU-bound decode of large bodies
+/// (>= [`DECODE_OFFLOAD_THRESHOLD_BYTES`]) to the blocking pool so it never
+/// stalls a reactor worker thread. Decode duration, any decode-error reason, and
+/// the terminal request status on failure are recorded via `request_metrics`.
+async fn decode_otlp_body<T>(
+    request_metrics: &OtlpRequestRecorder<'_>,
+    content_type: &str,
+    body: &Bytes,
+) -> Result<T, IngestError>
+where
+    T: prost::Message + Default + serde::de::DeserializeOwned + Send + 'static,
+{
+    let (result, elapsed) = if body.len() >= DECODE_OFFLOAD_THRESHOLD_BYTES {
+        // `Bytes` is reference-counted, so the clone is O(1); `content_type` is
+        // tiny. Both move into the blocking task, which returns the decoded
+        // (owned, `Send`) request together with how long the decode took.
+        let body = body.clone();
+        let content_type = content_type.to_string();
+        tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
+            let result = parse_otlp_request::<T>(&content_type, &body);
+            (result, start.elapsed())
+        })
+        .await
+        .map_err(IngestError::Join)?
+    } else {
+        let start = Instant::now();
+        (parse_otlp_request::<T>(content_type, body), start.elapsed())
+    };
+
+    request_metrics.finish_decode(content_type, elapsed, result)
+}
+
 /// Handle OTLP traces ingestion.
 ///
 /// Supports both Content-Types:
@@ -146,12 +185,11 @@ pub async fn ingest_traces(
     let encoding = otlp_encoding_from_content_type(content_type);
     let request_metrics = OtlpRequestRecorder::new(&state.metrics, PROTOCOL_HTTP, SIGNAL_TRACES, encoding);
     request_metrics.record_request_size(body.len());
+    tracing::debug!(bytes = body.len(), "received OTLP/HTTP request");
 
-    // Parse the request based on content type.
-    let export_request: ExportTraceServiceRequest = request_metrics
-        .record_decode(content_type, || {
-            parse_otlp_request::<ExportTraceServiceRequest>(content_type, &body)
-        })
+    // Decode the request body; large bodies decode off the reactor (see `decode_otlp_body`).
+    let export_request: ExportTraceServiceRequest = decode_otlp_body(&request_metrics, content_type, &body)
+        .await
         .map_err(OtlpError::from)?;
 
     let tenant_id = extract_tenant_id(&headers);
@@ -252,11 +290,11 @@ pub async fn ingest_metrics(
     let encoding = otlp_encoding_from_content_type(content_type);
     let request_metrics = OtlpRequestRecorder::new(&state.metrics, PROTOCOL_HTTP, SIGNAL_METRICS, encoding);
     request_metrics.record_request_size(body.len());
+    tracing::debug!(bytes = body.len(), "received OTLP/HTTP request");
 
-    let export_request: ExportMetricsServiceRequest = request_metrics
-        .record_decode(content_type, || {
-            parse_otlp_request::<ExportMetricsServiceRequest>(content_type, &body)
-        })
+    // Decode the request body; large bodies decode off the reactor (see `decode_otlp_body`).
+    let export_request: ExportMetricsServiceRequest = decode_otlp_body(&request_metrics, content_type, &body)
+        .await
         .map_err(OtlpError::from)?;
 
     let tenant_id = extract_tenant_id(&headers);
@@ -893,5 +931,102 @@ mod tests {
             .expect("http response");
         writer.await.expect("writer task");
         assert!(response.0.partial_success.is_none());
+    }
+
+    /// Number of log records used to build a body above the decode-offload threshold.
+    const LARGE_LOGS_RECORD_COUNT: usize = 4000;
+
+    /// Build a logs request whose encoded protobuf comfortably exceeds
+    /// [`DECODE_OFFLOAD_THRESHOLD_BYTES`], exercising the blocking-pool decode path.
+    fn large_logs_request() -> ExportLogsServiceRequest {
+        let log_records = (0..LARGE_LOGS_RECORD_COUNT)
+            .map(|i| LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                observed_time_unix_nano: 1_700_000_000_000_000_000,
+                severity_number: 9,
+                severity_text: "INFO".to_string(),
+                body: Some(AnyValue {
+                    value: Some(Value::StringValue(format!("log message number {i} with filler text"))),
+                }),
+                attributes: vec![],
+                dropped_attributes_count: 0,
+                flags: 0,
+                trace_id: vec![0; 16],
+                span_id: vec![0; 8],
+                event_name: String::new(),
+            })
+            .collect();
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_logs_decodes_large_offloaded_body() {
+        // A body above the offload threshold decodes on the blocking pool and
+        // still writes every record through to the WAL.
+        let body = Bytes::from(large_logs_request().encode_to_vec());
+        assert!(
+            body.len() >= DECODE_OFFLOAD_THRESHOLD_BYTES,
+            "fixture must exceed the offload threshold to exercise the blocking-pool path"
+        );
+
+        let (tx, mut rx) = channel(1);
+        let writer = tokio::spawn(async move {
+            let request = rx.recv().await.expect("write request");
+            let rows = request.row_groups.iter().map(|rg| rg.batch.num_rows()).sum::<usize>();
+            request.response_tx.send(WriteResult::success(1, rows, None)).expect("ack");
+            rows
+        });
+
+        let response = ingest_logs(State(test_state(tx)), HeaderMap::new(), body)
+            .await
+            .expect("http ok");
+        let rows = writer.await.expect("writer task");
+
+        assert!(response.0.partial_success.is_none());
+        assert_eq!(rows, LARGE_LOGS_RECORD_COUNT);
+    }
+
+    #[tokio::test]
+    async fn ingest_logs_sheds_load_when_wal_channel_is_full() {
+        // Occupy the single channel slot so the handler's `try_send` observes a
+        // full channel and sheds load with a retryable `QueueFull` (429) instead
+        // of blocking. `_rx` stays alive to keep the slot occupied.
+        let (tx, _rx) = channel(1);
+        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
+        tx.try_send(icegate_queue::WriteRequest {
+            topic: String::new(),
+            row_groups: Vec::new(),
+            response_tx: resp_tx,
+            trace_context: None,
+        })
+        .expect("prefill channel slot");
+
+        let result = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request()).await;
+
+        assert!(matches!(result, Err(OtlpError(IngestError::QueueFull))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ingest_logs_times_out_when_wal_never_acks() {
+        // The handler enqueues but no writer ever acks. Under the paused clock the
+        // bounded `wait_for_ack` auto-advances to its deadline and sheds load with
+        // a retryable `AckTimeout` (503). `_rx` stays alive so the enqueued
+        // request's `response_tx` is not dropped (which would surface as a receive
+        // error rather than the timeout under test).
+        let (tx, _rx) = channel(1);
+
+        let result = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request()).await;
+
+        assert!(matches!(result, Err(OtlpError(IngestError::AckTimeout))));
     }
 }

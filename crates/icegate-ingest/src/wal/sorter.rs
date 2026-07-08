@@ -655,7 +655,7 @@ mod tests {
         let prepared = sort_logs(&batch, 4, Some("trace-request".to_string()))
             .expect("prepare wal write")
             .expect("prepared wal write");
-        let pending = submit_sorted_rows_to_wal(&tx, prepared).await.expect("submit wal write");
+        let pending = submit_sorted_rows_to_wal(&tx, prepared).expect("submit wal write");
         let summary = match pending.wait_for_ack().await.expect("wait for wal ack") {
             WalAckOutcome::Success(summary) => summary,
             WalAckOutcome::Partial(_) => panic!("unexpected partial wal write"),
@@ -686,7 +686,7 @@ mod tests {
         let prepared = sort_logs(&batch, 4, Some("trace-request".to_string()))
             .expect("prepare wal write")
             .expect("prepared wal write");
-        let pending = submit_sorted_rows_to_wal(&tx, prepared).await.expect("submit wal write");
+        let pending = submit_sorted_rows_to_wal(&tx, prepared).expect("submit wal write");
         let outcome = pending.wait_for_ack().await.expect("wait for wal ack");
         writer.await.expect("writer task");
 

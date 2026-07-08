@@ -26,6 +26,9 @@ build:
         dockerfile: config/docker/release.Dockerfile
         buildArgs:
           BINARY: ingest
+          # Compile the tokio-console instrumentation into the ingest binary.
+          # Pairs with ingest.tokioConsole.enabled in the skaffold overlay values.
+          CARGO_FEATURES: icegate-ingest/tokio-console
         target: runtime
     - image: ghcr.io/icegatetech/icegate-maintain
       context: .

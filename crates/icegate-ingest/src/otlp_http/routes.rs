@@ -1,13 +1,21 @@
 //! OTLP HTTP API routes
 
 use axum::{
-    Router,
-    extract::DefaultBodyLimit,
+    Json, Router,
+    extract::{DefaultBodyLimit, Request},
+    http::{StatusCode, header::CONTENT_LENGTH},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures::StreamExt;
 use tower_http::decompression::RequestDecompressionLayer;
 
-use super::{handlers, server::OtlpHttpState};
+use super::{
+    handlers,
+    models::{ErrorResponse, ErrorType},
+    server::OtlpHttpState,
+};
 
 /// Create OTLP HTTP API router.
 ///
@@ -16,10 +24,12 @@ use super::{handlers, server::OtlpHttpState};
 /// This matches the `OpenTelemetry` Collector's default behaviour of sending
 /// gzip-compressed payloads.
 ///
-/// `max_body_bytes` caps the size of the decompressed request body. Requests larger than
-/// this limit are rejected with HTTP 413. Axum's framework default is 2 `MiB`, which is below
-/// realistic OTLP batch sizes; we raise it to a service-level value (see
-/// [`OtlpHttpConfig::max_body_bytes`](super::OtlpHttpConfig)).
+/// `max_body_bytes` caps the size of the decompressed request body. Requests
+/// larger than this limit are rejected with HTTP 413. A request whose declared
+/// `Content-Length` already exceeds the limit is rejected *gracefully* by
+/// [`reject_oversized_body`] (the body is drained first so the client reads the
+/// 413 instead of a connection reset); [`DefaultBodyLimit`] remains the enforcing
+/// safety net for the decompressed body and for chunked requests.
 pub fn routes(state: OtlpHttpState, max_body_bytes: usize) -> Router {
     Router::new()
         // OTLP endpoints (support both protobuf and JSON)
@@ -33,7 +43,63 @@ pub fn routes(state: OtlpHttpState, max_body_bytes: usize) -> Router {
         // *decompressed* payload size (the figure that drives parser memory usage).
         .layer(RequestDecompressionLayer::new())
         .layer(DefaultBodyLimit::max(max_body_bytes))
+        // Outermost: turn an over-limit rejection into a *drained* clean 413
+        // instead of a mid-upload connection reset (GH-158). Runs before the
+        // layers above; within-limit requests fall through untouched.
+        .layer(middleware::from_fn(move |request, next| {
+            reject_oversized_body(request, next, max_body_bytes)
+        }))
         .with_state(state)
+}
+
+/// Reject an OTLP/HTTP request whose declared `Content-Length` exceeds
+/// `max_body_bytes` with a clean HTTP 413.
+///
+/// [`DefaultBodyLimit`] alone returns the 413 *without* consuming the request
+/// body, so on HTTP/1.1 the server closes the connection while the client is
+/// still uploading and the client (e.g. the `OpenTelemetry` Collector's Go
+/// exporter) sees `connection reset by peer` / `EOF` instead of the status —
+/// then reset-retry-storms (GH-158). This middleware drains the request body
+/// (discarding it, in constant memory) so the upload completes and the client
+/// reads the 413, which a stock collector treats as a permanent rejection and
+/// drops. Requests within the limit — or without a `Content-Length` (chunked) —
+/// fall through to the handler, where [`DefaultBodyLimit`] enforces the cap on
+/// the decompressed body.
+async fn reject_oversized_body(request: Request, next: Next, max_body_bytes: usize) -> Response {
+    let declared_len = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+
+    if let Some(len) = declared_len {
+        if len > max_body_bytes {
+            // Drain the body so the client finishes sending and reads our
+            // response instead of seeing a connection reset. Each chunk is
+            // discarded, so memory stays bounded regardless of body size.
+            let mut body = request.into_body().into_data_stream();
+            while let Some(chunk) = body.next().await {
+                if chunk.is_err() {
+                    break; // client hung up mid-upload; nothing left to drain
+                }
+            }
+            tracing::warn!(
+                content_length = len,
+                limit = max_body_bytes,
+                "rejected oversized OTLP/HTTP request with 413"
+            );
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ErrorResponse::new(
+                    ErrorType::BadData,
+                    format!("request body exceeds the {max_body_bytes}-byte limit"),
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
 }
 
 #[cfg(test)]
