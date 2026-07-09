@@ -10,7 +10,8 @@ use std::{
 use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
-use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv};
+use super::common::manager_env::ManagerEnv;
+use super::common::s3_container::S3TestContainer;
 use crate::{
     JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,
@@ -37,8 +38,8 @@ async fn test_simple_job_execution_cbor() -> Result<(), Box<dyn std::error::Erro
 async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dyn std::error::Error>> {
     let max_iterations = 1u64;
 
-    // 1. Start MinIO
-    let minio_env = MinIOEnv::new().await?;
+    // 1. Start object storage
+    let store = S3TestContainer::start().await?;
 
     // 2. Define job with single task
     let executed = Arc::new(AtomicBool::new(false));
@@ -78,9 +79,9 @@ async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dy
     // 4. Create storage
     let storage = S3Storage::new(
         S3StorageConfig {
-            endpoint: minio_env.endpoint().to_string(),
-            access_key_id: minio_env.username().to_string(),
-            secret_access_key: minio_env.password().to_string(),
+            endpoint: store.endpoint().to_string(),
+            access_key_id: store.username().to_string(),
+            secret_access_key: store.password().to_string(),
             bucket_name: "test-jobs".to_string(),
             use_ssl: false,
             region: "us-east-1".to_string(),
@@ -138,8 +139,8 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
 
     let max_iterations = 1u64;
 
-    // 1. Start MinIO
-    let minio_env = MinIOEnv::new().await?;
+    // 1. Start object storage
+    let store = S3TestContainer::start().await?;
 
     // 2. Define job with two sequential tasks
     let first_task_executed = Arc::new(AtomicBool::new(false));
@@ -193,9 +194,9 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Create storage
     let storage = S3Storage::new(
         S3StorageConfig {
-            endpoint: minio_env.endpoint().to_string(),
-            access_key_id: minio_env.username().to_string(),
-            secret_access_key: minio_env.password().to_string(),
+            endpoint: store.endpoint().to_string(),
+            access_key_id: store.username().to_string(),
+            secret_access_key: store.password().to_string(),
             bucket_name: "test-jobs".to_string(),
             use_ssl: false,
             region: "us-east-1".to_string(),

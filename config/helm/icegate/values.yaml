@@ -52,14 +52,22 @@ storage:
   s3:
     bucket: warehouse
     region: us-east-1
-    ## Optional S3-compatible endpoint (e.g. MinIO). Omit for real AWS S3.
+    ## Optional S3-compatible endpoint (e.g. RustFS). Omit for real AWS S3.
     endpoint: ""
 
 ## Queue (WAL) configuration (shared by query and ingest)
 queue:
   common:
     basePath: "s3://queue/"
-    channelCapacity: 1024
+    ## Bounded WAL write-channel depth (in-flight WriteRequests held in memory).
+    ## Kept small on purpose: at 1024 the channel never fills under realistic
+    ## concurrency, so the QueueFull->429 backpressure (GH-158) never engages and
+    ## up to 1024 in-flight Arrow batches accumulate, driving the ingest into an
+    ## OOM crash-loop under sustained load. A small bound caps that memory and
+    ## makes the handler shed load with a retryable 429 (which a stock OTLP
+    ## collector retries) instead of buffering toward OOM. Raise per-overlay only
+    ## with matching memory headroom.
+    channelCapacity: 64
     maxRowGroupSize: 16384
   read:
     ## LRU cache capacity for parsed Parquet metadata (default: 2048).
@@ -211,7 +219,16 @@ query:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Query starts only when all return 2xx.
     endpoints: []
-    #  - http://minio:9000/minio/health/ready
+    #  - http://rustfs-svc:9000/health/ready
+    ## S3 buckets that must exist before startup, polled with an authenticated
+    ## head-bucket (pod AWS creds) against storage.s3.endpoint. RustFS enforces
+    ## SigV4, so bucket existence cannot be checked over anonymous HTTP. Use when
+    ## buckets are created out-of-band (e.g. the rustfs-init Job) so the workload
+    ## does not start before its buckets exist. Requires storage.s3.endpoint.
+    buckets: []
+    #  - warehouse
+    ## Image for the bucket check (must contain the AWS CLI).
+    awsCliImage: amazon/aws-cli:2.35.15
 
   ## Liveness and readiness probe overrides
   livenessProbe:
@@ -300,6 +317,12 @@ ingest:
   otlpHttp:
     enabled: true
     port: 4318
+    ## Max decompressed request body, in bytes (hard limit). A request exceeding
+    ## this is rejected with a clean HTTP 413 — the body is drained first so the
+    ## client receives the status instead of a mid-upload connection reset, and a
+    ## stock OTel Collector treats the 413 as permanent (drops the batch, no
+    ## reset/retry storm). Default 16 MiB. See icegate#158.
+    maxBodyBytes: 16777216
 
   ## OTLP gRPC receiver
   otlpGrpc:
@@ -368,7 +391,16 @@ ingest:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Ingest starts only when all return 2xx.
     endpoints: []
-    #  - http://minio:9000/minio/health/ready
+    #  - http://rustfs-svc:9000/health/ready
+    ## S3 buckets that must exist before startup, polled with an authenticated
+    ## head-bucket (pod AWS creds) against storage.s3.endpoint. RustFS enforces
+    ## SigV4, so bucket existence cannot be checked over anonymous HTTP. Use when
+    ## buckets are created out-of-band (e.g. the rustfs-init Job) so the workload
+    ## does not start before its buckets exist. Requires storage.s3.endpoint.
+    buckets: []
+    #  - warehouse
+    ## Image for the bucket check (must contain the AWS CLI).
+    awsCliImage: amazon/aws-cli:2.35.15
 
   ## Liveness and readiness probe overrides
   livenessProbe:
@@ -417,6 +449,15 @@ migrate:
     ## Endpoints to poll (HTTP GET). Migrate starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
+    ## S3 buckets that must exist before startup, polled with an authenticated
+    ## head-bucket (pod AWS creds) against storage.s3.endpoint. RustFS enforces
+    ## SigV4, so bucket existence cannot be checked over anonymous HTTP. Use when
+    ## buckets are created out-of-band (e.g. the rustfs-init Job) so the workload
+    ## does not start before its buckets exist. Requires storage.s3.endpoint.
+    buckets: []
+    #  - warehouse
+    ## Image for the bucket check (must contain the AWS CLI).
+    awsCliImage: amazon/aws-cli:2.35.15
 
 ## ---------------------------------------------------------------------------
 ## Maintain component (long-running `maintain run` service)
@@ -601,7 +642,16 @@ maintain:
     image: busybox:1.37
     ## Endpoints to poll (HTTP GET). Compaction starts only when all return 2xx.
     endpoints: []
-    #  - http://minio:9000/minio/health/ready
+    #  - http://rustfs-svc:9000/health/ready
+    ## S3 buckets that must exist before startup, polled with an authenticated
+    ## head-bucket (pod AWS creds) against storage.s3.endpoint. RustFS enforces
+    ## SigV4, so bucket existence cannot be checked over anonymous HTTP. Use when
+    ## buckets are created out-of-band (e.g. the rustfs-init Job) so the workload
+    ## does not start before its buckets exist. Requires storage.s3.endpoint.
+    buckets: []
+    #  - warehouse
+    ## Image for the bucket check (must contain the AWS CLI).
+    awsCliImage: amazon/aws-cli:2.35.15
 
 ## ---------------------------------------------------------------------------
 ## ServiceMonitor (Prometheus Operator)

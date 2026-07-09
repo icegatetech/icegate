@@ -1,153 +1,60 @@
-//! Integration tests for maintain migrate operations
+//! Integration tests for maintain migrate operations.
 //!
-//! Uses testcontainers to run `MinIO` and Iceberg REST catalog containers.
+//! Runs an object-storage container via testcontainers and builds the S3 catalog in-process
+//! (matching the default `backend: !s3` config), so no external catalog service
+//! is required.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::print_stdout,
     clippy::uninlined_format_args,
     clippy::cast_possible_truncation
-)] // Test code can use unwrap/expect and println
+)]
 
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::collections::HashMap;
 
 use icegate_common::{
     CancellationToken,
     catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
-    testing::{MinIOContainer, create_s3_bucket},
+    testing::{S3TestContainer, create_s3_bucket},
 };
 use icegate_maintain::migrate::operations::{MigrationOperation, create_tables, upgrade_schemas};
-use testcontainers::{
-    ContainerAsync, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
-};
 
-/// Counter for generating unique container names
-static CONTAINER_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Shared network name for container-to-container communication
-const NETWORK_NAME: &str = "icegate-test-net";
-
-/// `MinIO` bucket used as the Iceberg warehouse root for the catalog under test.
+/// Object-storage bucket used as the Iceberg warehouse root for the catalog under test.
 const BUCKET_NAME: &str = "warehouse";
 
-/// Setup `MinIO` and Iceberg REST containers
-async fn setup_containers() -> (MinIOContainer, ContainerAsync<GenericImage>, CatalogConfig) {
-    // Start MinIO container on shared network with a unique name
-    // Using an atomic counter to generate unique names across parallel tests
-    let test_id = CONTAINER_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let minio_container_name = format!("minio-{}-{}", std::process::id(), test_id);
-    println!("Starting MinIO container (name: {})...", minio_container_name);
-
-    let minio = MinIOContainer::builder()
-        .network(NETWORK_NAME)
-        .container_name(&minio_container_name)
-        .start()
+/// Start object storage and build an S3-catalog config pointing at it (mirrors the
+/// default `backend: !s3` config and `builder::tests::test_catalog_config`).
+async fn setup_containers() -> (S3TestContainer, CatalogConfig) {
+    let store = S3TestContainer::start()
         .await
-        .expect("Failed to start MinIO container");
-
-    println!(
-        "MinIO started at {} (container name: {})",
-        minio.endpoint(),
-        minio_container_name
-    );
-
-    println!("Creating S3 bucket...");
-    create_s3_bucket(minio.endpoint(), BUCKET_NAME)
+        .expect("Failed to start object-storage container");
+    create_s3_bucket(store.endpoint(), BUCKET_NAME)
         .await
         .expect("Failed to create S3 bucket");
-    println!("S3 bucket created");
-
-    // Start Nessie catalog container (Iceberg REST compatible) on the same
-    // Docker network as MinIO so Nessie can resolve MinIO via container DNS.
-    println!("Starting Nessie catalog container...");
-    // Use container name to reach MinIO via Docker network
-    let s3_internal_endpoint = format!(
-        "{}/",
-        minio
-            .internal_endpoint()
-            .expect("MinIO must be started with a container_name for inter-container DNS")
-    );
-    // External endpoint for clients on the host
-    let s3_external_endpoint = format!("{}/", minio.endpoint());
-    println!("Nessie will connect to S3 at: {} (internal)", s3_internal_endpoint);
-    println!("Clients will access S3 at: {} (external)", s3_external_endpoint);
-
-    // Nessie requires catalog configuration to enable Iceberg REST API
-    // Use dot notation for Quarkus configuration (supported by Nessie)
-    // Use quay.io registry with specific version that has Iceberg REST catalog
-    // Note: with_wait_for must be called before with_network to stay on
-    // GenericImage
-    let nessie_image = GenericImage::new("quay.io/projectnessie/nessie", "0.105.7")
-        .with_exposed_port(19120.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Listening on: http://0.0.0.0:19120"))
-        // Nessie takes time to initialize S3 catalog, increase startup timeout from default 60s
-        .with_startup_timeout(Duration::from_secs(120))
-        .with_network(NETWORK_NAME)
-        // Disable authentication for testing
-        .with_env_var("nessie.server.authentication.enabled", "false")
-        // Configure default warehouse
-        .with_env_var("nessie.catalog.default-warehouse", "warehouse")
-        // Configure warehouse location in S3
-        .with_env_var(
-            "nessie.catalog.warehouses.warehouse.location",
-            format!("s3://{BUCKET_NAME}/"),
-        )
-        // Configure S3 endpoint (internal for Nessie, external for clients)
-        .with_env_var(
-            "nessie.catalog.service.s3.default-options.endpoint",
-            &s3_internal_endpoint,
-        )
-        .with_env_var(
-            "nessie.catalog.service.s3.default-options.external-endpoint",
-            &s3_external_endpoint,
-        )
-        .with_env_var("nessie.catalog.service.s3.default-options.path-style-access", "true")
-        .with_env_var("nessie.catalog.service.s3.default-options.region", "us-east-1")
-        // Configure S3 credentials via secret reference
-        .with_env_var(
-            "nessie.catalog.service.s3.default-options.access-key",
-            "urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key",
-        )
-        .with_env_var("nessie.catalog.secrets.access-key.name", minio.username())
-        .with_env_var("nessie.catalog.secrets.access-key.secret", minio.password())
-        // Disable AWS SDK v2 default checksum calculation for MinIO compatibility
-        // See: https://github.com/aws/aws-sdk-java-v2/discussions/5802
-        .with_env_var("AWS_REQUEST_CHECKSUM_CALCULATION", "WHEN_REQUIRED")
-        .with_env_var("AWS_RESPONSE_CHECKSUM_VALIDATION", "WHEN_REQUIRED");
-
-    let iceberg = nessie_image.start().await.expect("Failed to start Nessie container");
-
-    let nessie_port = iceberg.get_host_port_ipv4(19120).await.expect("Failed to get Nessie port");
-    println!("Nessie catalog started on port {}", nessie_port);
-
-    // Nessie Iceberg REST API base URL (branch is specified via prefix property)
-    let iceberg_base = format!("http://127.0.0.1:{nessie_port}/iceberg");
-
-    // Build catalog config - Nessie REST API is at /iceberg with prefix=main for
-    // branch
-    let mut properties = HashMap::new();
-    properties.insert("prefix".to_string(), "main".to_string());
 
     let config = CatalogConfig {
-        backend: CatalogBackend::Rest { uri: iceberg_base },
+        backend: CatalogBackend::S3 {
+            warehouse: "catalog".to_string(),
+        },
         warehouse: format!("s3://{BUCKET_NAME}/"),
-        properties,
+        properties: HashMap::from([
+            ("bucket".to_string(), BUCKET_NAME.to_string()),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("endpoint".to_string(), store.endpoint().to_string()),
+            ("access_key_id".to_string(), store.username().to_string()),
+            ("secret_access_key".to_string(), store.password().to_string()),
+        ]),
         cache: None,
     };
 
-    (minio, iceberg, config)
+    (store, config)
 }
 
 /// Test that `create_tables` creates all 5 observability tables
 #[tokio::test]
 async fn test_migrate_create_tables() {
-    let (_minio, _iceberg, config) = setup_containers().await;
+    let (_store, config) = setup_containers().await;
 
     println!("Creating catalog with config: {:?}", config);
 
@@ -190,7 +97,7 @@ async fn test_migrate_create_tables() {
 /// create tables
 #[tokio::test]
 async fn test_migrate_create_tables_dry_run() {
-    let (_minio, _iceberg, config) = setup_containers().await;
+    let (_store, config) = setup_containers().await;
 
     let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
         .await
@@ -218,7 +125,7 @@ async fn test_migrate_create_tables_dry_run() {
 /// Test that `create_tables` is idempotent - calling twice returns 0 operations
 #[tokio::test]
 async fn test_migrate_create_tables_idempotent() {
-    let (_minio, _iceberg, config) = setup_containers().await;
+    let (_store, config) = setup_containers().await;
 
     let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
         .await
@@ -244,7 +151,7 @@ async fn test_migrate_create_tables_idempotent() {
 /// Test that `upgrade_schemas` returns 0 operations when schemas are up to date
 #[tokio::test]
 async fn test_migrate_upgrade_schemas() {
-    let (_minio, _iceberg, config) = setup_containers().await;
+    let (_store, config) = setup_containers().await;
 
     let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
         .await

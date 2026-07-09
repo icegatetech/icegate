@@ -1,5 +1,5 @@
 //! Integration test for the compaction REWRITE executor
-//! ([`RewriteExecutor`]) against `MinIO`.
+//! ([`RewriteExecutor`]) against the object store.
 //!
 //! Seeds a `logs` table with several small data files in ONE `(tenant, day)`
 //! partition, each internally sorted by the logs sort order `(service_name ASC,
@@ -14,14 +14,15 @@
 //! * the full row set and the per-key order are identical before vs after the
 //!   rewrite (both read back through the table's parquet and compared).
 //!
-//! Marked `#[ignore]`; run with Docker available:
+//! Requires Docker (a prerequisite):
 //!
 //! ```text
-//! cargo test -p icegate-maintain --test rewrite_it -- --ignored --nocapture
+//! cargo test -p icegate-maintain --test rewrite_it -- --nocapture
 //! ```
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
 
+mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -29,9 +30,9 @@ use arrow::array::{Array, FixedSizeBinaryArray, MapArray, StringArray, StructArr
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
+use common::{build_s3_catalog, setup_object_store};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
-use iceberg::io::FileIOBuilder;
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -42,15 +43,13 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
+use icegate_catalog_s3::S3Catalog;
 use icegate_common::WAL_OFFSET_PROPERTY;
-use icegate_common::catalog::IoHandle;
 use icegate_common::iceberg_write::WriteConfig;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS};
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_common::testing::{MinIOContainer, create_s3_bucket};
 use icegate_maintain::compact::metrics::CompactMetrics;
 use icegate_maintain::compact::rewrite::{RewriteExecutor, RewriteInput, RewriteOutcome};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -58,7 +57,6 @@ use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const BUCKET_NAME: &str = "warehouse";
 const NAMESPACE: &str = "icegate";
 const TABLE: &str = "logs";
 const TENANT: &str = "tenant-a";
@@ -69,56 +67,6 @@ const DAY_MICROS: i64 = 1_749_600_000_000_000;
 /// the tiny seeded data, so the whole rewrite lands in one output file,
 /// exercising the many-to-one happy path.
 const TARGET_FILE_SIZE_BYTES: u64 = 128 * 1024 * 1024;
-
-/// Connection parameters for a running `MinIO`.
-#[derive(Clone)]
-struct MinioConn {
-    endpoint: String,
-    access_key: String,
-    secret_key: String,
-}
-
-/// Stand up `MinIO` and capture its connection parameters.
-async fn setup_minio() -> (MinIOContainer, MinioConn) {
-    let minio = MinIOContainer::builder().start().await.expect("start MinIO");
-    create_s3_bucket(minio.endpoint(), BUCKET_NAME).await.expect("create bucket");
-    let conn = MinioConn {
-        endpoint: minio.endpoint().to_string(),
-        access_key: minio.username().to_string(),
-        secret_key: minio.password().to_string(),
-    };
-    (minio, conn)
-}
-
-/// Build a concrete [`S3Catalog`] against `MinIO`.
-async fn build_s3_catalog(conn: &MinioConn) -> S3Catalog {
-    let io = IoHandle::noop();
-    let mut props: HashMap<String, String> = HashMap::new();
-    props.insert("warehouse".to_string(), format!("s3://{BUCKET_NAME}"));
-    props.insert("s3.endpoint".to_string(), conn.endpoint.clone());
-    props.insert("s3.path-style-access".to_string(), "true".to_string());
-    props.insert("s3.access-key-id".to_string(), conn.access_key.clone());
-    props.insert("s3.secret-access-key".to_string(), conn.secret_key.clone());
-    props.insert("s3.region".to_string(), "us-east-1".to_string());
-    let file_io = FileIOBuilder::new(io.storage_factory()).with_props(props).build();
-
-    S3Catalog::new(
-        S3CatalogConfig {
-            bucket: BUCKET_NAME.to_string(),
-            region: "us-east-1".to_string(),
-            endpoint: Some(conn.endpoint.clone()),
-            access_key_id: Some(conn.access_key.clone()),
-            secret_access_key: Some(conn.secret_key.clone()),
-            warehouse: BUCKET_NAME.to_string(),
-            codec: CatalogCodecKind::Json,
-            ..S3CatalogConfig::default()
-        },
-        file_io,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await
-    .expect("build S3 catalog")
-}
 
 /// Create the namespace and `logs` table, returning the table identifier.
 async fn create_logs_table(catalog: &S3Catalog) -> TableIdent {
@@ -316,9 +264,8 @@ async fn data_file_count(table: &Table, descriptor: &SortColumnsDescriptor) -> u
 }
 
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn rewrite_executor_compacts_partition_preserving_rows_and_order() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
     let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
@@ -460,11 +407,10 @@ async fn rewrite_executor_compacts_partition_preserving_rows_and_order() {
 /// every row. This guards that the upstream-fork `inherit_summary_property`
 /// behaviour the fix relies on does not silently regress on a fork bump.
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn rewrite_carries_wal_offset_property_forward() {
     const SEED_OFFSET: u64 = 4242;
 
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
     let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");

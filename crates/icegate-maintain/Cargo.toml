@@ -70,7 +70,7 @@ tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 icegate-common = { workspace = true, features = ["testing"] }
-# Integration tests seed tables over MinIO through the concrete S3 catalog and
+# Integration tests seed tables over object storage through the concrete S3 catalog and
 # then drive compaction against it as an `Arc<dyn Catalog>`.
 icegate-catalog-s3 = { workspace = true }
 testcontainers = { workspace = true }

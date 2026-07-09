@@ -417,7 +417,8 @@ mod tests {
 
     use super::*;
     use crate::error::CommonError;
-    use crate::testing::{MinIOContainer, create_s3_bucket};
+    use crate::testing::container::{STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY};
+    use crate::testing::{S3TestContainer, create_s3_bucket};
 
     fn test_catalog_config(endpoint: &str, bucket: &str) -> CatalogConfig {
         CatalogConfig {
@@ -429,8 +430,8 @@ mod tests {
                 ("bucket".to_string(), bucket.to_string()),
                 ("region".to_string(), "us-east-1".to_string()),
                 ("endpoint".to_string(), endpoint.to_string()),
-                ("access_key_id".to_string(), "minioadmin".to_string()),
-                ("secret_access_key".to_string(), "minioadmin".to_string()),
+                ("access_key_id".to_string(), STORAGE_ACCESS_KEY.to_string()),
+                ("secret_access_key".to_string(), STORAGE_SECRET_KEY.to_string()),
             ]),
             cache: None,
         }
@@ -451,12 +452,12 @@ mod tests {
 
     #[tokio::test]
     async fn s3_catalog_file_io_reads_with_explicit_credentials() {
-        let minio = MinIOContainer::start().await.expect("start minio");
+        let store = S3TestContainer::start().await.expect("start object storage");
         let bucket = format!("catalog-{}", rand::random::<u64>());
-        create_s3_bucket(minio.endpoint(), &bucket).await.expect("create bucket");
+        create_s3_bucket(store.endpoint(), &bucket).await.expect("create bucket");
 
         let catalog = CatalogBuilder::from_config(
-            &test_catalog_config(minio.endpoint(), &bucket),
+            &test_catalog_config(store.endpoint(), &bucket),
             &IoHandle::noop(),
             CancellationToken::new(),
         )

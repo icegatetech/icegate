@@ -1,5 +1,5 @@
 //! End-to-end integration test for the compaction [`Compactor`] service against
-//! `MinIO` (§13).
+//! the object store (§13).
 //!
 //! Seeds a `logs` table with SIX small, internally-sorted data files in ONE
 //! `(tenant, day)` partition, each committed in its own `fast_append` so they
@@ -17,14 +17,15 @@
 //! * the post-compaction files' `[min_key, max_key]` sort-key ranges are
 //!   pairwise NON-overlapping.
 //!
-//! Marked `#[ignore]`; run with Docker available:
+//! Requires Docker (a prerequisite):
 //!
 //! ```text
-//! cargo test -p icegate-maintain --test compaction_e2e_it -- --ignored --nocapture
+//! cargo test -p icegate-maintain --test compaction_e2e_it -- --nocapture
 //! ```
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
 
+mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,9 +34,9 @@ use arrow::array::{Array, FixedSizeBinaryArray, MapArray, StringArray, StructArr
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
+use common::{BUCKET_NAME, StorageConn, build_s3_catalog, setup_object_store};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
-use iceberg::io::FileIOBuilder;
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -46,19 +47,16 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
-use icegate_common::catalog::IoHandle;
+use icegate_catalog_s3::S3Catalog;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_common::testing::{MinIOContainer, create_s3_bucket};
 use icegate_maintain::compact::config::{CompactionConfig, CompactionJobsManagerConfig, JobsStorageConfig};
 use icegate_maintain::compact::{Compactor, CompactorHandle};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
-const BUCKET_NAME: &str = "warehouse";
 const NAMESPACE: &str = "icegate";
 const TABLE: &str = "logs";
 const TENANT: &str = "tenant-a";
@@ -73,56 +71,6 @@ const TARGET_FILE_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Interval between data-file-count polls while waiting for the cycle to land.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Connection parameters for a running `MinIO`.
-#[derive(Clone)]
-struct MinioConn {
-    endpoint: String,
-    access_key: String,
-    secret_key: String,
-}
-
-/// Stand up `MinIO` and capture its connection parameters.
-async fn setup_minio() -> (MinIOContainer, MinioConn) {
-    let minio = MinIOContainer::builder().start().await.expect("start MinIO");
-    create_s3_bucket(minio.endpoint(), BUCKET_NAME).await.expect("create bucket");
-    let conn = MinioConn {
-        endpoint: minio.endpoint().to_string(),
-        access_key: minio.username().to_string(),
-        secret_key: minio.password().to_string(),
-    };
-    (minio, conn)
-}
-
-/// Build a concrete [`S3Catalog`] against `MinIO` (cribbed from `rewrite_it.rs`).
-async fn build_s3_catalog(conn: &MinioConn) -> S3Catalog {
-    let io = IoHandle::noop();
-    let mut props: HashMap<String, String> = HashMap::new();
-    props.insert("warehouse".to_string(), format!("s3://{BUCKET_NAME}"));
-    props.insert("s3.endpoint".to_string(), conn.endpoint.clone());
-    props.insert("s3.path-style-access".to_string(), "true".to_string());
-    props.insert("s3.access-key-id".to_string(), conn.access_key.clone());
-    props.insert("s3.secret-access-key".to_string(), conn.secret_key.clone());
-    props.insert("s3.region".to_string(), "us-east-1".to_string());
-    let file_io = FileIOBuilder::new(io.storage_factory()).with_props(props).build();
-
-    S3Catalog::new(
-        S3CatalogConfig {
-            bucket: BUCKET_NAME.to_string(),
-            region: "us-east-1".to_string(),
-            endpoint: Some(conn.endpoint.clone()),
-            access_key_id: Some(conn.access_key.clone()),
-            secret_access_key: Some(conn.secret_key.clone()),
-            warehouse: BUCKET_NAME.to_string(),
-            codec: CatalogCodecKind::Json,
-            ..S3CatalogConfig::default()
-        },
-        file_io,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await
-    .expect("build S3 catalog")
-}
 
 /// Create the namespace and `logs` table, returning the table identifier.
 async fn create_logs_table(catalog: &S3Catalog) -> TableIdent {
@@ -306,8 +254,8 @@ async fn data_file_count(table: &Table, descriptor: &SortColumnsDescriptor) -> u
 
 /// Build a compaction config that compacts ONLY `logs`, eagerly (so the small
 /// seeded partition is never skipped as healthy), packs the whole partition into
-/// a single rewrite group, and points its job-state storage at `MinIO`.
-fn compaction_config(conn: &MinioConn) -> CompactionConfig {
+/// a single rewrite group, and points its job-state storage at the object store.
+fn compaction_config(conn: &StorageConn) -> CompactionConfig {
     let jobs_storage = JobsStorageConfig {
         endpoint: conn.endpoint.clone(),
         bucket: BUCKET_NAME.to_string(),
@@ -374,9 +322,8 @@ async fn wait_for_file_count_drop(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn compactor_compacts_partition_end_to_end() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
     let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");

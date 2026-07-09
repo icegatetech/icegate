@@ -52,5 +52,5 @@ tracing-subscriber = { workspace = true }
 
 
 [dev-dependencies]
-# Testcontainers for MinIO
-testcontainers = { workspace = true, features = ["blocking"] }
+# S3-compatible object-store testcontainer (local S3TestContainer helper, no IceGate deps)
+testcontainers = { workspace = true }

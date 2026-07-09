@@ -16,7 +16,7 @@ storage:
   s3:
     bucket: warehouse
     region: us-east-1
-    endpoint: http://minio.infra.svc.cluster.local.:9000
+    endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
 
 ## AWS credentials from existing Secret
 ## Secret keys: aws-access-key-id, aws-secret-access-key (per _helpers.tpl:152-162)
@@ -47,8 +47,9 @@ query:
       enabled: false
   waitForDependencies:
     enabled: true
-    endpoints:
-      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
+    buckets:
+      - warehouse
+      - queue
   loki:
     enabled: true
     port: 3100
@@ -77,11 +78,15 @@ ingest:
   replicaCount: 1
   waitForDependencies:
     enabled: true
-    endpoints:
-      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
+    buckets:
+      - warehouse
+      - queue
+      - jobs
   otlpHttp:
     enabled: true
     port: 4318
+    ## Hard body limit; oversized payloads get a clean 413 (drained, no reset). icegate#158.
+    maxBodyBytes: 16777216
   otlpGrpc:
     enabled: true
     port: 4317
@@ -92,7 +97,7 @@ ingest:
   shift:
     jobsmanager:
       storage:
-        endpoint: http://minio.infra.svc.cluster.local.:9000
+        endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
         bucket: jobs
         prefix: shifter
         useSsl: false
@@ -123,5 +128,5 @@ migrate:
   activeDeadlineSeconds: 300
   waitForDependencies:
     enabled: true
-    endpoints:
-      - http://minio.infra.svc.cluster.local.:9000/minio/health/ready
+    buckets:
+      - warehouse

@@ -40,7 +40,7 @@ serviceMonitor:
 authentication:
   enabled: false
 
-# MinIO compatibility
+# AWS SDK v2 checksum compatibility
 extraEnv:
   - name: AWS_REQUEST_CHECKSUM_CALCULATION
     value: WHEN_REQUIRED

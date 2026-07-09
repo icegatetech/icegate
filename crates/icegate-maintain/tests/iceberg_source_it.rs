@@ -1,5 +1,5 @@
 //! Integration test for the Iceberg [`IcebergMergeSource`] compaction adapter
-//! against `MinIO`.
+//! against the object store.
 //!
 //! Seeds a `logs` table with TWO data files in one `(tenant, day)` partition,
 //! each internally sorted by the logs sort order `(service_name ASC, timestamp
@@ -11,14 +11,15 @@
 //! the merged output preserves the row count and is globally sorted by the logs
 //! sort order.
 //!
-//! Marked `#[ignore]`; run with Docker available:
+//! Requires Docker (a prerequisite):
 //!
 //! ```text
-//! cargo test -p icegate-maintain --test iceberg_source_it -- --ignored --nocapture
+//! cargo test -p icegate-maintain --test iceberg_source_it -- --nocapture
 //! ```
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
 
+mod common;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,8 +28,8 @@ use arrow::array::{Array, FixedSizeBinaryArray, MapArray, StringArray, StructArr
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
+use common::{build_s3_catalog, setup_object_store};
 use futures::TryStreamExt;
-use iceberg::io::FileIOBuilder;
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -39,75 +40,22 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
-use icegate_common::catalog::IoHandle;
+use icegate_catalog_s3::S3Catalog;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::{SortColumnCache, SortColumnsDescriptor};
 use icegate_common::merge::{MergeInput, MergePosition, RowGroupsMerger, SortedBatchMergerConfig};
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_common::testing::{MinIOContainer, create_s3_bucket};
 use icegate_maintain::compact::iceberg_source::IcebergMergeSource;
 use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const BUCKET_NAME: &str = "warehouse";
 const NAMESPACE: &str = "icegate";
 const TABLE: &str = "logs";
 const TENANT: &str = "tenant-a";
 /// 2026-06-11T00:00:00Z in microseconds. Both seeded files share this day so
 /// they land in the same `(tenant_id, day)` partition.
 const DAY_MICROS: i64 = 1_749_600_000_000_000;
-
-/// Connection parameters for a running `MinIO`.
-#[derive(Clone)]
-struct MinioConn {
-    endpoint: String,
-    access_key: String,
-    secret_key: String,
-}
-
-/// Stand up `MinIO` and capture its connection parameters.
-async fn setup_minio() -> (MinIOContainer, MinioConn) {
-    let minio = MinIOContainer::builder().start().await.expect("start MinIO");
-    create_s3_bucket(minio.endpoint(), BUCKET_NAME).await.expect("create bucket");
-    let conn = MinioConn {
-        endpoint: minio.endpoint().to_string(),
-        access_key: minio.username().to_string(),
-        secret_key: minio.password().to_string(),
-    };
-    (minio, conn)
-}
-
-/// Build a concrete [`S3Catalog`] against `MinIO`.
-async fn build_s3_catalog(conn: &MinioConn) -> S3Catalog {
-    let io = IoHandle::noop();
-    let mut props: HashMap<String, String> = HashMap::new();
-    props.insert("warehouse".to_string(), format!("s3://{BUCKET_NAME}"));
-    props.insert("s3.endpoint".to_string(), conn.endpoint.clone());
-    props.insert("s3.path-style-access".to_string(), "true".to_string());
-    props.insert("s3.access-key-id".to_string(), conn.access_key.clone());
-    props.insert("s3.secret-access-key".to_string(), conn.secret_key.clone());
-    props.insert("s3.region".to_string(), "us-east-1".to_string());
-    let file_io = FileIOBuilder::new(io.storage_factory()).with_props(props).build();
-
-    S3Catalog::new(
-        S3CatalogConfig {
-            bucket: BUCKET_NAME.to_string(),
-            region: "us-east-1".to_string(),
-            endpoint: Some(conn.endpoint.clone()),
-            access_key_id: Some(conn.access_key.clone()),
-            secret_access_key: Some(conn.secret_key.clone()),
-            warehouse: BUCKET_NAME.to_string(),
-            codec: CatalogCodecKind::Json,
-            ..S3CatalogConfig::default()
-        },
-        file_io,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await
-    .expect("build S3 catalog")
-}
 
 /// Create the namespace and `logs` table, returning the table identifier.
 async fn create_logs_table(catalog: &S3Catalog) -> TableIdent {
@@ -252,9 +200,8 @@ fn service_and_timestamp_rows(batches: &[RecordBatch]) -> Vec<(String, i64)> {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker (MinIO); run with --ignored"]
 async fn iceberg_merge_source_interleaves_two_overlapping_sorted_files() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = build_s3_catalog(&conn).await;
     let ident = create_logs_table(&catalog).await;
 

@@ -6,7 +6,8 @@
 use std::path::Path;
 
 use icegate_common::{
-    CatalogConfig, MetricsConfig, StorageConfig, TracingConfig, check_port_conflicts, load_config_file,
+    CatalogConfig, MemoryPressureConfig, MetricsConfig, StorageConfig, TracingConfig, check_port_conflicts,
+    load_config_file,
 };
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,10 @@ pub struct IngestConfig {
     /// Tracing configuration
     #[serde(default)]
     pub tracing: TracingConfig,
+    /// Memory-pressure request-shedding guard. Inert (never sheds) when no finite
+    /// cgroup memory limit is detected, so leaving it enabled is safe in dev/CI.
+    #[serde(default)]
+    pub memory_pressure: MemoryPressureConfig,
 }
 
 /// Operations (LLM observability) materialization configuration.
@@ -101,6 +106,7 @@ impl IngestConfig {
         self.shift.validate()?;
         self.metrics.validate()?;
         self.tracing.validate()?;
+        self.memory_pressure.validate()?;
         if let Some(queue) = &self.queue {
             queue.validate()?;
         }
@@ -109,5 +115,36 @@ impl IngestConfig {
         check_port_conflicts(&[&self.otlp_http, &self.otlp_grpc, &self.metrics])?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IngestConfig;
+    use crate::error::IngestError;
+
+    /// A `memory_pressure` validation failure must propagate out of
+    /// `IngestConfig::validate`, proving the field is wired into the aggregate
+    /// validator rather than merely deserialized.
+    #[test]
+    fn validate_rejects_invalid_memory_pressure() {
+        // Defaults are valid except tracing (enabled with no OTLP endpoint) and the
+        // shift job-storage endpoint/bucket; populate exactly those. Catalog
+        // (Memory + /tmp warehouse), storage (Memory), OTLP servers, and metrics
+        // (disabled) all validate as-is.
+        let mut config = IngestConfig::default();
+        config.tracing.enabled = false;
+        config.shift.jobsmanager.storage.endpoint = "http://localhost:9000".to_string();
+        config.shift.jobsmanager.storage.bucket = "warehouse".to_string();
+
+        // Baseline validates: any error after flipping only `memory_pressure`
+        // therefore originates in its validator.
+        config.validate().expect("baseline ingest config is valid");
+
+        // Violates `0 < low < high <= 1` (low >= high).
+        config.memory_pressure.low_watermark = 0.95;
+        config.memory_pressure.high_watermark = 0.90;
+
+        assert!(matches!(config.validate(), Err(IngestError::Config(_))));
     }
 }

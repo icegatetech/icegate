@@ -1,0 +1,46 @@
+# RustFS (S3-compatible object storage) - standalone single-node for development.
+mode:
+  standalone:
+    enabled: true
+  distributed:
+    enabled: false
+
+# rustfsadmin/rustfsadmin is the chart default; the fail-closed credential gate
+# requires this flag to accept the default dev credentials.
+secret:
+  allowInsecureDefaults: true
+
+image:
+  rustfs:
+    repository: rustfs/rustfs
+    tag: "1.0.0-beta.8"
+    pullPolicy: IfNotPresent
+
+ingress:
+  enabled: false
+gatewayApi:
+  enabled: false
+
+service:
+  type: ClusterIP
+
+storageclass:
+  name: local-path
+  dataStorageSize: 10Gi
+
+config:
+  rustfs:
+    # Disable the logs PVC for dev (only the data PVC remains).
+    obs_log_directory: ""
+    # With obs_log_directory empty, RustFS logs every request as an info-level
+    # JSON line to stdout; the OTLP collector ships those to Loki (millions of
+    # lines/hour under WAL churn). warn drops the per-request info flood while
+    # keeping warnings and errors. Maps to RUSTFS_OBS_LOGGER_LEVEL (RUST_LOG syntax).
+    log_level: "warn"
+    # Push object-store metrics to the cluster OTLP collector (RustFS exposes no
+    # Prometheus scrape endpoint / ServiceMonitor).
+    obs_endpoint:
+      enabled: true
+      metrics:
+        enabled: true
+        endpoint: http://otel-collector.observability.svc.cluster.local.:4318/v1/metrics

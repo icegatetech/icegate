@@ -1845,9 +1845,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -3957,13 +3957,12 @@ dependencies = [
  "dashmap",
  "futures",
  "iceberg",
+ "icegate-common",
  "lru",
  "object_store",
  "rand 0.9.4",
  "serde",
  "serde_json",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -4006,11 +4005,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "toml",
+ "tonic",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -4156,6 +4158,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tower",
  "tower-http",
  "tracing",
 ]
@@ -6955,15 +6958,6 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "url",
-]
-
-[[package]]
-name = "testcontainers-modules"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5985fde5befe4ffa77a052e035e16c2da86e8bae301baa9f9904ad3c494d357"
-dependencies = [
- "testcontainers",
 ]
 
 [[package]]

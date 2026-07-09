@@ -12,8 +12,7 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadata, Type};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation, TableIdent};
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
+use icegate_common::testing::S3TestContainer;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -121,31 +120,27 @@ impl CatalogStorage for InMemoryCatalogStorage {
     }
 }
 
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASSWORD: &str = "minioadmin";
-
 pub(crate) struct TestEnv {
-    _minio: testcontainers::ContainerAsync<MinIO>,
+    _store: S3TestContainer,
     pub(crate) catalog: S3Catalog,
     pub(crate) s3_storage: Arc<S3CatalogStorage>,
     pub(crate) tables_uri_prefix: String,
 }
 
-/// Start a fresh `MinIO` container with a unique bucket and a raw S3 storage
+/// Start a fresh object-storage container with a unique bucket and a raw S3 storage
 /// backend over it. Shared by the raw ([`make_catalog`]) and cached
 /// ([`make_cached_catalog`]) harnesses so the bucket bootstrap lives in one
 /// place.
 #[allow(clippy::expect_used)]
-async fn bootstrap_minio_storage() -> (testcontainers::ContainerAsync<MinIO>, Arc<S3CatalogStorage>, String) {
-    let minio = MinIO::default().start().await.expect("start minio");
-    let port = minio.get_host_port_ipv4(9000).await.expect("minio port");
-    let endpoint = format!("http://127.0.0.1:{port}");
+async fn bootstrap_object_store() -> (S3TestContainer, Arc<S3CatalogStorage>, String) {
+    let store = S3TestContainer::start().await.expect("start object storage");
+    let endpoint = store.endpoint().to_string();
     let bucket = format!("catalog-{}", Uuid::new_v4());
 
     let cfg = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_config::Region::new("us-east-1"))
         .endpoint_url(endpoint.clone())
-        .credentials_provider(Credentials::new(MINIO_USER, MINIO_PASSWORD, None, None, "test"))
+        .credentials_provider(Credentials::new(store.username(), store.password(), None, None, "test"))
         .load()
         .await;
     let client = aws_sdk_s3::Client::new(&cfg);
@@ -157,8 +152,8 @@ async fn bootstrap_minio_storage() -> (testcontainers::ContainerAsync<MinIO>, Ar
                 bucket: bucket.clone(),
                 region: "us-east-1".to_string(),
                 endpoint: Some(endpoint),
-                access_key_id: Some(MINIO_USER.to_string()),
-                secret_access_key: Some(MINIO_PASSWORD.to_string()),
+                access_key_id: Some(store.username().to_string()),
+                secret_access_key: Some(store.password().to_string()),
                 warehouse: "warehouse".to_string(),
                 codec: CatalogCodecKind::Json,
                 ..S3CatalogConfig::default()
@@ -169,15 +164,15 @@ async fn bootstrap_minio_storage() -> (testcontainers::ContainerAsync<MinIO>, Ar
     );
 
     let tables_uri_prefix = format!("s3://{bucket}/warehouse/catalog/tables");
-    (minio, storage, tables_uri_prefix)
+    (store, storage, tables_uri_prefix)
 }
 
 pub(crate) async fn make_catalog() -> TestEnv {
-    let (minio, storage, tables_uri_prefix) = bootstrap_minio_storage().await;
+    let (store, storage, tables_uri_prefix) = bootstrap_object_store().await;
     let catalog = test_catalog(storage.clone(), FileIO::new_with_memory(), tables_uri_prefix.clone());
 
     TestEnv {
-        _minio: minio,
+        _store: store,
         catalog,
         s3_storage: storage,
         tables_uri_prefix,
@@ -192,21 +187,21 @@ pub(crate) async fn make_catalog() -> TestEnv {
 /// cache wraps, exposed so a test can drive an out-of-band writer that bypasses
 /// the cache.
 pub(crate) struct CachedTestEnv {
-    _minio: testcontainers::ContainerAsync<MinIO>,
+    _store: S3TestContainer,
     pub(crate) catalog: S3Catalog,
     pub(crate) counting: Arc<LoadCountingStorage>,
     pub(crate) s3_storage: Arc<S3CatalogStorage>,
     pub(crate) tables_uri_prefix: String,
 }
 
-/// Build the production S3 + cache composition over a fresh `MinIO` bucket.
+/// Build the production S3 + cache composition over a fresh object-storage bucket.
 ///
 /// This is the only harness that exercises the real `If-None-Match` round-trip
 /// end-to-end: the cache revalidates against S3, and `object_store` maps a 304
 /// into [`LoadOutcome::NotModified`]. The unit tests in `cached.rs` only simulate
 /// that against an in-memory backend.
 pub(crate) async fn make_cached_catalog() -> CachedTestEnv {
-    let (minio, storage, tables_uri_prefix) = bootstrap_minio_storage().await;
+    let (store, storage, tables_uri_prefix) = bootstrap_object_store().await;
     let counting = Arc::new(LoadCountingStorage::new(storage.clone()));
     let counting_dyn: Arc<dyn CatalogStorage> = counting.clone();
     let cached: Arc<dyn CatalogStorage> = Arc::new(CachedCatalogStorage::new(
@@ -216,7 +211,7 @@ pub(crate) async fn make_cached_catalog() -> CachedTestEnv {
     let catalog = test_catalog(cached, FileIO::new_with_memory(), tables_uri_prefix.clone());
 
     CachedTestEnv {
-        _minio: minio,
+        _store: store,
         catalog,
         counting,
         s3_storage: storage,

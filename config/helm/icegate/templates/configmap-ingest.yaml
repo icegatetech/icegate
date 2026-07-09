@@ -81,6 +81,7 @@ data:
       enabled: {{ .Values.ingest.otlpHttp.enabled }}
       host: "0.0.0.0"
       port: {{ .Values.ingest.otlpHttp.port }}
+      max_body_bytes: {{ .Values.ingest.otlpHttp.maxBodyBytes | default 16777216 | int64 }}
     otlp_grpc:
       enabled: {{ .Values.ingest.otlpGrpc.enabled }}
       host: "0.0.0.0"

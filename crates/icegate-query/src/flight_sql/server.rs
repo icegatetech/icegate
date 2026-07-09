@@ -20,9 +20,11 @@ use std::sync::Arc;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::execution::context::SQLOptions;
 use datafusion_flight_sql_server::service::FlightSqlService;
+use icegate_common::{MemoryPressure, MemoryShedInterceptor};
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
+use tonic::service::interceptor::InterceptedService;
 
 use super::FlightSqlConfig;
 use super::provider::IceGateSessionStateProvider;
@@ -54,8 +56,9 @@ pub async fn run(
     engine: Arc<QueryEngine>,
     config: FlightSqlConfig,
     cancel_token: CancellationToken,
+    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(engine, config, cancel_token, None).await
+    run_with_port_tx(engine, config, cancel_token, None, pressure).await
 }
 
 /// Variant of [`run`] that publishes the actually bound port on a
@@ -71,6 +74,7 @@ pub async fn run_with_port_tx(
     config: FlightSqlConfig,
     cancel_token: CancellationToken,
     port_tx: Option<oneshot::Sender<u16>>,
+    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Bind via the `(host, port)` tuple so tonic resolves hostnames and
     // IPv6 literals through `ToSocketAddrs`. Parsing a `"host:port"`
@@ -90,9 +94,13 @@ pub async fn run_with_port_tx(
     let svc = FlightServiceServer::new(service)
         .max_decoding_message_size(config.max_message_size)
         .max_encoding_message_size(config.max_message_size);
+    // Wrap the already-configured server so `InterceptedService` preserves the
+    // codec size limits and `NamedService::NAME`; rejecting here happens at
+    // HTTP/2 HEADERS time, before protobuf decode / session build.
+    let intercepted = InterceptedService::new(svc, MemoryShedInterceptor::new(pressure, "flight_sql"));
 
     tonic::transport::Server::builder()
-        .add_service(svc)
+        .add_service(intercepted)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             cancel_token.cancelled().await;
             tracing::info!("Flight SQL server shutting down gracefully...");

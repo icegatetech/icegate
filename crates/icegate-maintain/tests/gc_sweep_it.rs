@@ -1,8 +1,8 @@
-//! Integration tests for the orphan-file garbage-collection sweep against `MinIO`.
+//! Integration tests for the orphan-file garbage-collection sweep against the object store.
 //!
 //! Drives `run_sweep` directly (deterministic, fast) for five targeted tests,
 //! and one end-to-end test that drives the full [`GcRunner`] background loop.
-//! Each test starts its own `MinIO` container via testcontainers and threads the
+//! Each test starts its own object-storage container via testcontainers and threads the
 //! container credentials through the storage config, so the suite is
 //! self-contained and needs only a running Docker daemon:
 //!
@@ -12,6 +12,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
 
+mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,10 +21,10 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
+use common::{BUCKET_NAME, StorageConn, build_s3_catalog, setup_object_store};
 use futures::StreamExt;
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
-use iceberg::io::FileIOBuilder;
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -34,13 +35,12 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
-use icegate_common::catalog::IoHandle;
+use icegate_catalog_s3::S3Catalog;
 use icegate_common::manifest_scan::list_data_files_with_stats;
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
 use icegate_common::storage::{S3Config, StorageBackend, StorageConfig};
-use icegate_common::testing::{MinIOContainer, create_s3_bucket, create_s3_object_store};
+use icegate_common::testing::create_s3_object_store;
 use icegate_maintain::gc::config::GcOrphansConfig;
 use icegate_maintain::gc::metrics::GcMetrics;
 use icegate_maintain::gc::sweep::run_sweep;
@@ -50,63 +50,12 @@ use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const BUCKET_NAME: &str = "warehouse";
 const NAMESPACE: &str = "icegate";
 const TABLE: &str = "logs";
 const TENANT: &str = "tenant-a";
 /// 2026-06-11T00:00:00Z in microseconds. Every seeded file shares this day so
 /// they all land in the same `(tenant_id, day)` partition.
 const DAY_MICROS: i64 = 1_749_600_000_000_000;
-
-/// Connection parameters for a running `MinIO`.
-#[derive(Clone)]
-struct MinioConn {
-    endpoint: String,
-    access_key: String,
-    secret_key: String,
-}
-
-/// Stand up `MinIO` and capture its connection parameters.
-async fn setup_minio() -> (MinIOContainer, MinioConn) {
-    let minio = MinIOContainer::builder().start().await.expect("start MinIO");
-    create_s3_bucket(minio.endpoint(), BUCKET_NAME).await.expect("create bucket");
-    let conn = MinioConn {
-        endpoint: minio.endpoint().to_string(),
-        access_key: minio.username().to_string(),
-        secret_key: minio.password().to_string(),
-    };
-    (minio, conn)
-}
-
-/// Build a concrete [`S3Catalog`] against `MinIO`.
-async fn build_s3_catalog(conn: &MinioConn) -> S3Catalog {
-    let io = IoHandle::noop();
-    let mut props: HashMap<String, String> = HashMap::new();
-    props.insert("warehouse".to_string(), format!("s3://{BUCKET_NAME}"));
-    props.insert("s3.endpoint".to_string(), conn.endpoint.clone());
-    props.insert("s3.path-style-access".to_string(), "true".to_string());
-    props.insert("s3.access-key-id".to_string(), conn.access_key.clone());
-    props.insert("s3.secret-access-key".to_string(), conn.secret_key.clone());
-    props.insert("s3.region".to_string(), "us-east-1".to_string());
-    let file_io = FileIOBuilder::new(io.storage_factory()).with_props(props).build();
-
-    S3Catalog::new(
-        S3CatalogConfig {
-            bucket: BUCKET_NAME.to_string(),
-            region: "us-east-1".to_string(),
-            endpoint: Some(conn.endpoint.clone()),
-            access_key_id: Some(conn.access_key.clone()),
-            secret_access_key: Some(conn.secret_key.clone()),
-            warehouse: BUCKET_NAME.to_string(),
-            codec: CatalogCodecKind::Json,
-            ..S3CatalogConfig::default()
-        },
-        file_io,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await
-    .expect("build S3 catalog")
-}
 
 /// Create the namespace and `logs` table, returning the table identifier.
 async fn create_logs_table(catalog: &S3Catalog) -> TableIdent {
@@ -287,9 +236,9 @@ fn append_rows(batch: &RecordBatch, rows: &mut Vec<LogRow>) {
 /// store.
 ///
 /// The container credentials are threaded straight into the config, so the sweep
-/// authenticates against this test's `MinIO` without relying on ambient `AWS_*`
+/// authenticates against this test's object store without relying on ambient `AWS_*`
 /// environment variables.
-fn gc_storage_config(conn: &MinioConn) -> StorageConfig {
+fn gc_storage_config(conn: &StorageConn) -> StorageConfig {
     StorageConfig {
         backend: StorageBackend::S3(S3Config {
             bucket: BUCKET_NAME.to_string(),
@@ -315,7 +264,7 @@ const fn orphans_config(min_age_secs: u64, dry_run: bool, include_metadata: bool
 }
 
 /// List every object key in the bucket (sorted) via a direct S3 object store.
-async fn list_all_object_keys(conn: &MinioConn) -> Vec<String> {
+async fn list_all_object_keys(conn: &StorageConn) -> Vec<String> {
     let store: Arc<dyn ObjectStore> =
         create_s3_object_store(&conn.endpoint, BUCKET_NAME).expect("build test object store");
     let mut stream = store.list(None);
@@ -354,7 +303,7 @@ async fn write_leaked_data_file(catalog: &S3Catalog, ident: &TableIdent, unique:
 ///
 /// Looks up the table's actual location (e.g. `s3://warehouse/warehouse/catalog/tables/<uuid>`)
 /// to write the leaked file into the correct S3 prefix that `run_sweep` will scan.
-async fn put_leaked_metadata(conn: &MinioConn, catalog: &S3Catalog, ident: &TableIdent, name: &str) {
+async fn put_leaked_metadata(conn: &StorageConn, catalog: &S3Catalog, ident: &TableIdent, name: &str) {
     let table = catalog.load_table(ident).await.unwrap();
     // This catalog always lays tables out at s3://<bucket>/...; assert it loudly.
     let location = table.metadata().location();
@@ -376,7 +325,7 @@ async fn put_leaked_metadata(conn: &MinioConn, catalog: &S3Catalog, ident: &Tabl
 
 #[tokio::test]
 async fn gc_reclaims_unreferenced_files_and_keeps_live_ones() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
 
@@ -426,7 +375,7 @@ async fn gc_reclaims_unreferenced_files_and_keeps_live_ones() {
 
 #[tokio::test]
 async fn gc_preserves_everything_inside_the_grace_period() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
 
@@ -464,7 +413,7 @@ async fn gc_preserves_everything_inside_the_grace_period() {
 
 #[tokio::test]
 async fn gc_dry_run_finds_orphans_but_deletes_nothing() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
 
@@ -502,7 +451,7 @@ async fn gc_dry_run_finds_orphans_but_deletes_nothing() {
 
 #[tokio::test]
 async fn gc_leaves_metadata_when_metadata_sweeping_is_disabled() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
 
@@ -547,7 +496,7 @@ async fn gc_leaves_metadata_when_metadata_sweeping_is_disabled() {
 
 #[tokio::test]
 async fn gc_fails_closed_and_deletes_nothing_when_a_manifest_is_unreadable() {
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
     let live = write_one_file(
@@ -608,7 +557,7 @@ async fn gc_runner_reclaims_in_the_background() {
     use icegate_maintain::gc::GcRunner;
     use icegate_maintain::gc::config::GcConfig;
 
-    let (_minio, conn) = setup_minio().await;
+    let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let ident = create_logs_table(&catalog).await;
 

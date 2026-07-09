@@ -94,12 +94,31 @@ data:
           # demo datasources.
           - type: json_parser
             id: parse-json-body
+            # Best-effort JSON detection: the `^\{`-only router gate cannot tell
+            # real JSON from `{`-prefixed non-JSON (RustFS/Grafana/etc. lines).
+            # Failures fall through to rename-attributes and are still ingested,
+            # so demote them to debug instead of flooding error logs.
+            on_error: send_quiet
             trace:
               trace_id:
                 parse_from: attributes.trace_id
               span_id:
                 parse_from: attributes.span_id
-            output: set-severity
+            output: route-by-shape
+          # Only IceGate's tracing `.json()` logs carry a nested `fields` object.
+          # Other producers scraped from /var/log/pods parse as JSON but have no
+          # `fields`: RustFS pretty-text lines whose continuation happens to start
+          # with `{`, plus Grafana/Prometheus/etc. JSON. Those used to error the
+          # `check-message`/`use-fields` operators below ("cannot fetch message
+          # from <nil>", "field does not exist: attributes.fields"). Route only
+          # `fields`-bearing entries into the IceGate pipeline; everything else
+          # falls through to rename-attributes and is ingested with its body as-is.
+          - type: router
+            id: route-by-shape
+            default: rename-attributes
+            routes:
+              - output: set-severity
+                expr: 'attributes.fields != nil'
           # Map level field to OTEL severity
           - type: severity_parser
             id: set-severity
@@ -212,6 +231,12 @@ data:
           - sources:
               - from: connection
 
+      # KEEP DEFAULT (send_batch_size 8192, no max). Do NOT tune the batch to
+      # work around ingest: IceGate must accept a stock, untuned OpenTelemetry
+      # Collector out of the box so users' default configs work from the start.
+      # If ingest can't process a default-sized OTLP/HTTP batch in time, fix it
+      # in ingest (payload limits / concurrent processing), not here.
+      # See icegatetech/icegate#158.
       batch: {}
 
       # Shared environment/demo labels. Added to both logs and traces.
@@ -246,8 +271,17 @@ data:
             action: upsert
 
     exporters:
+      # KEEP DEFAULT PARAMETERS (no timeout / sending_queue / retry_on_failure /
+      # compression overrides). IceGate must work with a stock, untuned
+      # OpenTelemetry Collector so users' default configurations work from the
+      # start; the fix for large/slow OTLP/HTTP batches belongs in icegate-ingest
+      # (payload limits / concurrent processing), NOT in special-casing this
+      # exporter. See icegatetech/icegate#158.
       otlp_http:
-        endpoint: http://icegate-ingest.icegate.svc.cluster.local.:4318
+        # No trailing dot on the host: the dot defeats ndots DNS search-path
+        # caching and caused intermittent "no such host"/"connection refused"
+        # here. This is an endpoint-correctness fix, not a tuning parameter.
+        endpoint: http://icegate-ingest.icegate.svc.cluster.local:4318
         compression: none
         headers:
           X-Scope-OrgID: demo

@@ -1,13 +1,21 @@
 //! OTLP HTTP API routes
 
 use axum::{
-    Router,
+    Json, Router,
     extract::DefaultBodyLimit,
+    http::StatusCode,
+    middleware,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use icegate_common::{MemoryPressure, ShedPolicy, shed_when_pressured};
 use tower_http::decompression::RequestDecompressionLayer;
 
-use super::{handlers, server::OtlpHttpState};
+use super::{
+    handlers,
+    models::{ErrorResponse, ErrorType},
+    server::OtlpHttpState,
+};
 
 /// Create OTLP HTTP API router.
 ///
@@ -16,11 +24,9 @@ use super::{handlers, server::OtlpHttpState};
 /// This matches the `OpenTelemetry` Collector's default behaviour of sending
 /// gzip-compressed payloads.
 ///
-/// `max_body_bytes` caps the size of the decompressed request body. Requests larger than
-/// this limit are rejected with HTTP 413. Axum's framework default is 2 `MiB`, which is below
-/// realistic OTLP batch sizes; we raise it to a service-level value (see
-/// [`OtlpHttpConfig::max_body_bytes`](super::OtlpHttpConfig)).
-pub fn routes(state: OtlpHttpState, max_body_bytes: usize) -> Router {
+/// `max_body_bytes` caps the size of the decompressed request body via
+/// [`DefaultBodyLimit`]; requests larger than this limit are rejected with HTTP 413.
+pub fn routes(state: OtlpHttpState, max_body_bytes: usize, memory_pressure: MemoryPressure) -> Router {
     Router::new()
         // OTLP endpoints (support both protobuf and JSON)
         .route("/v1/logs", post(handlers::ingest_logs))
@@ -33,7 +39,43 @@ pub fn routes(state: OtlpHttpState, max_body_bytes: usize) -> Router {
         // *decompressed* payload size (the figure that drives parser memory usage).
         .layer(RequestDecompressionLayer::new())
         .layer(DefaultBodyLimit::max(max_body_bytes))
+        // Outermost: shed with a drained 503 while under memory pressure, before
+        // decompress / decode. Runs first of all layers; `/health` bypasses so the
+        // kubelet never kills a recovering pod. `drain_body=true` lets the client
+        // finish its upload and read the 503 instead of seeing a connection reset.
+        .layer(middleware::from_fn(move |req, next| {
+            shed_when_pressured(
+                ShedPolicy::new(memory_pressure.clone(), "otlp_http", OTLP_HTTP_SHED_BYPASS, true),
+                otlp_http_shed_response,
+                req,
+                next,
+            )
+        }))
         .with_state(state)
+}
+
+/// Paths exempt from memory-pressure shedding: the health probe must stay reachable.
+const OTLP_HTTP_SHED_BYPASS: &[&str] = &["/health"];
+
+/// 503 shed by the memory-pressure guard on the OTLP/HTTP surface.
+///
+/// Uses the crate-local [`ErrorResponse`]/[`ErrorType`] so the body matches every other
+/// OTLP/HTTP error (`errorType: "internal"`). `Retry-After` is built inline from
+/// [`icegate_common::SHED_RETRY_AFTER_SECS`] because the header helper is private to
+/// `icegate_common::memory::http`.
+fn otlp_http_shed_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from(icegate_common::SHED_RETRY_AFTER_SECS),
+        )],
+        Json(ErrorResponse::new(
+            ErrorType::Internal,
+            "ingest under memory pressure, retry later",
+        )),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -46,6 +88,7 @@ mod tests {
     };
     use flate2::write::GzEncoder;
     use http_body_util::BodyExt;
+    use icegate_common::MemoryPressure;
     use icegate_queue::{WriteResult, channel};
     use opentelemetry_proto::tonic::{
         common::v1::{AnyValue, KeyValue, any_value::Value},
@@ -57,6 +100,102 @@ mod tests {
 
     use super::*;
     use crate::{infra::metrics::OtlpMetrics, otlp_http::server::OtlpHttpState};
+
+    /// Fixed-ratio `UsageReader` for deterministic pressure in tests (no cgroup).
+    struct FixedReader {
+        limit: u64,
+        working_set: u64,
+    }
+
+    impl icegate_common::UsageReader for FixedReader {
+        fn limit_bytes(&self) -> u64 {
+            self.limit
+        }
+
+        fn read_working_set_bytes(&self) -> icegate_common::Result<u64> {
+            Ok(self.working_set)
+        }
+    }
+
+    /// A `MemoryPressure` handle that reports "under pressure" after one sample:
+    /// 95/100 = 0.95 >= the default 0.90 high-watermark. No background sampler.
+    fn pressured_guard() -> MemoryPressure {
+        let config = icegate_common::MemoryPressureConfig::default();
+        let sampler = icegate_common::MemoryPressureSampler::with_reader(
+            &config,
+            std::sync::Arc::new(FixedReader {
+                limit: 100,
+                working_set: 95,
+            }),
+        );
+        let handle = sampler.handle();
+        sampler.sample_once().expect("sample_once succeeds with a fixed reader");
+        handle
+    }
+
+    #[tokio::test]
+    async fn sheds_with_503_under_memory_pressure() {
+        let (tx, _rx) = channel(1);
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES, pressured_guard());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(CONTENT_TYPE, "application/x-protobuf")
+            .body(Body::from(encode_protobuf()))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Own the header value before consuming the body (ends the headers borrow).
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .expect("retry-after header present");
+        assert_eq!(retry_after, icegate_common::SHED_RETRY_AFTER_SECS.to_string());
+
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        // Assert on the error-type classification, not the human message.
+        assert_eq!(value["errorType"], "internal");
+    }
+
+    #[tokio::test]
+    async fn health_probe_bypasses_shedding() {
+        let (tx, _rx) = channel(1);
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES, pressured_guard());
+        let request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sheds_oversized_body_under_pressure_without_hang() {
+        const TINY_LIMIT_BYTES: usize = 1024;
+
+        let (tx, _rx) = channel(1);
+        let app = routes(test_state(tx), TINY_LIMIT_BYTES, pressured_guard());
+        let oversized_body = vec![0_u8; TINY_LIMIT_BYTES * 2];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header(CONTENT_TYPE, "application/x-protobuf")
+            .body(Body::from(oversized_body))
+            .expect("build request");
+
+        // Shed layer is outermost with drain_body=true: it drains the oversized body in
+        // constant memory and returns 503 before the 413 body-limit layer runs. `oneshot`
+        // completing (not hanging / resetting) is the assertion the drain preserves.
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     /// Body limit used by tests that expect to *succeed*. Plenty of headroom for the small
     /// fixtures built below.
@@ -142,7 +281,7 @@ mod tests {
         let writer = spawn_ack_writer(rx);
 
         let compressed = gzip_compress(&encode_protobuf());
-        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES);
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES, MemoryPressure::inert());
         let request = Request::builder()
             .method("POST")
             .uri("/v1/logs")
@@ -166,7 +305,7 @@ mod tests {
         let writer = spawn_ack_writer(rx);
 
         let compressed = zstd_compress(&encode_protobuf());
-        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES);
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES, MemoryPressure::inert());
         let request = Request::builder()
             .method("POST")
             .uri("/v1/logs")
@@ -191,7 +330,7 @@ mod tests {
 
         let json = serde_json::to_vec(&create_test_request()).expect("json encode");
         let compressed = gzip_compress(&json);
-        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES);
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES, MemoryPressure::inert());
         let request = Request::builder()
             .method("POST")
             .uri("/v1/logs")
@@ -211,7 +350,7 @@ mod tests {
         let (tx, rx) = channel(1);
         let writer = spawn_ack_writer(rx);
 
-        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES);
+        let app = routes(test_state(tx), TEST_MAX_BODY_BYTES, MemoryPressure::inert());
         let request = Request::builder()
             .method("POST")
             .uri("/v1/logs")
@@ -238,7 +377,7 @@ mod tests {
         // hang on `oneshot`, surfacing the regression.
         let (tx, _rx) = channel(1);
 
-        let app = routes(test_state(tx), TINY_LIMIT_BYTES);
+        let app = routes(test_state(tx), TINY_LIMIT_BYTES, MemoryPressure::inert());
         let oversized_body = vec![0_u8; TINY_LIMIT_BYTES * 2];
         let request = Request::builder()
             .method("POST")

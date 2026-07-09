@@ -7,7 +7,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
-use icegate_common::testing::{MinIOContainer, create_s3_bucket, create_s3_object_store};
+use icegate_common::testing::{S3TestContainer, create_s3_bucket, create_s3_object_store};
 use icegate_queue::PreparedWalRowGroup;
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
@@ -38,22 +38,22 @@ pub struct RowGroupBoundaryRange {
     pub max_key: RowGroupBoundaryKey,
 }
 
-/// Sets up `MinIO` container, creates a unique S3 bucket, and returns an `ObjectStore`.
+/// Sets up an object-storage container, creates a unique S3 bucket, and returns an `ObjectStore`.
 ///
 /// # Returns
 ///
-/// A tuple of (`MinIOContainer`, `ObjectStore`, `bucket_name`).
+/// A tuple of (`S3TestContainer`, `ObjectStore`, `bucket_name`).
 /// The container and bucket are automatically cleaned up when dropped.
 ///
 /// # Errors
 ///
-/// Returns an error if `MinIO` container start fails, bucket creation fails, or object store creation fails.
-pub async fn setup_queue_test() -> Result<(MinIOContainer, Arc<dyn ObjectStore>, String), Box<dyn std::error::Error>> {
-    let minio = MinIOContainer::start().await?;
+/// Returns an error if the object-storage container start fails, bucket creation fails, or object store creation fails.
+pub async fn setup_queue_test() -> Result<(S3TestContainer, Arc<dyn ObjectStore>, String), Box<dyn std::error::Error>> {
+    let store_container = S3TestContainer::start().await?;
     let bucket = format!("test-{}", Uuid::new_v4());
-    create_s3_bucket(minio.endpoint(), &bucket).await?;
-    let store = create_s3_object_store(minio.endpoint(), &bucket)?;
-    Ok((minio, store, bucket))
+    create_s3_bucket(store_container.endpoint(), &bucket).await?;
+    let store = create_s3_object_store(store_container.endpoint(), &bucket)?;
+    Ok((store_container, store, bucket))
 }
 
 /// Generate test batch using the benchmark data generation utilities.

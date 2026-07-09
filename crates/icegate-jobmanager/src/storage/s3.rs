@@ -204,7 +204,7 @@ impl S3Storage {
         let client = Client::from_conf(s3_config);
 
         // TODO(med): add check that conditional requests work for specific S3.
-        // For example, old Minio versions ignore the header and atomicity breaks
+        // For example, some S3 backends ignore the header and atomicity breaks.
 
         let retrier = Retrier::new(config.retrier_config.clone());
         let cancel_token = CancellationToken::new();

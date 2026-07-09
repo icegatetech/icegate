@@ -26,9 +26,16 @@ use tracing_opentelemetry::{OpenTelemetrySpanExt, OtelData};
 use tracing_subscriber::fmt::FormattedFields;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, JsonFields, Writer};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::error::{CommonError, Result};
+
+/// Build the default event filter for the fmt and `OTel` layers: honor `RUST_LOG`
+/// if set, otherwise `info`. Applied as a *per-layer* filter so the fmt and `OTel`
+/// layers each carry their own filtering independently.
+fn default_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
 
 /// `OpenTelemetry` tracing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,11 +337,8 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .event_format(TraceContextJsonFormatter)
-                    .fmt_fields(JsonFields::new()),
-            )
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    .fmt_fields(JsonFields::new())
+                    .with_filter(default_env_filter()),
             )
             .try_init()
             .ok();
@@ -405,13 +409,14 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
         .with(
             tracing_subscriber::fmt::layer()
                 .event_format(TraceContextJsonFormatter)
-                .fmt_fields(JsonFields::new()),
+                .fmt_fields(JsonFields::new())
+                .with_filter(default_env_filter()),
         )
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(default_env_filter()),
         )
-        .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .try_init()
         .ok();
 

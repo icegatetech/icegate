@@ -5,7 +5,8 @@ use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::common::{manager_env::ManagerEnv, minio_env::MinIOEnv, storage_wrapper::CountingStorage};
+use super::common::s3_container::S3TestContainer;
+use super::common::{manager_env::ManagerEnv, storage_wrapper::CountingStorage};
 use crate::{
     CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, Storage,
     TaskCode, TaskDefinition, WorkerConfig,
@@ -44,8 +45,8 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     let max_iterations = 1u64;
     let workers_cnt = 10;
 
-    // 1. Start MinIO
-    let minio_env = MinIOEnv::new().await?;
+    // 1. Start object storage
+    let store = S3TestContainer::start().await?;
 
     // 2. Track execution
     let executed_primary_tasks: Arc<DashMap<Uuid, bool>> = Arc::new(DashMap::new());
@@ -109,9 +110,9 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     let s3_storage = Arc::new(
         S3Storage::new(
             S3StorageConfig {
-                endpoint: minio_env.endpoint().to_string(),
-                access_key_id: minio_env.username().to_string(),
-                secret_access_key: minio_env.password().to_string(),
+                endpoint: store.endpoint().to_string(),
+                access_key_id: store.username().to_string(),
+                secret_access_key: store.password().to_string(),
                 bucket_name: "test-jobs".to_string(),
                 use_ssl: false,
                 region: "us-east-1".to_string(),

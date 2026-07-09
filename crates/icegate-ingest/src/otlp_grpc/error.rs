@@ -43,9 +43,37 @@ impl From<GrpcError> for Status {
 
             IngestError::Cancelled => (Code::Cancelled, err.0.to_string()),
 
-            IngestError::MaxAttemptsReached => (Code::Unavailable, err.0.to_string()),
+            // Retryable load-shedding: `RESOURCE_EXHAUSTED` when the WAL channel is
+            // full (request not enqueued), `UNAVAILABLE` when retries are exhausted
+            // or the durability ack exceeds its deadline (GH-158).
+            IngestError::QueueFull => (Code::ResourceExhausted, err.0.to_string()),
+            IngestError::MaxAttemptsReached | IngestError::AckTimeout => (Code::Unavailable, err.0.to_string()),
         };
 
         Self::new(code, message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::{Code, Status};
+
+    use super::GrpcError;
+    use crate::error::IngestError;
+
+    #[test]
+    fn queue_full_maps_to_resource_exhausted() {
+        assert_eq!(
+            Status::from(GrpcError(IngestError::QueueFull)).code(),
+            Code::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn ack_timeout_maps_to_unavailable() {
+        assert_eq!(
+            Status::from(GrpcError(IngestError::AckTimeout)).code(),
+            Code::Unavailable
+        );
     }
 }

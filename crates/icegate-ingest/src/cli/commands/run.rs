@@ -10,8 +10,8 @@ use std::{
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use icegate_common::{
-    IoHandle, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, MetricsRuntime, OPERATIONS_TABLE, OPERATIONS_TOPIC,
-    SPANS_TABLE, SPANS_TOPIC,
+    IoHandle, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, MemoryPressure, MetricsRuntime, OPERATIONS_TABLE,
+    OPERATIONS_TOPIC, SPANS_TABLE, SPANS_TOPIC,
     catalog::CatalogBuilder,
     create_object_store,
     parquet_encoding::{
@@ -432,6 +432,11 @@ async fn run_services(
     // SIGTERM instead of running to their retry budget during shutdown.
     let cancel_token = CancellationToken::new();
 
+    // Process-wide memory-pressure guard shared by every OTLP surface. Inert (never
+    // sheds, no sampler) when no finite cgroup memory limit is detected (dev/CI/
+    // bare-metal); one sampler is bound to `cancel_token` when a limit exists.
+    let memory_pressure = MemoryPressure::spawn(config.memory_pressure.clone(), cancel_token.clone());
+
     // Initialize shifter (WAL -> Iceberg)
     tracing::info!("Initializing shifter");
     let catalog = CatalogBuilder::from_config(&config.catalog, io_cache, cancel_token.clone()).await?;
@@ -547,6 +552,7 @@ async fn run_services(
         let http_config = config.otlp_http.clone();
         let token = cancel_token.clone();
         let metrics = otlp_metrics.clone();
+        let guard = memory_pressure.clone();
         let handle = tokio::spawn(async move {
             crate::otlp_http::run(
                 write_channel,
@@ -555,6 +561,7 @@ async fn run_services(
                 metrics,
                 http_config,
                 token,
+                guard,
             )
             .await
         });
@@ -569,6 +576,7 @@ async fn run_services(
         let grpc_config = config.otlp_grpc.clone();
         let token = cancel_token.clone();
         let metrics = otlp_metrics.clone();
+        let guard = memory_pressure.clone();
         let handle = tokio::spawn(async move {
             crate::otlp_grpc::run(
                 write_channel,
@@ -577,6 +585,7 @@ async fn run_services(
                 metrics,
                 grpc_config,
                 token,
+                guard,
             )
             .await
         });

@@ -1,4 +1,4 @@
-//! Integration tests for `QueueWriter` with MinIO/S3.
+//! Integration tests for `QueueWriter` with an S3-compatible object store.
 
 mod common;
 
@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn test_write_single_batch_to_s3() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Setup writer
     let config = QueueConfig::new("queue");
@@ -51,7 +51,7 @@ async fn test_write_single_batch_to_s3() -> Result<(), Box<dyn std::error::Error
 
 #[tokio::test]
 async fn test_sequential_writes_monotonic_offsets() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -95,7 +95,7 @@ async fn test_sequential_writes_monotonic_offsets() -> Result<(), Box<dyn std::e
 
 #[tokio::test]
 async fn test_write_empty_batch() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -134,7 +134,7 @@ async fn test_write_empty_batch() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_write_with_base_path() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("my-custom-path");
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -169,7 +169,7 @@ async fn test_write_with_base_path() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_channel_write_response() -> Result<(), Box<dyn std::error::Error>> {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -203,7 +203,7 @@ async fn test_multi_batch_request_gets_single_ack_and_multiple_row_groups() -> R
     use icegate_queue::ParquetQueueReader;
     use tokio_util::sync::CancellationToken;
 
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue").with_flush_interval_ms(50);
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -252,7 +252,7 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
     use icegate_queue::ParquetQueueReader;
     use tokio_util::sync::CancellationToken;
 
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue").with_flush_interval_ms(50);
     let (tx, rx) = channel(config.common.channel_capacity);
@@ -320,7 +320,7 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
 #[tokio::test]
 async fn test_requests_in_same_flush_share_offset_but_keep_own_record_counts() -> Result<(), Box<dyn std::error::Error>>
 {
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     let config = QueueConfig::new("queue")
         .with_max_row_group_size(10)
@@ -370,7 +370,7 @@ async fn test_write_then_read_roundtrip() -> Result<(), Box<dyn std::error::Erro
     use icegate_queue::ParquetQueueReader;
     use tokio_util::sync::CancellationToken;
 
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write phase
     let config = QueueConfig::new("queue");
@@ -424,7 +424,7 @@ async fn test_write_read_schema_preservation() -> Result<(), Box<dyn std::error:
     use icegate_queue::ParquetQueueReader;
     use tokio_util::sync::CancellationToken;
 
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write phase
     let config = QueueConfig::new("queue");
@@ -480,7 +480,7 @@ async fn test_write_read_with_compression() -> Result<(), Box<dyn std::error::Er
     use icegate_queue::ParquetQueueReader;
     use tokio_util::sync::CancellationToken;
 
-    let (_minio, store, _bucket) = common::setup_queue_test().await?;
+    let (_store, store, _bucket) = common::setup_queue_test().await?;
 
     // Write phase - default config uses ZSTD compression
     let config = QueueConfig::new("queue");

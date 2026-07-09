@@ -18,7 +18,7 @@ name = "ingest"
 path = "src/main.rs"
 
 [dependencies]
-icegate-common = { workspace = true }
+icegate-common = { workspace = true, features = ["shed-tonic"] }
 icegate-jobmanager = { path = "../icegate-jobmanager" }
 icegate-queue = { path = "../icegate-queue" }
 
@@ -78,3 +78,6 @@ flate2 = "1"
 zstd = "0.13"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# `test-util` enables the paused-clock (`start_paused`) test runtime used to
+# exercise the WAL ack-timeout backpressure path without real-time waits.
+tokio = { workspace = true, features = ["test-util"] }

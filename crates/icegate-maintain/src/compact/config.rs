@@ -412,7 +412,7 @@ mod tests {
         CompactionConfig {
             jobsmanager: CompactionJobsManagerConfig {
                 storage: JobsStorageConfig {
-                    endpoint: "http://minio:9000".to_string(),
+                    endpoint: "http://localhost:9000".to_string(),
                     bucket: "jobs".to_string(),
                     ..JobsStorageConfig::default()
                 },

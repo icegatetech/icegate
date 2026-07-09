@@ -3,7 +3,7 @@
 
 # Documentation
 # Enforce documentation on public items
-doc-valid-idents = ["DataFusion", "Iceberg", "IceGate"]
+doc-valid-idents = ["DataFusion", "Iceberg", "IceGate", "RustFS"]
 
 # Cognitive complexity threshold
 cognitive-complexity-threshold = 30

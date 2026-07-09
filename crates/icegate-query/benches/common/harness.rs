@@ -130,6 +130,7 @@ impl TestServer {
                 cancel_token_clone,
                 Some(port_tx),
                 disabled_metrics,
+                icegate_common::MemoryPressure::inert(),
             )
             .await
             .unwrap();

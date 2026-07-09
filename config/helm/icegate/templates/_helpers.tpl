@@ -193,13 +193,22 @@ Usage: include "icegate.awsEnv" .
 {{- end }}
 
 {{/*
-Init container that polls HTTP endpoints until they return 2xx.
+Init containers that block startup until dependencies are ready.
+
+- `endpoints`: HTTP GET each until 2xx (RustFS/service health).
+- `buckets`: authenticated `head-bucket` each until it exists. RustFS enforces
+  SigV4, so bucket existence cannot be verified over anonymous HTTP; this uses
+  the pod's AWS credentials against `storage.s3.endpoint`. Needed because buckets
+  are created out-of-band by the `rustfs-init` Job, which finishes after RustFS
+  reports healthy.
+
 Usage: include "icegate.waitForDeps" (dict "context" . "config" .Values.ingest.waitForDependencies)
 */}}
 {{- define "icegate.waitForDeps" -}}
 {{- if .config.enabled }}
-{{- if .config.endpoints }}
+{{- if or .config.endpoints .config.buckets }}
 initContainers:
+  {{- if .config.endpoints }}
   - name: wait-for-deps
     image: {{ .config.image }}
     securityContext:
@@ -215,6 +224,35 @@ initContainers:
         done
         echo "{{ . }} is ready"
         {{- end }}
+  {{- end }}
+  {{- if .config.buckets }}
+  - name: wait-for-buckets
+    image: {{ .config.awsCliImage | default "amazon/aws-cli:2.35.15" }}
+    securityContext:
+      # readOnlyRootFilesystem is relaxed (unlike the strict container context)
+      # so the AWS CLI can use its writable scratch space; still non-root, no
+      # privilege escalation, all capabilities dropped.
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop:
+          - ALL
+    env:
+      {{- include "icegate.awsEnv" .context | nindent 6 }}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        E={{ .context.Values.storage.s3.endpoint | quote }}
+        {{- range .config.buckets }}
+        echo "Waiting for bucket {{ . }} ..."
+        until aws --endpoint-url "$E" s3api head-bucket --bucket {{ . }} >/dev/null 2>&1; do
+          sleep 3
+        done
+        echo "bucket {{ . }} exists"
+        {{- end }}
+  {{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

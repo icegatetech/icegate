@@ -129,10 +129,10 @@ Both commands use Docker Compose to start the full development environment.
 The development environment includes:
 
 **Core Infrastructure:**
-- **MinIO (S3):** Object storage backend
+- **RustFS (S3):** Object storage backend
   - API: `http://localhost:9000`
   - Console: `http://localhost:9001`
-  - Credentials: minioadmin/minioadmin
+  - Credentials: rustfsadmin/rustfsadmin
 
 - **Nessie:** Iceberg catalog with REST API
   - API: `http://localhost:19120`
@@ -155,8 +155,8 @@ The development environment includes:
 
 For local development:
 ```bash
-AWS_ACCESS_KEY_ID=minioadmin
-AWS_SECRET_ACCESS_KEY=minioadmin
+AWS_ACCESS_KEY_ID=rustfsadmin
+AWS_SECRET_ACCESS_KEY=rustfsadmin
 AWS_REGION=us-east-1
 ```
 

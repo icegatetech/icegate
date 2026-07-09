@@ -1115,22 +1115,24 @@ impl<'a> OtlpRequestRecorder<'a> {
             .record_request_size(bytes, self.protocol, self.signal, self.encoding);
     }
 
-    /// Record decode duration and return the decode result.
-    pub fn record_decode<F, T>(&self, content_type: &str, decode: F) -> Result<T, IngestError>
-    where
-        F: FnOnce() -> Result<T, IngestError>,
-    {
-        // metric uses only in http hanler (TODO: otlp_grpc/services.rs:56)
-        let start = Instant::now();
-        match decode() {
+    /// Finish decode accounting for a decode performed by the caller (the decode
+    /// itself may run inline or offloaded to the blocking pool). Records the
+    /// externally-measured `elapsed`, and on failure the decode-error reason and
+    /// the terminal request status. Returns the decoded value unchanged on
+    /// success. Used only by the HTTP handlers (gRPC decodes inside tonic).
+    pub fn finish_decode<T>(
+        &self,
+        content_type: &str,
+        elapsed: Duration,
+        result: Result<T, IngestError>,
+    ) -> Result<T, IngestError> {
+        match result {
             Ok(value) => {
-                self.metrics
-                    .record_decode_duration(start.elapsed(), self.protocol, self.signal, "ok");
+                self.record_decode_duration(elapsed, "ok");
                 Ok(value)
             }
             Err(err) => {
-                self.metrics
-                    .record_decode_duration(start.elapsed(), self.protocol, self.signal, "error");
+                self.record_decode_duration(elapsed, "error");
                 if let Some(reason) = Self::otlp_decode_error_reason(&err, content_type) {
                     self.metrics.add_decode_error(self.protocol, self.signal, reason);
                 }
@@ -1140,7 +1142,7 @@ impl<'a> OtlpRequestRecorder<'a> {
         }
     }
 
-    /// Record decode duration when decoding is external.
+    /// Record decode duration for a decode measured by the caller.
     pub fn record_decode_duration(&self, duration: Duration, status: &str) {
         self.metrics
             .record_decode_duration(duration, self.protocol, self.signal, status);

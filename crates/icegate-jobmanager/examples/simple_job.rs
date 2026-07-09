@@ -57,12 +57,12 @@ pub async fn run_simple_job(codec: JobStateCodecKind, bucket_prefix: String) -> 
     // 4. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
 
-    // 5. Initialize S3 Storage (MinIO)
+    // 5. Initialize S3 Storage
     let storage = S3Storage::new(
         S3StorageConfig {
             endpoint: "http://localhost:9000".to_string(),
-            access_key_id: "minioadmin".to_string(),
-            secret_access_key: "minioadmin".to_string(),
+            access_key_id: "rustfsadmin".to_string(),
+            secret_access_key: "rustfsadmin".to_string(),
             bucket_name: "jobs".to_string(),
             use_ssl: false,
             region: "us-east-1".to_string(),

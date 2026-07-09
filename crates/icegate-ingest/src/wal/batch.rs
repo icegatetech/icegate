@@ -36,10 +36,22 @@ const SIGNAL_METRICS: &str = "metrics";
 const SIGNAL_OPERATIONS: &str = "operations";
 /// WAL-unavailable reason recorded when the write channel is closed.
 const WAL_REASON_CHANNEL_CLOSED: &str = "channel_closed";
+/// WAL-unavailable reason recorded when the write channel is full (backpressure).
+const WAL_REASON_CHANNEL_FULL: &str = "channel_full";
 /// Status label for successful timing metrics.
 const STATUS_OK: &str = "ok";
 /// Status label for failed timing metrics.
 const STATUS_ERROR: &str = "error";
+
+/// Metric reason label for a failed WAL submit: [`IngestError::QueueFull`] is
+/// load-shedding backpressure (`channel_full`); any other submit failure is the
+/// channel closing at shutdown (`channel_closed`).
+const fn wal_unavailable_reason(error: &IngestError) -> &'static str {
+    match error {
+        IngestError::QueueFull => WAL_REASON_CHANNEL_FULL,
+        _ => WAL_REASON_CHANNEL_CLOSED,
+    }
+}
 
 /// Sort a logs `RecordBatch`, submit it to the WAL, await the ack, and return the
 /// partial-success payload. Shared by the HTTP and gRPC logs handlers.
@@ -71,9 +83,19 @@ pub async fn write_logs_batch_to_wal(
 
     let trace_context = icegate_common::extract_current_trace_context();
     let prepare_start = Instant::now();
-    let prepared = sort_logs(&batch, wal_row_group_size, trace_context).inspect_err(|_| {
-        request_metrics.finish_error();
-    })?;
+    // Offload the CPU-bound sort/`take` to the blocking pool so a large logs
+    // batch never blocks a reactor worker thread inline (the transform was
+    // already offloaded upstream; mirrors `submit_signal`). An inline sort would
+    // otherwise stall the reactor under a burst and starve other in-flight HTTP
+    // requests, tripping the collector's client timeout (GH-158).
+    let prepared =
+        match tokio::task::spawn_blocking(move || sort_logs(&batch, wal_row_group_size, trace_context)).await {
+            Ok(result) => result,
+            Err(join_err) => Err(IngestError::Join(join_err)),
+        }
+        .inspect_err(|_| {
+            request_metrics.finish_error();
+        })?;
     // A non-empty batch always yields at least one row group; treat its absence
     // as an internal invariant violation instead of silently succeeding, so valid
     // log records cannot disappear without an error. Record the OK sort timing
@@ -87,9 +109,9 @@ pub async fn write_logs_batch_to_wal(
     request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
 
     let enqueue_start = Instant::now();
-    let pending = submit_sorted_rows_to_wal(write_channel, prepared).await.inspect_err(|_| {
+    let pending = submit_sorted_rows_to_wal(write_channel, prepared).inspect_err(|err| {
         request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_ERROR);
-        request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
+        request_metrics.add_wal_queue_unavailable(LOGS_TOPIC, wal_unavailable_reason(err));
         request_metrics.finish_error();
     })?;
     request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), LOGS_TOPIC, STATUS_OK);
@@ -201,9 +223,9 @@ async fn submit_signal(
     request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), signal, STATUS_OK);
 
     let enqueue_start = Instant::now();
-    let pending = submit_sorted_rows_to_wal(write_channel, prepared).await.inspect_err(|_| {
+    let pending = submit_sorted_rows_to_wal(write_channel, prepared).inspect_err(|err| {
         request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), topic, STATUS_ERROR);
-        request_metrics.add_wal_queue_unavailable(topic, WAL_REASON_CHANNEL_CLOSED);
+        request_metrics.add_wal_queue_unavailable(topic, wal_unavailable_reason(err));
         request_metrics.finish_error();
     })?;
     request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), topic, STATUS_OK);
@@ -406,9 +428,18 @@ pub async fn write_metrics_batch_to_wal(
 
     let trace_context = icegate_common::extract_current_trace_context();
     let prepare_start = Instant::now();
-    let prepared = sort_metrics(&batch, wal_row_group_size, trace_context).inspect_err(|_| {
-        request_metrics.finish_error();
-    })?;
+    // Offload the CPU-bound sort/`take` to the blocking pool so a large metrics
+    // batch never blocks a reactor worker thread inline (mirrors the logs path
+    // and `submit_signal`), keeping the reactor free to service other in-flight
+    // requests under a burst (GH-158).
+    let prepared =
+        match tokio::task::spawn_blocking(move || sort_metrics(&batch, wal_row_group_size, trace_context)).await {
+            Ok(result) => result,
+            Err(join_err) => Err(IngestError::Join(join_err)),
+        }
+        .inspect_err(|_| {
+            request_metrics.finish_error();
+        })?;
     // A non-empty batch always yields at least one row group; treat its absence
     // as an internal invariant violation instead of silently succeeding. Record
     // the OK sort timing only after this check passes, so the invariant-violation
@@ -421,9 +452,9 @@ pub async fn write_metrics_batch_to_wal(
     request_metrics.record_wal_sorting_duration(prepare_start.elapsed(), SIGNAL_METRICS, STATUS_OK);
 
     let enqueue_start = Instant::now();
-    let pending = submit_sorted_rows_to_wal(write_channel, prepared).await.inspect_err(|_| {
+    let pending = submit_sorted_rows_to_wal(write_channel, prepared).inspect_err(|err| {
         request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), METRICS_TOPIC, STATUS_ERROR);
-        request_metrics.add_wal_queue_unavailable(METRICS_TOPIC, WAL_REASON_CHANNEL_CLOSED);
+        request_metrics.add_wal_queue_unavailable(METRICS_TOPIC, wal_unavailable_reason(err));
         request_metrics.finish_error();
     })?;
     request_metrics.record_wal_enqueue_duration(enqueue_start.elapsed(), METRICS_TOPIC, STATUS_OK);

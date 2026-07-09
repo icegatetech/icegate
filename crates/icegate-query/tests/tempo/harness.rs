@@ -112,9 +112,14 @@ impl TestServer {
         let server_engine = Arc::clone(&query_engine);
 
         let server_handle = tokio::spawn(async move {
-            icegate_query::tempo::run(server_engine, tempo_config, cancel_token_clone)
-                .await
-                .unwrap();
+            icegate_query::tempo::run(
+                server_engine,
+                tempo_config,
+                cancel_token_clone,
+                icegate_common::MemoryPressure::inert(),
+            )
+            .await
+            .unwrap();
         });
 
         // Wait for the server to be reachable.

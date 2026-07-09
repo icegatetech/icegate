@@ -2,6 +2,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
+use icegate_common::MemoryPressure;
 use tokio_util::sync::CancellationToken;
 
 use super::PrometheusConfig;
@@ -24,12 +25,13 @@ pub async fn run(
     engine: Arc<QueryEngine>,
     config: PrometheusConfig,
     cancel_token: CancellationToken,
+    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
     let state = PrometheusState { engine };
 
-    let app = super::routes::routes(state);
+    let app = super::routes::routes(state, pressure);
 
     tracing::info!("Prometheus API server listening on {}", addr);
 

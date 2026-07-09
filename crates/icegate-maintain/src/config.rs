@@ -96,7 +96,7 @@ storage:
   backend: !s3
     bucket: warehouse
     region: us-east-1
-    endpoint: http://minio:9000
+    endpoint: http://localhost:9000
 ";
         let config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse migrate-style config");
         config

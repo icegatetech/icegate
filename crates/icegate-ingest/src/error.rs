@@ -60,6 +60,20 @@ pub enum IngestError {
     #[error("max retry attempts reached")]
     MaxAttemptsReached,
 
+    /// WAL write channel is full: the ingest node is shedding load rather than
+    /// blocking the caller. The request was NOT enqueued, so a client retry is
+    /// safe (no duplicate write). Surfaces as a retryable 429 / `RESOURCE_EXHAUSTED`.
+    #[error("WAL write channel is full")]
+    QueueFull,
+
+    /// WAL acknowledgement did not arrive within the durability deadline. The
+    /// write may still land (the request was enqueued), so a client retry is
+    /// at-least-once and may duplicate — acceptable for OTLP. Surfaces as a
+    /// retryable 503 / `UNAVAILABLE` so a stock collector retries gracefully
+    /// instead of tripping its own client timeout.
+    #[error("WAL acknowledgement deadline exceeded")]
+    AckTimeout,
+
     /// Other errors
     #[error("other error: {0}")]
     Other(#[from] Box<dyn Error + Send + Sync>),
@@ -101,6 +115,8 @@ impl IngestError {
             Self::Queue(err) => err.is_retryable(),
             Self::Other(err) => is_retryable_error_chain(err.as_ref()),
             Self::Multiple(errors) => errors.iter().all(Self::is_retryable),
+            // Backpressure signals: shed now, let the client retry.
+            Self::QueueFull | Self::AckTimeout => true,
             Self::Decode(_)
             | Self::Validation(_)
             | Self::NotImplemented(_)
@@ -158,5 +174,16 @@ impl icegate_common::RetryError for IngestError {
 
     fn max_attempts() -> Self {
         Self::MaxAttemptsReached
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IngestError;
+
+    #[test]
+    fn backpressure_errors_are_retryable() {
+        assert!(IngestError::QueueFull.is_retryable());
+        assert!(IngestError::AckTimeout.is_retryable());
     }
 }
