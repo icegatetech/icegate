@@ -44,13 +44,13 @@ const fn default_enabled() -> bool {
     true
 }
 const fn default_high_watermark() -> f64 {
-    0.85
+    0.90
 }
 const fn default_low_watermark() -> f64 {
-    0.80
+    0.85
 }
 const fn default_sample_interval_ms() -> u64 {
-    100
+    250
 }
 
 impl Default for MemoryPressureConfig {
