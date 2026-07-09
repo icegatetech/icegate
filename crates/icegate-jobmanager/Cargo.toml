@@ -52,5 +52,5 @@ tracing-subscriber = { workspace = true }
 
 
 [dev-dependencies]
-# Object-store testcontainer helpers (S3TestContainer)
-icegate-common = { workspace = true, features = ["testing"] }
+# S3-compatible object-store testcontainer (local S3TestContainer helper, no IceGate deps)
+testcontainers = { workspace = true }

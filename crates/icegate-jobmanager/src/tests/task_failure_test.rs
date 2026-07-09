@@ -8,10 +8,10 @@ use std::{
 };
 
 use chrono::Duration as ChronoDuration;
-use icegate_common::testing::S3TestContainer;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
+use super::common::s3_container::S3TestContainer;
 use crate::{
     Error, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, TaskCode,
     TaskDefinition, WorkerConfig,

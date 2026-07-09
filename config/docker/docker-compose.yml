@@ -11,6 +11,12 @@ x-logging: &fluentd-logging
 services:
   rustfs:
     image: rustfs/rustfs:1.0.0-beta.8
+    # `s3` network alias decouples client configs from the object-store impl:
+    # swap the image here and callers keep pointing at http://s3:9000.
+    networks:
+      default:
+        aliases:
+          - s3
     ports:
       - "9000:9000"
       - "9001:9001"

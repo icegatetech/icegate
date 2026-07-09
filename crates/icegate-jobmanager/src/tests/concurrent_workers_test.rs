@@ -2,10 +2,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
 use dashmap::DashMap;
-use icegate_common::testing::S3TestContainer;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::common::s3_container::S3TestContainer;
 use super::common::{manager_env::ManagerEnv, storage_wrapper::CountingStorage};
 use crate::{
     CachedStorage, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Metrics, RetrierConfig, Storage,
