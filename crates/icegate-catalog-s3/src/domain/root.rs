@@ -8,7 +8,7 @@ use iceberg::{NamespaceIdent, TableCreation, TableIdent, TableRequirement};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::Error;
+use super::DomainError;
 
 /// Version of an Iceberg metadata file commit.
 ///
@@ -25,31 +25,31 @@ impl MetadataVersion {
     }
 
     /// Parse metadata version from an Iceberg metadata file location.
-    fn from_location(location: &TableMetadataLocation) -> Result<Self, Error> {
+    fn from_location(location: &TableMetadataLocation) -> Result<Self, DomainError> {
         let filename = location
             .as_str()
             .rsplit('/')
             .next()
             .filter(|segment| !segment.is_empty())
-            .ok_or_else(|| Error::InvalidMetadata(format!("Invalid metadata location: {location}")))?;
+            .ok_or_else(|| DomainError::InvalidMetadata(format!("Invalid metadata location: {location}")))?;
         let version = filename
             .split_once('-')
             .map(|(prefix, _)| prefix)
-            .ok_or_else(|| Error::InvalidMetadata(format!("Missing metadata version in location: {location}")))?;
+            .ok_or_else(|| DomainError::InvalidMetadata(format!("Missing metadata version in location: {location}")))?;
 
         version.parse::<u32>().map(Self).map_err(|error| {
-            Error::InvalidMetadata(format!(
+            DomainError::InvalidMetadata(format!(
                 "Invalid metadata version '{version}' in location {location}: {error}"
             ))
         })
     }
 
     /// Return the next metadata version.
-    fn next(self) -> Result<Self, Error> {
+    fn next(self) -> Result<Self, DomainError> {
         self.0
             .checked_add(1)
             .map(Self)
-            .ok_or_else(|| Error::InvalidMetadata(format!("Metadata version overflow: {}", self.0)))
+            .ok_or_else(|| DomainError::InvalidMetadata(format!("Metadata version overflow: {}", self.0)))
     }
 
     /// Return the numeric value of this metadata version.
@@ -97,7 +97,7 @@ impl TableUpdate {
         namespace: &NamespaceIdent,
         creation: TableCreation,
         tables_uri_prefix: &str,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DomainError> {
         let uuid = Uuid::new_v4();
         let table_location = creation
             .location
@@ -130,7 +130,7 @@ impl TableUpdate {
     }
 
     /// Metadata version baked into the updated metadata location.
-    fn metadata_version(&self) -> Result<MetadataVersion, Error> {
+    fn metadata_version(&self) -> Result<MetadataVersion, DomainError> {
         MetadataVersion::from_location(self.updated.metadata_location())
     }
 
@@ -139,10 +139,10 @@ impl TableUpdate {
         storage_locations.iter().any(|location| location == prepared_location)
     }
 
-    fn committed(&self) -> Result<&CatalogTableLink, Error> {
+    fn committed(&self) -> Result<&CatalogTableLink, DomainError> {
         self.committed
             .as_ref()
-            .ok_or_else(|| Error::InvalidMetadata("prepared commit missing persisted root entry".to_string()))
+            .ok_or_else(|| DomainError::InvalidMetadata("prepared commit missing persisted root entry".to_string()))
     }
 }
 
@@ -184,7 +184,7 @@ impl IcebergTableMetadata {
     /// # Errors
     ///
     /// Returns an error if the `TableCreation` is invalid or metadata cannot be built.
-    pub(crate) fn create(creation: TableCreation, uuid: Uuid) -> Result<Self, Error> {
+    pub(crate) fn create(creation: TableCreation, uuid: Uuid) -> Result<Self, DomainError> {
         // `from_table_creation` reassigns every field id to a fresh sequence —
         // the Iceberg default for a brand-new table. icegate, however, depends
         // on *fixed* schema field ids end to end: the WAL and the shifter write
@@ -231,7 +231,7 @@ impl IcebergTableMetadata {
         persisted: CatalogTableLink,
         requirements: Vec<TableRequirement>,
         updates: Vec<IcebergTableUpdate>,
-    ) -> Result<TableUpdate, Error> {
+    ) -> Result<TableUpdate, DomainError> {
         for requirement in requirements {
             requirement.check(Some(&self.metadata))?;
         }
@@ -243,7 +243,9 @@ impl IcebergTableMetadata {
 
         let build = builder.build()?;
         if build.metadata.location().is_empty() {
-            return Err(Error::InvalidMetadata(format!("empty table location for {full_name}")));
+            return Err(DomainError::InvalidMetadata(format!(
+                "empty table location for {full_name}"
+            )));
         }
 
         let metadata_version = MetadataVersion::from_location(&self.metadata_location)?.next()?;
@@ -267,7 +269,7 @@ impl IcebergTableMetadata {
 }
 
 /// Table entry inside the catalog root.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct CatalogTableLink {
     /// Stable table identifier.
     table_id: TableId,
@@ -298,15 +300,18 @@ impl CatalogTableLink {
         self.status == TableStatus::Active
     }
 
-    fn validate_metadata_location(&self) -> Result<(), Error> {
+    pub(crate) fn mark_tombstoned(&mut self) {
+        self.status = TableStatus::Tombstoned;
+    }
+
+    fn validate_metadata_location(&self) -> Result<(), DomainError> {
         let _ = MetadataVersion::from_location(&self.metadata_location)?;
         Ok(())
     }
 }
 
 /// Table status in the catalog root.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TableStatus {
     /// Table is active and queryable.
     Active,
@@ -315,8 +320,7 @@ pub(crate) enum TableStatus {
 }
 
 /// Stable table identifier stored in the root index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TableId(Uuid);
 
 impl TableId {
@@ -340,8 +344,7 @@ impl From<Uuid> for TableId {
 }
 
 /// Full Iceberg table metadata file location stored in the root index.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableMetadataLocation(String);
 
 impl TableMetadataLocation {
@@ -372,66 +375,78 @@ impl std::fmt::Display for TableMetadataLocation {
     }
 }
 
-/// Root key as `{namespace}.{table}`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct TableKey(String);
+/// Lossless root key for a table identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct TableKey {
+    namespace: NamespaceKey,
+    name: String,
+}
 
 impl TableKey {
-    pub(crate) fn from_ident(ident: &TableIdent) -> Self {
-        Self(format!("{}.{}", ident.namespace(), ident.name()))
-    }
-
-    pub(crate) fn split(&self) -> Option<(NamespaceIdent, String)> {
-        let (namespace, table_name) = self.0.rsplit_once('.')?;
-        if namespace.is_empty() || table_name.is_empty() {
-            return None;
+    pub(crate) fn new(namespace: NamespaceKey, name: String) -> Result<Self, DomainError> {
+        if name.is_empty() {
+            return Err(DomainError::InvalidMetadata("Table name cannot be empty".to_string()));
         }
-
-        let namespace_parts = namespace.split('.').map(ToString::to_string).collect::<Vec<_>>();
-
-        let namespace_ident = NamespaceIdent::from_vec(namespace_parts).ok()?;
-        Some((namespace_ident, table_name.to_string()))
+        Ok(Self { namespace, name })
     }
 
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
+    pub(crate) fn from_ident(ident: &TableIdent) -> Self {
+        Self {
+            namespace: NamespaceKey::from_ident(ident.namespace()),
+            name: ident.name().to_string(),
+        }
+    }
+
+    pub(crate) const fn namespace(&self) -> &NamespaceKey {
+        &self.namespace
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn to_table_ident(&self) -> TableIdent {
+        TableIdent::new(self.namespace.to_ident(), self.name.clone())
     }
 }
 
-/// Root key as `{namespace}`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct NamespaceKey(String);
+/// Lossless root key for a multipart namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct NamespaceKey(NamespaceIdent);
 
 impl NamespaceKey {
-    pub(crate) fn from_ident(ident: &NamespaceIdent) -> Self {
-        Self(ident.join("."))
+    pub(crate) fn new(parts: Vec<String>) -> Result<Self, DomainError> {
+        if parts.is_empty() || parts.iter().any(String::is_empty) {
+            return Err(DomainError::InvalidMetadata(
+                "Namespace parts cannot be empty".to_string(),
+            ));
+        }
+        NamespaceIdent::from_vec(parts)
+            .map(Self)
+            .map_err(|error| DomainError::InvalidMetadata(format!("Invalid namespace: {error}")))
     }
 
-    pub(crate) fn split(&self) -> Option<NamespaceIdent> {
-        if self.0.is_empty() {
-            return None;
-        }
-
-        let namespace_parts = self.0.split('.').map(ToString::to_string).collect::<Vec<_>>();
-        if namespace_parts.iter().any(String::is_empty) {
-            return None;
-        }
-
-        NamespaceIdent::from_vec(namespace_parts).ok()
+    fn from_ident(ident: &NamespaceIdent) -> Self {
+        Self(ident.clone())
     }
 
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
+    pub(crate) fn parts(&self) -> &[String] {
+        self.0.as_ref()
+    }
+
+    pub(crate) fn to_ident(&self) -> NamespaceIdent {
+        self.0.clone()
+    }
+
+    fn is_descendant_of(&self, namespace: &Self) -> bool {
+        self.parts().len() > namespace.parts().len() && self.parts().starts_with(namespace.parts())
     }
 }
 
 /// Namespace record inside the catalog root.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct NamespaceEntry {
     /// Namespace properties.
-    #[serde(default)]
     properties: HashMap<String, String>,
 }
 
@@ -450,31 +465,87 @@ impl NamespaceEntry {
 }
 
 /// Root catalog state stored in catalog storage.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct CatalogRoot {
     /// Namespace records indexed by `{namespace}`.
-    #[serde(default)]
     namespaces: HashMap<NamespaceKey, NamespaceEntry>,
     /// Active table entries indexed by `{namespace}.{table}`.
-    #[serde(default)]
     tables: HashMap<TableKey, CatalogTableLink>,
     /// Tombstoned table entries indexed by stable table id.
-    #[serde(default)]
     tombstones: HashMap<TableId, CatalogTableLink>,
 }
 
 impl CatalogRoot {
+    // Restore from storage
+    pub(crate) fn new(
+        namespaces: Vec<(NamespaceKey, NamespaceEntry)>,
+        tables: Vec<(TableKey, CatalogTableLink)>,
+        tombstones: Vec<(TableId, CatalogTableLink)>,
+    ) -> Result<Self, DomainError> {
+        let mut root = Self::default();
+
+        for (key, entry) in namespaces {
+            if root.namespaces.insert(key, entry).is_some() {
+                return Err(DomainError::InvalidMetadata("Duplicate namespace record".to_string()));
+            }
+        }
+
+        for (key, entry) in tables {
+            if !entry.is_active() {
+                return Err(DomainError::InvalidMetadata(
+                    "Active table record is tombstoned".to_string(),
+                ));
+            }
+            entry.validate_metadata_location()?;
+            root.require_namespace(&key.namespace().to_ident())?;
+            if root.tables.insert(key, entry).is_some() {
+                return Err(DomainError::InvalidMetadata("Duplicate table record".to_string()));
+            }
+        }
+
+        for (table_id, entry) in tombstones {
+            if entry.is_active() || entry.table_id() != &table_id {
+                return Err(DomainError::InvalidMetadata("Invalid tombstone record".to_string()));
+            }
+            entry.validate_metadata_location()?;
+            if root.tombstones.insert(table_id, entry).is_some() {
+                return Err(DomainError::InvalidMetadata("Duplicate tombstone record".to_string()));
+            }
+        }
+
+        let mut table_ids = std::collections::HashSet::new();
+        for entry in root
+            .table_entries()
+            .map(|(_, entry)| entry)
+            .chain(root.tombstone_entries().map(|(_, entry)| entry))
+        {
+            if !table_ids.insert(*entry.table_id()) {
+                return Err(DomainError::InvalidMetadata(
+                    "Duplicate table id in catalog root".to_string(),
+                ));
+            }
+        }
+
+        Ok(root)
+    }
+
     pub(crate) fn namespace_entries(&self) -> impl Iterator<Item = (&NamespaceKey, &NamespaceEntry)> {
         self.namespaces.iter()
     }
 
+    pub(crate) fn table_entries(&self) -> impl Iterator<Item = (&TableKey, &CatalogTableLink)> {
+        self.tables.iter()
+    }
+
+    pub(crate) fn tombstone_entries(&self) -> impl Iterator<Item = (&TableId, &CatalogTableLink)> {
+        self.tombstones.iter()
+    }
+
     /// List direct child namespaces under `parent`, or top-level namespaces if `parent` is `None`.
     ///
-    /// Implicit namespaces derived from table keys are included alongside explicitly created ones.
-    /// The result is deterministically ordered.
+    /// Only explicitly created namespaces are returned. The result is deterministically ordered.
     pub(crate) fn list_namespaces(&self, parent: Option<&NamespaceIdent>) -> Vec<NamespaceIdent> {
-        let namespaces: BTreeSet<NamespaceIdent> =
-            self.namespace_entries().filter_map(|(key, _)| key.split()).collect();
+        let namespaces: BTreeSet<NamespaceIdent> = self.namespace_entries().map(|(key, _)| key.to_ident()).collect();
 
         match parent {
             None => namespaces.into_iter().filter(|ns| ns.as_ref().len() == 1).collect(),
@@ -518,16 +589,16 @@ impl CatalogRoot {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NamespaceNotEmpty`] if the namespace has active tables or descendant namespaces.
-    /// Returns [`Error::NamespaceNotFound`] if the namespace does not exist.
-    pub(crate) fn drop_namespace(&mut self, namespace: &NamespaceIdent) -> Result<(), Error> {
+    /// Returns [`DomainError::NamespaceNotEmpty`] if the namespace has active tables or descendant namespaces.
+    /// Returns [`DomainError::NamespaceNotFound`] if the namespace does not exist.
+    pub(crate) fn drop_namespace(&mut self, namespace: &NamespaceIdent) -> Result<(), DomainError> {
         let key = NamespaceKey::from_ident(namespace);
         if !self.namespaces.contains_key(&key) {
-            return Err(Error::NamespaceNotFound(namespace.clone()));
+            return Err(DomainError::NamespaceNotFound(namespace.clone()));
         }
 
         if self.has_active_tables_in_namespace_tree(namespace) || self.has_namespace_descendants(namespace) {
-            return Err(Error::NamespaceNotEmpty(namespace.clone()));
+            return Err(DomainError::NamespaceNotEmpty(namespace.clone()));
         }
 
         self.namespaces.remove(&key);
@@ -535,14 +606,14 @@ impl CatalogRoot {
     }
 
     fn has_namespace_descendants(&self, namespace: &NamespaceIdent) -> bool {
-        let prefix = format!("{}.", NamespaceKey::from_ident(namespace).as_str());
-        self.namespaces.keys().any(|key| key.as_str().starts_with(&prefix))
+        let key = NamespaceKey::from_ident(namespace);
+        self.namespaces.keys().any(|candidate| candidate.is_descendant_of(&key))
     }
 
     fn has_active_tables_in_namespace_tree(&self, namespace: &NamespaceIdent) -> bool {
-        let prefix = format!("{}.", NamespaceKey::from_ident(namespace).as_str());
+        let key = NamespaceKey::from_ident(namespace);
         self.active_entries()
-            .any(|(table_key, _)| table_key.as_str().starts_with(&prefix))
+            .any(|(table_key, _)| table_key.namespace() == &key || table_key.namespace().is_descendant_of(&key))
     }
 
     pub(crate) fn get_active(&self, key: &TableKey) -> Option<&CatalogTableLink> {
@@ -557,11 +628,10 @@ impl CatalogRoot {
         let mut tables = self
             .active_entries()
             .filter_map(|(key, _)| {
-                let (key_namespace, table_name) = key.split()?;
-                if &key_namespace != namespace {
+                if key.namespace() != &NamespaceKey::from_ident(namespace) {
                     return None;
                 }
-                Some(TableIdent::new(key_namespace, table_name))
+                Some(key.to_table_ident())
             })
             .collect::<Vec<_>>();
         tables.sort_by(|left, right| left.name().cmp(right.name()));
@@ -569,9 +639,9 @@ impl CatalogRoot {
     }
 
     /// Check whether `namespace` exists; used as a pre-flight before mutating ops.
-    pub(crate) fn require_namespace(&self, namespace: &NamespaceIdent) -> Result<(), Error> {
+    pub(crate) fn require_namespace(&self, namespace: &NamespaceIdent) -> Result<(), DomainError> {
         if self.get_namespace(namespace).is_none() {
-            Err(Error::NamespaceNotFound(namespace.clone()))
+            Err(DomainError::NamespaceNotFound(namespace.clone()))
         } else {
             Ok(())
         }
@@ -584,11 +654,11 @@ impl CatalogRoot {
     ///
     /// # Errors
     ///
-    /// - [`Error::NamespaceNotFound`] — the target namespace does not exist.
-    /// - [`Error::TableAlreadyExists`] — a different table already occupies this key.
-    /// - [`Error::InvalidMetadata`] — entry invariants violated (bad metadata location
+    /// - [`DomainError::NamespaceNotFound`] — the target namespace does not exist.
+    /// - [`DomainError::TableAlreadyExists`] — a different table already occupies this key.
+    /// - [`DomainError::InvalidMetadata`] — entry invariants violated (bad metadata location
     ///   format, duplicate UUID under another key).
-    pub(crate) fn create_table(&mut self, prepared_table: &TableUpdate) -> Result<(), Error> {
+    pub(crate) fn create_table(&mut self, prepared_table: &TableUpdate) -> Result<(), DomainError> {
         let key = prepared_table.to_key();
         let link = prepared_table.to_link();
 
@@ -599,7 +669,7 @@ impl CatalogRoot {
             if existing.table_id() == link.table_id() && existing.metadata_location() == link.metadata_location() {
                 return Ok(());
             }
-            return Err(Error::TableAlreadyExists(prepared_table.full_name.clone()));
+            return Err(DomainError::TableAlreadyExists(prepared_table.full_name.clone()));
         }
 
         self.link_table(key, link)?;
@@ -612,7 +682,7 @@ impl CatalogRoot {
     /// metadata. It intentionally does not apply the lost-response convergence
     /// path from [`Self::create_table`], because before the metadata write an
     /// already occupied name is always a deterministic rejection.
-    pub(crate) fn validate_new_table(&self, prepared_table: &TableUpdate) -> Result<(), Error> {
+    pub(crate) fn validate_new_table(&self, prepared_table: &TableUpdate) -> Result<(), DomainError> {
         let key = prepared_table.to_key();
         let link = prepared_table.to_link();
         self.validate_new_table_link(&key, &link)
@@ -639,25 +709,25 @@ impl CatalogRoot {
     ///
     /// # Errors
     ///
-    /// - [`Error::TableNotFound`] — no active root entry for a commit's key.
-    /// - [`Error::CommitConflict`] — the active entry has a different table id
+    /// - [`DomainError::TableNotFound`] — no active root entry for a commit's key.
+    /// - [`DomainError::CommitConflict`] — the active entry has a different table id
     ///   (ABA recreate), or [`Self::apply_commit`] rejects the link.
     pub(crate) fn merge_transaction(
         &mut self,
         commits: &[&TableUpdate],
         committed_locations: &HashMap<TableKey, Vec<TableMetadataLocation>>,
-    ) -> Result<MergeOutcome, Error> {
+    ) -> Result<MergeOutcome, DomainError> {
         let mut rebuild = Vec::new();
 
         for &table in commits {
             let key = table.to_key();
             let entry = self
                 .get_active(&key)
-                .ok_or_else(|| Error::TableNotFound(table.full_name.clone()))?;
+                .ok_or_else(|| DomainError::TableNotFound(table.full_name.clone()))?;
             let persisted = table.committed()?;
 
             if entry.table_id() != persisted.table_id() {
-                return Err(Error::CommitConflict);
+                return Err(DomainError::CommitConflict);
             }
 
             // Lost-response convergence: head already points at our exact prepared
@@ -712,22 +782,19 @@ impl CatalogRoot {
     /// Link an existing table entry (pre-built key and entry) into the catalog.
     ///
     /// Used for `register_table` where the metadata location comes from the caller.
-    pub(crate) fn link_table(&mut self, key: TableKey, entry: CatalogTableLink) -> Result<(), Error> {
+    pub(crate) fn link_table(&mut self, key: TableKey, entry: CatalogTableLink) -> Result<(), DomainError> {
         self.validate_new_table_link(&key, &entry)?;
         self.tables.insert(key, entry);
         Ok(())
     }
 
-    fn validate_new_table_link(&self, key: &TableKey, entry: &CatalogTableLink) -> Result<(), Error> {
+    fn validate_new_table_link(&self, key: &TableKey, entry: &CatalogTableLink) -> Result<(), DomainError> {
         entry.validate_metadata_location()?;
 
-        let (namespace, _) = key
-            .split()
-            .ok_or_else(|| Error::InvalidMetadata(format!("Invalid table key: {}", key.as_str())))?;
-        self.require_namespace(&namespace)?;
+        self.require_namespace(&key.namespace().to_ident())?;
 
         if self.get_active(key).is_some() {
-            return Err(Error::TableAlreadyExists(Self::table_ident_from_key(key)?));
+            return Err(DomainError::TableAlreadyExists(Self::table_ident_from_key(key)));
         }
 
         let table_id = TableId::from_entry(entry);
@@ -735,7 +802,7 @@ impl CatalogRoot {
             .active_entries()
             .any(|(_, active_entry)| active_entry.table_id() == &table_id)
         {
-            return Err(Error::InvalidMetadata(format!(
+            return Err(DomainError::InvalidMetadata(format!(
                 "Duplicate table id in catalog root: {}",
                 table_id.as_uuid()
             )));
@@ -749,40 +816,40 @@ impl CatalogRoot {
         key: &TableKey,
         persisted: &CatalogTableLink,
         metadata_location: TableMetadataLocation,
-    ) -> Result<(), Error> {
-        let entry = self.tables.get_mut(key).ok_or(Error::CommitConflict)?;
+    ) -> Result<(), DomainError> {
+        let entry = self.tables.get_mut(key).ok_or(DomainError::CommitConflict)?;
         if !entry.is_active() {
-            return Err(Error::CommitConflict);
+            return Err(DomainError::CommitConflict);
         }
 
         if entry.table_id() != persisted.table_id() || entry.metadata_location() != persisted.metadata_location() {
-            return Err(Error::CommitConflict);
+            return Err(DomainError::CommitConflict);
         }
 
         let old_version = MetadataVersion::from_location(&entry.metadata_location)?;
         let new_version = MetadataVersion::from_location(&metadata_location)?;
-        let expected = old_version.as_u32().checked_add(1).ok_or(Error::CommitConflict)?;
+        let expected = old_version.as_u32().checked_add(1).ok_or(DomainError::CommitConflict)?;
         if new_version.as_u32() != expected {
-            return Err(Error::CommitConflict);
+            return Err(DomainError::CommitConflict);
         }
 
         entry.metadata_location = metadata_location;
         Ok(())
     }
 
-    pub(crate) fn tombstone(&mut self, key: &TableKey, table_id: &TableId) -> Result<(), Error> {
-        let table_ident = Self::table_ident_from_key(key)?;
+    pub(crate) fn tombstone(&mut self, key: &TableKey, table_id: &TableId) -> Result<(), DomainError> {
+        let table_ident = Self::table_ident_from_key(key);
 
         if let Some(entry) = self.get_active(key) {
             if entry.table_id() != table_id {
-                return Err(Error::TableNotFound(table_ident));
+                return Err(DomainError::TableNotFound(table_ident));
             }
 
             let mut entry = self
                 .tables
                 .remove(key)
-                .ok_or_else(|| Error::TableNotFound(table_ident.clone()))?;
-            entry.status = TableStatus::Tombstoned;
+                .ok_or_else(|| DomainError::TableNotFound(table_ident.clone()))?;
+            entry.mark_tombstoned();
             self.tombstones.insert(TableId::from_entry(&entry), entry);
             return Ok(());
         }
@@ -795,42 +862,40 @@ impl CatalogRoot {
             return Ok(());
         }
 
-        Err(Error::TableNotFound(table_ident))
+        Err(DomainError::TableNotFound(table_ident))
     }
 
-    pub(crate) fn rename(&mut self, src: &TableKey, dst: TableKey, table_id: &TableId) -> Result<(), Error> {
-        let (dst_namespace, _) = dst
-            .split()
-            .ok_or_else(|| Error::InvalidMetadata(format!("Invalid table key: {}", dst.as_str())))?;
+    pub(crate) fn rename(&mut self, src: &TableKey, dst: TableKey, table_id: &TableId) -> Result<(), DomainError> {
+        let dst_namespace = dst.namespace().to_ident();
         if self.get_namespace(&dst_namespace).is_none() {
-            return Err(Error::NamespaceNotFound(dst_namespace));
+            return Err(DomainError::NamespaceNotFound(dst_namespace));
         }
 
         if let Some(destination) = self.get_active(&dst) {
             if destination.table_id() == table_id && self.get_active(src).is_none() {
                 return Ok(());
             }
-            return Err(Error::TableAlreadyExists(Self::table_ident_from_key(&dst)?));
+            return Err(DomainError::TableAlreadyExists(Self::table_ident_from_key(&dst)));
         }
 
-        let source_ident = Self::table_ident_from_key(src)?;
-        let source = self.tables.get(src).ok_or_else(|| Error::TableNotFound(source_ident.clone()))?;
+        let source_ident = Self::table_ident_from_key(src);
+        let source = self
+            .tables
+            .get(src)
+            .ok_or_else(|| DomainError::TableNotFound(source_ident.clone()))?;
         if !source.is_active() || source.table_id() != table_id {
-            return Err(Error::TableNotFound(source_ident));
+            return Err(DomainError::TableNotFound(source_ident));
         }
 
         let Some(entry) = self.tables.remove(src) else {
-            return Err(Error::TableNotFound(Self::table_ident_from_key(src)?));
+            return Err(DomainError::TableNotFound(Self::table_ident_from_key(src)));
         };
         self.tables.insert(dst, entry);
         Ok(())
     }
 
-    fn table_ident_from_key(key: &TableKey) -> Result<TableIdent, Error> {
-        let (namespace, table_name) = key
-            .split()
-            .ok_or_else(|| Error::InvalidMetadata(format!("Invalid table key: {}", key.as_str())))?;
-        Ok(TableIdent::new(namespace, table_name))
+    fn table_ident_from_key(key: &TableKey) -> TableIdent {
+        key.to_table_ident()
     }
 }
 
@@ -917,7 +982,7 @@ mod tests {
         let error =
             MetadataVersion::from_location(&metadata_location("s3://bucket/")).expect_err("trailing slash must fail");
 
-        assert!(matches!(error, Error::InvalidMetadata(_)));
+        assert!(matches!(error, DomainError::InvalidMetadata(_)));
     }
 
     #[test]
@@ -925,7 +990,7 @@ mod tests {
         let error = MetadataVersion::from_location(&metadata_location("s3://bucket/metadata/nondash.json"))
             .expect_err("missing dash must fail");
 
-        assert!(matches!(error, Error::InvalidMetadata(_)));
+        assert!(matches!(error, DomainError::InvalidMetadata(_)));
     }
 
     #[test]
@@ -933,7 +998,7 @@ mod tests {
         let error = MetadataVersion::from_location(&metadata_location("s3://bucket/metadata/abc-uuid.json"))
             .expect_err("non-numeric prefix must fail");
 
-        assert!(matches!(error, Error::InvalidMetadata(_)));
+        assert!(matches!(error, DomainError::InvalidMetadata(_)));
     }
 
     #[test]
@@ -950,7 +1015,7 @@ mod tests {
     fn metadata_version_next_overflows() {
         let error = MetadataVersion(u32::MAX).next().expect_err("overflow must fail");
 
-        assert!(matches!(error, Error::InvalidMetadata(_)));
+        assert!(matches!(error, DomainError::InvalidMetadata(_)));
     }
 
     #[test]
@@ -1144,7 +1209,7 @@ mod tests {
             )
             .expect_err("empty table location must fail");
 
-        assert!(matches!(error, Error::InvalidMetadata(_)));
+        assert!(matches!(error, DomainError::InvalidMetadata(_)));
     }
 
     #[test]
@@ -1168,24 +1233,23 @@ mod tests {
             .prepare_commit(identifier, persisted, vec![TableRequirement::NotExist], Vec::new())
             .expect_err("failing requirement must abort prepare_commit");
 
-        assert!(matches!(error, Error::Iceberg(_)));
+        assert!(matches!(error, DomainError::Iceberg(_)));
     }
 
     #[test]
-    fn table_key_split_supports_nested_namespace() {
-        let key = TableKey("a.b.tbl".to_string());
+    fn table_key_preserves_nested_namespace_and_table_name() {
+        let ident = table_ident(namespace(&["a", "b"]), "events.v2");
+        let key = TableKey::from_ident(&ident);
 
-        let (namespace_ident, table_name) = key.split().expect("split table key");
-
-        assert_eq!(namespace_ident, namespace(&["a", "b"]));
-        assert_eq!(table_name, "tbl");
+        assert_eq!(key.to_table_ident(), ident);
     }
 
     #[test]
-    fn table_key_split_fails_for_invalid_key() {
-        let key = TableKey(".tbl".to_string());
+    fn namespace_key_rejects_empty_part() {
+        let error =
+            NamespaceKey::new(vec!["valid".to_string(), String::new()]).expect_err("empty namespace part must fail");
 
-        assert!(key.split().is_none());
+        assert!(matches!(error, DomainError::InvalidMetadata(_)));
     }
 
     #[test]
@@ -1200,7 +1264,7 @@ mod tests {
 
         let entry = root.get_active(&key).expect("active entry");
         assert_eq!(entry.table_id(), &table_id(1));
-        assert_eq!(CatalogRoot::table_ident_from_key(&key).expect("table ident"), ident);
+        assert_eq!(CatalogRoot::table_ident_from_key(&key), ident);
     }
 
     #[test]
@@ -1214,7 +1278,7 @@ mod tests {
 
         let error = root.link_table(key, table_entry(1)).expect_err("active duplicate must fail");
 
-        assert!(matches!(error, Error::TableAlreadyExists(existing) if existing == ident));
+        assert!(matches!(error, DomainError::TableAlreadyExists(existing) if existing == ident));
     }
 
     #[test]
@@ -1233,7 +1297,7 @@ mod tests {
             )
             .expect_err("invalid metadata location must fail");
 
-        assert!(matches!(error, Error::InvalidMetadata(_)));
+        assert!(matches!(error, DomainError::InvalidMetadata(_)));
     }
 
     #[test]
@@ -1244,7 +1308,7 @@ mod tests {
 
         let error = root.link_table(key, table_entry(0)).expect_err("missing namespace must fail");
 
-        assert!(matches!(error, Error::NamespaceNotFound(ns) if ns == namespace));
+        assert!(matches!(error, DomainError::NamespaceNotFound(ns) if ns == namespace));
     }
 
     #[test]
@@ -1319,7 +1383,7 @@ mod tests {
 
         let error = root.tombstone(&key, &table_id(9_999)).expect_err("missing key must fail");
 
-        assert!(matches!(error, Error::TableNotFound(table) if table == ident));
+        assert!(matches!(error, DomainError::TableNotFound(table) if table == ident));
     }
 
     #[test]
@@ -1353,7 +1417,7 @@ mod tests {
             .tombstone(&key, &original_table_id)
             .expect_err("foreign occupant must not be dropped");
 
-        assert!(matches!(error, Error::TableNotFound(table) if table == ident));
+        assert!(matches!(error, DomainError::TableNotFound(table) if table == ident));
         assert_eq!(
             root.get_active(&key).expect("foreign table remains").table_id(),
             &table_id(2)
@@ -1387,7 +1451,7 @@ mod tests {
 
         let error = root.rename(&src, dst, &table_id(9_999)).expect_err("missing source must fail");
 
-        assert!(matches!(error, Error::TableNotFound(table) if table == src_ident));
+        assert!(matches!(error, DomainError::TableNotFound(table) if table == src_ident));
     }
 
     #[test]
@@ -1406,7 +1470,7 @@ mod tests {
             .rename(&src, dst, &source_table_id)
             .expect_err("active destination must fail");
 
-        assert!(matches!(error, Error::TableAlreadyExists(table) if table == dst_ident));
+        assert!(matches!(error, DomainError::TableAlreadyExists(table) if table == dst_ident));
         assert!(root.get_active(&src).is_some());
     }
 
@@ -1445,7 +1509,7 @@ mod tests {
             .rename(&src, dst, &source_table_id)
             .expect_err("foreign destination must reject convergence");
 
-        assert!(matches!(error, Error::TableAlreadyExists(table) if table == dst_ident));
+        assert!(matches!(error, DomainError::TableAlreadyExists(table) if table == dst_ident));
     }
 
     #[test]
@@ -1521,7 +1585,7 @@ mod tests {
             )
             .expect_err("different table id must fail");
 
-        assert!(matches!(error, Error::CommitConflict));
+        assert!(matches!(error, DomainError::CommitConflict));
         assert_eq!(
             root.get_active(&key).expect("active entry").metadata_location(),
             base_entry.metadata_location()
@@ -1549,7 +1613,7 @@ mod tests {
             )
             .expect_err("different persisted metadata location must fail");
 
-        assert!(matches!(error, Error::CommitConflict));
+        assert!(matches!(error, DomainError::CommitConflict));
         assert_eq!(
             root.get_active(&key).expect("active entry").metadata_location(),
             base_entry.metadata_location()
@@ -1573,7 +1637,7 @@ mod tests {
             )
             .expect_err("missing key must fail");
 
-        assert!(matches!(error, Error::CommitConflict));
+        assert!(matches!(error, DomainError::CommitConflict));
     }
 
     #[test]
@@ -1594,7 +1658,7 @@ mod tests {
             )
             .expect_err("tombstoned table must fail");
 
-        assert!(matches!(error, Error::CommitConflict));
+        assert!(matches!(error, DomainError::CommitConflict));
     }
 
     #[test]
@@ -1613,7 +1677,7 @@ mod tests {
                 metadata_location("memory://catalog/tables/table-id/metadata/00003-next.metadata.json"),
             )
             .expect_err("skipping a version must fail");
-        assert!(matches!(skip_error, Error::CommitConflict));
+        assert!(matches!(skip_error, DomainError::CommitConflict));
 
         let regress_error = root
             .apply_commit(
@@ -1622,7 +1686,7 @@ mod tests {
                 metadata_location("memory://catalog/tables/table-id/metadata/00001-prev.metadata.json"),
             )
             .expect_err("regressing a version must fail");
-        assert!(matches!(regress_error, Error::CommitConflict));
+        assert!(matches!(regress_error, DomainError::CommitConflict));
     }
 
     #[test]
@@ -1642,7 +1706,7 @@ mod tests {
             )
             .expect_err("invalid metadata location must fail");
 
-        assert!(matches!(error, Error::InvalidMetadata(_)));
+        assert!(matches!(error, DomainError::InvalidMetadata(_)));
         let entry = root.get_active(&key).expect("active entry remains unchanged");
         assert_eq!(
             MetadataVersion::from_location(entry.metadata_location())
@@ -1719,7 +1783,7 @@ mod tests {
             .merge_transaction(&[&update], &empty_head_locations())
             .expect_err("table id mismatch must conflict");
 
-        assert!(matches!(error, Error::CommitConflict));
+        assert!(matches!(error, DomainError::CommitConflict));
     }
 
     #[test]
@@ -1858,7 +1922,7 @@ mod tests {
             .merge_transaction(&[&update], &empty_head_locations())
             .expect_err("absent entry must fail");
 
-        assert!(matches!(error, Error::TableNotFound(_)));
+        assert!(matches!(error, DomainError::TableNotFound(_)));
         let _ = key;
     }
 
@@ -1948,7 +2012,7 @@ mod tests {
 
         let result = root.rename(&src_key, dst_key, &table_id(42));
 
-        assert!(matches!(result, Err(Error::TableNotFound(ident)) if ident == src_ident));
+        assert!(matches!(result, Err(DomainError::TableNotFound(ident)) if ident == src_ident));
         assert!(root.tombstones.iter().any(|(_, entry)| !entry.is_active()));
         assert!(root.get_active(&src_key).is_none());
     }
@@ -1968,7 +2032,7 @@ mod tests {
             .rename(&src, dst, &table_id)
             .expect_err("missing destination namespace must fail");
 
-        assert!(matches!(error, Error::NamespaceNotFound(ns) if ns == dst_ns));
+        assert!(matches!(error, DomainError::NamespaceNotFound(ns) if ns == dst_ns));
     }
 
     #[test]
@@ -1979,7 +2043,7 @@ mod tests {
 
         let error = root.link_table(key, table_entry(0)).expect_err("missing namespace must fail");
 
-        assert!(matches!(error, Error::NamespaceNotFound(ns) if ns == namespace));
+        assert!(matches!(error, DomainError::NamespaceNotFound(ns) if ns == namespace));
     }
 
     #[test]
@@ -2058,7 +2122,7 @@ mod tests {
 
         let error = root.drop_namespace(&ns).expect_err("missing namespace must fail");
 
-        assert!(matches!(error, Error::NamespaceNotFound(n) if n == ns));
+        assert!(matches!(error, DomainError::NamespaceNotFound(n) if n == ns));
     }
 
     #[test]
@@ -2073,7 +2137,7 @@ mod tests {
 
         let error = root.drop_namespace(&ns).expect_err("namespace with descendant table must fail");
 
-        assert!(matches!(error, Error::NamespaceNotEmpty(n) if n == ns));
+        assert!(matches!(error, DomainError::NamespaceNotEmpty(n) if n == ns));
     }
 
     #[test]
@@ -2088,6 +2152,6 @@ mod tests {
             .drop_namespace(&ns)
             .expect_err("namespace with descendant namespace must fail");
 
-        assert!(matches!(error, Error::NamespaceNotEmpty(n) if n == ns));
+        assert!(matches!(error, DomainError::NamespaceNotEmpty(n) if n == ns));
     }
 }

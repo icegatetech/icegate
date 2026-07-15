@@ -1,194 +1,104 @@
 # AGENTS.md
 
-This file provides guidance to AI agents (Claude Code, Gemini Code Assist, etc.) when working with code in this repository.
+Guidance for AI agents working in this repo. This file holds the rules for **how
+to write code** here. Operational detail (commands, ports, service URLs) lives in
+the executable files and the README — this file points at them, never copies them.
 
-## Component Instructions
+- What IceGate is, features, architecture overview: [README.md](README.md).
+- Rust rules (naming, errors, types, testing, imports, formatting): [RUST.md](RUST.md) — binding, not restated below.
+- Deep-dive docs are linked per crate in the table below (a `—` means the crate has none yet).
 
-- `icegate-catalog-s3`: [crates/icegate-catalog-s3/AGENTS.md](crates/icegate-catalog-s3/AGENTS.md)
+## Operational commands
 
-## Build Commands
+Do not reproduce these in prose — read the source of truth:
 
-### Cargo Commands
+- Build / test / lint / CI: the [`Makefile`](Makefile) targets (`make test` / `check` / `clippy` / `fmt` / `ci`). Lint
+  config: `Cargo.toml` + `clippy.toml`.
+- Dev environment, services, ports, credentials, quick start, k8s: [README.md](README.md).
+- LogQL parser regeneration (Java + ANTLR): [logql/README](crates/icegate-query/src/logql/README.md).
 
-```bash
-cargo build                    # Debug build
-cargo build --release          # Release build
-cargo build --bin query        # Build only query binary
-cargo test                     # Run all tests
-cargo test test_name           # Run specific test
-cargo test -- --nocapture      # Run tests with output shown
-```
+Running rules:
 
-### Make Commands
+- **Do not** run a full `make ci`, build, `cargo test`, or formatting without an explicit request — prefer targeted
+  `cargo test <name>` for the code you touched.
+- Format only the affected crate: `cargo +nightly fmt -p <crate>` (plain `cargo fmt` ignores `rustfmt.toml`).
 
-```bash
-make test           # Run all tests
-make check          # Check all targets
-make fmt            # Check code format (DO NOT RUN via rustup because it doesn't respect rustfmt.toml)
-make clippy         # Run linter with warnings as errors
-make audit          # Run security audit
-make install        # Install cargo-audit
-make ci             # Run all CI checks (check, fmt, clippy, test, audit)
-```
+## Crates and where code goes
 
-## Project Overview
+Place a change in the crate that owns its responsibility; shared infrastructure
+goes in `icegate-common`, never copied into a component.
 
-IceGate is an observability data lake engine that stores logs, traces, metrics, and events in Apache Iceberg tables with DataFusion as the query engine. Data is ingested via OpenTelemetry protocol and queried via Loki/Prometheus/Tempo-compatible APIs.
+| Crate                | Responsibility                                                                                 | Deep-dive docs                                                                                           |
+|----------------------|------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| `icegate-common`     | Shared foundation: Iceberg catalog builder, storage/S3 config, table schema, error types.      | schema [SCHEMA.md](crates/icegate-common/src/SCHEMA.md)                                                  |
+| `icegate-catalog-s3` | S3-backed Iceberg REST catalog. Has its own `domain`/`services`/`storage` layers.              | [AGENTS](crates/icegate-catalog-s3/AGENTS.md), [README](crates/icegate-catalog-s3/README.md)             |
+| `icegate-queue`      | Generic WAL data queue on object storage: durable-before-ack, exactly-once, per-topic offsets. | [README](crates/icegate-queue/README.md)                                                                 |
+| `icegate-ingest`     | OTLP receivers (gRPC/HTTP), transform, WAL write.                                              | per-tenant task model [README](crates/icegate-ingest/README.md)                                                   |
+| `icegate-query`      | Query APIs (Loki/Prometheus/Tempo), query engine, LogQL, query CLI.                            | [README](crates/icegate-query/README.md), LogQL [logql/README](crates/icegate-query/src/logql/README.md) |
+| `icegate-maintain`   | Background maintenance: compaction, GC, schema migration, maintain CLI.                        | compaction [compact/README](crates/icegate-maintain/src/compact/README.md)                               |
+| `icegate-jobmanager` | Background job/task execution framework: registry, execution, S3 job-state.                    | —                                                                                                        |
 
-The architecture is based on open standards:
-- **Apache Iceberg:** For the data lake's table format, providing ACID transactions
-- **Apache DataFusion and Apache Arrow:** As the query engine
-- **Apache Parquet:** For efficient data storage
-- **OpenTelemetry:** For data ingestion
+### Dependency rules
+- `icegate-common` is the foundation and depends on no other workspace crate;
+- Components depend on `common` plus the library crates they need (`queue`, `jobmanager`, `catalog-s3`).
+- `catalog-s3`'s production library pulls no other workspace crate (dev-only dependency on `common`).
+- `jobmanager` should not depend on any Icegate component, including should not depend on `common`. The `jobmanager` will be allocated to a separate repository as an independent project.
 
-## Architecture
+### Where docs live
 
-This project is organized as a Cargo workspace with 4 crates:
+- Crate-specific docs live **with the crate**, never in the root `docs/`: agent
+  instructions ("how to write code in this crate") go in `crates/<crate>/AGENTS.md`;
+  overview, deep-dive, and invariants go in a README beside the code (crate root,
+  or the subsystem — e.g. [`compact/README`](crates/icegate-maintain/src/compact/README.md)).
+- Root [`docs/`](docs) holds only cross-crate, project-wide material
+  (e.g. [tests.md](docs/tests.md)) — never a `docs/<crate>.md`.
+- Why: a crate's docs then travel with it (`jobmanager` will move to its own repo)
+  and sit next to the code they describe, which resists drift.
 
-```
-crates/
-├── icegate-common/           # Shared infrastructure (lib)
-│   └── src/
-│       ├── lib.rs
-│       ├── catalog/          # Iceberg catalog management (CatalogBuilder)
-│       ├── storage/          # Storage backends (S3Config, StorageConfig)
-│       ├── schema.rs         # Iceberg table schemas
-│       └── errors.rs         # Error types
-│
-├── icegate-query/            # Query APIs + CLI (lib + bin)
-│   └── src/
-│       ├── lib.rs
-│       ├── main.rs           # Query binary entry point
-│       ├── cli/              # Query CLI commands
-│       ├── engine/           # Query engine
-│       ├── loki/             # Loki API (handlers, routes, server)
-│       ├── logql/            # LogQL implementation (parser, planner, AST)
-│       ├── prometheus/       # Prometheus API
-│       └── tempo/            # Tempo API
-│
-├── icegate-ingest/           # OTLP receivers (lib)
-│   └── src/
-│       ├── lib.rs
-│       ├── config.rs
-│       ├── otlp_grpc/        # gRPC receiver
-│       └── otlp_http/        # HTTP receiver (handlers, routes, server)
-│
-└── icegate-maintain/         # Maintenance ops + CLI (lib + bin)
-    └── src/
-        ├── lib.rs
-        ├── main.rs           # Maintain binary entry point
-        ├── cli/              # Maintain CLI commands
-        ├── config.rs
-        └── migrate/          # Schema migration operations
-```
+## Iceberg and data invariants
 
-**Dependency graph:**
-```
-icegate-common (no deps on other workspace crates)
-    ↑
-    ├── icegate-query     (depends: icegate-common)
-    ├── icegate-ingest    (depends: icegate-common)
-    └── icegate-maintain  (depends: icegate-common)
-```
+- **Schema is single-source.** The four tables (logs, spans, events, metrics) are
+  defined once in [`schema.rs`](crates/icegate-common/src/schema.rs) (DDL in
+  [SCHEMA.md](crates/icegate-common/src/SCHEMA.md)). **NEVER** hardcode columns or
+  types anywhere else — derive from the schema.
+- Table conventions (tenant_id partitioning, ZSTD, `MAP(VARCHAR,VARCHAR)`
+  attributes) are inherited from the schema, not re-decided at a call site.
+- Writes commit as **atomic Iceberg snapshots** with optimistic-concurrency retry
+  through the generic catalog; maintenance work **never blocks ingest**. Per-flow
+  detail lives in the crate docs (e.g. compaction's README).
+- Durability contract of the WAL queue: data is persisted to object storage
+  before it is acknowledged (exactly-once). See the queue README.
 
-## Key Data Types
+## Writing code
 
-Four Iceberg tables defined in `crates/icegate-common/src/schema.rs` (DDL in `crates/icegate-common/src/SCHEMA.md`):
-- **logs** - OpenTelemetry LogRecords
-- **spans** - Distributed trace spans with nested events/links
-- **events** - Semantic events (extracted from logs)
-- **metrics** - All metric types (gauge, sum, histogram, summary)
+- [RUST.md](RUST.md) is binding for naming, errors (`thiserror`/`anyhow`), the
+  type system, testing, imports, and style. Follow it; do not duplicate it here.
+- **A convention is only what is documented** in this file, RUST.md, or `docs/`.
+  The mere presence of a pattern in the code is **NOT** a convention — someone may
+  have committed junk. Do not justify a decision with "the existing code does X";
+  cite the documented rule, or propose adding one if it is missing.
+- Separation of responsibility comes first; apply DRY; the lints forbid dead code.
+- Schema, config fields, and service ports/URLs are referenced from their source,
+  never copied as literals into working code.
+- It is better to return an error than to use, calculate, or show invalid data.
 
-All tables use: tenant_id partitioning, ZSTD compression, MAP(VARCHAR,VARCHAR) for attributes.
+## Before a change
 
-## LogQL Implementation
+- Determine the crate and the layer the change belongs to; shared logic goes to
+  `common`, not into a component.
+- Cover significant behaviour with tests — read [docs/tests.md](docs/tests.md) first.
+- Do not break the Iceberg schema, nor the public API/CLI contracts.
 
-The LogQL parser uses ANTLR4. Grammar files are in `crates/icegate-query/src/logql/antlr/`.
+## Before finishing
 
-Regenerate parser (requires Java):
-```bash
-cd crates/icegate-query/src/logql && make install  # Download ANTLR jar (first time)
-cd crates/icegate-query/src/logql && make gen      # Regenerate parser from .g4 files
-```
+- Follow [docs/tests.md](docs/tests.md). Report which test commands were run and
+  which required tests were not.
+- Run targeted tests for the affected functionality; leave full `make ci` to an
+  explicit request.
+- Keep `TODO` comments intact unless the change fully resolves them.
+- Ensure each file ends with a single trailing newline.
 
-Parser status: Complete. Planner status: Partial (see `crates/icegate-query/src/logql/README.md` for feature matrix).
+## Code style
 
-## Development Environment
-
-### Quick Start
-
-```bash
-make dev     # Run full stack with hot-reload (watches crates/ for changes)
-make debug   # Run without query service for debugging
-```
-
-Both commands use Docker Compose to start the full development environment.
-
-### Available Services
-
-The development environment includes:
-
-**Core Infrastructure:**
-- **RustFS (S3):** Object storage backend
-  - API: `http://localhost:9000`
-  - Console: `http://localhost:9001`
-  - Credentials: rustfsadmin/rustfsadmin
-
-- **Nessie:** Iceberg catalog with REST API
-  - API: `http://localhost:19120`
-  - Default warehouse: `s3://warehouse/`
-
-**Query & Analytics:**
-- **Query Service:** Loki/Prometheus/Tempo-compatible APIs
-  - Loki API: `http://localhost:3100`
-  - Prometheus API: `http://localhost:9090`
-  - Tempo API: `http://localhost:3200`
-
-- **Trino:** Distributed SQL query engine
-  - Web UI: `http://localhost:8080`
-
-- **Grafana:** Observability dashboard
-  - Web UI: `http://localhost:3000`
-  - Anonymous access enabled (no login required)
-
-### Environment Variables
-
-For local development:
-```bash
-AWS_ACCESS_KEY_ID=rustfsadmin
-AWS_SECRET_ACCESS_KEY=rustfsadmin
-AWS_REGION=us-east-1
-```
-
-## Linting Configuration
-
-Strict clippy/rustc lints configured in `Cargo.toml`:
-- `unsafe_code = "forbid"`
-- `missing_docs = "deny"`
-- `dead_code = "deny"`
-- clippy pedantic/nursery enabled
-
-Thresholds in `clippy.toml`: cognitive-complexity=30, too-many-arguments=8, too-many-lines=150.
-
-Use rules in `rustfmt.toml` to generate well-formatted code.
-
-## Development Conventions
-
-### Code Style
-
-The project uses `rustfmt` for code formatting. Configuration is in `rustfmt.toml`.
+The project uses `rustfmt`; configuration is in `rustfmt.toml`.
 @RUST.md
-
-### Important Instructions
-
-- Do what has been asked; nothing more, nothing less
-- NEVER create files unless they're absolutely necessary for achieving your goal
-- ALWAYS prefer editing an existing file to creating a new one
-- NEVER proactively create documentation files (*.md) or README files unless explicitly requested
-- Ensure each file is finishing by new line, do not duplicate if it already exists
-- It is better to give an error than to use/calculate/show invalid data.
-- NEVER delete TODO comments if the changes do not fully cover the necessary edits in the comment.
-- Format only the affected crate: `cargo +nightly fmt -p <crate>`.
-- All code and comments should be in English only.
-- ALWAYS use the Iceberg schema only from `crates/icegate-common/src/schema.rs`, NEVER hardcode columns in the working code.
-- The project documentation (`docs/`, `Readme.md`, etc.) should not duplicate the code - it is fragile. Documentation should provide a top-level understanding (basic concept, schematics, if applicable, structure, if applicable) and describe non-specific (atypical) nuances.

@@ -1,11 +1,13 @@
-//! Catalog metadata serialization codecs.
+//! Serialization codecs for persisted catalog state.
 
 use bytes::Bytes;
 
+use crate::domain::CatalogRoot;
 use crate::error::Result;
-use crate::root::CatalogRoot;
 
 pub(crate) mod json;
+
+// TODO(med): add cbor codec for best perf
 
 /// Strategy for serializing catalog metadata objects.
 ///

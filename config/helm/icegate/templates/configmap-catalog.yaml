@@ -1,0 +1,33 @@
+{{- if and .Values.catalogServer.enabled (ne .Values.catalog.backend "s3") -}}
+{{- fail "catalogServer.enabled requires catalog.backend=s3: the catalog REST server supports only the S3 catalog" -}}
+{{- end -}}
+{{- if .Values.catalogServer.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "catalog") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "catalog") | nindent 4 }}
+data:
+  catalog.yaml: |
+    http:
+      host: 0.0.0.0
+      port: {{ .Values.catalogServer.http.port }}
+      {{- with .Values.catalogServer.http.prefix }}
+      prefix: {{ . | quote }}
+      {{- end }}
+      default_page_size: {{ .Values.catalogServer.pagination.defaultPageSize }}
+      max_page_size: {{ .Values.catalogServer.pagination.maxPageSize }}
+    s3:
+      bucket: {{ .Values.catalog.s3.bucket | default .Values.storage.s3.bucket | quote }}
+      region: {{ .Values.storage.s3.region | quote }}
+      {{- if .Values.storage.s3.endpoint }}
+      endpoint: {{ .Values.storage.s3.endpoint | quote }}
+      {{- end }}
+      warehouse: {{ .Values.catalog.s3.warehouse | quote }}
+      codec: {{ .Values.catalog.s3.codec | default "json" | quote }}
+      {{- if not (kindIs "invalid" .Values.catalog.s3.pathStyleAccess) }}
+      path_style_access: {{ .Values.catalog.s3.pathStyleAccess }}
+      {{- end }}
+{{- end }}

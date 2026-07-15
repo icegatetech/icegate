@@ -2,39 +2,55 @@
 
 use iceberg::{ErrorKind, NamespaceIdent, TableIdent};
 
+use crate::domain::DomainError;
 use crate::infra::retrier::RetryError;
 
 /// Catalog result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors returned by the S3-backed catalog.
+///
+/// The variants are flat by design: the domain layer raises its own
+/// [`DomainError`], but a caller of this crate classifies a failure without
+/// knowing that layer exists, so [`From<DomainError>`] folds every domain
+/// condition into one of these.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The requested namespace does not exist.
+    #[error("namespace not found: {0}")]
+    NamespaceNotFound(NamespaceIdent),
+
+    /// The namespace cannot be deleted while it still contains state.
+    #[error("namespace not empty: {0}")]
+    NamespaceNotEmpty(NamespaceIdent),
+
+    /// The requested table does not exist.
+    #[error("table not found: {0}")]
+    TableNotFound(TableIdent),
+
+    /// A distinct table already occupies the requested identifier.
+    #[error("table already exists: {0}")]
+    TableAlreadyExists(TableIdent),
+
     /// Storage-level failure.
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 
-    /// Table was not found.
-    #[error("table not found: {0}")]
-    TableNotFound(TableIdent),
-
-    /// Table already exists.
-    #[error("table already exists: {0}")]
-    TableAlreadyExists(TableIdent),
-
-    /// Namespace was not found.
-    #[error("namespace not found: {0}")]
-    NamespaceNotFound(NamespaceIdent),
-
-    /// Namespace is not empty.
-    #[error("namespace not empty: {0}")]
-    NamespaceNotEmpty(NamespaceIdent),
-
     /// Commit conflict caused by stale `ETag` or table-state CAS mismatch.
+    ///
+    /// Storage-level CAS losses and domain-level ones are the same condition to
+    /// a caller, so both fold here and [`Self::is_conflict`] classifies them
+    /// without matching through a nested error.
     #[error("commit conflict")]
     CommitConflict,
 
     /// Metadata is invalid.
+    ///
+    /// Raised outside the domain as well: the storage layer raises it for
+    /// undecodable catalog roots, unusable metadata locations, and rejected
+    /// [`crate::S3CatalogConfig`] settings. Process-level failures (server
+    /// config files, CLI, listener) have their own types instead:
+    /// `CatalogServerConfigError` and `cli::CliError`.
     #[error("invalid metadata: {0}")]
     InvalidMetadata(String),
 
@@ -80,6 +96,20 @@ impl Error {
         match self {
             Self::Storage(storage) => storage.is_retryable(),
             _ => false,
+        }
+    }
+}
+
+impl From<DomainError> for Error {
+    fn from(error: DomainError) -> Self {
+        match error {
+            DomainError::NamespaceNotFound(namespace) => Self::NamespaceNotFound(namespace),
+            DomainError::NamespaceNotEmpty(namespace) => Self::NamespaceNotEmpty(namespace),
+            DomainError::TableNotFound(table) => Self::TableNotFound(table),
+            DomainError::TableAlreadyExists(table) => Self::TableAlreadyExists(table),
+            DomainError::CommitConflict => Self::CommitConflict,
+            DomainError::InvalidMetadata(message) => Self::InvalidMetadata(message),
+            DomainError::Iceberg(error) => Self::Iceberg(error),
         }
     }
 }
@@ -166,6 +196,18 @@ impl From<object_store::Error> for StorageError {
 impl From<Error> for iceberg::Error {
     fn from(error: Error) -> Self {
         match error {
+            Error::NamespaceNotFound(namespace) => Self::new(
+                ErrorKind::NamespaceNotFound,
+                format!("Namespace not found: {namespace}"),
+            ),
+            Error::NamespaceNotEmpty(namespace) => Self::new(
+                ErrorKind::PreconditionFailed,
+                format!("Namespace not empty: {namespace}"),
+            ),
+            Error::TableNotFound(table) => Self::new(ErrorKind::TableNotFound, format!("Table not found: {table}")),
+            Error::TableAlreadyExists(table) => {
+                Self::new(ErrorKind::TableAlreadyExists, format!("Table already exists: {table}"))
+            }
             Error::Iceberg(iceberg_error) => iceberg_error,
             Error::Storage(StorageError::NotFound(path)) => {
                 Self::new(ErrorKind::Unexpected, format!("Object not found: {path}"))
@@ -182,18 +224,6 @@ impl From<Error> for iceberg::Error {
                 Self::new(ErrorKind::Unexpected, message).with_retryable(true)
             }
             Error::Storage(StorageError::Io(message)) => Self::new(ErrorKind::Unexpected, message),
-            Error::TableNotFound(table) => Self::new(ErrorKind::TableNotFound, format!("Table not found: {table}")),
-            Error::TableAlreadyExists(table) => {
-                Self::new(ErrorKind::TableAlreadyExists, format!("Table already exists: {table}"))
-            }
-            Error::NamespaceNotFound(namespace) => Self::new(
-                ErrorKind::NamespaceNotFound,
-                format!("Namespace not found: {namespace}"),
-            ),
-            Error::NamespaceNotEmpty(namespace) => Self::new(
-                ErrorKind::PreconditionFailed,
-                format!("Namespace not empty: {namespace}"),
-            ),
             Error::CommitConflict => {
                 Self::new(ErrorKind::CatalogCommitConflicts, "catalog commit conflict").with_retryable(true)
             }

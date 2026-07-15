@@ -92,6 +92,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --verbose
 
+      - name: Check catalog REST API
+        run: cargo check -p icegate-catalog-s3 --all-targets --features rest
+
+      - name: Test catalog REST API
+        run: cargo test -p icegate-catalog-s3 --all-targets --features rest
+
   format:
     name: Format
     runs-on: ubuntu-latest
@@ -149,6 +155,9 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Lint catalog REST API
+        run: cargo clippy -p icegate-catalog-s3 --all-targets --features rest -- -D warnings
+
   build-release:
     name: Build Release
     runs-on: ubuntu-latest
@@ -187,7 +196,7 @@ jobs:
             ${{ runner.os }}-stable-cargo-build-target-release-
 
       - name: Build release binaries
-        run: cargo build --workspace --release --verbose
+        run: cargo build --workspace --release --verbose --features icegate-catalog-s3/rest
 
   benchmark:
     name: Benchmark

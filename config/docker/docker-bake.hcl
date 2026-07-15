@@ -11,7 +11,7 @@ variable "BUILD_DATE" {
 }
 
 group "default" {
-  targets = ["query", "ingest", "maintain"]
+  targets = ["query", "ingest", "maintain", "catalog"]
 }
 
 target "_common" {
@@ -53,6 +53,17 @@ target "maintain" {
   args = {
     BINARY      = "maintain"
     DESCRIPTION = "Maintenance operations for IceGate"
+    VERSION     = VERSION
+    REVISION    = REVISION
+    BUILD_DATE  = BUILD_DATE
+  }
+}
+
+target "catalog" {
+  inherits = ["_common"]
+  args = {
+    BINARY      = "catalog"
+    DESCRIPTION = "Read-only Iceberg REST Catalog API for IceGate"
     VERSION     = VERSION
     REVISION    = REVISION
     BUILD_DATE  = BUILD_DATE

@@ -13,6 +13,25 @@ repository = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Opt-in server stack: the REST API, its configuration parsers, and the CLI.
+# Library consumers (`icegate-common`, `icegate-query`, `icegate-maintain`) embed
+# this crate only as an Iceberg `Catalog`, and must not compile Axum, Clap,
+# OpenDAL, or the YAML/TOML parsers to do so. The `catalog` binary is the one
+# artifact that needs the stack, so it declares `required-features = ["rest"]`.
+rest = [
+    "dep:axum",
+    "dep:base64",
+    "dep:clap",
+    "dep:iceberg-storage-opendal",
+    "dep:percent-encoding",
+    "dep:serde_yaml",
+    "dep:sha2",
+    "dep:toml",
+    "dep:tower-http",
+    "dep:tracing-subscriber",
+]
+
 [dependencies]
 iceberg = { workspace = true }
 object_store = { workspace = true }
@@ -29,9 +48,37 @@ dashmap = { workspace = true }
 lru = { workspace = true }
 tokio-util = { workspace = true }
 rand = { workspace = true }
+axum = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[[bin]]
+name = "catalog"
+path = "src/main.rs"
+required-features = ["rest"]
+
+# The public CLI/config scenarios live under `tests/`; both need the server
+# stack, so the targets are skipped entirely when `rest` is off.
+[[test]]
+name = "cli_test"
+required-features = ["rest"]
+
+[[test]]
+name = "server_config_test"
+required-features = ["rest"]
 
 [dev-dependencies]
 icegate-common = { workspace = true, features = ["testing"] }
+iceberg-catalog-rest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

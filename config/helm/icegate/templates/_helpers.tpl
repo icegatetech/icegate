@@ -147,10 +147,13 @@ properties:
   {{- with .Values.catalog.s3.codec }}
   codec: {{ . | quote }}
   {{- end }}
+  {{- if not (kindIs "invalid" .Values.catalog.s3.pathStyleAccess) }}
+  s3.path-style-access: {{ .Values.catalog.s3.pathStyleAccess | quote }}
+  {{- end }}
   {{- /* Forward user-supplied catalog.properties into FileIO, skipping the
          structural keys already rendered above to avoid duplicate YAML keys. */}}
   {{- range $key, $val := .Values.catalog.properties }}
-  {{- if not (has $key (list "bucket" "region" "endpoint" "codec")) }}
+  {{- if not (has $key (list "bucket" "region" "endpoint" "codec" "s3.path-style-access")) }}
   {{ $key }}: {{ $val | quote }}
   {{- end }}
   {{- end }}

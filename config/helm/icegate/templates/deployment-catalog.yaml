@@ -1,0 +1,84 @@
+{{- if .Values.catalogServer.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "catalog") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "catalog") | nindent 4 }}
+spec:
+  replicas: {{ .Values.catalogServer.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "icegate.selectorLabels" (dict "context" . "component" "catalog") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-catalog.yaml") . | sha256sum }}
+      labels:
+        {{- include "icegate.componentLabels" (dict "context" . "component" "catalog") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icegate.serviceAccountName" . }}
+      securityContext:
+        {{- include "icegate.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: catalog
+          image: {{ include "icegate.image" (dict "image" .Values.catalogServer.image "tag" .Chart.AppVersion) }}
+          imagePullPolicy: {{ .Values.catalogServer.image.pullPolicy }}
+          command:
+            - /usr/local/bin/entrypoint
+            - serve
+            - --config
+            - /etc/icegate/catalog.yaml
+          securityContext:
+            {{- include "icegate.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.catalogServer.http.port }}
+              protocol: TCP
+          env:
+            {{- include "icegate.awsEnv" . | nindent 12 }}
+            - name: RUST_LOG
+              value: {{ .Values.catalogServer.rustLog | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: icegate-catalog
+            {{- with .Values.catalogServer.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            tcpSocket:
+              port: http
+          readinessProbe:
+            tcpSocket:
+              port: http
+          resources:
+            {{- toYaml .Values.catalogServer.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/icegate
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "icegate.componentName" (dict "context" . "component" "catalog") }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.catalogServer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.catalogServer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.catalogServer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

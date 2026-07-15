@@ -10,11 +10,11 @@ use object_store::path::Path;
 use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, UpdateVersion};
 use tokio_util::sync::CancellationToken;
 
-use crate::codec::CatalogCodec;
-use crate::config::S3CatalogConfig;
+use crate::config::{S3CatalogConfig, resolve_path_style_access};
+use crate::domain::CatalogRoot;
 use crate::error::{Error, Result, StorageError};
 use crate::infra::retrier::Retrier;
-use crate::root::CatalogRoot;
+use crate::storage::codec::CatalogCodec;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
 const CATALOG_SEGMENT: &str = "catalog";
@@ -37,7 +37,11 @@ impl S3CatalogStorage {
 
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(config.bucket.clone())
-            .with_region(config.region.clone());
+            .with_region(config.region.clone())
+            .with_virtual_hosted_style_request(!resolve_path_style_access(
+                config.path_style_access,
+                config.endpoint.as_deref(),
+            ));
 
         if let Some(endpoint) = config.endpoint.as_ref() {
             builder = builder.with_endpoint(endpoint.clone());

@@ -50,7 +50,7 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 
 # Cook dependencies with cross-compilation target
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    cargo chef cook --release --target "${RUST_TARGET}" --recipe-path recipe.json
+    cargo chef cook --release --target "${RUST_TARGET}" --recipe-path recipe.json --features icegate-catalog-s3/rest
 
 COPY ./crates ./crates
 COPY Cargo.toml Cargo.lock ./
@@ -60,11 +60,12 @@ COPY Cargo.toml Cargo.lock ./
 RUN <<EOF
 set -eu
 RUST_TARGET=$(cat /tmp/rust-target)
-cargo build --release --target "${RUST_TARGET}" --workspace --bins
+cargo build --release --target "${RUST_TARGET}" --workspace --bins --features icegate-catalog-s3/rest
 mkdir -p /app/output
 cp /app/target/${RUST_TARGET}/release/query    /app/output/
 cp /app/target/${RUST_TARGET}/release/ingest   /app/output/
 cp /app/target/${RUST_TARGET}/release/maintain /app/output/
+cp /app/target/${RUST_TARGET}/release/catalog  /app/output/
 EOF
 
 # ── Runtime (one binary per image) ──────────────────────────────────────────

@@ -29,6 +29,13 @@ catalog:
     bucket: ""
     ## Optional catalog root codec (default: json)
     # codec: json
+    ## Optional S3 addressing (default: derived from storage.s3.endpoint —
+    ## path-style when one is set, as S3-compatible endpoints require, and
+    ## virtual-hosted on real AWS S3, which deprecated path-style).
+    ## Set only to overrule that. The value then applies to catalog metadata and
+    ## table data alike, and so overrides AWS_VIRTUAL_HOSTED_STYLE_REQUEST:
+    ## honouring that variable would address the two differently.
+    # pathStyleAccess: true
   ## REST catalog settings (used when backend=rest)
   rest:
     uri: http://nessie:19120/iceberg
@@ -86,6 +93,49 @@ aws:
   ## Leave empty when using IRSA/Workload Identity.
   existingSecret: ""
   region: us-east-1
+
+## ---------------------------------------------------------------------------
+## Catalog REST server component
+## ---------------------------------------------------------------------------
+catalogServer:
+  enabled: false
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/icegatetech/icegate-catalog
+    tag: ""  # defaults to Chart.appVersion
+    pullPolicy: IfNotPresent
+
+  http:
+    port: 8181
+    ## Optional exact REST catalog prefix relative to /v1 (for example, "catalog").
+    prefix: ""
+
+  pagination:
+    defaultPageSize: 100
+    maxPageSize: 1000
+
+  ## RUST_LOG level
+  rustLog: "info"
+
+  ## Extra environment variables
+  extraEnv: []
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  service:
+    type: ClusterIP
+    annotations: {}
 
 ## ---------------------------------------------------------------------------
 ## Query component

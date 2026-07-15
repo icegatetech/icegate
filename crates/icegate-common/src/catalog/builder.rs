@@ -10,7 +10,9 @@ use iceberg::{
 use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
-use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
+use icegate_catalog_s3::{
+    CatalogCodecKind, S3Catalog, S3CatalogConfig, format_warehouse_uri, resolve_path_style_access,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{CacheConfig, CatalogBackend, CatalogConfig};
@@ -335,57 +337,40 @@ impl CatalogBuilder {
             _ => {}
         }
 
-        // TODO(high): move to custom config and build fileio from custom config
-        let mut file_io_props = config.properties.clone();
-        let warehouse_trimmed = warehouse.trim_matches('/');
-        let file_io_warehouse = if warehouse_trimmed.is_empty() {
-            format!("s3://{bucket}")
-        } else {
-            format!("s3://{bucket}/{warehouse_trimmed}")
-        };
-        file_io_props.insert("warehouse".to_string(), file_io_warehouse);
-        if let Some(ref endpoint_value) = endpoint {
-            file_io_props
-                .entry("s3.endpoint".to_string())
-                .or_insert_with(|| endpoint_value.clone());
-            file_io_props
-                .entry("s3.path-style-access".to_string())
-                .or_insert_with(|| "true".to_string());
-        }
-        if let (Some(key), Some(secret)) = (&access_key_id, &secret_access_key) {
-            file_io_props
-                .entry("s3.access-key-id".to_string())
-                .or_insert_with(|| key.clone());
-            file_io_props
-                .entry("s3.secret-access-key".to_string())
-                .or_insert_with(|| secret.clone());
-        }
-        file_io_props.entry("s3.region".to_string()).or_insert_with(|| region.clone());
-
-        let file_io = FileIOBuilder::new(io_cache.storage_factory()).with_props(file_io_props).build();
-
+        let path_style_access = config
+            .properties
+            .get("s3.path-style-access")
+            .map(|value| {
+                value.parse::<bool>().map_err(|error| {
+                    CommonError::Config(format!("S3 catalog: invalid `s3.path-style-access`: {error}"))
+                })
+            })
+            .transpose()?;
         let codec = config
             .properties
             .get("codec")
             .map_or(Ok(CatalogCodecKind::Json), |value| value.parse())
-            .map_err(|e: icegate_catalog_s3::Error| CommonError::Config(format!("invalid s3 catalog codec: {e}")))?;
+            .map_err(|e| CommonError::Config(format!("invalid s3 catalog codec: {e}")))?;
 
-        let catalog = S3Catalog::new(
-            S3CatalogConfig {
-                bucket: bucket.clone(),
-                region: region.clone(),
-                endpoint: endpoint.clone(),
-                access_key_id,
-                secret_access_key,
-                warehouse: warehouse.to_string(),
-                codec,
-                ..S3CatalogConfig::default()
-            },
-            file_io,
-            cancel_token,
-        )
-        .await
-        .map_err(|e| CommonError::Config(format!("failed to create s3 catalog: {e}")))?;
+        // TODO(high): move to custom config and build fileio from custom config
+        let s3_config = S3CatalogConfig {
+            bucket: bucket.clone(),
+            region: region.clone(),
+            endpoint: endpoint.clone(),
+            path_style_access,
+            access_key_id,
+            secret_access_key,
+            warehouse: warehouse.to_string(),
+            codec,
+            ..S3CatalogConfig::default()
+        };
+        let file_io = FileIOBuilder::new(io_cache.storage_factory())
+            .with_props(build_file_io_props(&config.properties, &s3_config))
+            .build();
+
+        let catalog = S3Catalog::new(s3_config, file_io, cancel_token)
+            .await
+            .map_err(|e| CommonError::Config(format!("failed to create s3 catalog: {e}")))?;
 
         if let Some(endpoint) = endpoint.as_deref() {
             tracing::info!(
@@ -406,6 +391,42 @@ impl CatalogBuilder {
 
         Ok(Arc::new(catalog))
     }
+}
+
+/// Assemble the `FileIO` properties for tables the S3 catalog returns.
+///
+/// Every key `s3_config` also owns is written from it rather than from
+/// `properties`, so table data cannot end up addressed differently from the
+/// catalog root it was found through; the remaining user properties pass through
+/// untouched. The `s3.*` forms a user set directly still win, because
+/// `s3_config` was itself built from them.
+fn build_file_io_props(properties: &HashMap<String, String>, s3_config: &S3CatalogConfig) -> HashMap<String, String> {
+    let mut file_io_props = properties.clone();
+    file_io_props.insert(
+        "warehouse".to_string(),
+        format_warehouse_uri(&s3_config.bucket, &s3_config.warehouse),
+    );
+    file_io_props.insert(
+        "s3.path-style-access".to_string(),
+        resolve_path_style_access(s3_config.path_style_access, s3_config.endpoint.as_deref()).to_string(),
+    );
+    if let Some(endpoint) = s3_config.endpoint.as_ref() {
+        file_io_props
+            .entry("s3.endpoint".to_string())
+            .or_insert_with(|| endpoint.clone());
+    }
+    if let (Some(key), Some(secret)) = (&s3_config.access_key_id, &s3_config.secret_access_key) {
+        file_io_props
+            .entry("s3.access-key-id".to_string())
+            .or_insert_with(|| key.clone());
+        file_io_props
+            .entry("s3.secret-access-key".to_string())
+            .or_insert_with(|| secret.clone());
+    }
+    file_io_props
+        .entry("s3.region".to_string())
+        .or_insert_with(|| s3_config.region.clone());
+    file_io_props
 }
 
 #[cfg(all(test, feature = "testing"))]
@@ -486,6 +507,70 @@ mod tests {
 
         assert_eq!(metadata.size, 2);
         assert_eq!(bytes, Bytes::from_static(b"ok"));
+    }
+
+    /// The `FileIO` that reads table data and the storage that reads the catalog
+    /// root are configured from one [`S3CatalogConfig`], so they must not be able
+    /// to disagree about how a bucket is addressed. Without an endpoint that
+    /// means virtual-hosted: path-style is what AWS deprecated, not its default.
+    #[test]
+    fn file_io_addresses_the_bucket_the_way_the_catalog_root_will() {
+        for (endpoint, path_style_access, expected) in [
+            (None, None, "false"),
+            (Some("http://127.0.0.1:9000"), None, "true"),
+            (None, Some(true), "true"),
+            (Some("http://127.0.0.1:9000"), Some(false), "false"),
+        ] {
+            let s3_config = S3CatalogConfig {
+                bucket: "catalog".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: endpoint.map(ToString::to_string),
+                path_style_access,
+                warehouse: "catalog".to_string(),
+                ..S3CatalogConfig::default()
+            };
+            let properties = path_style_access
+                .map(|value| HashMap::from([("s3.path-style-access".to_string(), value.to_string())]))
+                .unwrap_or_default();
+
+            let file_io_props = build_file_io_props(&properties, &s3_config);
+
+            assert_eq!(
+                file_io_props.get("s3.path-style-access").map(String::as_str),
+                Some(expected),
+                "endpoint {endpoint:?}, configured {path_style_access:?}",
+            );
+        }
+    }
+
+    /// The parse guard on `s3.path-style-access` must reject the value before
+    /// any S3 client exists. The control run pins the proof: the identical
+    /// configuration with a parsable value builds a catalog end to end (client
+    /// construction is lazy, nothing dials S3), so swapping only that value
+    /// leaves the parse guard as the sole source of the `Config` error.
+    #[tokio::test]
+    async fn s3_catalog_rejects_an_unparsable_path_style_access_before_touching_s3() {
+        let config_with = |path_style_access: &str| CatalogConfig {
+            backend: CatalogBackend::S3 {
+                warehouse: "catalog".to_string(),
+            },
+            warehouse: "warehouse".to_string(),
+            properties: HashMap::from([
+                ("bucket".to_string(), "catalog".to_string()),
+                ("s3.path-style-access".to_string(), path_style_access.to_string()),
+            ]),
+            cache: None,
+        };
+
+        CatalogBuilder::from_config(&config_with("true"), &IoHandle::noop(), CancellationToken::new())
+            .await
+            .expect("a parsable s3.path-style-access must build the catalog");
+
+        let error = CatalogBuilder::from_config(&config_with("invalid"), &IoHandle::noop(), CancellationToken::new())
+            .await
+            .expect_err("unparsable s3.path-style-access must fail");
+
+        assert!(matches!(error, CommonError::Config(_)), "{error}");
     }
 
     #[test]

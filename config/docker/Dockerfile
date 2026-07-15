@@ -18,10 +18,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
 ENV RUSTFLAGS="--cfg tokio_unstable"
-RUN cargo chef cook $([ "$PROFILE" = "release" ] && echo "--release") --recipe-path recipe.json
+RUN cargo chef cook $([ "$PROFILE" = "release" ] && echo "--release") --recipe-path recipe.json --features icegate-catalog-s3/rest
 COPY ./crates ./crates
 COPY Cargo.toml Cargo.lock ./
-RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") --workspace --bins
+RUN cargo build $([ "$PROFILE" = "release" ] && echo "--release") --workspace --bins --features icegate-catalog-s3/rest
 
 FROM debian:bookworm-slim
 ARG PROFILE=release
@@ -29,5 +29,6 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 COPY --from=builder /app/target/${PROFILE}/query    /usr/local/bin/query
 COPY --from=builder /app/target/${PROFILE}/ingest   /usr/local/bin/ingest
 COPY --from=builder /app/target/${PROFILE}/maintain  /usr/local/bin/maintain
+COPY --from=builder /app/target/${PROFILE}/catalog   /usr/local/bin/catalog
 USER nobody
 ENTRYPOINT ["/bin/sh", "-c", "exec \"$@\"", "--"]
