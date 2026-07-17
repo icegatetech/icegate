@@ -5,10 +5,25 @@ Iceberg table into fewer, larger, target-sized files, so queries scan fewer,
 larger objects. It runs as a long-running background service (`maintain run`),
 never blocks ingest, and commits its work as atomic Iceberg `replace` snapshots.
 
-- Code: [`mod.rs`](mod.rs) (service), [`planner.rs`](planner.rs) (which files to
-  rewrite), [`rewrite.rs`](rewrite.rs) (how they are merged), [`config.rs`](config.rs).
-- Design: [`docs/superpowers/specs/2026-06-11-parquet-compaction-design.md`](../../../../docs/superpowers/specs/2026-06-11-parquet-compaction-design.md)
-  and [`...-2026-06-14-compaction-size-aware-grouping-design.md`](../../../../docs/superpowers/specs/2026-06-14-compaction-size-aware-grouping-design.md).
+Design: [`docs/superpowers/specs/2026-06-11-parquet-compaction-design.md`](../../../../docs/superpowers/specs/2026-06-11-parquet-compaction-design.md)
+and [`...-2026-06-14-compaction-size-aware-grouping-design.md`](../../../../docs/superpowers/specs/2026-06-14-compaction-size-aware-grouping-design.md).
+
+## Module layout
+
+Two axes: the compaction **domain** (data files vs manifests) and the **layer**
+(jobmanager task → domain logic → assembly). Each domain is planner + rewrite.
+
+| Path | Layer | Responsibility |
+|------|-------|----------------|
+| [`compactor.rs`](compactor.rs) | assembly | Per-table job specs, timeouts, the `Compactor` service. The only module touching the jobmanager registry. |
+| [`tasks.rs`](tasks.rs) | task | Task codes and the PLAN/REWRITE/MANIFEST runners. Everything below this line is jobmanager-free. |
+| [`data/planner.rs`](data/planner.rs) | domain | Which data files to merge (pure bin-packing). |
+| [`data/rewrite.rs`](data/rewrite.rs) | domain | How one group is merged and committed. |
+| [`data/envelope.rs`](data/envelope.rs) | domain | Content invariants checked before the replace commits. |
+| [`data/merge_source.rs`](data/merge_source.rs) | domain | Opens Iceberg data files for the k-way merger. |
+| [`manifest/planner.rs`](manifest/planner.rs) | domain | Which manifests to repack. |
+| [`manifest/rewrite.rs`](manifest/rewrite.rs) | domain | How a manifest group is repacked and committed. |
+| [`config.rs`](config.rs), [`metrics.rs`](metrics.rs) | — | Shared by both domains. |
 
 ## Service architecture
 
@@ -31,7 +46,7 @@ flowchart LR
 ```
 
 - **PLAN** loads the table fresh, enumerates its data files with per-column
-  sort-key bounds, calls [`plan_rewrite_groups`](planner.rs), and dynamically
+  sort-key bounds, calls [`plan_rewrite_groups`](data/planner.rs), and dynamically
   fans out one REWRITE task per group. It schedules no commit task.
 - **REWRITE** k-way-merges its group's already-sorted inputs into target-sized
   Parquet and atomically swaps inputs for outputs via Iceberg
@@ -40,7 +55,7 @@ flowchart LR
 
 ## The planning pipeline
 
-[`plan_rewrite_groups`](planner.rs) runs four stages per partition. Stages 1 and
+[`plan_rewrite_groups`](data/planner.rs) runs four stages per partition. Stages 1 and
 4 are structural; stages 2 and 3 decide what is worth rewriting. (There is no
 sort-key clustering stage — see [Guarantees and limitations](#guarantees-and-limitations).)
 
@@ -161,17 +176,24 @@ output; the cost is weaker per-file pruning for this partition.
 
 Defaults live in [`config.rs`](config.rs); Helm keys in
 [`config/helm/icegate/values.yaml`](../../../../config/helm/icegate/values.yaml)
-under `compact.compaction`.
+under `maintain.compaction`.
+
+The per-table toggles sit at the root and govern BOTH compaction kinds; the
+kind-specific tunables are grouped under `data` and `manifest`.
 
 | Field (`snake_case`) | Helm (`camelCase`) | Default | Meaning |
 |----------------------|--------------------|---------|---------|
-| `target_file_size_bytes` | `targetFileSizeBytes` | 128 MiB | Desired output file size; below this a file is "sub-target". |
-| `max_group_input_bytes` | `maxGroupInputBytes` | 256 MiB | Max summed input a single rewrite may read. |
-| `min_input_files` | `minInputFiles` | 4 | A partition at or below this is a skip candidate. |
-| `max_skippable_tail_files` | `maxSkippableTailFiles` | 0 | Tolerated sub-target files in a skip candidate. |
-| `max_merge_size_ratio` | `maxMergeSizeRatio` | 2 | Largest-to-smallest size ratio within one group. Must be `>= 1` (rejected at startup otherwise). |
-| `rewrite_timeout_secs` | `rewriteTimeoutSecs` | 3600 | Deadline for one REWRITE task. |
-| `{logs,spans,events,metrics}_enabled` | `…Enabled` | true | Per-table toggles. |
+| `{logs,spans,events,metrics,operations}_enabled` | `tables.…` | true | Per-table toggles. |
+| `data.target_file_size_bytes` | `data.targetFileSizeBytes` | 128 MiB | Desired output file size; below this a file is "sub-target". |
+| `data.max_group_input_bytes` | `data.maxGroupInputBytes` | 256 MiB | Max summed input a single rewrite may read. |
+| `data.min_input_files` | `data.minInputFiles` | 4 | A partition at or below this is a skip candidate. |
+| `data.max_skippable_tail_files` | `data.maxSkippableTailFiles` | 0 | Tolerated sub-target files in a skip candidate. |
+| `data.max_merge_size_ratio` | `data.maxMergeSizeRatio` | 2 | Largest-to-smallest size ratio within one group. Must be `>= 1` (rejected at startup otherwise). |
+| `data.rewrite_timeout_secs` | `data.rewriteTimeoutSecs` | 3600 | Deadline for one REWRITE task. |
+| `manifest.target_size_bytes` | `manifest.targetSizeBytes` | 8 MiB | Packing target for each output manifest. |
+| `manifest.candidate_size_ratio` | `manifest.candidateSizeRatio` | 0.75 | Fraction of the target below which a manifest is a repack candidate. Must be in `(0.0, 1.0]`. |
+| `manifest.max_manifests_per_commit` | `manifest.maxManifestsPerCommit` | 64 | Input manifests repacked per commit. Must be `>= 2`. |
+| `manifest.rewrite_timeout_secs` | `manifest.rewriteTimeoutSecs` | 600 | Deadline for one `compact_manifest` task. |
 
 Jobs-manager settings are nested under `jobsmanager` (mirroring ingest's
 `shift.jobsmanager`):

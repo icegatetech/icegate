@@ -263,7 +263,6 @@ where
                 Error::TaskExecution(format!("failed to serialize shift output: {err}")),
             )
         })?;
-        // TODO(med): If shift task failed, the old files physically remain in the object storage. We get garbage/leaked files.
 
         manager
             .complete_task(&task_id, output_payload)
@@ -566,6 +565,9 @@ mod tests {
         }
         fn attempts(&self) -> u32 {
             0
+        }
+        fn max_attempts(&self) -> u32 {
+            1
         }
     }
 

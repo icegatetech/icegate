@@ -86,6 +86,21 @@ impl JobStatus {
     }
 }
 
+/// Outcome of selecting a task to execute in the current job iteration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TaskPickup {
+    /// This task is ready to be started by the caller.
+    Ready(Uuid),
+    /// Nothing can be started right now: the remaining tasks are either
+    /// in flight or blocked behind tasks that are still running.
+    Waiting,
+    /// The iteration cannot progress because tasks spent their attempt budget;
+    /// the job has been moved to [`JobStatus::Failed`]. The caller must persist
+    /// the job so the scheduler starts the next iteration, which replans from
+    /// scratch.
+    Exhausted,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TaskLimits {
     pub max_input_bytes: usize,
@@ -369,7 +384,7 @@ impl Job {
         task.fail(error_msg)
     }
 
-    pub(crate) fn pick_task_to_execute(&mut self, worker_id: &Uuid) -> Result<Option<Uuid>, JobError> {
+    pub(crate) fn pick_task_to_execute(&mut self, worker_id: &Uuid) -> Result<TaskPickup, JobError> {
         if !matches!(self.status, JobStatus::Running) {
             self.work(worker_id)?;
         }
@@ -377,6 +392,7 @@ impl Job {
         // TODO(low): with a large number of tasks in the job, iteration can add overhead. Solution: pending tasks can be cached.
         // Since map iteration is randomized, no additional randomization is needed.
         let mut blocked_to_unblock: Option<Uuid> = None;
+        let mut expired_to_fail: Vec<Uuid> = Vec::new();
         for (task_id, task_arc) in &self.tasks_by_id {
             let status = task_arc.status();
 
@@ -391,10 +407,22 @@ impl Job {
                 }
                 TaskStatus::Todo | TaskStatus::Failed | TaskStatus::Started => {
                     if task_arc.can_be_picked_up() {
-                        return Ok(Some(*task_id));
+                        return Ok(TaskPickup::Ready(*task_id));
+                    }
+                    if matches!(status, TaskStatus::Started) && task_arc.is_expired() {
+                        expired_to_fail.push(*task_id);
                     }
                 }
             }
+        }
+
+        // Fail the expired, budget-exhausted tasks gathered above. This mutates
+        // task state only; the iteration verdict below (`has_exhausted_task`) then
+        // sees them as terminal and ends the iteration as Failed.
+        for task_id in expired_to_fail {
+            let task_arc = self.get_task_arc_mut(&task_id)?;
+            let task = Arc::make_mut(task_arc);
+            task.fail("task expired after exhausting its attempt budget")?;
         }
 
         if let Some(task_id) = blocked_to_unblock {
@@ -402,7 +430,7 @@ impl Job {
             let task = Arc::make_mut(task_arc);
             task.unblock();
             if task.can_be_picked_up() {
-                return Ok(Some(task_id));
+                return Ok(TaskPickup::Ready(task_id));
             }
         }
 
@@ -413,14 +441,26 @@ impl Job {
             )));
         }
 
-        if self.is_deadlocked() {
-            return Err(JobError::Other(format!(
-                "job {} deadlock: blocked tasks with unmet dependencies",
-                self.code
-            )));
+        // Tasks that spent their attempt budget can never run again, and neither
+        // can whatever is blocked behind them. Wait while another task is still in
+        // flight (it may yet unblock work), otherwise end the iteration: the next
+        // scheduled one replans from scratch, which is what keeps a permanently
+        // failing task from blocking its dependents forever.
+        if !self.has_started_task() {
+            if self.has_exhausted_task() {
+                self.fail(worker_id)?;
+                return Ok(TaskPickup::Exhausted);
+            }
+
+            if self.is_deadlocked() {
+                return Err(JobError::Other(format!(
+                    "job {} deadlock: blocked tasks with unmet dependencies",
+                    self.code
+                )));
+            }
         }
 
-        Ok(None)
+        Ok(TaskPickup::Waiting)
     }
 
     // Accessors
@@ -548,7 +588,6 @@ impl Job {
         Ok(true)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn fail(&mut self, worker_id: &Uuid) -> Result<(), JobError> {
         self.status.transition_to(JobStatus::Failed)?;
         self.updated_by_worker_id = *worker_id;
@@ -707,16 +746,22 @@ impl Job {
             .all(|dep_id| self.tasks_by_id.get(dep_id).is_some_and(|t| t.is_completed()))
     }
 
+    /// Whether any task is currently being executed by a worker.
+    fn has_started_task(&self) -> bool {
+        self.tasks_by_id
+            .values()
+            .any(|task| matches!(task.status(), TaskStatus::Started))
+    }
+
+    /// Whether any task failed and spent its whole attempt budget.
+    fn has_exhausted_task(&self) -> bool {
+        self.tasks_by_id.values().any(|task| task.is_terminally_failed())
+    }
+
     fn is_deadlocked(&self) -> bool {
-        let has_blocked = self
-            .tasks_by_id
+        self.tasks_by_id
             .values()
-            .any(|task| matches!(task.status(), TaskStatus::Blocked) && !self.dependencies_satisfied(task));
-        let has_started = self
-            .tasks_by_id
-            .values()
-            .any(|task| matches!(task.status(), TaskStatus::Started));
-        has_blocked && !has_started
+            .any(|task| matches!(task.status(), TaskStatus::Blocked) && !self.dependencies_satisfied(task))
     }
 
     fn get_task_arc(&self, task_id: &Uuid) -> Result<&Arc<Task>, JobError> {
@@ -747,8 +792,22 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::core::task::DEFAULT_MAX_ATTEMPTS;
 
     fn make_task(id: Uuid, code: &str, status: TaskStatus, depends_on: Vec<Uuid>) -> Task {
+        make_task_with_attempts(id, code, status, depends_on, 0, DEFAULT_MAX_ATTEMPTS)
+    }
+
+    /// A task restored with an explicit attempt count and budget, so tests can
+    /// build a task that is one retry away from — or already past — its cap.
+    fn make_task_with_attempts(
+        id: Uuid,
+        code: &str,
+        status: TaskStatus,
+        depends_on: Vec<Uuid>,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Task {
         Task::restore(
             id,
             TaskCode::new(code),
@@ -759,7 +818,8 @@ mod tests {
             None,
             None,
             None,
-            0,
+            attempt,
+            max_attempts,
             Vec::new(),
             Vec::new(),
             String::new(),
@@ -820,7 +880,7 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(task_id));
+        assert_eq!(picked, TaskPickup::Ready(task_id));
     }
 
     #[test]
@@ -845,7 +905,7 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(shift_id));
+        assert_eq!(picked, TaskPickup::Ready(shift_id));
         let commit_status = job.get_task_arc(&commit_id).unwrap().status().clone();
         assert_eq!(commit_status, TaskStatus::Blocked);
     }
@@ -872,7 +932,7 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(commit_id));
+        assert_eq!(picked, TaskPickup::Ready(commit_id));
         let commit_status = job.get_task_arc(&commit_id).unwrap().status().clone();
         assert_eq!(commit_status, TaskStatus::Todo);
     }
@@ -896,7 +956,7 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert!(picked.is_none());
+        assert_eq!(picked, TaskPickup::Waiting);
     }
 
     #[test]
@@ -919,7 +979,7 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(failed_id));
+        assert_eq!(picked, TaskPickup::Ready(failed_id));
     }
 
     #[test]
@@ -935,6 +995,7 @@ mod tests {
             None,
             Some(Utc::now() - Duration::seconds(1)),
             0,
+            DEFAULT_MAX_ATTEMPTS,
             Vec::new(),
             Vec::new(),
             String::new(),
@@ -957,7 +1018,84 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(Uuid::from_u128(8)));
+        assert_eq!(picked, TaskPickup::Ready(Uuid::from_u128(8)));
+    }
+
+    /// Build an expired Started task (deadline in the past) with an explicit
+    /// attempt count and budget, so a test can place it just below or exactly at
+    /// its cap.
+    fn make_expired_started_task(id: Uuid, attempt: u32, max_attempts: u32) -> Task {
+        Task::restore(
+            id,
+            TaskCode::new("expired"),
+            TaskStatus::Started,
+            Some(Uuid::from_u128(101)),
+            Uuid::from_u128(101),
+            Duration::seconds(5),
+            Some(Utc::now() - Duration::seconds(10)),
+            None,
+            Some(Utc::now() - Duration::seconds(1)),
+            attempt,
+            max_attempts,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn test_pick_task_to_execute_retries_expired_started_below_attempt_limit() {
+        // An expired Started task with attempts left is re-picked (its worker is
+        // presumed lost), exactly as before the attempt budget was added.
+        let expired_id = Uuid::from_u128(140);
+        let expired = make_expired_started_task(expired_id, 1, 2);
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(141),
+            JobStatus::Started,
+            vec![expired],
+            1,
+            Some(1),
+            None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, TaskPickup::Ready(expired_id));
+    }
+
+    #[test]
+    fn test_pick_task_to_execute_fails_iteration_when_expired_started_exhausts_attempts() {
+        // An expired Started task that has spent its whole attempt budget is failed
+        // and ends the iteration, instead of being re-picked forever (the timeout
+        // counterpart of the Failed-task exhaustion path).
+        let expired_id = Uuid::from_u128(142);
+        let expired = make_expired_started_task(expired_id, 2, 2);
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(143),
+            JobStatus::Started,
+            vec![expired],
+            1,
+            Some(1),
+            None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, TaskPickup::Exhausted);
+        assert!(matches!(job.status(), JobStatus::Failed));
+        let expired_status = job.get_task_arc(&expired_id).unwrap().status().clone();
+        assert_eq!(expired_status, TaskStatus::Failed);
     }
 
     #[test]
@@ -1007,6 +1145,126 @@ mod tests {
 
         let err = job.pick_task_to_execute(&worker_id).unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
+    }
+
+    #[test]
+    fn test_pick_task_to_execute_retries_failed_task_below_attempt_limit() {
+        let failed_id = Uuid::from_u128(14);
+        let failed = make_task_with_attempts(failed_id, "failed", TaskStatus::Failed, Vec::new(), 1, 2);
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(111),
+            JobStatus::Started,
+            vec![failed],
+            1,
+            Some(1),
+            None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, TaskPickup::Ready(failed_id));
+    }
+
+    #[test]
+    fn test_pick_task_to_execute_fails_iteration_when_attempts_exhausted() {
+        let failed_id = Uuid::from_u128(15);
+        let failed = make_task_with_attempts(failed_id, "failed", TaskStatus::Failed, Vec::new(), 2, 2);
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(112),
+            JobStatus::Started,
+            vec![failed],
+            1,
+            Some(1),
+            None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, TaskPickup::Exhausted);
+        assert!(matches!(job.status(), JobStatus::Failed));
+        assert!(job.completed_at().is_some());
+    }
+
+    #[test]
+    fn test_pick_task_to_execute_fails_iteration_for_task_blocked_behind_exhausted_task() {
+        // The dependent task must never run once its dependency is terminal, and
+        // the iteration must end as Failed rather than as a "deadlock" error.
+        let failed_id = Uuid::from_u128(16);
+        let dependent_id = Uuid::from_u128(17);
+        let failed = make_task_with_attempts(failed_id, "failed", TaskStatus::Failed, Vec::new(), 2, 2);
+        let dependent = make_task(dependent_id, "dependent", TaskStatus::Blocked, vec![failed_id]);
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(113),
+            JobStatus::Started,
+            vec![failed, dependent],
+            1,
+            Some(1),
+            None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, TaskPickup::Exhausted);
+        assert!(matches!(job.status(), JobStatus::Failed));
+        let dependent_status = job.get_task_arc(&dependent_id).unwrap().status().clone();
+        assert_eq!(dependent_status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn test_pick_task_to_execute_waits_while_another_task_runs_after_exhausted_task() {
+        // An in-flight task may still unblock work, so an exhausted task ends the
+        // iteration only once nothing is running.
+        let failed = make_task_with_attempts(Uuid::from_u128(18), "failed", TaskStatus::Failed, Vec::new(), 2, 2);
+        let started = Task::restore(
+            Uuid::from_u128(19),
+            TaskCode::new("started"),
+            TaskStatus::Started,
+            Some(Uuid::from_u128(114)),
+            Uuid::from_u128(114),
+            Duration::seconds(5),
+            Some(Utc::now()),
+            None,
+            Some(Utc::now() + Duration::seconds(60)),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+        let worker_id = Uuid::from_u128(100);
+        let mut job = restore_job(
+            Uuid::from_u128(115),
+            JobStatus::Started,
+            vec![failed, started],
+            1,
+            Some(1),
+            None,
+            worker_id,
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let picked = job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, TaskPickup::Waiting);
+        assert!(matches!(job.status(), JobStatus::Running));
     }
 
     #[test]
@@ -1518,6 +1776,7 @@ mod tests {
             None,
             Some(Utc::now() + Duration::seconds(60)),
             1,
+            DEFAULT_MAX_ATTEMPTS,
             Vec::new(),
             Vec::new(),
             String::new(),
@@ -1823,7 +2082,7 @@ mod tests {
 
         let mut worker_job = saved_job.clone();
         let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(task_id));
+        assert_eq!(picked, TaskPickup::Ready(task_id));
         worker_job.start_task(&task_id, worker_id).unwrap();
 
         saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap();
@@ -1855,7 +2114,7 @@ mod tests {
             HashMap::new(),
         );
         let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(task_id));
+        assert_eq!(picked, TaskPickup::Ready(task_id));
         worker_job.start_task(&task_id, worker_id).unwrap();
 
         let started_by_other = Task::restore(
@@ -1869,6 +2128,7 @@ mod tests {
             None,
             Some(Utc::now() + Duration::seconds(60)),
             1,
+            DEFAULT_MAX_ATTEMPTS,
             Vec::new(),
             Vec::new(),
             String::new(),
@@ -1912,7 +2172,7 @@ mod tests {
         );
         let mut worker_job = saved_job.clone();
         let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(task_id));
+        assert_eq!(picked, TaskPickup::Ready(task_id));
         worker_job.start_task(&task_id, worker_id).unwrap();
 
         saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap();
@@ -1961,7 +2221,7 @@ mod tests {
         );
 
         let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(task_id));
+        assert_eq!(picked, TaskPickup::Ready(task_id));
         worker_job.start_task(&task_id, worker_id).unwrap();
 
         let err = saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap_err();
@@ -2001,7 +2261,7 @@ mod tests {
         );
 
         let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, Some(task_id));
+        assert_eq!(picked, TaskPickup::Ready(task_id));
 
         let err = saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
@@ -2057,6 +2317,7 @@ mod tests {
             None,
             Some(Utc::now() + Duration::seconds(60)),
             1,
+            DEFAULT_MAX_ATTEMPTS,
             Vec::new(),
             Vec::new(),
             String::new(),
@@ -2115,6 +2376,7 @@ mod tests {
             None,
             None,
             0,
+            DEFAULT_MAX_ATTEMPTS,
             Vec::new(),
             Vec::new(),
             String::new(),
@@ -2132,6 +2394,7 @@ mod tests {
             None,
             Some(Utc::now() + Duration::seconds(60)),
             1,
+            DEFAULT_MAX_ATTEMPTS,
             Vec::new(),
             Vec::new(),
             String::new(),
@@ -2149,6 +2412,7 @@ mod tests {
             None,
             None,
             0,
+            DEFAULT_MAX_ATTEMPTS,
             Vec::new(),
             Vec::new(),
             String::new(),
@@ -2213,6 +2477,7 @@ mod tests {
                 None,
                 Some(Utc::now() + Duration::seconds(60)),
                 1,
+                DEFAULT_MAX_ATTEMPTS,
                 Vec::new(),
                 Vec::new(),
                 String::new(),
@@ -2265,6 +2530,7 @@ mod tests {
                 None,
                 Some(Utc::now() + Duration::seconds(60)),
                 1,
+                DEFAULT_MAX_ATTEMPTS,
                 Vec::new(),
                 Vec::new(),
                 String::new(),

@@ -154,6 +154,21 @@ pub async fn list_data_files_in_partition(
     collect_data_file_stats(table, descriptor, Some(partition_key)).await
 }
 
+/// Enumerate the table's current-snapshot manifest-list entries.
+///
+/// # Errors
+///
+/// Returns [`Error::Iceberg`] if the manifest list cannot be loaded.
+pub async fn list_manifest_entries(table: &Table) -> Result<Vec<ManifestFile>> {
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.current_snapshot() else {
+        // No committed snapshot yet: nothing to enumerate.
+        return Ok(Vec::new());
+    };
+    let manifest_list = snapshot.load_manifest_list(table.file_io(), metadata).await?;
+    Ok(manifest_list.consume_entries().into_iter().collect())
+}
+
 /// Walk the current snapshot's manifests and collect [`DataFileStats`], loading
 /// the manifests concurrently while preserving manifest-list order.
 ///

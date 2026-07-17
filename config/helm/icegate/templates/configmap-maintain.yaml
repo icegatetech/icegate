@@ -13,19 +13,25 @@ data:
     storage:
       {{- include "icegate.storageYaml" . | nindent 6 }}
     compaction:
-      target_file_size_bytes: {{ .Values.maintain.compaction.targetFileSizeBytes | int }}
-      max_group_input_bytes: {{ .Values.maintain.compaction.maxGroupInputBytes | int }}
-      min_input_files: {{ .Values.maintain.compaction.minInputFiles }}
-      max_skippable_tail_files: {{ .Values.maintain.compaction.maxSkippableTailFiles }}
-      max_merge_size_ratio: {{ .Values.maintain.compaction.maxMergeSizeRatio }}
-      rewrite_timeout_secs: {{ .Values.maintain.compaction.rewriteTimeoutSecs }}
-      row_group_size: {{ .Values.maintain.compaction.rowGroupSize }}
-      data_page_size_limit_bytes: {{ .Values.maintain.compaction.dataPageSizeLimitBytes | int }}
       logs_enabled: {{ .Values.maintain.compaction.tables.logs }}
       spans_enabled: {{ .Values.maintain.compaction.tables.spans }}
       events_enabled: {{ .Values.maintain.compaction.tables.events }}
       metrics_enabled: {{ .Values.maintain.compaction.tables.metrics }}
       operations_enabled: {{ .Values.maintain.compaction.tables.operations }}
+      data:
+        target_file_size_bytes: {{ .Values.maintain.compaction.data.targetFileSizeBytes | int }}
+        max_group_input_bytes: {{ .Values.maintain.compaction.data.maxGroupInputBytes | int }}
+        min_input_files: {{ .Values.maintain.compaction.data.minInputFiles }}
+        max_skippable_tail_files: {{ .Values.maintain.compaction.data.maxSkippableTailFiles }}
+        max_merge_size_ratio: {{ .Values.maintain.compaction.data.maxMergeSizeRatio }}
+        rewrite_timeout_secs: {{ .Values.maintain.compaction.data.rewriteTimeoutSecs }}
+        row_group_size: {{ .Values.maintain.compaction.data.rowGroupSize }}
+        data_page_size_limit_bytes: {{ .Values.maintain.compaction.data.dataPageSizeLimitBytes | int }}
+      manifest:
+        target_size_bytes: {{ .Values.maintain.compaction.manifest.targetSizeBytes | int }}
+        candidate_size_ratio: {{ .Values.maintain.compaction.manifest.candidateSizeRatio }}
+        max_manifests_per_commit: {{ .Values.maintain.compaction.manifest.maxManifestsPerCommit }}
+        rewrite_timeout_secs: {{ .Values.maintain.compaction.manifest.rewriteTimeoutSecs }}
       jobsmanager:
         scan_interval_secs: {{ .Values.maintain.compaction.jobsmanager.scanIntervalSecs }}
         worker_count: {{ .Values.maintain.compaction.jobsmanager.workerCount }}

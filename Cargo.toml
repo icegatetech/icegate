@@ -79,14 +79,15 @@ tikv-jemallocator = "0.6"
 antlr4rust = "0.5"
 
 # Sourced from the icegatetech/iceberg-rust fork (0.9.0 base + the `rewrite_files`
-# transaction action that compaction commits through a generic `dyn Catalog`).
+# and `rewrite_manifests` transaction actions that compaction commits through a
+# generic `dyn Catalog`).
 # Pinned to an immutable rev (not a branch) for reproducible builds; bump the SHA
 # deliberately when adopting fork updates rather than letting `develop` float.
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
-iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
-iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "22f9bfd1ea389dbc52fb7c51351acd73d1e9c6bc" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "22f9bfd1ea389dbc52fb7c51351acd73d1e9c6bc" }
+iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "22f9bfd1ea389dbc52fb7c51351acd73d1e9c6bc" }
+iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "22f9bfd1ea389dbc52fb7c51351acd73d1e9c6bc" }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "22f9bfd1ea389dbc52fb7c51351acd73d1e9c6bc" }
 
 # DataFusion
 datafusion = "52.2"

@@ -206,6 +206,7 @@ where
             .timeouts
             .shift_timeout(segments_count, record_batches_total)
             .map_err(|e| Error::TaskExecution(e.to_string()))?;
+        // TODO(med): check task max attempts constant (default 5)
         let shift_task = TaskDefinition::new(
             TaskCode::new(SHIFT_TASK_CODE),
             serde_json::to_vec(&shift_input)
@@ -299,6 +300,7 @@ where
             .timeouts
             .commit_timeout(shift_task_ids.len())
             .map_err(|e| Error::TaskExecution(e.to_string()))?;
+        // TODO(med): check task max attempts constant (default 5)
         let commit_task = TaskDefinition::new(
             TaskCode::new(super::COMMIT_TASK_CODE),
             serde_json::to_vec(&commit_input)

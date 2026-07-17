@@ -45,7 +45,7 @@ use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::{SortColumnCache, SortColumnsDescriptor};
 use icegate_common::merge::{MergeInput, MergePosition, RowGroupsMerger, SortedBatchMergerConfig};
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_maintain::compact::iceberg_source::IcebergMergeSource;
+use icegate_maintain::compact::data::merge_source::IcebergMergeSource;
 use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
