@@ -28,7 +28,7 @@ impl OperationConvention for Traceloop {
         }
     }
 
-    fn classify_operation(&self, attrs: &AttributeView) -> Option<String> {
+    fn classify_operation(&self, _span_name: &str, attrs: &AttributeView) -> Option<String> {
         let kind = extract_string_value(attrs.get("traceloop.span.kind"))?;
         let normalized = match kind.as_str() {
             "workflow" | "task" => "chain",
@@ -59,7 +59,7 @@ mod tests {
     fn classify(kind: &str) -> Option<String> {
         let attrs = vec![kv_str("traceloop.span.kind", kind)];
         let view = AttributeView::new(&attrs);
-        Traceloop.classify_operation(&view)
+        Traceloop.classify_operation("op", &view)
     }
 
     #[test]
@@ -117,6 +117,6 @@ mod tests {
     fn classify_is_none_without_span_kind() {
         let attrs = vec![kv_str("traceloop.workflow.name", "my_flow")];
         let view = AttributeView::new(&attrs);
-        assert_eq!(Traceloop.classify_operation(&view), None);
+        assert_eq!(Traceloop.classify_operation("op", &view), None);
     }
 }
