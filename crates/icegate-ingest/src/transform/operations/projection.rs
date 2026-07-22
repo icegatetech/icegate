@@ -8,13 +8,14 @@
 use std::collections::HashMap;
 
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
-use opentelemetry_proto::tonic::trace::v1::Span;
+use opentelemetry_proto::tonic::trace::v1::{Span, span::Event};
 
 use super::convention::{CONVENTIONS, field_precedence};
 use crate::error::Result;
 use crate::transform::attributes::{
     extract_bool, extract_f64, extract_i64, extract_string_list, extract_string_value, is_zero_bytes, nanos_to_micros,
-    serialize_any_value_to_json, u32_count_to_i32,
+    serialize_all_attrs_to_json_object, serialize_any_value_to_json, serialize_attrs_to_json_object,
+    serialize_message_to_json_array, u32_count_to_i32,
 };
 
 /// Borrowing view over a span's attribute list. Built once per span and shared
@@ -405,6 +406,92 @@ fn resolve_json(view: &AttributeView, field: OperationField) -> Result<Option<St
     Ok(None)
 }
 
+/// Resolve a content field from span *events*: for the first registered
+/// convention that names an event source for `field`, serialize the first
+/// matching event's full attribute set into one JSON object. Returns `None` when
+/// no convention sources `field` from events, or no such event is present.
+fn resolve_json_from_events(events: &[Event], field: OperationField) -> Option<String> {
+    for convention in CONVENTIONS {
+        let event_names = convention.event_field_names(field);
+        if event_names.is_empty() {
+            continue;
+        }
+        for event in events {
+            if event_names.contains(&event.name.as_str()) {
+                if let Some(json) = serialize_all_attrs_to_json_object(&event.attributes) {
+                    return Some(json);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a content field as a JSON object of the convention-declared flat span
+/// attributes present on the span, keyed by attribute name. Returns `None` when
+/// no convention declares object attributes for `field`, or none are present.
+fn resolve_json_object_from_attrs(attrs: &[KeyValue], field: OperationField) -> Option<String> {
+    for convention in CONVENTIONS {
+        let keys = convention.object_field_keys(field);
+        if keys.is_empty() {
+            continue;
+        }
+        if let Some(json) = serialize_attrs_to_json_object(attrs, keys) {
+            return Some(json);
+        }
+    }
+    None
+}
+
+/// Resolve a message content field as a single-message JSON array
+/// `[{"role": role, "content": <value>}]` from the first present
+/// convention-declared `(attribute_key, role)` source. Returns `None` when no
+/// convention declares a message source for `field`, or none is present.
+fn resolve_message_array_from_attrs(attrs: &[KeyValue], field: OperationField) -> Option<String> {
+    for convention in CONVENTIONS {
+        for &(key, role) in convention.message_field_keys(field) {
+            let content = attrs
+                .iter()
+                .find(|kv| kv.key == key)
+                .and_then(|kv| extract_string_value(kv.value.as_ref()));
+            if let Some(content) = content {
+                if let Some(json) = serialize_message_to_json_array(role, &content) {
+                    return Some(json);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a content field through the modes in precedence order: a scalar
+/// attribute value ([`resolve_json`]), a JSON object of flat attributes
+/// ([`resolve_json_object_from_attrs`]), a single-message JSON array
+/// ([`resolve_message_array_from_attrs`]), then a JSON object from a span event
+/// ([`resolve_json_from_events`]). The first mode to produce a value wins.
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` if the field's precedence slice is
+/// unavailable (see [`field_precedence`]).
+fn resolve_json_incl_events(
+    view: &AttributeView,
+    attrs: &[KeyValue],
+    events: &[Event],
+    field: OperationField,
+) -> Result<Option<String>> {
+    if let Some(json) = resolve_json(view, field)? {
+        return Ok(Some(json));
+    }
+    if let Some(json) = resolve_json_object_from_attrs(attrs, field) {
+        return Ok(Some(json));
+    }
+    if let Some(json) = resolve_message_array_from_attrs(attrs, field) {
+        return Ok(Some(json));
+    }
+    Ok(resolve_json_from_events(events, field))
+}
+
 /// Resolve `input_tokens`-style counts via strict `i64` parse.
 ///
 /// # Errors
@@ -419,6 +506,56 @@ fn resolve_token(view: &AttributeView, field: OperationField, context: &'static 
         ))),
         other => Ok(other),
     }
+}
+
+/// Resolve `time_to_first_chunk_ms`, normalizing the source to milliseconds.
+///
+/// The source unit is inferred from the matched attribute key: a key whose name
+/// ends in `_ms` (e.g. Claude Code's `ttft_ms`) is already milliseconds and is
+/// kept as-is; every other key (OTEL's seconds-based
+/// `gen_ai.response.time_to_first_chunk`) is seconds and scaled by 1000. The
+/// value is validated non-negative and must fit the `i64` millisecond column
+/// after conversion (D6); finiteness is already guaranteed by [`extract_f64`].
+///
+/// Resolves against the first present key in precedence order, matching the
+/// other `resolve_*` helpers.
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` when a present value fails strict parsing,
+/// is negative, or overflows the `i64` millisecond column.
+fn resolve_time_to_first_chunk_ms(view: &AttributeView) -> Result<Option<i64>> {
+    for &key in field_precedence(OperationField::TimeToFirstChunkMs)? {
+        let Some(value) = view.get(key) else {
+            continue;
+        };
+        let Some(raw) = extract_f64(Some(value), "time_to_first_chunk_ms")? else {
+            return Ok(None);
+        };
+        // A direct `as i64` cast would turn a negative duration into a nonsense
+        // latency, so reject it before converting.
+        if raw < 0.0 {
+            return Err(crate::error::IngestError::Validation(format!(
+                "time_to_first_chunk_ms must be a finite non-negative duration: {raw}"
+            )));
+        }
+        // `_ms` source keys are already milliseconds; every other key is seconds.
+        let millis = if key.ends_with("_ms") { raw } else { raw * 1000.0 };
+        // `i64::MAX as f64` rounds to 2^63; `>=` rejects anything that would
+        // overflow the truncating cast below (including a `*1000.0` that pushed a
+        // large-but-finite value to infinity).
+        #[allow(clippy::cast_precision_loss)]
+        let max_millis = i64::MAX as f64;
+        if millis >= max_millis {
+            return Err(crate::error::IngestError::Validation(format!(
+                "time_to_first_chunk_ms out of range: {raw}"
+            )));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let millis = millis as i64;
+        return Ok(Some(millis));
+    }
+    Ok(None)
 }
 
 /// Project one OTLP span (+ scope + tenant) into an optional operations row.
@@ -444,9 +581,10 @@ pub(crate) fn project_operation_row(
 ) -> Result<Option<OperationRow>> {
     let view = AttributeView::new(&span.attributes);
 
-    let qualifies = CONVENTIONS
-        .iter()
-        .any(|conv| conv.marker_keys().iter().any(|key| view.has(key)));
+    let qualifies = CONVENTIONS.iter().any(|conv| {
+        conv.marker_keys().iter().any(|key| view.has(key))
+            || conv.name_prefixes().iter().any(|prefix| span.name.starts_with(prefix))
+    });
     if !qualifies {
         return Ok(None);
     }
@@ -460,7 +598,7 @@ pub(crate) fn project_operation_row(
 
     let operation_name = CONVENTIONS
         .iter()
-        .find_map(|conv| conv.classify_operation(&view))
+        .find_map(|conv| conv.classify_operation(&span.name, &view))
         .unwrap_or_else(|| "other".to_string());
 
     let timestamp = nanos_to_micros(span.start_time_unix_nano);
@@ -499,34 +637,7 @@ pub(crate) fn project_operation_row(
         None => None,
     };
 
-    // A finite, non-negative duration is the only valid input; a direct `as i64`
-    // cast would otherwise turn NaN into 0 and saturate infinities/overflow into
-    // nonsense latencies, so validate before converting seconds to millis.
-    let time_to_first_chunk_ms = match resolve_f64(&view, OperationField::TimeToFirstChunkMs, "time_to_first_chunk_ms")?
-    {
-        Some(seconds) if !seconds.is_finite() || seconds < 0.0 => {
-            return Err(crate::error::IngestError::Validation(format!(
-                "time_to_first_chunk_ms must be a finite non-negative duration: {seconds}"
-            )));
-        }
-        Some(seconds) => {
-            let millis = seconds * 1000.0;
-            // `i64::MAX as f64` rounds to 2^63; `>=` rejects anything that would
-            // overflow the truncating cast below (including a `*1000.0` that
-            // pushed a large-but-finite value to infinity).
-            #[allow(clippy::cast_precision_loss)]
-            let max_millis = i64::MAX as f64;
-            if millis >= max_millis {
-                return Err(crate::error::IngestError::Validation(format!(
-                    "time_to_first_chunk_ms out of range: {seconds}"
-                )));
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let millis = millis as i64;
-            Some(millis)
-        }
-        None => None,
-    };
+    let time_to_first_chunk_ms = resolve_time_to_first_chunk_ms(&view)?;
 
     Ok(Some(OperationRow {
         tenant_id: tenant_id.to_string(),
@@ -588,19 +699,44 @@ pub(crate) fn project_operation_row(
         agent_version: resolve_str(&view, OperationField::AgentVersion)?,
         agent_description: resolve_str(&view, OperationField::AgentDescription)?,
         workflow_name: resolve_str(&view, OperationField::WorkflowName)?,
-        input_messages: resolve_json(&view, OperationField::InputMessages)?,
-        output_messages: resolve_json(&view, OperationField::OutputMessages)?,
-        system_instructions: resolve_json(&view, OperationField::SystemInstructions)?,
-        tool_definitions: resolve_json(&view, OperationField::ToolDefinitions)?,
-        tool_call_arguments: resolve_json(&view, OperationField::ToolCallArguments)?,
-        tool_call_result: resolve_json(&view, OperationField::ToolCallResult)?,
+        input_messages: resolve_json_incl_events(&view, &span.attributes, &span.events, OperationField::InputMessages)?,
+        output_messages: resolve_json_incl_events(
+            &view,
+            &span.attributes,
+            &span.events,
+            OperationField::OutputMessages,
+        )?,
+        system_instructions: resolve_json_incl_events(
+            &view,
+            &span.attributes,
+            &span.events,
+            OperationField::SystemInstructions,
+        )?,
+        tool_definitions: resolve_json_incl_events(
+            &view,
+            &span.attributes,
+            &span.events,
+            OperationField::ToolDefinitions,
+        )?,
+        tool_call_arguments: resolve_json_incl_events(
+            &view,
+            &span.attributes,
+            &span.events,
+            OperationField::ToolCallArguments,
+        )?,
+        tool_call_result: resolve_json_incl_events(
+            &view,
+            &span.attributes,
+            &span.events,
+            OperationField::ToolCallResult,
+        )?,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, any_value::Value};
-    use opentelemetry_proto::tonic::trace::v1::{Span, Status};
+    use opentelemetry_proto::tonic::trace::v1::{Span, Status, span::Event};
 
     use super::*;
 
@@ -940,5 +1076,354 @@ mod tests {
         span.end_time_unix_nano = 1_000_000_000;
         let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
         assert_eq!(row.duration_micros, 0);
+    }
+
+    /// Build a Claude Code span with the given name and attributes.
+    fn claude_span(name: &str, attributes: Vec<KeyValue>) -> Span {
+        let mut span = span_with(attributes);
+        span.name = name.to_string();
+        span
+    }
+
+    /// Build a `tool.output` span event carrying the given attributes.
+    fn tool_output_event(attributes: Vec<KeyValue>) -> Event {
+        Event {
+            time_unix_nano: 1_500_000_000,
+            name: "tool.output".to_string(),
+            attributes,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    /// Build a Claude Code span with the given name, attributes, and events.
+    fn claude_span_with_events(name: &str, attributes: Vec<KeyValue>, events: Vec<Event>) -> Span {
+        let mut span = claude_span(name, attributes);
+        span.events = events;
+        span
+    }
+
+    #[test]
+    fn claude_code_llm_request_projects_tokens_and_chat() {
+        // Real captured `claude_code.llm_request` attributes (values stringified,
+        // as Claude Code emits them). Tokens must land (previously NULL), ttft_ms
+        // must stay milliseconds, and provider/model/ids resolve via OTEL/OI.
+        let span = claude_span(
+            "claude_code.llm_request",
+            vec![
+                kv_str("gen_ai.request.model", "claude-opus-4-8[1m]"),
+                kv_str("gen_ai.system", "anthropic"),
+                kv_str("gen_ai.response.id", "req_011Ccznc3e9DSqCxko4AaReK"),
+                kv_str("input_tokens", "94"),
+                kv_str("output_tokens", "83"),
+                kv_str("cache_creation_tokens", "10062"),
+                kv_str("cache_read_tokens", "146256"),
+                kv_str("ttft_ms", "1305"),
+                kv_str("session.id", "c82374f6-6c77-451b-94d1-5fd472cccf1a"),
+                kv_str(
+                    "user.id",
+                    "f1ec8a18ce99fb0e68706cfbb735351381c5c1d945928a5cd0b56a2fbbd2f055",
+                ),
+                kv_str("span.type", "llm_request"),
+            ],
+        );
+
+        let row = project_operation_row(&span, None, "tenant-a", Some("claude-code"), 1)
+            .expect("projection ok")
+            .expect("llm span -> row");
+
+        assert_eq!(row.operation_name, "chat");
+        assert_eq!(row.request_model.as_deref(), Some("claude-opus-4-8[1m]"));
+        assert_eq!(row.provider_name.as_deref(), Some("anthropic"));
+        assert_eq!(row.response_id.as_deref(), Some("req_011Ccznc3e9DSqCxko4AaReK"));
+        assert_eq!(row.input_tokens, Some(94));
+        assert_eq!(row.output_tokens, Some(83));
+        assert_eq!(row.cache_creation_input_tokens, Some(10_062));
+        assert_eq!(row.cache_read_input_tokens, Some(146_256));
+        // `ttft_ms` is already milliseconds and must NOT be scaled by 1000.
+        assert_eq!(row.time_to_first_chunk_ms, Some(1305));
+        assert_eq!(
+            row.conversation_id.as_deref(),
+            Some("c82374f6-6c77-451b-94d1-5fd472cccf1a")
+        );
+        assert_eq!(
+            row.user_id.as_deref(),
+            Some("f1ec8a18ce99fb0e68706cfbb735351381c5c1d945928a5cd0b56a2fbbd2f055")
+        );
+    }
+
+    #[test]
+    fn claude_code_interaction_qualifies_by_name_without_gen_ai_marker() {
+        // interaction carries no gen_ai.* marker, so it qualifies purely by the
+        // `claude_code.` span-name prefix.
+        let span = claude_span(
+            "claude_code.interaction",
+            vec![
+                kv_str("session.id", "c82374f6"),
+                kv_str("user.id", "f1ec8a18"),
+                kv_str("span.type", "interaction"),
+            ],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("interaction span -> row");
+
+        assert_eq!(row.operation_name, "invoke_agent");
+        assert_eq!(row.conversation_id.as_deref(), Some("c82374f6"));
+        assert_eq!(row.user_id.as_deref(), Some("f1ec8a18"));
+    }
+
+    #[test]
+    fn claude_code_agent_tool_projects_invoke_subagent() {
+        let span = claude_span(
+            "claude_code.tool",
+            vec![
+                kv_str("tool_name", "Agent"),
+                kv_str("subagent_type", "code-reviewer"),
+                kv_str("gen_ai.tool.call.id", "toolu_015wNSz"),
+                kv_str("span.type", "tool"),
+            ],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("tool span -> row");
+
+        assert_eq!(row.operation_name, "invoke_subagent");
+        assert_eq!(row.tool_name.as_deref(), Some("Agent"));
+        assert_eq!(row.tool_call_id.as_deref(), Some("toolu_015wNSz"));
+        // subagent_type names WHICH subagent was dispatched.
+        assert_eq!(row.agent_name.as_deref(), Some("code-reviewer"));
+    }
+
+    #[test]
+    fn claude_code_llm_request_projects_agent_id_and_workflow_name() {
+        // agent_id / workflow.name are Claude Code's flat spellings; they populate
+        // the agent_id / workflow_name columns OTEL only sources from gen_ai.* keys.
+        let span = claude_span(
+            "claude_code.llm_request",
+            vec![
+                kv_str("gen_ai.system", "anthropic"),
+                kv_str("agent_id", "agent-7"),
+                kv_str("workflow.name", "code-review"),
+            ],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("row");
+
+        assert_eq!(row.operation_name, "chat");
+        assert_eq!(row.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(row.workflow_name.as_deref(), Some("code-review"));
+    }
+
+    #[test]
+    fn claude_code_bash_tool_projects_execute_tool() {
+        let span = claude_span(
+            "claude_code.tool",
+            vec![kv_str("tool_name", "Bash"), kv_str("span.type", "tool")],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("tool span -> row");
+
+        assert_eq!(row.operation_name, "execute_tool");
+        assert_eq!(row.tool_name.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn claude_code_bash_tool_projects_full_command_as_arguments() {
+        let span = claude_span(
+            "claude_code.tool",
+            vec![
+                kv_str("tool_name", "Bash"),
+                kv_str("full_command", "git status --short"),
+                kv_str("span.type", "tool"),
+            ],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("tool span -> row");
+
+        // Arguments are a JSON object keyed by the attribute name.
+        let args: serde_json::Value =
+            serde_json::from_str(row.tool_call_arguments.as_deref().expect("args present")).expect("args is json");
+        assert_eq!(args["full_command"], "git status --short");
+    }
+
+    #[test]
+    fn claude_code_read_tool_projects_file_path_as_arguments() {
+        // The file_path key covers Read/Edit tools that carry no full_command.
+        let span = claude_span(
+            "claude_code.tool",
+            vec![
+                kv_str("tool_name", "Read"),
+                kv_str("file_path", "/repo/src/main.rs"),
+                kv_str("span.type", "tool"),
+            ],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("tool span -> row");
+
+        let args: serde_json::Value =
+            serde_json::from_str(row.tool_call_arguments.as_deref().expect("args present")).expect("args is json");
+        assert_eq!(args["file_path"], "/repo/src/main.rs");
+    }
+
+    #[test]
+    fn claude_code_interaction_projects_user_prompt_as_input_messages() {
+        let span = claude_span(
+            "claude_code.interaction",
+            vec![
+                kv_str("span.type", "interaction"),
+                kv_str("user_prompt", "/code-review"),
+            ],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("interaction span -> row");
+
+        assert_eq!(row.operation_name, "invoke_agent");
+        // The conversation UI requires input_messages to be a JSON array of
+        // {role, content} messages, so user_prompt is wrapped as a user message.
+        let messages: serde_json::Value =
+            serde_json::from_str(row.input_messages.as_deref().expect("input_messages present")).expect("json array");
+        assert!(messages.is_array(), "input_messages must be a JSON array");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "/code-review");
+    }
+
+    #[test]
+    fn otel_time_to_first_chunk_seconds_scales_to_millis() {
+        // OTEL's `gen_ai.response.time_to_first_chunk` is seconds; the resolver
+        // scales it x1000. Guards the unit-aware resolver's seconds branch.
+        let span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_dbl("gen_ai.response.time_to_first_chunk", 1.3),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("row");
+        assert_eq!(row.time_to_first_chunk_ms, Some(1300));
+    }
+
+    #[test]
+    fn claude_code_negative_input_tokens_drops_row() {
+        // Claude Code's flat token keys inherit the same strict non-negative
+        // contract as every other adapter: a negative count drops the row (D6).
+        let span = claude_span("claude_code.llm_request", vec![kv_str("input_tokens", "-5")]);
+        assert!(project_operation_row(&span, None, "t", None, 1).is_err());
+    }
+
+    #[test]
+    fn claude_code_negative_ttft_ms_drops_row() {
+        // Exercises the unit-aware resolver's negative guard on the `_ms` path.
+        let span = claude_span("claude_code.llm_request", vec![kv_str("ttft_ms", "-1")]);
+        assert!(project_operation_row(&span, None, "t", None, 1).is_err());
+    }
+
+    #[test]
+    fn claude_code_tool_execution_subspan_projects_execute_tool() {
+        // tool.execution carries no gen_ai marker and no tool_name; it qualifies
+        // by the `claude_code.` name prefix and classifies via the tool family.
+        let span = claude_span(
+            "claude_code.tool.execution",
+            vec![
+                kv_str("gen_ai.tool.call.id", "toolu_015wNSz"),
+                kv_str("span.type", "tool.execution"),
+            ],
+        );
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("tool.execution span -> row");
+        assert_eq!(row.operation_name, "execute_tool");
+        assert_eq!(row.tool_call_id.as_deref(), Some("toolu_015wNSz"));
+    }
+
+    #[test]
+    fn claude_code_bash_tool_output_event_is_the_result() {
+        // The whole tool.output event is the tool's result (echoed command +
+        // output); arguments come from span attributes, not the event.
+        let span = claude_span_with_events(
+            "claude_code.tool",
+            vec![kv_str("tool_name", "Bash"), kv_str("span.type", "tool")],
+            vec![tool_output_event(vec![
+                kv_str("bash_command", "git status --short"),
+                kv_str("output", "M src/main.rs"),
+            ])],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("tool span -> row");
+
+        // Result is the whole event, including the echoed command.
+        let result: serde_json::Value =
+            serde_json::from_str(row.tool_call_result.as_deref().expect("result present")).expect("result is json");
+        assert_eq!(result["output"], "M src/main.rs");
+        assert_eq!(result["bash_command"], "git status --short");
+
+        // No full_command span attribute and no event->arguments source -> None.
+        assert!(row.tool_call_arguments.is_none());
+    }
+
+    #[test]
+    fn claude_code_read_tool_output_event_is_the_result() {
+        let span = claude_span_with_events(
+            "claude_code.tool",
+            vec![kv_str("tool_name", "Read"), kv_str("span.type", "tool")],
+            vec![tool_output_event(vec![
+                kv_str("file_path", "/repo/main.rs"),
+                kv_str("content", "fn main() {}"),
+            ])],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("tool span -> row");
+
+        let result: serde_json::Value =
+            serde_json::from_str(row.tool_call_result.as_deref().expect("result present")).expect("result is json");
+        assert_eq!(result["content"], "fn main() {}");
+        assert_eq!(result["file_path"], "/repo/main.rs");
+
+        assert!(row.tool_call_arguments.is_none());
+    }
+
+    #[test]
+    fn claude_code_tool_arguments_come_from_span_attributes_not_the_event() {
+        // full_command (span attribute) is the input; the tool.output event is the
+        // result. The two are independent sources.
+        let span = claude_span_with_events(
+            "claude_code.tool",
+            vec![
+                kv_str("tool_name", "Bash"),
+                kv_str("full_command", "ls -la"),
+                kv_str("span.type", "tool"),
+            ],
+            vec![tool_output_event(vec![
+                kv_str("bash_command", "ls -la"),
+                kv_str("output", "a\nb"),
+            ])],
+        );
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("tool span -> row");
+
+        // Arguments come from the span attribute (input), as a JSON object.
+        let args: serde_json::Value =
+            serde_json::from_str(row.tool_call_arguments.as_deref().expect("args present")).expect("args is json");
+        assert_eq!(args["full_command"], "ls -la");
+        // Result comes from the event (output).
+        let result: serde_json::Value =
+            serde_json::from_str(row.tool_call_result.as_deref().expect("result present")).expect("result is json");
+        assert_eq!(result["output"], "a\nb");
     }
 }

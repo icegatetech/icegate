@@ -70,7 +70,7 @@ impl OperationConvention for OtelGenAi {
         }
     }
 
-    fn classify_operation(&self, attrs: &AttributeView) -> Option<String> {
+    fn classify_operation(&self, _span_name: &str, attrs: &AttributeView) -> Option<String> {
         // Verbatim, lowercased: preserves text_completion / generate_content /
         // invoke_workflow / plan without special-casing (spec section 4).
         extract_string_value(attrs.get("gen_ai.operation.name")).map(|name| name.to_lowercase())
@@ -136,13 +136,16 @@ mod tests {
     fn classify_operation_returns_lowercased_verbatim() {
         let attrs = vec![kv_str("gen_ai.operation.name", "Text_Completion")];
         let view = AttributeView::new(&attrs);
-        assert_eq!(OtelGenAi.classify_operation(&view), Some("text_completion".to_string()));
+        assert_eq!(
+            OtelGenAi.classify_operation("op", &view),
+            Some("text_completion".to_string())
+        );
     }
 
     #[test]
     fn classify_operation_is_none_without_operation_name() {
         let attrs = vec![kv_str("gen_ai.system", "openai")];
         let view = AttributeView::new(&attrs);
-        assert_eq!(OtelGenAi.classify_operation(&view), None);
+        assert_eq!(OtelGenAi.classify_operation("op", &view), None);
     }
 }

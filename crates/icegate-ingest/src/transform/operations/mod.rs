@@ -6,6 +6,7 @@
 //! precedence-ordered registry of per-SDK convention adapters
 //! ([`convention::CONVENTIONS`]), plus the thin Arrow driver below.
 
+mod claude_code;
 mod convention;
 mod openinference;
 mod otel;

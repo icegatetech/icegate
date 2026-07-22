@@ -111,6 +111,63 @@ fn any_value_to_json(value: &AnyValue) -> Option<serde_json::Value> {
     })
 }
 
+/// Serialize every attribute of a span event into a JSON object string keyed by
+/// attribute name (output order follows the input).
+///
+/// Returns `None` when there are no serializable attributes. Used to project a
+/// span event's full payload (e.g. Claude Code's `tool.output` event) into a
+/// single JSON content column. On a duplicate attribute key the first value wins.
+pub(crate) fn serialize_all_attrs_to_json_object(attrs: &[KeyValue]) -> Option<String> {
+    let mut object = serde_json::Map::new();
+    for kv in attrs {
+        if object.contains_key(&kv.key) {
+            continue;
+        }
+        if let Some(value) = kv.value.as_ref().and_then(any_value_to_json) {
+            object.insert(kv.key.clone(), value);
+        }
+    }
+    if object.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&object).ok()
+}
+
+/// Serialize the named attribute `keys` present in `attrs` into a JSON object
+/// string keyed by attribute name (output order follows `keys`).
+///
+/// Returns `None` when none of the keys are present. Used to project a selected
+/// set of flat span attributes (e.g. a tool call's `full_command` / `file_path`
+/// input) into a single JSON content column. On a duplicate key the first wins.
+pub(crate) fn serialize_attrs_to_json_object(attrs: &[KeyValue], keys: &[&str]) -> Option<String> {
+    let mut object = serde_json::Map::new();
+    for &key in keys {
+        if object.contains_key(key) {
+            continue;
+        }
+        if let Some(kv) = attrs.iter().find(|kv| kv.key == key) {
+            if let Some(value) = kv.value.as_ref().and_then(any_value_to_json) {
+                object.insert(key.to_string(), value);
+            }
+        }
+    }
+    if object.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&object).ok()
+}
+
+/// Serialize a single chat message into the `[{"role": role, "content": content}]`
+/// JSON array shape that the message content columns (`input_messages` /
+/// `output_messages`) use.
+///
+/// Used for SDKs (e.g. Claude Code) that emit a bare prompt/response string
+/// rather than a structured messages array; consumers reconstruct a conversation
+/// by parsing this column as an array of role/content messages.
+pub(crate) fn serialize_message_to_json_array(role: &str, content: &str) -> Option<String> {
+    serde_json::to_string(&serde_json::json!([{ "role": role, "content": content }])).ok()
+}
+
 /// Checks if a byte slice is all zeros.
 pub(crate) fn is_zero_bytes(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == 0)
@@ -1042,5 +1099,72 @@ mod tests {
             })),
         };
         assert!(extract_string_list(Some(&mixed), "ctx").is_err());
+    }
+
+    #[test]
+    fn serialize_all_attrs_to_json_object_includes_every_attribute() {
+        let attrs = vec![
+            KeyValue {
+                key: "output".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue("done".to_string())),
+                }),
+            },
+            KeyValue {
+                key: "bash_command".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue("ls".to_string())),
+                }),
+            },
+        ];
+
+        // Every attribute is included, keyed by its name.
+        let json = serialize_all_attrs_to_json_object(&attrs).expect("some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["output"], "done");
+        assert_eq!(parsed["bash_command"], "ls");
+
+        // No attributes -> None (a NULL content column, not "{}").
+        assert!(serialize_all_attrs_to_json_object(&[]).is_none());
+    }
+
+    #[test]
+    fn serialize_attrs_to_json_object_selects_named_keys() {
+        let attrs = vec![
+            KeyValue {
+                key: "full_command".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue("ls -la".to_string())),
+                }),
+            },
+            KeyValue {
+                key: "tool_name".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue("Bash".to_string())),
+                }),
+            },
+        ];
+
+        // Only the requested, present key is included (keyed by name); an absent
+        // requested key and unrequested attributes are excluded.
+        let json = serialize_attrs_to_json_object(&attrs, &["full_command", "file_path"]).expect("some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["full_command"], "ls -la");
+        assert!(parsed.get("file_path").is_none());
+        assert!(parsed.get("tool_name").is_none());
+
+        // No requested key present -> None.
+        assert!(serialize_attrs_to_json_object(&attrs, &["file_path"]).is_none());
+    }
+
+    #[test]
+    fn serialize_message_to_json_array_wraps_role_and_content() {
+        // Produces the [{"role","content"}] array shape conversation views parse,
+        // with content correctly JSON-escaped.
+        let json = serialize_message_to_json_array("user", "hello \"world\"").expect("some");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(parsed.is_array());
+        assert_eq!(parsed[0]["role"], "user");
+        assert_eq!(parsed[0]["content"], "hello \"world\"");
     }
 }
