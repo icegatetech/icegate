@@ -133,9 +133,14 @@ impl PricingConfig {
                 "pricing.min_model_count_ratio must be between 0.0 and 1.0".to_string(),
             ));
         }
-        if self.max_change_ratio < 0.0 {
+        // Non-finite fails closed rather than reading as "no limit": `NaN` and
+        // `inf` both survive a bare `< 0.0` test, and `check_delta`'s
+        // `ratio > max_change_ratio` is then always false — the guard would run
+        // on every rate and reject nothing. `min_model_count_ratio` above needs
+        // no such test because a range `contains` already rejects both.
+        if !self.max_change_ratio.is_finite() || self.max_change_ratio < 0.0 {
             return Err(MaintainError::Config(
-                "pricing.max_change_ratio must not be negative".to_string(),
+                "pricing.max_change_ratio must be a finite, non-negative number".to_string(),
             ));
         }
         // The crawler's worker pool and job-state storage, validated here for
@@ -218,6 +223,19 @@ mod tests {
             config.validate().is_ok(),
             "zero disables the guard rather than being invalid"
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_non_finite_change_ratio() {
+        // YAML spells these `.nan` / `.inf`, so both are one typo away in a
+        // hand-edited config. Either would leave the guard running but unable
+        // to reject anything, which is worse than the explicit `0` opt-out
+        // because nothing in the logs says the guard is off.
+        let mut config = enabled_config();
+        for ratio in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            config.max_change_ratio = ratio;
+            assert!(config.validate().is_err(), "max_change_ratio {ratio} must be rejected");
+        }
     }
 
     #[test]

@@ -860,13 +860,13 @@ pub fn prices_schema() -> Result<Schema> {
             // Matches `operations.provider_name` verbatim (OTel `gen_ai.provider.name`).
             Arc::new(NestedField::required(
                 1,
-                "provider",
+                COL_PROVIDER,
                 Type::Primitive(PrimitiveType::String),
             )),
             // The serving platform's own name, matching `operations.request_model`.
             Arc::new(NestedField::required(
                 2,
-                "model",
+                COL_MODEL,
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── identity ─────────────────────────────────────────────────
@@ -881,7 +881,7 @@ pub fn prices_schema() -> Result<Schema> {
             // ── key (continued) ──────────────────────────────────────────
             Arc::new(NestedField::required(
                 4,
-                "service_tier",
+                COL_SERVICE_TIER,
                 Type::Primitive(PrimitiveType::String),
             )),
             // Reseller region; `global` for vendors with one worldwide price.
@@ -889,12 +889,12 @@ pub fn prices_schema() -> Result<Schema> {
             // complete and the configured-region filter always has a match.
             Arc::new(NestedField::required(
                 5,
-                "region",
+                COL_REGION,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::required(
                 6,
-                "min_input_tokens",
+                COL_MIN_INPUT_TOKENS,
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::optional(
@@ -904,7 +904,7 @@ pub fn prices_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::required(
                 8,
-                "valid_from",
+                COL_VALID_FROM,
                 Type::Primitive(PrimitiveType::Timestamp),
             )),
             // `vendor` when the source published an effective date (AWS does),
@@ -1019,14 +1019,7 @@ pub fn prices_sort_order(schema: &Schema) -> Result<SortOrder> {
     let mut builder = SortOrder::builder();
     builder.with_order_id(6);
 
-    for name in [
-        "provider",
-        "model",
-        "service_tier",
-        "region",
-        "min_input_tokens",
-        "valid_from",
-    ] {
+    for name in PRICES_KEY_COLUMNS.iter().copied().chain([COL_VALID_FROM]) {
         let field = schema.field_by_name(name).ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -1643,6 +1636,35 @@ pub const COL_MAX: &str = "max";
 pub const COL_ZERO_THRESHOLD: &str = "zero_threshold";
 /// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
 pub const LEVEL_ALIAS: &str = "level";
+
+// ── Prices table column name constants ───────────────────────────────
+
+/// Prices — selling platform, matching `operations.provider_name`.
+pub const COL_PROVIDER: &str = "provider";
+/// Prices — platform's own model name, matching `operations.request_model`.
+pub const COL_MODEL: &str = "model";
+/// Prices — service tier (`standard`, `batch`, …).
+pub const COL_SERVICE_TIER: &str = "service_tier";
+/// Prices — reseller region; `global` for one worldwide price.
+pub const COL_REGION: &str = "region";
+/// Prices — inclusive lower bound of the context tier, in tokens.
+pub const COL_MIN_INPUT_TOKENS: &str = "min_input_tokens";
+/// Prices — instant this revision took effect.
+pub const COL_VALID_FROM: &str = "valid_from";
+
+/// The `prices` key columns that identify one rate line across revisions.
+///
+/// [`COL_VALID_FROM`] completes the append key but is deliberately excluded:
+/// consumers partition by this slice and order by `valid_from` within it, which
+/// is exactly how [`prices_sort_order`] clusters the table and how the
+/// `prices_effective` view derives `valid_to`.
+pub const PRICES_KEY_COLUMNS: &[&str] = &[
+    COL_PROVIDER,
+    COL_MODEL,
+    COL_SERVICE_TIER,
+    COL_REGION,
+    COL_MIN_INPUT_TOKENS,
+];
 
 /// Indexed attribute columns for log label extraction.
 ///

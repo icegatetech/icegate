@@ -6,7 +6,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
@@ -16,6 +16,7 @@ use datafusion::prelude::SessionContext;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
+use icegate_common::schema::{COL_VALID_FROM, PRICES_KEY_COLUMNS};
 use icegate_queue::ParquetQueueReader;
 
 use super::WalQueryConfig;
@@ -44,12 +45,28 @@ const WAL_MERGED_TABLES: &[&str] = &[
 /// This view is a DataFusion object: Flight SQL and the query APIs see it, but
 /// **Trino reads the Iceberg catalog directly and will not**. External consumers
 /// apply this window themselves, which is why the raw table is self-sufficient.
-const PRICES_EFFECTIVE_SQL: &str = "\
-SELECT *, LEAD(valid_from) OVER (\
-    PARTITION BY provider, model, service_tier, region, min_input_tokens \
-    ORDER BY valid_from\
-) AS valid_to \
-FROM prices";
+///
+/// Every `prices` column is named through `icegate_common::schema`, so renaming
+/// one there breaks this build rather than silently degrading into a planning
+/// error at startup — the failure [`plan_prices_effective`] swallows.
+static PRICES_EFFECTIVE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT *, LEAD({valid_from}) OVER (\
+             PARTITION BY {key} ORDER BY {valid_from}\
+         ) AS {valid_to} FROM {prices}",
+        valid_from = COL_VALID_FROM,
+        key = PRICES_KEY_COLUMNS.join(", "),
+        valid_to = COL_VALID_TO,
+        prices = icegate_common::PRICES_TABLE,
+    )
+});
+
+/// The column [`PRICES_EFFECTIVE_SQL`] derives, and the only one the view adds
+/// to the `prices` schema.
+///
+/// Deliberately not in `icegate_common::schema`: no Iceberg table has this
+/// column, so it is the view's contract rather than a schema-of-record entry.
+const COL_VALID_TO: &str = "valid_to";
 
 /// Plans [`PRICES_EFFECTIVE_SQL`] over `prices` as a standalone view.
 ///
@@ -68,8 +85,8 @@ FROM prices";
 async fn plan_prices_effective(prices: Arc<dyn TableProvider>) -> DFResult<Arc<dyn TableProvider>> {
     let planning_ctx = SessionContext::new();
     planning_ctx.register_table(icegate_common::PRICES_TABLE, prices)?;
-    let plan = planning_ctx.sql(PRICES_EFFECTIVE_SQL).await?.into_unoptimized_plan();
-    Ok(Arc::new(ViewTable::new(plan, Some(PRICES_EFFECTIVE_SQL.to_string()))))
+    let plan = planning_ctx.sql(PRICES_EFFECTIVE_SQL.as_str()).await?.into_unoptimized_plan();
+    Ok(Arc::new(ViewTable::new(plan, Some(PRICES_EFFECTIVE_SQL.clone()))))
 }
 
 /// Schema provider that substitutes `IcegateTableProvider` for WAL-backed
@@ -191,7 +208,7 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
 
-    use super::{PRICES_EFFECTIVE_SQL, WAL_MERGED_TABLES};
+    use super::{COL_VALID_FROM, COL_VALID_TO, PRICES_EFFECTIVE_SQL, WAL_MERGED_TABLES};
 
     /// Guard against accidental drift in the WAL-merged table allowlist.
     /// The dispatch in `IcegateSchemaProvider::try_new` keys off this slice;
@@ -277,7 +294,7 @@ mod tests {
             .expect("prices registers");
 
         let results = ctx
-            .sql(PRICES_EFFECTIVE_SQL)
+            .sql(PRICES_EFFECTIVE_SQL.as_str())
             .await
             .expect("PRICES_EFFECTIVE_SQL plans")
             .collect()
@@ -289,13 +306,13 @@ mod tests {
         let mut valid_to_by_valid_from: HashMap<i64, Option<i64>> = HashMap::new();
         for result_batch in &results {
             let valid_from_col = result_batch
-                .column_by_name("valid_from")
+                .column_by_name(COL_VALID_FROM)
                 .expect("valid_from present")
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .expect("valid_from is a timestamp column");
             let valid_to_col = result_batch
-                .column_by_name("valid_to")
+                .column_by_name(COL_VALID_TO)
                 .expect("valid_to present")
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
