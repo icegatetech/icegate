@@ -4,11 +4,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use icegate_common::{
-    EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE,
+    EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, PRICES_TABLE, SPANS_TABLE,
     schema::{
         events_partition_spec, events_schema, events_sort_order, logs_partition_spec, logs_schema, logs_sort_order,
         metrics_partition_spec, metrics_schema, metrics_sort_order, operations_partition_spec, operations_schema,
-        operations_sort_order, spans_partition_spec, spans_schema, spans_sort_order,
+        operations_sort_order, prices_partition_spec, prices_schema, prices_sort_order, spans_partition_spec,
+        spans_schema, spans_sort_order,
     },
 };
 
@@ -39,7 +40,7 @@ struct TableDefinition {
 
 /// Build table definitions from schema module
 fn build_table_definitions() -> Result<Vec<TableDefinition>> {
-    let mut definitions = Vec::with_capacity(5);
+    let mut definitions = Vec::with_capacity(6);
 
     // Logs table
     let logs = logs_schema()?;
@@ -96,6 +97,18 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         sort_order: operations_sort,
     });
 
+    // Prices table (global LLM rate card — the 6th physical table, and the only
+    // one without `tenant_id` or partitioning).
+    let prices = prices_schema()?;
+    let prices_partition = prices_partition_spec(&prices)?;
+    let prices_sort = prices_sort_order(&prices)?;
+    definitions.push(TableDefinition {
+        name: PRICES_TABLE,
+        schema: prices,
+        partition_spec: prices_partition,
+        sort_order: prices_sort,
+    });
+
     Ok(definitions)
 }
 
@@ -107,6 +120,7 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
 /// - events: Semantic events extracted from logs
 /// - metrics: All metric types (gauge, sum, histogram, summary)
 /// - operations: LLM/`GenAI` typed projection over spans
+/// - prices: global LLM rate card (no `tenant_id`, unpartitioned)
 ///
 /// Each table is created with appropriate partition specs and sort orders
 /// for optimal query performance.
@@ -444,8 +458,8 @@ mod tests {
     fn build_table_definitions_includes_operations_table() {
         let definitions = build_table_definitions().expect("build table definitions");
         // Phase 5 adds the 5th physical table; all four prior tables plus
-        // operations must be present.
-        assert_eq!(definitions.len(), 5);
+        // operations must be present. Phase 6 adds the prices table.
+        assert_eq!(definitions.len(), 6);
 
         let names: Vec<&str> = definitions.iter().map(|def| def.name).collect();
         assert!(names.contains(&LOGS_TABLE));
@@ -467,6 +481,21 @@ mod tests {
         assert_eq!(operations.schema.schema_id(), 5);
         assert_eq!(operations.partition_spec.spec_id(), 5);
         assert_eq!(operations.sort_order.order_id, 5);
+    }
+
+    #[test]
+    fn build_table_definitions_includes_prices() {
+        let defs = build_table_definitions().expect("definitions build");
+        assert_eq!(defs.len(), 6, "expected the five telemetry tables plus prices");
+
+        let prices = defs
+            .iter()
+            .find(|d| d.name == icegate_common::PRICES_TABLE)
+            .expect("prices definition present");
+        assert!(
+            prices.partition_spec.fields().is_empty(),
+            "prices is the one unpartitioned table"
+        );
     }
 
     #[test]

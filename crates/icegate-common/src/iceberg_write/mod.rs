@@ -29,7 +29,7 @@ use iceberg::{
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator},
             rolling_writer::RollingFileWriterBuilder,
         },
-        partitioning::{PartitioningWriter, fanout_writer::FanoutWriter},
+        partitioning::{PartitioningWriter, fanout_writer::FanoutWriter, unpartitioned_writer::UnpartitionedWriter},
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -247,15 +247,12 @@ async fn write_parquet_files_once(
 
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-    // Create FanoutWriter for partitioned writes
-    let mut fanout_writer = FanoutWriter::new(data_file_writer_builder);
-
-    // Create partition splitter to compute partition keys from source columns
-    let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
-        table_metadata.current_schema().clone(),
-        table_metadata.default_partition_spec().clone(),
-    )
-    .map_err(CommonError::Iceberg)?;
+    // `RecordBatchPartitionSplitter` refuses to compute partition values for an
+    // unpartitioned spec outright (there is nothing to compute — see
+    // `PartitionValueCalculator::try_new`), and an unpartitioned table has only
+    // ever one "partition": the whole table. `prices` is the one table in the
+    // catalog this branch exists for.
+    let unpartitioned = table_metadata.default_partition_spec().is_unpartitioned();
 
     // Run the encoding pipeline under `catch_unwind` so a panic on the blocking
     // thread (e.g. inside Parquet encoding or `FanoutWriter::close`) still
@@ -266,63 +263,16 @@ async fn write_parquet_files_once(
     // cleanup (which tolerates a poisoned `generated_paths` mutex) and re-raise
     // the original panic, preserving the caller's panic-to-error mapping.
     let write_result = AssertUnwindSafe(async {
-        let mut rows_written = 0usize;
-        let mut partitioned_batches_total = 0usize;
-        while let Some(batch) = batches.try_next().await? {
-            if cancel_token.is_cancelled() {
-                return Err(CommonError::Write(
-                    "shift task cancelled during parquet write".to_string(),
-                ));
-            }
-            rows_written = rows_written
-                .checked_add(batch.num_rows())
-                .ok_or_else(|| CommonError::Write("rows written overflow".to_string()))?;
-            let partitioned_batches = splitter
-                .split(&batch)
-                .map_err(|e| CommonError::Write(format!("failed to split batch by partition: {e}")))?;
-            partitioned_batches_total = partitioned_batches_total
-                .checked_add(partitioned_batches.len())
-                .ok_or_else(|| CommonError::Write("partitioned batch count overflow".to_string()))?;
-
-            for (partition_key, partition_batch) in partitioned_batches {
-                // Re-check cancellation between partition writes too, not only
-                // between source batches: a batch may split into many partitions,
-                // and an individual `fanout_writer.write`/`close` await is not
-                // itself cancellation-aware, so this bounds how much of a
-                // cancelled batch still gets uploaded.
-                if cancel_token.is_cancelled() {
-                    return Err(CommonError::Write(
-                        "shift task cancelled during parquet write".to_string(),
-                    ));
-                }
-                let partition_path = partition_key.to_path();
-                let span = tracing::info_span!(
-                    "iceberg_partition_write",
-                    partition_key = %partition_path,
-                    rows = partition_batch.num_rows()
-                );
-                fanout_writer
-                    .write(partition_key, partition_batch)
-                    .instrument(span)
-                    .await
-                    .map_err(CommonError::Iceberg)?;
-            }
+        if unpartitioned {
+            write_unpartitioned_batches(data_file_writer_builder, &mut batches, cancel_token).await
+        } else {
+            let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            )
+            .map_err(CommonError::Iceberg)?;
+            write_partitioned_batches(data_file_writer_builder, &splitter, &mut batches, cancel_token).await
         }
-
-        // Close writer and get data files
-        let span = tracing::info_span!("iceberg_write_close");
-        let data_files: Vec<DataFile> = fanout_writer.close().instrument(span).await.map_err(CommonError::Iceberg)?;
-
-        tracing::info!(
-            "Complete write {} parquet files for {} partitions",
-            data_files.len(),
-            partitioned_batches_total
-        );
-
-        Ok(WrittenDataFiles {
-            data_files,
-            rows_written,
-        })
     })
     .catch_unwind()
     .await;
@@ -342,6 +292,112 @@ async fn write_parquet_files_once(
             std::panic::resume_unwind(panic_payload);
         }
     }
+}
+
+/// Write every batch straight through a single writer with no partition key,
+/// for a table whose partition spec is empty (`is_unpartitioned()`).
+///
+/// There is only ever one "partition" — the whole table — so this bypasses
+/// `RecordBatchPartitionSplitter`/`FanoutWriter` entirely rather than fanning
+/// out over a single, always-empty partition key.
+async fn write_unpartitioned_batches(
+    writer_builder: DataFileWriterBuilder<ParquetWriterBuilder, TrackingLocationGenerator, DefaultFileNameGenerator>,
+    batches: &mut CommonRecordBatchStream,
+    cancel_token: &CancellationToken,
+) -> Result<WrittenDataFiles> {
+    let mut writer = UnpartitionedWriter::new(writer_builder);
+    let mut rows_written = 0usize;
+    while let Some(batch) = batches.try_next().await? {
+        if cancel_token.is_cancelled() {
+            return Err(CommonError::Write(
+                "shift task cancelled during parquet write".to_string(),
+            ));
+        }
+        rows_written = rows_written
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| CommonError::Write("rows written overflow".to_string()))?;
+        writer.write(batch).await.map_err(CommonError::Iceberg)?;
+    }
+
+    let span = tracing::info_span!("iceberg_write_close");
+    let data_files: Vec<DataFile> = writer.close().instrument(span).await.map_err(CommonError::Iceberg)?;
+    tracing::info!(
+        "Complete write {} parquet files for the unpartitioned table",
+        data_files.len()
+    );
+
+    Ok(WrittenDataFiles {
+        data_files,
+        rows_written,
+    })
+}
+
+/// Split every batch by partition and fan the partitions out across a
+/// [`FanoutWriter`] built from `writer_builder`.
+async fn write_partitioned_batches(
+    writer_builder: DataFileWriterBuilder<ParquetWriterBuilder, TrackingLocationGenerator, DefaultFileNameGenerator>,
+    splitter: &RecordBatchPartitionSplitter,
+    batches: &mut CommonRecordBatchStream,
+    cancel_token: &CancellationToken,
+) -> Result<WrittenDataFiles> {
+    let mut fanout_writer = FanoutWriter::new(writer_builder);
+    let mut rows_written = 0usize;
+    let mut partitioned_batches_total = 0usize;
+    while let Some(batch) = batches.try_next().await? {
+        if cancel_token.is_cancelled() {
+            return Err(CommonError::Write(
+                "shift task cancelled during parquet write".to_string(),
+            ));
+        }
+        rows_written = rows_written
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| CommonError::Write("rows written overflow".to_string()))?;
+        let partitioned_batches = splitter
+            .split(&batch)
+            .map_err(|e| CommonError::Write(format!("failed to split batch by partition: {e}")))?;
+        partitioned_batches_total = partitioned_batches_total
+            .checked_add(partitioned_batches.len())
+            .ok_or_else(|| CommonError::Write("partitioned batch count overflow".to_string()))?;
+
+        for (partition_key, partition_batch) in partitioned_batches {
+            // Re-check cancellation between partition writes too, not only
+            // between source batches: a batch may split into many partitions,
+            // and an individual `fanout_writer.write`/`close` await is not
+            // itself cancellation-aware, so this bounds how much of a
+            // cancelled batch still gets uploaded.
+            if cancel_token.is_cancelled() {
+                return Err(CommonError::Write(
+                    "shift task cancelled during parquet write".to_string(),
+                ));
+            }
+            let partition_path = partition_key.to_path();
+            let span = tracing::info_span!(
+                "iceberg_partition_write",
+                partition_key = %partition_path,
+                rows = partition_batch.num_rows()
+            );
+            fanout_writer
+                .write(partition_key, partition_batch)
+                .instrument(span)
+                .await
+                .map_err(CommonError::Iceberg)?;
+        }
+    }
+
+    // Close writer and get data files
+    let span = tracing::info_span!("iceberg_write_close");
+    let data_files: Vec<DataFile> = fanout_writer.close().instrument(span).await.map_err(CommonError::Iceberg)?;
+
+    tracing::info!(
+        "Complete write {} parquet files for {} partitions",
+        data_files.len(),
+        partitioned_batches_total
+    );
+
+    Ok(WrittenDataFiles {
+        data_files,
+        rows_written,
+    })
 }
 
 async fn cleanup_generated_data_files(file_io: &FileIO, generated_paths: &Arc<std::sync::Mutex<Vec<String>>>) {

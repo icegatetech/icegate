@@ -28,6 +28,23 @@ pub const METRICS_TABLE_FQN: &str = "iceberg.icegate.metrics";
 /// Fully qualified table name for operations (`iceberg.icegate.operations`).
 pub const OPERATIONS_TABLE_FQN: &str = "iceberg.icegate.operations";
 
+/// Table name for global LLM rate cards.
+pub const PRICES_TABLE: &str = "prices";
+/// Fully qualified table name for prices (`iceberg.icegate.prices`).
+pub const PRICES_TABLE_FQN: &str = "iceberg.icegate.prices";
+/// View name exposing [`PRICES_TABLE`] with a derived `valid_to` column.
+pub const PRICES_EFFECTIVE_TABLE: &str = "prices_effective";
+
+/// Tables in the IceGate namespace that carry no `tenant_id` and hold identical
+/// rows for every tenant.
+///
+/// The Flight SQL tenant decorator consults this allowlist and passes matching
+/// tables through **unwrapped**. Everything absent from this list is still
+/// wrapped, and a table with no `tenant_id` column fails closed at
+/// catalog-resolution time — so forgetting to add a genuinely tenant-scoped
+/// table here is an error, never a silent cross-tenant leak.
+pub const GLOBAL_TABLES: &[&str] = &[PRICES_TABLE, PRICES_EFFECTIVE_TABLE];
+
 /// Build the [`iceberg::TableIdent`] for a table name inside the IceGate
 /// namespace ([`ICEGATE_NAMESPACE`]).
 ///

@@ -31,6 +31,10 @@ pub struct MaintainConfig {
     /// service. Disabled by default; ignored by the one-shot `migrate` commands.
     #[serde(default)]
     pub gc: GcConfig,
+    /// LLM pricing crawler configuration for the long-running `run` service.
+    /// Disabled by default; ignored by the one-shot `migrate` commands.
+    #[serde(default)]
+    pub pricing: crate::pricing::config::PricingConfig,
     /// Prometheus metrics endpoint configuration for the long-running `run`
     /// service. Disabled by default and ignored by the one-shot `migrate`
     /// commands; when enabled, `run` installs the global meter provider (so the
@@ -54,14 +58,15 @@ impl MaintainConfig {
     /// Validate the always-required shared configuration: catalog, storage, and
     /// the (optional) metrics endpoint.
     ///
-    /// The component-specific `compaction` and `gc` blocks are deliberately NOT
-    /// validated here. Both carry required job-state storage that the one-shot
-    /// `migrate` commands never set — those commands share this `MaintainConfig`
-    /// but use only `catalog` + `storage`. Each block is instead validated when
-    /// its background loop is constructed in the `run` service
-    /// (`Compactor::new` / `GcRunner::new`), so a `migrate` config that omits the
-    /// `gc`/`compaction` block still loads. (Validating `gc` here previously
-    /// broke `migrate create` on the minimal migrate config.)
+    /// The component-specific `compaction`, `gc`, and `pricing` blocks are
+    /// deliberately NOT validated here. Each carries required job-state storage
+    /// that the one-shot `migrate` commands never set — those commands share
+    /// this `MaintainConfig` but use only `catalog` + `storage`. Each block is
+    /// instead validated when its background loop is constructed in the `run`
+    /// service (`Compactor::new` / `GcRunner::new` / `PricingRunner::new`), so a
+    /// `migrate` config that omits the `gc`/`compaction`/`pricing` block still
+    /// loads. (Validating `gc` here previously broke `migrate create` on the
+    /// minimal migrate config.)
     ///
     /// # Errors
     ///

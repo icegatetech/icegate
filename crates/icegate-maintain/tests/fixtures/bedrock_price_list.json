@@ -1,0 +1,238 @@
+{
+  "formatVersion": "v1.0",
+  "publicationDate": "2026-07-20T21:52:47Z",
+  "products": {
+    "ZEJSXGT973DYB7JF": {
+      "sku": "ZEJSXGT973DYB7JF",
+      "productFamily": "Amazon Bedrock",
+      "attributes": {
+        "servicecode": "AmazonBedrock",
+        "location": "US East (N. Virginia)",
+        "locationType": "AWS Region",
+        "usagetype": "USE1-Claude3Sonnet-input-tokens",
+        "operation": "",
+        "feature": "On-demand Inference",
+        "inferenceType": "Input tokens",
+        "model": "Claude 3 Sonnet",
+        "provider": "Anthropic",
+        "regionCode": "us-east-1",
+        "servicename": "Amazon Bedrock"
+      }
+    },
+    "9466MFKTBJUDFPCU": {
+      "sku": "9466MFKTBJUDFPCU",
+      "productFamily": "Amazon Bedrock",
+      "attributes": {
+        "servicecode": "AmazonBedrock",
+        "location": "US West (Oregon)",
+        "locationType": "AWS Region",
+        "usagetype": "USW2-Claude3Sonnet-input-tokens",
+        "operation": "",
+        "feature": "On-demand Inference",
+        "inferenceType": "Input tokens",
+        "model": "Claude 3 Sonnet",
+        "provider": "Anthropic",
+        "regionCode": "us-west-2",
+        "servicename": "Amazon Bedrock"
+      }
+    },
+    "TVXDZHHJWJ5B7JSS": {
+      "sku": "TVXDZHHJWJ5B7JSS",
+      "productFamily": "Amazon Bedrock",
+      "attributes": {
+        "servicecode": "AmazonBedrock",
+        "location": "US East (N. Virginia)",
+        "locationType": "AWS Region",
+        "usagetype": "USE1-Llama3-8B-input-tokens",
+        "operation": "",
+        "feature": "On-demand Inference",
+        "inferenceType": "Input tokens",
+        "model": "Llama 3 8B",
+        "provider": "Meta",
+        "regionCode": "us-east-1",
+        "servicename": "Amazon Bedrock"
+      }
+    },
+    "9KCAYBRC34FDC2RF": {
+      "sku": "9KCAYBRC34FDC2RF",
+      "productFamily": "Amazon Bedrock",
+      "attributes": {
+        "servicecode": "AmazonBedrock",
+        "location": "US East (N. Virginia)",
+        "locationType": "AWS Region",
+        "usagetype": "USE1-Llama3-8B-output-tokens",
+        "operation": "",
+        "feature": "On-demand Inference",
+        "inferenceType": "Output tokens",
+        "model": "Llama 3 8B",
+        "provider": "Meta",
+        "regionCode": "us-east-1",
+        "servicename": "Amazon Bedrock"
+      }
+    },
+    "TPXFZ3Q6ECMJRV4S": {
+      "sku": "TPXFZ3Q6ECMJRV4S",
+      "productFamily": "Amazon Bedrock",
+      "attributes": {
+        "servicecode": "AmazonBedrock",
+        "location": "US West (Oregon)",
+        "locationType": "AWS Region",
+        "usagetype": "USW2-Llama3-8B-input-tokens",
+        "operation": "",
+        "feature": "On-demand Inference",
+        "inferenceType": "Input tokens",
+        "model": "Llama 3 8B",
+        "provider": "Meta",
+        "regionCode": "us-west-2",
+        "servicename": "Amazon Bedrock"
+      }
+    },
+    "5F5EAD5FCEEFP6M6": {
+      "sku": "5F5EAD5FCEEFP6M6",
+      "productFamily": "Amazon Bedrock",
+      "attributes": {
+        "servicecode": "AmazonBedrock",
+        "location": "US West (Oregon)",
+        "locationType": "AWS Region",
+        "usagetype": "USW2-Llama3-8B-output-tokens",
+        "operation": "",
+        "feature": "On-demand Inference",
+        "inferenceType": "Output tokens",
+        "model": "Llama 3 8B",
+        "provider": "Meta",
+        "regionCode": "us-west-2",
+        "servicename": "Amazon Bedrock"
+      }
+    }
+  },
+  "terms": {
+    "OnDemand": {
+      "ZEJSXGT973DYB7JF": {
+        "ZEJSXGT973DYB7JF.JRTCKXETXF": {
+          "offerTermCode": "JRTCKXETXF",
+          "sku": "ZEJSXGT973DYB7JF",
+          "effectiveDate": "2026-07-01T00:00:00Z",
+          "priceDimensions": {
+            "ZEJSXGT973DYB7JF.JRTCKXETXF.6YS6EN2CT7": {
+              "rateCode": "ZEJSXGT973DYB7JF.JRTCKXETXF.6YS6EN2CT7",
+              "description": "$0.00300 per 1K tokens for Claude3Sonnet-input-tokens inUS East (N. Virginia)",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "1K tokens",
+              "pricePerUnit": {
+                "USD": "0.0030000000"
+              },
+              "appliesTo": []
+            }
+          },
+          "termAttributes": {}
+        }
+      },
+      "9466MFKTBJUDFPCU": {
+        "9466MFKTBJUDFPCU.JRTCKXETXF": {
+          "offerTermCode": "JRTCKXETXF",
+          "sku": "9466MFKTBJUDFPCU",
+          "effectiveDate": "2026-07-01T00:00:00Z",
+          "priceDimensions": {
+            "9466MFKTBJUDFPCU.JRTCKXETXF.6YS6EN2CT7": {
+              "rateCode": "9466MFKTBJUDFPCU.JRTCKXETXF.6YS6EN2CT7",
+              "description": "$0.00300 per 1K tokens for Claude3Sonnet-input-tokens inUS West (Oregon)",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "1K tokens",
+              "pricePerUnit": {
+                "USD": "0.0030000000"
+              },
+              "appliesTo": []
+            }
+          },
+          "termAttributes": {}
+        }
+      },
+      "TVXDZHHJWJ5B7JSS": {
+        "TVXDZHHJWJ5B7JSS.JRTCKXETXF": {
+          "offerTermCode": "JRTCKXETXF",
+          "sku": "TVXDZHHJWJ5B7JSS",
+          "effectiveDate": "2026-07-01T00:00:00Z",
+          "priceDimensions": {
+            "TVXDZHHJWJ5B7JSS.JRTCKXETXF.6YS6EN2CT7": {
+              "rateCode": "TVXDZHHJWJ5B7JSS.JRTCKXETXF.6YS6EN2CT7",
+              "description": "$0.0003 per 1K input tokens for Llama 3 8B in US East (N. Virginia)",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "1K tokens",
+              "pricePerUnit": {
+                "USD": "0.0003000000"
+              },
+              "appliesTo": []
+            }
+          },
+          "termAttributes": {}
+        }
+      },
+      "9KCAYBRC34FDC2RF": {
+        "9KCAYBRC34FDC2RF.JRTCKXETXF": {
+          "offerTermCode": "JRTCKXETXF",
+          "sku": "9KCAYBRC34FDC2RF",
+          "effectiveDate": "2026-07-01T00:00:00Z",
+          "priceDimensions": {
+            "9KCAYBRC34FDC2RF.JRTCKXETXF.6YS6EN2CT7": {
+              "rateCode": "9KCAYBRC34FDC2RF.JRTCKXETXF.6YS6EN2CT7",
+              "description": ".0006 per 1K output tokens for Llama 3 8B in US East (N. Virginia)",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "1K tokens",
+              "pricePerUnit": {
+                "USD": "0.0006000000"
+              },
+              "appliesTo": []
+            }
+          },
+          "termAttributes": {}
+        }
+      },
+      "TPXFZ3Q6ECMJRV4S": {
+        "TPXFZ3Q6ECMJRV4S.JRTCKXETXF": {
+          "offerTermCode": "JRTCKXETXF",
+          "sku": "TPXFZ3Q6ECMJRV4S",
+          "effectiveDate": "2026-07-01T00:00:00Z",
+          "priceDimensions": {
+            "TPXFZ3Q6ECMJRV4S.JRTCKXETXF.6YS6EN2CT7": {
+              "rateCode": "TPXFZ3Q6ECMJRV4S.JRTCKXETXF.6YS6EN2CT7",
+              "description": "$0.0003 per 1K input tokens for Llama 3 8B in US West (Oregon)",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "1K tokens",
+              "pricePerUnit": {
+                "USD": "0.0003000000"
+              },
+              "appliesTo": []
+            }
+          },
+          "termAttributes": {}
+        }
+      },
+      "5F5EAD5FCEEFP6M6": {
+        "5F5EAD5FCEEFP6M6.JRTCKXETXF": {
+          "offerTermCode": "JRTCKXETXF",
+          "sku": "5F5EAD5FCEEFP6M6",
+          "effectiveDate": "2026-07-01T00:00:00Z",
+          "priceDimensions": {
+            "5F5EAD5FCEEFP6M6.JRTCKXETXF.6YS6EN2CT7": {
+              "rateCode": "5F5EAD5FCEEFP6M6.JRTCKXETXF.6YS6EN2CT7",
+              "description": ".0006 per 1K output tokens for Llama 3 8B in US West (Oregon)",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "1K tokens",
+              "pricePerUnit": {
+                "USD": "0.0006000000"
+              },
+              "appliesTo": []
+            }
+          },
+          "termAttributes": {}
+        }
+      }
+    }
+  }
+}

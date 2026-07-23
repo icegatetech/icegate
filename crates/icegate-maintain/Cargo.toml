@@ -32,6 +32,15 @@ object_store = { workspace = true }
 # URL parsing: reduce Iceberg's absolute file URIs to bucket-relative object keys
 url = { workspace = true }
 
+# HTTP: the pricing crawler fetches rate cards from upstream JSON endpoints.
+# `stream` enables `bytes_stream()`, used to enforce the response size cap
+# before buffering rather than after.
+reqwest = { workspace = true, features = ["stream"] }
+# Named directly (not just pulled in transitively via reqwest) so the response-cap
+# helper can be typed over `bytes::Bytes` and exercised with a synthetic stream in
+# unit tests, without a network round trip.
+bytes = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 
@@ -49,6 +58,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
+
+# Pattern matching: the LiteLLM source detects context-tier fields by name
+# (`input_cost_per_token_above_<N>k_tokens`) since the boundary is dynamic.
+regex = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

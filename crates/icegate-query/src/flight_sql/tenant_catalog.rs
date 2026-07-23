@@ -60,6 +60,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
+use icegate_common::GLOBAL_TABLES;
 use icegate_common::schema::COL_TENANT_ID;
 
 /// `CatalogProvider` decorator that returns tenant-scoped schemas.
@@ -128,6 +129,15 @@ impl SchemaProvider for TenantScopedSchemaProvider {
         let Some(inner) = self.inner.table(name).await? else {
             return Ok(None);
         };
+        // Global reference tables carry no `tenant_id` by design and hold
+        // identical rows for every tenant, so there is nothing to scope. This is
+        // an explicit allowlist and never an inferred "has no tenant_id, so skip
+        // wrapping" rule — the inferred form would make any future table that
+        // forgets the column silently readable across tenants. Everything absent
+        // from the list still goes through the decorator, which fails closed.
+        if GLOBAL_TABLES.contains(&name) {
+            return Ok(Some(inner));
+        }
         let wrapped = TenantScopedTableProvider::new(inner, &self.tenant_id)?;
         Ok(Some(Arc::new(wrapped)))
     }
@@ -347,18 +357,21 @@ impl TableProvider for TenantScopedTableProvider {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use std::sync::Arc;
 
     use datafusion::arrow::array::{Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::catalog::TableProvider;
+    use datafusion::catalog::{MemorySchemaProvider, SchemaProvider, TableProvider};
     use datafusion::datasource::MemTable;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
     use icegate_common::schema::COL_TENANT_ID;
+    use icegate_common::{GLOBAL_TABLES, LOGS_TABLE, PRICES_TABLE};
 
-    use super::TenantScopedTableProvider;
+    use super::{TenantScopedSchemaProvider, TenantScopedTableProvider};
 
     /// Build a `MemTable` holding rows for two tenants.
     ///
@@ -432,5 +445,58 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(StringArray::from(vec![Some("x")]))]).unwrap();
         let inner: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
         assert!(TenantScopedTableProvider::new(inner, "tenant-a").is_err());
+    }
+
+    /// A table with the given columns and no rows.
+    fn empty_table(columns: &[&str]) -> Arc<MemTable> {
+        let fields: Vec<Field> = columns.iter().map(|c| Field::new(*c, DataType::Utf8, true)).collect();
+        let schema = Arc::new(Schema::new(fields));
+        Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())
+    }
+
+    fn provider_with(name: &str, columns: &[&str]) -> TenantScopedSchemaProvider {
+        let inner = MemorySchemaProvider::new();
+        inner.register_table(name.to_string(), empty_table(columns)).unwrap();
+        TenantScopedSchemaProvider {
+            inner: Arc::new(inner),
+            tenant_id: Arc::from("tenant-alpha"),
+        }
+    }
+
+    #[test]
+    fn prices_is_on_the_global_allowlist() {
+        assert!(GLOBAL_TABLES.contains(&PRICES_TABLE));
+        assert!(!GLOBAL_TABLES.contains(&LOGS_TABLE));
+    }
+
+    #[tokio::test]
+    async fn global_table_passes_through_unwrapped() {
+        // `prices` has no tenant_id and must still resolve — its schema is
+        // returned intact, not stripped of a column it never had.
+        let provider = provider_with(PRICES_TABLE, &["provider", "model"]);
+        let table = provider.table(PRICES_TABLE).await.unwrap().expect("prices resolves");
+        assert_eq!(table.schema().fields().len(), 2);
+        assert!(table.schema().field_with_name("provider").is_ok());
+    }
+
+    #[tokio::test]
+    async fn tenant_table_is_wrapped_and_hides_tenant_id() {
+        let provider = provider_with(LOGS_TABLE, &["tenant_id", "body"]);
+        let table = provider.table(LOGS_TABLE).await.unwrap().expect("logs resolves");
+        // The decorator projects tenant_id back out of the advertised schema.
+        assert_eq!(table.schema().fields().len(), 1);
+        assert!(table.schema().field_with_name("tenant_id").is_err());
+    }
+
+    #[tokio::test]
+    async fn non_allowlisted_table_without_tenant_id_still_fails_closed() {
+        // The regression that matters: a future table that forgets tenant_id
+        // must error, not silently become readable by every tenant.
+        let provider = provider_with("some_new_table", &["a", "b"]);
+        let result = provider.table("some_new_table").await;
+        assert!(
+            result.is_err(),
+            "a tenant-less table off the allowlist must not resolve"
+        );
     }
 }
