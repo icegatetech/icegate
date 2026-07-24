@@ -47,6 +47,15 @@ pub struct CompactMetrics {
     ratio: Histogram<f64>,
     /// Rewrites abandoned because an input vanished before commit.
     commit_aborted: Counter<u64>,
+    /// Manifest-rewrite commits (one per repacked manifest group).
+    manifest_compacted: Counter<u64>,
+    /// Input manifests consumed by committed manifest rewrites.
+    manifest_in: Counter<u64>,
+    /// Output manifests produced by committed manifest rewrites.
+    manifest_out: Counter<u64>,
+    /// Manifest-rewrite runs that hit a no-op gate (too few candidates or no
+    /// count reduction) and committed nothing.
+    manifest_skipped: Counter<u64>,
 }
 
 impl CompactMetrics {
@@ -100,6 +109,22 @@ impl CompactMetrics {
             .u64_counter("compaction.commit.aborted")
             .with_description("Rewrites abandoned because an input vanished before commit")
             .build();
+        let manifest_compacted = meter
+            .u64_counter("compaction.manifest.compacted")
+            .with_description("Manifest-rewrite commits (one per repacked manifest group)")
+            .build();
+        let manifest_in = meter
+            .u64_counter("compaction.manifest.in")
+            .with_description("Input manifests consumed by committed manifest rewrites")
+            .build();
+        let manifest_out = meter
+            .u64_counter("compaction.manifest.out")
+            .with_description("Output manifests produced by committed manifest rewrites")
+            .build();
+        let manifest_skipped = meter
+            .u64_counter("compaction.manifest.skipped")
+            .with_description("Manifest-rewrite runs that hit a no-op gate and committed nothing")
+            .build();
 
         Self {
             partitions_compacted,
@@ -112,6 +137,10 @@ impl CompactMetrics {
             bytes_out,
             ratio,
             commit_aborted,
+            manifest_compacted,
+            manifest_in,
+            manifest_out,
+            manifest_skipped,
         }
     }
 
@@ -159,6 +188,21 @@ impl CompactMetrics {
     pub fn record_commit_aborted(&self, table: &str) {
         self.commit_aborted.add(1, &Self::table_attrs(table));
     }
+
+    /// Record a committed manifest rewrite: `input_manifests` manifests repacked
+    /// into `output_manifests` manifests (one commit).
+    pub fn record_manifest_compacted(&self, table: &str, input_manifests: u64, output_manifests: u64) {
+        let attrs = Self::table_attrs(table);
+        self.manifest_compacted.add(1, &attrs);
+        self.manifest_in.add(input_manifests, &attrs);
+        self.manifest_out.add(output_manifests, &attrs);
+    }
+
+    /// Record one manifest-rewrite run that hit a no-op gate (too few candidates
+    /// or no count reduction) and committed nothing.
+    pub fn record_manifest_skipped(&self, table: &str) {
+        self.manifest_skipped.add(1, &Self::table_attrs(table));
+    }
 }
 
 impl Default for CompactMetrics {
@@ -180,5 +224,7 @@ mod tests {
         metrics.record_plan("logs", 3, 2, 1);
         metrics.record_rewrite_committed("logs", 4, 1, 100, 4096, 1024);
         metrics.record_commit_aborted("logs");
+        metrics.record_manifest_compacted("logs", 5, 1);
+        metrics.record_manifest_skipped("logs");
     }
 }

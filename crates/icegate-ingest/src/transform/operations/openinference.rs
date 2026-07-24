@@ -29,7 +29,7 @@ impl OperationConvention for OpenInference {
         }
     }
 
-    fn classify_operation(&self, attrs: &AttributeView) -> Option<String> {
+    fn classify_operation(&self, _span_name: &str, attrs: &AttributeView) -> Option<String> {
         let kind = extract_string_value(attrs.get("openinference.span.kind"))?;
         // Normalization map per spec section 4. PROMPT and any unrecognized kind
         // collapse to "other" via the catch-all.
@@ -67,7 +67,7 @@ mod tests {
     fn classify(kind: &str) -> Option<String> {
         let attrs = vec![kv_str("openinference.span.kind", kind)];
         let view = AttributeView::new(&attrs);
-        OpenInference.classify_operation(&view)
+        OpenInference.classify_operation("op", &view)
     }
 
     #[test]
@@ -125,6 +125,6 @@ mod tests {
     fn classify_is_none_without_span_kind() {
         let attrs = vec![kv_str("llm.system", "openai")];
         let view = AttributeView::new(&attrs);
-        assert_eq!(OpenInference.classify_operation(&view), None);
+        assert_eq!(OpenInference.classify_operation("op", &view), None);
     }
 }

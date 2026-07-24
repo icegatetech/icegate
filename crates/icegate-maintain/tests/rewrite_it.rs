@@ -1,10 +1,10 @@
 //! Integration test for the compaction REWRITE executor
-//! ([`RewriteExecutor`]) against the object store.
+//! ([`CompactFilesExecutor`]) against the object store.
 //!
 //! Seeds a `logs` table with several small data files in ONE `(tenant, day)`
 //! partition, each internally sorted by the logs sort order `(service_name ASC,
 //! timestamp DESC)`, and commits them in a single `fast_append` so they share
-//! one snapshot. A [`RewriteExecutor`] built for `logs` then runs one
+//! one snapshot. A [`CompactFilesExecutor`] built for `logs` then runs one
 //! [`RewriteInput`] listing those files (base = the table's current `main`
 //! snapshot id) and the test asserts:
 //!
@@ -50,8 +50,8 @@ use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS};
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
+use icegate_maintain::compact::data::rewrite::{CompactFilesExecutor, RewriteInput, RewriteOutcome};
 use icegate_maintain::compact::metrics::CompactMetrics;
-use icegate_maintain::compact::rewrite::{RewriteExecutor, RewriteInput, RewriteOutcome};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
@@ -338,7 +338,7 @@ async fn rewrite_executor_compacts_partition_preserving_rows_and_order() {
     // The executor commits over `dyn Catalog`; coerce the concrete S3 catalog
     // used for seeding into the generic trait object.
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let executor = RewriteExecutor::new(dyn_catalog, write_cfg, descriptor, CompactMetrics::new());
+    let executor = CompactFilesExecutor::new(dyn_catalog, write_cfg, descriptor, CompactMetrics::new());
 
     let rewrite_input = RewriteInput {
         table: TABLE.to_string(),
@@ -461,7 +461,7 @@ async fn rewrite_carries_wal_offset_property_forward() {
         column_encodings: LOGS_COLUMN_ENCODINGS,
     };
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let executor = RewriteExecutor::new(dyn_catalog, write_cfg, descriptor, CompactMetrics::new());
+    let executor = CompactFilesExecutor::new(dyn_catalog, write_cfg, descriptor, CompactMetrics::new());
     let rewrite_input = RewriteInput {
         table: TABLE.to_string(),
         partition_key,

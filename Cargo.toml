@@ -78,16 +78,15 @@ tikv-jemallocator = "0.6"
 # ANTLR parser
 antlr4rust = "0.5"
 
-# Sourced from the icegatetech/iceberg-rust fork (0.9.0 base + the `rewrite_files`
-# transaction action that compaction commits through a generic `dyn Catalog`).
+# Sourced from the icegatetech/iceberg-rust fork (0.9.0 base).
 # Pinned to an immutable rev (not a branch) for reproducible builds; bump the SHA
 # deliberately when adopting fork updates rather than letting `develop` float.
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
-iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
-iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
-iceberg-storage-opendal = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf", features = ["opendal-s3"] }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "27af5bd6d213dd775c99b36bf48dd4380e48c0bf" }
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
+iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
+iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
+iceberg-storage-opendal = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b", features = ["opendal-s3"] }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
 
 # DataFusion
 datafusion = "52.2"

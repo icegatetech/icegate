@@ -10,6 +10,7 @@ mod dynamic_task_test;
 mod job_iterations_test;
 mod shutdown_test;
 mod simple_job_test;
+mod task_attempt_limit_test;
 mod task_dependencies_test;
 mod task_failure_test;
 mod two_jobs_test;

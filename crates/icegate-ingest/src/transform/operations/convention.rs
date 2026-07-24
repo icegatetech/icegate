@@ -2,6 +2,7 @@
 
 use std::sync::OnceLock;
 
+use super::claude_code::ClaudeCode;
 use super::openinference::OpenInference;
 use super::otel::OtelGenAi;
 use super::projection::{AttributeView, OperationField};
@@ -18,19 +19,58 @@ pub(crate) trait OperationConvention: Send + Sync {
     /// the union of every adapter's markers.
     fn marker_keys(&self) -> &'static [&'static str];
 
+    /// Span-name prefixes that qualify a span for this convention even when no
+    /// marker attribute is present. Name-based SDKs (e.g. Claude Code, whose
+    /// non-LLM spans carry no `gen_ai.*` marker) opt in here; attribute-marker
+    /// conventions inherit the empty default. Kept separate from
+    /// [`Self::marker_keys`] so name-based qualification does not widen the
+    /// attribute-marker union filter.
+    fn name_prefixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Ordered candidate attribute keys this convention offers for `field`
     /// (most-specific first). Empty slice when this convention does not source
     /// the field.
     fn field_keys(&self, field: OperationField) -> &'static [&'static str];
 
-    /// Classifies this convention's span-kind into a canonical `operation_name`,
-    /// or `None` when this convention cannot decide (the next adapter then tries).
-    fn classify_operation(&self, attrs: &AttributeView) -> Option<String>;
+    /// Attribute keys this convention assembles into a JSON object for a content
+    /// `field`, keyed by attribute name — used when the field is a set of flat
+    /// attributes rather than a single value (e.g. a tool call's flat input
+    /// arguments). Resolved after the scalar [`Self::field_keys`] and before
+    /// event objects ([`Self::event_field_names`]). Default: none.
+    fn object_field_keys(&self, _field: OperationField) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Span *event* names whose full attribute set this convention projects into
+    /// `field` as a single JSON object keyed by attribute name — used when a
+    /// field's value lives in a span event rather than an attribute (e.g. a tool
+    /// result). Attribute sources ([`Self::field_keys`]) are resolved first and
+    /// win. Default: no event-sourced fields.
+    fn event_field_names(&self, _field: OperationField) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// `(attribute_key, role)` sources this convention wraps into a single-message
+    /// JSON array `[{"role": role, "content": <value>}]` for a message content
+    /// `field` — used when an SDK emits a bare prompt/response string rather than
+    /// a structured messages array (the shape conversation UIs parse). Resolved
+    /// after the scalar, object, and event modes. Default: none.
+    fn message_field_keys(&self, _field: OperationField) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// Classifies a span into a canonical `operation_name` from its `span_name`
+    /// and attributes, or `None` when this convention cannot decide (the next
+    /// adapter then tries). `span_name` is the OTLP span name, letting name-based
+    /// conventions classify by exact name or prefix.
+    fn classify_operation(&self, span_name: &str, attrs: &AttributeView) -> Option<String>;
 }
 
 /// Precedence-ordered convention registry: earlier wins on shared keys. This
 /// slice is the whole extension surface — append an adapter to add an SDK.
-pub(crate) static CONVENTIONS: &[&dyn OperationConvention] = &[&OtelGenAi, &OpenInference, &Traceloop];
+pub(crate) static CONVENTIONS: &[&dyn OperationConvention] = &[&OtelGenAi, &OpenInference, &Traceloop, &ClaudeCode];
 
 /// Flattens every convention's `field_keys(field)` into a single
 /// precedence-ordered vector, preserving registry order. Pulled out as a free
@@ -173,7 +213,7 @@ mod tests {
             }
         }
 
-        fn classify_operation(&self, _attrs: &AttributeView) -> Option<String> {
+        fn classify_operation(&self, _span_name: &str, _attrs: &AttributeView) -> Option<String> {
             None
         }
     }
@@ -194,7 +234,7 @@ mod tests {
             }
         }
 
-        fn classify_operation(&self, _attrs: &AttributeView) -> Option<String> {
+        fn classify_operation(&self, _span_name: &str, _attrs: &AttributeView) -> Option<String> {
             None
         }
     }
@@ -260,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn input_tokens_precedence_is_otel_then_oi_then_traceloop() {
+    fn input_tokens_precedence_is_otel_then_oi_then_traceloop_then_claude_code() {
         let keys: Vec<&str> = field_precedence(OperationField::InputTokens)
             .expect("precedence available")
             .to_vec();
@@ -269,7 +309,8 @@ mod tests {
             vec![
                 "gen_ai.usage.input_tokens",
                 "llm.token_count.prompt",
-                "gen_ai.usage.prompt_tokens"
+                "gen_ai.usage.prompt_tokens",
+                "input_tokens"
             ]
         );
     }

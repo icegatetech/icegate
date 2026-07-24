@@ -8,10 +8,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
+use crate::core::job::TaskPickup;
 use crate::execution::job_manager::JobManagerImpl;
 use crate::{
-    InternalError, Job, JobCode, JobError, JobRegistry, Metrics, Retrier, RetrierConfig, Storage, StorageError,
-    TaskCode,
+    InternalError, Job, JobCode, JobError, JobRegistry, JobStatus, Metrics, Retrier, RetrierConfig, Storage,
+    StorageError, TaskCode,
 };
 // TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
 // Can be done via storage wrapper.
@@ -373,9 +374,15 @@ impl Worker {
         cancel_token: &CancellationToken,
     ) -> Result<bool, InternalError> {
         // TODO(low): think about what to do here, likely we have invalid job state
-        let Some(task_id) = job.pick_task_to_execute(&self.id)? else {
-            debug!("Tasks for job {} not found", job.code());
-            return Ok(false);
+        let task_id = match job.pick_task_to_execute(&self.id)? {
+            TaskPickup::Ready(task_id) => task_id,
+            TaskPickup::Waiting => {
+                debug!("Tasks for job {} not found", job.code());
+                return Ok(false);
+            }
+            TaskPickup::Exhausted => {
+                return self.save_failed_iteration(job, cancel_token).await;
+            }
         };
         let task_code = job.get_task(&task_id)?.code().clone();
         let job_code = job.code().clone();
@@ -698,10 +705,43 @@ impl Worker {
         Ok(job)
     }
 
+    /// Persist an iteration that cannot progress because tasks spent their
+    /// attempt budget.
+    ///
+    /// [`Job::pick_task_to_execute`] has already moved the job to `Failed`;
+    /// saving that state is what lets the scheduler start the next iteration,
+    /// which replans from scratch. A concurrent modification means another
+    /// worker advanced the job, so this worker drops its verdict and re-derives
+    /// it on the next poll.
+    async fn save_failed_iteration(&self, job: Job, cancel_token: &CancellationToken) -> Result<bool, InternalError> {
+        error!(
+            "Job {} iteration {} failed - tasks exhausted their attempts ({})",
+            job.code(),
+            job.iter_num(),
+            job.tasks_as_string()
+        );
+
+        let (job, outcome) = self
+            .save_job_state(job, cancel_token, |ctx| {
+                debug!("Job has concurrent modification when failing iteration - skip");
+                Ok(MergeDecision::Done(ctx.saved_job, SaveOutcome::Skipped))
+            })
+            .await?;
+
+        if outcome == SaveOutcome::Saved {
+            self.record_job_iteration(&job, &JobStatus::Failed);
+        }
+
+        Ok(true)
+    }
+
     fn job_completed(&self, job: &Job) {
         info!("Job {} completed (iter: {})", job.code(), job.iter_num());
+        self.record_job_iteration(job, &JobStatus::Completed);
+    }
 
-        // Calculate duration
+    /// Record the duration of a finished job iteration under its final `status`.
+    fn record_job_iteration(&self, job: &Job, status: &JobStatus) {
         let duration = job.completed_at().map_or_else(
             || Duration::from_secs(0),
             |completed| {
@@ -712,8 +752,7 @@ impl Worker {
             },
         );
 
-        self.metrics
-            .record_job_iteration_complete(job.code(), &crate::JobStatus::Completed, duration);
+        self.metrics.record_job_iteration_complete(job.code(), status, duration);
     }
 
     fn update_cache(&self, job_code: JobCode, version: String, exhausted: bool) {

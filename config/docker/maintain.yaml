@@ -21,13 +21,16 @@ storage:
 # Compaction config for the long-running `compact` service (`maintain run`).
 # Ignored by the one-shot `migrate create` command, which shares this file.
 compaction:
-  # Lowered from the default 4 so the small demo dataset triggers rewrites.
-  min_input_files: 2
+  # Per-table toggles, shared by data and manifest compaction.
   logs_enabled: true
   spans_enabled: true
   events_enabled: true
   metrics_enabled: true
   operations_enabled: true
+  # Data compaction: rewrites small Parquet files into fewer, larger ones.
+  data:
+    # Lowered from the default 4 so the small demo dataset triggers rewrites.
+    min_input_files: 2
   # Jobs-manager settings, nested to mirror ingest's `shift.jobsmanager`.
   jobsmanager:
     # Shorter discovery loop than the 300s default so the demo stack compacts

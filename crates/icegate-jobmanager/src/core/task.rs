@@ -61,14 +61,21 @@ impl std::fmt::Display for TaskStatus {
     }
 }
 
+/// Number of execution attempts a task gets before it is terminally failed.
+///
+/// Sized for transient failures (a flaky object-store call, a lost worker): five
+/// attempts absorb those, while a task failing deterministically stops retrying
+/// instead of blocking its dependents and the job's next iteration forever.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+
 /// Definition of a task to be executed.
 #[derive(Debug, Clone)]
 pub struct TaskDefinition {
-    // TODO(med): add maximum number of failed execution attempts
     code: TaskCode,
     input: Vec<u8>,
     timeout: Duration,
     depends_on: Vec<Uuid>,
+    max_attempts: u32,
 }
 
 impl TaskDefinition {
@@ -81,6 +88,7 @@ impl TaskDefinition {
             input,
             timeout,
             depends_on: Vec::new(),
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
         })
     }
 
@@ -108,6 +116,26 @@ impl TaskDefinition {
     pub fn depends_on(&self) -> &[Uuid] {
         &self.depends_on
     }
+
+    /// Caps how many times the task may be started before it is terminally
+    /// failed and never picked up again. Defaults to [`DEFAULT_MAX_ATTEMPTS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] if `max_attempts` is zero (a task must get at
+    /// least one attempt).
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Result<Self, Error> {
+        if max_attempts == 0 {
+            return Err(Error::Other("task max attempts must be positive".into()));
+        }
+        self.max_attempts = max_attempts;
+        Ok(self)
+    }
+
+    /// Returns the execution attempt budget.
+    pub const fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
 }
 
 /// Read-only view of a task for workers and clients.
@@ -122,6 +150,7 @@ pub trait ImmutableTask: Send + Sync {
     fn is_completed(&self) -> bool;
     fn is_failed(&self) -> bool;
     fn attempts(&self) -> u32;
+    fn max_attempts(&self) -> u32;
 }
 
 // Task - internal task representation
@@ -137,6 +166,7 @@ pub(crate) struct Task {
     completed_at: Option<DateTime<Utc>>,
     deadline_at: Option<DateTime<Utc>>,
     attempt: u32,
+    max_attempts: u32,
     input: Vec<u8>,
     output: Vec<u8>,
     error_msg: String,
@@ -161,6 +191,7 @@ impl Task {
             completed_at: None,
             deadline_at: None,
             attempt: 0,
+            max_attempts: task_def.max_attempts(),
             input: task_def.input().to_vec(),
             output: Vec::new(),
             error_msg: String::new(),
@@ -180,6 +211,7 @@ impl Task {
         completed_at: Option<DateTime<Utc>>,
         deadline_at: Option<DateTime<Utc>>,
         attempt: u32,
+        max_attempts: u32,
         input: Vec<u8>,
         output: Vec<u8>,
         error_msg: String,
@@ -196,6 +228,7 @@ impl Task {
             completed_at,
             deadline_at,
             attempt,
+            max_attempts,
             input,
             output,
             error_msg,
@@ -230,6 +263,10 @@ impl Task {
 
     pub(crate) const fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    pub(crate) const fn max_attempts(&self) -> u32 {
+        self.max_attempts
     }
 
     pub(crate) const fn started_at(&self) -> Option<DateTime<Utc>> {
@@ -281,11 +318,19 @@ impl Task {
         self.is_completed() || self.is_failed()
     }
 
+    /// Whether the task failed and spent its whole attempt budget, so it will
+    /// never run again. Tasks blocked behind it can never be unblocked either,
+    /// which is what ends the job iteration (see `Job::pick_task_to_execute`).
+    pub(crate) const fn is_terminally_failed(&self) -> bool {
+        self.is_failed() && self.attempt >= self.max_attempts
+    }
+
     pub(crate) fn can_be_picked_up(&self) -> bool {
         match self.status {
-            TaskStatus::Todo | TaskStatus::Failed => true, // TODO(low): add limit on number of attempts
+            TaskStatus::Todo => true,
+            TaskStatus::Failed => !self.is_terminally_failed(),
             TaskStatus::Blocked | TaskStatus::Completed => false,
-            TaskStatus::Started => self.is_expired(),
+            TaskStatus::Started => self.is_expired() && self.attempt < self.max_attempts,
         }
     }
 
@@ -387,5 +432,9 @@ impl ImmutableTask for Task {
 
     fn attempts(&self) -> u32 {
         self.attempt()
+    }
+
+    fn max_attempts(&self) -> u32 {
+        self.max_attempts()
     }
 }

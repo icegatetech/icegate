@@ -537,37 +537,54 @@ maintain:
 
   ## Compaction tuning (maps to the binary's CompactionConfig).
   compaction:
-    ## Desired OUTPUT Parquet file size, in bytes (default: 128 MiB).
-    targetFileSizeBytes: 134217728
-    ## Hard cap on a rewrite group's summed INPUT bytes (bin-packing budget, default: 256 MiB).
-    maxGroupInputBytes: 268435456
-    ## Skip a partition with at most this many files and no sub-target tail.
-    minInputFiles: 4
-    ## Tolerated number of sub-target files when deciding to skip a partition.
-    maxSkippableTailFiles: 0
-    ## Largest-to-smallest size ratio allowed within one rewrite group. A file is
-    ## merged with a larger one only when it is at least 1/ratio of the group's
-    ## largest file, so a small file is not repeatedly re-read into a much larger
-    ## one. Smaller files merge with each other instead. The gate only applies
-    ## while the group's largest file is at or above targetFileSizeBytes; below
-    ## target, files merge regardless of skew. Must be at least 1 (0 is rejected
-    ## at startup).
-    maxMergeSizeRatio: 2
-    ## Deadline for a single rewrite task (merge + encode + commit), in seconds.
-    ## Kept separate from jobsmanager.scanIntervalSecs so a long-running rewrite is
-    ## not declared expired and duplicated by another worker (default: 1 hour).
-    rewriteTimeoutSecs: 3600
-    ## Parquet row group size, in rows.
-    rowGroupSize: 20000
-    ## Maximum Parquet data page size, in bytes.
-    dataPageSizeLimitBytes: 2097152
-    ## Per-table compaction toggles.
+    ## Per-table compaction toggles. They govern BOTH compaction kinds: manifest
+    ## compaction repacks the manifests of the tables listed here.
     tables:
       logs: true
       spans: true
       events: true
       metrics: true
       operations: true
+    ## Data compaction: rewrites small Parquet data files into fewer, larger ones.
+    data:
+      ## Desired OUTPUT Parquet file size, in bytes (default: 128 MiB).
+      targetFileSizeBytes: 134217728
+      ## Hard cap on a rewrite group's summed INPUT bytes (bin-packing budget, default: 256 MiB).
+      maxGroupInputBytes: 268435456
+      ## Skip a partition with at most this many files and no sub-target tail.
+      minInputFiles: 4
+      ## Tolerated number of sub-target files when deciding to skip a partition.
+      maxSkippableTailFiles: 0
+      ## Largest-to-smallest size ratio allowed within one rewrite group. A file is
+      ## merged with a larger one only when it is at least 1/ratio of the group's
+      ## largest file, so a small file is not repeatedly re-read into a much larger
+      ## one. Smaller files merge with each other instead. The gate only applies
+      ## while the group's largest file is at or above targetFileSizeBytes; below
+      ## target, files merge regardless of skew. Must be at least 1 (0 is rejected
+      ## at startup).
+      maxMergeSizeRatio: 2
+      ## Deadline for a single rewrite task (merge + encode + commit), in seconds.
+      ## Kept separate from jobsmanager.scanIntervalSecs so a long-running rewrite is
+      ## not declared expired and duplicated by another worker (default: 1 hour).
+      rewriteTimeoutSecs: 3600
+      ## Parquet row group size, in rows.
+      rowGroupSize: 20000
+      ## Maximum Parquet data page size, in bytes.
+      dataPageSizeLimitBytes: 2097152
+    ## Manifest compaction: repacks the small DATA manifests of the current
+    ## snapshot into fewer, larger ones. Each shift commit adds one manifest, so
+    ## without this the query planner opens ever more objects per scan.
+    manifest:
+      ## Target byte size of each OUTPUT manifest (packing target, default: 8 MiB).
+      targetSizeBytes: 8388608
+      ## Fraction of targetSizeBytes below which a manifest is a repack candidate;
+      ## anything at or above it is already large enough. Must be in (0.0, 1.0].
+      candidateSizeRatio: 0.75
+      ## Upper bound on input manifests repacked per commit, keeping a commit
+      ## incremental. Must be at least 2.
+      maxManifestsPerCommit: 64
+      ## Deadline for a single manifest-repack task (repack + commit), in seconds.
+      rewriteTimeoutSecs: 600
     ## Jobs-manager settings, nested to mirror ingest's shift.jobsmanager.
     jobsmanager:
       ## Period of the discovery loop, in seconds.
