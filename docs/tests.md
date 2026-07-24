@@ -240,15 +240,13 @@ Before completing a code change, verify:
 - tests are deterministic, isolated, and safe under normal parallel execution;
 - all applicable feature combinations were tested.
 
-Run the narrowest relevant test while developing, then the affected crate and workspace
-tests before completion:
+Run the narrowest relevant test while developing, then the affected crate before
+completion:
 
 ```bash
 cargo test -p <crate> <test_name>
 cargo test -p <crate>
-cargo test --workspace
 cargo test -p icegate-catalog-s3 --all-targets --features rest
-make ci
 ```
 
 The REST command is required when `icegate-catalog-s3` REST code or shared catalog behavior

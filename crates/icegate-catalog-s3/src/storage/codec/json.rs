@@ -126,9 +126,9 @@ impl JsonCatalogCodec {
                     TableMetadataLocation::new(record.metadata_location),
                 );
                 entry.mark_tombstoned();
-                Ok((TableId::from(record.table_id), entry))
+                (TableId::from(record.table_id), entry)
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
         CatalogRoot::new(namespaces, tables, tombstones).map_err(|error| Error::InvalidMetadata(error.to_string()))
     }

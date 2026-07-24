@@ -450,7 +450,13 @@ impl CatalogServerConfig {
     /// Returns [`CatalogServerConfigError::InvalidListenAddress`] when host and
     /// port do not form a socket address.
     pub fn listen_address(&self) -> Result<SocketAddr, CatalogServerConfigError> {
-        Ok(format!("{}:{}", self.http.host, self.http.port).parse()?)
+        let host = &self.http.host;
+        let authority = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{}", self.http.port) // ipv6
+        } else {
+            format!("{host}:{}", self.http.port) // ipv4
+        };
+        Ok(authority.parse()?)
     }
 
     /// Convert the file configuration into the validated REST API configuration.
@@ -688,6 +694,42 @@ s3:
 
         config.s3.warehouse = "/".to_string();
         assert_eq!(config.warehouse_uri().expect("warehouse uri"), "s3://catalog");
+    }
+
+    /// The host names the address family the server listens on, so every form a
+    /// `SocketAddr` can hold must reach the listener — including the bare `::`
+    /// that requests a dual-stack listener and would parse as neither host nor
+    /// port if its brackets were left to the operator.
+    #[cfg(feature = "rest")]
+    #[test]
+    fn listen_address_accepts_every_host_form_a_socket_address_can_hold() {
+        for (host, expected) in [
+            ("127.0.0.1", "127.0.0.1:8181"),
+            ("0.0.0.0", "0.0.0.0:8181"),
+            ("::", "[::]:8181"),
+            ("::1", "[::1]:8181"),
+            ("[::]", "[::]:8181"),
+        ] {
+            let mut config = server_config_with_bucket("catalog");
+            config.http.host = host.to_string();
+
+            assert_eq!(
+                config.listen_address().expect("listen address").to_string(),
+                expected,
+                "host {host:?}",
+            );
+        }
+
+        let mut config = server_config_with_bucket("catalog");
+        config.http.host = "catalog.internal".to_string();
+
+        assert!(
+            matches!(
+                config.listen_address(),
+                Err(CatalogServerConfigError::InvalidListenAddress(_))
+            ),
+            "a host that is not an address must not bracket its way into a listener",
+        );
     }
 
     /// Addressing is derived, not defaulted to a constant: AWS deprecated

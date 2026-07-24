@@ -26,18 +26,6 @@ server dependencies.
     └── {version:05}-{uuid}.json              # table metadata snapshot
 ```
 
-## Architecture
-
-```
-catalog (bin, feature `rest`)
-    └── cli
-            └── api
-                    └── services::S3Catalog (iceberg::Catalog)
-                            ├── domain
-                            └── storage
-                                    └── storage::codec
-```
-
 ### Layers and Responsibilities
 
 | Layer    | Path                                   | Responsibility                                                        |

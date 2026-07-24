@@ -22,10 +22,22 @@ pub(crate) enum ApiError {
 impl From<IcebergError> for ApiError {
     fn from(error: IcebergError) -> Self {
         match error.kind() {
-            ErrorKind::NamespaceNotFound => Self::NoSuchNamespace,
-            ErrorKind::TableNotFound => Self::NoSuchTable,
-            _ if error.retryable() => Self::CatalogStorageUnavailable,
-            _ => Self::Internal,
+            ErrorKind::NamespaceNotFound => {
+                tracing::debug!(%error, "Catalog namespace not found");
+                Self::NoSuchNamespace
+            }
+            ErrorKind::TableNotFound => {
+                tracing::debug!(%error, "Catalog table not found");
+                Self::NoSuchTable
+            }
+            _ if error.retryable() => {
+                tracing::warn!(%error, "Catalog storage is temporarily unavailable");
+                Self::CatalogStorageUnavailable
+            }
+            _ => {
+                tracing::error!(%error, "Catalog request failed");
+                Self::Internal
+            }
         }
     }
 }

@@ -625,10 +625,11 @@ impl CatalogRoot {
     }
 
     pub(crate) fn active_tables_in_namespace(&self, namespace: &NamespaceIdent) -> Vec<TableIdent> {
+        let namespace_key = NamespaceKey::from_ident(namespace);
         let mut tables = self
             .active_entries()
             .filter_map(|(key, _)| {
-                if key.namespace() != &NamespaceKey::from_ident(namespace) {
+                if key.namespace() != &namespace_key {
                     return None;
                 }
                 Some(key.to_table_ident())

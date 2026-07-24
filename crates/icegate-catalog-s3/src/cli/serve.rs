@@ -1,5 +1,6 @@
 //! `CatalogServer` lifecycle implementation.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -19,13 +20,7 @@ pub(crate) async fn run(
     let listener = tokio::net::TcpListener::bind(address).await.map_err(CliError::Bind)?;
     tracing::info!(%address, "Catalog REST server listening");
 
-    let shutdown = cancellation.clone();
-    tokio::spawn(async move {
-        if let Err(error) = wait_for_shutdown_signal().await {
-            tracing::error!(%error, "Catalog shutdown signal handler failed");
-        }
-        shutdown.cancel();
-    });
+    tokio::spawn(cancel_token_on_signal(wait_for_shutdown_signal(), cancellation.clone()));
 
     axum::serve(listener, router(catalog, api_config))
         .with_graceful_shutdown(async move {
@@ -34,6 +29,23 @@ pub(crate) async fn run(
         })
         .await
         .map_err(CliError::Server)
+}
+
+/// Cancel `cancellation` when `signal` reports that shutdown was actually requested.
+///
+/// A signal handler that cannot register leaves the token alone. Cancelling there
+/// would stop a server that is serving traffic and let `run` finish with `Ok(())`,
+/// so the process would exit `0` having answered nothing — an operator reading the
+/// exit code would see a clean shutdown. The server keeps serving instead, and
+/// SIGTERM still terminates the process through its default disposition.
+async fn cancel_token_on_signal<F>(signal: F, cancellation: CancellationToken)
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    match signal.await {
+        Ok(()) => cancellation.cancel(),
+        Err(error) => tracing::error!(%error, "Catalog shutdown signal handler failed; the server keeps serving"),
+    }
 }
 
 async fn wait_for_shutdown_signal() -> std::io::Result<()> {
@@ -106,6 +118,30 @@ mod tests {
         outcome
             .expect("cancelled server must stop within its shutdown budget")
             .expect("graceful shutdown must finish with Ok");
+    }
+
+    /// The token is the only thing that stops the server, so cancelling it is
+    /// reserved for a signal that actually fired. A handler that fails to
+    /// register would otherwise shut a healthy server down and let `run` report
+    /// `Ok`, exiting `0` for a process that served nothing. Driven with ready
+    /// futures because the production trigger is a process signal a test must
+    /// not raise.
+    #[tokio::test]
+    async fn a_failed_signal_handler_leaves_the_server_running() {
+        let cancellation = CancellationToken::new();
+
+        cancel_token_on_signal(
+            std::future::ready(Err(std::io::Error::other("signal registration failed"))),
+            cancellation.clone(),
+        )
+        .await;
+        assert!(
+            !cancellation.is_cancelled(),
+            "a failed signal handler must not stop a serving process"
+        );
+
+        cancel_token_on_signal(std::future::ready(Ok(())), cancellation.clone()).await;
+        assert!(cancellation.is_cancelled(), "a delivered signal must stop the server");
     }
 
     /// A port that is already owned must fail `run` instead of leaving a
