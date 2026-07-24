@@ -337,7 +337,7 @@ fn split_by_size<F: PlannableFile>(files: Vec<F>, cfg: &PlannerLimits) -> Vec<Ve
             }
             total = total.saturating_add(size);
         }
-        // TODO(closed-partition): when this partition is "closed" (its day is far
+        // TODO(med): when this partition is "closed" (its day is far
         // enough in the past that no further writes will land), bypass the size
         // gate so a final partition is fully compacted regardless of size
         // differences even when the largest file is over target. No closure

@@ -37,7 +37,7 @@ use arrow::record_batch::RecordBatch;
 use common::{BUCKET_NAME, StorageConn, build_s3_catalog, setup_object_store};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
-use iceberg::spec::{DataFile, DataFileFormat};
+use iceberg::spec::{DataFile, DataFileFormat, Datum, FieldSummary, ManifestContentType, Operation, PrimitiveType};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -48,21 +48,35 @@ use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use icegate_catalog_s3::S3Catalog;
-use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
+use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats, list_manifest_entries};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_maintain::compact::config::{CompactionConfig, CompactionJobsManagerConfig, JobsStorageConfig};
+use icegate_common::{WAL_OFFSET_PROPERTY, resolve_wal_offset};
+use icegate_maintain::compact::config::{
+    CompactionConfig, CompactionJobsManagerConfig, DataCompactionConfig, JobsStorageConfig, ManifestCompactionConfig,
+};
+use icegate_maintain::compact::manifest::rewrite::{
+    MANIFEST_REWRITE_MARKER_KEY, ManifestCompactExecutor, ManifestCompactInput, ManifestCompactOutcome,
+};
+use icegate_maintain::compact::metrics::CompactMetrics;
 use icegate_maintain::compact::{Compactor, CompactorHandle};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::properties::WriterProperties;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const NAMESPACE: &str = "icegate";
 const TABLE: &str = "logs";
 const TENANT: &str = "tenant-a";
-/// 2026-06-11T00:00:00Z in microseconds. Every seeded file shares this day so
-/// they all land in the same `(tenant_id, day)` partition.
-const DAY_MICROS: i64 = 1_749_600_000_000_000;
+/// Second tenant, used where a test needs more than one partition value.
+const OTHER_TENANT: &str = "tenant-b";
+/// The `timestamp_day` partition value of every seeded file: the day ordinal
+/// (days since the epoch) the Iceberg `day` transform stores. 20250 is
+/// 2025-06-11.
+const DAY_ORDINAL: i32 = 20_250;
+/// Midnight of [`DAY_ORDINAL`] in microseconds, so every seeded file lands in
+/// the same `(tenant_id, timestamp_day)` partition for its tenant.
+const DAY_MICROS: i64 = 20_250 * 86_400_000_000;
 /// Output Parquet target size (128 mebibytes): far larger than the tiny seeded
 /// data, so the rewrite collapses the partition into a single output file.
 const TARGET_FILE_SIZE_BYTES: u64 = 128 * 1024 * 1024;
@@ -95,17 +109,18 @@ async fn create_logs_table(catalog: &S3Catalog) -> TableIdent {
     TableIdent::new(NamespaceIdent::new(NAMESPACE.to_string()), TABLE.to_string())
 }
 
-/// Build one `logs` Arrow batch from `(service_name, timestamp_micros)` rows in
-/// the caller's order. The writer does not re-sort, so the caller must emit rows
-/// already in `(service_name ASC, timestamp DESC)` order to produce an
-/// internally sorted file. The `body` column is `msg-<unique>` so every row is
-/// globally distinguishable when comparing the set before vs after.
-fn logs_batch(rows: &[(&str, i64)], unique_offset: usize) -> RecordBatch {
+/// Build one `logs` Arrow batch for `tenant` from `(service_name,
+/// timestamp_micros)` rows in the caller's order. The writer does not re-sort,
+/// so the caller must emit rows already in `(service_name ASC, timestamp DESC)`
+/// order to produce an internally sorted file. The `body` column is
+/// `msg-<unique>` so every row is globally distinguishable when comparing the
+/// set before vs after.
+fn logs_batch(tenant_id: &str, rows: &[(&str, i64)], unique_offset: usize) -> RecordBatch {
     let iceberg_schema = logs_schema().unwrap();
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).unwrap());
     let n = rows.len();
 
-    let tenant = StringArray::from(vec![TENANT; n]);
+    let tenant = StringArray::from(vec![tenant_id; n]);
     let service_name = StringArray::from(rows.iter().map(|(s, _)| Some(*s)).collect::<Vec<_>>());
     let ts: Vec<i64> = rows.iter().map(|(_, t)| *t).collect();
     let trace_vals: Vec<[u8; 16]> = (0..n).map(|i| [u8::try_from((unique_offset + i) % 256).unwrap(); 16]).collect();
@@ -269,24 +284,35 @@ fn compaction_config(conn: &StorageConn) -> CompactionConfig {
     };
 
     CompactionConfig {
-        target_file_size_bytes: TARGET_FILE_SIZE_BYTES,
-        // Generous group budget so all six tiny files pack into one group.
-        max_group_input_bytes: TARGET_FILE_SIZE_BYTES,
-        // A 2-file partition is the healthy ceiling; six files is well past it,
-        // so the partition is always selected for rewrite.
-        min_input_files: 2,
-        max_skippable_tail_files: 0,
-        // Equal-size seed files, so the default 2x ratio keeps them in one group.
-        max_merge_size_ratio: 2,
-        // Generous rewrite deadline so the merge is never declared expired.
-        rewrite_timeout_secs: 600,
-        row_group_size: 20_000,
-        data_page_size_limit_bytes: 2 * 1024 * 1024,
         logs_enabled: true,
         spans_enabled: false,
         events_enabled: false,
         metrics_enabled: false,
         operations_enabled: false,
+        data: DataCompactionConfig {
+            target_file_size_bytes: TARGET_FILE_SIZE_BYTES,
+            // Generous group budget so all six tiny files pack into one group.
+            max_group_input_bytes: TARGET_FILE_SIZE_BYTES,
+            // A 2-file partition is the healthy ceiling; six files is well past it,
+            // so the partition is always selected for rewrite.
+            min_input_files: 2,
+            max_skippable_tail_files: 0,
+            // Equal-size seed files, so the default 2x ratio keeps them in one group.
+            max_merge_size_ratio: 2,
+            // Generous rewrite deadline so the merge is never declared expired.
+            rewrite_timeout_secs: 600,
+            row_group_size: 20_000,
+            data_page_size_limit_bytes: 2 * 1024 * 1024,
+        },
+        manifest: ManifestCompactionConfig {
+            // Manifest compaction runs for every enabled table; these are just its
+            // default tunables. The DATA-compaction test asserts only on data files,
+            // which manifest repacking never touches, so it stays deterministic.
+            target_size_bytes: 8 * 1024 * 1024,
+            candidate_size_ratio: 0.75,
+            max_manifests_per_commit: 64,
+            rewrite_timeout_secs: 600,
+        },
         jobsmanager: CompactionJobsManagerConfig {
             // Tight loop so the single iteration runs promptly.
             scan_interval_secs: 1,
@@ -369,7 +395,7 @@ async fn compactor_compacts_partition_end_to_end() {
     for rows in &files_rows {
         // Each file is committed in its own fast_append => its own snapshot.
         let table = catalog.load_table(&ident).await.unwrap();
-        let file = write_one_file(&table, logs_batch(rows, unique_offset)).await;
+        let file = write_one_file(&table, logs_batch(TENANT, rows, unique_offset)).await;
         seeded_rows_total += file.record_count();
         unique_offset += rows.len();
         fast_append_one(&catalog, &ident, file).await;
@@ -449,5 +475,438 @@ async fn compactor_compacts_partition_end_to_end() {
             lower.max_key(),
             upper.min_key(),
         );
+    }
+}
+
+/// Count the DATA manifests in the table's current snapshot's manifest list.
+async fn data_manifest_count(table: &Table) -> usize {
+    list_manifest_entries(table)
+        .await
+        .expect("list manifest entries")
+        .into_iter()
+        .filter(|entry| entry.content == ManifestContentType::Data)
+        .count()
+}
+
+/// What a `(tenant_id, timestamp_day)` predicate still has to open: the number
+/// of DATA manifests manifest pruning cannot discard for that partition value,
+/// and their total `manifest_length`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PruningFootprint {
+    manifests: usize,
+    bytes: i64,
+}
+
+/// Measure the pruning footprint of one `(tenant_id, timestamp_day)` value.
+///
+/// Reads the same source manifest pruning uses — the manifest-list entries'
+/// partition summaries (`ManifestFile.partitions`, what
+/// `iceberg::expr::visitors::manifest_evaluator` evaluates) — and keeps every
+/// DATA manifest whose summaries admit the value. A manifest with no summaries
+/// (or no bound for a field) can never be pruned away, so it always counts:
+/// the result is the upper bound on what a scan for that partition must open.
+async fn measure_pruning_footprint(table: &Table, tenant_id: &str, timestamp_day: i32) -> PruningFootprint {
+    let snapshot = table.metadata().current_snapshot().expect("current snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("load manifest list");
+
+    let tenant_value = Datum::string(tenant_id);
+    let day_value = Datum::int(timestamp_day);
+
+    manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == ManifestContentType::Data)
+        .filter(|manifest| {
+            // The logs spec is (tenant_id identity, timestamp_day day), so the
+            // summaries are positional: index 0 is the tenant, index 1 the day.
+            manifest.partitions.as_ref().is_none_or(|summaries| {
+                summary_admits(summaries.first(), &tenant_value, &PrimitiveType::String)
+                    && summary_admits(summaries.get(1), &day_value, &PrimitiveType::Int)
+            })
+        })
+        .fold(PruningFootprint { manifests: 0, bytes: 0 }, |footprint, manifest| {
+            PruningFootprint {
+                manifests: footprint.manifests + 1,
+                bytes: footprint.bytes + manifest.manifest_length,
+            }
+        })
+}
+
+/// Whether one partition-field summary admits `value`, i.e. cannot prove the
+/// manifest holds no row with it. A missing summary or bound admits everything,
+/// and a bound that fails to decode is treated as admitting rather than silently
+/// pruning the manifest out of the measurement.
+fn summary_admits(summary: Option<&FieldSummary>, value: &Datum, primitive: &PrimitiveType) -> bool {
+    let Some(summary) = summary else { return true };
+
+    let below_lower = summary
+        .lower_bound
+        .as_ref()
+        .and_then(|bytes| Datum::try_from_bytes(bytes, primitive.clone()).ok())
+        .is_some_and(|lower| lower > *value);
+    let above_upper = summary
+        .upper_bound
+        .as_ref()
+        .and_then(|bytes| Datum::try_from_bytes(bytes, primitive.clone()).ok())
+        .is_some_and(|upper| upper < *value);
+
+    !below_lower && !above_upper
+}
+
+/// Poll the current snapshot's DATA-manifest count until it drops below
+/// `baseline`, returning the new count. Fails the test if the drop does not
+/// happen within [`POLL_TIMEOUT`].
+async fn wait_for_manifest_count_drop(catalog: &S3Catalog, ident: &TableIdent, baseline: usize) -> usize {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let table = catalog.load_table(ident).await.expect("reload table");
+        let count = data_manifest_count(&table).await;
+        if count < baseline {
+            return count;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "manifest compaction did not reduce the manifest count within {POLL_TIMEOUT:?} (still {count})"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Commit a single data file in its own `fast_append`, stamping `props` on the
+/// snapshot summary (used to seed a base WAL offset before manifest compaction).
+async fn fast_append_one_with_props(
+    catalog: &S3Catalog,
+    ident: &TableIdent,
+    data_file: DataFile,
+    props: HashMap<String, String>,
+) {
+    let table = catalog.load_table(ident).await.unwrap();
+    let tx = Transaction::new(&table);
+    let action = tx.fast_append().add_data_files(vec![data_file]).set_snapshot_properties(props);
+    let tx = action.apply(tx).unwrap();
+    tx.commit(catalog).await.unwrap();
+}
+
+/// A config that DISABLES data-file compaction (both healthiness thresholds far
+/// above the seeded file count, so the partition is always skipped and the PLAN
+/// fans out zero REWRITE tasks). Manifest compaction runs for every enabled
+/// table, so this isolates manifest repacking and exercises the `N == 0`
+/// independent trigger.
+fn manifest_compaction_config(conn: &StorageConn) -> CompactionConfig {
+    let mut config = compaction_config(conn);
+    config.data.min_input_files = 1_000;
+    config.data.max_skippable_tail_files = 1_000;
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compactor_repacks_manifests_without_touching_data() {
+    let (_store, conn) = setup_object_store().await;
+    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let ident = create_logs_table(&catalog).await;
+    let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
+
+    // Seed SIX small files, each in its own fast_append => six snapshots, each
+    // adding one DATA manifest and carrying the earlier ones forward unmerged.
+    // Three files per tenant, so the seeded partition values are
+    // (tenant-a, day) and (tenant-b, day) and the pruning check below is not
+    // degenerate: a repack that widened every output manifest's tenant range
+    // would show up as a larger per-value footprint.
+    let files_rows: Vec<(&str, Vec<(&str, i64)>)> = vec![
+        (TENANT, vec![("svc-a", DAY_MICROS + 30)]),
+        (TENANT, vec![("svc-b", DAY_MICROS + 40)]),
+        (TENANT, vec![("svc-c", DAY_MICROS + 50)]),
+        (OTHER_TENANT, vec![("svc-d", DAY_MICROS + 60)]),
+        (OTHER_TENANT, vec![("svc-e", DAY_MICROS + 70)]),
+        (OTHER_TENANT, vec![("svc-f", DAY_MICROS + 80)]),
+    ];
+    let mut unique_offset = 0usize;
+    let mut seeded_rows_total: u64 = 0;
+    for (tenant_id, rows) in &files_rows {
+        let table = catalog.load_table(&ident).await.unwrap();
+        let file = write_one_file(&table, logs_batch(tenant_id, rows, unique_offset)).await;
+        seeded_rows_total += file.record_count();
+        unique_offset += rows.len();
+        fast_append_one(&catalog, &ident, file).await;
+    }
+
+    let before = catalog.load_table(&ident).await.unwrap();
+    let manifests_before = data_manifest_count(&before).await;
+    let files_before = data_file_count(&before, descriptor).await;
+    assert_eq!(
+        manifests_before,
+        files_rows.len(),
+        "each fast_append adds one data manifest"
+    );
+    assert_eq!(files_before, files_rows.len(), "all seeded files must be enumerable");
+    let mut rows_before = read_all_rows(&before, descriptor).await;
+
+    // Pruning baseline per seeded partition value, re-checked after the repack.
+    let footprints_before: Vec<PruningFootprint> = futures::future::join_all(
+        [TENANT, OTHER_TENANT]
+            .iter()
+            .map(|tenant_id| measure_pruning_footprint(&before, tenant_id, DAY_ORDINAL)),
+    )
+    .await;
+
+    // One cycle. Data compaction skips the (healthy) partition, so the PLAN fans
+    // out zero REWRITE tasks and the compact_manifest task runs immediately (the
+    // independent `N == 0` trigger), repacking the five manifests.
+    let config = manifest_compaction_config(&conn);
+    let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
+    let compactor = Compactor::new_with_max_iterations(dyn_catalog.clone(), &config, Some(1))
+        .await
+        .expect("build compactor");
+    let handle: CompactorHandle = compactor.start().expect("start compactor");
+    let manifests_after = wait_for_manifest_count_drop(&catalog, &ident, manifests_before).await;
+    handle.shutdown().await.expect("shutdown compactor");
+
+    // 1. The current snapshot has STRICTLY FEWER data manifests than before.
+    assert!(
+        manifests_after < manifests_before,
+        "manifest count must drop: before={manifests_before}, after={manifests_after}"
+    );
+
+    let after = catalog.load_table(&ident).await.unwrap();
+
+    // 2. Data files are untouched: the data-file count is unchanged and the full
+    //    row set is identical before vs after.
+    assert_eq!(
+        data_file_count(&after, descriptor).await,
+        files_before,
+        "manifest compaction must not change the data-file count"
+    );
+    let mut rows_after = read_all_rows(&after, descriptor).await;
+    assert_eq!(rows_after.len() as u64, seeded_rows_total, "row count preserved");
+    rows_before.sort();
+    rows_after.sort();
+    assert_eq!(
+        rows_before, rows_after,
+        "row set must be identical (data files untouched)"
+    );
+
+    // 3. The new snapshot is a Replace carrying the manifest-rewrite marker.
+    let snapshot = after.metadata().current_snapshot().expect("current snapshot");
+    assert_eq!(snapshot.summary().operation, Operation::Replace);
+    assert_eq!(
+        snapshot
+            .summary()
+            .additional_properties
+            .get(MANIFEST_REWRITE_MARKER_KEY)
+            .map(String::as_str),
+        Some("true"),
+        "the replace snapshot must carry the manifest-rewrite marker"
+    );
+
+    // 3b. Pruning metadata survives the rewrite: every repacked output DATA
+    //     manifest carries partition summaries, one per partition-spec field
+    //     (tenant_id, timestamp_day), so manifest pruning stays effective.
+    let manifest_list = snapshot
+        .load_manifest_list(after.file_io(), after.metadata())
+        .await
+        .expect("load manifest list");
+    let output_data_manifests: Vec<_> = manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == ManifestContentType::Data)
+        .collect();
+    assert_eq!(
+        output_data_manifests.len(),
+        manifests_after,
+        "data-manifest count is consistent"
+    );
+    for manifest in &output_data_manifests {
+        let summaries = manifest
+            .partitions
+            .as_ref()
+            .expect("output manifest must carry partition summaries");
+        assert_eq!(
+            summaries.len(),
+            2,
+            "the logs partition spec has two fields (tenant_id, timestamp_day)"
+        );
+    }
+
+    // 3c. Pruning stays at least as effective: for every seeded partition value,
+    //     neither the number of DATA manifests a scan must open nor their total
+    //     bytes grew. Repacking trades object count for wider summaries, so this
+    //     is the check that the trade did not backfire on the query side.
+    for (tenant_id, before_footprint) in [TENANT, OTHER_TENANT].iter().zip(footprints_before) {
+        let after_footprint = measure_pruning_footprint(&after, tenant_id, DAY_ORDINAL).await;
+        assert!(
+            after_footprint.manifests <= before_footprint.manifests,
+            "manifests surviving pruning for ({tenant_id}, {DAY_ORDINAL}) grew: \
+             before={before_footprint:?}, after={after_footprint:?}"
+        );
+        assert!(
+            after_footprint.bytes <= before_footprint.bytes,
+            "manifest bytes surviving pruning for ({tenant_id}, {DAY_ORDINAL}) grew: \
+             before={before_footprint:?}, after={after_footprint:?}"
+        );
+    }
+
+    // 4. Idempotent no-op: a second run against the now-compact snapshot finds
+    //    fewer than two candidates, opens no transaction, and leaves the current
+    //    snapshot id unchanged.
+    let snapshot_id_after = after.metadata().current_snapshot_id().expect("snapshot id");
+    let executor = ManifestCompactExecutor::new(
+        dyn_catalog.clone(),
+        config.manifest.target_size_bytes,
+        config.manifest.candidate_size_ratio,
+        config.manifest.max_manifests_per_commit,
+        CompactMetrics::new(),
+    );
+    let outcome = executor
+        .execute(
+            &ManifestCompactInput {
+                table: TABLE.to_string(),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("idempotent run");
+    assert_eq!(
+        outcome,
+        ManifestCompactOutcome::Skipped,
+        "a second run on a compact snapshot must be a no-op"
+    );
+    let reloaded = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        Some(snapshot_id_after),
+        "the no-op run must not create a new snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manifest_compaction_carries_wal_offset_forward() {
+    const WAL_OFFSET: u64 = 4242;
+
+    let (_store, conn) = setup_object_store().await;
+    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let ident = create_logs_table(&catalog).await;
+
+    // Seed four files; the LAST fast_append stamps the WAL offset on its snapshot,
+    // so the base the manifest rewrite supersedes carries an offset to inherit.
+    let files_rows: Vec<Vec<(&str, i64)>> = vec![
+        vec![("svc-a", DAY_MICROS + 30)],
+        vec![("svc-b", DAY_MICROS + 40)],
+        vec![("svc-c", DAY_MICROS + 50)],
+        vec![("svc-d", DAY_MICROS + 60)],
+    ];
+    let mut unique_offset = 0usize;
+    for (index, rows) in files_rows.iter().enumerate() {
+        let table = catalog.load_table(&ident).await.unwrap();
+        let file = write_one_file(&table, logs_batch(TENANT, rows, unique_offset)).await;
+        unique_offset += rows.len();
+        let props = if index + 1 == files_rows.len() {
+            HashMap::from([(WAL_OFFSET_PROPERTY.to_string(), WAL_OFFSET.to_string())])
+        } else {
+            HashMap::new()
+        };
+        fast_append_one_with_props(&catalog, &ident, file, props).await;
+    }
+
+    let before = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(
+        resolve_wal_offset(before.metadata()).expect("resolve before"),
+        Some(WAL_OFFSET),
+        "the seeded base snapshot must carry the WAL offset"
+    );
+    let manifests_before = data_manifest_count(&before).await;
+
+    let config = manifest_compaction_config(&conn);
+    let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
+    let compactor = Compactor::new_with_max_iterations(dyn_catalog, &config, Some(1))
+        .await
+        .expect("build compactor");
+    let handle = compactor.start().expect("start compactor");
+    wait_for_manifest_count_drop(&catalog, &ident, manifests_before).await;
+    handle.shutdown().await.expect("shutdown compactor");
+
+    // The replace snapshot inherited the WAL offset, so resolution still finds it
+    // after manifest compaction.
+    let after = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(
+        resolve_wal_offset(after.metadata()).expect("resolve after"),
+        Some(WAL_OFFSET),
+        "manifest compaction must carry the WAL offset forward onto the replace snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manifest_compaction_reports_actual_output_count() {
+    // The committed outcome's `output_manifests` must be the ACTUAL number the
+    // repack produced (re-read from the manifest list), not the pre-commit
+    // estimate. Drive the executor directly so the `Committed` outcome is
+    // observable, then cross-check it against the table's real post-commit
+    // DATA-manifest count.
+    let (_store, conn) = setup_object_store().await;
+    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let ident = create_logs_table(&catalog).await;
+
+    // Four tiny single-partition files, one manifest each, all well below the
+    // candidate threshold so all four are selected and pack into one manifest.
+    let files_rows: Vec<Vec<(&str, i64)>> = vec![
+        vec![("svc-a", DAY_MICROS + 30)],
+        vec![("svc-b", DAY_MICROS + 40)],
+        vec![("svc-c", DAY_MICROS + 50)],
+        vec![("svc-d", DAY_MICROS + 60)],
+    ];
+    let mut unique_offset = 0usize;
+    for rows in &files_rows {
+        let table = catalog.load_table(&ident).await.unwrap();
+        let file = write_one_file(&table, logs_batch(TENANT, rows, unique_offset)).await;
+        unique_offset += rows.len();
+        fast_append_one(&catalog, &ident, file).await;
+    }
+
+    let before = catalog.load_table(&ident).await.unwrap();
+    let manifests_before = data_manifest_count(&before).await;
+    assert_eq!(
+        manifests_before,
+        files_rows.len(),
+        "each fast_append adds one data manifest"
+    );
+
+    let config = manifest_compaction_config(&conn);
+    let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
+    let executor = ManifestCompactExecutor::new(
+        dyn_catalog,
+        config.manifest.target_size_bytes,
+        config.manifest.candidate_size_ratio,
+        config.manifest.max_manifests_per_commit,
+        CompactMetrics::new(),
+    );
+    let outcome = executor
+        .execute(
+            &ManifestCompactInput {
+                table: TABLE.to_string(),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("repack run");
+
+    let after = catalog.load_table(&ident).await.unwrap();
+    let manifests_after = data_manifest_count(&after).await;
+
+    match outcome {
+        ManifestCompactOutcome::Committed {
+            input_manifests,
+            output_manifests,
+        } => {
+            assert_eq!(input_manifests, manifests_before, "all seeded manifests were repacked");
+            // The reported output count must equal the manifests the snapshot now
+            // actually carries (all repacked into one group, no DELETE manifests).
+            assert_eq!(
+                output_manifests, manifests_after,
+                "reported output count must match the actual post-commit manifest count"
+            );
+        }
+        ManifestCompactOutcome::Skipped => panic!("expected a committed repack, got a skip"),
     }
 }

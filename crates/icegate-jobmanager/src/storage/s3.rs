@@ -102,6 +102,7 @@ struct TaskJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     deadline_at: Option<DateTime<Utc>>,
     attempt: u32,
+    max_attempts: u32,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     input: Vec<u8>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -385,6 +386,7 @@ impl S3Storage {
             completed_at: task.completed_at(),
             deadline_at: task.deadline_at(),
             attempt: task.attempt(),
+            max_attempts: task.max_attempts(),
             input: task.input().to_vec(),
             output: task.output().to_vec(),
             error: task.error_msg().to_string(),
@@ -426,6 +428,7 @@ impl S3Storage {
             json.completed_at,
             json.deadline_at,
             json.attempt,
+            json.max_attempts,
             json.input,
             json.output,
             json.error,

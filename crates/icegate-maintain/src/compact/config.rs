@@ -249,17 +249,13 @@ impl CompactionJobsManagerConfig {
     }
 }
 
-/// Configuration for the Parquet compaction process.
-///
-/// Controls how small Parquet data files in Iceberg tables are discovered,
+/// Data-compaction tunables: how small Parquet data files are discovered,
 /// bin-packed into rewrite groups, and rewritten into fewer, larger files.
-// The five `*_enabled` flags are independent per-table toggles (logs, spans,
-// events, metrics, operations), not a hidden state machine; modelling them as
-// enums would add noise without improving clarity.
-#[allow(clippy::struct_excessive_bools)]
+///
+/// Maps to the `compaction.data` config section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct CompactionConfig {
+pub struct DataCompactionConfig {
     /// Desired OUTPUT parquet file size, in bytes.
     ///
     /// Measured against `DataFile.file_size_in_bytes` when deciding whether a
@@ -293,22 +289,9 @@ pub struct CompactionConfig {
     pub row_group_size: usize,
     /// Maximum Parquet data page size, in bytes.
     pub data_page_size_limit_bytes: usize,
-    /// Whether compaction is enabled for the `logs` table.
-    pub logs_enabled: bool,
-    /// Whether compaction is enabled for the `spans` table.
-    pub spans_enabled: bool,
-    /// Whether compaction is enabled for the `events` table.
-    pub events_enabled: bool,
-    /// Whether compaction is enabled for the `metrics` table.
-    pub metrics_enabled: bool,
-    /// Whether compaction is enabled for the `operations` table.
-    pub operations_enabled: bool,
-    /// Jobs-manager settings (worker pool, discovery interval, job-state storage),
-    /// nested to mirror ingest's `shift.jobsmanager`.
-    pub jobsmanager: CompactionJobsManagerConfig,
 }
 
-impl Default for CompactionConfig {
+impl Default for DataCompactionConfig {
     fn default() -> Self {
         Self {
             target_file_size_bytes: 128 * 1024 * 1024,
@@ -319,34 +302,20 @@ impl Default for CompactionConfig {
             rewrite_timeout_secs: 3_600,
             row_group_size: 20_000,
             data_page_size_limit_bytes: 2 * 1024 * 1024,
-            logs_enabled: true,
-            spans_enabled: true,
-            events_enabled: true,
-            metrics_enabled: true,
-            operations_enabled: true,
-            jobsmanager: CompactionJobsManagerConfig::default(),
         }
     }
 }
 
-impl CompactionConfig {
-    /// Validate the compaction tunables and the job-state storage config.
-    ///
-    /// Every field is `#[serde(default)]`, so a malformed config file loads
-    /// silently with zeros in places that make the planner degenerate rather
-    /// than erroring. This catches those up front. For example a
-    /// `max_group_input_bytes` of 0 makes [`crate::compact::planner`] place every
-    /// file in its own single-file group, all of which it drops as
-    /// non-beneficial — so the service would run forever compacting nothing.
+impl DataCompactionConfig {
+    /// Validate the data-compaction tunables.
     ///
     /// # Errors
     ///
-    /// Returns [`MaintainError::Config`] if any tunable is out of range or the
-    /// [`JobsStorageConfig`] is invalid.
+    /// Returns [`MaintainError::Config`] if any tunable is out of range.
     pub fn validate(&self) -> Result<(), MaintainError> {
         if self.target_file_size_bytes == 0 {
             return Err(MaintainError::Config(
-                "compaction.target_file_size_bytes must be greater than zero".to_string(),
+                "compaction.data.target_file_size_bytes must be greater than zero".to_string(),
             ));
         }
         // A group budget below the target file size can never bin-pack enough
@@ -356,30 +325,174 @@ impl CompactionConfig {
         // compaction.
         if self.max_group_input_bytes < self.target_file_size_bytes {
             return Err(MaintainError::Config(format!(
-                "compaction.max_group_input_bytes ({}) must be at least target_file_size_bytes ({})",
+                "compaction.data.max_group_input_bytes ({}) must be at least target_file_size_bytes ({})",
                 self.max_group_input_bytes, self.target_file_size_bytes
             )));
         }
         if self.max_merge_size_ratio == 0 {
             return Err(MaintainError::Config(
-                "compaction.max_merge_size_ratio must be greater than or equal to 1".to_string(),
+                "compaction.data.max_merge_size_ratio must be greater than or equal to 1".to_string(),
             ));
         }
         if self.rewrite_timeout_secs == 0 {
             return Err(MaintainError::Config(
-                "compaction.rewrite_timeout_secs must be greater than zero".to_string(),
+                "compaction.data.rewrite_timeout_secs must be greater than zero".to_string(),
             ));
         }
         if self.row_group_size == 0 {
             return Err(MaintainError::Config(
-                "compaction.row_group_size must be greater than zero".to_string(),
+                "compaction.data.row_group_size must be greater than zero".to_string(),
             ));
         }
         if self.data_page_size_limit_bytes == 0 {
             return Err(MaintainError::Config(
-                "compaction.data_page_size_limit_bytes must be greater than zero".to_string(),
+                "compaction.data.data_page_size_limit_bytes must be greater than zero".to_string(),
             ));
         }
+        Ok(())
+    }
+}
+
+/// Manifest-compaction tunables: how the small DATA manifests of the current
+/// snapshot are repacked into fewer, larger ones.
+///
+/// Maps to the `compaction.manifest` config section. The per-table toggles stay
+/// in [`CompactionConfig`]: manifest compaction repacks the manifests of
+/// whichever tables compaction is enabled for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManifestCompactionConfig {
+    /// Target byte size of each OUTPUT manifest: entries are packed into an output
+    /// manifest until its estimated manifest-byte size reaches this value. A
+    /// packing target, NOT a trigger by itself (see [`Self::candidate_size_ratio`]).
+    pub target_size_bytes: u64,
+    /// Fraction of [`Self::target_size_bytes`] below which a manifest is a repack
+    /// candidate; a manifest at or above `candidate_size_ratio * target` bytes is
+    /// already large enough and is left alone. Must be in `(0.0, 1.0]`.
+    pub candidate_size_ratio: f64,
+    /// Upper bound on how many input manifests one `compact_manifest` commit
+    /// repacks, keeping a single commit incremental; any remaining candidates are
+    /// picked up on later iterations. Must be at least 2.
+    pub max_manifests_per_commit: usize,
+    /// Deadline for a single `compact_manifest` task (repack + commit), in seconds.
+    pub rewrite_timeout_secs: u64,
+}
+
+impl Default for ManifestCompactionConfig {
+    fn default() -> Self {
+        Self {
+            target_size_bytes: 8 * 1024 * 1024,
+            candidate_size_ratio: 0.75,
+            max_manifests_per_commit: 64,
+            rewrite_timeout_secs: 600,
+        }
+    }
+}
+
+impl ManifestCompactionConfig {
+    /// Validate the manifest-compaction tunables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintainError::Config`] if any tunable is out of range.
+    pub fn validate(&self) -> Result<(), MaintainError> {
+        if self.target_size_bytes == 0 {
+            return Err(MaintainError::Config(
+                "compaction.manifest.target_size_bytes must be greater than zero".to_string(),
+            ));
+        }
+        // `is_finite` rejects NaN/±inf (whose ordering comparisons below would
+        // otherwise let a NaN slip through), leaving only a real ratio in
+        // `(0.0, 1.0]`. A ratio outside that range makes candidate selection
+        // degenerate (0 selects nothing; > 1 would admit already-large manifests).
+        if !self.candidate_size_ratio.is_finite() || self.candidate_size_ratio <= 0.0 || self.candidate_size_ratio > 1.0
+        {
+            return Err(MaintainError::Config(format!(
+                "compaction.manifest.candidate_size_ratio ({}) must be in (0.0, 1.0]",
+                self.candidate_size_ratio
+            )));
+        }
+        // A group of fewer than two manifests can never repack into fewer, so the
+        // per-commit cap must admit at least two inputs.
+        if self.max_manifests_per_commit < 2 {
+            return Err(MaintainError::Config(
+                "compaction.manifest.max_manifests_per_commit must be at least 2".to_string(),
+            ));
+        }
+        if self.rewrite_timeout_secs == 0 {
+            return Err(MaintainError::Config(
+                "compaction.manifest.rewrite_timeout_secs must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for the compaction process.
+///
+/// Holds what both compaction kinds share — the per-table toggles and the
+/// jobs-manager settings — and nests the kind-specific tunables under
+/// [`data`](Self::data) and [`manifest`](Self::manifest). A table's toggle
+/// governs both kinds: manifest compaction repacks the manifests of the tables
+/// data compaction runs on.
+// The five `*_enabled` flags are independent per-table toggles (logs, spans,
+// events, metrics, operations), not a hidden state machine; modelling them as
+// enums would add noise without improving clarity.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionConfig {
+    /// Whether compaction is enabled for the `logs` table.
+    pub logs_enabled: bool,
+    /// Whether compaction is enabled for the `spans` table.
+    pub spans_enabled: bool,
+    /// Whether compaction is enabled for the `events` table.
+    pub events_enabled: bool,
+    /// Whether compaction is enabled for the `metrics` table.
+    pub metrics_enabled: bool,
+    /// Whether compaction is enabled for the `operations` table.
+    pub operations_enabled: bool,
+    /// Data-compaction tunables (`compaction.data`).
+    pub data: DataCompactionConfig,
+    /// Manifest-compaction tunables (`compaction.manifest`).
+    pub manifest: ManifestCompactionConfig,
+    /// Jobs-manager settings (worker pool, discovery interval, job-state storage),
+    /// nested to mirror ingest's `shift.jobsmanager`.
+    pub jobsmanager: CompactionJobsManagerConfig,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            logs_enabled: true,
+            spans_enabled: true,
+            events_enabled: true,
+            metrics_enabled: true,
+            operations_enabled: true,
+            data: DataCompactionConfig::default(),
+            manifest: ManifestCompactionConfig::default(),
+            jobsmanager: CompactionJobsManagerConfig::default(),
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// Validate every compaction group and the job-state storage config.
+    ///
+    /// Every field is `#[serde(default)]`, so a malformed config file loads
+    /// silently with zeros in places that make the planner degenerate rather
+    /// than erroring. This catches those up front. For example a
+    /// `data.max_group_input_bytes` of 0 makes [`crate::compact::data::planner`] place
+    /// every file in its own single-file group, all of which it drops as
+    /// non-beneficial — so the service would run forever compacting nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintainError::Config`] if any tunable is out of range or the
+    /// [`JobsStorageConfig`] is invalid.
+    pub fn validate(&self) -> Result<(), MaintainError> {
+        self.data.validate()?;
+        self.manifest.validate()?;
         self.jobsmanager.validate()
     }
 }
@@ -391,12 +504,17 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let c = CompactionConfig::default();
-        assert_eq!(c.target_file_size_bytes, 128 * 1024 * 1024);
-        assert!(c.max_group_input_bytes >= c.target_file_size_bytes);
-        assert_eq!(c.min_input_files, 4);
-        assert_eq!(c.max_skippable_tail_files, 0);
-        assert_eq!(c.max_merge_size_ratio, 2);
+        assert_eq!(c.data.target_file_size_bytes, 128 * 1024 * 1024);
+        assert!(c.data.max_group_input_bytes >= c.data.target_file_size_bytes);
+        assert_eq!(c.data.min_input_files, 4);
+        assert_eq!(c.data.max_skippable_tail_files, 0);
+        assert_eq!(c.data.max_merge_size_ratio, 2);
         assert!(c.logs_enabled && c.spans_enabled && c.events_enabled && c.metrics_enabled && c.operations_enabled);
+        assert_eq!(c.manifest.target_size_bytes, 8 * 1024 * 1024);
+        // Exact float equality trips clippy::float_cmp; compare within epsilon.
+        assert!((c.manifest.candidate_size_ratio - 0.75).abs() < f64::EPSILON);
+        assert_eq!(c.manifest.max_manifests_per_commit, 64);
+        assert_eq!(c.manifest.rewrite_timeout_secs, 600);
     }
 
     #[test]
@@ -431,7 +549,10 @@ mod tests {
     fn zero_max_group_input_bytes_is_rejected() {
         // Sergey's example: a zero budget silently disables all compaction.
         let config = CompactionConfig {
-            max_group_input_bytes: 0,
+            data: DataCompactionConfig {
+                max_group_input_bytes: 0,
+                ..DataCompactionConfig::default()
+            },
             ..valid_config()
         };
         assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
@@ -440,8 +561,11 @@ mod tests {
     #[test]
     fn max_group_input_below_target_is_rejected() {
         let config = CompactionConfig {
-            target_file_size_bytes: 128 * 1024 * 1024,
-            max_group_input_bytes: 64 * 1024 * 1024,
+            data: DataCompactionConfig {
+                target_file_size_bytes: 128 * 1024 * 1024,
+                max_group_input_bytes: 64 * 1024 * 1024,
+                ..DataCompactionConfig::default()
+            },
             ..valid_config()
         };
         assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
@@ -450,7 +574,10 @@ mod tests {
     #[test]
     fn zero_target_file_size_is_rejected() {
         let config = CompactionConfig {
-            target_file_size_bytes: 0,
+            data: DataCompactionConfig {
+                target_file_size_bytes: 0,
+                ..DataCompactionConfig::default()
+            },
             ..valid_config()
         };
         assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
@@ -459,7 +586,87 @@ mod tests {
     #[test]
     fn zero_size_merge_ratio_is_rejected() {
         let config = CompactionConfig {
-            max_merge_size_ratio: 0,
+            data: DataCompactionConfig {
+                max_merge_size_ratio: 0,
+                ..DataCompactionConfig::default()
+            },
+            ..valid_config()
+        };
+        assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+    }
+
+    #[test]
+    fn zero_data_rewrite_timeout_is_rejected() {
+        let config = CompactionConfig {
+            data: DataCompactionConfig {
+                rewrite_timeout_secs: 0,
+                ..DataCompactionConfig::default()
+            },
+            ..valid_config()
+        };
+        assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+    }
+
+    #[test]
+    fn zero_target_manifest_size_is_rejected() {
+        let config = CompactionConfig {
+            manifest: ManifestCompactionConfig {
+                target_size_bytes: 0,
+                ..ManifestCompactionConfig::default()
+            },
+            ..valid_config()
+        };
+        assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+    }
+
+    #[test]
+    fn candidate_size_ratio_out_of_range_is_rejected() {
+        // Zero, negative, above one, and NaN must all be rejected.
+        for ratio in [0.0, -0.1, 1.5, f64::NAN] {
+            let config = CompactionConfig {
+                manifest: ManifestCompactionConfig {
+                    candidate_size_ratio: ratio,
+                    ..ManifestCompactionConfig::default()
+                },
+                ..valid_config()
+            };
+            assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+        }
+    }
+
+    #[test]
+    fn candidate_size_ratio_at_upper_bound_is_accepted() {
+        let config = CompactionConfig {
+            manifest: ManifestCompactionConfig {
+                candidate_size_ratio: 1.0,
+                ..ManifestCompactionConfig::default()
+            },
+            ..valid_config()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn max_manifests_per_commit_below_two_is_rejected() {
+        for value in [0, 1] {
+            let config = CompactionConfig {
+                manifest: ManifestCompactionConfig {
+                    max_manifests_per_commit: value,
+                    ..ManifestCompactionConfig::default()
+                },
+                ..valid_config()
+            };
+            assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
+        }
+    }
+
+    #[test]
+    fn zero_manifest_rewrite_timeout_is_rejected() {
+        let config = CompactionConfig {
+            manifest: ManifestCompactionConfig {
+                rewrite_timeout_secs: 0,
+                ..ManifestCompactionConfig::default()
+            },
             ..valid_config()
         };
         assert!(matches!(config.validate(), Err(MaintainError::Config(_))));
