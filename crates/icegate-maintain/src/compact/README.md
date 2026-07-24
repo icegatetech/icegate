@@ -23,18 +23,24 @@ Two axes: the compaction **domain** (data files vs manifests) and the **layer**
 
 ## Service
 
-One jobmanager job per enabled table. Each job is a `PLAN → REWRITE` pipeline:
-PLAN decides *what* to rewrite and fans out one REWRITE per group; each REWRITE
-does its own merge and commits its own replace, with optimistic-concurrency
-retry from the generic catalog (so concurrent ingest commits are tolerated).
+One jobmanager job per enabled table. Each job is a `compact_plan →
+compact_files` pipeline: `compact_plan` decides *what* to rewrite and fans out
+one `compact_files` per group; each `compact_files` does its own merge and
+commits its own replace, with optimistic-concurrency retry from the generic
+catalog (so concurrent ingest commits are tolerated). `compact_plan` also fans
+out one `compact_manifest` task, gated on those rewrites, that repacks the
+manifests they leave behind.
 
 ```mermaid
 flowchart LR
     CFG[CompactionConfig] --> CMP[Compactor service]
     CMP -->|one job per enabled table| J[job]
-    J --> P[PLAN<br/>enumerate + plan groups]
-    P -->|fan out one per group| R[REWRITE<br/>k-way merge + replace]
+    J --> P[compact_plan<br/>enumerate + plan groups]
+    P -->|fan out one per group| R[compact_files<br/>k-way merge + replace]
+    P -->|fan out one| M[compact_manifest<br/>repack + replace]
+    R -.->|gates| M
     R --> IC[(Iceberg snapshot)]
+    M --> IC
 ```
 
 ## Guarantees and limitations
