@@ -31,16 +31,42 @@ catalog (so concurrent ingest commits are tolerated). `compact_plan` also fans
 out one `compact_manifest` task, gated on those rewrites, that repacks the
 manifests they leave behind.
 
+#### Job scheme
 ```mermaid
-flowchart LR
-    CFG[CompactionConfig] --> CMP[Compactor service]
-    CMP -->|one job per enabled table| J[job]
-    J --> P[compact_plan<br/>enumerate + plan groups]
-    P -->|fan out one per group| R[compact_files<br/>k-way merge + replace]
-    P -->|fan out one| M[compact_manifest<br/>repack + replace]
-    R -.->|gates| M
-    R --> IC[(Iceberg snapshot)]
-    M --> IC
+flowchart TD
+    START(["iteraion: every scan_interval_secs"]) --> PLAN
+
+    subgraph P["compact_plan task"]
+        PLAN["load_table fresh"] --> HS{"current_snapshot?"}
+        HS -->|None| DONE0["complete_task"]
+        HS -->|Some| ENUM["enumerate + plan_rewrite_groups"]
+        ENUM --> FAN["add_task ×N + add_task manifest"]
+        FAN --> DONEP["complete_task"]
+    end
+
+    FAN --> F1
+    FAN --> F2
+    FAN --> FN
+    FAN -.->|"Blocked, deps = [id₁..idₙ]"| MAN
+
+    subgraph W["N × compact_files tasks"]
+        F1["#1: merge → write"] --> K1{{"commit"}} --> D1["complete_task"]
+        F2["#2: merge → write"] --> K2{{"commit"}} --> D2["complete_task"]
+        FN["#N: merge → write"] --> KN{{"commit"}} --> DN["complete_task"]
+        F1 -.->|"maybe failed"| D1
+    end
+
+    D1 ==>|Completed| MAN
+    D2 ==>|Completed| MAN
+    DN ==>|Completed| MAN
+
+    subgraph M["compact_manifest task (gate for complete compact_files tasks)"]
+        MAN["load fresh + plan repack"] --> KM{{"commit"}} --> DM["complete_task"]
+        MAN -.->|"Skip / NoReduction"| DM
+    end
+
+    DM --> NEXT(["continue"])
+    DONE0 --> NEXT
 ```
 
 ## Guarantees and limitations
