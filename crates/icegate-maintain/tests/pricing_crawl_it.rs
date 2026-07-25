@@ -14,7 +14,7 @@ mod common; // reuse the RustFS + catalog harness used by the GC tests
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, TimestampMicrosecondArray};
+use arrow::array::{Array, Decimal128Array, TimestampMicrosecondArray};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{BUCKET_NAME, build_s3_catalog};
@@ -25,6 +25,7 @@ use icegate_maintain::compact::config::{CompactionJobsManagerConfig, JobStateCod
 use icegate_maintain::migrate::operations::create_tables;
 use icegate_maintain::pricing::PricingRunner;
 use icegate_maintain::pricing::config::{PricingConfig, SourceConfig};
+use icegate_maintain::pricing::decimal::unscaled_to_rate;
 use icegate_maintain::pricing::diff::diff_rates;
 use icegate_maintain::pricing::guard::apply_row_guards;
 use icegate_maintain::pricing::read::read_live_rates;
@@ -99,7 +100,11 @@ async fn run_stub_crawl(catalog: &Arc<dyn Catalog>, stub: &StubSource, config: &
         "stub rates must pass every row guard: {:?}",
         guarded.rejected
     );
-    let outcome = diff_rates(guarded.accepted, &live, config, now);
+    let mut accepted = guarded.accepted;
+    for candidate in &mut accepted {
+        icegate_maintain::pricing::decimal::quantize_observation(candidate);
+    }
+    let outcome = diff_rates(accepted, &live, config, now);
     assert!(
         outcome.rejected.is_empty(),
         "stub rates must pass the delta guard: {:?}",
@@ -136,15 +141,16 @@ async fn read_raw_rows(catalog: &Arc<dyn Catalog>) -> Vec<(f64, i64)> {
         let input = batch
             .column(schema.index_of("input_usd_per_1m").expect("input_usd_per_1m column"))
             .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("input_usd_per_1m is Float64");
+            .downcast_ref::<Decimal128Array>()
+            .expect("input_usd_per_1m is Decimal128");
         let valid_from = batch
             .column(schema.index_of("valid_from").expect("valid_from column"))
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("valid_from is TimestampMicrosecond");
         for i in 0..batch.num_rows() {
-            rows.push((input.value(i), valid_from.value(i)));
+            // Decode the unscaled i128 back to the rate the same way the reader does.
+            rows.push((unscaled_to_rate(input.value(i)), valid_from.value(i)));
         }
     }
     rows.sort_by_key(|(_, valid_from)| *valid_from);

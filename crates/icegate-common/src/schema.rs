@@ -16,6 +16,13 @@ use iceberg::{
 
 use crate::error::Result;
 
+/// Decimal precision of every `icegate.prices` rate column. 38 is the
+/// `Decimal128` maximum; see [`prices_schema`] for why decimal, not `Double`.
+pub const PRICE_DECIMAL_PRECISION: u32 = 38;
+/// Decimal scale (fractional digits) of every `icegate.prices` rate column.
+/// The crawler quantizes rates onto this grid before storing them.
+pub const PRICE_DECIMAL_SCALE: u32 = 10;
+
 /// Creates the Iceberg schema for `OpenTelemetry` logs.
 ///
 /// Based on the `LogRecord` message from
@@ -853,6 +860,16 @@ pub fn operations_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// Returns an error if the schema cannot be built.
 #[allow(clippy::too_many_lines)]
 pub fn prices_schema() -> Result<Schema> {
+    // Rate columns are fixed-point decimal, not `Double`: money must be exact,
+    // and binary `f64` cannot represent values like `0.075` nor sum them without
+    // drift. `Decimal(38, 10)` fits every real rate (ceiling is 10_000, so 5
+    // integer digits, far below 28) with 10 fractional digits — well beyond the
+    // ~6 significant decimals any token price carries. 38 is the `Decimal128`
+    // maximum and costs nothing over a smaller precision (both are 16 bytes).
+    let rate_type = Type::Primitive(PrimitiveType::Decimal {
+        precision: PRICE_DECIMAL_PRECISION,
+        scale: PRICE_DECIMAL_SCALE,
+    });
     let schema = Schema::builder()
         .with_schema_id(6)
         .with_fields(vec![
@@ -915,61 +932,29 @@ pub fn prices_schema() -> Result<Schema> {
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── token rates (USD per 1M tokens) ──────────────────────────
-            Arc::new(NestedField::optional(
-                10,
-                "input_usd_per_1m",
-                Type::Primitive(PrimitiveType::Double),
-            )),
-            Arc::new(NestedField::optional(
-                11,
-                "output_usd_per_1m",
-                Type::Primitive(PrimitiveType::Double),
-            )),
-            Arc::new(NestedField::optional(
-                12,
-                "cache_read_usd_per_1m",
-                Type::Primitive(PrimitiveType::Double),
-            )),
-            Arc::new(NestedField::optional(
-                13,
-                "cache_write_usd_per_1m",
-                Type::Primitive(PrimitiveType::Double),
-            )),
-            Arc::new(NestedField::optional(
-                14,
-                "reasoning_usd_per_1m",
-                Type::Primitive(PrimitiveType::Double),
-            )),
+            Arc::new(NestedField::optional(10, "input_usd_per_1m", rate_type.clone())),
+            Arc::new(NestedField::optional(11, "output_usd_per_1m", rate_type.clone())),
+            Arc::new(NestedField::optional(12, "cache_read_usd_per_1m", rate_type.clone())),
+            Arc::new(NestedField::optional(13, "cache_write_usd_per_1m", rate_type.clone())),
+            Arc::new(NestedField::optional(14, "reasoning_usd_per_1m", rate_type.clone())),
             // ── non-token rates ──────────────────────────────────────────
-            Arc::new(NestedField::optional(
-                15,
-                "request_usd",
-                Type::Primitive(PrimitiveType::Double),
-            )),
+            Arc::new(NestedField::optional(15, "request_usd", rate_type.clone())),
             // Image and audio rates are populated by the crawler but currently
             // unjoinable: `operations` stores only the six token counters. They
             // are carried because reading them is nearly free and backfilling a
             // column later is far more painful than shipping it inert.
-            Arc::new(NestedField::optional(
-                16,
-                "image_input_usd_per_unit",
-                Type::Primitive(PrimitiveType::Double),
-            )),
+            Arc::new(NestedField::optional(16, "image_input_usd_per_unit", rate_type.clone())),
             Arc::new(NestedField::optional(
                 17,
                 "image_output_usd_per_unit",
-                Type::Primitive(PrimitiveType::Double),
+                rate_type.clone(),
             )),
             Arc::new(NestedField::optional(
                 18,
                 "audio_input_usd_per_second",
-                Type::Primitive(PrimitiveType::Double),
+                rate_type.clone(),
             )),
-            Arc::new(NestedField::optional(
-                19,
-                "audio_output_usd_per_second",
-                Type::Primitive(PrimitiveType::Double),
-            )),
+            Arc::new(NestedField::optional(19, "audio_output_usd_per_second", rate_type)),
             // ── provenance ───────────────────────────────────────────────
             Arc::new(NestedField::required(
                 20,
@@ -2154,6 +2139,34 @@ mod tests {
                 .field_by_name(name)
                 .unwrap_or_else(|| panic!("field '{name}' missing from prices schema"));
             assert!(!field.required, "field '{name}' must be optional");
+        }
+    }
+
+    #[test]
+    fn prices_rate_columns_are_fixed_point_decimal_not_double() {
+        // Money must be exact. A regression back to `Double` would silently
+        // reintroduce float rounding into stored rates and cost sums.
+        let schema = prices_schema().expect("prices schema builds");
+        for name in [
+            "input_usd_per_1m",
+            "output_usd_per_1m",
+            "cache_read_usd_per_1m",
+            "cache_write_usd_per_1m",
+            "reasoning_usd_per_1m",
+            "request_usd",
+            "image_input_usd_per_unit",
+            "image_output_usd_per_unit",
+            "audio_input_usd_per_second",
+            "audio_output_usd_per_second",
+        ] {
+            let field = schema.field_by_name(name).unwrap_or_else(|| panic!("field '{name}' missing"));
+            match &*field.field_type {
+                Type::Primitive(PrimitiveType::Decimal { precision, scale }) => {
+                    assert_eq!(*precision, PRICE_DECIMAL_PRECISION, "{name} precision");
+                    assert_eq!(*scale, PRICE_DECIMAL_SCALE, "{name} scale");
+                }
+                other => panic!("rate column '{name}' must be Decimal, got {other:?}"),
+            }
         }
     }
 

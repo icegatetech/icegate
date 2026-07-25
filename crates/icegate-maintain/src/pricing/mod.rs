@@ -21,6 +21,8 @@
 pub mod canonical;
 /// Crawler configuration: interval, sources, guard thresholds.
 pub mod config;
+/// Fixed-point quantization mapping `f64` rates onto the stored decimal grid.
+pub mod decimal;
 
 /// Upstream rate-card sources and the observation type they produce.
 pub mod source;
@@ -289,6 +291,14 @@ async fn run_crawl(
     canonical::apply_canonical_ids(&mut candidates);
     let missing = candidates.iter().filter(|r| r.canonical_id.is_none()).count();
     metrics.record_canonical_missing(missing as u64);
+
+    // Snap fresh rates onto the stored decimal grid before diffing. Live rates
+    // read back from `Decimal(38,10)` storage are already on the grid, so an
+    // un-quantized fresh `3.0000000000000004` would look like a change and append
+    // a spurious revision every crawl. See `decimal::quantize_observation`.
+    for candidate in &mut candidates {
+        decimal::quantize_observation(candidate);
+    }
 
     let diff_outcome = diff::diff_rates(candidates, &live, config, now);
     for (rate, reason) in &diff_outcome.rejected {

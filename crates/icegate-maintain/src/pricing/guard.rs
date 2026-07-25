@@ -6,6 +6,7 @@
 //! advisory.
 
 use crate::pricing::config::PricingConfig;
+use crate::pricing::decimal::carries_subgrid_precision;
 use crate::pricing::source::RateObservation;
 
 /// Absolute ceiling applied to every rate column. No real model approaches this;
@@ -34,6 +35,9 @@ pub enum RejectReason {
     CardinalityFloor,
     /// A rate moved by more than the configured ratio.
     DeltaTooLarge,
+    /// A rate carries more precision than the storage grid can hold, so storing
+    /// it would silently drop meaningful digits.
+    PrecisionTooFine,
 }
 
 impl RejectReason {
@@ -51,6 +55,7 @@ impl RejectReason {
             Self::NonUsdCurrency => "non_usd_currency",
             Self::CardinalityFloor => "cardinality_floor",
             Self::DeltaTooLarge => "delta_too_large",
+            Self::PrecisionTooFine => "precision_too_fine",
         }
     }
 }
@@ -99,6 +104,14 @@ fn classify(rate: &RateObservation) -> Option<RejectReason> {
     }
     if columns.iter().all(Option::is_none) {
         return Some(RejectReason::NoRates);
+    }
+    // Reject rather than silently round: a rate finer than the storage grid
+    // cannot be stored without dropping digits, and quantization would do that
+    // silently. The row is dropped and counted like any other guard failure; the
+    // affected spans surface as unpriced instead of mispriced. See
+    // `decimal::carries_subgrid_precision`.
+    if columns.iter().flatten().any(|v| carries_subgrid_precision(*v)) {
+        return Some(RejectReason::PrecisionTooFine);
     }
     None
 }
@@ -293,6 +306,26 @@ mod tests {
     #[test]
     fn accepts_a_well_formed_row() {
         let outcome = apply_row_guards(vec![observation(Some(5.0), "USD")]);
+        assert_eq!(outcome.accepted.len(), 1);
+        assert!(outcome.rejected.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_rate_finer_than_the_storage_grid() {
+        // A rate with an 11th fractional digit cannot be stored at scale 10.
+        // Rather than silently rounding it, the guard drops the row so the
+        // affected spans surface as unpriced, not mispriced.
+        let outcome = apply_row_guards(vec![observation(Some(3.000_000_000_05), "USD")]);
+        assert!(outcome.accepted.is_empty());
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].1, RejectReason::PrecisionTooFine);
+    }
+
+    #[test]
+    fn accepts_a_grid_representable_rate_with_float_noise() {
+        // A clean rate carrying only f64 noise is on the grid and must pass —
+        // the precision guard must not false-reject legitimate rates.
+        let outcome = apply_row_guards(vec![observation(Some(3.000_000_000_000_000_4), "USD")]);
         assert_eq!(outcome.accepted.len(), 1);
         assert!(outcome.rejected.is_empty());
     }

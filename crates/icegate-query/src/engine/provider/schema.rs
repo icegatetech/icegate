@@ -203,7 +203,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use datafusion::arrow::array::{
+        Array, ArrayRef, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
@@ -251,6 +253,17 @@ mod tests {
         let arrow_schema =
             Arc::new(iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).expect("prices schema converts to arrow"));
 
+        // Rate columns are `Decimal(38,10)`. Build them from unscaled `i128`
+        // values (rate x 10^10) with the schema's precision/scale.
+        let decimal = |unscaled: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(unscaled)
+                    .with_precision_and_scale(38, 10)
+                    .expect("rate decimal precision/scale"),
+            )
+        };
+        let empty_rates = || decimal(vec![None, None, None]);
+
         let batch = RecordBatch::try_new(
             Arc::clone(&arrow_schema),
             vec![
@@ -271,16 +284,17 @@ mod tests {
                     OTHER_MODEL_VALID_FROM,
                 ])),
                 Arc::new(StringArray::from(vec!["vendor", "vendor", "vendor"])), // valid_from_source
-                Arc::new(Float64Array::from(vec![Some(3.0), Some(4.0), Some(2.0)])), // input_usd_per_1m
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // output_usd_per_1m
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // cache_read_usd_per_1m
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // cache_write_usd_per_1m
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // reasoning_usd_per_1m
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // request_usd
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // image_input_usd_per_unit
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // image_output_usd_per_unit
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // audio_input_usd_per_second
-                Arc::new(Float64Array::from(vec![None::<f64>, None, None])),     // audio_output_usd_per_second
+                // 3.0 / 4.0 / 2.0 as unscaled Decimal(38,10) (rate x 10^10).
+                decimal(vec![Some(30_000_000_000), Some(40_000_000_000), Some(20_000_000_000)]), // input_usd_per_1m
+                empty_rates(),                                                                   // output_usd_per_1m
+                empty_rates(), // cache_read_usd_per_1m
+                empty_rates(), // cache_write_usd_per_1m
+                empty_rates(), // reasoning_usd_per_1m
+                empty_rates(), // request_usd
+                empty_rates(), // image_input_usd_per_unit
+                empty_rates(), // image_output_usd_per_unit
+                empty_rates(), // audio_input_usd_per_second
+                empty_rates(), // audio_output_usd_per_second
                 Arc::new(StringArray::from(vec!["USD", "USD", "USD"])),
                 Arc::new(StringArray::from(vec!["test", "test", "test"])), // source
                 Arc::new(StringArray::from(vec![None::<&str>, None, None])), // source_url

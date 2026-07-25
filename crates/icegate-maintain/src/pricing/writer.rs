@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use iceberg::Catalog;
@@ -13,6 +13,7 @@ use icegate_common::{PRICES_TABLE, icegate_table_ident};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{MaintainError, Result};
+use crate::pricing::decimal::{RATE_PRECISION, RATE_SCALE, rate_to_unscaled};
 use crate::pricing::source::RateObservation;
 
 /// Parquet row-group size for the prices writer.
@@ -61,16 +62,16 @@ pub fn build_price_batch(rates: &[RateObservation]) -> Result<RecordBatch> {
             rates.iter().map(|r| r.valid_from.timestamp_micros()),
         )),
         required_text(rates, |r| r.valid_from_source.as_str()),
-        optional_number(rates, |r| r.input_usd_per_1m),
-        optional_number(rates, |r| r.output_usd_per_1m),
-        optional_number(rates, |r| r.cache_read_usd_per_1m),
-        optional_number(rates, |r| r.cache_write_usd_per_1m),
-        optional_number(rates, |r| r.reasoning_usd_per_1m),
-        optional_number(rates, |r| r.request_usd),
-        optional_number(rates, |r| r.image_input_usd_per_unit),
-        optional_number(rates, |r| r.image_output_usd_per_unit),
-        optional_number(rates, |r| r.audio_input_usd_per_second),
-        optional_number(rates, |r| r.audio_output_usd_per_second),
+        optional_decimal(rates, |r| r.input_usd_per_1m)?,
+        optional_decimal(rates, |r| r.output_usd_per_1m)?,
+        optional_decimal(rates, |r| r.cache_read_usd_per_1m)?,
+        optional_decimal(rates, |r| r.cache_write_usd_per_1m)?,
+        optional_decimal(rates, |r| r.reasoning_usd_per_1m)?,
+        optional_decimal(rates, |r| r.request_usd)?,
+        optional_decimal(rates, |r| r.image_input_usd_per_unit)?,
+        optional_decimal(rates, |r| r.image_output_usd_per_unit)?,
+        optional_decimal(rates, |r| r.audio_input_usd_per_second)?,
+        optional_decimal(rates, |r| r.audio_output_usd_per_second)?,
         required_text(rates, |r| &r.currency),
         required_text(rates, |r| &r.source),
         optional_text(rates, |r| r.source_url.as_deref()),
@@ -90,9 +91,28 @@ fn optional_text<'a>(rates: &'a [RateObservation], field: impl Fn(&'a RateObserv
     Arc::new(rates.iter().map(field).collect::<StringArray>())
 }
 
-/// Build an optional `Float64` column by applying `field` to every row.
-fn optional_number(rates: &[RateObservation], field: impl Fn(&RateObservation) -> Option<f64>) -> ArrayRef {
-    Arc::new(rates.iter().map(field).collect::<Float64Array>())
+/// Build an optional `Decimal(RATE_PRECISION, RATE_SCALE)` column.
+///
+/// Each rate is encoded to its unscaled `i128` via [`rate_to_unscaled`], which
+/// rounds onto the storage grid — the same rounding the crawl applies before the
+/// diff, so a stored rate and its re-fetched twin compare equal.
+///
+/// # Errors
+///
+/// Returns an error if the built array's precision/scale are rejected — a
+/// programmer error, since they come from the fixed schema constants.
+fn optional_decimal(rates: &[RateObservation], field: impl Fn(&RateObservation) -> Option<f64>) -> Result<ArrayRef> {
+    // `rate_to_unscaled` is fallible (it refuses non-finite / out-of-range rather
+    // than letting the `as i128` cast saturate silently); `transpose` + `?` lifts
+    // that failure out of the per-cell `Option` instead of swallowing it.
+    let unscaled = rates
+        .iter()
+        .map(|r| field(r).map(rate_to_unscaled).transpose())
+        .collect::<Result<Vec<Option<i128>>>>()?;
+    let array = Decimal128Array::from(unscaled)
+        .with_precision_and_scale(RATE_PRECISION, RATE_SCALE)
+        .map_err(|e| MaintainError::InvariantViolation(format!("prices decimal column: {e}")))?;
+    Ok(Arc::new(array))
 }
 
 /// Append rate rows to `icegate.prices` in a single commit.
@@ -146,7 +166,9 @@ pub async fn append_prices(catalog: &Arc<dyn Catalog>, rates: &[RateObservation]
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    // `float_cmp`: rate values round-trip through the decimal grid exactly, so an
+    // exact `assert_eq!` is the correct assertion, not an epsilon comparison.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
     use chrono::DateTime;
 
@@ -255,7 +277,9 @@ mod tests {
         // `Iterator::map` that closes over the first element instead of `r`).
         // Two rows differing on almost every field pin that each column array
         // is built by iterating `rates`, not by repeating one row's value.
-        use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow::array::{Array, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
+
+        use crate::pricing::decimal::unscaled_to_rate;
 
         let batch = build_price_batch(&[rate(), other_rate()]).expect("batch builds");
         assert_eq!(batch.num_rows(), 2);
@@ -281,17 +305,17 @@ mod tests {
 
         let input_usd = col("input_usd_per_1m")
             .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("float64");
-        assert!((input_usd.value(0) - 5.0).abs() < f64::EPSILON);
-        assert!((input_usd.value(1) - 1.5).abs() < f64::EPSILON);
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal128");
+        assert_eq!(unscaled_to_rate(input_usd.value(0)), 5.0);
+        assert_eq!(unscaled_to_rate(input_usd.value(1)), 1.5);
 
         let cache_read = col("cache_read_usd_per_1m")
             .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("float64");
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal128");
         assert!(cache_read.is_null(0));
-        assert!((cache_read.value(1) - 0.5).abs() < f64::EPSILON);
+        assert_eq!(unscaled_to_rate(cache_read.value(1)), 0.5);
 
         let valid_from_source = col("valid_from_source").as_any().downcast_ref::<StringArray>().expect("utf8");
         assert_eq!(valid_from_source.value(0), "observed");

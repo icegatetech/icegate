@@ -7,13 +7,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Array, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use iceberg::Catalog;
 use icegate_common::{PRICES_TABLE, icegate_table_ident};
 
 use crate::error::{MaintainError, Result};
+use crate::pricing::decimal::unscaled_to_rate;
 use crate::pricing::diff::LiveRates;
 use crate::pricing::source::{RateObservation, ValidFromSource};
 
@@ -62,16 +63,16 @@ struct PriceColumns<'a> {
     max_input_tokens: &'a Int64Array,
     valid_from: &'a TimestampMicrosecondArray,
     valid_from_source: &'a StringArray,
-    input_usd_per_1m: &'a Float64Array,
-    output_usd_per_1m: &'a Float64Array,
-    cache_read_usd_per_1m: &'a Float64Array,
-    cache_write_usd_per_1m: &'a Float64Array,
-    reasoning_usd_per_1m: &'a Float64Array,
-    request_usd: &'a Float64Array,
-    image_input_usd_per_unit: &'a Float64Array,
-    image_output_usd_per_unit: &'a Float64Array,
-    audio_input_usd_per_second: &'a Float64Array,
-    audio_output_usd_per_second: &'a Float64Array,
+    input_usd_per_1m: &'a Decimal128Array,
+    output_usd_per_1m: &'a Decimal128Array,
+    cache_read_usd_per_1m: &'a Decimal128Array,
+    cache_write_usd_per_1m: &'a Decimal128Array,
+    reasoning_usd_per_1m: &'a Decimal128Array,
+    request_usd: &'a Decimal128Array,
+    image_input_usd_per_unit: &'a Decimal128Array,
+    image_output_usd_per_unit: &'a Decimal128Array,
+    audio_input_usd_per_second: &'a Decimal128Array,
+    audio_output_usd_per_second: &'a Decimal128Array,
     currency: &'a StringArray,
     source: &'a StringArray,
     source_url: &'a StringArray,
@@ -141,12 +142,12 @@ fn optional_i64(array: &Int64Array, row: usize) -> Option<i64> {
     }
 }
 
-/// An optional `Float64` cell.
-fn optional_f64(array: &Float64Array, row: usize) -> Option<f64> {
+/// An optional `Decimal128` rate cell, decoded from its unscaled `i128`.
+fn optional_decimal(array: &Decimal128Array, row: usize) -> Option<f64> {
     if array.is_null(row) {
         None
     } else {
-        Some(array.value(row))
+        Some(unscaled_to_rate(array.value(row)))
     }
 }
 
@@ -192,16 +193,16 @@ fn decode_row(columns: &PriceColumns<'_>, row: usize) -> Result<RateObservation>
         max_input_tokens: optional_i64(columns.max_input_tokens, row),
         valid_from,
         valid_from_source: decode_valid_from_source(columns.valid_from_source.value(row))?,
-        input_usd_per_1m: optional_f64(columns.input_usd_per_1m, row),
-        output_usd_per_1m: optional_f64(columns.output_usd_per_1m, row),
-        cache_read_usd_per_1m: optional_f64(columns.cache_read_usd_per_1m, row),
-        cache_write_usd_per_1m: optional_f64(columns.cache_write_usd_per_1m, row),
-        reasoning_usd_per_1m: optional_f64(columns.reasoning_usd_per_1m, row),
-        request_usd: optional_f64(columns.request_usd, row),
-        image_input_usd_per_unit: optional_f64(columns.image_input_usd_per_unit, row),
-        image_output_usd_per_unit: optional_f64(columns.image_output_usd_per_unit, row),
-        audio_input_usd_per_second: optional_f64(columns.audio_input_usd_per_second, row),
-        audio_output_usd_per_second: optional_f64(columns.audio_output_usd_per_second, row),
+        input_usd_per_1m: optional_decimal(columns.input_usd_per_1m, row),
+        output_usd_per_1m: optional_decimal(columns.output_usd_per_1m, row),
+        cache_read_usd_per_1m: optional_decimal(columns.cache_read_usd_per_1m, row),
+        cache_write_usd_per_1m: optional_decimal(columns.cache_write_usd_per_1m, row),
+        reasoning_usd_per_1m: optional_decimal(columns.reasoning_usd_per_1m, row),
+        request_usd: optional_decimal(columns.request_usd, row),
+        image_input_usd_per_unit: optional_decimal(columns.image_input_usd_per_unit, row),
+        image_output_usd_per_unit: optional_decimal(columns.image_output_usd_per_unit, row),
+        audio_input_usd_per_second: optional_decimal(columns.audio_input_usd_per_second, row),
+        audio_output_usd_per_second: optional_decimal(columns.audio_output_usd_per_second, row),
         currency: columns.currency.value(row).to_string(),
         source: columns.source.value(row).to_string(),
         source_url: optional_str(columns.source_url, row),
