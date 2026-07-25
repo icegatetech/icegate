@@ -37,16 +37,22 @@ fn scale_factor() -> f64 {
     10f64.powi(i32::from(RATE_SCALE))
 }
 
-/// How far a rate may sit from the nearest grid point and still count as "on the
-/// grid, modulo `f64` noise" rather than carrying real sub-grid precision.
+/// How far a rate may sit from the nearest grid point, in ULPs of the rate
+/// itself, and still count as "on the grid, modulo `f64` noise".
 ///
-/// A tenth of one grid step (`10^-scale`). The `f64` representation error of a
-/// scaled rate at the guard ceiling is ~0.026 of a step, so a tenth of a step
-/// clears the noise with margin while still being far below the half-step that
-/// separates two grid points. Derived from the scale so it tracks a scale change.
-fn grid_tolerance() -> f64 {
-    0.1 / scale_factor()
-}
+/// The tolerance has to be *relative*: `f64` noise scales with the value, while
+/// a fixed fraction of a grid step does not. An absolute threshold is both too
+/// loose for small rates — `1e-12` sits within a tenth of a step of zero, so it
+/// would quantize to `0.0` and pass as "on the grid" — and needlessly tight for
+/// large ones.
+///
+/// Four ULPs is the widest tolerance that still keeps the property the guard
+/// depends on: at the ceiling (`10_000`) it is 8.9e-12, below the 1e-11 that the
+/// smallest genuine 11th fractional digit moves a rate, so every real sub-grid
+/// value in the priced range is still flagged. Round-tripping a grid value
+/// through [`quantize_rate`] costs under one ULP, so four leaves room for a few
+/// ULPs of upstream artifact (a per-token rate scaled by `1_000_000`) on top.
+const NOISE_TOLERANCE_ULPS: f64 = 4.0;
 
 /// Snap a rate onto the `Decimal(_, scale)` grid it will be stored on.
 ///
@@ -67,9 +73,13 @@ pub fn quantize_rate(value: f64) -> f64 {
 /// rounding them silently. Non-finite values are *not* this function's concern
 /// (the row guards reject them first); it only distinguishes noise from real
 /// sub-grid content, so it treats a non-finite input as "not sub-grid".
+///
+/// `0.0` is on the grid: its tolerance is zero, and so is its distance from the
+/// nearest grid point.
 #[must_use]
 pub fn carries_subgrid_precision(value: f64) -> bool {
-    value.is_finite() && (value - quantize_rate(value)).abs() > grid_tolerance()
+    let tolerance = NOISE_TOLERANCE_ULPS * f64::EPSILON * value.abs();
+    value.is_finite() && (value - quantize_rate(value)).abs() > tolerance
 }
 
 /// Encode a rate as the unscaled `i128` an Arrow `Decimal128` column holds.
@@ -77,10 +87,10 @@ pub fn carries_subgrid_precision(value: f64) -> bool {
 /// # Errors
 ///
 /// Returns [`MaintainError::InvariantViolation`] if `value` is not finite or
-/// scales beyond the `i128` range. Both are unreachable in the crawl — the row
-/// guards reject non-finite and above-ceiling rates, and a real rate scaled by
-/// `10^10` is nowhere near `i128::MAX` — so this is defence in depth against the
-/// silent saturation an `as i128` cast would otherwise do (`NaN` → 0, ∞ →
+/// scales beyond what the column holds. Both are unreachable in the crawl — the
+/// row guards reject non-finite and above-ceiling rates, and a real rate scaled
+/// by `10^10` is nowhere near the bound — so this is defence in depth against
+/// the silent saturation an `as i128` cast would otherwise do (`NaN` → 0, ∞ →
 /// `i128::MAX`), which on a money path would turn a broken rate into a plausible
 /// number.
 pub fn rate_to_unscaled(value: f64) -> Result<i128> {
@@ -96,7 +106,23 @@ pub fn rate_to_unscaled(value: f64) -> Result<i128> {
         )));
     }
     #[allow(clippy::cast_possible_truncation)] // bounds checked above; deliberate f64 -> fixed-point boundary
-    Ok(scaled as i128)
+    let unscaled = scaled as i128;
+    // The cast bound is not the column bound: `i128` reaches ~1.7 * 10^38, so a
+    // 39-digit unscaled value clears it and would reach the Decimal128 writer,
+    // which validates precision/scale but not the values it carries.
+    if unscaled.unsigned_abs() >= unscaled_ceiling() {
+        return Err(MaintainError::InvariantViolation(format!(
+            "rate {value} scales beyond Decimal({RATE_PRECISION}, {RATE_SCALE})"
+        )));
+    }
+    Ok(unscaled)
+}
+
+/// Exclusive bound on the unscaled magnitude a `Decimal(RATE_PRECISION, _)`
+/// column can hold: `10^precision`, i.e. every value of at most `precision`
+/// digits.
+const fn unscaled_ceiling() -> u128 {
+    10u128.pow(PRICE_DECIMAL_PRECISION)
 }
 
 /// `i128::MAX` as `f64` (rounds to `2^127`), the upper cast bound.
@@ -207,6 +233,15 @@ mod tests {
     }
 
     #[test]
+    fn encode_rejects_a_value_that_fits_i128_but_not_the_column() {
+        // 1.1e28 scales to a 39-digit integer: within i128 (~1.7e38) but wider
+        // than Decimal(38, 10). The Decimal128 builder validates precision and
+        // scale, not the values, so the column bound has to be enforced here.
+        assert!(rate_to_unscaled(1.1e28).is_err());
+        assert!(rate_to_unscaled(-1.1e28).is_err());
+    }
+
+    #[test]
     fn grid_representable_values_do_not_count_as_subgrid() {
         // Clean rates and pure f64 artifacts are on the grid modulo noise.
         for v in [
@@ -228,5 +263,20 @@ mod tests {
         // it must be flagged so the guard rejects the row rather than rounding.
         assert!(carries_subgrid_precision(0.000_000_000_05));
         assert!(carries_subgrid_precision(3.000_000_000_05));
+        // Right at the guard ceiling, where the relative tolerance is widest.
+        assert!(carries_subgrid_precision(9_999.999_999_999_95));
+    }
+
+    #[test]
+    fn a_rate_quantizing_to_zero_is_flagged_as_subgrid() {
+        // These sit within a fraction of one grid step of zero, so an absolute
+        // tolerance reads them as "on the grid" and stores them as 0.0 — the
+        // whole value silently dropped, on a money path.
+        for v in [0.000_000_000_001, 1e-15, -1e-15] {
+            assert!(
+                carries_subgrid_precision(v),
+                "{v} quantizes to zero, losing the whole rate"
+            );
+        }
     }
 }
