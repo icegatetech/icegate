@@ -168,6 +168,22 @@ maintain:
         useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
+  ## LLM pricing crawler — enabled in dev with a short 5-minute cadence so a
+  ## real crawl runs shortly after startup and can be inspected. Fetches the
+  ## live OpenRouter and LiteLLM feeds (chart defaults), so the dev cluster
+  ## needs outbound HTTPS to those hosts. Chart defaults cover the rest.
+  pricing:
+    enabled: true
+    intervalSecs: 300
+    jobsmanager:
+      scanIntervalSecs: 300
+      storage:
+        endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
+        bucket: jobs
+        prefix: pricing
+        useSsl: false
+        jobStateCodec: json
+        requestTimeoutSecs: 5
   tracing:
     otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317
   rustLog: "info,icegate_maintain=debug,icegate_jobmanager=debug,icegate_common=debug,opendal=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn,opendal::services::s3::backend=info"

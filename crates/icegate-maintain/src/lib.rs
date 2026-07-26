@@ -13,3 +13,5 @@ pub mod config;
 pub mod gc;
 /// Schema migration operations.
 pub mod migrate;
+/// Background LLM pricing crawler.
+pub mod pricing;

@@ -32,6 +32,13 @@ pub enum MaintainError {
     #[error("migration requires manual intervention: {0}")]
     Migration(String),
 
+    /// No third-party feed yielded usable data in one pass. Distinct from
+    /// [`Self::Storage`], which covers this cluster's own data plane: an
+    /// unreachable or malformed upstream is somebody else's outage, so it wants
+    /// its own alert and its own retry expectations.
+    #[error("no usable upstream data: {0}")]
+    Upstream(String),
+
     /// A data-integrity invariant was violated (e.g. a compaction rewrite
     /// changed the row count or sort-key envelope). Distinct from [`Self::Config`]
     /// so a corruption signal is never confused with a misconfiguration and can

@@ -35,8 +35,8 @@ use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator,
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, METRICS_TABLE, SPANS_TABLE,
-    TENANT_ID_HEADER, catalog::CatalogBuilder, schema,
+    CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, METRICS_TABLE, PRICES_TABLE,
+    SPANS_TABLE, TENANT_ID_HEADER, catalog::CatalogBuilder, schema,
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
@@ -181,6 +181,7 @@ async fn create_namespace_and_tables(catalog: &Arc<dyn Catalog>) -> Result<(), B
         (SPANS_TABLE, schema::spans_schema()?),
         (EVENTS_TABLE, schema::events_schema()?),
         (METRICS_TABLE, schema::metrics_schema()?),
+        (PRICES_TABLE, schema::prices_schema()?),
     ] {
         let creation = iceberg::TableCreation::builder().name(name.to_string()).schema(schema).build();
         let _ = catalog.create_table(&namespace_ident, creation).await?;

@@ -1,8 +1,9 @@
 //! Run command implementation
 //!
 //! Starts the long-running maintenance services (Parquet compaction and, when
-//! enabled, orphan-file GC) and runs them until a shutdown signal (SIGINT or
-//! SIGTERM) is received, then drains both worker pools gracefully.
+//! enabled, orphan-file GC and the LLM pricing crawler) and runs them until a
+//! shutdown signal (SIGINT or SIGTERM) is received, then drains all worker
+//! pools gracefully.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,21 +12,23 @@ use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, run_metrics_serve
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{compact::Compactor, config::MaintainConfig, error::MaintainError, gc::GcRunner};
+use crate::{compact::Compactor, config::MaintainConfig, error::MaintainError, gc::GcRunner, pricing::PricingRunner};
 
 /// Execute the run command.
 ///
 /// Loads the maintain configuration, starts the Prometheus metrics server (when
 /// `metrics.enabled`), builds the Iceberg catalog, starts the compaction
-/// service and (when `gc.enabled`) the orphan-file GC service, then blocks
-/// until a shutdown signal arrives. On shutdown both worker pools are drained
-/// and the metrics server is stopped before returning.
+/// service and (when enabled) the orphan-file GC service and the LLM pricing
+/// crawler, then blocks until a shutdown signal arrives. On shutdown all
+/// worker pools are drained and the metrics server is stopped before
+/// returning.
 ///
 /// # Errors
 ///
 /// Returns [`MaintainError`] if the configuration cannot be loaded, the metrics
-/// runtime cannot be built, the catalog cannot be built, the compactor or GC
-/// runner cannot start, or any worker pool stops with an error during shutdown.
+/// runtime cannot be built, the catalog cannot be built, the compactor, GC
+/// runner, or pricing crawler cannot start, or any worker pool stops with an
+/// error during shutdown.
 pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
@@ -91,6 +94,41 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
         None
     };
 
+    // Start the pricing crawler alongside compaction and GC when enabled. The
+    // runner is dropped after `start()`; the returned handle owns the workers.
+    let pricing_handle = if config.pricing.enabled {
+        match PricingRunner::new(Arc::clone(&catalog), &config.pricing)
+            .await
+            .and_then(|runner| runner.start())
+        {
+            Ok(handle) => {
+                tracing::info!("pricing crawler service started");
+                Some(handle)
+            }
+            // The compactor (and, if enabled, GC) are already running; a pricing
+            // startup failure must still drain them and stop the metrics server
+            // before propagating the error.
+            Err(error) => {
+                cancel_token.cancel();
+                if let Err(drain_error) = compactor_handle.shutdown().await {
+                    tracing::error!("compactor drain error after pricing startup failure: {drain_error}");
+                }
+                if let Some(handle) = gc_handle {
+                    if let Err(drain_error) = handle.shutdown().await {
+                        tracing::error!("gc drain error after pricing startup failure: {drain_error}");
+                    }
+                }
+                metrics_cancel.cancel();
+                if let Some(server) = metrics_server {
+                    let _ = server.await;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     // Wait for shutdown, but watch the metrics server task at the same time: it
     // only resolves before a shutdown signal if it failed to start (e.g. its port
     // is already bound). Surfacing that here aborts the service immediately rather
@@ -102,26 +140,41 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // out its full retry budget, so the worker drain below completes promptly.
     cancel_token.cancel();
     tracing::info!("draining maintenance workers");
-    // Drain both loops before propagating either error so a compactor drain
-    // failure cannot skip the GC drain.
+    // Drain all three loops before propagating any error so a compactor (or GC)
+    // drain failure cannot skip the others.
     let compactor_drain = compactor_handle.shutdown().await;
     let gc_drain = match gc_handle {
         Some(handle) => handle.shutdown().await,
         None => Ok(()),
     };
-    // A compactor-drain error below short-circuits before `gc_drain?`, so a
-    // simultaneous GC-drain failure would be lost. Surface it here first.
+    let pricing_drain = match pricing_handle {
+        Some(handle) => handle.shutdown().await,
+        None => Ok(()),
+    };
+    // The chosen `drain_result` below short-circuits on the first error in
+    // compactor -> gc -> pricing order, so a later failure in that order would
+    // otherwise be lost. Surface every suppressed failure here first.
     if compactor_drain.is_err() {
         if let Err(ref error) = gc_drain {
             tracing::error!("gc drain error (suppressed by compactor drain failure): {error}");
         }
+        if let Err(ref error) = pricing_drain {
+            tracing::error!("pricing drain error (suppressed by compactor drain failure): {error}");
+        }
+    } else if gc_drain.is_err() {
+        if let Err(ref error) = pricing_drain {
+            tracing::error!("pricing drain error (suppressed by gc drain failure): {error}");
+        }
     }
     // Defer surfacing a worker-drain failure until the metrics server has been
-    // stopped below, so a drain error never leaks the metrics task. A compactor
-    // failure takes precedence; the GC failure was already logged above.
+    // stopped below, so a drain error never leaks the metrics task. Earlier
+    // failures take precedence; later ones were already logged above.
     let drain_result = match compactor_drain {
         Err(error) => Err(error),
-        Ok(()) => gc_drain,
+        Ok(()) => match gc_drain {
+            Err(error) => Err(error),
+            Ok(()) => pricing_drain,
+        },
     };
 
     // Stop the metrics server and wait for it to unbind before the runtime (and

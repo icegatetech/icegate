@@ -51,7 +51,7 @@ async fn setup_containers() -> (S3TestContainer, CatalogConfig) {
     (store, config)
 }
 
-/// Test that `create_tables` creates all 5 observability tables
+/// Test that `create_tables` creates all 6 observability tables
 #[tokio::test]
 async fn test_migrate_create_tables() {
     let (_store, config) = setup_containers().await;
@@ -72,8 +72,8 @@ async fn test_migrate_create_tables() {
         }
     };
 
-    // Should have created 5 tables: logs, spans, events, metrics, operations
-    assert_eq!(ops.len(), 5, "Expected 5 table creation operations");
+    // Should have created 6 tables: logs, spans, events, metrics, operations, prices
+    assert_eq!(ops.len(), 6, "Expected 6 table creation operations");
 
     // Verify table names
     let table_names: Vec<&str> = ops
@@ -91,6 +91,7 @@ async fn test_migrate_create_tables() {
     assert!(table_names.contains(&"events"));
     assert!(table_names.contains(&"metrics"));
     assert!(table_names.contains(&"operations"));
+    assert!(table_names.contains(&"prices"));
 }
 
 /// Test that `create_tables` with `dry_run=true` returns operations but doesn't
@@ -106,18 +107,18 @@ async fn test_migrate_create_tables_dry_run() {
     // First call with dry_run=true
     let ops = create_tables(&catalog, true).await.expect("Failed to dry-run create tables");
 
-    // Should report 5 operations
-    assert_eq!(ops.len(), 5, "Expected 5 table creation operations in dry-run");
+    // Should report 6 operations
+    assert_eq!(ops.len(), 6, "Expected 6 table creation operations in dry-run");
 
     // Verify NO tables were actually created by calling create_tables again
-    // This time with dry_run=false, it should still create 5 tables
+    // This time with dry_run=false, it should still create 6 tables
     let ops_actual = create_tables(&catalog, false)
         .await
         .expect("Failed to create tables after dry-run");
 
     assert_eq!(
         ops_actual.len(),
-        5,
+        6,
         "Tables should not have been created during dry-run"
     );
 }
@@ -135,7 +136,7 @@ async fn test_migrate_create_tables_idempotent() {
     let ops_first = create_tables(&catalog, false)
         .await
         .expect("Failed to create tables first time");
-    assert_eq!(ops_first.len(), 5, "First call should create 5 tables");
+    assert_eq!(ops_first.len(), 6, "First call should create 6 tables");
 
     // Second call - should be idempotent
     let ops_second = create_tables(&catalog, false)
@@ -159,7 +160,7 @@ async fn test_migrate_upgrade_schemas() {
 
     // First create the tables
     let create_ops = create_tables(&catalog, false).await.expect("Failed to create tables");
-    assert_eq!(create_ops.len(), 5);
+    assert_eq!(create_ops.len(), 6);
 
     // Now call upgrade_schemas - should return 0 operations since schemas are
     // current

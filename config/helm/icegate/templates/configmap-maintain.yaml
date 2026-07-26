@@ -70,6 +70,30 @@ data:
           use_ssl: {{ .Values.maintain.gc.jobsmanager.storage.useSsl }}
           job_state_codec: {{ .Values.maintain.gc.jobsmanager.storage.jobStateCodec }}
           request_timeout_secs: {{ .Values.maintain.gc.jobsmanager.storage.requestTimeoutSecs }}
+    pricing:
+      enabled: {{ .Values.maintain.pricing.enabled }}
+      interval_secs: {{ .Values.maintain.pricing.intervalSecs }}
+      timeout_secs: {{ .Values.maintain.pricing.timeoutSecs }}
+      crawl_timeout_secs: {{ .Values.maintain.pricing.crawlTimeoutSecs }}
+      max_change_ratio: {{ .Values.maintain.pricing.maxChangeRatio }}
+      min_model_count_ratio: {{ .Values.maintain.pricing.minModelCountRatio }}
+      max_response_bytes: {{ .Values.maintain.pricing.maxResponseBytes | int }}
+      billing_region:
+        {{- toYaml .Values.maintain.pricing.billingRegion | nindent 8 }}
+      sources:
+        {{- toYaml .Values.maintain.pricing.sources | nindent 8 }}
+      jobsmanager:
+        scan_interval_secs: {{ .Values.maintain.pricing.jobsmanager.scanIntervalSecs }}
+        worker_count: {{ .Values.maintain.pricing.jobsmanager.workerCount }}
+        poll_interval_ms: {{ .Values.maintain.pricing.jobsmanager.pollIntervalMs }}
+        storage:
+          endpoint: {{ .Values.maintain.pricing.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          bucket: {{ .Values.maintain.pricing.jobsmanager.storage.bucket | quote }}
+          prefix: {{ .Values.maintain.pricing.jobsmanager.storage.prefix | quote }}
+          region: {{ .Values.maintain.pricing.jobsmanager.storage.region | default .Values.aws.region | quote }}
+          use_ssl: {{ .Values.maintain.pricing.jobsmanager.storage.useSsl }}
+          job_state_codec: {{ .Values.maintain.pricing.jobsmanager.storage.jobStateCodec }}
+          request_timeout_secs: {{ .Values.maintain.pricing.jobsmanager.storage.requestTimeoutSecs }}
     metrics:
       enabled: {{ .Values.maintain.metrics.enabled }}
       host: "0.0.0.0"

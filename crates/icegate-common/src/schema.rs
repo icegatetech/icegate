@@ -16,6 +16,13 @@ use iceberg::{
 
 use crate::error::Result;
 
+/// Decimal precision of every `icegate.prices` rate column. 38 is the
+/// `Decimal128` maximum; see [`prices_schema`] for why decimal, not `Double`.
+pub const PRICE_DECIMAL_PRECISION: u32 = 38;
+/// Decimal scale (fractional digits) of every `icegate.prices` rate column.
+/// The crawler quantizes rates onto this grid before storing them.
+pub const PRICE_DECIMAL_SCALE: u32 = 10;
+
 /// Creates the Iceberg schema for `OpenTelemetry` logs.
 ///
 /// Based on the `LogRecord` message from
@@ -830,6 +837,197 @@ pub fn operations_sort_order(schema: &Schema) -> Result<SortOrder> {
     Ok(sort_order)
 }
 
+/// Creates the Iceberg schema for the global LLM rate card.
+///
+/// Unlike the five telemetry tables this carries **no `tenant_id`**: rates are
+/// reference data, identical for every tenant. It is an append-only observation
+/// log — a row is written only when a rate first differs from the previous one
+/// for its key, and `valid_to` is derived at query time (there is no row-level
+/// update in this codebase; the only write path is `fast_append`).
+///
+/// # Key
+///
+/// `(provider, model, service_tier, region, min_input_tokens, valid_from)`.
+/// Context tiers and service tiers live in the key rather than in extra columns
+/// so the rate columns stay flat as the card grows.
+///
+/// # Field IDs
+///
+/// Assigned sequentially 1–22. Schema ID is 6 (1–5 are the telemetry tables).
+///
+/// # Errors
+///
+/// Returns an error if the schema cannot be built.
+#[allow(clippy::too_many_lines)]
+pub fn prices_schema() -> Result<Schema> {
+    // Rate columns are fixed-point decimal, not `Double`: money must be exact,
+    // and binary `f64` cannot represent values like `0.075` nor sum them without
+    // drift. `Decimal(38, 10)` fits every real rate (ceiling is 10_000, so 5
+    // integer digits, far below 28) with 10 fractional digits — well beyond the
+    // ~6 significant decimals any token price carries. 38 is the `Decimal128`
+    // maximum and costs nothing over a smaller precision (both are 16 bytes).
+    let rate_type = Type::Primitive(PrimitiveType::Decimal {
+        precision: PRICE_DECIMAL_PRECISION,
+        scale: PRICE_DECIMAL_SCALE,
+    });
+    let schema = Schema::builder()
+        .with_schema_id(6)
+        .with_fields(vec![
+            // ── key ──────────────────────────────────────────────────────
+            // Matches `operations.provider_name` verbatim (OTel `gen_ai.provider.name`).
+            Arc::new(NestedField::required(
+                1,
+                COL_PROVIDER,
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // The serving platform's own name, matching `operations.request_model`.
+            Arc::new(NestedField::required(
+                2,
+                COL_MODEL,
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── identity ─────────────────────────────────────────────────
+            // Cross-provider model identity, namespaced by AUTHOR not seller
+            // (`anthropic/claude-3-5-sonnet-20241022`). Nullable: a wrong or
+            // absent value costs grouping accuracy, never pricing accuracy.
+            Arc::new(NestedField::optional(
+                3,
+                COL_CANONICAL_ID,
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── key (continued) ──────────────────────────────────────────
+            Arc::new(NestedField::required(
+                4,
+                COL_SERVICE_TIER,
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // Reseller region; `global` for vendors with one worldwide price.
+            // Required with a sentinel rather than nullable so the key is always
+            // complete and the configured-region filter always has a match.
+            Arc::new(NestedField::required(
+                5,
+                COL_REGION,
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::required(
+                6,
+                COL_MIN_INPUT_TOKENS,
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                7,
+                COL_MAX_INPUT_TOKENS,
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::required(
+                8,
+                COL_VALID_FROM,
+                Type::Primitive(PrimitiveType::Timestamp),
+            )),
+            // `vendor` when the source published an effective date (AWS does),
+            // `observed` when it is the crawl time that first saw the change.
+            Arc::new(NestedField::required(
+                9,
+                COL_VALID_FROM_SOURCE,
+                Type::Primitive(PrimitiveType::String),
+            )),
+            // ── token rates (USD per 1M tokens) ──────────────────────────
+            Arc::new(NestedField::optional(10, COL_INPUT_USD_PER_1M, rate_type.clone())),
+            Arc::new(NestedField::optional(11, COL_OUTPUT_USD_PER_1M, rate_type.clone())),
+            Arc::new(NestedField::optional(12, COL_CACHE_READ_USD_PER_1M, rate_type.clone())),
+            Arc::new(NestedField::optional(13, COL_CACHE_WRITE_USD_PER_1M, rate_type.clone())),
+            Arc::new(NestedField::optional(14, COL_REASONING_USD_PER_1M, rate_type.clone())),
+            // ── non-token rates ──────────────────────────────────────────
+            Arc::new(NestedField::optional(15, COL_REQUEST_USD, rate_type.clone())),
+            // Image and audio rates are populated by the crawler but currently
+            // unjoinable: `operations` stores only the six token counters. They
+            // are carried because reading them is nearly free and backfilling a
+            // column later is far more painful than shipping it inert.
+            Arc::new(NestedField::optional(
+                16,
+                COL_IMAGE_INPUT_USD_PER_UNIT,
+                rate_type.clone(),
+            )),
+            Arc::new(NestedField::optional(
+                17,
+                COL_IMAGE_OUTPUT_USD_PER_UNIT,
+                rate_type.clone(),
+            )),
+            Arc::new(NestedField::optional(
+                18,
+                COL_AUDIO_INPUT_USD_PER_SECOND,
+                rate_type.clone(),
+            )),
+            Arc::new(NestedField::optional(19, COL_AUDIO_OUTPUT_USD_PER_SECOND, rate_type)),
+            // ── provenance ───────────────────────────────────────────────
+            Arc::new(NestedField::required(
+                20,
+                COL_CURRENCY,
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::required(
+                21,
+                COL_SOURCE,
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                22,
+                COL_SOURCE_URL,
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ])
+        .build()?;
+
+    Ok(schema)
+}
+
+/// Unpartitioned spec for [`prices_schema`].
+///
+/// The table holds a few thousand rows and is scanned whole on every cost query,
+/// so partitioning would add file count and manifest overhead with no pruning
+/// benefit. This is the only unpartitioned table in the catalog.
+///
+/// # Errors
+///
+/// Returns an error if the spec cannot be built for the given schema.
+pub fn prices_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
+    let spec = PartitionSpec::builder(schema.clone()).with_spec_id(6).build()?;
+
+    Ok(spec)
+}
+
+/// Sort order for [`prices_schema`], matching the append key.
+///
+/// Ordering by the key clusters each model's revision history together, so the
+/// `LEAD(valid_from)` window that derives `valid_to` reads sequentially.
+///
+/// # Errors
+///
+/// Returns an error if any sort column is missing from the schema.
+pub fn prices_sort_order(schema: &Schema) -> Result<SortOrder> {
+    let mut builder = SortOrder::builder();
+    builder.with_order_id(6);
+
+    for name in PRICES_KEY_COLUMNS.iter().copied().chain([COL_VALID_FROM]) {
+        let field = schema.field_by_name(name).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("field '{name}' not found in prices schema"),
+            )
+        })?;
+        builder.with_sort_field(SortField {
+            source_id: field.id,
+            transform: Transform::Identity,
+            direction: SortDirection::Ascending,
+            null_order: iceberg::spec::NullOrder::First,
+        });
+    }
+
+    let sort_order = builder.build(schema)?;
+
+    Ok(sort_order)
+}
+
 /// Creates partition specification for spans table.
 ///
 /// Partitions by:
@@ -1428,6 +1626,67 @@ pub const COL_ZERO_THRESHOLD: &str = "zero_threshold";
 /// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
 pub const LEVEL_ALIAS: &str = "level";
 
+// ── Prices table column name constants ───────────────────────────────
+
+/// Prices — selling platform, matching `operations.provider_name`.
+pub const COL_PROVIDER: &str = "provider";
+/// Prices — platform's own model name, matching `operations.request_model`.
+pub const COL_MODEL: &str = "model";
+/// Prices — service tier (`standard`, `batch`, …).
+pub const COL_SERVICE_TIER: &str = "service_tier";
+/// Prices — reseller region; `global` for one worldwide price.
+pub const COL_REGION: &str = "region";
+/// Prices — inclusive lower bound of the context tier, in tokens.
+pub const COL_MIN_INPUT_TOKENS: &str = "min_input_tokens";
+/// Prices — instant this revision took effect.
+pub const COL_VALID_FROM: &str = "valid_from";
+/// Prices — cross-provider model identity, namespaced by author.
+pub const COL_CANONICAL_ID: &str = "canonical_id";
+/// Prices — exclusive upper bound of the context tier; NULL is unbounded.
+pub const COL_MAX_INPUT_TOKENS: &str = "max_input_tokens";
+/// Prices — whether [`COL_VALID_FROM`] is the vendor's date or the crawl's.
+pub const COL_VALID_FROM_SOURCE: &str = "valid_from_source";
+/// Prices — USD per 1M input tokens.
+pub const COL_INPUT_USD_PER_1M: &str = "input_usd_per_1m";
+/// Prices — USD per 1M output tokens.
+pub const COL_OUTPUT_USD_PER_1M: &str = "output_usd_per_1m";
+/// Prices — USD per 1M cache-read tokens.
+pub const COL_CACHE_READ_USD_PER_1M: &str = "cache_read_usd_per_1m";
+/// Prices — USD per 1M cache-write tokens.
+pub const COL_CACHE_WRITE_USD_PER_1M: &str = "cache_write_usd_per_1m";
+/// Prices — USD per 1M reasoning tokens.
+pub const COL_REASONING_USD_PER_1M: &str = "reasoning_usd_per_1m";
+/// Prices — flat per-request fee in USD.
+pub const COL_REQUEST_USD: &str = "request_usd";
+/// Prices — USD per input image.
+pub const COL_IMAGE_INPUT_USD_PER_UNIT: &str = "image_input_usd_per_unit";
+/// Prices — USD per output image.
+pub const COL_IMAGE_OUTPUT_USD_PER_UNIT: &str = "image_output_usd_per_unit";
+/// Prices — USD per second of input audio.
+pub const COL_AUDIO_INPUT_USD_PER_SECOND: &str = "audio_input_usd_per_second";
+/// Prices — USD per second of output audio.
+pub const COL_AUDIO_OUTPUT_USD_PER_SECOND: &str = "audio_output_usd_per_second";
+/// Prices — ISO currency code of every rate on the row.
+pub const COL_CURRENCY: &str = "currency";
+/// Prices — identifier of the upstream rate card the row came from.
+pub const COL_SOURCE: &str = "source";
+/// Prices — provenance URL of the upstream rate card.
+pub const COL_SOURCE_URL: &str = "source_url";
+
+/// The `prices` key columns that identify one rate line across revisions.
+///
+/// [`COL_VALID_FROM`] completes the append key but is deliberately excluded:
+/// consumers partition by this slice and order by `valid_from` within it, which
+/// is exactly how [`prices_sort_order`] clusters the table and how the
+/// `prices_effective` view derives `valid_to`.
+pub const PRICES_KEY_COLUMNS: &[&str] = &[
+    COL_PROVIDER,
+    COL_MODEL,
+    COL_SERVICE_TIER,
+    COL_REGION,
+    COL_MIN_INPUT_TOKENS,
+];
+
 /// Indexed attribute columns for log label extraction.
 ///
 /// These columns are extracted as top-level fields from log query results.
@@ -1869,5 +2128,116 @@ mod tests {
         };
         assert_eq!(meta_map.key_field.id, 51);
         assert_eq!(meta_map.value_field.id, 52);
+    }
+
+    #[test]
+    fn prices_schema_has_expected_key_and_rate_fields() {
+        let schema = prices_schema().expect("prices schema builds");
+
+        // Key columns — all required.
+        for name in [
+            "provider",
+            "model",
+            "service_tier",
+            "region",
+            "min_input_tokens",
+            "valid_from",
+            "valid_from_source",
+            "currency",
+            "source",
+        ] {
+            let field = schema
+                .field_by_name(name)
+                .unwrap_or_else(|| panic!("field '{name}' missing from prices schema"));
+            assert!(field.required, "field '{name}' must be required");
+        }
+
+        // Cross-provider identity is nullable by design: a missing canonical_id
+        // degrades grouping, never pricing.
+        assert!(!schema.field_by_name("canonical_id").expect("canonical_id").required);
+
+        // Rate columns are all optional — not every model prices every dimension.
+        for name in [
+            "input_usd_per_1m",
+            "output_usd_per_1m",
+            "cache_read_usd_per_1m",
+            "cache_write_usd_per_1m",
+            "reasoning_usd_per_1m",
+            "request_usd",
+            "image_input_usd_per_unit",
+            "image_output_usd_per_unit",
+            "audio_input_usd_per_second",
+            "audio_output_usd_per_second",
+            "max_input_tokens",
+            "source_url",
+        ] {
+            let field = schema
+                .field_by_name(name)
+                .unwrap_or_else(|| panic!("field '{name}' missing from prices schema"));
+            assert!(!field.required, "field '{name}' must be optional");
+        }
+    }
+
+    #[test]
+    fn prices_rate_columns_are_fixed_point_decimal_not_double() {
+        // Money must be exact. A regression back to `Double` would silently
+        // reintroduce float rounding into stored rates and cost sums.
+        let schema = prices_schema().expect("prices schema builds");
+        for name in [
+            "input_usd_per_1m",
+            "output_usd_per_1m",
+            "cache_read_usd_per_1m",
+            "cache_write_usd_per_1m",
+            "reasoning_usd_per_1m",
+            "request_usd",
+            "image_input_usd_per_unit",
+            "image_output_usd_per_unit",
+            "audio_input_usd_per_second",
+            "audio_output_usd_per_second",
+        ] {
+            let field = schema.field_by_name(name).unwrap_or_else(|| panic!("field '{name}' missing"));
+            match &*field.field_type {
+                Type::Primitive(PrimitiveType::Decimal { precision, scale }) => {
+                    assert_eq!(*precision, PRICE_DECIMAL_PRECISION, "{name} precision");
+                    assert_eq!(*scale, PRICE_DECIMAL_SCALE, "{name} scale");
+                }
+                other => panic!("rate column '{name}' must be Decimal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn prices_schema_has_no_tenant_id() {
+        // `prices` is global reference data. A tenant_id column here would imply
+        // per-tenant rates and would make the GLOBAL_TABLES allowlist wrong.
+        let schema = prices_schema().expect("prices schema builds");
+        assert!(schema.field_by_name("tenant_id").is_none());
+    }
+
+    #[test]
+    fn prices_partition_spec_is_unpartitioned() {
+        // A few thousand rows: partitioning adds file count for no pruning benefit.
+        let schema = prices_schema().expect("prices schema builds");
+        let spec = prices_partition_spec(&schema).expect("partition spec builds");
+        assert!(spec.fields().is_empty(), "prices must be unpartitioned");
+    }
+
+    #[test]
+    fn prices_sort_order_matches_the_append_key() {
+        let schema = prices_schema().expect("prices schema builds");
+        let order = prices_sort_order(&schema).expect("sort order builds");
+        let ids: Vec<i32> = order.fields.iter().map(|f| f.source_id).collect();
+        let expected: Vec<i32> = [
+            "provider",
+            "model",
+            "service_tier",
+            "region",
+            "min_input_tokens",
+            "valid_from",
+        ]
+        .iter()
+        .map(|n| schema.field_by_name(n).expect("field present").id)
+        .collect();
+        assert_eq!(ids, expected);
     }
 }

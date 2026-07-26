@@ -659,6 +659,64 @@ maintain:
         jobStateCodec: json
         requestTimeoutSecs: 5
 
+  ## LLM pricing crawler. Fetches rate cards from upstream JSON feeds and appends
+  ## changed rates to the global `icegate.prices` table. Disabled by default
+  ## because it is the one maintain workload that makes outbound internet calls —
+  ## enabling it is a deployment decision (egress policy, source reachability).
+  pricing:
+    enabled: false
+    ## Seconds between crawls. Prices move on the order of hours, not seconds.
+    intervalSecs: 21600
+    ## Per-source HTTP timeout, in seconds.
+    timeoutSecs: 60
+    ## Deadline for one whole crawl, in seconds. Must exceed timeoutSecs: sources
+    ## fetch concurrently, so a crawl costs one HTTP round trip plus the guard,
+    ## diff, and Iceberg append that follow. A task that overruns its deadline
+    ## becomes pickup-eligible again, and a second worker would append every
+    ## revision twice.
+    crawlTimeoutSecs: 600
+    ## Reject a rate that moved by more than this multiple of the live rate; the
+    ## delta guard. 0.0 disables it. Blocks legitimate large cuts on purpose — a
+    ## 10x move on a money path should get a human, not land silently overnight.
+    maxChangeRatio: 10.0
+    ## Abort a source's rows when it returns fewer than this fraction of the
+    ## models it currently has live — the signature of a truncated response.
+    minModelCountRatio: 0.8
+    ## Hard cap on a single source response body (128 MiB); the AWS price list is
+    ## tens of MB, and this bounds a mis-pointed URL.
+    maxResponseBytes: 134217728
+    ## Which region each reseller bills in, exposed by the prices_effective view.
+    ## Providers absent here use the "global" sentinel. Direct vendors (OpenAI,
+    ## Anthropic) have one worldwide price and need no entry.
+    ## Example: { "aws.bedrock": "us-east-1" }
+    billingRegion: {}
+    ## Sources to crawl. Each is { name, url } and optionally `owns` to reassign
+    ## which providers it is authoritative for. URLs are configurable so an
+    ## air-gapped deployment can point at internal mirrors.
+    sources:
+      - name: openrouter
+        url: https://openrouter.ai/api/v1/models
+      - name: litellm
+        url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+    ## Jobs-manager settings. Reuses compaction's shape with a distinct "pricing"
+    ## job-state prefix. Note: the crawl cadence is `intervalSecs` above, NOT
+    ## `scanIntervalSecs` — this job has a single task, so the jobmanager's own
+    ## discovery loop is not what drives crawling.
+    jobsmanager:
+      scanIntervalSecs: 21600
+      ## One worker: the single crawl task fetches all sources concurrently itself.
+      workerCount: 1
+      pollIntervalMs: 1000
+      storage:
+        ## Defaults to storage.s3.endpoint when empty.
+        endpoint: ""
+        bucket: jobs
+        prefix: pricing
+        region: ""  # defaults to aws.region
+        useSsl: false
+        jobStateCodec: json
+        requestTimeoutSecs: 5
+
   ## Prometheus metrics endpoint. When enabled, the long-running `run` service
   ## installs the global meter provider (so the compactor's CompactMetrics
   ## record) and serves /metrics on this port. Scraped by the per-component
