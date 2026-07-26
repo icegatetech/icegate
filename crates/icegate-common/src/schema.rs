@@ -892,7 +892,7 @@ pub fn prices_schema() -> Result<Schema> {
             // absent value costs grouping accuracy, never pricing accuracy.
             Arc::new(NestedField::optional(
                 3,
-                "canonical_id",
+                COL_CANONICAL_ID,
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── key (continued) ──────────────────────────────────────────
@@ -916,7 +916,7 @@ pub fn prices_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 7,
-                "max_input_tokens",
+                COL_MAX_INPUT_TOKENS,
                 Type::Primitive(PrimitiveType::Long),
             )),
             Arc::new(NestedField::required(
@@ -928,47 +928,51 @@ pub fn prices_schema() -> Result<Schema> {
             // `observed` when it is the crawl time that first saw the change.
             Arc::new(NestedField::required(
                 9,
-                "valid_from_source",
+                COL_VALID_FROM_SOURCE,
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── token rates (USD per 1M tokens) ──────────────────────────
-            Arc::new(NestedField::optional(10, "input_usd_per_1m", rate_type.clone())),
-            Arc::new(NestedField::optional(11, "output_usd_per_1m", rate_type.clone())),
-            Arc::new(NestedField::optional(12, "cache_read_usd_per_1m", rate_type.clone())),
-            Arc::new(NestedField::optional(13, "cache_write_usd_per_1m", rate_type.clone())),
-            Arc::new(NestedField::optional(14, "reasoning_usd_per_1m", rate_type.clone())),
+            Arc::new(NestedField::optional(10, COL_INPUT_USD_PER_1M, rate_type.clone())),
+            Arc::new(NestedField::optional(11, COL_OUTPUT_USD_PER_1M, rate_type.clone())),
+            Arc::new(NestedField::optional(12, COL_CACHE_READ_USD_PER_1M, rate_type.clone())),
+            Arc::new(NestedField::optional(13, COL_CACHE_WRITE_USD_PER_1M, rate_type.clone())),
+            Arc::new(NestedField::optional(14, COL_REASONING_USD_PER_1M, rate_type.clone())),
             // ── non-token rates ──────────────────────────────────────────
-            Arc::new(NestedField::optional(15, "request_usd", rate_type.clone())),
+            Arc::new(NestedField::optional(15, COL_REQUEST_USD, rate_type.clone())),
             // Image and audio rates are populated by the crawler but currently
             // unjoinable: `operations` stores only the six token counters. They
             // are carried because reading them is nearly free and backfilling a
             // column later is far more painful than shipping it inert.
-            Arc::new(NestedField::optional(16, "image_input_usd_per_unit", rate_type.clone())),
+            Arc::new(NestedField::optional(
+                16,
+                COL_IMAGE_INPUT_USD_PER_UNIT,
+                rate_type.clone(),
+            )),
             Arc::new(NestedField::optional(
                 17,
-                "image_output_usd_per_unit",
+                COL_IMAGE_OUTPUT_USD_PER_UNIT,
                 rate_type.clone(),
             )),
             Arc::new(NestedField::optional(
                 18,
-                "audio_input_usd_per_second",
+                COL_AUDIO_INPUT_USD_PER_SECOND,
                 rate_type.clone(),
             )),
-            Arc::new(NestedField::optional(19, "audio_output_usd_per_second", rate_type)),
+            Arc::new(NestedField::optional(19, COL_AUDIO_OUTPUT_USD_PER_SECOND, rate_type)),
             // ── provenance ───────────────────────────────────────────────
             Arc::new(NestedField::required(
                 20,
-                "currency",
+                COL_CURRENCY,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::required(
                 21,
-                "source",
+                COL_SOURCE,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
                 22,
-                "source_url",
+                COL_SOURCE_URL,
                 Type::Primitive(PrimitiveType::String),
             )),
         ])
@@ -1636,6 +1640,38 @@ pub const COL_REGION: &str = "region";
 pub const COL_MIN_INPUT_TOKENS: &str = "min_input_tokens";
 /// Prices — instant this revision took effect.
 pub const COL_VALID_FROM: &str = "valid_from";
+/// Prices — cross-provider model identity, namespaced by author.
+pub const COL_CANONICAL_ID: &str = "canonical_id";
+/// Prices — exclusive upper bound of the context tier; NULL is unbounded.
+pub const COL_MAX_INPUT_TOKENS: &str = "max_input_tokens";
+/// Prices — whether [`COL_VALID_FROM`] is the vendor's date or the crawl's.
+pub const COL_VALID_FROM_SOURCE: &str = "valid_from_source";
+/// Prices — USD per 1M input tokens.
+pub const COL_INPUT_USD_PER_1M: &str = "input_usd_per_1m";
+/// Prices — USD per 1M output tokens.
+pub const COL_OUTPUT_USD_PER_1M: &str = "output_usd_per_1m";
+/// Prices — USD per 1M cache-read tokens.
+pub const COL_CACHE_READ_USD_PER_1M: &str = "cache_read_usd_per_1m";
+/// Prices — USD per 1M cache-write tokens.
+pub const COL_CACHE_WRITE_USD_PER_1M: &str = "cache_write_usd_per_1m";
+/// Prices — USD per 1M reasoning tokens.
+pub const COL_REASONING_USD_PER_1M: &str = "reasoning_usd_per_1m";
+/// Prices — flat per-request fee in USD.
+pub const COL_REQUEST_USD: &str = "request_usd";
+/// Prices — USD per input image.
+pub const COL_IMAGE_INPUT_USD_PER_UNIT: &str = "image_input_usd_per_unit";
+/// Prices — USD per output image.
+pub const COL_IMAGE_OUTPUT_USD_PER_UNIT: &str = "image_output_usd_per_unit";
+/// Prices — USD per second of input audio.
+pub const COL_AUDIO_INPUT_USD_PER_SECOND: &str = "audio_input_usd_per_second";
+/// Prices — USD per second of output audio.
+pub const COL_AUDIO_OUTPUT_USD_PER_SECOND: &str = "audio_output_usd_per_second";
+/// Prices — ISO currency code of every rate on the row.
+pub const COL_CURRENCY: &str = "currency";
+/// Prices — identifier of the upstream rate card the row came from.
+pub const COL_SOURCE: &str = "source";
+/// Prices — provenance URL of the upstream rate card.
+pub const COL_SOURCE_URL: &str = "source_url";
 
 /// The `prices` key columns that identify one rate line across revisions.
 ///

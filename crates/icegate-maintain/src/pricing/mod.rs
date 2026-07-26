@@ -12,10 +12,12 @@
 //!    guard discards the source's entire batch on failure, not individual
 //!    rows; the row guards run; a source with no live rows to compare against
 //!    logs a WARN summary, since both live-comparing guards no-op for it.
-//! 4. Drop any candidate repeating a key an earlier one already claimed.
-//! 5. Derive `canonical_id` over the pooled candidates.
-//! 6. Diff against the live rate card.
-//! 7. Append changed rates in a single commit — or nothing, if none changed.
+//! 4. Fail the crawl if *no* source contributed a row — one source going dark
+//!    is tolerated, all of them going dark is an outage, not a quiet market.
+//! 5. Drop any candidate repeating a key an earlier one already claimed.
+//! 6. Derive `canonical_id` over the pooled candidates.
+//! 7. Diff against the live rate card.
+//! 8. Append changed rates in a single commit — or nothing, if none changed.
 
 /// Cross-provider model identity derivation.
 pub mod canonical;
@@ -163,6 +165,19 @@ fn log_bootstrap_summary(source_name: &str, accepted: &[source::RateObservation]
     );
 }
 
+/// What one source contributed to a crawl.
+///
+/// A source that contributes nothing leaves its live rates in effect, which is
+/// the right per-source behaviour but indistinguishable from "prices did not
+/// move" once the contributions are pooled. Carrying the reason lets
+/// [`run_crawl`] tell the two apart when *every* source contributes nothing.
+enum SourceContribution {
+    /// Rows that survived ownership scoping and every guard; never empty.
+    Rates(Vec<source::RateObservation>),
+    /// The source supplied no usable rows, for this reason.
+    Nothing(String),
+}
+
 /// Source-independent context [`process_source`] needs, bundled so its
 /// parameter count stays within the workspace's `too-many-arguments`
 /// threshold.
@@ -187,7 +202,7 @@ fn process_source(
     elapsed_secs: f64,
     result: Result<Vec<source::RateObservation>>,
     ctx: &CrawlContext<'_>,
-) -> Vec<source::RateObservation> {
+) -> SourceContribution {
     let name = source_impl.name();
     ctx.metrics.record_duration(name, elapsed_secs);
 
@@ -195,7 +210,7 @@ fn process_source(
         Ok(rates) => rates,
         Err(error) => {
             tracing::error!(source = name, %error, "pricing source failed; its live rates stay in effect");
-            return Vec::new();
+            return SourceContribution::Nothing(format!("fetch failed: {error}"));
         }
     };
 
@@ -210,9 +225,10 @@ fn process_source(
     let live_count = ctx.live.count_for_source(name);
     if let Err(reason) = guard::check_cardinality(name, scoped.len(), live_count, ctx.config) {
         ctx.metrics.record_rejected(name, reason.as_str(), scoped.len() as u64);
-        return Vec::new();
+        return SourceContribution::Nothing(format!("cardinality guard discarded the batch: {}", reason.as_str()));
     }
 
+    let scoped_count = scoped.len();
     let outcome = guard::apply_row_guards(scoped);
     for (_, reason) in &outcome.rejected {
         ctx.metrics.record_rejected(name, reason.as_str(), 1);
@@ -223,8 +239,19 @@ fn process_source(
         log_bootstrap_summary(name, &outcome.accepted);
     }
 
+    // Recorded before the emptiness check: the fetch itself succeeded, which is
+    // what this instrument tracks. Whether the rows survived the guards is
+    // `record_rejected`'s business.
     ctx.metrics.record_success(name, ctx.now.timestamp());
-    outcome.accepted
+
+    if outcome.accepted.is_empty() {
+        return SourceContribution::Nothing(if scoped_count == 0 {
+            "no rows for the providers it owns".to_string()
+        } else {
+            format!("all {scoped_count} owned rows were rejected by the row guards")
+        });
+    }
+    SourceContribution::Rates(outcome.accepted)
 }
 
 /// Drop every candidate whose [`source::RateKey`] a preceding candidate already
@@ -258,7 +285,14 @@ fn retain_first_per_key(candidates: &mut Vec<source::RateObservation>) {
 
 /// Fetch, guard, diff, and commit one crawl.
 ///
-/// See the module doc for the full six-step order this function implements.
+/// See the module doc for the full eight-step order this function implements.
+///
+/// # Errors
+///
+/// Returns [`MaintainError::Upstream`] if no source contributed a single row,
+/// and otherwise whatever reading the live card or committing the append
+/// returns. An individual source failing is not an error: its live rates stay
+/// in effect and the crawl proceeds on the rest.
 async fn run_crawl(
     catalog: &Arc<dyn Catalog>,
     client: &Client,
@@ -283,9 +317,27 @@ async fn run_crawl(
     .await;
 
     let mut candidates: Vec<source::RateObservation> = Vec::new();
+    let mut barren: Vec<String> = Vec::new();
     for (source_impl, elapsed_secs, result) in fetched {
-        candidates.extend(process_source(source_impl, elapsed_secs, result, &ctx));
+        match process_source(source_impl, elapsed_secs, result, &ctx) {
+            SourceContribution::Rates(rates) => candidates.extend(rates),
+            SourceContribution::Nothing(reason) => barren.push(format!("{}: {reason}", source_impl.name())),
+        }
     }
+
+    // An empty pool is not a no-change crawl: nothing was observed at all, so
+    // the stale live card would be reported as current and the task would go
+    // green. Fail instead, naming every source and why it gave nothing — an
+    // all-sources-down crawl and a genuinely unchanged rate card are otherwise
+    // indistinguishable from the job status.
+    if candidates.is_empty() {
+        return Err(MaintainError::Upstream(format!(
+            "pricing crawl observed no rates from any of {} sources ({})",
+            barren.len(),
+            barren.join("; ")
+        )));
+    }
+
     retain_first_per_key(&mut candidates);
 
     canonical::apply_canonical_ids(&mut candidates);
@@ -416,13 +468,14 @@ impl PricingRunner {
         let interval_secs = i64::try_from(config.interval_secs)
             .map_err(|_| MaintainError::Config("pricing.interval_secs is too large".to_string()))?;
         let interval = ChronoDuration::seconds(interval_secs);
-        // The per-source HTTP timeout doubles as the task timeout: sources fetch
-        // concurrently (see `run_crawl`), so the crawl's wall time is bounded by
-        // one HTTP round trip plus the fast, in-memory guard/diff/append work —
-        // not by the sum of every source's timeout.
-        let timeout_secs = i64::try_from(config.timeout_secs)
-            .map_err(|_| MaintainError::Config("pricing.timeout_secs is too large".to_string()))?;
-        let timeout = ChronoDuration::seconds(timeout_secs);
+        // The task deadline is its own knob, not the per-source HTTP timeout:
+        // sources fetch concurrently (see `run_crawl`), so a crawl costs one HTTP
+        // round trip plus the guard/diff/append tail, and a task that overruns its
+        // deadline becomes pickup-eligible again — a second worker would crawl
+        // concurrently and append every revision twice.
+        let crawl_timeout_secs = i64::try_from(config.crawl_timeout_secs)
+            .map_err(|_| MaintainError::Config("pricing.crawl_timeout_secs is too large".to_string()))?;
+        let timeout = ChronoDuration::seconds(crawl_timeout_secs);
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
@@ -519,8 +572,9 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use chrono::DateTime;
+    use chrono::{DateTime, Utc};
 
+    use super::MaintainError;
     use super::config::{PricingConfig, SourceConfig};
     use super::{PricingRunner, build_sources, retain_first_per_key, select_highest_output_rates};
     use crate::pricing::source::{RateObservation, ValidFromSource};
@@ -762,5 +816,101 @@ mod tests {
         ];
         assert_eq!(select_highest_output_rates(&rates, 2).len(), 2);
         assert_eq!(select_highest_output_rates(&rates, 10).len(), 3);
+    }
+
+    /// A source implementation whose only job is to have a name and an owned
+    /// provider; `process_source` is handed the fetch result directly, so this
+    /// never fetches.
+    struct NamedSource;
+
+    #[async_trait::async_trait]
+    impl super::source::PriceSource for NamedSource {
+        fn name(&self) -> &'static str {
+            "litellm"
+        }
+        fn owned_providers(&self) -> Vec<String> {
+            vec!["anthropic".to_string()]
+        }
+        async fn fetch_rates(
+            &self,
+            _client: &reqwest::Client,
+            _now: DateTime<Utc>,
+        ) -> crate::error::Result<Vec<RateObservation>> {
+            unreachable!("process_source is given the fetch result, it does not fetch")
+        }
+    }
+
+    /// The pieces a [`super::CrawlContext`] borrows, over an empty live card —
+    /// the bootstrap case, where the cardinality guard no-ops and only the row
+    /// guards can reject. Returned rather than assembled here so the caller
+    /// owns them for as long as the context borrows them.
+    fn bootstrap_context_parts() -> (super::diff::LiveRates, PricingConfig, super::metrics::PricingMetrics) {
+        (
+            super::diff::LiveRates::from_rows(Vec::new()),
+            PricingConfig::default(),
+            super::metrics::PricingMetrics::new(),
+        )
+    }
+
+    fn crawl_context<'a>(
+        live: &'a super::diff::LiveRates,
+        config: &'a PricingConfig,
+        metrics: &'a super::metrics::PricingMetrics,
+    ) -> super::CrawlContext<'a> {
+        super::CrawlContext {
+            live,
+            config,
+            metrics,
+            now: DateTime::from_timestamp(1_760_000_000, 0).expect("valid timestamp"),
+        }
+    }
+
+    #[test]
+    fn a_source_that_supplies_rows_contributes_them() {
+        let (live, config, metrics) = bootstrap_context_parts();
+        let ctx = crawl_context(&live, &config, &metrics);
+
+        let contribution = super::process_source(
+            &NamedSource,
+            0.1,
+            Ok(vec![observation_with_output_rate("claude-opus-4-8", Some(25.0))]),
+            &ctx,
+        );
+
+        match contribution {
+            super::SourceContribution::Rates(rates) => assert_eq!(rates.len(), 1),
+            super::SourceContribution::Nothing(reason) => panic!("expected rates, got nothing: {reason}"),
+        }
+    }
+
+    #[test]
+    fn a_source_that_supplies_nothing_carries_the_reason_why() {
+        // The reason is what makes an all-sources-dark crawl distinguishable
+        // from an unchanged rate card: `run_crawl` fails with these strings
+        // rather than reporting a quiet, successful no-change crawl.
+        let (live, config, metrics) = bootstrap_context_parts();
+        let ctx = crawl_context(&live, &config, &metrics);
+
+        let failed = super::process_source(
+            &NamedSource,
+            0.1,
+            Err(MaintainError::Storage("connection refused".to_string())),
+            &ctx,
+        );
+        assert!(matches!(failed, super::SourceContribution::Nothing(_)));
+
+        // A 200 response carrying only providers this source does not own is
+        // just as barren as a failed fetch, and must not read as success.
+        let unowned = observation_with_output_rate("gpt-5", Some(25.0));
+        let disowned = super::process_source(
+            &NamedSource,
+            0.1,
+            Ok(vec![RateObservation {
+                provider: "openai".to_string(),
+                ..unowned
+            }]),
+            &ctx,
+        );
+        assert!(matches!(disowned, super::SourceContribution::Nothing(_)));
     }
 }

@@ -68,6 +68,7 @@ data:
       enabled: {{ .Values.maintain.pricing.enabled }}
       interval_secs: {{ .Values.maintain.pricing.intervalSecs }}
       timeout_secs: {{ .Values.maintain.pricing.timeoutSecs }}
+      crawl_timeout_secs: {{ .Values.maintain.pricing.crawlTimeoutSecs }}
       max_change_ratio: {{ .Values.maintain.pricing.maxChangeRatio }}
       min_model_count_ratio: {{ .Values.maintain.pricing.minModelCountRatio }}
       max_response_bytes: {{ .Values.maintain.pricing.maxResponseBytes | int }}

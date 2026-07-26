@@ -108,4 +108,43 @@ storage:
             .validate()
             .expect("migrate-style config (no gc/compaction) must validate");
     }
+
+    /// Serde ignores unknown keys, so a `ConfigMap` key with no matching field
+    /// is dropped in silence rather than rejected — the chart shipped
+    /// `pricing.billing_region` that way. This parses the block as the chart
+    /// renders it, so a field that goes missing again fails here.
+    #[test]
+    fn the_pricing_block_the_chart_renders_lands_on_the_config() {
+        let yaml = r"
+catalog:
+  backend: !rest
+    uri: http://nessie:19120/iceberg
+  warehouse: s3://warehouse/
+storage:
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: http://localhost:9000
+pricing:
+  enabled: false
+  interval_secs: 21600
+  timeout_secs: 60
+  crawl_timeout_secs: 600
+  max_change_ratio: 10
+  min_model_count_ratio: 0.8
+  max_response_bytes: 134217728
+  billing_region:
+    aws.bedrock: us-east-1
+  sources:
+    - name: openrouter
+      url: https://openrouter.ai/api/v1/models
+";
+        let config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse chart-style pricing config");
+        assert_eq!(config.pricing.crawl_timeout_secs, 600);
+        assert_eq!(config.pricing.billing_region_for("aws.bedrock"), "us-east-1");
+        assert_eq!(
+            config.pricing.billing_region_for("anthropic"),
+            crate::pricing::config::GLOBAL_REGION
+        );
+    }
 }

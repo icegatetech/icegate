@@ -1,5 +1,7 @@
 //! Configuration for the LLM pricing crawler.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::compact::config::{CompactionJobsManagerConfig, JobsStorageConfig};
@@ -35,6 +37,15 @@ pub struct PricingConfig {
     pub interval_secs: u64,
     /// Per-source HTTP timeout in seconds.
     pub timeout_secs: u64,
+    /// Deadline for one whole crawl, in seconds.
+    ///
+    /// Separate from [`Self::timeout_secs`], and necessarily larger: sources
+    /// fetch concurrently, so a crawl costs one HTTP round trip *plus* the
+    /// guard, diff, and Iceberg append that follow it. A deadline equal to the
+    /// HTTP timeout leaves that tail with no budget, and an overrunning task is
+    /// pickup-eligible again — a second worker would start a concurrent crawl
+    /// that appends the same revisions twice.
+    pub crawl_timeout_secs: u64,
     /// Reject a rate that moved by more than this multiple of the live rate.
     /// `0.0` disables the check. See `guard::check_delta`.
     pub max_change_ratio: f64,
@@ -43,6 +54,19 @@ pub struct PricingConfig {
     pub min_model_count_ratio: f64,
     /// Hard cap on a single source response body.
     pub max_response_bytes: usize,
+    /// Which region each provider bills this deployment in, keyed by
+    /// `prices.provider`. Read through [`Self::billing_region_for`].
+    ///
+    /// `operations` carries no region, so nothing on a telemetry row says which
+    /// regional price applies to it. The crawler therefore stores every region a
+    /// vendor publishes and consumers narrow to the one declared here, which
+    /// keeps the cost join a two-column equality on
+    /// `(provider_name, request_model)`.
+    ///
+    /// Empty by default: the default sources both publish one worldwide price,
+    /// so every provider resolves to [`GLOBAL_REGION`] until a regional source
+    /// (AWS Bedrock) is configured.
+    pub billing_region: HashMap<String, String>,
     /// Sources to crawl.
     pub sources: Vec<SourceConfig>,
     /// Worker pool and job-state storage, shared shape with compaction and GC.
@@ -58,9 +82,11 @@ impl Default for PricingConfig {
             enabled: false,
             interval_secs: 21_600,
             timeout_secs: 60,
+            crawl_timeout_secs: 600,
             max_change_ratio: 10.0,
             min_model_count_ratio: 0.8,
             max_response_bytes: 134_217_728,
+            billing_region: HashMap::new(),
             sources: vec![
                 SourceConfig {
                     name: "openrouter".to_string(),
@@ -89,6 +115,16 @@ impl Default for PricingConfig {
 }
 
 impl PricingConfig {
+    /// The region `provider` bills this deployment in.
+    ///
+    /// Falls back to [`GLOBAL_REGION`] for any provider with no entry, which is
+    /// the region a one-worldwide-price vendor already writes — so an
+    /// unconfigured deployment resolves every provider without special-casing.
+    #[must_use]
+    pub fn billing_region_for(&self, provider: &str) -> &str {
+        self.billing_region.get(provider).map_or(GLOBAL_REGION, String::as_str)
+    }
+
     /// Validate the crawler tunables.
     ///
     /// A disabled crawler validates trivially: `MaintainConfig` is shared with
@@ -97,8 +133,10 @@ impl PricingConfig {
     /// # Errors
     ///
     /// Returns [`MaintainError::Config`] when enabled and the interval or
-    /// timeout is zero, no sources are configured, source names collide, the
-    /// guard ratios are out of range, or the jobs-manager block is invalid.
+    /// timeout is zero, the crawl deadline does not exceed the HTTP timeout, no
+    /// sources are configured, source names collide, the guard ratios are out of
+    /// range, a billing-region entry is blank on either side, or the
+    /// jobs-manager block is invalid.
     pub fn validate(&self) -> Result<(), MaintainError> {
         if !self.enabled {
             return Ok(());
@@ -111,6 +149,14 @@ impl PricingConfig {
         if self.timeout_secs == 0 {
             return Err(MaintainError::Config(
                 "pricing.timeout_secs must be greater than zero".to_string(),
+            ));
+        }
+        // Strictly greater, not merely non-zero: at equality the guard/diff/append
+        // tail runs past the deadline whenever a single source uses its full HTTP
+        // budget, which is exactly when a crawl is slowest.
+        if self.crawl_timeout_secs <= self.timeout_secs {
+            return Err(MaintainError::Config(
+                "pricing.crawl_timeout_secs must be greater than pricing.timeout_secs".to_string(),
             ));
         }
         if self.sources.is_empty() {
@@ -142,6 +188,16 @@ impl PricingConfig {
             return Err(MaintainError::Config(
                 "pricing.max_change_ratio must be a finite, non-negative number".to_string(),
             ));
+        }
+        // An empty side is always a mistake: a blank provider matches no row,
+        // and a blank region would resolve a provider to a region no source
+        // writes, silently making its rates unfindable.
+        for (provider, region) in &self.billing_region {
+            if provider.trim().is_empty() || region.trim().is_empty() {
+                return Err(MaintainError::Config(
+                    "pricing.billing_region entries must have a non-empty provider and region".to_string(),
+                ));
+            }
         }
         // The crawler's worker pool and job-state storage, validated here for
         // the same reason `GcConfig::validate` validates its own: a zero
@@ -193,6 +249,56 @@ mod tests {
         // A zero timeout would make every source fail guard 1 on the first crawl.
         let mut config = enabled_config();
         config.timeout_secs = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_crawl_deadline_that_does_not_exceed_the_http_timeout() {
+        // At or below the HTTP timeout the append tail runs past the deadline,
+        // and an expired task is pickup-eligible: a second worker would crawl
+        // concurrently and append every revision twice.
+        let mut config = enabled_config();
+        for crawl_timeout_secs in [0, config.timeout_secs - 1, config.timeout_secs] {
+            config.crawl_timeout_secs = crawl_timeout_secs;
+            assert!(
+                config.validate().is_err(),
+                "crawl_timeout_secs {crawl_timeout_secs} must be rejected"
+            );
+        }
+
+        config.crawl_timeout_secs = config.timeout_secs + 1;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_undeclared_provider_bills_in_the_global_region() {
+        // The default. `global` is what a one-worldwide-price vendor writes, so
+        // an unconfigured deployment resolves every provider without a special
+        // case anywhere downstream.
+        let config = PricingConfig::default();
+        assert!(config.billing_region.is_empty());
+        assert_eq!(config.billing_region_for("anthropic"), super::GLOBAL_REGION);
+    }
+
+    #[test]
+    fn a_declared_provider_bills_in_its_configured_region() {
+        let mut config = PricingConfig::default();
+        config.billing_region.insert("aws.bedrock".to_string(), "eu-west-1".to_string());
+        assert_eq!(config.billing_region_for("aws.bedrock"), "eu-west-1");
+        // Declaring one provider must not move any other off the sentinel.
+        assert_eq!(config.billing_region_for("anthropic"), super::GLOBAL_REGION);
+    }
+
+    #[test]
+    fn validate_rejects_a_blank_billing_region_entry() {
+        // A blank region resolves a provider to a region no source writes, which
+        // makes its rates unfindable rather than obviously misconfigured.
+        let mut config = enabled_config();
+        config.billing_region.insert("aws.bedrock".to_string(), String::new());
+        assert!(config.validate().is_err());
+
+        config.billing_region.clear();
+        config.billing_region.insert(String::new(), "us-east-1".to_string());
         assert!(config.validate().is_err());
     }
 

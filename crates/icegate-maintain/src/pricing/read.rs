@@ -11,6 +11,13 @@ use arrow::array::{Array, Decimal128Array, Int64Array, StringArray, TimestampMic
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use iceberg::Catalog;
+use icegate_common::schema::{
+    COL_AUDIO_INPUT_USD_PER_SECOND, COL_AUDIO_OUTPUT_USD_PER_SECOND, COL_CACHE_READ_USD_PER_1M,
+    COL_CACHE_WRITE_USD_PER_1M, COL_CANONICAL_ID, COL_CURRENCY, COL_IMAGE_INPUT_USD_PER_UNIT,
+    COL_IMAGE_OUTPUT_USD_PER_UNIT, COL_INPUT_USD_PER_1M, COL_MAX_INPUT_TOKENS, COL_MIN_INPUT_TOKENS, COL_MODEL,
+    COL_OUTPUT_USD_PER_1M, COL_PROVIDER, COL_REASONING_USD_PER_1M, COL_REGION, COL_REQUEST_USD, COL_SERVICE_TIER,
+    COL_SOURCE, COL_SOURCE_URL, COL_VALID_FROM, COL_VALID_FROM_SOURCE,
+};
 use icegate_common::{PRICES_TABLE, icegate_table_ident};
 
 use crate::error::{MaintainError, Result};
@@ -99,28 +106,28 @@ fn column<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<
 /// Resolve every `prices` column in `batch` by name.
 fn resolve_columns(batch: &RecordBatch) -> Result<PriceColumns<'_>> {
     Ok(PriceColumns {
-        provider: column(batch, "provider")?,
-        model: column(batch, "model")?,
-        canonical_id: column(batch, "canonical_id")?,
-        service_tier: column(batch, "service_tier")?,
-        region: column(batch, "region")?,
-        min_input_tokens: column(batch, "min_input_tokens")?,
-        max_input_tokens: column(batch, "max_input_tokens")?,
-        valid_from: column(batch, "valid_from")?,
-        valid_from_source: column(batch, "valid_from_source")?,
-        input_usd_per_1m: column(batch, "input_usd_per_1m")?,
-        output_usd_per_1m: column(batch, "output_usd_per_1m")?,
-        cache_read_usd_per_1m: column(batch, "cache_read_usd_per_1m")?,
-        cache_write_usd_per_1m: column(batch, "cache_write_usd_per_1m")?,
-        reasoning_usd_per_1m: column(batch, "reasoning_usd_per_1m")?,
-        request_usd: column(batch, "request_usd")?,
-        image_input_usd_per_unit: column(batch, "image_input_usd_per_unit")?,
-        image_output_usd_per_unit: column(batch, "image_output_usd_per_unit")?,
-        audio_input_usd_per_second: column(batch, "audio_input_usd_per_second")?,
-        audio_output_usd_per_second: column(batch, "audio_output_usd_per_second")?,
-        currency: column(batch, "currency")?,
-        source: column(batch, "source")?,
-        source_url: column(batch, "source_url")?,
+        provider: column(batch, COL_PROVIDER)?,
+        model: column(batch, COL_MODEL)?,
+        canonical_id: column(batch, COL_CANONICAL_ID)?,
+        service_tier: column(batch, COL_SERVICE_TIER)?,
+        region: column(batch, COL_REGION)?,
+        min_input_tokens: column(batch, COL_MIN_INPUT_TOKENS)?,
+        max_input_tokens: column(batch, COL_MAX_INPUT_TOKENS)?,
+        valid_from: column(batch, COL_VALID_FROM)?,
+        valid_from_source: column(batch, COL_VALID_FROM_SOURCE)?,
+        input_usd_per_1m: column(batch, COL_INPUT_USD_PER_1M)?,
+        output_usd_per_1m: column(batch, COL_OUTPUT_USD_PER_1M)?,
+        cache_read_usd_per_1m: column(batch, COL_CACHE_READ_USD_PER_1M)?,
+        cache_write_usd_per_1m: column(batch, COL_CACHE_WRITE_USD_PER_1M)?,
+        reasoning_usd_per_1m: column(batch, COL_REASONING_USD_PER_1M)?,
+        request_usd: column(batch, COL_REQUEST_USD)?,
+        image_input_usd_per_unit: column(batch, COL_IMAGE_INPUT_USD_PER_UNIT)?,
+        image_output_usd_per_unit: column(batch, COL_IMAGE_OUTPUT_USD_PER_UNIT)?,
+        audio_input_usd_per_second: column(batch, COL_AUDIO_INPUT_USD_PER_SECOND)?,
+        audio_output_usd_per_second: column(batch, COL_AUDIO_OUTPUT_USD_PER_SECOND)?,
+        currency: column(batch, COL_CURRENCY)?,
+        source: column(batch, COL_SOURCE)?,
+        source_url: column(batch, COL_SOURCE_URL)?,
     })
 }
 
