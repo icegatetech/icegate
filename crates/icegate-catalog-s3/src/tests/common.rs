@@ -17,12 +17,12 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::CatalogCodecKind;
-use crate::catalog::S3Catalog;
 use crate::config::S3CatalogConfig;
 use crate::config::cas_retrier_config_default;
+use crate::domain::CatalogRoot;
 use crate::error::{Error, Result};
 use crate::infra::retrier::Retrier;
-use crate::root::CatalogRoot;
+use crate::services::S3Catalog;
 use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::s3::S3CatalogStorage;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
@@ -125,6 +125,9 @@ pub(crate) struct TestEnv {
     pub(crate) catalog: S3Catalog,
     pub(crate) s3_storage: Arc<S3CatalogStorage>,
     pub(crate) tables_uri_prefix: String,
+    /// Storage settings of the running container, kept so [`restart_catalog`]
+    /// can open an independent catalog process over the same bucket.
+    s3_config: S3CatalogConfig,
 }
 
 /// Start a fresh object-storage container with a unique bucket and a raw S3 storage
@@ -132,7 +135,7 @@ pub(crate) struct TestEnv {
 /// ([`make_cached_catalog`]) harnesses so the bucket bootstrap lives in one
 /// place.
 #[allow(clippy::expect_used)]
-async fn bootstrap_object_store() -> (S3TestContainer, Arc<S3CatalogStorage>, String) {
+async fn bootstrap_object_store() -> (S3TestContainer, S3CatalogConfig, Arc<S3CatalogStorage>, String) {
     let store = S3TestContainer::start().await.expect("start object storage");
     let endpoint = store.endpoint().to_string();
     let bucket = format!("catalog-{}", Uuid::new_v4());
@@ -146,29 +149,25 @@ async fn bootstrap_object_store() -> (S3TestContainer, Arc<S3CatalogStorage>, St
     let client = aws_sdk_s3::Client::new(&cfg);
     client.create_bucket().bucket(&bucket).send().await.expect("create bucket");
 
-    let storage = Arc::new(
-        S3CatalogStorage::new(
-            &S3CatalogConfig {
-                bucket: bucket.clone(),
-                region: "us-east-1".to_string(),
-                endpoint: Some(endpoint),
-                access_key_id: Some(store.username().to_string()),
-                secret_access_key: Some(store.password().to_string()),
-                warehouse: "warehouse".to_string(),
-                codec: CatalogCodecKind::Json,
-                ..S3CatalogConfig::default()
-            },
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .expect("storage"),
-    );
+    let s3_config = S3CatalogConfig {
+        bucket: bucket.clone(),
+        region: "us-east-1".to_string(),
+        endpoint: Some(endpoint),
+        access_key_id: Some(store.username().to_string()),
+        secret_access_key: Some(store.password().to_string()),
+        warehouse: "warehouse".to_string(),
+        codec: CatalogCodecKind::Json,
+        ..S3CatalogConfig::default()
+    };
+    let storage =
+        Arc::new(S3CatalogStorage::new(&s3_config, tokio_util::sync::CancellationToken::new()).expect("storage"));
 
     let tables_uri_prefix = format!("s3://{bucket}/warehouse/catalog/tables");
-    (store, storage, tables_uri_prefix)
+    (store, s3_config, storage, tables_uri_prefix)
 }
 
 pub(crate) async fn make_catalog() -> TestEnv {
-    let (store, storage, tables_uri_prefix) = bootstrap_object_store().await;
+    let (store, s3_config, storage, tables_uri_prefix) = bootstrap_object_store().await;
     let catalog = test_catalog(storage.clone(), FileIO::new_with_memory(), tables_uri_prefix.clone());
 
     TestEnv {
@@ -176,7 +175,21 @@ pub(crate) async fn make_catalog() -> TestEnv {
         catalog,
         s3_storage: storage,
         tables_uri_prefix,
+        s3_config,
     }
+}
+
+/// Open a second catalog over `env`'s bucket through a freshly constructed
+/// storage backend, as a process restart would: the persisted S3 bucket —
+/// catalog root and table metadata alike — is all that is shared with the
+/// catalog that wrote the state; no in-memory `CatalogRoot`, cache, or storage
+/// instance crosses the boundary.
+#[allow(clippy::expect_used)]
+pub(crate) fn restart_catalog(env: &TestEnv) -> S3Catalog {
+    let storage = Arc::new(
+        S3CatalogStorage::new(&env.s3_config, tokio_util::sync::CancellationToken::new()).expect("restarted storage"),
+    );
+    test_catalog(storage, FileIO::new_with_memory(), env.tables_uri_prefix.clone())
 }
 
 /// Counters and a catalog over the production composition `Cached(Counting(S3))`.
@@ -201,7 +214,7 @@ pub(crate) struct CachedTestEnv {
 /// into [`LoadOutcome::NotModified`]. The unit tests in `cached.rs` only simulate
 /// that against an in-memory backend.
 pub(crate) async fn make_cached_catalog() -> CachedTestEnv {
-    let (store, storage, tables_uri_prefix) = bootstrap_object_store().await;
+    let (store, _, storage, tables_uri_prefix) = bootstrap_object_store().await;
     let counting = Arc::new(LoadCountingStorage::new(storage.clone()));
     let counting_dyn: Arc<dyn CatalogStorage> = counting.clone();
     let cached: Arc<dyn CatalogStorage> = Arc::new(CachedCatalogStorage::new(

@@ -12,20 +12,19 @@ use bytes::Bytes;
 use iceberg::io::FileIO;
 use iceberg::spec::{FormatVersion, SortOrder, TableMetadataBuilder, UnboundPartitionSpec};
 use iceberg::{Catalog, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
-use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::common::{
     CachedTestEnv, create_table, make_cached_catalog, make_catalog, make_in_memory_catalog,
-    make_in_memory_catalog_cached, make_in_memory_catalog_with_storage, metadata_version_in, test_schema,
-    update_request,
+    make_in_memory_catalog_cached, make_in_memory_catalog_with_storage, metadata_version_in, restart_catalog,
+    test_schema, update_request,
 };
-use crate::catalog::S3Catalog;
 use crate::config::{S3CatalogConfig, cas_retrier_config_default};
+use crate::domain::{CatalogRoot, CatalogTableLink, IcebergTableMetadata, TableId, TableKey, TableMetadataLocation};
 use crate::error::Error;
 use crate::infra::retrier::{Retrier, RetrierConfig};
-use crate::root::{CatalogRoot, CatalogTableLink, IcebergTableMetadata, TableId, TableKey, TableMetadataLocation};
+use crate::services::S3Catalog;
 use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
@@ -53,30 +52,6 @@ fn initial_metadata_location(table_location: &str) -> String {
         table_location.trim_end_matches('/'),
         Uuid::new_v4()
     )
-}
-
-fn root_tables_json(root: &CatalogRoot) -> Value {
-    serde_json::to_value(root)
-        .expect("serialize root")
-        .get("tables")
-        .cloned()
-        .expect("tables field")
-}
-
-fn root_tombstones_json(root: &CatalogRoot) -> Value {
-    serde_json::to_value(root)
-        .expect("serialize root")
-        .get("tombstones")
-        .cloned()
-        .expect("tombstones field")
-}
-
-fn root_namespaces_json(root: &CatalogRoot) -> Value {
-    serde_json::to_value(root)
-        .expect("serialize root")
-        .get("namespaces")
-        .cloned()
-        .expect("namespaces field")
 }
 
 /// Hook invoked inside `save_root` before the version check. Allows tests to
@@ -618,12 +593,84 @@ async fn s3_storage_writes_metadata_using_catalog_layout() {
     assert_eq!(loaded.last_column_id(), table_metadata.last_column_id());
 }
 
+/// Dots inside namespace parts and table names must survive the persisted
+/// `root.json` format across a process restart: a second catalog that shares
+/// nothing but the bucket must list, resolve, and load exactly the identifiers
+/// the first one wrote. The codec unit tests pin the wire format; this is the
+/// one test that proves it against real S3-compatible storage.
+#[tokio::test]
+async fn dotted_identifiers_survive_a_catalog_restart_on_real_s3() {
+    let env = make_catalog().await;
+    // The parent is created explicitly: only explicitly created namespaces are
+    // listed, so the top-level assertion below needs it as its own record.
+    env.catalog
+        .create_namespace(&NamespaceIdent::new("dogs".to_string()), HashMap::new())
+        .await
+        .expect("create parent namespace");
+    let namespace =
+        NamespaceIdent::from_vec(vec!["dogs".to_string(), "owners.and.handlers".to_string()]).expect("namespace");
+    let properties = HashMap::from([("owner".to_string(), "dogs".to_string())]);
+    env.catalog
+        .create_namespace(&namespace, properties.clone())
+        .await
+        .expect("create namespace");
+    let created = create_table(&env.catalog, &namespace, "events.v2").await;
+
+    let restarted = restart_catalog(&env);
+
+    assert_eq!(
+        restarted.list_namespaces(None).await.expect("list top-level namespaces"),
+        vec![NamespaceIdent::new("dogs".to_string())],
+    );
+    assert_eq!(
+        restarted
+            .list_namespaces(Some(&NamespaceIdent::new("dogs".to_string())))
+            .await
+            .expect("list nested namespaces"),
+        vec![namespace.clone()],
+    );
+    let loaded_namespace = restarted.get_namespace(&namespace).await.expect("get namespace");
+    assert_eq!(loaded_namespace.name(), &namespace);
+    assert_eq!(loaded_namespace.properties(), &properties);
+
+    let expected_identifier = TableIdent::new(namespace.clone(), "events.v2".to_string());
+    assert_eq!(
+        restarted.list_tables(&namespace).await.expect("list tables"),
+        vec![expected_identifier.clone()],
+    );
+    let loaded = restarted.load_table(&expected_identifier).await.expect("load table");
+    assert_eq!(loaded.identifier(), &expected_identifier);
+    assert_eq!(loaded.metadata_location(), created.metadata_location());
+    assert_eq!(loaded.metadata().uuid(), created.metadata().uuid());
+
+    // The dot inside a part must not be readable as an extra nesting level.
+    assert!(
+        !restarted
+            .namespace_exists(
+                &NamespaceIdent::from_vec(vec![
+                    "dogs".to_string(),
+                    "owners".to_string(),
+                    "and".to_string(),
+                    "handlers".to_string(),
+                ])
+                .expect("split namespace")
+            )
+            .await
+            .expect("check split namespace"),
+    );
+}
+
 #[tokio::test]
 async fn list_namespaces_with_parent() {
     let catalog = make_in_memory_catalog();
     let namespace_left = NamespaceIdent::from_vec(vec!["a".to_string(), "b".to_string()]).expect("namespace a.b");
     let namespace_right = NamespaceIdent::from_vec(vec!["a".to_string(), "c".to_string()]).expect("namespace a.c");
     let parent = NamespaceIdent::new("a".to_string());
+
+    catalog
+        .create_namespace(&parent, HashMap::new())
+        .await
+        .expect("create parent namespace");
 
     create_table(&catalog, &namespace_left, "t1").await;
     create_table(&catalog, &namespace_right, "t1").await;
@@ -664,6 +711,32 @@ async fn list_tables_in_namespace() {
     let tables = catalog.list_tables(&namespace).await.expect("list tables");
 
     assert_eq!(tables, vec![table_a.identifier().clone(), table_b.identifier().clone()]);
+}
+
+#[tokio::test]
+async fn list_namespaces_with_missing_parent_reports_namespace_not_found() {
+    let catalog = make_in_memory_catalog();
+    let missing = NamespaceIdent::new("missing".to_string());
+
+    let error = catalog
+        .list_namespaces(Some(&missing))
+        .await
+        .expect_err("listing under a missing parent must fail");
+
+    assert_eq!(error.kind(), ErrorKind::NamespaceNotFound);
+}
+
+#[tokio::test]
+async fn list_tables_in_missing_namespace_reports_namespace_not_found() {
+    let catalog = make_in_memory_catalog();
+    let missing = NamespaceIdent::new("missing".to_string());
+
+    let error = catalog
+        .list_tables(&missing)
+        .await
+        .expect_err("listing a missing namespace must fail");
+
+    assert_eq!(error.kind(), ErrorKind::NamespaceNotFound);
 }
 
 #[tokio::test]
@@ -961,8 +1034,7 @@ async fn empty_namespace_survives_reload_and_can_be_dropped() {
         .await
         .expect("create empty namespace");
     let root = unwrap_loaded(storage.load_root(None).await.expect("load root after create")).0;
-    let namespaces = root_namespaces_json(&root).as_object().cloned().expect("namespaces object");
-    assert!(namespaces.contains_key("a.b"));
+    assert!(root.get_namespace(&namespace).is_some());
 
     let reloaded_catalog = test_catalog(
         storage.clone(),
@@ -1091,16 +1163,11 @@ async fn create_after_drop_same_name_sequential() {
             .as_str(),
         recreated.metadata_location().expect("recreated metadata location")
     );
-    let tables = root_tables_json(&root).as_object().cloned().expect("tables object");
-    let tombstones = root_tombstones_json(&root).as_object().cloned().expect("tombstones object");
-    assert_eq!(tables.len(), 1);
-    assert_eq!(tombstones.len(), 1);
-    assert!(tombstones.values().any(|entry| {
-        entry.get("status") == Some(&Value::String("tombstoned".to_string()))
-            && entry.get("metadata_location")
-                == Some(&Value::String(
-                    original.metadata_location().expect("original metadata location").to_string(),
-                ))
+    assert_eq!(root.table_entries().count(), 1);
+    assert_eq!(root.tombstone_entries().count(), 1);
+    assert!(root.tombstone_entries().any(|(_, entry)| {
+        !entry.is_active()
+            && entry.metadata_location().as_str() == original.metadata_location().expect("original metadata location")
     }));
 }
 
@@ -1125,13 +1192,9 @@ async fn rename_over_tombstoned_name_preserves_old_tombstone() {
         active.metadata_location().as_str(),
         src.metadata_location().expect("source metadata location")
     );
-    let tombstones = root_tombstones_json(&root).as_object().cloned().expect("tombstones object");
-    assert!(tombstones.values().any(|entry| {
-        entry.get("status") == Some(&Value::String("tombstoned".to_string()))
-            && entry.get("metadata_location")
-                == Some(&Value::String(
-                    dst.metadata_location().expect("dst metadata location").to_string(),
-                ))
+    assert!(root.tombstone_entries().any(|(_, entry)| {
+        !entry.is_active()
+            && entry.metadata_location().as_str() == dst.metadata_location().expect("dst metadata location")
     }));
 }
 
@@ -2108,8 +2171,10 @@ async fn drop_table_converges_after_lost_ack() {
 
     let root = storage.root_state().await;
     assert!(root.get_active(&key).is_none());
-    let tombstones = root_tombstones_json(&root).as_object().cloned().expect("tombstones object");
-    assert!(tombstones.contains_key(&table_id.to_string()));
+    assert!(
+        root.tombstone_entries()
+            .any(|(id, entry)| id.as_uuid() == &table_id && !entry.is_active())
+    );
 }
 
 #[tokio::test]

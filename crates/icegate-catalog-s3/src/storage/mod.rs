@@ -5,10 +5,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iceberg::spec::TableMetadata;
 
+use crate::domain::CatalogRoot;
 use crate::error::Result;
-use crate::root::CatalogRoot;
 
 pub(crate) mod cached;
+pub(crate) mod codec;
 pub(crate) mod s3;
 
 /// Opaque version token for compare-and-swap operations.

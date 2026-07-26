@@ -5,11 +5,13 @@ on:
     branches: [ main ]
     paths:
       - 'config/helm/**'
+      - 'Makefile'
       - '.github/workflows/helm-lint.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'config/helm/**'
+      - 'Makefile'
       - '.github/workflows/helm-lint.yml'
   workflow_dispatch:
 
@@ -30,4 +32,7 @@ jobs:
         run: helm lint config/helm/icegate
 
       - name: Template chart
-        run: helm template icegate config/helm/icegate > /dev/null
+        run: make helm-template
+
+      - name: Template catalog server
+        run: make helm-catalog-test

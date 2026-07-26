@@ -112,6 +112,21 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
 
+      - name: Docker metadata (catalog)
+        id: meta-catalog
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-catalog
+          bake-target: catalog
+          labels: |
+            org.opencontainers.image.description=Read-only Iceberg REST Catalog API for IceGate
+          annotations: |
+            org.opencontainers.image.description=Read-only Iceberg REST Catalog API for IceGate
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
+
       - name: Build and push
         uses: docker/bake-action@v6
         with:
@@ -126,6 +141,9 @@ jobs:
             cwd://${{ steps.meta-maintain.outputs.bake-file-tags }}
             cwd://${{ steps.meta-maintain.outputs.bake-file-labels }}
             cwd://${{ steps.meta-maintain.outputs.bake-file-annotations }}
+            cwd://${{ steps.meta-catalog.outputs.bake-file-tags }}
+            cwd://${{ steps.meta-catalog.outputs.bake-file-labels }}
+            cwd://${{ steps.meta-catalog.outputs.bake-file-annotations }}
           targets: default
           push: true
           set: |
@@ -204,6 +222,7 @@ jobs:
           docker pull ${IMAGE_PREFIX}-query:${VERSION}
           docker pull ${IMAGE_PREFIX}-ingest:${VERSION}
           docker pull ${IMAGE_PREFIX}-maintain:${VERSION}
+          docker pull ${IMAGE_PREFIX}-catalog:${VERSION}
           \`\`\`
 
           Platforms: \`linux/amd64\`, \`linux/arm64\`

@@ -1,5 +1,5 @@
 .PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench down \
-       helm-lint helm-template
+       helm-lint helm-template helm-catalog-test catalog-rest-check catalog-rest-test catalog-rest-clippy
 
 run-docker-core-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml up --build
@@ -45,6 +45,15 @@ clippy:
 clippy-fix:
 	cargo clippy --workspace --all-targets --fix --allow-dirty
 
+catalog-rest-check:
+	cargo check -p icegate-catalog-s3 --all-targets --features rest
+
+catalog-rest-test:
+	cargo test -p icegate-catalog-s3 --all-targets --features rest
+
+catalog-rest-clippy:
+	cargo clippy -p icegate-catalog-s3 --all-targets --features rest -- -D warnings
+
 audit:
 	cargo audit
 
@@ -63,4 +72,42 @@ helm-lint:
 helm-template:
 	helm template icegate config/helm/icegate > /dev/null
 
-ci: check fmt clippy test audit helm-lint helm-template
+ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test catalog-rest-check catalog-rest-test catalog-rest-clippy
+
+# The catalog server is off by default, so the default render above never covers
+# its templates. Enabling it must produce a complete deployable unit, and pairing
+# it with any backend other than s3 must fail the render rather than ship a
+# server wired to a catalog it cannot read.
+#
+# S3 addressing is rendered only when set, because an absent key is what makes
+# the catalog derive the policy from the endpoint instead of forcing path-style
+# onto AWS. Both halves are asserted: a chart that started emitting a default
+# would silently take that choice away, and a guard that stopped emitting an
+# explicit value would silently ignore the operator.
+helm-catalog-test:
+	@rendered=$$(helm template icegate config/helm/icegate --set catalogServer.enabled=true --set catalog.backend=s3) || exit 1; \
+	for resource in "kind: Deployment" "kind: Service" "kind: ConfigMap"; do \
+		printf '%s\n' "$$rendered" | grep -F -A 3 "$$resource" | grep -F "name: icegate-catalog" > /dev/null || { \
+			echo "catalog server render is missing $$resource"; \
+			exit 1; \
+		}; \
+	done
+	@if error=$$(helm template icegate config/helm/icegate --set catalogServer.enabled=true --set catalog.backend=rest 2>&1 > /dev/null); then \
+		echo "expected catalog server with REST backend to fail rendering"; \
+		exit 1; \
+	fi; \
+	printf '%s\n' "$$error" | grep -F "catalogServer.enabled requires catalog.backend=s3" > /dev/null
+	@default_render=$$(helm template icegate config/helm/icegate --set catalogServer.enabled=true --set catalog.backend=s3) || exit 1; \
+	if printf '%s\n' "$$default_render" | grep -E "path.style.access|path_style_access" > /dev/null; then \
+		echo "chart must leave S3 addressing unset so the catalog derives it from the endpoint"; \
+		exit 1; \
+	fi; \
+	set_render=$$(helm template icegate config/helm/icegate --set catalogServer.enabled=true --set catalog.backend=s3 --set catalog.s3.pathStyleAccess=false) || exit 1; \
+	printf '%s\n' "$$set_render" | grep -F 's3.path-style-access: "false"' > /dev/null || { \
+		echo "an explicit pathStyleAccess must reach the FileIO properties"; \
+		exit 1; \
+	}; \
+	printf '%s\n' "$$set_render" | grep -F "path_style_access: false" > /dev/null || { \
+		echo "an explicit pathStyleAccess must reach the catalog server config"; \
+		exit 1; \
+	}

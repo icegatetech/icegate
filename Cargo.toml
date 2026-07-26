@@ -85,6 +85,7 @@ iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce56
 iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
 iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
 iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
+iceberg-storage-opendal = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b", features = ["opendal-s3"] }
 iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "3fadce564546f7f40ff57b16b4d62a8398c9bc9b" }
 
 # DataFusion
@@ -143,6 +144,8 @@ regex = "1.12"
 itoa = "1"
 bytes = "1.11.1"
 base64 = "0.22"
+percent-encoding = "2"
+sha2 = "0.10"
 dashmap = "6.1"
 lru = "0.16"
 url = "2"

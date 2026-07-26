@@ -1,0 +1,22 @@
+{{- if .Values.catalogServer.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "catalog") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "catalog") | nindent 4 }}
+  {{- with .Values.catalogServer.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.catalogServer.service.type }}
+  selector:
+    {{- include "icegate.selectorLabels" (dict "context" . "component" "catalog") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.catalogServer.http.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

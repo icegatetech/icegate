@@ -5,6 +5,12 @@ compare-and-swap on its ETag. No external database.
 
 Architecture, S3 layout, and layer responsibilities are documented in [AGENTS.md](AGENTS.md).
 
+The crate supports two modes. In library mode, the default features provide the
+`iceberg::Catalog` implementation through `CatalogBuilder::create_s3_catalog`; the library path
+does not compile the server stack. In server mode, enable the `rest` feature to run the standalone
+`catalog` binary with `cargo run -p icegate-catalog-s3 --features rest --bin catalog -- serve
+--config <path>`. The configuration file may be YAML or TOML.
+
 ## Known limitations
 
 ### Lost-ack re-apply on a truncated metadata-log
@@ -43,5 +49,5 @@ Consequence depends on the commit:
 The fix (an identity check that survives log truncation — e.g. matching the prepared `snapshot_id`
 against the head's snapshots, or returning a hard conflict instead of a silent rebuild) is deferred
 as over-engineering for the current usage. Tracked by the `TODO(low)` in
-`CatalogRoot::merge_transaction` (`src/root.rs`). Revisit if per-table write concurrency rises or a
+`CatalogRoot::merge_transaction` (`src/domain/root.rs`). Revisit if per-table write concurrency rises or a
 commit path without a snapshot requirement is introduced.

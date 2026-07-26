@@ -22,8 +22,8 @@ use iceberg::spec::TableMetadata;
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::domain::CatalogRoot;
 use crate::error::{Error, Result, StorageError};
-use crate::root::CatalogRoot;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
 /// Snapshot of the catalog root paired with its CAS token.

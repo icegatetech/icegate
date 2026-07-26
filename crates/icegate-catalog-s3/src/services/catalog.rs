@@ -14,13 +14,13 @@ use iceberg::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::S3CatalogConfig;
+use crate::config::{S3CatalogConfig, format_warehouse_uri};
+use crate::domain::{
+    CatalogRoot, CatalogTableLink, DomainError, IcebergTableMetadata, MergeOutcome, TableId, TableKey,
+    TableMetadataLocation, TableUpdate,
+};
 use crate::error::{Error, Result, StorageError};
 use crate::infra::retrier::Retrier;
-use crate::root::{
-    CatalogRoot, CatalogTableLink, IcebergTableMetadata, MergeOutcome, TableId, TableKey, TableMetadataLocation,
-    TableUpdate,
-};
 use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::s3::S3CatalogStorage;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
@@ -121,12 +121,10 @@ impl S3Catalog {
     }
 
     fn compute_tables_uri_prefix(config: &S3CatalogConfig) -> String {
-        let warehouse = config.warehouse.trim_matches('/');
-        if warehouse.is_empty() {
-            format!("s3://{}/catalog/tables", config.bucket)
-        } else {
-            format!("s3://{}/{}/catalog/tables", config.bucket, warehouse)
-        }
+        format!(
+            "{}/catalog/tables",
+            format_warehouse_uri(&config.bucket, &config.warehouse)
+        )
     }
 
     /// Load the current root as an owned value plus its CAS version, for the
@@ -403,7 +401,7 @@ impl S3Catalog {
         for (key, state) in commit_states.iter_mut() {
             let entry = root
                 .get_active(key)
-                .ok_or_else(|| Error::TableNotFound(state.identifier.clone()))?;
+                .ok_or_else(|| DomainError::TableNotFound(state.identifier.clone()))?;
             let persisted = entry.clone();
             let head_location = entry.metadata_location().clone();
             // Unchanged heads resolve from the metadata cache on retries.
@@ -439,9 +437,7 @@ impl S3Catalog {
                 let table = match &state.stage {
                     CommitStage::Pending(table) => table,
                     CommitStage::Unprepared => {
-                        return Err(Error::InvalidMetadata(
-                            "prepared commit missing on success path".to_string(),
-                        ));
+                        return Err(Error::Internal("prepared commit missing on success path"));
                     }
                 };
                 Table::builder()
@@ -461,6 +457,9 @@ impl Catalog for S3Catalog {
     async fn list_namespaces(&self, parent: Option<&NamespaceIdent>) -> IcebergResult<Vec<NamespaceIdent>> {
         let result: Result<Vec<NamespaceIdent>> = async {
             let root = Self::load_root_for_read(&self.storage).await?;
+            if let Some(parent) = parent {
+                root.require_namespace(parent)?;
+            }
             Ok(root.list_namespaces(parent))
         }
         .await;
@@ -514,7 +513,7 @@ impl Catalog for S3Catalog {
         let result: Result<Namespace> = async {
             let root = Self::load_root_for_read(&self.storage).await?;
             let Some(entry) = root.get_namespace(namespace) else {
-                return Err(Error::NamespaceNotFound(namespace.clone()));
+                return Err(DomainError::NamespaceNotFound(namespace.clone()).into());
             };
 
             Ok(Namespace::with_properties(
@@ -547,7 +546,7 @@ impl Catalog for S3Catalog {
         let result: Result<()> = self
             .update_root(move |root| {
                 if !root.update_namespace(&namespace_owned, properties_owned.clone()) {
-                    return Err(Error::NamespaceNotFound(namespace_owned.clone()));
+                    return Err(DomainError::NamespaceNotFound(namespace_owned.clone()).into());
                 }
                 Ok(())
             })
@@ -577,7 +576,7 @@ impl Catalog for S3Catalog {
             // surfacing a spurious error after a durable drop.
             let root = Self::load_root_for_read(&self.storage).await?;
             if root.get_namespace(&namespace_owned).is_none() {
-                return Err(Error::NamespaceNotFound(namespace_owned.clone()));
+                return Err(DomainError::NamespaceNotFound(namespace_owned.clone()).into());
             }
             drop(root);
 
@@ -586,8 +585,8 @@ impl Catalog for S3Catalog {
                 // lost, surfacing as a conflict); the replay sees the namespace
                 // gone. Converge to success rather than re-erroring on the
                 // already-applied effect. `NamespaceNotEmpty` still propagates.
-                Err(Error::NamespaceNotFound(_)) => Ok(()),
-                other => other,
+                Err(DomainError::NamespaceNotFound(_)) => Ok(()),
+                other => other.map_err(Error::from),
             })
             .await
         }
@@ -599,6 +598,7 @@ impl Catalog for S3Catalog {
     async fn list_tables(&self, namespace: &NamespaceIdent) -> IcebergResult<Vec<TableIdent>> {
         let result: Result<Vec<TableIdent>> = async {
             let root = Self::load_root_for_read(&self.storage).await?;
+            root.require_namespace(namespace)?;
             Ok(root.active_tables_in_namespace(namespace))
         }
         .await;
@@ -661,7 +661,7 @@ impl Catalog for S3Catalog {
         let result: Result<Table> = async {
             let root = Self::load_root_for_read(&self.storage).await?;
             let key = TableKey::from_ident(table);
-            let entry = root.get_active(&key).ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            let entry = root.get_active(&key).ok_or_else(|| DomainError::TableNotFound(table.clone()))?;
             let metadata = self.storage.read_table_metadata(entry.metadata_location().as_str()).await?;
 
             Table::builder()
@@ -684,7 +684,7 @@ impl Catalog for S3Catalog {
             let root = Self::load_root_for_read(&self.storage).await?;
             let table_id = *root
                 .get_active(&key)
-                .ok_or_else(|| Error::TableNotFound(table_ident.clone()))?
+                .ok_or_else(|| DomainError::TableNotFound(table_ident.clone()))?
                 .table_id();
 
             self.update_root(move |root| {
@@ -716,7 +716,7 @@ impl Catalog for S3Catalog {
             let root = Self::load_root_for_read(&self.storage).await?;
             let table_id = *root
                 .get_active(&src_key)
-                .ok_or_else(|| Error::TableNotFound(src_ident.clone()))?
+                .ok_or_else(|| DomainError::TableNotFound(src_ident.clone()))?
                 .table_id();
 
             self.update_root(move |root| {

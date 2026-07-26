@@ -126,15 +126,13 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 
 ## Testing
 
-- **MUST** write unit tests for all new functions and types
-- **MUST** mock external dependencies (APIs, databases, file systems)
-- **MUST** use the built-in `#[test]` attribute and `cargo test`
-- **NEVER** create methods in a structure just for tests (`#[cfg(test)]`).
-- Follow the Arrange-Act-Assert pattern
-- Do not commit commented-out tests
-- Use `#[cfg(test)]` modules for test code
-- Never check the error text in tests, only the error types.
-- Never test private methods and functions, the tests will be fragile.
+All new and modified tests **MUST** follow the project testing policy in
+[docs/tests.md](docs/tests.md).
+
+- **NEVER** add production methods or widen production visibility solely for tests.
+  Test-only helpers and fakes belong in `#[cfg(test)]` modules, integration-test support, or
+  a deliberate testing feature and should implement production traits where applicable.
+- Keep inline `#[cfg(test)]` modules at the end of the source file.
 
 ## Imports and Dependencies
 

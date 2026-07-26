@@ -64,11 +64,20 @@ cargo build --bin query        # Build specific binary
 
 ### Testing
 
+See the project [testing policy](docs/tests.md) for required coverage and test design.
+
 ```bash
-cargo test                     # Run all tests
+cargo test -p <crate>          # Run tests for the affected crate
+cargo test --workspace         # Run workspace tests with default features
 cargo test test_name           # Run specific test
 cargo test -- --nocapture      # Run tests with output shown
+cargo test -p icegate-catalog-s3 --all-targets --features rest
+                               # Run catalog REST feature tests
 ```
+
+Some integration tests start an S3-compatible object store through testcontainers and
+require a working Docker-compatible runtime. If required infrastructure is unavailable,
+state which tests were not run; do not silently treat them as passing.
 
 ### Code Quality
 
@@ -105,7 +114,7 @@ make audit   # Run security audit
 
 2. **Make your changes** following the code style guidelines
 
-3. **Write tests** for new functionality
+3. **Add or update required tests**
 
 4. **Run all checks** before committing:
    ```bash
@@ -121,7 +130,6 @@ make audit   # Run security audit
 ### Pull Request Guidelines
 
 - Keep PRs focused on a single concern
-- Include tests for new functionality
 - Update documentation if needed
 - Ensure all CI checks pass
 - Provide a clear description of what the PR does and why
