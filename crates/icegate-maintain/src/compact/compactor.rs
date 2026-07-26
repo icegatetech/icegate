@@ -14,10 +14,9 @@ use icegate_common::parquet_encoding::{
 };
 use icegate_common::parquet_writer::ColumnEncoding;
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
-use icegate_jobmanager::registry::TaskExecutorFn;
-use icegate_jobmanager::{
+use jobmanager::{
     CachedStorage, JobCode, JobDefinition, JobDefinitionRegistry, JobRegistry, JobsManager, JobsManagerConfig,
-    JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, WorkerConfig,
+    JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
 };
 
 use crate::compact::config::CompactionConfig;

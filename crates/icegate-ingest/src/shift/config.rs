@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use icegate_jobmanager::s3_storage::{JobStateCodecKind, S3StorageConfig};
+use jobmanager::{JobStateCodecKind, S3StorageConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::error::IngestError;
@@ -113,7 +113,7 @@ impl JobsStorageConfig {
             bucket_prefix: self.prefix.clone(),
             job_state_codec: self.job_state_codec.into(),
             request_timeout: Duration::from_secs(self.request_timeout_secs),
-            retrier_config: icegate_jobmanager::RetrierConfig::default(),
+            retrier_config: jobmanager::RetrierConfig::default(),
         })
     }
 

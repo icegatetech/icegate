@@ -6,8 +6,8 @@ use std::{
 
 use async_trait::async_trait;
 use icegate_common::merge::MergePosition;
-use icegate_jobmanager::{Error, JobManager};
 use icegate_queue::{ExtractField, QueueReader, RecordBatchStream, SegmentsPlan, Topic};
+use jobmanager::{Error, JobManager};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -212,7 +212,7 @@ where
 {
     async fn run(
         &self,
-        task: Arc<dyn icegate_jobmanager::ImmutableTask>,
+        task: Arc<dyn jobmanager::ImmutableTask>,
         manager: &dyn JobManager,
         cancel_token: &CancellationToken,
     ) -> Result<ShiftTaskResult, ShiftTaskFailure> {
@@ -286,7 +286,7 @@ where
 {
     async fn run(
         &self,
-        task: Arc<dyn icegate_jobmanager::ImmutableTask>,
+        task: Arc<dyn jobmanager::ImmutableTask>,
         manager: &dyn JobManager,
         cancel_token: &CancellationToken,
     ) -> Result<CommitResult, CommitTaskFailure> {

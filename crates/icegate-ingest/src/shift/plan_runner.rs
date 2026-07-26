@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use icegate_jobmanager::{Error, JobManager, TaskCode, TaskDefinition};
 use icegate_queue::{QueueReader, SegmentsPlan, Topic};
+use jobmanager::{Error, JobManager, TaskCode, TaskDefinition};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
@@ -331,8 +331,8 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use iceberg::spec::DataFile;
-    use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
     use icegate_queue::ExtractedValue;
+    use jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -417,7 +417,7 @@ mod tests {
     }
 
     impl JobManager for RecordingManager {
-        fn add_task(&self, task_def: TaskDefinition) -> std::result::Result<Uuid, icegate_jobmanager::Error> {
+        fn add_task(&self, task_def: TaskDefinition) -> std::result::Result<Uuid, jobmanager::Error> {
             let task_id = Uuid::new_v4();
             self.task_ids.lock().expect("task ids lock").push(task_id);
             self.task_payloads
@@ -427,33 +427,26 @@ mod tests {
             Ok(task_id)
         }
 
-        fn complete_task(
-            &self,
-            _task_id: &Uuid,
-            _output: Vec<u8>,
-        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn complete_task(&self, _task_id: &Uuid, _output: Vec<u8>) -> std::result::Result<(), jobmanager::Error> {
             panic!("complete_task is not expected in plan runner tests");
         }
 
-        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), jobmanager::Error> {
             panic!("fail_task is not expected in plan runner tests");
         }
 
-        fn set_next_start_at(
-            &self,
-            _next_start_at: DateTime<Utc>,
-        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn set_next_start_at(&self, _next_start_at: DateTime<Utc>) -> std::result::Result<(), jobmanager::Error> {
             panic!("set_next_start_at is not expected in plan runner tests");
         }
 
-        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
+        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, jobmanager::Error> {
             panic!("get_task is not expected in plan runner tests");
         }
 
         fn get_tasks_by_code(
             &self,
             _code: &TaskCode,
-        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, icegate_jobmanager::Error> {
+        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, jobmanager::Error> {
             panic!("get_tasks_by_code is not expected in plan runner tests");
         }
     }

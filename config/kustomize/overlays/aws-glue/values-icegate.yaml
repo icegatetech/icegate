@@ -99,7 +99,7 @@ ingest:
         useSsl: true
         jobStateCodec: json
         requestTimeoutSecs: 5
-  rustLog: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+  rustLog: "info,icegate_ingest=debug,jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
   resources:
     requests:
       cpu: "2"

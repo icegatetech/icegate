@@ -147,7 +147,7 @@ services:
       AWS_ACCESS_KEY_ID: rustfsadmin
       AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_REGION: us-east-1
-      RUST_LOG: "info,icegate_maintain=debug,icegate_jobmanager=debug,icegate_common=debug,aws_sdk_s3=warn,aws_smithy_runtime=warn"
+      RUST_LOG: "info,icegate_maintain=debug,jobmanager=debug,icegate_common=debug,aws_sdk_s3=warn,aws_smithy_runtime=warn"
       # `maintain run` initialises tracing and refuses to start without an OTLP endpoint.
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: icegate-maintain
@@ -224,7 +224,7 @@ services:
       AWS_ACCESS_KEY_ID: rustfsadmin
       AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_REGION: us-east-1
-      RUST_LOG: "info,icegate_ingest=debug,icegate_jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
+      RUST_LOG: "info,icegate_ingest=debug,jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: ingest
     healthcheck:

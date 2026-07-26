@@ -35,14 +35,14 @@ use iceberg::Catalog;
 pub(crate) use iceberg_storage::IcebergStorage;
 use iceberg_storage::writer_max_parquet_bytes;
 use icegate_common::parquet_writer::ColumnEncoding;
-use icegate_jobmanager::{
-    CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
-    Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, WorkerConfig, s3_storage::S3StorageConfig,
-};
 use icegate_queue::ParquetQueueReader;
 use instrumentation::{
     CommitTaskRunnerWithMetrics, PlanTaskRunnerWithMetrics, QueueReaderWithMetrics, RowGroupsMergerObserverWithMetrics,
     ShiftTaskRunnerWithMetrics, StorageWithMetrics,
+};
+use jobmanager::{
+    CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
+    Metrics as JobMetrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, WorkerConfig,
 };
 use plan_runner::PlanTaskRunnerImpl;
 pub use planner_partitioning::{CURRENT_PLANNER_PARTITION_SPEC, PlannerPartitionSpec};

@@ -8,3 +8,6 @@ output.txt
 config/helm/*
 !config/helm/icegate/
 config/kustomize/**/charts
+# Local-only cargo overrides (e.g. `[patch]` for icegatetech/jobmanager); `.cargo/audit.toml`
+# is shared configuration and stays under version control.
+/.cargo/config.toml

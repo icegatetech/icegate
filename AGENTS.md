@@ -36,13 +36,14 @@ goes in `icegate-common`, never copied into a component.
 | `icegate-ingest`     | OTLP receivers (gRPC/HTTP), transform, WAL write.                                              | per-tenant task model [README](crates/icegate-ingest/README.md)                                                   |
 | `icegate-query`      | Query APIs (Loki/Prometheus/Tempo), query engine, LogQL, query CLI.                            | [README](crates/icegate-query/README.md), LogQL [logql/README](crates/icegate-query/src/logql/README.md) |
 | `icegate-maintain`   | Background maintenance: compaction, GC, schema migration, maintain CLI.                        | compaction [compact/README](crates/icegate-maintain/src/compact/README.md)                               |
-| `icegate-jobmanager` | Background job/task execution framework: registry, execution, S3 job-state.                    | —                                                                                                        |
 
 ### Dependency rules
 - `icegate-common` is the foundation and depends on no other workspace crate;
-- Components depend on `common` plus the library crates they need (`queue`, `jobmanager`, `catalog-s3`).
+- Components depend on `common` plus the library crates they need (`queue`, `catalog-s3`).
 - `catalog-s3`'s production library pulls no other workspace crate (dev-only dependency on `common`).
-- `jobmanager` should not depend on any Icegate component, including should not depend on `common`. The `jobmanager` will be allocated to a separate repository as an independent project.
+- The job/task framework is **not** a workspace crate: it lives in
+  [icegatetech/jobmanager](https://github.com/icegatetech/jobmanager) and enters the build as an
+  external dependency, git-pinned once in `[workspace.dependencies]` as `jobmanager`.
 
 ### Where docs live
 
@@ -52,8 +53,7 @@ goes in `icegate-common`, never copied into a component.
   or the subsystem — e.g. [`compact/README`](crates/icegate-maintain/src/compact/README.md)).
 - Root [`docs/`](docs) holds only cross-crate, project-wide material
   (e.g. [tests.md](docs/tests.md)) — never a `docs/<crate>.md`.
-- Why: a crate's docs then travel with it (`jobmanager` will move to its own repo)
-  and sit next to the code they describe, which resists drift.
+- Why: a crate's docs then travel with it and sit next to the code they describe, which resists drift.
 
 ## Iceberg and data invariants
 

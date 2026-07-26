@@ -162,6 +162,36 @@ IceGate uses a fork of `apache/iceberg-rust` for Iceberg table operations. See [
 - Responsible: IceGate maintainers
 - Regression testing: Run `make ci` after each sync
 
+## Dependency: icegatetech/jobmanager
+
+The job/task framework that drives ingest's shift pipeline and maintain's compaction, GC, and
+pricing loops lives in its own repository, [icegatetech/jobmanager](https://github.com/icegatetech/jobmanager),
+as the `jobmanager` crate. It is a general-purpose tool with no IceGate specifics, so it is
+developed, tested, and released on its own; keeping it here would tie a standalone project to
+IceGate's release cycle and let IceGate types leak into its API.
+
+**Pin policy:** the crate is not published to a registry, so a version IS a git rev. It is declared
+once in the root `Cargo.toml` under `[workspace.dependencies]` and pinned to an immutable rev, never
+a branch, so builds are reproducible. Bumping the SHA is a deliberate change: run the ingest and
+maintain integration tests with the new rev, since the pin covers runtime behaviour the type system
+does not.
+
+**Local co-development.** To work on both repositories at once, override the git source locally
+without touching the committed pin:
+
+```toml
+# .cargo/config.toml (local only, git-ignored)
+[patch."https://github.com/icegatetech/jobmanager"]
+jobmanager = { path = "../jobmanager" }
+```
+
+Remove the patch before running the checks you intend to trust: with it in place you are testing
+your working copy, not the pinned rev that CI will build.
+
+**Audit caveat:** `cargo audit` matches advisories against crates.io versions and skips git
+sources, so `jobmanager`'s own dependency tree is not covered by this repository's audit job — its
+CI audits it.
+
 ## Code of Conduct
 
 Be respectful and constructive in all interactions. We are committed to providing a welcoming and inclusive environment for all contributors.
