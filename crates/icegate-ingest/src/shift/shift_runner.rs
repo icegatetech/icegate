@@ -6,8 +6,8 @@ use std::sync::{
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use icegate_common::retrier::{Retrier, RetrierConfig};
-use icegate_jobmanager::{Error, ImmutableTask, JobManager};
 use icegate_queue::{QueueReader, Topic};
+use jobmanager::{Error, ImmutableTask, JobManager};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
@@ -482,8 +482,8 @@ mod tests {
         catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
         schema::{COL_SERVICE_NAME, COL_TENANT_ID, COL_TIMESTAMP},
     };
-    use icegate_jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
     use icegate_queue::{RowGroupPlanEntry, SegmentsPlan};
+    use jobmanager::{ImmutableTask, JobManager, TaskCode, TaskDefinition};
     use parquet::{
         arrow::arrow_writer::ArrowWriter,
         arrow::{PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder},
@@ -574,32 +574,25 @@ mod tests {
     struct NoopJobManager;
 
     impl JobManager for NoopJobManager {
-        fn add_task(&self, _task_def: TaskDefinition) -> std::result::Result<Uuid, icegate_jobmanager::Error> {
+        fn add_task(&self, _task_def: TaskDefinition) -> std::result::Result<Uuid, jobmanager::Error> {
             panic!("add_task is not expected in shift runner tests");
         }
-        fn complete_task(
-            &self,
-            _task_id: &Uuid,
-            _output: Vec<u8>,
-        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn complete_task(&self, _task_id: &Uuid, _output: Vec<u8>) -> std::result::Result<(), jobmanager::Error> {
             panic!("complete_task is not expected in shift runner tests");
         }
-        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), jobmanager::Error> {
             panic!("fail_task is not expected in shift runner tests");
         }
-        fn set_next_start_at(
-            &self,
-            _next_start_at: DateTime<Utc>,
-        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn set_next_start_at(&self, _next_start_at: DateTime<Utc>) -> std::result::Result<(), jobmanager::Error> {
             panic!("set_next_start_at is not expected in shift runner tests");
         }
-        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
+        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, jobmanager::Error> {
             panic!("get_task is not expected in shift runner tests");
         }
         fn get_tasks_by_code(
             &self,
             _code: &TaskCode,
-        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, icegate_jobmanager::Error> {
+        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, jobmanager::Error> {
             panic!("get_tasks_by_code is not expected in shift runner tests");
         }
     }
@@ -617,34 +610,31 @@ mod tests {
     }
 
     impl JobManager for RecordingJobManager {
-        fn add_task(&self, _task_def: TaskDefinition) -> std::result::Result<Uuid, icegate_jobmanager::Error> {
+        fn add_task(&self, _task_def: TaskDefinition) -> std::result::Result<Uuid, jobmanager::Error> {
             panic!("add_task is not expected in shift runner tests");
         }
 
-        fn complete_task(&self, task_id: &Uuid, output: Vec<u8>) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn complete_task(&self, task_id: &Uuid, output: Vec<u8>) -> std::result::Result<(), jobmanager::Error> {
             self.completed.lock().expect("completed lock").push((*task_id, output));
             Ok(())
         }
 
-        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), jobmanager::Error> {
             panic!("fail_task is not expected in shift runner tests");
         }
 
-        fn set_next_start_at(
-            &self,
-            _next_start_at: DateTime<Utc>,
-        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn set_next_start_at(&self, _next_start_at: DateTime<Utc>) -> std::result::Result<(), jobmanager::Error> {
             panic!("set_next_start_at is not expected in shift runner tests");
         }
 
-        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
+        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, jobmanager::Error> {
             panic!("get_task is not expected in shift runner tests");
         }
 
         fn get_tasks_by_code(
             &self,
             _code: &TaskCode,
-        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, icegate_jobmanager::Error> {
+        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, jobmanager::Error> {
             panic!("get_tasks_by_code is not expected in shift runner tests");
         }
     }
@@ -1244,7 +1234,7 @@ mod tests {
     }
 
     impl JobManager for E2eManager {
-        fn add_task(&self, task_def: TaskDefinition) -> std::result::Result<Uuid, icegate_jobmanager::Error> {
+        fn add_task(&self, task_def: TaskDefinition) -> std::result::Result<Uuid, jobmanager::Error> {
             let task_id = Uuid::new_v4();
             self.added_tasks.lock().expect("added tasks lock").push(AddedTaskDefinition {
                 id: task_id,
@@ -1254,34 +1244,27 @@ mod tests {
             Ok(task_id)
         }
 
-        fn complete_task(
-            &self,
-            task_id: &Uuid,
-            _output: Vec<u8>,
-        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn complete_task(&self, task_id: &Uuid, _output: Vec<u8>) -> std::result::Result<(), jobmanager::Error> {
             self.completed_tasks.lock().expect("completed tasks lock").push(*task_id);
             Ok(())
         }
 
-        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn fail_task(&self, _task_id: &Uuid, _error_msg: &str) -> std::result::Result<(), jobmanager::Error> {
             panic!("fail_task is not expected in e2e test");
         }
 
-        fn set_next_start_at(
-            &self,
-            _next_start_at: DateTime<Utc>,
-        ) -> std::result::Result<(), icegate_jobmanager::Error> {
+        fn set_next_start_at(&self, _next_start_at: DateTime<Utc>) -> std::result::Result<(), jobmanager::Error> {
             panic!("set_next_start_at is not expected in e2e test");
         }
 
-        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, icegate_jobmanager::Error> {
+        fn get_task(&self, _task_id: &Uuid) -> std::result::Result<Arc<dyn ImmutableTask>, jobmanager::Error> {
             panic!("get_task is not expected in e2e test");
         }
 
         fn get_tasks_by_code(
             &self,
             _code: &TaskCode,
-        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, icegate_jobmanager::Error> {
+        ) -> std::result::Result<Vec<Arc<dyn ImmutableTask>>, jobmanager::Error> {
             panic!("get_tasks_by_code is not expected in e2e test");
         }
     }

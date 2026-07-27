@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use icegate_jobmanager::{Error, ImmutableTask, JobManager};
 use icegate_queue::Topic;
+use jobmanager::{Error, ImmutableTask, JobManager};
 use tokio_util::sync::CancellationToken;
 
 use super::{

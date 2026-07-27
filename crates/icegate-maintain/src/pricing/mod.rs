@@ -49,11 +49,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use iceberg::Catalog;
-use icegate_jobmanager::registry::TaskExecutorFn;
-use icegate_jobmanager::{
+use jobmanager::{
     CachedStorage, Error as JobError, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry, JobManager,
     JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode,
-    TaskDefinition, WorkerConfig,
+    TaskDefinition, TaskExecutorFn, WorkerConfig,
 };
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;

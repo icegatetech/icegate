@@ -17,8 +17,7 @@ use chrono::Duration as ChronoDuration;
 use iceberg::Catalog;
 use icegate_common::icegate_table_ident;
 use icegate_common::manifest_scan::list_data_files_with_stats;
-use icegate_jobmanager::registry::TaskExecutorFn;
-use icegate_jobmanager::{Error as JobError, ImmutableTask, JobManager, TaskCode, TaskDefinition};
+use jobmanager::{Error as JobError, ImmutableTask, JobManager, TaskCode, TaskDefinition, TaskExecutorFn};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, info_span};
 

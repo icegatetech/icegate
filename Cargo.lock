@@ -4050,8 +4050,8 @@ dependencies = [
  "http-body-util",
  "iceberg",
  "icegate-common",
- "icegate-jobmanager",
  "icegate-queue",
+ "jobmanager",
  "object_store",
  "opentelemetry",
  "opentelemetry-instrumentation-tokio",
@@ -4074,32 +4074,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "icegate-jobmanager"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "chrono",
- "ciborium",
- "dashmap",
- "futures-util",
- "opentelemetry",
- "opentelemetry_sdk",
- "parking_lot",
- "rand 0.9.4",
- "serde",
- "serde_json",
- "testcontainers",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "icegate-maintain"
 version = "0.2.0"
 dependencies = [
@@ -4112,7 +4086,7 @@ dependencies = [
  "iceberg",
  "icegate-catalog-s3",
  "icegate-common",
- "icegate-jobmanager",
+ "jobmanager",
  "object_store",
  "opentelemetry",
  "parquet",
@@ -4496,6 +4470,31 @@ checksum = "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
 dependencies = [
  "quote",
  "syn",
+]
+
+[[package]]
+name = "jobmanager"
+version = "0.1.0"
+source = "git+https://github.com/icegatetech/jobmanager?rev=50ade7dd144a32d00900577f191e07b1663214b9#50ade7dd144a32d00900577f191e07b1663214b9"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "chrono",
+ "ciborium",
+ "dashmap",
+ "futures-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 icegate-common = { workspace = true }
-icegate-jobmanager = { path = "../icegate-jobmanager" }
+jobmanager = { workspace = true }
 
 # Iceberg
 iceberg = { workspace = true }

@@ -464,8 +464,8 @@ async fn run_services(
     });
     let jobsmanager_metrics = metrics_runtime
         .as_ref()
-        .map_or_else(icegate_jobmanager::Metrics::new_disabled, |runtime| {
-            icegate_jobmanager::Metrics::new(&runtime.meter())
+        .map_or_else(jobmanager::Metrics::new_disabled, |runtime| {
+            jobmanager::Metrics::new(&runtime.meter())
         });
     let otlp_metrics = metrics_runtime
         .as_ref()

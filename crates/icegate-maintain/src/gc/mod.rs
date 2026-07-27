@@ -22,11 +22,10 @@ use std::sync::Arc;
 use chrono::Duration as ChronoDuration;
 use iceberg::Catalog;
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE, StorageConfig};
-use icegate_jobmanager::registry::TaskExecutorFn;
-use icegate_jobmanager::{
+use jobmanager::{
     CachedStorage, Error as JobError, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry, JobManager,
     JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode,
-    TaskDefinition, WorkerConfig,
+    TaskDefinition, TaskExecutorFn, WorkerConfig,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};

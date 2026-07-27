@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use icegate_jobmanager::{ImmutableTask, JobManager, registry::TaskExecutorFn};
+use jobmanager::{ImmutableTask, JobManager, TaskExecutorFn};
 use serde::{Deserialize, Serialize};
 
 use super::{commit_runner::CommitTaskRunner, plan_runner::PlanTaskRunner, shift_runner::ShiftTaskRunner};
@@ -176,9 +176,7 @@ where
     }
 }
 
-pub(crate) fn parse_task_input<T: for<'de> Deserialize<'de>>(
-    task: &dyn ImmutableTask,
-) -> Result<T, icegate_jobmanager::Error> {
+pub(crate) fn parse_task_input<T: for<'de> Deserialize<'de>>(task: &dyn ImmutableTask) -> Result<T, jobmanager::Error> {
     serde_json::from_slice(task.get_input())
-        .map_err(|e| icegate_jobmanager::Error::TaskExecution(format!("failed to parse task input: {e}")))
+        .map_err(|e| jobmanager::Error::TaskExecution(format!("failed to parse task input: {e}")))
 }
