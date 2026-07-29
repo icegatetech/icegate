@@ -272,60 +272,74 @@ pub async fn write_spans_file(
     // canonical schema's fields.
     let mut by_name: std::collections::HashMap<&str, ArrayRef> = std::collections::HashMap::new();
     by_name.insert(
-        "tenant_id",
+        schema::COL_TENANT_ID,
         Arc::new(StringArray::from(spans.iter().map(|(t, _)| *t).collect::<Vec<_>>())),
     );
     by_name.insert(
-        "service_name",
+        schema::COL_SERVICE_NAME,
         Arc::new(StringArray::from(vec![Some("svc"); row_count])),
     );
-    by_name.insert("trace_id", Arc::new(trace_id_builder.finish()));
-    by_name.insert("span_id", Arc::new(span_id_builder.finish()));
+    by_name.insert(schema::COL_TRACE_ID, Arc::new(trace_id_builder.finish()));
+    by_name.insert(schema::COL_SPAN_ID, Arc::new(span_id_builder.finish()));
     by_name.insert(
-        "parent_span_id",
+        schema::COL_PARENT_SPAN_ID,
         Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
             std::iter::repeat_n(None::<&[u8]>, row_count),
             8,
         )?),
     );
     by_name.insert(
-        "timestamp",
+        schema::COL_TIMESTAMP,
         Arc::new(TimestampMicrosecondArray::from(timestamps.clone())),
     );
-    by_name.insert("end_timestamp", Arc::new(TimestampMicrosecondArray::from(timestamps)));
     by_name.insert(
-        "ingested_timestamp",
+        schema::COL_END_TIMESTAMP,
+        Arc::new(TimestampMicrosecondArray::from(timestamps)),
+    );
+    by_name.insert(
+        schema::COL_INGESTED_TIMESTAMP,
         Arc::new(TimestampMicrosecondArray::from(vec![now_micros; row_count])),
     );
-    by_name.insert("duration_micros", Arc::new(Int64Array::from(vec![1_000i64; row_count])));
     by_name.insert(
-        "trace_state",
+        schema::COL_DURATION_MICROS,
+        Arc::new(Int64Array::from(vec![1_000i64; row_count])),
+    );
+    by_name.insert(
+        schema::COL_TRACE_STATE,
         Arc::new(StringArray::from(vec![None::<&str>; row_count])),
     );
     by_name.insert(
-        "name",
+        schema::COL_NAME,
         Arc::new(StringArray::from(spans.iter().map(|(_, n)| *n).collect::<Vec<_>>())),
     );
-    by_name.insert("kind", Arc::new(Int32Array::from(vec![Some(2); row_count])));
-    by_name.insert("status_code", Arc::clone(&zeros));
+    by_name.insert(schema::COL_KIND, Arc::new(Int32Array::from(vec![Some(2); row_count])));
+    by_name.insert(schema::COL_STATUS_CODE, Arc::clone(&zeros));
     by_name.insert(
-        "status_message",
+        schema::COL_STATUS_MESSAGE,
         Arc::new(StringArray::from(vec![None::<&str>; row_count])),
     );
     by_name.insert(
-        "resource_attributes",
-        build_attribute_map(&arrow_schema, "resource_attributes", &attribute_rows)?,
+        schema::COL_RESOURCE_ATTRIBUTES,
+        build_attribute_map(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES, &attribute_rows)?,
     );
     by_name.insert(
-        "span_attributes",
-        build_attribute_map(&arrow_schema, "span_attributes", &attribute_rows)?,
+        schema::COL_SPAN_ATTRIBUTES,
+        build_attribute_map(&arrow_schema, schema::COL_SPAN_ATTRIBUTES, &attribute_rows)?,
     );
+    // `icegate_common::schema` exports no `COL_*` constant for these four, so
+    // they stay literals; the emptiness assertion below still catches drift.
     by_name.insert("flags", Arc::clone(&zeros));
     by_name.insert("dropped_attributes_count", Arc::clone(&zeros));
     by_name.insert("dropped_events_count", Arc::clone(&zeros));
     by_name.insert("dropped_links_count", zeros);
-    by_name.insert("events", empty_list_array(&arrow_schema, "events", row_count));
-    by_name.insert("links", empty_list_array(&arrow_schema, "links", row_count));
+    by_name.insert(
+        schema::COL_EVENTS,
+        empty_list_array(&arrow_schema, schema::COL_EVENTS, row_count),
+    );
+    by_name.insert(
+        schema::COL_LINKS,
+        empty_list_array(&arrow_schema, schema::COL_LINKS, row_count),
+    );
 
     let columns: Vec<ArrayRef> = arrow_schema
         .fields()

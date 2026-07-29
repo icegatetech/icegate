@@ -1,10 +1,5 @@
 //! Column projection through the tenant-scoped table provider.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::print_stdout,
-    clippy::uninlined_format_args
-)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use datafusion::arrow::array::{Array, RecordBatch, StringArray};
 use icegate_common::{ICEGATE_NAMESPACE, SPANS_TABLE};
