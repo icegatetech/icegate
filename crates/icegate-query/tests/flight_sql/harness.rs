@@ -19,9 +19,10 @@ use std::time::Duration;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use datafusion::arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
-    TimestampMicrosecondArray,
+    ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, Int32Array, Int64Array, ListArray, MapBuilder,
+    MapFieldNames, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray,
 };
+use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::parquet::file::properties::WriterProperties;
 use futures::TryStreamExt;
@@ -229,6 +230,211 @@ pub fn count_from_batches(batches: &[RecordBatch]) -> i64 {
     arr.value(0)
 }
 
+/// Write one span row per `(tenant_id, name)` entry into a SINGLE Parquet
+/// data file and commit it.
+///
+/// `spans` is the table that exposes projection-order bugs: `name` and the
+/// hidden `tenant_id` are both non-nullable strings, so a projection handed
+/// to the Iceberg reader out of schema order comes back relabelled rather
+/// than reordered, and nothing in the Arrow types gives that away. Callers
+/// supply `name` per row so a test can assert the exact values a projection
+/// returns, not merely a row count.
+///
+/// Deliberately narrow, in the spirit of [`write_logs_file`]: every column
+/// the schema requires is populated, but attributes, events, and links carry
+/// only enough content to be valid. `crates/icegate-query/tests/tempo` owns
+/// the richer span fixture used for trace formatting.
+pub async fn write_spans_file(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    spans: &[(&str, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let row_count = spans.len();
+    let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
+    let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
+        table.metadata().current_schema(),
+    )?);
+
+    let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
+    let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
+    for i in 0..row_count {
+        trace_id_builder.append_value((i as u128).to_le_bytes())?;
+        span_id_builder.append_value((i as u64).to_le_bytes())?;
+    }
+
+    let attribute_rows: Vec<&[(&str, &str)]> = vec![&[("http.method", "GET")]; row_count];
+    let timestamps: Vec<i64> = (0..row_count).map(|i| now_micros - (i as i64) * 1000).collect();
+    let zeros: ArrayRef = Arc::new(Int32Array::from(vec![Some(0); row_count]));
+
+    // Assemble by name so the fixture survives any reordering of the
+    // canonical schema's fields.
+    let mut by_name: std::collections::HashMap<&str, ArrayRef> = std::collections::HashMap::new();
+    by_name.insert(
+        schema::COL_TENANT_ID,
+        Arc::new(StringArray::from(spans.iter().map(|(t, _)| *t).collect::<Vec<_>>())),
+    );
+    by_name.insert(
+        schema::COL_SERVICE_NAME,
+        Arc::new(StringArray::from(vec![Some("svc"); row_count])),
+    );
+    by_name.insert(schema::COL_TRACE_ID, Arc::new(trace_id_builder.finish()));
+    by_name.insert(schema::COL_SPAN_ID, Arc::new(span_id_builder.finish()));
+    by_name.insert(
+        schema::COL_PARENT_SPAN_ID,
+        Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            std::iter::repeat_n(None::<&[u8]>, row_count),
+            8,
+        )?),
+    );
+    by_name.insert(
+        schema::COL_TIMESTAMP,
+        Arc::new(TimestampMicrosecondArray::from(timestamps.clone())),
+    );
+    by_name.insert(
+        schema::COL_END_TIMESTAMP,
+        Arc::new(TimestampMicrosecondArray::from(timestamps)),
+    );
+    by_name.insert(
+        schema::COL_INGESTED_TIMESTAMP,
+        Arc::new(TimestampMicrosecondArray::from(vec![now_micros; row_count])),
+    );
+    by_name.insert(
+        schema::COL_DURATION_MICROS,
+        Arc::new(Int64Array::from(vec![1_000i64; row_count])),
+    );
+    by_name.insert(
+        schema::COL_TRACE_STATE,
+        Arc::new(StringArray::from(vec![None::<&str>; row_count])),
+    );
+    by_name.insert(
+        schema::COL_NAME,
+        Arc::new(StringArray::from(spans.iter().map(|(_, n)| *n).collect::<Vec<_>>())),
+    );
+    by_name.insert(schema::COL_KIND, Arc::new(Int32Array::from(vec![Some(2); row_count])));
+    by_name.insert(schema::COL_STATUS_CODE, Arc::clone(&zeros));
+    by_name.insert(
+        schema::COL_STATUS_MESSAGE,
+        Arc::new(StringArray::from(vec![None::<&str>; row_count])),
+    );
+    by_name.insert(
+        schema::COL_RESOURCE_ATTRIBUTES,
+        build_attribute_map(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES, &attribute_rows)?,
+    );
+    by_name.insert(
+        schema::COL_SPAN_ATTRIBUTES,
+        build_attribute_map(&arrow_schema, schema::COL_SPAN_ATTRIBUTES, &attribute_rows)?,
+    );
+    // `icegate_common::schema` exports no `COL_*` constant for these four, so
+    // they stay literals; the emptiness assertion below still catches drift.
+    by_name.insert("flags", Arc::clone(&zeros));
+    by_name.insert("dropped_attributes_count", Arc::clone(&zeros));
+    by_name.insert("dropped_events_count", Arc::clone(&zeros));
+    by_name.insert("dropped_links_count", zeros);
+    by_name.insert(
+        schema::COL_EVENTS,
+        empty_list_array(&arrow_schema, schema::COL_EVENTS, row_count),
+    );
+    by_name.insert(
+        schema::COL_LINKS,
+        empty_list_array(&arrow_schema, schema::COL_LINKS, row_count),
+    );
+
+    let columns: Vec<ArrayRef> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            by_name
+                .remove(f.name().as_str())
+                .unwrap_or_else(|| panic!("spans fixture is missing column `{}`", f.name()))
+        })
+        .collect();
+    assert!(
+        by_name.is_empty(),
+        "spans fixture builds columns the schema does not have: {:?}",
+        by_name.keys()
+    );
+
+    let batch = RecordBatch::try_new(arrow_schema, columns)?;
+    commit_data_file(table, catalog, batch, &format!("spans-{now_micros}")).await
+}
+
+/// A `LIST` column where every row is an empty list.
+fn empty_list_array(schema: &datafusion::arrow::datatypes::Schema, name: &str, length: usize) -> ArrayRef {
+    let field = schema.field_with_name(name).expect("list column present in schema");
+    let DataType::List(inner_field) = field.data_type() else {
+        panic!("expected a List column for `{name}`");
+    };
+    // length+1 zero offsets: every row spans values[0..0), i.e. an empty list.
+    let offsets = OffsetBuffer::new(vec![0i32; length + 1].into());
+    let values = datafusion::arrow::array::new_empty_array(inner_field.data_type());
+    Arc::new(ListArray::new(Arc::clone(inner_field), offsets, values, None))
+}
+
+/// Build a `MAP<STRING,STRING>` column from per-row key/value pairs.
+fn build_attribute_map(
+    schema: &datafusion::arrow::datatypes::Schema,
+    name: &str,
+    rows: &[&[(&str, &str)]],
+) -> Result<ArrayRef, Box<dyn std::error::Error>> {
+    let field = schema.field_with_name(name).expect("map column present in schema");
+    let (key_field, value_field) = match field.data_type() {
+        DataType::Map(entries_field, _) => match entries_field.data_type() {
+            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
+            other => panic!("expected Struct entries for `{name}`, got {other:?}"),
+        },
+        other => panic!("expected a Map column for `{name}`, got {other:?}"),
+    };
+    let field_names = MapFieldNames {
+        entry: "key_value".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut builder = MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field)
+        .with_values_field(value_field);
+    for row in rows {
+        for (key, value) in *row {
+            builder.keys().append_value(*key);
+            builder.values().append_value(*value);
+        }
+        builder.append(true)?;
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Write one batch as a single Parquet data file and commit it to `table`.
+async fn commit_data_file(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    batch: RecordBatch,
+    file_suffix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let file_name_generator = DefaultFileNameGenerator::new(file_suffix.to_string(), None, DataFileFormat::Parquet);
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::builder().build(),
+        table.metadata().current_schema().clone(),
+    );
+    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+    let mut data_file_writer = data_file_writer_builder.build(None).await?;
+    data_file_writer.write(batch).await?;
+    let data_files = data_file_writer.close().await?;
+
+    let tx = Transaction::new(table);
+    let action = tx.fast_append().add_data_files(data_files);
+    let tx = action.apply(Transaction::new(table))?;
+    tx.commit(&**catalog).await?;
+    Ok(())
+}
+
 /// Write three rows of log data for the given tenant.
 ///
 /// Thin wrapper over [`write_logs_file`] for the common single-tenant
@@ -361,26 +567,5 @@ pub async fn write_logs_file(
         ],
     )?;
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
-    let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::builder().build(),
-        table.metadata().current_schema().clone(),
-    );
-    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_writer_builder,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
-    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
-    let mut data_file_writer = data_file_writer_builder.build(None).await?;
-    data_file_writer.write(batch).await?;
-    let data_files = data_file_writer.close().await?;
-
-    let tx = Transaction::new(table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action.apply(Transaction::new(table))?;
-    tx.commit(&**catalog).await?;
-    Ok(())
+    commit_data_file(table, catalog, batch, &unique_suffix).await
 }
