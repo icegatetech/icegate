@@ -41,9 +41,24 @@
 //! key.
 //!
 //! The inner scan is asked for the visible columns *plus* `tenant_id`
-//! (needed to evaluate the row-level filter); the trailing `tenant_id`
-//! column is then dropped by a [`ProjectionExec`] so the batches handed
-//! back match the advertised schema exactly.
+//! (needed to evaluate the row-level filter), in ascending schema order;
+//! a [`ProjectionExec`] then drops `tenant_id` and restores the caller's
+//! column order, so the batches handed back match the advertised schema
+//! exactly.
+//!
+//! ## Why the inner projection is sorted
+//!
+//! Asking in schema order is load-bearing, not tidiness. A
+//! `TableProvider` may emit a projection in *schema* order rather than the
+//! order it was asked for: the Iceberg reader relabels the batch instead
+//! of reordering it whenever the two orders differ but the projected
+//! columns line up positionally by Arrow type and nullability. A wrapper
+//! that appended `tenant_id` last would then evaluate the tenant
+//! predicate against whichever column landed in that slot, and every row
+//! would silently disappear — `SELECT name FROM spans` returned nothing
+//! while `count(*)` returned the full row count, because `name` and
+//! `tenant_id` are both non-nullable strings. Requesting ascending order
+//! leaves no provider anything to reorder.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -172,7 +187,7 @@ struct TenantScopedTableProvider {
     /// corresponding original-schema index. Used to translate
     /// projections before delegating to `inner.scan(...)`.
     index_map: Arc<[usize]>,
-    /// Original-schema index of the `tenant_id` column, appended to the
+    /// Original-schema index of the `tenant_id` column, merged into the
     /// inner projection so the row-level filter can reference it.
     tenant_col_idx: usize,
     /// Pre-built `tenant_id = '<t>'` predicate, reused for both the
@@ -285,13 +300,16 @@ impl TableProvider for TenantScopedTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Visible columns the caller wants, expressed in the inner
-        // provider's original schema (`tenant_id` excluded — it's hidden).
-        let mut scan_projection = self.translate_projection(projection)?;
-        let visible_len = scan_projection.len();
-        // Append `tenant_id` so the row-level filter below can reference
-        // it; it occupies the trailing slot of the inner scan's output.
+        // Visible columns the caller wants, in the caller's order,
+        // expressed in the inner provider's original schema (`tenant_id`
+        // excluded — it's hidden).
+        let visible_columns = self.translate_projection(projection)?;
+        // Add `tenant_id` so the row-level filter below can reference it,
+        // then sort: the inner scan must be asked in schema order (see the
+        // module docs), never in the caller's order.
+        let mut scan_projection = visible_columns.clone();
         scan_projection.push(self.tenant_col_idx);
+        scan_projection.sort_unstable();
 
         // Push the tenant predicate down too, so partition / row-group
         // pruning still skips other tenants' files (Iceberg identity
@@ -314,17 +332,24 @@ impl TableProvider for TenantScopedTableProvider {
         let predicate = state.create_physical_expr(self.tenant_filter.clone(), &df_schema)?;
         let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, inner_plan)?);
 
-        // Drop the trailing `tenant_id` column so the output matches the
-        // advertised (N-1 column) schema. The visible columns occupy
-        // indices `0..visible_len` in the filtered plan.
-        let filtered_schema = filtered.schema();
-        let projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = (0..visible_len)
-            .map(|i| {
-                let name = filtered_schema.field(i).name().clone();
-                let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new(&name, i));
-                (expr, name)
+        // Drop `tenant_id` and put the visible columns back in the caller's
+        // order, so the output matches the advertised (N-1 column) schema.
+        // Each column's slot in the sorted inner output is found by its
+        // original-schema index.
+        let scan_schema = filtered.schema();
+        let projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = visible_columns
+            .iter()
+            .map(|original_idx| {
+                let slot = scan_projection.binary_search(original_idx).map_err(|_| {
+                    DataFusionError::Internal(format!(
+                        "column {original_idx} is missing from the tenant-scoped scan projection"
+                    ))
+                })?;
+                let name = scan_schema.field(slot).name().clone();
+                let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new(&name, slot));
+                Ok((expr, name))
             })
-            .collect();
+            .collect::<DataFusionResult<_>>()?;
         let projected: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(projection_exprs, filtered)?);
 
         // Re-apply the caller's limit above the tenant filter.
@@ -359,14 +384,18 @@ impl TableProvider for TenantScopedTableProvider {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::sync::Arc;
+    use std::any::Any;
+    use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use datafusion::arrow::array::{Array, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::catalog::{MemorySchemaProvider, SchemaProvider, TableProvider};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+    use datafusion::catalog::{MemorySchemaProvider, SchemaProvider, Session, TableProvider};
     use datafusion::datasource::MemTable;
-    use datafusion::physical_plan::collect;
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::logical_expr::{Expr, TableType};
+    use datafusion::physical_plan::{ExecutionPlan, collect};
     use datafusion::prelude::SessionContext;
     use icegate_common::schema::COL_TENANT_ID;
     use icegate_common::{GLOBAL_TABLES, LOGS_TABLE, PRICES_TABLE};
@@ -486,6 +515,177 @@ mod tests {
         // The decorator projects tenant_id back out of the advertised schema.
         assert_eq!(table.schema().fields().len(), 1);
         assert!(table.schema().field_with_name("tenant_id").is_err());
+    }
+
+    /// Inner provider that emits projected columns in SCHEMA order while
+    /// advertising them in the order it was asked for.
+    ///
+    /// This is the production Iceberg reader's behaviour: when the requested
+    /// order differs from schema order but the projected columns line up
+    /// positionally by Arrow type and nullability, it relabels the batch
+    /// instead of reordering it. A caller that asks in schema order never
+    /// meets the case, because the two orders then coincide.
+    #[derive(Debug)]
+    struct SchemaOrderTableProvider {
+        schema: SchemaRef,
+        batch: RecordBatch,
+        /// Projections received, in call order, so a test can assert what the
+        /// wrapper *asked for* and not only what came back.
+        requests: Mutex<Vec<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl TableProvider for SchemaOrderTableProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let requested: Vec<usize> =
+                projection.cloned().unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+            self.requests.lock().unwrap().push(requested.clone());
+
+            let mut schema_order = requested.clone();
+            schema_order.sort_unstable();
+            let columns = schema_order.iter().map(|&i| Arc::clone(self.batch.column(i))).collect();
+
+            let advertised = Arc::new(self.schema.project(&requested)?);
+            let options = RecordBatchOptions::new().with_match_field_names(false);
+            let batch = RecordBatch::try_new_with_options(Arc::clone(&advertised), columns, &options)?;
+            MemTable::try_new(advertised, vec![vec![batch]])?
+                .scan(state, None, &[], None)
+                .await
+        }
+    }
+
+    /// Rows for two tenants where every column is, like `tenant_id`, a
+    /// non-nullable string.
+    ///
+    /// That uniformity is the point: it is exactly the condition under which
+    /// the reader relabels rather than reorders, so any permutation of these
+    /// columns is indistinguishable from the right one by Arrow type alone.
+    /// `spans` has this shape — `name` and `tenant_id` are both required
+    /// strings — and it is the only column of `spans` that reproduced the
+    /// defect.
+    fn spans_shaped_table() -> Arc<SchemaOrderTableProvider> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_TENANT_ID, DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("level", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["tenant-a", "tenant-b", "tenant-a"])),
+                Arc::new(StringArray::from(vec!["lookup", "insert", "commit"])),
+                Arc::new(StringArray::from(vec!["debug", "warn", "info"])),
+            ],
+        )
+        .unwrap();
+        Arc::new(SchemaOrderTableProvider {
+            schema,
+            batch,
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Values of one string column across all batches, in row order.
+    fn string_column(batches: &[RecordBatch], index: usize) -> Vec<Option<String>> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let array = batch.column(index).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..array.len())
+                    .map(|i| array.is_valid(i).then(|| array.value(i).to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn projecting_a_lone_non_nullable_string_column_returns_its_rows() {
+        // Regression: the wrapper appended `tenant_id` *after* the visible
+        // columns, so the inner scan was asked for [name, tenant_id] — an
+        // order the Iceberg reader does not honour. The tenant filter then
+        // read `name` as the tenancy key and dropped every row, which is why
+        // `SELECT name FROM spans` came back empty while `count(*)` reported
+        // the full table.
+        let inner = spans_shaped_table();
+        let provider =
+            TenantScopedTableProvider::new(Arc::clone(&inner) as Arc<dyn TableProvider>, "tenant-a").unwrap();
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = provider.scan(&state, Some(&vec![0]), &[], None).await.unwrap();
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+
+        assert_eq!(
+            string_column(&batches, 0),
+            vec![Some("lookup".to_string()), Some("commit".to_string())],
+            "projecting `name` alone must return tenant-a's two rows, never an empty result"
+        );
+    }
+
+    #[tokio::test]
+    async fn inner_scan_is_asked_for_columns_in_ascending_schema_order() {
+        // The wrapper must not require the inner provider to reorder columns.
+        let inner = spans_shaped_table();
+        let provider =
+            TenantScopedTableProvider::new(Arc::clone(&inner) as Arc<dyn TableProvider>, "tenant-a").unwrap();
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        // Visible schema is [name, level]; ask for them back to front.
+        provider.scan(&state, Some(&vec![1, 0]), &[], None).await.unwrap();
+
+        let requests = inner.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "one scan must issue exactly one inner projection");
+        assert_eq!(
+            requests[0],
+            vec![0, 1, 2],
+            "inner projection must list tenant_id plus the visible columns in ascending schema order"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_output_follows_the_caller_projection_order() {
+        // Sorting the inner projection must not leak into the output: the
+        // caller still gets its columns in the order it asked for.
+        let inner = spans_shaped_table();
+        let provider =
+            TenantScopedTableProvider::new(Arc::clone(&inner) as Arc<dyn TableProvider>, "tenant-a").unwrap();
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = provider.scan(&state, Some(&vec![1, 0]), &[], None).await.unwrap();
+        assert_eq!(
+            plan.schema().fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(),
+            vec!["level".to_string(), "name".to_string()]
+        );
+
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        assert_eq!(
+            string_column(&batches, 0),
+            vec![Some("debug".to_string()), Some("info".to_string())]
+        );
+        assert_eq!(
+            string_column(&batches, 1),
+            vec![Some("lookup".to_string()), Some("commit".to_string())]
+        );
     }
 
     #[tokio::test]
