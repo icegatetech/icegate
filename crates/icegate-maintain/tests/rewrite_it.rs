@@ -344,6 +344,7 @@ async fn rewrite_executor_compacts_partition_preserving_rows_and_order() {
         table: TABLE.to_string(),
         partition_key,
         input_file_paths,
+        trace_context: None,
     };
 
     let cancel = CancellationToken::new();
@@ -466,6 +467,7 @@ async fn rewrite_carries_wal_offset_property_forward() {
         table: TABLE.to_string(),
         partition_key,
         input_file_paths,
+        trace_context: None,
     };
     let cancel = CancellationToken::new();
     let outcome = executor.execute(&rewrite_input, &cancel).await.expect("execute rewrite");

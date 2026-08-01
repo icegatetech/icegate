@@ -31,6 +31,16 @@ catalog (so concurrent ingest commits are tolerated). `compact_plan` also fans
 out one `compact_manifest` task, gated on those rewrites, that repacks the
 manifests they leave behind.
 
+Every fanned-out task opens its OWN trace and joins the planner's by a **span
+link**, not by parent-child: a link is the only relation that spans two traces,
+and the tasks genuinely are separate traces (see
+[`tasks::link_planning_span`](tasks.rs)). The link graph is a star centred on
+PLAN — both REWRITE and MANIFEST link to PLAN, and no `rewrite → manifest` edge
+is built even though the dependency exists: a REWRITE task's output is empty, so
+the repack would have to read every dependency's job state purely for telemetry.
+Tasks queued before the payload field existed (and any run with tracing disabled)
+simply carry no link.
+
 #### Job scheme
 ```mermaid
 flowchart TD

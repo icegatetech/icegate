@@ -69,6 +69,12 @@ pub struct RewriteInput {
     pub partition_key: String,
     /// Input data-file paths, in sorted order (position = index).
     pub input_file_paths: Vec<String>,
+    /// W3C traceparent of the PLAN span that fanned this rewrite out; the REWRITE
+    /// task links its span back to it (see [`crate::compact::tasks`]). `None` when
+    /// the planner ran with no active trace context (tracing disabled) or the
+    /// payload predates the field.
+    #[serde(default)]
+    pub trace_context: Option<String>,
 }
 
 /// Outcome of executing one REWRITE task.
@@ -170,12 +176,26 @@ impl CompactFilesExecutor {
         // Step 1: load the table FRESH. The transaction commit reloads it again
         // and guards concurrency itself, so this load only needs to be recent
         // enough to plan the merge against the live data files.
-        let table = self.catalog.load_table(&table_ident).await?;
+        let table = self
+            .catalog
+            .load_table(&table_ident)
+            .instrument(info_span!("compact_load_table", table = input.table.as_str()))
+            .await?;
 
         // Step 2: enumerate the partition's live data files and match the planned
         // input paths. A missing input means a sibling compactor already took it;
         // abort before doing any merge/write work.
-        let Some(matched) = self.match_inputs(&table, &input.partition_key, &input.input_file_paths).await? else {
+        let match_span = info_span!(
+            "compact_match_inputs",
+            table = input.table.as_str(),
+            partition = input.partition_key.as_str(),
+            input_files = input.input_file_paths.len()
+        );
+        let Some(matched) = self
+            .match_inputs(&table, &input.partition_key, &input.input_file_paths)
+            .instrument(match_span)
+            .await?
+        else {
             self.metrics.record_commit_aborted(&input.table);
             return Ok(RewriteOutcome::Aborted);
         };
@@ -192,7 +212,18 @@ impl CompactFilesExecutor {
         // parquet. `added` is committed verbatim (the transaction's internal
         // retry replays it without re-merging).
         let merged_stream = self.build_merge_stream(&table, &matched, cancel)?;
-        let written = write_record_batches_to_parquet(table.clone(), self.write_cfg, merged_stream, cancel).await?;
+        // The merge itself is lazy: it runs inside the write pipeline as it pulls
+        // batches, so this span covers read + merge + encode together — the bulk
+        // of a REWRITE task's wall clock.
+        let write_span = info_span!(
+            "compact_merge_write",
+            table = input.table.as_str(),
+            partition = input.partition_key.as_str(),
+            input_files = matched.len()
+        );
+        let written = write_record_batches_to_parquet(table.clone(), self.write_cfg, merged_stream, cancel)
+            .instrument(write_span)
+            .await?;
         let output_files = written.data_files.len();
         let rows = written.rows_written;
         let added = written.data_files;
@@ -470,5 +501,44 @@ async fn cleanup_orphaned_outputs(file_io: &FileIO, paths: &[String]) {
                 "failed to delete orphaned compaction output after a failed rewrite"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RewriteInput;
+
+    /// REWRITE payloads outlive the process that wrote them: a task queued
+    /// before `trace_context` existed is still sitting in S3 job-state when the
+    /// upgraded binary picks it up. Parsing it MUST succeed with no context
+    /// rather than failing the task on an unknown-shape payload.
+    #[test]
+    fn rewrite_payload_without_trace_context_parses_with_none() {
+        let legacy = r#"{"table":"logs","partition_key":"tenant-a/2026-01-01","input_file_paths":["a.parquet"]}"#;
+
+        let input: RewriteInput = serde_json::from_str(legacy).expect("payload predating trace_context must parse");
+
+        assert_eq!(input.table, "logs");
+        assert_eq!(input.input_file_paths, vec!["a.parquet".to_string()]);
+        assert_eq!(input.trace_context, None);
+    }
+
+    /// The traceparent is what joins a fanned-out REWRITE back to its PLAN, so
+    /// it has to survive the serialize -> job-state -> deserialize hop verbatim.
+    #[test]
+    fn rewrite_payload_round_trips_trace_context() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let input = RewriteInput {
+            table: "spans".to_string(),
+            partition_key: "tenant-b/2026-01-02".to_string(),
+            input_file_paths: vec!["b.parquet".to_string()],
+            trace_context: Some(traceparent.to_string()),
+        };
+
+        let encoded = serde_json::to_vec(&input).expect("serialize rewrite input");
+        let decoded: RewriteInput = serde_json::from_slice(&encoded).expect("deserialize rewrite input");
+
+        assert_eq!(decoded, input);
+        assert_eq!(decoded.trace_context.as_deref(), Some(traceparent));
     }
 }

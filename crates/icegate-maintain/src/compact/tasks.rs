@@ -10,6 +10,11 @@
 //! tasks IS a jobmanager operation, so [`PlanTaskRunner`] holds the planning
 //! I/O itself and delegates only the pure bin-packing to
 //! [`crate::compact::data::planner`].
+//!
+//! This layer also owns the trace handoff across the fan-out: PLAN puts its own
+//! W3C traceparent into every task payload, and the runner that picks the task up
+//! adds it to its span as a span link — see `link_planning_span` in this module
+//! for why a link, and not a parent, is what joins them.
 
 use std::sync::Arc;
 
@@ -68,7 +73,13 @@ impl PlanTaskRunner {
         manager: &dyn JobManager,
         cancel: &CancellationToken,
     ) -> std::result::Result<(), JobError> {
-        let span = info_span!("compact_plan", table = self.spec.table);
+        // `rewrite_groups` is only known once the planner has run; declare it
+        // empty and fill it in from `run_plan` via `Span::record`.
+        let span = info_span!(
+            "compact_plan",
+            table = self.spec.table,
+            rewrite_groups = tracing::field::Empty
+        );
         self.run_plan(task, manager, cancel).instrument(span).await
     }
 
@@ -93,6 +104,7 @@ impl PlanTaskRunner {
         let table = self
             .catalog
             .load_table(&table_ident)
+            .instrument(info_span!("compact_plan_load_table", table = self.spec.table))
             .await
             .map_err(|e| JobError::TaskExecution(format!("failed to load table '{}': {e}", self.spec.table)))?;
 
@@ -109,11 +121,13 @@ impl PlanTaskRunner {
 
         check_cancellation(cancel)?;
         let stats = list_data_files_with_stats(&table, self.spec.descriptor)
+            .instrument(info_span!("compact_plan_list_data_files", table = self.spec.table))
             .await
             .map_err(|e| JobError::TaskExecution(format!("failed to enumerate data files: {e}")))?;
 
         let outcome = plan_rewrite_groups(stats, &self.planner_limits);
         let group_count = outcome.groups.len();
+        tracing::Span::current().record("rewrite_groups", group_count);
         // PLAN telemetry: groups fanned out, plus the partition compacted/skipped
         // split. `usize -> u64` is lossless on every supported (<= 64-bit) target.
         self.metrics.record_plan(
@@ -126,6 +140,9 @@ impl PlanTaskRunner {
         // Ids of the REWRITE tasks fanned out this iteration; a `compact_manifest`
         // task depends on them so it runs only after data compaction settles.
         let mut rewrite_ids = Vec::new();
+        // Every task of this fan-out links back to the same `compact_plan` span,
+        // so the context is extracted once rather than per group.
+        let plan_trace_context = icegate_common::extract_current_trace_context();
         for group in outcome.groups {
             // Stop fanning out promptly on shutdown. Tasks already submitted stay
             // queued; the immutable PLAN task re-runs next cycle and re-derives the
@@ -149,6 +166,7 @@ impl PlanTaskRunner {
                 table: self.spec.table.to_string(),
                 partition_key,
                 input_file_paths,
+                trace_context: plan_trace_context.clone(),
             };
             let payload = serde_json::to_vec(&rewrite_input)
                 .map_err(|e| JobError::TaskExecution(format!("failed to serialize rewrite input: {e}")))?;
@@ -165,6 +183,7 @@ impl PlanTaskRunner {
 
         let manifest_input = ManifestCompactInput {
             table: self.spec.table.to_string(),
+            trace_context: plan_trace_context,
         };
         let payload = serde_json::to_vec(&manifest_input)
             .map_err(|e| JobError::TaskExecution(format!("failed to serialize manifest compact input: {e}")))?;
@@ -218,6 +237,7 @@ impl CompactFilesRunner {
         let input: RewriteInput = serde_json::from_slice(task.get_input())
             .map_err(|e| JobError::TaskExecution(format!("failed to parse rewrite input: {e}")))?;
         tracing::Span::current().record("partition", input.partition_key.as_str());
+        link_planning_span(input.trace_context.as_deref());
 
         let outcome = self
             .executor
@@ -289,6 +309,7 @@ impl CompactManifestRunner {
         check_cancellation(cancel)?;
         let input: ManifestCompactInput = serde_json::from_slice(task.get_input())
             .map_err(|e| JobError::TaskExecution(format!("failed to parse manifest compact input: {e}")))?;
+        link_planning_span(input.trace_context.as_deref());
 
         let outcome = self.executor.execute(&input, cancel).await.map_err(|e| {
             JobError::TaskExecution(format!("manifest compaction of table '{}' failed: {e}", self.table))
@@ -351,6 +372,21 @@ pub fn manifest_executor_fn(runner: Arc<CompactManifestRunner>) -> TaskExecutorF
     })
 }
 
+/// Link the current task span back to the PLAN span that fanned this task out.
+///
+/// A fanned-out task is picked up by a worker with no ambient trace context —
+/// possibly in another process — so it opens a NEW trace. The link is what joins
+/// the two in the trace backend. Silently does nothing when the planner carried
+/// no context (tracing disabled) or the traceparent is unparseable, since a task
+/// must never fail over telemetry.
+fn link_planning_span(trace_context: Option<&str>) {
+    if let Some(traceparent) = trace_context {
+        if !icegate_common::add_span_link(traceparent) {
+            tracing::debug!(traceparent, "compaction task carries an invalid plan traceparent");
+        }
+    }
+}
+
 /// Return a task error if `cancel` has been triggered, so a task stops at the
 /// next checkpoint on shutdown.
 ///
@@ -362,4 +398,23 @@ fn check_cancellation(cancel: &CancellationToken) -> std::result::Result<(), Job
         return Err(JobError::TaskExecution("compaction task cancelled".to_string()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_planning_span;
+
+    /// The declared contract is "a task must never fail over telemetry", so the
+    /// only thing to prove here is that no payload shape aborts the task: an
+    /// absent context, unparseable bytes, and a well-formed traceparent whose
+    /// all-zero ids make the `SpanContext` invalid all return normally. There is
+    /// nothing to assert on — the function returns `()`; which traceparents are
+    /// rejected is `add_span_link`'s rule and is tested where it lives
+    /// (`icegate_common::tracing`).
+    #[test]
+    fn link_planning_span_never_fails_the_task() {
+        link_planning_span(None);
+        link_planning_span(Some("not-a-traceparent"));
+        link_planning_span(Some("00-00000000000000000000000000000000-0000000000000000-01"));
+    }
 }

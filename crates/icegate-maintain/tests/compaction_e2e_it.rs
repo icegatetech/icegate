@@ -763,6 +763,7 @@ async fn compactor_repacks_manifests_without_touching_data() {
         .execute(
             &ManifestCompactInput {
                 table: TABLE.to_string(),
+                trace_context: None,
             },
             &CancellationToken::new(),
         )
@@ -885,6 +886,7 @@ async fn manifest_compaction_reports_actual_output_count() {
         .execute(
             &ManifestCompactInput {
                 table: TABLE.to_string(),
+                trace_context: None,
             },
             &CancellationToken::new(),
         )
