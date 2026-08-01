@@ -82,6 +82,22 @@ goes in `icegate-common`, never copied into a component.
   never copied as literals into working code.
 - It is better to return an error than to use, calculate, or show invalid data.
 
+### Deployment configs come in pairs
+
+A component is configured in two independent places, and they **MUST** be changed
+together in the same change:
+
+- Kubernetes: the Helm chart in [`config/helm/icegate`](config/helm/icegate)
+  (`values.yaml` plus the per-component `templates/configmap-*.yaml`), and any
+  kustomize overlay in [`config/kustomize`](config/kustomize) that pins the value.
+- Docker Compose: the per-component files in [`config/docker`](config/docker)
+  (`ingest.yaml`, `query.yaml`, `maintain.yaml`) and `docker-compose.yml`.
+
+So: adding, renaming, removing, or re-defaulting a config field, an env var, a
+port, or a service URL is not done until both sides are updated. Updating one
+side only leaves the other deployment broken or silently running the old
+behaviour — the failure surfaces far from the change.
+
 ## Before a change
 
 - Determine the crate and the layer the change belongs to; shared logic goes to
