@@ -16,21 +16,30 @@ use crate::{compact::Compactor, config::MaintainConfig, error::MaintainError, gc
 
 /// Execute the run command.
 ///
-/// Loads the maintain configuration, starts the Prometheus metrics server (when
-/// `metrics.enabled`), builds the Iceberg catalog, starts the compaction
-/// service and (when enabled) the orphan-file GC service and the LLM pricing
-/// crawler, then blocks until a shutdown signal arrives. On shutdown all
-/// worker pools are drained and the metrics server is stopped before
+/// Loads the maintain configuration, initialises tracing, starts the Prometheus
+/// metrics server (when `metrics.enabled`), builds the Iceberg catalog, starts
+/// the compaction service and (when enabled) the orphan-file GC service and the
+/// LLM pricing crawler, then blocks until a shutdown signal arrives. On shutdown
+/// all worker pools are drained and the metrics server is stopped before
 /// returning.
 ///
 /// # Errors
 ///
-/// Returns [`MaintainError`] if the configuration cannot be loaded, the metrics
-/// runtime cannot be built, the catalog cannot be built, the compactor, GC
-/// runner, or pricing crawler cannot start, or any worker pool stops with an
-/// error during shutdown.
+/// Returns [`MaintainError`] if the configuration cannot be loaded, the tracing
+/// block is invalid or its subscriber cannot be initialised, the metrics runtime
+/// cannot be built, the catalog cannot be built, the compactor, GC runner, or
+/// pricing crawler cannot start, or any worker pool stops with an error during
+/// shutdown.
 pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
+
+    // Tracing first: everything below logs, and the subscriber must be installed
+    // before the first event so no startup line is dropped. `MaintainConfig` does
+    // not validate this block (see its `validate` doc), so validate it here — the
+    // sample ratio and the endpoint requirement are checked before any exporter is
+    // built. The guard flushes pending spans when it drops at end of scope.
+    config.tracing.validate()?;
+    let _tracing_guard = icegate_common::init_tracing(&config.tracing)?;
 
     // Initialise metrics BEFORE building the compactor: `MetricsRuntime::new`
     // installs the global meter provider, and the compactor's `CompactMetrics`

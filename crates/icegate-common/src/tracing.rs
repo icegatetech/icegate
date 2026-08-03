@@ -615,6 +615,21 @@ mod tests {
         }
     }
 
+    /// The rule callers depend on: a traceparent is accepted only when it
+    /// resolves to a VALID `SpanContext`. Callers branch on the returned `bool`
+    /// (compaction logs the rejection and carries on rather than failing its
+    /// task), so both rejected shapes are pinned here: bytes that do not parse at
+    /// all, and a well-formed header whose all-zero ids the W3C spec defines as
+    /// invalid.
+    #[test]
+    fn add_span_link_rejects_malformed_and_zeroed_traceparents() {
+        assert!(!add_span_link("not-a-traceparent"));
+        assert!(!add_span_link(
+            "00-00000000000000000000000000000000-0000000000000000-01"
+        ));
+        assert!(add_span_link("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
+    }
+
     /// Sanity check: the always-present keys (`timestamp`, `level`,
     /// `target`, `fields`, `threadId`) survive the rewrite, and a log
     /// outside any span has neither a `span` object nor any trace

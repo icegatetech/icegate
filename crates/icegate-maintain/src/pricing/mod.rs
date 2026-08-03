@@ -300,7 +300,9 @@ async fn run_crawl(
     metrics: &metrics::PricingMetrics,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let live = read::read_live_rates(catalog).await?;
+    let live = read::read_live_rates(catalog)
+        .instrument(info_span!("pricing_read_live_rates"))
+        .await?;
     let ctx = CrawlContext {
         live: &live,
         config,
@@ -308,10 +310,16 @@ async fn run_crawl(
         now,
     };
 
-    let fetched = futures::future::join_all(sources.iter().map(|s| async move {
-        let started = std::time::Instant::now();
-        let result = s.fetch_rates(client, now).await;
-        (s.as_ref(), started.elapsed().as_secs_f64(), result)
+    // One span per source: the fetches run concurrently, so a slow or hanging
+    // feed is only distinguishable from a slow crawl when each has its own span.
+    let fetched = futures::future::join_all(sources.iter().map(|s| {
+        let span = info_span!("pricing_fetch_source", source = s.name());
+        async move {
+            let started = std::time::Instant::now();
+            let result = s.fetch_rates(client, now).await;
+            (s.as_ref(), started.elapsed().as_secs_f64(), result)
+        }
+        .instrument(span)
     }))
     .await;
 
@@ -363,7 +371,9 @@ async fn run_crawl(
         return Ok(());
     }
 
-    writer::append_prices(catalog, &diff_outcome.to_append).await?;
+    writer::append_prices(catalog, &diff_outcome.to_append)
+        .instrument(info_span!("pricing_append", rows = diff_outcome.to_append.len()))
+        .await?;
     for rate in &diff_outcome.to_append {
         metrics.record_appended(&rate.source, 1);
     }

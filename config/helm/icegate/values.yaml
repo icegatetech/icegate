@@ -517,9 +517,10 @@ migrate:
 ## unreferenced S3 objects). Runs as a Deployment; each sub-feature loops on its
 ## own `jobsmanager.scanIntervalSecs`.
 ##
-## Disabled by default: the `maintain run` binary always initialises tracing and
-## refuses to start without an OTLP endpoint, so enabling it REQUIRES setting
-## `maintain.tracing.otlpEndpoint` (a Helm `required` guard enforces it).
+## Disabled by default. With the default `maintain.tracing.enabled: true` the
+## `run` service refuses to start without an OTLP endpoint, so enabling it also
+## requires setting `maintain.tracing.otlpEndpoint` (a Helm `required` guard
+## enforces it) or turning `maintain.tracing.enabled` off.
 maintain:
   enabled: false
   ## Replicas may be scaled out. The jobmanager distributes rewrite tasks across
@@ -732,10 +733,13 @@ maintain:
     type: ClusterIP
     annotations: {}
 
-  ## OpenTelemetry tracing. The OTLP endpoint is mandatory (see note above):
-  ## it is exported as OTEL_EXPORTER_OTLP_ENDPOINT (gRPC, e.g. host:4317).
+  ## OpenTelemetry tracing, rendered into the maintain ConfigMap exactly as for
+  ## ingest and query. With tracing enabled the service refuses to start without
+  ## an endpoint, so set otlpEndpoint (gRPC, e.g. host:4317) or turn tracing off.
   tracing:
+    enabled: true
     otlpEndpoint: ""
+    sampleRatio: 1.0
 
   ## RUST_LOG level
   rustLog: "info"

@@ -105,3 +105,11 @@ metrics:
   host: 0.0.0.0
   port: 9091
   path: /metrics
+
+# OpenTelemetry tracing for the long-running `maintain run` service; the
+# one-shot `migrate` commands share this file but never read this block.
+# Fields and their defaults: `icegate_common::TracingConfig`.
+tracing:
+  enabled: true
+  otlp_endpoint: http://jaeger:4317
+  sample_ratio: 1.0

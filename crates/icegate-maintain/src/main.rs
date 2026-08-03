@@ -22,13 +22,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI arguments first so tracing can be gated on the subcommand.
     let cli = Cli::parse();
 
-    // The one-shot `migrate` commands keep tracing disabled (they report via
-    // their own stdout/stderr output), while the long-running `run` service
-    // must enable tracing so its spans and logs are emitted.
-    let _guard = init_tracing(&TracingConfig {
-        enabled: matches!(cli.command, Commands::Run { .. }),
-        ..TracingConfig::default()
-    })?;
+    // Exhaustive on purpose: a new subcommand must decide where its subscriber
+    // comes from, and the compiler is what forces that decision — an
+    // uninstrumented binary logs nothing and fails silently.
+    let _guard = match &cli.command {
+        // The one-shot `migrate` commands carry no `tracing` config block and
+        // report via their own stdout/stderr output, so they get the plain JSON
+        // logger here (tracing disabled = no OTLP exporter).
+        Commands::Migrate { .. } => Some(init_tracing(&TracingConfig {
+            enabled: false,
+            ..TracingConfig::default()
+        })?),
+        // The long-running `run` service initialises the subscriber from
+        // `MaintainConfig::tracing` once it has read its config file, mirroring
+        // ingest and query — nothing is installed here: the first `init_tracing`
+        // call wins.
+        Commands::Run { .. } => None,
+    };
 
     // Execute command
     if let Err(e) = cli.execute().await {

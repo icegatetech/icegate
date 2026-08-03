@@ -11,6 +11,7 @@ use iceberg::Catalog;
 use icegate_common::{StorageConfig, create_object_store, icegate_table_ident};
 use object_store::path::Path as ObjectPath;
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, info_span};
 
 use crate::error::MaintainError;
 use crate::gc::config::GcOrphansConfig;
@@ -62,10 +63,19 @@ pub async fn run_sweep(
     cancel: &CancellationToken,
 ) -> Result<SweepSummary, MaintainError> {
     let ident = icegate_table_ident(table);
-    let loaded = catalog.load_table(&ident).await?;
+    let loaded = catalog
+        .load_table(&ident)
+        .instrument(info_span!("gc_load_table", table))
+        .await?;
 
     // FAIL-CLOSED: a partial referenced set must never drive a delete.
-    let referenced = match collect_referenced_paths(&loaded).await {
+    // The reference set walks every snapshot's manifest list and every manifest
+    // in it, so on a table with deep history it dominates the sweep; its own span
+    // separates that cost from the object listing below.
+    let referenced = match collect_referenced_paths(&loaded)
+        .instrument(info_span!("gc_reference_set", table))
+        .await
+    {
         Ok(set) => set,
         Err(error) => {
             metrics.record_reference_set_build_failed(table);
@@ -88,53 +98,63 @@ pub async fn run_sweep(
     // larger structure, is the live set.
     let mut orphans: Vec<(ObjectPath, u64, ObjectClass)> = Vec::new();
 
-    loop {
-        // Race the list page against cancellation so a slow or stuck storage
-        // call cannot keep shutdown blocked until the future resolves.
-        let item = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Err(MaintainError::Storage(format!("gc sweep of table '{table}' cancelled")));
-            }
-            item = stream.next() => item,
-        };
-        let Some(item) = item else { break };
-        let meta = item.map_err(|e| MaintainError::Storage(format!("gc list error for table '{table}': {e}")))?;
-        summary.scanned += 1;
-        // `meta.location` is already a bucket-relative object key; the referenced
-        // set holds the same keys (Iceberg's absolute URIs parsed via
-        // decide::parse_object_key), so the two compare directly as `ObjectPath`.
-        match Decision::classify(
-            &meta.location,
-            &prefix,
-            &referenced,
-            meta.last_modified,
-            cutoff,
-            cfg.include_metadata,
-        ) {
-            Decision::Referenced => summary.referenced += 1,
-            Decision::TooYoung => summary.too_young += 1,
-            Decision::SkipMetadataDisabled | Decision::SkipUnknownLayout => {}
-            Decision::Delete(class) => {
-                match class {
-                    ObjectClass::Data => summary.found_data += 1,
-                    ObjectClass::Metadata => summary.found_metadata += 1,
+    // The list-and-classify pass runs as an instrumented async block rather than
+    // an extracted function: it touches every local this function holds, which a
+    // helper would have to take as a parameter list far past the workspace's
+    // argument budget.
+    async {
+        loop {
+            // Race the list page against cancellation so a slow or stuck storage
+            // call cannot keep shutdown blocked until the future resolves.
+            let item = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(MaintainError::Storage(format!("gc sweep of table '{table}' cancelled")));
                 }
-                metrics.record_orphan_found(table, class);
-                // A dry run returns before deletion, so retaining the path would
-                // only grow memory across a large backlog scan without use.
-                if !cfg.dry_run {
-                    orphans.push((meta.location, meta.size, class));
+                item = stream.next() => item,
+            };
+            let Some(item) = item else { break };
+            let meta = item.map_err(|e| MaintainError::Storage(format!("gc list error for table '{table}': {e}")))?;
+            summary.scanned += 1;
+            // `meta.location` is already a bucket-relative object key; the referenced
+            // set holds the same keys (Iceberg's absolute URIs parsed via
+            // decide::parse_object_key), so the two compare directly as `ObjectPath`.
+            match Decision::classify(
+                &meta.location,
+                &prefix,
+                &referenced,
+                meta.last_modified,
+                cutoff,
+                cfg.include_metadata,
+            ) {
+                Decision::Referenced => summary.referenced += 1,
+                Decision::TooYoung => summary.too_young += 1,
+                Decision::SkipMetadataDisabled | Decision::SkipUnknownLayout => {}
+                Decision::Delete(class) => {
+                    match class {
+                        ObjectClass::Data => summary.found_data += 1,
+                        ObjectClass::Metadata => summary.found_metadata += 1,
+                    }
+                    metrics.record_orphan_found(table, class);
+                    // A dry run returns before deletion, so retaining the path would
+                    // only grow memory across a large backlog scan without use.
+                    if !cfg.dry_run {
+                        orphans.push((meta.location, meta.size, class));
+                    }
                 }
             }
         }
+        Ok(())
     }
+    .instrument(info_span!("gc_list_objects", table))
+    .await?;
 
     if cfg.dry_run {
         metrics.record_scan(table, summary.scanned, summary.too_young);
         return Ok(summary);
     }
 
+    let delete_span = info_span!("gc_delete_orphans", table, orphans = orphans.len());
     let mut deletions = futures::stream::iter(orphans.into_iter().map(|(path, size, class)| {
         let store = Arc::clone(&store);
         async move {
@@ -146,30 +166,35 @@ pub async fn run_sweep(
     }))
     .buffer_unordered(cfg.delete_concurrency.max(1));
 
-    loop {
-        // Keep the delete drain cancellation-aware too, so shutdown short-circuits
-        // promptly instead of waiting on the next in-flight deletion.
-        let result = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Err(MaintainError::Storage(format!("gc sweep of table '{table}' cancelled")));
-            }
-            result = deletions.next() => result,
-        };
-        let Some(result) = result else { break };
-        match result {
-            Ok((size, class)) => {
-                summary.deleted += 1;
-                summary.bytes_reclaimed += size;
-                metrics.record_orphan_deleted(table, class, size);
-            }
-            Err((path, class, error)) => {
-                summary.delete_failed += 1;
-                metrics.record_orphan_delete_failed(table, class);
-                tracing::warn!(table, path = %path, kind = ?class, error = %error, "failed to delete orphan object");
+    async {
+        loop {
+            // Keep the delete drain cancellation-aware too, so shutdown short-circuits
+            // promptly instead of waiting on the next in-flight deletion.
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(MaintainError::Storage(format!("gc sweep of table '{table}' cancelled")));
+                }
+                result = deletions.next() => result,
+            };
+            let Some(result) = result else { break };
+            match result {
+                Ok((size, class)) => {
+                    summary.deleted += 1;
+                    summary.bytes_reclaimed += size;
+                    metrics.record_orphan_deleted(table, class, size);
+                }
+                Err((path, class, error)) => {
+                    summary.delete_failed += 1;
+                    metrics.record_orphan_delete_failed(table, class);
+                    tracing::warn!(table, path = %path, kind = ?class, error = %error, "failed to delete orphan object");
+                }
             }
         }
+        Ok(())
     }
+    .instrument(delete_span)
+    .await?;
 
     metrics.record_scan(table, summary.scanned, summary.too_young);
     Ok(summary)

@@ -99,4 +99,13 @@ data:
       host: "0.0.0.0"
       port: {{ .Values.maintain.metrics.port }}
       path: {{ .Values.maintain.metrics.path | quote }}
+    tracing:
+      enabled: {{ .Values.maintain.tracing.enabled }}
+      {{- if .Values.maintain.tracing.enabled }}
+      {{/* Guarded rather than optional (as in configmap-ingest): the run service
+           refuses to start without an endpoint, so a missing one is better caught
+           at `helm install` than as a CrashLoopBackOff. */}}
+      otlp_endpoint: {{ required "maintain.tracing.otlpEndpoint is required when maintain.tracing.enabled is true: the maintain run service refuses to start without an OTLP endpoint" .Values.maintain.tracing.otlpEndpoint | quote }}
+      {{- end }}
+      sample_ratio: {{ .Values.maintain.tracing.sampleRatio }}
 {{- end }}

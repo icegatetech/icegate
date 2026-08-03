@@ -148,8 +148,10 @@ services:
       AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_REGION: us-east-1
       RUST_LOG: "info,icegate_maintain=debug,jobmanager=debug,icegate_common=debug,aws_sdk_s3=warn,aws_smithy_runtime=warn"
-      # `maintain run` initialises tracing and refuses to start without an OTLP endpoint.
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      # The OTLP endpoint lives in `maintain.yaml` (`tracing.otlp_endpoint`), which
+      # wins over `OTEL_EXPORTER_OTLP_ENDPOINT`; setting both here would leave a
+      # second, silently-ignored source of truth. `OTEL_SERVICE_NAME` stays: it is
+      # read by the SDK's resource detector, not by the config file.
       OTEL_SERVICE_NAME: icegate-maintain
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/9091' || exit 1"]

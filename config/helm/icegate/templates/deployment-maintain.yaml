@@ -55,11 +55,6 @@ spec:
               value: {{ .Values.maintain.rustLog | quote }}
             - name: OTEL_SERVICE_NAME
               value: icegate-maintain
-            # The `maintain run` service always initialises tracing and refuses to
-            # start without an OTLP endpoint (it carries no tracing config block),
-            # so this env var is required whenever compaction is enabled.
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{ required "maintain.tracing.otlpEndpoint is required when maintain.enabled is true: the maintain run service refuses to start without an OTLP endpoint" .Values.maintain.tracing.otlpEndpoint | quote }}
             {{- with .Values.maintain.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

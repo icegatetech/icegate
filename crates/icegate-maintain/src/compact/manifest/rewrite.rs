@@ -35,6 +35,12 @@ const MANIFEST_REWRITE_MARKER_VALUE: &str = "true";
 pub struct ManifestCompactInput {
     /// Table name within the `icegate` namespace (e.g. `logs`, `spans`).
     pub table: String,
+    /// W3C traceparent of the PLAN span that scheduled this repack; the MANIFEST
+    /// task links its span back to it (see [`crate::compact::tasks`]). `None` when
+    /// the planner ran with no active trace context (tracing disabled) or the
+    /// payload predates the field.
+    #[serde(default)]
+    pub trace_context: Option<String>,
 }
 
 /// Outcome of executing one `compact_manifest` task.
@@ -104,7 +110,11 @@ impl ManifestCompactExecutor {
         // Load the table FRESH. The transaction commit reloads it again and guards
         // concurrency itself, so this load only needs to be recent enough to plan
         // the repack against the live manifest list.
-        let table = self.catalog.load_table(&table_ident).await?;
+        let table = self
+            .catalog
+            .load_table(&table_ident)
+            .instrument(info_span!("compact_manifest_load_table", table = input.table.as_str()))
+            .await?;
 
         // Without a current snapshot there are no manifests to repack.
         if table.metadata().current_snapshot_id().is_none() {
@@ -115,7 +125,12 @@ impl ManifestCompactExecutor {
             return Ok(ManifestCompactOutcome::Skipped);
         }
 
-        let entries = list_manifest_entries(&table).await?;
+        let entries = list_manifest_entries(&table)
+            .instrument(info_span!(
+                "compact_manifest_list_entries",
+                table = input.table.as_str()
+            ))
+            .await?;
         let (partition_spec_id, selected) = match plan_manifest_compaction(
             &entries,
             self.target_manifest_size_bytes,
@@ -259,5 +274,41 @@ impl ManifestCompactExecutor {
         let manifests_after = list_manifest_entries(&table).await?.len();
         let carried = manifests_before.saturating_sub(input_manifests);
         Ok(manifests_after.saturating_sub(carried))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ManifestCompactInput;
+
+    /// A MANIFEST task queued before `trace_context` existed is still in S3
+    /// job-state when the upgraded binary picks it up, so the old payload shape
+    /// MUST keep parsing instead of failing the task.
+    #[test]
+    fn manifest_payload_without_trace_context_parses_with_none() {
+        let legacy = r#"{"table":"logs"}"#;
+
+        let input: ManifestCompactInput =
+            serde_json::from_str(legacy).expect("payload predating trace_context must parse");
+
+        assert_eq!(input.table, "logs");
+        assert_eq!(input.trace_context, None);
+    }
+
+    /// The traceparent links the repack back to the PLAN that scheduled it, so
+    /// it must survive the serialize -> job-state -> deserialize hop verbatim.
+    #[test]
+    fn manifest_payload_round_trips_trace_context() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let input = ManifestCompactInput {
+            table: "spans".to_string(),
+            trace_context: Some(traceparent.to_string()),
+        };
+
+        let encoded = serde_json::to_vec(&input).expect("serialize manifest compact input");
+        let decoded: ManifestCompactInput = serde_json::from_slice(&encoded).expect("deserialize");
+
+        assert_eq!(decoded, input);
+        assert_eq!(decoded.trace_context.as_deref(), Some(traceparent));
     }
 }
