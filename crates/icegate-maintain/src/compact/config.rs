@@ -44,7 +44,7 @@ impl From<JobStateCodec> for JobStateCodecKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JobsStorageConfig {
-    /// S3 endpoint URL.
+    /// S3 endpoint URL. Its scheme selects TLS: `https://` connects over TLS, `http://` does not.
     pub endpoint: String,
     /// Bucket name for job state.
     pub bucket: String,
@@ -52,8 +52,6 @@ pub struct JobsStorageConfig {
     pub prefix: String,
     /// AWS region name.
     pub region: String,
-    /// Whether to use HTTPS for the endpoint.
-    pub use_ssl: bool,
     /// Job state serialization codec.
     pub job_state_codec: JobStateCodec,
     /// Request timeout for S3 operations, in seconds.
@@ -71,7 +69,6 @@ impl Default for JobsStorageConfig {
             bucket: String::new(),
             prefix: "compactor".to_string(),
             region: "us-east-1".to_string(),
-            use_ssl: false,
             job_state_codec: JobStateCodec::default(),
             request_timeout_secs: 5,
             access_key_id: None,
@@ -129,18 +126,16 @@ impl JobsStorageConfig {
         let access_key_id = self.resolve_access_key_id()?;
         let secret_access_key = self.resolve_secret_access_key()?;
 
-        Ok(S3StorageConfig {
-            endpoint: self.endpoint.clone(),
+        Ok(S3StorageConfig::new(
+            self.endpoint.as_str(),
             access_key_id,
             secret_access_key,
-            bucket_name: self.bucket.clone(),
-            use_ssl: self.use_ssl,
-            region: self.region.clone(),
-            bucket_prefix: self.prefix.clone(),
-            job_state_codec: self.job_state_codec.into(),
-            request_timeout: Duration::from_secs(self.request_timeout_secs),
-            retrier_config: jobmanager::RetrierConfig::default(),
-        })
+            self.bucket.as_str(),
+            self.region.as_str(),
+        )
+        .with_bucket_prefix(self.prefix.as_str())
+        .with_job_state_codec(self.job_state_codec.into())
+        .with_request_timeout(Duration::from_secs(self.request_timeout_secs)))
     }
 
     fn resolve_access_key_id(&self) -> Result<String, MaintainError> {

@@ -599,7 +599,6 @@ async fn gc_runner_reclaims_in_the_background() {
                 bucket: BUCKET_NAME.to_string(),
                 prefix: "gc".to_string(),
                 region: "us-east-1".to_string(),
-                use_ssl: false,
                 job_state_codec: JobStateCodec::Json,
                 request_timeout_secs: 5,
                 access_key_id: Some(conn.access_key.clone()),

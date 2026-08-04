@@ -104,7 +104,6 @@ ingest:
         endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
         bucket: jobs
         prefix: shifter
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
   rustLog: "info,icegate_ingest=debug,jobmanager=debug,icegate_queue=debug,icegate_common=trace,opendal=debug,opendal::services::s3::backend=info,reqwest_tracing=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
@@ -149,7 +148,6 @@ maintain:
         endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
         bucket: jobs
         prefix: compactor
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
   ## Orphan-file GC — enabled with an aggressive dev cadence: sweep every 5
@@ -165,7 +163,6 @@ maintain:
         endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
         bucket: jobs
         prefix: gc
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
   ## LLM pricing crawler — enabled in dev with a short 5-minute cadence so a
@@ -181,7 +178,6 @@ maintain:
         endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
         bucket: jobs
         prefix: pricing
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
   tracing:

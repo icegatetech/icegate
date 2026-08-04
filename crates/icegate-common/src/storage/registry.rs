@@ -21,15 +21,15 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use dashmap::mapref::one::Ref;
-use dashmap::DashMap;
 use object_store::ObjectStore;
 use object_store_opendal::OpendalStore;
-use opendal::services::S3Config;
 use opendal::Operator;
+use opendal::services::S3Config;
 
-use super::builder::{create_local_store, create_memory_store, ObjectStoreWithPath};
+use super::builder::{ObjectStoreWithPath, create_local_store, create_memory_store};
 use super::config::StorageBackend;
 use super::icegate_s3::build_s3_operator;
 use super::layers::{StorageLayers, StorageLayersConfig};

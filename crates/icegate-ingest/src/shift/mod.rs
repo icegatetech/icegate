@@ -41,7 +41,7 @@ use instrumentation::{
     ShiftTaskRunnerWithMetrics, StorageWithMetrics,
 };
 use jobmanager::{
-    CachedStorage, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
+    CachedStorage, JobCleanerConfig, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
     Metrics as JobMetrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, WorkerConfig,
 };
 use plan_runner::PlanTaskRunnerImpl;
@@ -207,6 +207,7 @@ impl Shifter {
                 poll_interval: Duration::from_millis(shift_config.jobsmanager.poll_interval_ms),
                 ..Default::default()
             },
+            cleaner_config: JobCleanerConfig::default(),
         };
 
         let manager = JobsManager::new(

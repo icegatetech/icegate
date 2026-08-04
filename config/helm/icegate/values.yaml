@@ -334,12 +334,12 @@ ingest:
       pollIntervalMs: 1000
       iterationIntervalMillisecs: 30000
       storage:
-        ## Defaults to storage.s3.endpoint when empty
+        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
         prefix: shifter
         region: ""  # defaults to aws.region
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
 
@@ -597,12 +597,12 @@ maintain:
       ## Jobs-state storage (S3), same shape ingest's shift uses. Credentials are
       ## taken from the AWS env vars injected into the pod, not configured here.
       storage:
-        ## Defaults to storage.s3.endpoint when empty.
+        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
         prefix: compactor
         region: ""  # defaults to aws.region
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
 
@@ -651,12 +651,12 @@ maintain:
       ## Jobmanager worker poll interval, in milliseconds.
       pollIntervalMs: 1000
       storage:
-        ## Defaults to storage.s3.endpoint when empty.
+        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
         prefix: gc
         region: ""  # defaults to aws.region
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
 
@@ -709,12 +709,12 @@ maintain:
       workerCount: 1
       pollIntervalMs: 1000
       storage:
-        ## Defaults to storage.s3.endpoint when empty.
+        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
         prefix: pricing
         region: ""  # defaults to aws.region
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
 

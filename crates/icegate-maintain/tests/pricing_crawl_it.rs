@@ -286,7 +286,6 @@ async fn pricing_runner_builds_starts_and_drains() {
                 bucket: BUCKET_NAME.to_string(),
                 prefix: "pricing".to_string(),
                 region: "us-east-1".to_string(),
-                use_ssl: false,
                 job_state_codec: JobStateCodec::Json,
                 request_timeout_secs: 5,
                 access_key_id: Some(conn.access_key.clone()),

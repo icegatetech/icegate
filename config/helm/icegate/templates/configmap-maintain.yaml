@@ -41,7 +41,6 @@ data:
           bucket: {{ .Values.maintain.compaction.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.maintain.compaction.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.maintain.compaction.jobsmanager.storage.region | default .Values.aws.region | quote }}
-          use_ssl: {{ .Values.maintain.compaction.jobsmanager.storage.useSsl }}
           job_state_codec: {{ .Values.maintain.compaction.jobsmanager.storage.jobStateCodec }}
           request_timeout_secs: {{ .Values.maintain.compaction.jobsmanager.storage.requestTimeoutSecs }}
     gc:
@@ -67,7 +66,6 @@ data:
           bucket: {{ .Values.maintain.gc.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.maintain.gc.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.maintain.gc.jobsmanager.storage.region | default .Values.aws.region | quote }}
-          use_ssl: {{ .Values.maintain.gc.jobsmanager.storage.useSsl }}
           job_state_codec: {{ .Values.maintain.gc.jobsmanager.storage.jobStateCodec }}
           request_timeout_secs: {{ .Values.maintain.gc.jobsmanager.storage.requestTimeoutSecs }}
     pricing:
@@ -91,7 +89,6 @@ data:
           bucket: {{ .Values.maintain.pricing.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.maintain.pricing.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.maintain.pricing.jobsmanager.storage.region | default .Values.aws.region | quote }}
-          use_ssl: {{ .Values.maintain.pricing.jobsmanager.storage.useSsl }}
           job_state_codec: {{ .Values.maintain.pricing.jobsmanager.storage.jobStateCodec }}
           request_timeout_secs: {{ .Values.maintain.pricing.jobsmanager.storage.requestTimeoutSecs }}
     metrics:

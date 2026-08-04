@@ -100,7 +100,6 @@ ingest:
         endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
         bucket: jobs
         prefix: shifter
-        useSsl: false
         jobStateCodec: json
         requestTimeoutSecs: 5
   cache:

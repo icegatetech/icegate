@@ -15,8 +15,9 @@ use icegate_common::parquet_encoding::{
 use icegate_common::parquet_writer::ColumnEncoding;
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
 use jobmanager::{
-    CachedStorage, JobCode, JobDefinition, JobDefinitionRegistry, JobRegistry, JobsManager, JobsManagerConfig,
-    JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    CachedStorage, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionRegistry, JobRegistry, JobsManager,
+    JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, TaskExecutorFn,
+    WorkerConfig,
 };
 
 use crate::compact::config::CompactionConfig;
@@ -277,6 +278,7 @@ impl Compactor {
                 poll_interval: std::time::Duration::from_millis(config.jobsmanager.poll_interval_ms),
                 ..Default::default()
             },
+            cleaner_config: JobCleanerConfig::default(),
         };
 
         let manager = JobsManager::new(cached_storage, manager_config, job_registry, metrics).map_err(map_job_error)?;

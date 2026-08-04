@@ -74,7 +74,6 @@ data:
           bucket: {{ .Values.ingest.shift.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.ingest.shift.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.ingest.shift.jobsmanager.storage.region | default .Values.aws.region | quote }}
-          use_ssl: {{ .Values.ingest.shift.jobsmanager.storage.useSsl }}
           job_state_codec: {{ .Values.ingest.shift.jobsmanager.storage.jobStateCodec }}
           request_timeout_secs: {{ .Values.ingest.shift.jobsmanager.storage.requestTimeoutSecs }}
     otlp_http:

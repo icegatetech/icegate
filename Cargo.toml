@@ -56,8 +56,7 @@ icegate-queue = { path = "crates/icegate-queue" }
 # It is not published to a registry, so a version IS a git rev. Pinned to an immutable
 # rev (not a branch) for reproducible builds; bump the SHA deliberately, together with a
 # run of the ingest/maintain integration tests that drive shift and compaction through it.
-#jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "e8978ff8b1a2072654017a4d2901ace1bfd6a414" }
-jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "50ade7dd144a32d00900577f191e07b1663214b9" }
+jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "d64197ada9d34471374b2ca30c8a0f46de9d568d" }
 
 # Arrow ecosystem (must match iceberg's version)
 arrow = { version = "57.0", default-features = false, features = ["prettyprint"] }
