@@ -162,9 +162,8 @@ pub use memory::{
 pub use metrics::{MetricsConfig, MetricsRuntime, run_metrics_server};
 pub use retrier::{Retrier, RetrierConfig, RetryError};
 pub use storage::{
-    IceGateStorage, IceGateStorageFactory, ObjectStoreWithPath, PrefetchConfig, S3Config, StorageBackend, StorageCache,
-    StorageConfig, build_storage_cache, create_local_store, create_memory_store, create_object_store, create_s3_store,
-    register_foyer_metrics,
+    IceGateStorage, IceGateStorageFactory, ObjectStoreWithPath, OperatorRegistry, PrefetchConfig, S3Config,
+    StorageBackend, StorageCache, StorageConfig, StorageLayersConfig, build_storage_cache, register_foyer_metrics,
 };
 // Re-exported so `CatalogBuilder::from_config` callers can name the shutdown
 // token type without a direct `tokio-util` dependency.

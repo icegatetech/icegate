@@ -13,7 +13,6 @@ use icegate_common::{
     IoHandle, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, MemoryPressure, MetricsRuntime, OPERATIONS_TABLE,
     OPERATIONS_TOPIC, SPANS_TABLE, SPANS_TOPIC,
     catalog::CatalogBuilder,
-    create_object_store,
     parquet_encoding::{
         LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, METRICS_BLOOM_COLUMNS, METRICS_COLUMN_ENCODINGS,
         OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS, SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
@@ -328,7 +327,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     let queue_config = config.queue.clone().unwrap_or_else(|| QueueConfig::new("wal"));
     let (write_tx, write_rx) = channel(queue_config.common.channel_capacity);
 
-    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
+    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), Some(&config.storage.backend)).await?;
 
     // Run the fallible startup/run path, then always close the IO cache.
     // Foyer's background flusher tasks need a clean close to avoid channel errors.
@@ -371,16 +370,11 @@ async fn run_services(
     }
 
     // Create object store based on queue base_path.
-    // Read cache, prefetch, and stat TTL are supplied via io_cache for the
-    // shifter's queue reader which shares this store.
-    let (store, normalized_path) = create_object_store(
-        &queue_config.common.base_path,
-        Some(&config.storage.backend),
-        io_cache.cache(),
-        io_cache.prefetch(),
-        io_cache.stat_ttl(),
-        io_cache.max_write_cache_size(),
-    )?;
+    // Read cache, prefetch, and stat TTL come from io_cache, which the
+    // shifter's queue reader shares through this store.
+    let (store, normalized_path) = io_cache
+        .object_store_operator_registry()
+        .resolve_object_store(&queue_config.common.base_path)?;
 
     // Update queue config with normalized base path
     let mut queue_config = queue_config;

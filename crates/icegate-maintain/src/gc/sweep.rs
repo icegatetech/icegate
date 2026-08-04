@@ -8,7 +8,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
 use iceberg::Catalog;
-use icegate_common::{StorageConfig, create_object_store, icegate_table_ident};
+use icegate_common::{OperatorRegistry, icegate_table_ident};
 use object_store::path::Path as ObjectPath;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
@@ -47,6 +47,13 @@ pub struct SweepSummary {
 /// `cfg.min_age_secs` relative to `now`. When `cfg.dry_run` is set, orphans are
 /// counted and metered but not deleted.
 ///
+/// The object store serving the table's location comes from
+/// `operator_registry`, which builds one operator per bucket and hands out that
+/// one afterwards: an operator
+/// carrying the metrics layer is retained for the lifetime of the process (see
+/// `icegate_common::storage`), so a store per sweep would be a slow leak. A
+/// table pointed at a new location is simply a different key.
+///
 /// # Errors
 ///
 /// Returns an error if the table cannot be loaded, the referenced set cannot be
@@ -55,7 +62,7 @@ pub struct SweepSummary {
 /// recorded in the summary, not propagated.
 pub async fn run_sweep(
     catalog: &Arc<dyn Catalog>,
-    storage: &StorageConfig,
+    operator_registry: &OperatorRegistry,
     table: &str,
     cfg: &GcOrphansConfig,
     now: DateTime<Utc>,
@@ -83,8 +90,7 @@ pub async fn run_sweep(
         }
     };
 
-    let location = loaded.metadata().location();
-    let (store, prefix) = create_object_store(location, Some(&storage.backend), None, None, None, None)?;
+    let (store, prefix) = operator_registry.resolve_object_store(loaded.metadata().location())?;
 
     let grace = i64::try_from(cfg.min_age_secs)
         .map_err(|_| MaintainError::Config("gc.orphans.min_age_secs is too large".to_string()))?;

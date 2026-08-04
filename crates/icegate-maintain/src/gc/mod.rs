@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use chrono::Duration as ChronoDuration;
 use iceberg::Catalog;
-use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE, StorageConfig};
+use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, OperatorRegistry, SPANS_TABLE};
 use jobmanager::{
     CachedStorage, Error as JobError, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry, JobManager,
     JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode,
@@ -86,7 +86,9 @@ fn enabled_gc_tables(config: &GcConfig) -> Vec<GcTableSpec> {
 /// Per-table GC task executor.
 struct GcExecutor {
     catalog: Arc<dyn Catalog>,
-    storage: StorageConfig,
+    /// Shared by every table's executor: one operator per bucket for the whole
+    /// process, however many tables sweep through it.
+    operator_registry: Arc<OperatorRegistry>,
     table: &'static str,
     orphans: GcOrphansConfig,
     metrics: GcMetrics,
@@ -116,7 +118,7 @@ impl GcExecutor {
         let now = chrono::Utc::now();
         let summary = run_sweep(
             &self.catalog,
-            &self.storage,
+            &self.operator_registry,
             self.table,
             &self.orphans,
             now,
@@ -159,12 +161,20 @@ pub struct GcRunnerHandle {
 impl GcRunner {
     /// Build a runner with one GC job per enabled table.
     ///
+    /// `operator_registry` is the process's registry: every table's sweep
+    /// resolves its store through it, so one bucket costs one `OpenDAL`
+    /// operator no matter how many tables are swept how often.
+    ///
     /// # Errors
     ///
     /// Returns [`MaintainError`] if the config is invalid, no tables are enabled,
     /// or the jobmanager storage cannot be constructed.
-    pub async fn new(catalog: Arc<dyn Catalog>, storage: &StorageConfig, config: &GcConfig) -> Result<Self> {
-        Self::new_with_max_iterations(catalog, storage, config, None).await
+    pub async fn new(
+        catalog: Arc<dyn Catalog>,
+        operator_registry: Arc<OperatorRegistry>,
+        config: &GcConfig,
+    ) -> Result<Self> {
+        Self::new_with_max_iterations(catalog, operator_registry, config, None).await
     }
 
     /// Test seam: like [`Self::new`] but caps each job at `max_iterations`
@@ -176,7 +186,7 @@ impl GcRunner {
     #[doc(hidden)]
     pub async fn new_with_max_iterations(
         catalog: Arc<dyn Catalog>,
-        storage: &StorageConfig,
+        operator_registry: Arc<OperatorRegistry>,
         config: &GcConfig,
         max_iterations: Option<u64>,
     ) -> Result<Self> {
@@ -201,7 +211,7 @@ impl GcRunner {
         for spec in specs {
             let executor = Arc::new(GcExecutor {
                 catalog: Arc::clone(&catalog),
-                storage: storage.clone(),
+                operator_registry: Arc::clone(&operator_registry),
                 table: spec.table,
                 orphans: config.orphans.clone(),
                 metrics: metrics.clone(),
