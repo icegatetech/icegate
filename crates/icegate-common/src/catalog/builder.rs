@@ -1,6 +1,10 @@
 //! Catalog builder factory
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use iceberg::{
     Catalog, CatalogBuilder as IcebergCatalogBuilder,
@@ -17,9 +21,17 @@ use tokio_util::sync::CancellationToken;
 
 use super::{CacheConfig, CatalogBackend, CatalogConfig};
 use crate::error::{CommonError, Result};
-use crate::storage::PrefetchConfig;
 use crate::storage::cache::{StorageCache, build_storage_cache};
 use crate::storage::icegate_storage::IceGateStorageFactory;
+use crate::storage::{OperatorRegistry, PrefetchConfig, StorageBackend, StorageLayersConfig};
+
+/// `OpenTelemetry` scope of the operators a catalog's `FileIO` reads through.
+const ICEBERG_STORAGE_SCOPE: &str = "iceberg-storage";
+
+/// `OpenTelemetry` scope of the operators reached by path: the WAL queue and
+/// the GC sweep. Kept separate from [`ICEBERG_STORAGE_SCOPE`] so a dashboard
+/// can tell table traffic from queue traffic.
+const OBJECT_STORE_SCOPE: &str = "icegate-wal";
 
 /// Handle for gracefully closing the foyer IO cache on shutdown.
 ///
@@ -34,11 +46,17 @@ use crate::storage::icegate_storage::IceGateStorageFactory;
 /// with other components (e.g., the WAL object store) without coupling its
 /// lifecycle to catalog construction.
 ///
+/// The handle also owns the component's operator registries — one per
+/// `OpenTelemetry` scope — because it outlives everything that reads through
+/// them and an operator must be built once per process (see the
+/// `storage::layers` module).
+///
 /// # Usage
 ///
 /// ```ignore
 /// let io_cache = IoHandle::from_config(
 ///     config.catalog.cache.as_ref(),
+///     Some(&config.storage.backend),
 /// ).await?;
 /// let catalog = CatalogBuilder::from_config(&config.catalog, &io_cache, shutdown_token).await?;
 /// // ... run servers ...
@@ -46,29 +64,37 @@ use crate::storage::icegate_storage::IceGateStorageFactory;
 /// io_cache.close().await;
 /// ```
 pub struct IoHandle {
-    cache: Option<StorageCache>,
-    prefetch: Option<PrefetchConfig>,
-    stat_ttl: Option<Duration>,
-    max_write_cache_size: Option<usize>,
+    /// The layer inputs, without a meter: a meter names an `OpenTelemetry`
+    /// scope, and each registry below is its own scope.
+    layers: StorageLayersConfig,
+    backend: Option<StorageBackend>,
+    /// The one factory [`storage_factory`](Self::storage_factory) hands out.
+    factory: OnceLock<Arc<IceGateStorageFactory>>,
+    /// The one registry
+    /// [`object_store_operator_registry`](Self::object_store_operator_registry)
+    /// hands out.
+    object_store_operator_registry: OnceLock<Arc<OperatorRegistry>>,
 }
 
 impl IoHandle {
-    /// Create a no-op handle (no cache configured).
+    /// Create a no-op handle (no cache, no storage backend).
     ///
-    /// Useful in tests and tools that don't need IO caching.
+    /// Useful in tests and tools that don't need IO caching and never resolve
+    /// an object store by path.
     #[must_use]
-    pub const fn noop() -> Self {
+    pub fn noop() -> Self {
         Self {
-            cache: None,
-            prefetch: None,
-            stat_ttl: None,
-            max_write_cache_size: None,
+            layers: StorageLayersConfig::default(),
+            backend: None,
+            factory: OnceLock::new(),
+            object_store_operator_registry: OnceLock::new(),
         }
     }
 
-    /// Create a handle from optional cache configuration.
+    /// Create a handle from optional cache configuration and the storage
+    /// backend its object stores address.
     ///
-    /// When `config` is `None`, creates a no-op handle whose
+    /// When `cache_config` is `None`, creates a handle whose
     /// [`close()`](Self::close) is a no-op and whose [`cache()`](Self::cache)
     /// returns `None`.
     ///
@@ -76,7 +102,7 @@ impl IoHandle {
     ///
     /// Returns an error if the foyer cache cannot be built (e.g., memory/disk
     /// size overflow or filesystem error).
-    pub async fn from_config(cache_config: Option<&CacheConfig>) -> Result<Self> {
+    pub async fn from_config(cache_config: Option<&CacheConfig>, backend: Option<&StorageBackend>) -> Result<Self> {
         let stat_ttl = cache_config.and_then(|cc| cc.stat_ttl_secs).map(Duration::from_secs);
         let max_write_cache_size = cache_config
             .and_then(|cc| cc.max_write_cache_size_mb)
@@ -87,10 +113,16 @@ impl IoHandle {
         };
         let prefetch = cache_config.and_then(|cc| cc.prefetch.clone());
         Ok(Self {
-            cache,
-            prefetch,
-            stat_ttl,
-            max_write_cache_size,
+            layers: StorageLayersConfig {
+                cache,
+                meter: None,
+                prefetch,
+                stat_ttl,
+                max_write_cache_size,
+            },
+            backend: backend.cloned(),
+            factory: OnceLock::new(),
+            object_store_operator_registry: OnceLock::new(),
         })
     }
 
@@ -100,29 +132,29 @@ impl IoHandle {
     /// object store). `StorageCache` is `Arc`-based, so clones share the same
     /// cache instance.
     pub const fn cache(&self) -> Option<&StorageCache> {
-        self.cache.as_ref()
+        self.layers.cache.as_ref()
     }
 
     /// Returns a reference to the prefetch configuration, if configured.
     pub const fn prefetch(&self) -> Option<&PrefetchConfig> {
-        self.prefetch.as_ref()
+        self.layers.prefetch.as_ref()
     }
 
     /// Returns the stat metadata cache TTL, if configured.
     pub const fn stat_ttl(&self) -> Option<Duration> {
-        self.stat_ttl
+        self.layers.stat_ttl
     }
 
     /// Returns the max value size (bytes) to cache on writes, if configured.
     pub const fn max_write_cache_size(&self) -> Option<usize> {
-        self.max_write_cache_size
+        self.layers.max_write_cache_size
     }
 
     /// Gracefully close the IO cache, draining background flusher tasks.
     ///
     /// No-op when no cache was configured.
     pub async fn close(self) {
-        if let Some(cache) = self.cache {
+        if let Some(cache) = self.layers.cache {
             tracing::info!("Closing IO cache...");
             if let Err(e) = cache.close().await {
                 tracing::warn!("IO cache close returned error: {e}");
@@ -131,20 +163,48 @@ impl IoHandle {
         }
     }
 
-    /// Build an [`IceGateStorageFactory`] that injects the shared cache
+    /// Return the [`IceGateStorageFactory`] that injects the shared cache
     /// and an `OpenTelemetry` meter into every `FileIO` created by catalogs.
     ///
     /// The returned factory auto-detects the storage scheme from
-    /// [`StorageConfig`] properties, so callers don't need to specify it.
+    /// `StorageConfig` properties, so callers don't need to specify it.
+    ///
+    /// Every call returns the same factory: a separate factory means a
+    /// separate set of `OpenTelemetry` registrations, a separate cache-sweep
+    /// task, and a separate operator registry — and an operator missing from a
+    /// registry is built again and then retained for the lifetime of the
+    /// process (see the `storage::layers` module).
     pub fn storage_factory(&self) -> Arc<dyn iceberg::io::StorageFactory> {
-        let meter = opentelemetry::global::meter("iceberg-storage");
-        Arc::new(IceGateStorageFactory::new(
-            self.cache.clone(),
-            Some(meter),
-            self.prefetch.clone(),
-            self.stat_ttl,
-            self.max_write_cache_size,
-        ))
+        let factory = self
+            .factory
+            .get_or_init(|| Arc::new(IceGateStorageFactory::new(self.layers_for(ICEBERG_STORAGE_SCOPE))));
+        Arc::clone(factory) as Arc<dyn iceberg::io::StorageFactory>
+    }
+
+    /// Return the operator registry of the object-store path — the WAL queue
+    /// and the GC sweep, which address storage by path rather than through a
+    /// catalog's `FileIO`.
+    ///
+    /// Every call returns the same registry, for the reason
+    /// [`storage_factory`](Self::storage_factory) gives. It is a second
+    /// registry, and not the factory's, because the two report under separate
+    /// `OpenTelemetry` scopes; the name says which of the two it is.
+    pub fn object_store_operator_registry(&self) -> Arc<OperatorRegistry> {
+        let registry = self.object_store_operator_registry.get_or_init(|| {
+            Arc::new(OperatorRegistry::new(
+                &self.layers_for(OBJECT_STORE_SCOPE),
+                self.backend.as_ref(),
+            ))
+        });
+        Arc::clone(registry)
+    }
+
+    /// The layer inputs stamped with the meter of one `OpenTelemetry` scope.
+    fn layers_for(&self, scope: &'static str) -> StorageLayersConfig {
+        StorageLayersConfig {
+            meter: Some(opentelemetry::global::meter(scope)),
+            ..self.layers.clone()
+        }
     }
 }
 
@@ -589,5 +649,19 @@ mod tests {
             panic!("unexpected error type");
         };
         assert_eq!(message, "S3 catalog requires `catalog.properties.bucket`");
+    }
+
+    /// Catalogs call this once each, and a catalog may call it per `FileIO`.
+    /// A second factory would mean a second operator cache, and an operator
+    /// that misses the cache is built again and then retained for the lifetime
+    /// of the process.
+    #[test]
+    fn every_call_returns_the_same_storage_factory() {
+        let io = IoHandle::noop();
+
+        let first = io.storage_factory();
+        let second = io.storage_factory();
+
+        assert!(Arc::ptr_eq(&first, &second), "a second factory was built");
     }
 }

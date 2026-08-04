@@ -36,10 +36,11 @@ use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use icegate_catalog_s3::S3Catalog;
+use icegate_common::IoHandle;
 use icegate_common::manifest_scan::list_data_files_with_stats;
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_common::storage::{S3Config, StorageBackend, StorageConfig};
+use icegate_common::storage::{OperatorRegistry, S3Config, StorageBackend, StorageConfig};
 use icegate_common::testing::create_s3_object_store;
 use icegate_maintain::gc::config::GcOrphansConfig;
 use icegate_maintain::gc::metrics::GcMetrics;
@@ -250,6 +251,15 @@ fn gc_storage_config(conn: &StorageConn) -> StorageConfig {
     }
 }
 
+/// The registry the sweep resolves its object store through, wired the way the
+/// maintain binary wires it: no read cache, the container's backend.
+async fn gc_operator_registry(conn: &StorageConn) -> Arc<OperatorRegistry> {
+    IoHandle::from_config(None, Some(&gc_storage_config(conn).backend))
+        .await
+        .expect("io handle")
+        .object_store_operator_registry()
+}
+
 /// A `GcOrphansConfig` with a zero grace period (everything unreferenced is
 /// eligible) unless overridden by the caller.
 const fn orphans_config(min_age_secs: u64, dry_run: bool, include_metadata: bool) -> GcOrphansConfig {
@@ -343,10 +353,10 @@ async fn gc_reclaims_unreferenced_files_and_keeps_live_ones() {
     assert_eq!(data_before, 2, "expected 1 live + 1 leaked data file before sweep");
 
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let storage = gc_storage_config(&conn);
+    let operator_registry = gc_operator_registry(&conn).await;
     let summary = run_sweep(
         &dyn_catalog,
-        &storage,
+        &operator_registry,
         TABLE,
         &orphans_config(0, false, true),
         Utc::now(),
@@ -389,11 +399,11 @@ async fn gc_preserves_everything_inside_the_grace_period() {
 
     let before = list_all_object_keys(&conn).await;
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let storage = gc_storage_config(&conn);
+    let operator_registry = gc_operator_registry(&conn).await;
     // 1 hour grace: everything was written seconds ago, so nothing is eligible.
     let summary = run_sweep(
         &dyn_catalog,
-        &storage,
+        &operator_registry,
         TABLE,
         &orphans_config(3_600, false, true),
         Utc::now(),
@@ -427,10 +437,10 @@ async fn gc_dry_run_finds_orphans_but_deletes_nothing() {
 
     let before = list_all_object_keys(&conn).await;
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let storage = gc_storage_config(&conn);
+    let operator_registry = gc_operator_registry(&conn).await;
     let summary = run_sweep(
         &dyn_catalog,
-        &storage,
+        &operator_registry,
         TABLE,
         &orphans_config(0, true, true), // dry_run = true
         Utc::now(),
@@ -467,10 +477,10 @@ async fn gc_leaves_metadata_when_metadata_sweeping_is_disabled() {
     let metadata_before = count_under_segment(&list_all_object_keys(&conn).await, "metadata");
     let data_before = count_under_segment(&list_all_object_keys(&conn).await, "data");
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let storage = gc_storage_config(&conn);
+    let operator_registry = gc_operator_registry(&conn).await;
     let summary = run_sweep(
         &dyn_catalog,
-        &storage,
+        &operator_registry,
         TABLE,
         &orphans_config(0, false, false), // include_metadata = false
         Utc::now(),
@@ -531,10 +541,10 @@ async fn gc_fails_closed_and_deletes_nothing_when_a_manifest_is_unreadable() {
 
     let before = list_all_object_keys(&conn).await;
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let storage = gc_storage_config(&conn);
+    let operator_registry = gc_operator_registry(&conn).await;
     let result = run_sweep(
         &dyn_catalog,
-        &storage,
+        &operator_registry,
         TABLE,
         &orphans_config(0, false, true),
         Utc::now(),
@@ -569,7 +579,6 @@ async fn gc_runner_reclaims_in_the_background() {
     fast_append_one(&catalog, &ident, live.clone()).await;
     write_leaked_data_file(&catalog, &ident, 1).await; // the orphan the background sweep should reclaim
 
-    let storage = gc_storage_config(&conn);
     let gc = GcConfig {
         enabled: true,
         spans_enabled: false,
@@ -601,7 +610,7 @@ async fn gc_runner_reclaims_in_the_background() {
     };
 
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let runner = GcRunner::new_with_max_iterations(dyn_catalog, &storage, &gc, Some(1))
+    let runner = GcRunner::new_with_max_iterations(dyn_catalog, gc_operator_registry(&conn).await, &gc, Some(1))
         .await
         .expect("build runner");
     let data_before = count_under_segment(&list_all_object_keys(&conn).await, "data");

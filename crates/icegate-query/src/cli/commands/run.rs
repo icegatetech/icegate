@@ -3,9 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use icegate_common::{
-    CatalogBuilder, IoHandle, MemoryPressure, MetricsRuntime, create_object_store, run_metrics_server,
-};
+use icegate_common::{CatalogBuilder, IoHandle, MemoryPressure, MetricsRuntime, run_metrics_server};
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
@@ -71,7 +69,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
 
     // Initialize catalog
     tracing::info!("Initializing catalog");
-    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref()).await?;
+    let io_cache = IoHandle::from_config(config.catalog.cache.as_ref(), Some(&config.storage.backend)).await?;
 
     // Register foyer cache metrics with the meter provider so Prometheus can
     // scrape memory usage, disk I/O, entry counts, and throttle state.
@@ -86,23 +84,13 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // Validate engine config
     config.engine.validate()?;
 
-    // Extract the shared foyer cache, prefetch config, and stat TTL from the
-    // IO cache handle so the WAL object store shares the same layers as the
-    // Iceberg catalog.
-    let foyer_cache = io_cache.cache().cloned();
-    let prefetch = io_cache.prefetch().cloned();
-    let stat_ttl = io_cache.stat_ttl();
-
-    // Initialize WAL object store from queue config
+    // Initialize the WAL object store from queue config. It comes from the same
+    // IO handle as the catalog's storage, so the WAL shares the foyer cache,
+    // the prefetch configuration, and the stat TTL with it.
     tracing::info!(queue_base_path = %config.queue.common.base_path, "Initializing WAL object store");
-    let (store, prefix) = create_object_store(
-        &config.queue.common.base_path,
-        Some(&config.storage.backend),
-        foyer_cache.as_ref(),
-        prefetch.as_ref(),
-        stat_ttl,
-        io_cache.max_write_cache_size(),
-    )?;
+    let (store, prefix) = io_cache
+        .object_store_operator_registry()
+        .resolve_object_store(&config.queue.common.base_path)?;
 
     // Build the shared WAL queue reader with metadata caching
     let wal_reader = ParquetQueueReader::with_metadata_entries_cache_capacity(

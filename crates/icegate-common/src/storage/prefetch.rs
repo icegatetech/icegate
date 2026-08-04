@@ -416,6 +416,11 @@ impl InFlightTracker {
 /// Implements [`Layer`] so it can be inserted into an operator's layer
 /// stack. The layer itself stores no data — all prefetched bytes land in
 /// the cache layer below.
+///
+/// Cloning shares the deduplication set and the in-flight tracker, so a
+/// single layer inserted into several operators still deduplicates
+/// prefetches across all of them.
+#[derive(Clone)]
 pub(crate) struct PrefetchLayer {
     config: Arc<PrefetchConfig>,
     seen: Arc<DashSet<Arc<str>>>,
@@ -1632,6 +1637,21 @@ mod tests {
 
         // Receiver should see done == true immediately.
         assert!(rx.wait_for(|&done| done).await.is_ok());
+    }
+
+    /// The layer is built once per storage factory and cloned into every
+    /// operator, so deduplication only works if a clone keeps pointing at
+    /// the same `seen` set and in-flight tracker.
+    #[test]
+    fn cloned_layer_shares_deduplication_state() {
+        let layer = PrefetchLayer::new(PrefetchConfig::default(), PrefetchMetrics::new_disabled());
+        let clone = layer.clone();
+
+        assert!(Arc::ptr_eq(&layer.seen, &clone.seen));
+        assert!(Arc::ptr_eq(&layer.tracker, &clone.tracker));
+
+        bounded_seen_insert(&layer.seen, Arc::from("file.parquet"));
+        assert!(clone.seen.contains("file.parquet"));
     }
 
     /// If the tracker entry is removed without sending `true` (simulating
