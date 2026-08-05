@@ -165,3 +165,83 @@ impl StorageLayers {
         self.cache.as_ref()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use foyer::HybridCacheBuilder;
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+    use super::super::cache::{CacheKey, CacheValue};
+    use super::*;
+
+    /// A cache that exists only so a stack has one to build its layer from: no
+    /// test here reads or writes, so entry weight is irrelevant.
+    async fn storage_cache() -> StorageCache {
+        HybridCacheBuilder::new()
+            .memory(64 * 1024)
+            .with_weighter(|_key: &CacheKey, _value: &CacheValue| 1)
+            .storage()
+            .build()
+            .await
+            .expect("test cache")
+    }
+
+    /// Each layer is independent of the others: a component configured without
+    /// a meter must still cache, and one without a cache must still report
+    /// metrics. Building a layer whose input is absent costs either instruments
+    /// registered against a meter nobody exports, or — for the cache — a
+    /// background sweep task with nothing to sweep.
+    ///
+    /// A prefetch config that is present but disabled is the same case as an
+    /// absent one, and is the shipped default.
+    #[tokio::test]
+    async fn an_absent_input_leaves_its_layer_out() {
+        let cache = storage_cache().await;
+        let enabled_prefetch = PrefetchConfig {
+            enabled: true,
+            ..PrefetchConfig::default()
+        };
+
+        // (case, meter configured, cache configured, prefetch config,
+        //  expected metrics/cache/prefetch layers)
+        let cases = [
+            (
+                "every input configured",
+                true,
+                true,
+                Some(enabled_prefetch.clone()),
+                (true, true, true),
+            ),
+            (
+                "no meter",
+                false,
+                true,
+                Some(enabled_prefetch.clone()),
+                (false, true, true),
+            ),
+            ("no cache", true, false, Some(enabled_prefetch), (true, false, true)),
+            (
+                "prefetch disabled",
+                true,
+                true,
+                Some(PrefetchConfig::default()),
+                (true, true, false),
+            ),
+            ("no prefetch config", true, true, None, (true, true, false)),
+        ];
+
+        for (case, has_meter, has_cache, prefetch, expected) in cases {
+            let layers = StorageLayers::new(&StorageLayersConfig {
+                cache: has_cache.then(|| cache.clone()),
+                meter: has_meter.then(|| SdkMeterProvider::builder().build().meter("storage-layers-test")),
+                prefetch,
+                ..StorageLayersConfig::default()
+            });
+
+            let built = (layers.has_metrics(), layers.cache().is_some(), layers.has_prefetch());
+
+            assert_eq!(built, expected, "{case}");
+        }
+    }
+}

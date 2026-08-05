@@ -443,6 +443,15 @@ mod tests {
 
     /// Build an S3 storage the way [`StorageFactory::build`] does, so the
     /// wiring under test is the production one.
+    ///
+    /// Repeats the S3 branch of `build` deliberately, and must be changed with
+    /// it: `build` returns an `Arc<dyn Storage>`, the `Storage` trait offers no
+    /// downcast, and the registry is `#[serde(skip)]` — so a storage that
+    /// `build` produced cannot be asked which registry it carries. The branch
+    /// itself does run in production wiring, through `io.storage_factory()` in
+    /// `tests/manifest_scan_it.rs` and `icegate-maintain/tests/common`; what
+    /// stays uncovered is the invariant that every storage `build` produces
+    /// shares one registry.
     fn s3_storage(
         factory: &IceGateStorageFactory,
         configured_scheme: &str,
@@ -473,19 +482,41 @@ mod tests {
         Arc::ptr_eq(left.inner(), right.inner())
     }
 
-    #[tokio::test]
-    async fn repeated_paths_reuse_a_single_operator() {
-        let factory = s3_factory(None);
-        let storage = s3_storage(&factory, "s3", s3_props());
+    /// The scheme detected from the `warehouse` property is what picks the
+    /// storage variant a catalog reads every table through, so a misread scheme
+    /// sends the catalog to a backend that cannot serve it. Absent and
+    /// unrecognised schemes fall back to S3 rather than failing, because a
+    /// catalog may name its warehouse in a form only the S3 path understands.
+    ///
+    /// Stops at the detected scheme: the variant it selects is unobservable,
+    /// because `build` hands back an `Arc<dyn Storage>` and the trait offers no
+    /// downcast.
+    #[test]
+    fn the_warehouse_property_decides_the_detected_scheme() {
+        // (`warehouse` property, detected scheme)
+        let cases = [
+            (Some("memory://wh"), "memory"),
+            (Some("memory:/wh"), "memory"),
+            (Some("file:///tmp/wh"), "file"),
+            (Some("/tmp/wh"), "file"),
+            (Some("s3a://bucket/wh"), "s3a"),
+            (Some("s3://bucket/wh"), "s3"),
+            (Some("gs://bucket/wh"), "s3"),
+            (Some(""), "s3"),
+            (None, "s3"),
+        ];
 
-        let (first, _) = storage.resolve_operator("s3://bucket/a/b").expect("first operator");
-        for _ in 0..100 {
-            let (operator, relative) = storage.resolve_operator("s3://bucket/a/b").expect("operator");
-            assert_eq!(relative, "a/b");
-            assert!(is_same_operator(&first, &operator), "operator was rebuilt");
+        for (warehouse, expected) in cases {
+            let config = warehouse.map_or_else(StorageConfig::new, |warehouse| {
+                StorageConfig::from_props(HashMap::from([("warehouse".to_string(), warehouse.to_string())]))
+            });
+
+            assert_eq!(
+                IceGateStorageFactory::detect_scheme(&config),
+                expected,
+                "warehouse {warehouse:?}"
+            );
         }
-
-        assert_eq!(cached_operator_count(&storage), 1);
     }
 
     /// The regression test for the leak this module exists to avoid: an
@@ -596,13 +627,5 @@ mod tests {
         let registry = storage_registry(&first);
         assert!(Arc::ptr_eq(registry, storage_registry(&second)));
         assert!(registry.layers().has_prefetch(), "prefetch layer must be built once");
-    }
-
-    #[tokio::test]
-    async fn disabled_prefetch_builds_no_layer() {
-        let factory = s3_factory(Some(PrefetchConfig::default()));
-        let storage = s3_storage(&factory, "s3", s3_props());
-
-        assert!(!storage_registry(&storage).layers().has_prefetch());
     }
 }

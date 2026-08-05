@@ -664,4 +664,19 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second), "a second factory was built");
     }
+
+    /// The WAL queue and the GC sweep each ask for this registry at startup,
+    /// and the sweep asks again per table it collects. It carries the same
+    /// regression risk the factory above does: an operator missing from a
+    /// second registry is built again and then retained for the lifetime of
+    /// the process.
+    #[test]
+    fn every_call_returns_the_same_object_store_registry() {
+        let io = IoHandle::noop();
+
+        let first = io.object_store_operator_registry();
+        let second = io.object_store_operator_registry();
+
+        assert!(Arc::ptr_eq(&first, &second), "a second registry was built");
+    }
 }

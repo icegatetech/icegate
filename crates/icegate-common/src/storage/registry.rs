@@ -194,8 +194,10 @@ impl OperatorRegistry {
     /// # Errors
     ///
     /// Returns [`CommonError::Config`] if the AWS credentials are only
-    /// partially configured or `OpenDAL` rejects the S3 configuration, and an
-    /// I/O error if a local store cannot be opened.
+    /// partially configured, [`CommonError::Iceberg`] if `OpenDAL` rejects the
+    /// S3 configuration (the rejection reaches the caller through
+    /// `from_opendal_error`), and [`CommonError::ObjectStore`] if a local store
+    /// cannot be opened.
     pub fn resolve_object_store(&self, base_path: &str) -> Result<ObjectStoreWithPath> {
         let Some(bucket_and_prefix) = base_path.strip_prefix("s3://").or_else(|| base_path.strip_prefix("s3a://"))
         else {
@@ -354,8 +356,11 @@ impl OperatorRegistry {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Barrier;
 
     use iceberg::io::{S3_ALLOW_ANONYMOUS, S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_ENDPOINT, S3_REGION};
+    use tracing_subscriber::Registry as TracingRegistry;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
     use super::super::icegate_s3::s3_config_parse;
     use super::*;
@@ -385,6 +390,33 @@ mod tests {
     /// a freshly built operator always carries its own.
     fn is_same_operator(left: &Operator, right: &Operator) -> bool {
         Arc::ptr_eq(left.inner(), right.inner())
+    }
+
+    /// Counts the WARN events this module emits while it is the default
+    /// subscriber, so the growth warning can be asserted where it is observable
+    /// — the log is the only place it appears.
+    ///
+    /// Scoped to the target [`OperatorRegistry`] logs under: an event another
+    /// crate emits on the same thread would otherwise be counted as the warning
+    /// under test.
+    struct WarnCounter(Arc<AtomicUsize>);
+
+    /// The target of the events [`OperatorRegistry::build_operator`] emits —
+    /// the module holding this test module, derived rather than spelled out so
+    /// renaming the production module cannot silently stop matching. Renaming
+    /// this test module still can, and the assertion it would silence is a
+    /// zero, which is why that assertion carries a positive control.
+    fn registry_target() -> &'static str {
+        module_path!().trim_end_matches("::tests")
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for WarnCounter {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let metadata = event.metadata();
+            if *metadata.level() == tracing::Level::WARN && metadata.target() == registry_target() {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The regression test for the leak this module exists to avoid: an
@@ -438,29 +470,182 @@ mod tests {
         assert_eq!(registry.operator_count(), 3);
     }
 
-    /// Nothing is evicted, so the count only grows: an identity resolved long
-    /// ago still answers from the cache instead of building a second operator
-    /// that could never be freed.
-    #[test]
-    fn no_identity_is_evicted_by_later_ones() {
-        let registry = registry();
-        let oldest = hermetic_config("key-0");
-        let first = registry.resolve_operator(&oldest, "bucket").expect("first operator");
+    /// Operators built before a race, so that the count sits one build below
+    /// [`OPERATOR_WARN_THRESHOLD`] when it starts.
+    ///
+    /// Derived from the threshold rather than picked: the warning witnesses a
+    /// build only where the next one crosses the threshold, and that has to hold
+    /// however the threshold is retuned.
+    const OPERATORS_BEFORE_RACE: usize = OPERATOR_WARN_THRESHOLD - 1;
 
-        for rotation in 1..=OPERATOR_WARN_THRESHOLD + 2 {
+    /// Concurrent misses on one identity must build one operator between them.
+    /// The entry is held across the build for exactly this reason, and every
+    /// operator ever built is retained, so moving the build outside the entry
+    /// would leak one per racing resolver rather than costing a retry.
+    ///
+    /// The oracle is the number of operators **built**, not the size of the map:
+    /// a build moved outside the entry leaves one entry either way, because the
+    /// resolvers that lose the insertion race drop the operator they built —
+    /// and a dropped operator carrying the metrics layer is exactly what is
+    /// never freed. The growth warning is the only place that count is
+    /// observable, and it fires past [`OPERATOR_WARN_THRESHOLD`] rather than at
+    /// an arbitrary number, so the registry is warmed to one below it first
+    /// ([`OPERATORS_BEFORE_RACE`]). The race then builds the operator that
+    /// reaches the threshold, and the **second** build within it crosses it and
+    /// warns. Racing on an empty registry would leave the oracle blind below
+    /// eleven builds, and how many of the resolvers reach the build before the
+    /// first insertion is the scheduler's choice, not the registry's.
+    ///
+    /// That oracle is a negative one, so it carries a positive control: once
+    /// the race is over, the same counter under the same subscriber observes a
+    /// deliberate rotation past the threshold. Without it the zero would also
+    /// hold for a counter that observes nothing at all — a subscriber never
+    /// installed, or a target that stopped matching after the test module was
+    /// renamed.
+    ///
+    /// What no oracle here can force is the race itself: the barrier releases
+    /// the resolvers together, but nothing makes them overlap, and on a machine
+    /// with one free core the first may build and insert while the rest wait for
+    /// a slice. The test proves that no extra operator was built when the
+    /// resolvers did overlap, and says nothing when they did not.
+    ///
+    /// Threads, not tasks: `#[tokio::test]` runs a current-thread runtime, on
+    /// which the resolutions would serialize and the race never happen. Each
+    /// resolver installs the counter itself, because a default subscriber is
+    /// per thread and the warning is emitted by whichever thread crosses the
+    /// threshold.
+    #[test]
+    fn concurrent_misses_of_one_identity_build_one_operator() {
+        const RESOLVERS: usize = 16;
+
+        let registry = registry();
+        let warnings = Arc::new(AtomicUsize::new(0));
+
+        for identity in 0..OPERATORS_BEFORE_RACE {
             registry
-                .resolve_operator(&hermetic_config(&format!("key-{rotation}")), "bucket")
-                .expect("operator");
+                .resolve_operator(&hermetic_config(&format!("warm-up-{identity}")), "bucket")
+                .expect("warm-up operator");
         }
+        assert_eq!(
+            registry.operator_count(),
+            OPERATORS_BEFORE_RACE,
+            "the race must start one build below the threshold, or its oracle is blind"
+        );
+
+        let config = hermetic_config("raced");
+        let barrier = Barrier::new(RESOLVERS);
+
+        let operators = std::thread::scope(|scope| {
+            let (registry, config, barrier) = (&registry, &config, &barrier);
+            // Every resolver is spawned before any is joined: a lazily spawned
+            // one would leave the barrier short of its count, and the resolvers
+            // already waiting on it would never be released.
+            let mut resolvers = Vec::with_capacity(RESOLVERS);
+            for _ in 0..RESOLVERS {
+                let warnings = Arc::clone(&warnings);
+                resolvers.push(scope.spawn(move || {
+                    tracing::subscriber::with_default(TracingRegistry::default().with(WarnCounter(warnings)), || {
+                        barrier.wait();
+                        registry.resolve_operator(config, "bucket").expect("operator")
+                    })
+                }));
+            }
+            resolvers
+                .into_iter()
+                .map(|resolver| resolver.join().expect("resolver thread"))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            0,
+            "a racing miss built an operator of its own instead of sharing one"
+        );
+        let first = operators.first().expect("every resolver returns an operator");
+        for operator in &operators {
+            assert!(
+                is_same_operator(first, operator),
+                "a racing miss built a second operator"
+            );
+        }
+        assert_eq!(registry.operator_count(), OPERATORS_BEFORE_RACE + 1);
+
+        // The positive control. The race left the count at the threshold, so one
+        // further identity is what crosses it.
+        tracing::subscriber::with_default(
+            TracingRegistry::default().with(WarnCounter(Arc::clone(&warnings))),
+            || {
+                registry
+                    .resolve_operator(&hermetic_config("past-the-threshold"), "bucket")
+                    .expect("operator past the threshold");
+            },
+        );
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            1,
+            "the counter observes no warning at all, so the zero above proved nothing"
+        );
+    }
+
+    /// A catalog vending rotating credentials is the case the registry cannot
+    /// fix, only report: each rotation is a new identity whose operator is
+    /// retained. Two guarantees hold across a rotation — an identity resolved
+    /// before it is still served from the cache rather than rebuilt, and the
+    /// growth is reported once, past the threshold and not on it.
+    #[test]
+    fn a_rotation_keeps_earlier_identities_and_warns_once_past_the_threshold() {
+        let registry = registry();
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let oldest = hermetic_config("key-0");
+
+        let first = tracing::subscriber::with_default(
+            TracingRegistry::default().with(WarnCounter(Arc::clone(&warnings))),
+            || {
+                let first = registry.resolve_operator(&oldest, "bucket").expect("oldest operator");
+                // One operator exists already, so this reaches the threshold exactly.
+                for rotation in 1..OPERATOR_WARN_THRESHOLD {
+                    registry
+                        .resolve_operator(&hermetic_config(&format!("key-{rotation}")), "bucket")
+                        .expect("operator");
+                }
+                assert_eq!(registry.operator_count(), OPERATOR_WARN_THRESHOLD);
+                assert_eq!(
+                    warnings.load(Ordering::Relaxed),
+                    0,
+                    "the threshold itself must not warn"
+                );
+
+                for rotation in OPERATOR_WARN_THRESHOLD..OPERATOR_WARN_THRESHOLD + 2 {
+                    registry
+                        .resolve_operator(&hermetic_config(&format!("key-{rotation}")), "bucket")
+                        .expect("operator");
+                }
+                assert_eq!(
+                    warnings.load(Ordering::Relaxed),
+                    1,
+                    "the growth past the threshold must be reported exactly once"
+                );
+                first
+            },
+        );
 
         let again = registry.resolve_operator(&oldest, "bucket").expect("cached operator");
         assert!(is_same_operator(&first, &again), "the oldest identity was evicted");
-        assert_eq!(registry.operator_count(), OPERATOR_WARN_THRESHOLD + 3);
+        assert_eq!(registry.operator_count(), OPERATOR_WARN_THRESHOLD + 2);
     }
 
     /// Partially configured credentials must fail before an operator exists:
     /// an access key without its secret signs nothing, and the request-time
     /// failure it would otherwise cause is far from its cause.
+    ///
+    /// Depends on the ambient environment, which `docs/tests.md` forbids: the
+    /// configured backend is only the first source of a secret, and
+    /// `s3_config` falls back to `AWS_SECRET_ACCESS_KEY`, which completes the
+    /// pair and makes the rejection under test not happen.
+    /// Kept because removing it would leave the rule uncovered altogether;
+    /// making it hermetic needs the ambient values passed in as an argument,
+    /// and `set_var` is unavailable under `unsafe_code = "forbid"`. A failure
+    /// here on a machine holding AWS credentials is this, not a regression.
     #[test]
     fn half_a_key_pair_is_rejected() {
         let registry = OperatorRegistry::new(
@@ -482,9 +667,11 @@ mod tests {
         assert_eq!(registry.operator_count(), 0);
     }
 
-    /// Non-S3 paths carry no operator: the sweep and the WAL both accept a
-    /// local or in-memory base path in development, and neither retains
-    /// anything, so they never reach the cache.
+    /// An in-memory path carries no operator: the sweep and the WAL both accept
+    /// one in development, and it retains nothing, so it never reaches the
+    /// cache. The local path is the other case that carries none, and it is
+    /// covered by the `operator_registry_it` integration test — opening a local
+    /// store touches the filesystem, which a unit test may not do.
     #[test]
     fn paths_without_an_operator_are_not_cached() {
         let registry = registry();
