@@ -50,9 +50,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use iceberg::Catalog;
 use jobmanager::{
-    CachedStorage, Error as JobError, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry, JobManager,
-    JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode,
-    TaskDefinition, TaskExecutorFn, WorkerConfig,
+    CachedStorage, Error as JobError, ImmutableTask, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionRegistry,
+    JobManager, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage,
+    TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
 };
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
@@ -538,6 +538,7 @@ impl PricingRunner {
                 poll_interval: std::time::Duration::from_millis(config.jobsmanager.poll_interval_ms),
                 ..Default::default()
             },
+            cleaner_config: JobCleanerConfig::default(),
         };
         let manager =
             JobsManager::new(cached_storage, manager_config, job_registry, job_metrics).map_err(map_job_error)?;

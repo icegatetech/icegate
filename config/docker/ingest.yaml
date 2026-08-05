@@ -31,7 +31,6 @@ shift:
       bucket: jobs
       prefix: shifter
       region: us-east-1
-      use_ssl: false
       job_state_codec: json
       request_timeout_secs: 5
 

@@ -276,7 +276,6 @@ fn compaction_config(conn: &StorageConn) -> CompactionConfig {
         bucket: BUCKET_NAME.to_string(),
         prefix: "compactor".to_string(),
         region: "us-east-1".to_string(),
-        use_ssl: false,
         job_state_codec: icegate_maintain::compact::config::JobStateCodec::Json,
         request_timeout_secs: 30,
         access_key_id: Some(conn.access_key.clone()),

@@ -23,9 +23,9 @@ use chrono::Duration as ChronoDuration;
 use iceberg::Catalog;
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, OperatorRegistry, SPANS_TABLE};
 use jobmanager::{
-    CachedStorage, Error as JobError, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry, JobManager,
-    JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode,
-    TaskDefinition, TaskExecutorFn, WorkerConfig,
+    CachedStorage, Error as JobError, ImmutableTask, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionRegistry,
+    JobManager, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage,
+    TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
@@ -256,6 +256,7 @@ impl GcRunner {
                 poll_interval: std::time::Duration::from_millis(config.jobsmanager.poll_interval_ms),
                 ..Default::default()
             },
+            cleaner_config: JobCleanerConfig::default(),
         };
         let manager =
             JobsManager::new(cached_storage, manager_config, job_registry, job_metrics).map_err(map_job_error)?;
