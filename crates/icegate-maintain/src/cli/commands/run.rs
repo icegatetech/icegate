@@ -69,7 +69,11 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // Distinct from `metrics_cancel`, which must outlive the worker drain so
     // `/metrics` keeps serving until the very end.
     let cancel_token = CancellationToken::new();
-    let catalog = CatalogBuilder::from_config(&config.catalog, &IoHandle::noop(), cancel_token.clone()).await?;
+    // Maintenance reads table data through the catalog and never through the
+    // foyer cache, so the handle carries no cache — only the storage backend
+    // the GC sweep addresses, and the operator registries built from it.
+    let io = IoHandle::from_config(None, Some(&config.storage.backend)).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &io, cancel_token.clone()).await?;
     let compactor = Compactor::new(Arc::clone(&catalog), &config.compaction).await?;
     let compactor_handle = compactor.start()?;
     tracing::info!("compaction maintenance service started");
@@ -77,7 +81,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // Start orphan-file GC alongside compaction when enabled. The runner is
     // dropped after `start()`; the returned handle owns the workers.
     let gc_handle = if config.gc.enabled {
-        match GcRunner::new(Arc::clone(&catalog), &config.storage, &config.gc)
+        match GcRunner::new(Arc::clone(&catalog), io.object_store_operator_registry(), &config.gc)
             .await
             .and_then(|runner| runner.start())
         {

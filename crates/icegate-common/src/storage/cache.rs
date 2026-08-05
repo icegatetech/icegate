@@ -235,6 +235,16 @@ impl CacheMetrics {
 // ---------------------------------------------------------------------------
 
 /// Cache key: file path.
+// TODO(high): the key carries no storage identity, so two objects that share a
+// relative path collide across storages. One `StorageCache` is shared by every
+// operator of a process and one `CacheLayer` by every operator of a registry
+// (see `layers::StorageLayers`), so a read of `tables/logs/metadata/v1.json`
+// in the warehouse bucket can be served the catalog bucket's bytes, and a
+// delete in one bucket invalidates the other's stat entry. Add a storage
+// namespace (endpoint + bucket + root, compared structurally, no credentials)
+// to this key and to `stat_cache`, `KeyLocks`, the prefetch `seen` set and
+// `InFlightTracker`, threading it from `registry::OperatorKey`. Changing this
+// key changes the on-disk foyer format: existing entries become misses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheKey {
     path: String,

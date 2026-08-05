@@ -127,31 +127,35 @@ pub fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
     Ok(cfg)
 }
 
-/// Build an `OpenDAL` [`Operator`] from an [`S3Config`] and an S3 URL.
+/// Extract the bucket name from an S3 URL such as
+/// `s3://bucket/prefix/file.json`.
 ///
-/// Parses `path` (e.g. `s3://bucket/prefix/file.json`) to extract the
-/// bucket name, then constructs a bare operator **without** any layers.
-/// Callers are responsible for adding tracing, metrics, and caching
-/// layers before calling `.finish()`.
-///
-/// # Arguments
-///
-/// * `cfg` — parsed S3 configuration (region, credentials, encryption, …)
-/// * `path` — full S3 URL used to determine the bucket
+/// The bucket is the URL host, so it is normalised the same way the
+/// [`Url`] parser normalises hosts (lower-cased).
 ///
 /// # Errors
 ///
 /// Returns an error if the URL cannot be parsed or has no host (bucket).
-pub fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
+pub fn parse_s3_bucket(path: &str) -> Result<String> {
     let url =
         Url::parse(path).map_err(|e| Error::new(ErrorKind::DataInvalid, format!("Invalid s3 url: {path}: {e}")))?;
-    let bucket = url.host_str().ok_or_else(|| {
+    url.host_str().map(ToString::to_string).ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
             format!("Invalid s3 url: {path}, missing bucket"),
         )
-    })?;
+    })
+}
 
+/// Build a bare `OpenDAL` [`Operator`] for `bucket` from an [`S3Config`].
+///
+/// The operator carries **no** layers — callers add tracing, metrics,
+/// caching, and prefetch themselves.
+///
+/// # Errors
+///
+/// Returns an error if `OpenDAL` rejects the configuration (e.g. no region).
+pub fn build_s3_operator(cfg: &S3Config, bucket: &str) -> Result<Operator> {
     let builder = cfg.clone().into_builder().bucket(bucket);
 
     Operator::new(builder)

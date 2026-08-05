@@ -2,35 +2,51 @@
 //! `OpenTelemetry` observability.
 //!
 //! Forked from `iceberg-storage-opendal` (commit `335961ae`) to inject
-//! custom `OpenDAL` layers between operator creation and use.
+//! custom `OpenDAL` layers between operator creation and use. The layer stack
+//! itself lives in the `layers` module and the operators carrying it in the
+//! `registry` module, both shared with the WAL object store.
 //!
-//! # Layer stack (outermost → innermost)
-//!
-//! ```text
-//! Prefetch → FoyerCache → OtelMetrics → OtelTrace → S3
-//! ```
-//!
-//! - **`Prefetch`** triggers background reads for Parquet metadata/column chunks.
-//! - **`FoyerCache`** short-circuits reads on cache hits.
-//! - **`OtelMetrics`** records metrics for S3 round-trips (cache misses only).
-//! - **`OtelTrace`** adds per-request tracing spans for S3 calls (cache misses only).
+//! Operators are built **once** per configuration and bucket and reused by
+//! every storage operation afterwards (see [`OperatorRegistry`]): an operator
+//! that carries the metrics layer is retained for the lifetime of the process,
+//! so building one per request grows memory without bound.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use iceberg::io::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig, StorageFactory};
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
-use opendal::layers::{OtelMetricsLayer, OtelTraceLayer};
 use opendal::services::S3Config;
-use opentelemetry::metrics::Meter;
 use serde::{Deserialize, Serialize};
 
-use super::cache::{CacheLayer, CacheMetrics, StorageCache};
-use super::icegate_s3::{from_opendal_error, s3_config_build, s3_config_parse};
-use super::prefetch::{PrefetchConfig, PrefetchLayer, PrefetchMetrics};
+use super::icegate_s3::{from_opendal_error, parse_s3_bucket, s3_config_parse};
+use super::layers::StorageLayersConfig;
+use super::registry::{OperatorRegistry, S3ConfigKey};
+
+/// Build an empty `OperatorRegistry` for serde deserialization fallback.
+///
+/// Like [`default_memory_operator`], this yields a storage that carries no
+/// credentials — a deserialized [`IceGateStorage`] cannot reach S3 and is
+/// only meaningful once a factory rebuilds it.
+fn default_operator_registry() -> Arc<OperatorRegistry> {
+    Arc::new(OperatorRegistry::new(&StorageLayersConfig::default(), None))
+}
+
+/// Build an empty S3 configuration key for serde deserialization fallback.
+fn default_s3_config_key() -> S3ConfigKey {
+    S3ConfigKey::new(S3Config::default())
+}
+
+/// Build a default memory operator for serde deserialization fallback.
+fn default_memory_operator() -> Operator {
+    use opendal::services::MemoryConfig;
+    #[allow(clippy::expect_used)]
+    Operator::from_config(MemoryConfig::default())
+        .expect("memory operator must build")
+        .finish()
+}
 
 // ---------------------------------------------------------------------------
 // IceGateStorage
@@ -57,46 +73,34 @@ pub enum IceGateStorage {
     S3 {
         /// URL scheme (`s3` or `s3a`).
         configured_scheme: String,
-        /// Parsed S3 configuration (skipped during serialization to avoid
-        /// leaking credentials).
-        #[serde(skip, default = "default_s3_config")]
-        config: Arc<S3Config>,
-        /// Pre-built cache layer (if configured). Stored here so that
-        /// shared state (key locks, stat cache) survives across
-        /// `create_operator()` calls.
-        #[serde(skip)]
+        /// S3 configuration this storage signs with. Belongs to the storage
+        /// and not to the registry: a catalog that vends per-table
+        /// credentials builds one `FileIO`, and one storage, per set of them
+        /// (skipped during serialization: it holds credentials).
+        #[serde(skip, default = "default_s3_config_key")]
         #[allow(private_interfaces)]
-        cache_layer: Option<Box<CacheLayer>>,
-        /// `OpenTelemetry` meter for storage metrics (if configured).
-        #[serde(skip)]
-        meter: Option<Meter>,
-        /// Parquet column-chunk prefetch configuration (if configured).
-        #[serde(skip)]
-        prefetch: Option<PrefetchConfig>,
+        config: S3ConfigKey,
+        /// Layers and operators shared with every other storage the same
+        /// factory produced (skipped during serialization: it holds
+        /// credentials and live layer state).
+        #[serde(skip, default = "default_operator_registry")]
+        registry: Arc<OperatorRegistry>,
     },
 }
 
-/// Build a default `S3Config` for serde deserialization fallback.
-fn default_s3_config() -> Arc<S3Config> {
-    Arc::new(S3Config::default())
-}
-
-/// Build a default memory operator for serde deserialization fallback.
-fn default_memory_operator() -> Operator {
-    use opendal::services::MemoryConfig;
-    #[allow(clippy::expect_used)]
-    Operator::from_config(MemoryConfig::default())
-        .expect("memory operator must build")
-        .finish()
-}
-
 impl IceGateStorage {
-    /// Build an [`Operator`] for the given absolute path, returning
-    /// the operator and the relative path within the operator's root.
+    /// Return the [`Operator`] serving `path` together with the path
+    /// relative to that operator's root.
     ///
-    /// For S3, the operator is wrapped with the full layer stack.
-    /// For Memory, the bare operator is returned unchanged.
-    fn create_operator<'a>(&self, path: &'a str) -> Result<(Operator, &'a str)> {
+    /// For S3 the operator comes from the [`OperatorRegistry`] with the
+    /// full layer stack already applied. For Memory the bare operator is
+    /// returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::DataInvalid`] if `path` does not belong to
+    /// this storage backend.
+    fn resolve_operator<'a>(&self, path: &'a str) -> Result<(Operator, &'a str)> {
         match self {
             Self::Memory(op) => {
                 let relative = if let Some(rest) = path.strip_prefix("memory:/") {
@@ -135,14 +139,10 @@ impl IceGateStorage {
             Self::S3 {
                 configured_scheme,
                 config,
-                cache_layer,
-                meter,
-                prefetch,
+                registry,
             } => {
-                // Build a bare operator from the S3 config + path.
-                let bare = s3_config_build(config, path)?;
-                let op_info = bare.info();
-                let prefix = format!("{configured_scheme}://{}/", op_info.name());
+                let bucket = parse_s3_bucket(path)?;
+                let prefix = format!("{configured_scheme}://{bucket}/");
 
                 // Accept both s3:// and s3a:// regardless of which scheme was
                 // used when the storage was configured.
@@ -151,7 +151,7 @@ impl IceGateStorage {
                     "s3a" => "s3",
                     other => other,
                 };
-                let alt_prefix = format!("{alt_scheme}://{}/", op_info.name());
+                let alt_prefix = format!("{alt_scheme}://{bucket}/");
 
                 let relative = if path.starts_with(&prefix) {
                     &path[prefix.len()..]
@@ -167,37 +167,7 @@ impl IceGateStorage {
                     ));
                 };
 
-                // Layer stack (applied bottom-up, executed top-down):
-                //   OtelTrace → OtelMetrics → [FoyerCache] → [Prefetch]
-                //
-                // OtelTrace and OtelMetrics sit below the cache so they only
-                // observe actual S3 round-trips (cache misses).
-                //
-                // `Operator::layer()` returns `Operator` directly (type-erased),
-                // so no `.finish()` is needed.
-                let mut operator = bare.layer(OtelTraceLayer);
-
-                if let Some(m) = meter {
-                    operator = operator.layer(OtelMetricsLayer::builder().register(m));
-                }
-
-                // Reuse the pre-built CacheLayer so that key locks and stat
-                // cache survive across create_operator() calls.
-                if let Some(cl) = cache_layer.as_deref() {
-                    operator = operator.layer(cl.clone());
-                }
-
-                // Prefetch layer sits outermost so background reads flow
-                // through the cache layer and land in the foyer cache.
-                if let Some(pf) = prefetch {
-                    if pf.enabled {
-                        let pf_metrics =
-                            meter.as_ref().map_or_else(PrefetchMetrics::new_disabled, PrefetchMetrics::new);
-                        operator = operator.layer(PrefetchLayer::new(pf.clone(), pf_metrics));
-                    }
-                }
-
-                Ok((operator, relative))
+                Ok((registry.resolve_operator(config, &bucket)?, relative))
             }
         }
     }
@@ -207,12 +177,12 @@ impl IceGateStorage {
 #[async_trait]
 impl Storage for IceGateStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
-        let (op, relative) = self.create_operator(path)?;
+        let (op, relative) = self.resolve_operator(path)?;
         op.exists(relative).await.map_err(from_opendal_error)
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        let (op, relative) = self.create_operator(path)?;
+        let (op, relative) = self.resolve_operator(path)?;
         let meta = op.stat(relative).await.map_err(from_opendal_error)?;
         Ok(FileMetadata {
             size: meta.content_length(),
@@ -220,37 +190,37 @@ impl Storage for IceGateStorage {
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
-        let (op, relative) = self.create_operator(path)?;
+        let (op, relative) = self.resolve_operator(path)?;
         let data = op.read(relative).await.map_err(from_opendal_error)?.to_bytes();
         Ok(data)
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        let (op, relative) = self.create_operator(path)?;
+        let (op, relative) = self.resolve_operator(path)?;
         let reader = op.reader(relative).await.map_err(from_opendal_error)?;
         Ok(Box::new(IceGateFileRead(reader)))
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        let (op, relative) = self.create_operator(path)?;
+        let (op, relative) = self.resolve_operator(path)?;
         op.write(relative, bs).await.map_err(from_opendal_error)?;
         Ok(())
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        let (op, relative) = self.create_operator(path)?;
+        let (op, relative) = self.resolve_operator(path)?;
         let writer = op.writer(relative).await.map_err(from_opendal_error)?;
         Ok(Box::new(IceGateFileWrite(writer)))
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        let (op, relative) = self.create_operator(path)?;
+        let (op, relative) = self.resolve_operator(path)?;
         op.delete(relative).await.map_err(from_opendal_error)?;
         Ok(())
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
-        let (op, relative) = self.create_operator(path)?;
+        let (op, relative) = self.resolve_operator(path)?;
         let dir_path = if relative.ends_with('/') {
             relative.to_string()
         } else {
@@ -316,44 +286,45 @@ impl FileWrite for IceGateFileWrite {
 /// The factory auto-detects the storage scheme from [`StorageConfig`]
 /// properties (warehouse URI), producing `Memory`, `Fs`, or `S3` variants
 /// accordingly.
+///
+/// A factory outlives every `FileIO` it serves (it is created once when the
+/// catalog is built), which is why it — and not the storage — owns the
+/// [`OperatorRegistry`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IceGateStorageFactory {
     #[serde(skip)]
-    cache: Option<StorageCache>,
+    layers: StorageLayersConfig,
+    /// Registry shared by every S3 storage this factory builds, and by
+    /// every clone of the factory. Built on the first S3 `build()` rather
+    /// than in [`Self::new`] so that a factory serving only Memory or Fs
+    /// warehouses registers no instruments and spawns no sweep task.
     #[serde(skip)]
-    meter: Option<Meter>,
-    #[serde(skip)]
-    prefetch: Option<PrefetchConfig>,
-    #[serde(skip)]
-    stat_ttl: Option<Duration>,
-    #[serde(skip)]
-    max_write_cache_size: Option<usize>,
+    registry: Arc<OnceLock<Arc<OperatorRegistry>>>,
 }
 
 impl IceGateStorageFactory {
-    /// Create a new factory.
-    ///
-    /// # Arguments
-    ///
-    /// * `cache` — optional shared foyer cache
-    /// * `meter` — optional `OpenTelemetry` meter for storage metrics
-    /// * `prefetch` — optional Parquet column-chunk prefetch configuration
-    /// * `stat_ttl` — optional TTL for stat metadata caching
-    /// * `max_write_cache_size` — optional max value size (bytes) to cache on writes
-    pub const fn new(
-        cache: Option<StorageCache>,
-        meter: Option<Meter>,
-        prefetch: Option<PrefetchConfig>,
-        stat_ttl: Option<Duration>,
-        max_write_cache_size: Option<usize>,
-    ) -> Self {
+    /// Create a factory whose storages carry the layers `layers` describes.
+    #[must_use]
+    pub fn new(layers: StorageLayersConfig) -> Self {
         Self {
-            cache,
-            meter,
-            prefetch,
-            stat_ttl,
-            max_write_cache_size,
+            layers,
+            registry: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Return this factory's operator registry, building it on first use.
+    ///
+    /// [`OnceLock::get_or_init`] runs the closure exactly once, so every
+    /// storage this factory produces shares one set of layers however many
+    /// threads ask for it at the same time.
+    fn resolve_registry(&self) -> Arc<OperatorRegistry> {
+        self.registry
+            .get_or_init(|| {
+                // No backend: an Iceberg storage carries the S3 configuration
+                // its `FileIO` was built with, and never resolves by path.
+                Arc::new(OperatorRegistry::new(&self.layers, None))
+            })
+            .clone()
     }
 
     /// Detect the storage scheme from config properties.
@@ -388,25 +359,273 @@ impl StorageFactory for IceGateStorageFactory {
                 let root = warehouse.strip_prefix("file://").unwrap_or(&warehouse).to_string();
                 Ok(Arc::new(IceGateStorage::Fs { root }))
             }
-            scheme => {
-                // S3 or S3a — build the CacheLayer once so its internal
-                // key locks and stat cache persist across create_operator()
-                // calls.
-                let cache_layer = self.cache.as_ref().map(|fc| {
-                    let cache_metrics = self.meter.as_ref().map_or_else(CacheMetrics::new_disabled, CacheMetrics::new);
-                    let layer = CacheLayer::new(fc.clone(), cache_metrics, self.stat_ttl, self.max_write_cache_size);
-                    layer.spawn_sweep();
-                    Box::new(layer)
-                });
-
-                Ok(Arc::new(IceGateStorage::S3 {
-                    configured_scheme: scheme.to_string(),
-                    config: s3_config_parse(config.props().clone())?.into(),
-                    cache_layer,
-                    meter: self.meter.clone(),
-                    prefetch: self.prefetch.clone(),
-                }))
-            }
+            scheme => Ok(Arc::new(IceGateStorage::S3 {
+                configured_scheme: scheme.to_string(),
+                config: S3ConfigKey::new(s3_config_parse(config.props().clone())?),
+                registry: self.resolve_registry(),
+            })),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use iceberg::io::{
+        S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_ENDPOINT, S3_REGION,
+        S3_SECRET_ACCESS_KEY,
+    };
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+    use super::super::cache::{CacheKey, CacheValue};
+    use super::super::prefetch::PrefetchConfig;
+    use super::*;
+    use crate::storage::StorageCache;
+
+    /// Storage properties for a local S3-compatible endpoint.
+    ///
+    /// Credential and metadata lookups are switched off so operator
+    /// construction stays hermetic — no test here performs any I/O.
+    fn s3_props() -> HashMap<String, String> {
+        HashMap::from([
+            ("warehouse".to_string(), "s3://bucket/wh".to_string()),
+            (S3_ENDPOINT.to_string(), "http://localhost:9000".to_string()),
+            (S3_REGION.to_string(), "us-east-1".to_string()),
+            (S3_DISABLE_CONFIG_LOAD.to_string(), "true".to_string()),
+            (S3_DISABLE_EC2_METADATA.to_string(), "true".to_string()),
+            (S3_ALLOW_ANONYMOUS.to_string(), "true".to_string()),
+        ])
+    }
+
+    /// The same endpoint addressed with the credentials a catalog would vend
+    /// for one table.
+    fn vended_s3_props(access_key_id: &str) -> HashMap<String, String> {
+        let mut props = s3_props();
+        props.remove(S3_ALLOW_ANONYMOUS);
+        props.insert(S3_ACCESS_KEY_ID.to_string(), access_key_id.to_string());
+        props.insert(S3_SECRET_ACCESS_KEY.to_string(), "secret".to_string());
+        props
+    }
+
+    fn s3_factory(prefetch: Option<PrefetchConfig>) -> IceGateStorageFactory {
+        IceGateStorageFactory::new(StorageLayersConfig {
+            prefetch,
+            ..StorageLayersConfig::default()
+        })
+    }
+
+    /// A factory wired the way production wires it: a meter to register
+    /// instruments against and a foyer cache to share.
+    async fn observed_s3_factory() -> IceGateStorageFactory {
+        let meter = SdkMeterProvider::builder().build().meter("icegate-storage-test");
+        // No test here reads or writes, so entry weight is irrelevant: the
+        // cache exists to make the factory build the cache layer.
+        let cache: StorageCache = foyer::HybridCacheBuilder::new()
+            .memory(64 * 1024)
+            .with_weighter(|_key: &CacheKey, _value: &CacheValue| 1)
+            .storage()
+            .build()
+            .await
+            .expect("test cache");
+
+        IceGateStorageFactory::new(StorageLayersConfig {
+            cache: Some(cache),
+            meter: Some(meter),
+            ..StorageLayersConfig::default()
+        })
+    }
+
+    /// Build an S3 storage the way [`StorageFactory::build`] does, so the
+    /// wiring under test is the production one.
+    ///
+    /// Repeats the S3 branch of `build` deliberately, and must be changed with
+    /// it: `build` returns an `Arc<dyn Storage>`, the `Storage` trait offers no
+    /// downcast, and the registry is `#[serde(skip)]` — so a storage that
+    /// `build` produced cannot be asked which registry it carries. The branch
+    /// itself does run in production wiring, through `io.storage_factory()` in
+    /// `tests/manifest_scan_it.rs` and `icegate-maintain/tests/common`; what
+    /// stays uncovered is the invariant that every storage `build` produces
+    /// shares one registry.
+    fn s3_storage(
+        factory: &IceGateStorageFactory,
+        configured_scheme: &str,
+        props: HashMap<String, String>,
+    ) -> IceGateStorage {
+        IceGateStorage::S3 {
+            configured_scheme: configured_scheme.to_string(),
+            config: S3ConfigKey::new(s3_config_parse(props).expect("s3 configuration must parse")),
+            registry: factory.resolve_registry(),
+        }
+    }
+
+    fn storage_registry(storage: &IceGateStorage) -> &Arc<OperatorRegistry> {
+        match storage {
+            IceGateStorage::S3 { registry, .. } => registry,
+            IceGateStorage::Memory(_) | IceGateStorage::Fs { .. } => panic!("expected an S3 storage"),
+        }
+    }
+
+    /// How many operators the registry has built and kept.
+    fn cached_operator_count(storage: &IceGateStorage) -> usize {
+        storage_registry(storage).operator_count()
+    }
+
+    /// Two operators are the same instance when they share one accessor;
+    /// a freshly built operator always carries its own.
+    fn is_same_operator(left: &Operator, right: &Operator) -> bool {
+        Arc::ptr_eq(left.inner(), right.inner())
+    }
+
+    /// The scheme detected from the `warehouse` property is what picks the
+    /// storage variant a catalog reads every table through, so a misread scheme
+    /// sends the catalog to a backend that cannot serve it. Absent and
+    /// unrecognised schemes fall back to S3 rather than failing, because a
+    /// catalog may name its warehouse in a form only the S3 path understands.
+    ///
+    /// Stops at the detected scheme: the variant it selects is unobservable,
+    /// because `build` hands back an `Arc<dyn Storage>` and the trait offers no
+    /// downcast.
+    #[test]
+    fn the_warehouse_property_decides_the_detected_scheme() {
+        // (`warehouse` property, detected scheme)
+        let cases = [
+            (Some("memory://wh"), "memory"),
+            (Some("memory:/wh"), "memory"),
+            (Some("file:///tmp/wh"), "file"),
+            (Some("/tmp/wh"), "file"),
+            (Some("s3a://bucket/wh"), "s3a"),
+            (Some("s3://bucket/wh"), "s3"),
+            (Some("gs://bucket/wh"), "s3"),
+            (Some(""), "s3"),
+            (None, "s3"),
+        ];
+
+        for (warehouse, expected) in cases {
+            let config = warehouse.map_or_else(StorageConfig::new, |warehouse| {
+                StorageConfig::from_props(HashMap::from([("warehouse".to_string(), warehouse.to_string())]))
+            });
+
+            assert_eq!(
+                IceGateStorageFactory::detect_scheme(&config),
+                expected,
+                "warehouse {warehouse:?}"
+            );
+        }
+    }
+
+    /// The regression test for the leak this module exists to avoid: an
+    /// operator carrying the metrics layer is never freed (see
+    /// the `layers` module), so the hot path must build one per
+    /// configuration and bucket and no more. Exercises the branches a factory
+    /// without a meter and cache leaves out.
+    #[tokio::test]
+    async fn a_configured_meter_and_cache_do_not_make_the_hot_path_rebuild() {
+        let factory = observed_s3_factory().await;
+        let storage = s3_storage(&factory, "s3", s3_props());
+
+        let registry = storage_registry(&storage);
+        assert!(registry.layers().has_metrics(), "metrics layer must be built");
+        assert!(registry.layers().cache().is_some(), "cache layer must be built");
+
+        let (first, _) = storage.resolve_operator("s3://bucket/a/b").expect("first operator");
+        for _ in 0..100 {
+            let (operator, _) = storage.resolve_operator("s3://bucket/a/b").expect("operator");
+            assert!(is_same_operator(&first, &operator), "operator was rebuilt");
+        }
+
+        assert_eq!(cached_operator_count(&storage), 1);
+    }
+
+    /// A catalog that vends per-table credentials builds one storage per set
+    /// of them: the credentials a storage carries reach the registry, so no
+    /// storage is served an operator built from another's.
+    #[tokio::test]
+    async fn a_storage_is_served_the_operator_of_its_own_credentials() {
+        let factory = s3_factory(None);
+        let first = s3_storage(&factory, "s3", vended_s3_props("key-one"));
+        let second = s3_storage(&factory, "s3", vended_s3_props("key-two"));
+
+        let (first_operator, _) = first.resolve_operator("s3://bucket/a").expect("first operator");
+        let (second_operator, _) = second.resolve_operator("s3://bucket/a").expect("second operator");
+
+        assert!(
+            !is_same_operator(&first_operator, &second_operator),
+            "one bucket addressed with two configurations must not share an operator"
+        );
+        assert!(
+            Arc::ptr_eq(storage_registry(&first), storage_registry(&second)),
+            "the layers stay shared: only the operators are per configuration"
+        );
+        assert_eq!(cached_operator_count(&first), 2);
+    }
+
+    #[tokio::test]
+    async fn s3_paths_map_to_bucket_relative_paths() {
+        let factory = s3_factory(None);
+
+        // (configured scheme, path, expected relative path)
+        let cases = [
+            ("s3", "s3://bucket/a/b", "a/b"),
+            ("s3", "s3a://bucket/a/b", "a/b"),
+            ("s3a", "s3://bucket/a/b", "a/b"),
+            ("s3a", "s3a://bucket/a/b", "a/b"),
+            // Exact bucket root, no trailing slash.
+            ("s3", "s3://bucket", ""),
+            ("s3", "s3a://bucket", ""),
+            ("s3", "s3://bucket/", ""),
+        ];
+
+        for (configured_scheme, path, expected) in cases {
+            let storage = s3_storage(&factory, configured_scheme, s3_props());
+            let (_, relative) = storage
+                .resolve_operator(path)
+                .unwrap_or_else(|e| panic!("{configured_scheme} + {path}: {e}"));
+            assert_eq!(relative, expected, "{configured_scheme} + {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_s3_paths_are_rejected() {
+        let factory = s3_factory(None);
+        let storage = s3_storage(&factory, "s3", s3_props());
+
+        // (path, why it is rejected)
+        let cases = [
+            ("gs://bucket/a/b", "foreign scheme"),
+            ("file:///a/b", "no bucket in the URL"),
+            ("/a/b", "not a URL at all"),
+        ];
+
+        for (path, reason) in cases {
+            let error = storage.resolve_operator(path).expect_err(reason);
+            assert_eq!(error.kind(), ErrorKind::DataInvalid, "{reason}");
+        }
+        assert_eq!(cached_operator_count(&storage), 0);
+    }
+
+    /// Prefetch deduplicates across storages only if they share the layer,
+    /// which they do by sharing the registry. That the layer itself keeps
+    /// its state when cloned into each operator is covered by
+    /// `prefetch::tests::cloned_layer_shares_deduplication_state`.
+    #[tokio::test]
+    async fn storages_of_one_factory_share_the_registry() {
+        let prefetch = PrefetchConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let factory = s3_factory(Some(prefetch));
+
+        let first = s3_storage(&factory, "s3", s3_props());
+        let second = s3_storage(&factory, "s3", s3_props());
+
+        let registry = storage_registry(&first);
+        assert!(Arc::ptr_eq(registry, storage_registry(&second)));
+        assert!(registry.layers().has_prefetch(), "prefetch layer must be built once");
     }
 }
