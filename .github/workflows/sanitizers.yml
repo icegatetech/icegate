@@ -1,0 +1,115 @@
+name: Sanitizers
+
+# Deliberately not part of ci.yml: a -Zbuild-std sanitizer build is far too slow
+# to sit in every PR's critical path. It runs nightly, on demand, and opt-in per
+# PR via the `sanitize` label.
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sanitize:
+    name: ${{ matrix.sanitizer }}
+    # On a pull_request event, run only when the `sanitize` label is present.
+    # Scheduled and manual runs are unconditional.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'sanitize')
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, leak, memory]
+    # MemorySanitizer cannot instrument the hand-written assembly in aws-lc-sys
+    # and ring, so it is expected to be noisy and must never block.
+    continue-on-error: ${{ matrix.sanitizer == 'memory' }}
+    runs-on: ubuntu-latest
+    # A cold sanitize-leak run takes well over an hour locally, and
+    # sanitize-address is slower still (-Zbuild-std compiles std from source,
+    # and the C dependencies rebuild instrumented). GitHub's default job
+    # timeout is 6 hours; set an explicit, lower ceiling so a genuinely hung
+    # job (a wedged container, a deadlocked test) fails cleanly instead of
+    # silently burning the full 6. 300 leaves an hour of margin below that
+    # default — tune it once real runner timings are observed.
+    timeout-minutes: 300
+    steps:
+      # Note docker-images: false here, unlike ci.yml: the container-backed
+      # integration tests need a working Docker daemon on this runner, and
+      # reclaiming the preinstalled images is not worth risking that.
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # The pinned nightly is read from config/sanitizers/toolchain, the same file
+      # config/docker/sanitize.Dockerfile and scripts/sanitize.sh read. Hardcoding
+      # the version here instead would let CI and the local wrapper drift onto
+      # different compilers, which is how a sanitizer run starts failing for
+      # reasons unrelated to sanitizers.
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "version=$(tr -d '[:space:]' < config/sanitizers/toolchain)" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+          components: rust-src
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev llvm
+        # llvm supplies llvm-symbolizer. Without it a sanitizer report is raw hex
+        # addresses instead of function names — and a 03:00 nightly failure is
+        # exactly when you cannot retrofit it. config/docker/sanitize.Dockerfile
+        # installs it for the same reason, so this keeps CI and the wrapper aligned.
+
+      # Sanitizer target dirs are deliberately not cached: a -Zbuild-std
+      # workspace build is large, GitHub's cache budget is 10 GB per repository,
+      # and caching these would evict the caches every PR's test and clippy jobs
+      # depend on.
+      #
+      # scripts/sanitize.sh derives -j from available RAM itself (4 GiB/job for
+      # leak, 8 GiB/job for address/memory), capped at the CPU count — that is
+      # automatic and must not be overridden here. GitHub's standard runner is
+
+      # leak; that lower parallelism versus a well-resourced workstation is why
+      # these jobs run slower here.
+      #
+      # address and memory also link with rust-lld on every architecture (see
+      # scripts/sanitize.sh for why). That combination has so far only run on
+      # aarch64 (the local Docker wrapper, built for the host architecture);
+      # this runner is x86_64, so a CI run is rust-lld's first x86_64 exercise.
+      # If address or memory fails at link time, that is the first thing to
+      # check.
+      - name: Run sanitizer
+        run: make sanitize-${{ matrix.sanitizer }}
+
+      # target/sanitize-address reached 13 GB and target/sanitize-leak 21 GB in
+      # local runs. Standard GitHub runners start with only ~14 GB free on /,
+      # even after the disk-space step above, so a sanitizer run may not fit.
+      # Diagnostic only, and deliberately unconditional (if: always()) so a
+      # disk-exhaustion failure leaves more in the log than a bare "No space
+      # left on device".
+      - name: Report disk usage
+        if: always()
+        run: |
+          df -h
+          du -sh target/sanitize-* 2>/dev/null || true

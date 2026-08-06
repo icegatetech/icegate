@@ -1417,7 +1417,7 @@ mod tests {
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions,
         PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
     };
-    use opentelemetry::{KeyValue, metrics::MeterProvider as _};
+    use opentelemetry::KeyValue;
     use opentelemetry_sdk::metrics::{
         InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
         data::{AggregatedMetrics, MetricData},

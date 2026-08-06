@@ -251,3 +251,97 @@ cargo test -p icegate-catalog-s3 --all-targets --features rest
 
 The REST command is required when `icegate-catalog-s3` REST code or shared catalog behavior
 changes. Other optional features MUST be tested whenever the change can affect them.
+
+## Sanitizers
+
+The workspace forbids `unsafe`, so these targets are aimed at the C dependencies
+(`zstd-sys`, `lz4-sys`, `aws-lc-sys`, `ring`), at `unsafe` inside third-party Rust, and at
+leaked allocations.
+
+```bash
+make sanitize-address   # memory errors
+make sanitize-leak      # allocations unreachable at exit
+make sanitize           # both
+```
+
+All of them run on Linux. `scripts/sanitize.sh` re-execs itself inside a container on
+macOS, where `leak` and `memory` do not exist — `aarch64-apple-darwin` supports only
+`address` and `thread`. They are NOT part of `make ci`: CI runs them nightly and on any PR
+labelled `sanitize` (`.github/workflows/sanitizers.yml`).
+
+Sanitizer builds disable the jemalloc global allocator via `--cfg icegate_sanitize`,
+because a custom global allocator and a sanitizer runtime cannot both intercept `malloc`.
+Ordinary builds are unaffected — a release build still links jemalloc.
+
+### Reading a green run honestly
+
+A green `make sanitize-leak` means **no new leaks**, not no leaks. `config/sanitizers/lsan.supp`
+suppresses a documented ~432 KB baseline, including two known first-party defects on
+production paths. Each entry records what leaks, how much, and the fix that retires it.
+Read that file before concluding the codebase is leak-free.
+
+**The sanitizer suite covers less than `make ci` does.** It runs no `--features`, so
+`crates/icegate-catalog-s3`'s `catalog` binary — which declares
+`required-features = ["rest"]` — is skipped entirely and without a warning, along with the
+Axum server, config parsers, and TLS stack that feature gates. That binary ships in every
+production image, and `ci.yml` tests it separately. Adding
+`--features icegate-catalog-s3/rest` to `scripts/sanitize.sh` would close the gap, at the
+cost of a full instrumented rebuild to re-verify. Until then, treat a green sanitizer run
+as saying nothing about the REST catalog server.
+
+A green `make sanitize-address` currently means **zstd is instrumented and clean under this
+suite**. All four C libraries are compiled with `-fsanitize=address`, but only zstd is
+meaningfully exercised: it is the Parquet writer's default codec. LZ4 is a non-default
+queue codec no test selects, and `aws-lc-sys`/`ring` are largely unentered because the
+container tests speak plain HTTP. Instrumented-but-unexecuted code finds nothing.
+
+Two limits worth knowing before reaching for these:
+
+- **LeakSanitizer does not detect memory growth.** It reports allocations unreachable at
+  exit. Retained-but-reachable memory — unbounded channels, retained buffers, oversized
+  caches — is invisible to it by construction. Use heap profiling (jemalloc `prof`, `dhat`)
+  for those.
+- **AddressSanitizer does not instrument assembly.** `aws-lc-sys` and `ring` ship
+  hand-written assembly, which ASan leaves alone. That is missed coverage, not a false
+  positive.
+
+### Suppressions
+
+`config/sanitizers/` holds one suppression file per sanitizer. Two rules: every entry names
+the library and why the allocation is not ours, and no entry may match a frame inside
+`icegate_*`. A leak in first-party code is a bug to fix, not to suppress.
+
+`lsan.supp` carries three documented exceptions to the second rule, each with measured
+figures and a retirement condition. Adding a fourth needs the same accounting, or the
+target quietly becomes a rubber stamp. `asan.supp` gets no such exemption: an ASan report
+is a memory error rather than a retained allocation, so suppressing one hides a bug.
+
+### Maintaining the targets
+
+- **The nightly is pinned** in `config/sanitizers/toolchain`, read by the wrapper image,
+  `scripts/sanitize.sh`, and CI alike. An unpinned nightly breaks these runs on unrelated
+  lint churn — that is not hypothetical, it happened. To bump: edit that one file, rebuild,
+  and confirm `make sanitize-leak` passes before merging. `SANITIZE_TOOLCHAIN=<name>`
+  overrides it for a one-off check.
+- **Parallelism is capped by memory**, per sanitizer, because instrumented links at full
+  parallelism exhaust a typical dev VM. The chosen value appears in the runner's progress
+  line.
+- **`address` and `memory` link with `rust-lld`.** Instrumented binaries exceed aarch64's
+  ±128 MB direct-call range, and GNU ld does not emit range-extension thunks for the
+  `.text.startup` sections `inventory` emits.
+- **`make sanitize-memory` is retained but does not work.** Verified 2026-08-05; it is
+  excluded from `make sanitize` and never blocks CI. Two independent blockers, either of
+  which is sufficient:
+
+  1. **GCC does not implement MemorySanitizer.** The wrapper image has no clang, so `cc` is
+     GCC 12.2.0, and `cc -fsanitize=memory` fails with `unrecognized argument to
+     '-fsanitize=' option: 'memory'`. MSan is a clang-only sanitizer. The run dies at the
+     first C file — `ring`'s `sha256-armv8-linux64.S`.
+  2. **Even with clang, the assembly is uninstrumentable.** MSan requires every linked
+     instruction to be instrumented, and `ring` and `aws-lc-sys` ship hand-written `.S`
+     files. Values flowing out of them would read as uninitialised, producing false
+     positives rather than findings.
+
+  Making this target work would mean installing clang, switching the C dependencies to it,
+  and then eliminating the assembly-bearing crates from the test binaries. That is not a
+  suppressions exercise. The target is kept so this finding is not rediscovered.
