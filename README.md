@@ -4,6 +4,8 @@
 [![Status](https://img.shields.io/badge/status-prototype-red.svg)]()
 [![Benchmarks](https://img.shields.io/badge/charts-benchmarks-blue)](https://icegatetech.github.io/benchmark-results/dev/bench/plot.html)
 
+**[icegate.tech](https://icegate.tech)** · **[Documentation](https://docs.icegate.tech)** · **[Slack](https://join.slack.com/t/icegate/shared_invite/zt-3ln3iae5z-YPz8piGJgbv~Zcc1Ev14OA)**
+
 An Observability Data Lake engine designed to be fast, easy-to-use, cost-effective, scalable, and fault-tolerant.
 
 IceGate supports open protocols and APIs compatible with standard ingesting and querying tools. All data is persisted in Object Storage, including WAL for ingested data, catalog metadata, and the data layer.
@@ -117,9 +119,9 @@ Once running, the following services are available:
 - **Ingest Metrics**: `http://localhost:9091/metrics` - Prometheus metrics for ingest service
 
 #### Query APIs
-- **Loki API**: `http://localhost:3100` - Query logs using Loki-compatible API ✅ **Currently Supported**
-- **Prometheus API**: `http://localhost:9090` - Query metrics (planned)
-- **Tempo API**: `http://localhost:3200` - Query traces (planned)
+- **Loki API**: `http://localhost:3100` - Query logs using Loki-compatible API ✅ **Currently Supported** (`query`, `query_range`, `labels`, `label/{name}/values`, `series`)
+- **Tempo API**: `http://localhost:3200` - Query traces using Tempo-compatible API ✅ **Currently Supported** (`traces/{id}`, `search` with TraceQL, `search/tags`, `search/tag/{name}/values`, plus the `v2` variants). Unsupported TraceQL features return `501`
+- **Prometheus API**: `http://localhost:9090` - Query metrics ⚠️ **Planned** — the routes are mounted but every handler returns `501 Not Implemented`; only `/-/ready` responds
 - **Arrow Flight SQL**: `grpc://localhost:8815` - General-purpose SQL over the merged WAL + Iceberg view; read-only, tenant identified by the `x-scope-orgid` gRPC metadata header (defaults to `default`). See [Querying via Flight SQL](#querying-via-flight-sql) below for supported clients.
 
 #### Visualization
@@ -152,7 +154,7 @@ The `analytics` profile starts Nessie and Trino. This is a legacy path: Trino re
 
 - Send telemetry data to `localhost:4317` (gRPC) or `localhost:4318` (HTTP) using any OpenTelemetry SDK
 - View data in Grafana at `http://localhost:3000`
-- Query data using Loki, Prometheus, or Tempo APIs
+- Query data using the [Query APIs](#query-apis) above — note the current status marked against each
 
 ## Querying via Flight SQL
 
@@ -166,7 +168,7 @@ IceGate exposes an [Apache Arrow Flight SQL](https://arrow.apache.org/docs/forma
 | JDBC (dbt, DataGrip, DBeaver, Apache Superset, Metabase) | [`org.apache.arrow:flight-sql-jdbc-driver`](https://central.sonatype.com/artifact/org.apache.arrow/flight-sql-jdbc-driver) |
 | ODBC (Tableau, Power BI, Excel) | [Apache Arrow Flight SQL ODBC Driver](https://github.com/apache/arrow/tree/main/cpp/src/arrow/flight/sql/odbc) |
 | Native | `arrow-flight` C++ / Rust / Go libraries |
-| Loki / Prometheus / Tempo HTTP | Existing endpoints on `:3100` / `:9090` / `:3200` — preferred for those workloads |
+| Loki / Tempo HTTP | Endpoints on `:3100` / `:3200` — preferred for those workloads. Prometheus (`:9090`) is not implemented yet; see [Query APIs](#query-apis) |
 
 ### Python example
 
@@ -210,6 +212,22 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
+## Who builds IceGate
+
+IceGate is built by [TripleCloud](https://triplecloud.tech), and is open source under Apache 2.0 —
+self-host it, fork it, and run it against object storage you own, with no TripleCloud account and
+no hosted component in the path.
+
+TripleCloud is the LLM observability platform built *on* this engine. IceGate is not a trial
+edition of it and is not feature-gated against it; the relationship runs the other way, and the
+engineering write-ups below describe the engine itself rather than the platform.
+
+- [Observability ingestion on S3 alone](https://blog.triplecloud.tech/posts/observability-ingestion-on-s3) —
+  how ingestion runs with no Kafka, no local disks and no coordination service
+- [Instrumenting an LLM agent with OpenTelemetry](https://blog.triplecloud.tech/posts/instrument-llm-agent-opentelemetry) —
+  end-to-end OTLP traces landing in IceGate, with runnable recipes in
+  [icegatetech/integrations](https://github.com/icegatetech/integrations)
+
 ## Acknowledgments
 
 Built with:
@@ -217,6 +235,24 @@ Built with:
 - [Apache Arrow](https://arrow.apache.org/) - Columnar memory format
 - [Apache Parquet](https://parquet.apache.org/) - Columnar storage format
 - [OpenTelemetry](https://opentelemetry.io/) - Observability framework
+
+## Trademarks
+
+IceGate names third-party projects to describe, factually, which formats it writes and which wire
+protocols its APIs implement. Such nominative use implies no affiliation with, endorsement by, or
+sponsorship from the owners of those marks.
+
+Apache®, Apache Iceberg, Apache Arrow, Apache Parquet, Apache DataFusion, Apache Arrow Flight SQL
+and associated project logos are either registered trademarks or trademarks of The Apache Software
+Foundation in the United States and/or other countries. OpenTelemetry® and Prometheus® are
+registered trademarks of The Linux Foundation. Grafana®, Loki® and Tempo® are registered
+trademarks of Raintank, Inc. dba Grafana Labs. IceGate is not affiliated with, endorsed by, or
+sponsored by any of these organizations. All other trademarks are the property of their respective
+owners.
+
+Where an API is described as Loki- or Tempo-compatible, IceGate implements a subset of that
+project's HTTP read API — not a complete reimplementation. See [Query APIs](#query-apis) for the
+endpoints served today and the current status of each.
 
 ## Status
 

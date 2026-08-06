@@ -4,24 +4,54 @@ description: >-
   IceGate is an observability data lake engine that stores logs, traces,
   metrics, and events in Apache Iceberg tables with DataFusion as the query
   engine. Data is ingested via OpenTelemetry protocol and queried via
-  Loki/Prometheus/Tempo-compatible APIs.
+  Loki- and Tempo-compatible APIs plus Arrow Flight SQL.
 type: application
+# `version` and `appVersion` are placeholders: .github/workflows/release.yml rewrites both
+# with sed from the git tag before packaging, so editing them here changes nothing at release.
 version: 0.2.0
 appVersion: "0.2.0"
-home: https://github.com/icegatetech/icegate
+# The product site, not the repo: `home` is the link Artifact Hub renders as the package's
+# homepage, and `icon` is fetched from this host on Artifact Hub's own schedule. Both must
+# resolve on icegate.tech before the repository is registered, or the listing ships a broken
+# icon — the assets live in triplecloud/triple-ui `apps/icegate/public/`, so that app has to be
+# deployed to this domain first. `sources` still points at the code.
+home: https://icegate.tech
+icon: https://icegate.tech/logo.png
 sources:
   - https://github.com/icegatetech/icegate
 maintainers:
   - name: icegatetech
     url: https://github.com/icegatetech
+annotations:
+  # Rendered by Artifact Hub as the package's category, license badge and link list. Values and
+  # formats per artifacthub.io/docs/topics/annotations/helm — `links` is a YAML *string*, and
+  # the name `support` is special (Artifact Hub gives it its own button).
+  artifacthub.io/category: monitoring-logging
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: homepage
+      url: https://icegate.tech
+    - name: documentation
+      url: https://docs.icegate.tech
+    - name: source
+      url: https://github.com/icegatetech/icegate
+    - name: support
+      url: https://github.com/icegatetech/icegate/issues
+# Discovery terms on Artifact Hub. `prometheus` is deliberately absent: the routes are mounted
+# but every handler returns 501, so listing it here would surface this chart for a query it
+# cannot answer. Add it back with the implementation, not before.
 keywords:
   - observability
   - iceberg
+  - lakehouse
+  - data-lake
   - datafusion
+  - parquet
   - opentelemetry
   - logs
   - traces
   - metrics
   - loki
-  - prometheus
   - tempo
+  - flight-sql
+  - rust
