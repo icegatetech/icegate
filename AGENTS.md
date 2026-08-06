@@ -23,6 +23,19 @@ Running rules:
   `cargo test <name>` for the code you touched.
 - Format only the affected crate: `cargo +nightly fmt -p <crate>` (plain `cargo fmt` ignores `rustfmt.toml`).
 
+### Docs
+
+- **A convention is only what is documented** in these three files. The mere presence of a pattern
+  in the code is **NOT** a convention — someone may have committed junk. Do not justify a decision
+  with "the existing code does X"; cite the documented rule, or propose adding one if it is missing.
+- How a thing behaves is documented in **its own doc comment**, next to the code. `missing_docs` is
+  denied, so this is enforced. Do not restate that behavior here or in the README — two copies drift.
+- `README.md` explains the crate to someone using it; `CONTRIBUTING.md` explains how to build, test,
+  and commit. Do not copy commands or contracts between them.
+- `docs/` holds only cross-cutting policy ([tests.md](docs/tests.md)).
+  Never add a `docs/<module>.md` — a deep-dive for a subsystem goes in a README beside its code.
+- Design notes, specs, and plans are working artifacts: keep them in `.tmp/`, not in `docs/`.
+
 ## Crates and where code goes
 
 Place a change in the crate that owns its responsibility; shared infrastructure
@@ -35,7 +48,7 @@ goes in `icegate-common`, never copied into a component.
 | `icegate-queue`      | Generic WAL data queue on object storage: durable-before-ack, exactly-once, per-topic offsets. | [README](crates/icegate-queue/README.md)                                                                 |
 | `icegate-ingest`     | OTLP receivers (gRPC/HTTP), transform, WAL write.                                              | per-tenant task model [README](crates/icegate-ingest/README.md)                                                   |
 | `icegate-query`      | Query APIs (Loki/Prometheus/Tempo), query engine, LogQL, query CLI.                            | [README](crates/icegate-query/README.md), LogQL [logql/README](crates/icegate-query/src/logql/README.md) |
-| `icegate-maintain`   | Background maintenance: compaction, GC, schema migration, maintain CLI.                        | compaction [compact/README](crates/icegate-maintain/src/compact/README.md)                               |
+| `icegate-maintain`   | Background maintenance: compaction, GC, schema migration, maintain CLI.                        | [README](crates/icegate-maintain/README.md), compaction [compact/README](crates/icegate-maintain/src/compact/README.md), retention [migrate/README](crates/icegate-maintain/src/migrate/README.md) |
 
 ### Dependency rules
 - `icegate-common` is the foundation and depends on no other workspace crate;

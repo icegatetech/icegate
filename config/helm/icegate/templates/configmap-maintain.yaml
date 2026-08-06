@@ -1,4 +1,8 @@
 {{- if .Values.maintain.enabled -}}
+{{/* The sweep's grace period is one of the three values the ordering is built
+     from, and it is rendered here — so the check runs even when neither query
+     nor migrate is enabled. */}}
+{{- include "icegate.validateRetentionWindow" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

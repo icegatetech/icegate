@@ -35,7 +35,7 @@ async fn create(config_path: PathBuf, dry_run: bool) -> Result<(), MaintainError
         tracing::info!("Running in dry-run mode - no changes will be made");
     }
 
-    let ops = operations::create_tables(&catalog, dry_run).await?;
+    let ops = operations::create_tables(&catalog, &config.snapshot_expiration, dry_run).await?;
     report_operations(&ops, dry_run);
 
     Ok(())

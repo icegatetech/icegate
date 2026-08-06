@@ -2,9 +2,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use icegate_common::{
     EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, PRICES_TABLE, SPANS_TABLE,
+    WAL_OFFSET_PROPERTY,
     schema::{
         events_partition_spec, events_schema, events_sort_order, logs_partition_spec, logs_schema, logs_sort_order,
         metrics_partition_spec, metrics_schema, metrics_sort_order, operations_partition_spec, operations_schema,
@@ -14,6 +16,7 @@ use icegate_common::{
 };
 
 use crate::error::Result;
+use crate::migrate::config::SnapshotExpirationConfig;
 
 /// Migration operation types
 #[derive(Debug, Clone)]
@@ -36,6 +39,11 @@ struct TableDefinition {
     schema: iceberg::spec::Schema,
     partition_spec: iceberg::spec::PartitionSpec,
     sort_order: iceberg::spec::SortOrder,
+    /// Whether this table's snapshots record the WAL queue offset in their
+    /// summary. True for every table the Shifter writes, whose readers resolve
+    /// that offset by walking the ancestor chain — expiration must be told to
+    /// keep the chain down to its most recent carrier intact.
+    carries_wal_offset: bool,
 }
 
 /// Build table definitions from schema module
@@ -51,6 +59,7 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         schema: logs,
         partition_spec: logs_partition,
         sort_order: logs_sort,
+        carries_wal_offset: true,
     });
 
     // Spans table
@@ -62,6 +71,7 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         schema: spans,
         partition_spec: spans_partition,
         sort_order: spans_sort,
+        carries_wal_offset: true,
     });
 
     // Events table
@@ -73,6 +83,7 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         schema: events,
         partition_spec: events_partition,
         sort_order: events_sort,
+        carries_wal_offset: true,
     });
 
     // Metrics table
@@ -84,6 +95,7 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         schema: metrics,
         partition_spec: metrics_partition,
         sort_order: metrics_sort,
+        carries_wal_offset: true,
     });
 
     // Operations table (LLM/GenAI projection over spans — the 5th physical table).
@@ -95,6 +107,7 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         schema: operations,
         partition_spec: operations_partition,
         sort_order: operations_sort,
+        carries_wal_offset: true,
     });
 
     // Prices table (global LLM rate card — the 6th physical table, and the only
@@ -107,6 +120,9 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         schema: prices,
         partition_spec: prices_partition,
         sort_order: prices_sort,
+        // The pricing crawler writes this table, not the Shifter: its snapshots
+        // carry no WAL offset, so expiration has no carrier to preserve here.
+        carries_wal_offset: false,
     });
 
     Ok(definitions)
@@ -123,7 +139,10 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
 /// - prices: global LLM rate card (no `tenant_id`, unpartitioned)
 ///
 /// Each table is created with appropriate partition specs and sort orders
-/// for optimal query performance.
+/// for optimal query performance, and with the `expiration` policy written into
+/// its properties — that stamp is what makes any later writer expire this
+/// table's snapshots, so a table created without it keeps its history forever.
+/// Existing tables are left untouched, properties included.
 ///
 /// # Return Value
 ///
@@ -133,11 +152,22 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
 /// # Errors
 ///
 /// Returns an error if:
+/// - `expiration` is out of the bounds of [`SnapshotExpirationConfig::validate`]
 /// - Schema construction fails
 /// - Namespace creation fails
 /// - Table creation fails (except for "already exists" errors)
 #[allow(clippy::cognitive_complexity)]
-pub async fn create_tables(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Result<Vec<MigrationOperation>> {
+pub async fn create_tables(
+    catalog: &Arc<dyn Catalog>,
+    expiration: &SnapshotExpirationConfig,
+    dry_run: bool,
+) -> Result<Vec<MigrationOperation>> {
+    // A policy is stamped once and never re-stamped, so an out-of-range window
+    // reaching a table's properties fails every later commit against it — ingest
+    // included. The CLI validates the whole config, but this is a public entry
+    // point and the stamp is what it exists to write.
+    expiration.validate()?;
+
     let catalog_ref = catalog.as_ref();
     let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
 
@@ -164,7 +194,7 @@ pub async fn create_tables(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Result<
             tracing::info!("[dry-run] Would create table: {}", def.name);
         } else {
             tracing::info!("Creating table: {}", def.name);
-            create_table(catalog_ref, &namespace, &def).await?;
+            create_table(catalog_ref, &namespace, &def, expiration).await?;
             tracing::info!("Created table: {}", def.name);
         }
 
@@ -193,16 +223,27 @@ async fn ensure_namespace_exists(catalog: &dyn Catalog, namespace: &NamespaceIde
 }
 
 /// Create a single table in the catalog
-async fn create_table(catalog: &dyn Catalog, namespace: &NamespaceIdent, def: &TableDefinition) -> Result<()> {
+async fn create_table(
+    catalog: &dyn Catalog,
+    namespace: &NamespaceIdent,
+    def: &TableDefinition,
+    expiration: &SnapshotExpirationConfig,
+) -> Result<()> {
+    let mut properties = expiration.build_table_properties(def.carries_wal_offset.then_some(WAL_OFFSET_PROPERTY));
+    properties.extend([
+        (
+            TableProperties::PROPERTY_DEFAULT_FILE_FORMAT.to_string(),
+            "parquet".to_string(),
+        ),
+        ("write.parquet.compression-codec".to_string(), "zstd".to_string()),
+    ]);
+
     let table_creation = TableCreation::builder()
         .name(def.name.to_string())
         .schema(def.schema.clone())
         .partition_spec(def.partition_spec.clone())
         .sort_order(def.sort_order.clone())
-        .properties(HashMap::from([
-            ("write.format.default".to_string(), "parquet".to_string()),
-            ("write.parquet.compression-codec".to_string(), "zstd".to_string()),
-        ]))
+        .properties(properties)
         .build();
 
     catalog.create_table(namespace, table_creation).await?;
@@ -496,6 +537,25 @@ mod tests {
             prices.partition_spec.fields().is_empty(),
             "prices is the one unpartitioned table"
         );
+    }
+
+    /// Every table the Shifter writes must advertise a WAL-offset carrier to
+    /// expiration; `prices`, written by the pricing crawler, must not — nothing
+    /// stamps an offset onto its snapshots.
+    #[test]
+    fn only_shifter_written_tables_declare_a_wal_offset_carrier() {
+        let definitions = build_table_definitions().expect("build table definitions");
+
+        for def in &definitions {
+            let expected = def.name != PRICES_TABLE;
+            assert_eq!(
+                def.carries_wal_offset,
+                expected,
+                "{} must{} declare a WAL-offset carrier",
+                def.name,
+                if expected { "" } else { " not" }
+            );
+        }
     }
 
     #[test]

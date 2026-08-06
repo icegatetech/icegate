@@ -156,8 +156,14 @@ query:
     catalogName: iceberg
     ## Interval (seconds) between background catalog refreshes (default: 15)
     # refreshIntervalSecs: 15
-    ## Max age (seconds) before cached provider is considered stale (default: 30)
-    # maxAgeSecs: 30
+    ## Max age (seconds) before cached provider is considered stale.
+    ## Bounded on both sides by the retention contract: it must stay below
+    ## migrate.snapshotExpiration.maxSnapshotAgeMs and below
+    ## maintain.gc.orphans.minAgeSecs, or a cached provider can outlive the files
+    ## it plans against. The chart fails the render when it does not, and reads
+    ## this line to do it — so unlike the tunables around it, the value is set
+    ## rather than commented out, and unsetting it fails the render.
+    maxAgeSecs: 30
     ## Include WAL (hot) segments in query results (default: false).
     ## When false, queries only read committed Iceberg data.
     ## Note: does not affect /labels, /label_values, or /series — those are Iceberg-only.
@@ -491,6 +497,28 @@ migrate:
   activeDeadlineSeconds: 300
   hookDeletePolicy: before-hook-creation
 
+  ## Snapshot-retention policy written into the properties of every table
+  ## `migrate create` creates. Expiration itself runs on every writer's commit
+  ## (ingest shift, compaction, pricing) off those properties, so this block
+  ## reaches a table exactly once, when it is created — changing it later does
+  ## not re-stamp existing tables. Without a bounded history GC cannot reclaim
+  ## anything: a snapshot in `metadata.json` keeps its manifests and data files
+  ## referenced forever.
+  snapshotExpiration:
+    ## Whether created tables expire snapshots at all.
+    enabled: true
+    ## Newest ancestors of the current snapshot that always survive.
+    minSnapshotsToKeep: 100
+    ## Age (ms) past which a snapshot may be expired. Must stay above
+    ## query.engine.maxAgeSecs — see the chart's retention check.
+    maxSnapshotAgeMs: 1800000
+    ## Superseded metadata.json versions a table keeps. Twice the snapshot
+    ## window, and never below it (maintain rejects a shorter log): past the
+    ## window a stored metadata.json is not a restore point, since its
+    ## snapshots' files have been swept, but the log is also what the S3 catalog
+    ## reads to recognise a commit of its own whose ack was lost.
+    metadataPreviousVersionsMax: 200
+
   ## Wait for catalog and storage to be ready before migrating.
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
@@ -631,7 +659,9 @@ maintain:
       dryRun: false
       ## Grace period: an object is deletable only if its last_modified is older
       ## than this. Protects freshly written files and in-flight compaction
-      ## outputs not yet referenced by a manifest (default: 7 days).
+      ## outputs not yet referenced by a manifest (default: 7 days). Must be
+      ## above zero and above query.engine.maxAgeSecs; both the chart and
+      ## MaintainConfig::validate reject a zero.
       minAgeSecs: 604800
       ## Also sweep orphaned Iceberg metadata (manifests, snap-*.avro, superseded
       ## *.metadata.json); when false, only data/ files are swept.

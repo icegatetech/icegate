@@ -1,10 +1,20 @@
 //! Query execution engine with background-refreshed catalog provider.
 //!
-//! The `QueryEngine` keeps a cached catalog provider that is refreshed
-//! in the background every `refresh_interval` (default 15s). The cached
-//! provider remains valid for up to `max_age` (default 30s). Queries
-//! never block on catalog rebuilds unless the cache is completely cold
-//! (first query or after a prolonged refresh failure).
+//! TODO: a cached provider pins a table state, not the files behind it. Snapshot
+//! expiration turns the manifests and data files of every snapshot it drops into
+//! orphans, and the maintain sweep deletes them once its grace period passes, so
+//! a query planned against a provider older than that can reach for a file that
+//! is gone — a scan error, not wrong results. Today the deployment keeps the two
+//! apart by configuration alone: `query.engine.max_age_secs * 1000` must stay
+//! below `history.expire.max-snapshot-age-ms` — the window is in milliseconds —
+//! so an expiring snapshot outlives every cached reference to it, and
+//! `gc.orphans.min_age_secs` must stay above
+//! `max_age_secs` so a swept file was already unreferenced when the newest
+//! provider was built. The Helm chart enforces both (`_helpers.tpl`,
+//! `icegate.validateRetentionWindow`); nothing enforces them at runtime, and a
+//! query holding a provider across a slow rebuild has no defence at all. The fix
+//! is for the read path to detect a missing referenced file and retry on a fresh
+//! provider rather than surfacing the object-store 404.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

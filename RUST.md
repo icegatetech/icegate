@@ -48,9 +48,18 @@ Before completing a task, perform an additional optimization pass to verify the 
 
 ## Documentation
 
-- **MUST** give every public item a doc comment stating its contract; a method whose body is self-evident needs one line, not a paragraph
-- Keep comments up to date with code changes
-- Include examples in doc comments for complex functions
+`missing_docs` is denied, so every public item carries a doc comment. Write it as a contract.
+
+- A doc comment on a `pub` item states **guarantees, errors, and invariants**, not a trace of the
+  implementation. A method whose body is self-evident needs one line, not a paragraph.
+- Document what the caller cannot see: what happens under concurrency, what is *not* durable yet,
+  what is validated later rather than here, what a returned empty value actually means.
+- `# Arguments` / `# Returns` blocks are required only when a name or signature is genuinely
+  ambiguous; do not pad self-evident parameters.
+- Include a doc example for a public entry point whose usage is not obvious from its signature.
+  Doc code is formatted (`format_code_in_doc_comments = true`) and compiled — keep it building.
+- Keep comments up to date with the code they describe.
+- Never write in the comments the exact values of constants that duplicate the code.
 
 ### Comment why, not what
 

@@ -1,4 +1,8 @@
 {{- if .Values.query.enabled -}}
+{{/* Also invoked from configmap-migrate and configmap-maintain: whichever
+     components are enabled, the ordering of cache age against retention and GC
+     grace is checked. */}}
+{{- include "icegate.validateRetentionWindow" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

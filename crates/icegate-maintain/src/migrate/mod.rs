@@ -9,4 +9,5 @@
 //! - Add validation and dry-run support
 //! - Integrate with existing schemas from schema.rs
 
+pub mod config;
 pub mod operations;

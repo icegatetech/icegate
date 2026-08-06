@@ -18,6 +18,20 @@ storage:
     region: us-east-1
     endpoint: http://s3:9000
 
+# Snapshot-retention policy stamped into the properties of every table
+# `migrate create` creates; the long-running services never read this block.
+# Expiration then rides along on every commit those services make, off the
+# table's own properties. Demo values match the chart defaults: the window must
+# outlive the query engine's provider cache (`engine.max_age_secs`, which
+# query.yaml leaves at the `icegate-query` default), and gc.orphans.min_age_secs
+# below must exceed that same cache age. Nothing checks this pair outside the
+# Helm chart, so the Compose stack relies on these two files staying ordered.
+snapshot_expiration:
+  enabled: true
+  min_snapshots_to_keep: 100
+  max_snapshot_age_ms: 1800000
+  metadata_previous_versions_max: 200
+
 # Compaction config for the long-running `compact` service (`maintain run`).
 # Ignored by the one-shot `migrate create` command, which shares this file.
 compaction:
