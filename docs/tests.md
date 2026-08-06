@@ -330,8 +330,9 @@ is a memory error rather than a retained allocation, so suppressing one hides a 
   ±128 MB direct-call range, and GNU ld does not emit range-extension thunks for the
   `.text.startup` sections `inventory` emits.
 - **`make sanitize-memory` is retained but does not work.** Verified 2026-08-05; it is
-  excluded from `make sanitize` and never blocks CI. Two independent blockers, either of
-  which is sufficient:
+  excluded from `make sanitize` and is not run by CI at all — a nightly job would spend a
+  runner to rediscover the failure below. The target is kept for a manual re-check after
+  either blocker is addressed. Two independent blockers, either of which is sufficient:
 
   1. **GCC does not implement MemorySanitizer.** The wrapper image has no clang, so `cc` is
      GCC 12.2.0, and `cc -fsanitize=memory` fails with `unrecognized argument to

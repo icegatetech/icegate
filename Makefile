@@ -122,9 +122,10 @@ sanitize-address:
 sanitize-leak:
 	scripts/sanitize.sh leak
 
-# MemorySanitizer is spike-gated: aws-lc-sys and ring ship hand-written assembly
-# that MSan cannot instrument, so this target is expected to be noisy. Excluded
-# from `sanitize` until it is shown to produce a usable signal.
+# MemorySanitizer does not currently work, which is why it is excluded from
+# `sanitize`. It fails at the first C file (MSan is clang-only, `cc` is GCC), and
+# even with clang would false-positive on the hand-written assembly aws-lc-sys
+# and ring ship. Both blockers and the remediation are in docs/tests.md.
 sanitize-memory:
 	scripts/sanitize.sh memory
 

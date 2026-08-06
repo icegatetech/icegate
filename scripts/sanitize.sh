@@ -174,6 +174,11 @@ case "$SANITIZER" in
         export LSAN_OPTIONS="suppressions=$REPO_ROOT/config/sanitizers/lsan.supp"
         ;;
     memory)
+        # This target does not currently work, and is retained only so the
+        # finding is not rediscovered. It dies at the first C file below: MSan
+        # is clang-only and `cc` here is GCC. Switching to clang does not fix
+        # it — see docs/tests.md for the second, independent blocker and the
+        # full remediation.
         RUSTFLAGS="$RUSTFLAGS -Zsanitizer-memory-track-origins"
         # Same linker reasoning as the address branch: -Zbuild-std plus
         # instrumentation exceeds aarch64's direct-call range under GNU ld.

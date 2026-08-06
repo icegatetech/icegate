@@ -27,11 +27,15 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'sanitize')
     strategy:
       fail-fast: false
+      # `memory` is deliberately absent, and must not be added back without
+      # first fixing the target. MemorySanitizer does not work here: it dies at
+      # the first C file (MSan is clang-only, `cc` is GCC), and even with clang
+      # would false-positive on the hand-written assembly aws-lc-sys and ring
+      # ship. Running it nightly would spend a runner to rediscover that. The
+      # `make sanitize-memory` target is retained for a manual re-check; both
+      # blockers and the remediation are in docs/tests.md.
       matrix:
-        sanitizer: [address, leak, memory]
-    # MemorySanitizer cannot instrument the hand-written assembly in aws-lc-sys
-    # and ring, so it is expected to be noisy and must never block.
-    continue-on-error: ${{ matrix.sanitizer == 'memory' }}
+        sanitizer: [address, leak]
     runs-on: ubuntu-latest
     # A cold sanitize-leak run takes well over an hour locally, and
     # sanitize-address is slower still (-Zbuild-std compiles std from source,
@@ -87,18 +91,17 @@ jobs:
       # depend on.
       #
       # scripts/sanitize.sh derives -j from available RAM itself (4 GiB/job for
-      # leak, 8 GiB/job for address/memory), capped at the CPU count — that is
+      # leak, 8 GiB/job for address), capped at the CPU count — that is
       # automatic and must not be overridden here. GitHub's standard runner is
-
-      # leak; that lower parallelism versus a well-resourced workstation is why
-      # these jobs run slower here.
+      # 4 vCPU / ~16 GB, and the division truncates, so that works out to -j1
+      # for address and -j3 for leak; that lower parallelism versus a
+      # well-resourced workstation is why these jobs run slower here.
       #
-      # address and memory also link with rust-lld on every architecture (see
+      # address also links with rust-lld on every architecture (see
       # scripts/sanitize.sh for why). That combination has so far only run on
       # aarch64 (the local Docker wrapper, built for the host architecture);
       # this runner is x86_64, so a CI run is rust-lld's first x86_64 exercise.
-      # If address or memory fails at link time, that is the first thing to
-      # check.
+      # If address fails at link time, that is the first thing to check.
       - name: Run sanitizer
         run: make sanitize-${{ matrix.sanitizer }}
 
