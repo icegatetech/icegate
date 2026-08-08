@@ -64,9 +64,22 @@ goes in `icegate-common`, never copied into a component.
   instructions ("how to write code in this crate") go in `crates/<crate>/AGENTS.md`;
   overview, deep-dive, and invariants go in a README beside the code (crate root,
   or the subsystem — e.g. [`compact/README`](crates/icegate-maintain/src/compact/README.md)).
+- A subsystem living outside a crate (`config/<name>/`, `scripts/`) is documented in a
+  README beside its own files — e.g. [`config/sanitizers/README`](config/sanitizers/README.md).
+  It is never a section inside a normative document.
 - Root [`docs/`](docs) holds only cross-crate, project-wide material
   (e.g. [tests.md](docs/tests.md)) — never a `docs/<crate>.md`.
 - Why: a crate's docs then travel with it and sit next to the code they describe, which resists drift.
+
+### Each document has one genre
+
+- **Normative** — this file, [RUST.md](RUST.md), all in [docs/](docs/): requirements
+  only. What a change MUST or SHOULD do, in the vocabulary of the surrounding rules.
+- **Reference** — a README beside the code: how a subsystem works, what its output means,
+  what it does not cover, how to maintain it.
+- Match the genre before adding a section. "How X behaves and why" belongs in the reference
+  document even when the topic fits the normative one: inside a rule set it dilutes the
+  requirements, and it drifts, because the thing it describes is not next to it.
 
 ## Iceberg and data invariants
 
@@ -91,8 +104,12 @@ goes in `icegate-common`, never copied into a component.
   have committed junk. Do not justify a decision with "the existing code does X";
   cite the documented rule, or propose adding one if it is missing.
 - Separation of responsibility comes first; apply DRY; the lints forbid dead code.
-- Schema, config fields, and service ports/URLs are referenced from their source,
-  never copied as literals into working code.
+- Schema, config fields, and service ports/URLs are referenced from their source, never
+  copied as literals into working code or into documentation. The same holds for measured
+  figures, tool versions, limits, and command definitions: name the file that owns them.
+  A copy is a second source, and it goes stale silently — the suppressed-leak total in
+  `docs/tests.md` had already drifted from `config/sanitizers/lsan.supp` before it was
+  removed.
 - It is better to return an error than to use, calculate, or show invalid data.
 
 ### Deployment configs come in pairs

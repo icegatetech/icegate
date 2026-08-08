@@ -1,5 +1,6 @@
 .PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench down \
-       helm-lint helm-template helm-catalog-test catalog-rest-check catalog-rest-test catalog-rest-clippy
+       helm-lint helm-template helm-catalog-test catalog-rest-check catalog-rest-test catalog-rest-clippy \
+       sanitize sanitize-address sanitize-leak sanitize-memory
 
 run-docker-core-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml up --build
@@ -111,3 +112,22 @@ helm-catalog-test:
 		echo "an explicit pathStyleAccess must reach the catalog server config"; \
 		exit 1; \
 	}
+
+# Run the test suite under LLVM sanitizers. Linux-only (leak and memory do not
+# exist on Darwin); scripts/sanitize.sh re-execs itself in a container on macOS.
+# Not part of `ci` — these run nightly, see .github/workflows/sanitizers.yml.
+sanitize-address:
+	scripts/sanitize.sh address
+
+sanitize-leak:
+	scripts/sanitize.sh leak
+
+# MemorySanitizer does not currently work, which is why it is excluded from
+# `sanitize`. It fails at the first C file (MSan is clang-only, `cc` is GCC), and
+# even with clang would false-positive on the hand-written assembly aws-lc-sys
+# and ring ship. Both blockers and the remediation are in
+# config/sanitizers/README.md.
+sanitize-memory:
+	scripts/sanitize.sh memory
+
+sanitize: sanitize-address sanitize-leak

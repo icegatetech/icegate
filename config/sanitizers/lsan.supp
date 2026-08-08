@@ -1,0 +1,160 @@
+# LeakSanitizer suppressions.
+#
+# Rules for this file:
+#   1. Every entry names the library and why the allocation is not ours.
+#   2. No entry may match a frame inside icegate_* — suppressing our own code
+#      defeats the point of the target.
+#
+# Rule 2 currently has THREE documented exceptions, all recorded on 2026-08-05
+# from the first real `make sanitize-leak` run. They exist so the nightly job
+# produces an actionable signal while known defects are investigated — not
+# because the leaks are benign. Two of them are on production code paths.
+#
+# Suppressed volume, final green run: 434,699 bytes across 9,930 allocations
+# (9,578 create_operator + 114 create_*_store + 110 TestServer::start
+# + 20 build_state + 108 apache_avro). That number is the honest cost of this
+# file: a green run means "no NEW leaks", not "no leaks".
+#
+# Per-entry counts below are from the run that first identified each leak, so
+# they differ from the totals above by ~1%. That much drift between runs is
+# normal; a larger change is worth investigating.
+#
+# Every first-party entry must be deleted as its defect is fixed, and adding a
+# fourth EXCEPTION needs the same dated accounting — otherwise this target
+# quietly becomes a rubber stamp. (Three exceptions, four first-party patterns:
+# Exception 3 needs two anchors to cover its five call sites.)
+
+# ===========================================================================
+# EXCEPTION 1 — PRODUCTION PATH. Largest single source by two orders of
+# magnitude. Suppressed to keep the signal usable, NOT benign.
+#
+# IceGateStorage::create_operator (crates/icegate-common/src/storage/icegate_storage.rs:143)
+# builds a brand-new opendal S3 backend on every call — and with it a new
+# AccessorInfo, HTTP client, and connection pool. It is called once per Iceberg
+# file operation through IceGateStorage::write / read / metadata.
+#
+# Measured whole-suite: 9,505 allocations / 422,712 bytes.
+# Scales with file-operation count: 67 allocations across the 3 operations in
+# icegate_common::catalog::builder::tests::s3_catalog_file_io_reads_with_explicit_credentials
+# (catalog/builder.rs:502/:505/:506), rising to 270 in manifest_scan_it — roughly 22 per
+# operation.
+#
+# The same function already hoists the cache layer out of the per-call path (see
+# the comment at icegate_storage.rs:184) because it runs hot. The S3 backend
+# itself was not given that treatment.
+#
+# Reports are Indirect with no Direct root, which points at a structure owned
+# inside opendal/reqwest rather than a Box of ours — a lead, not a diagnosis.
+#
+# BLAST RADIUS — read before trusting a green run. LSan matches if ANY frame in
+# the allocation stack matches, so this suppresses everything allocated anywhere
+# beneath create_operator (icegate_storage.rs:99), which is reached from all
+# eight FileIO call sites (:210-:253), not only the three named above. That
+# subtree also constructs OtelTraceLayer (:178), OtelMetricsLayer (:181), the
+# CacheLayer clone (:187), and PrefetchLayer/PrefetchMetrics (:196) — a new leak
+# in any of those would be swallowed by this entry.
+#
+# An `*opendal*` or `*reqwest*` anchor was considered and rejected as WIDER, not
+# narrower: it would suppress those libraries everywhere in the workspace, while
+# this pattern is at least confined to allocations under our own call.
+#
+# TODO(icegate): a per-operation leak on the Iceberg write path matches the
+# shape of the ingest and maintain OOM incidents. Delete this entry with the fix.
+leak:*IceGateStorage*create_operator*
+
+# ===========================================================================
+# EXCEPTION 2 — PRODUCTION PATH. Same shape of defect as Exception 1, but a
+# different code path and a different object-store abstraction (`object_store`
+# rather than `opendal`), so it is a second bug, not the same one seen twice.
+#
+# icegate_common::storage::builder::create_object_store
+# (crates/icegate-common/src/storage/builder.rs:213) leaks when constructing an
+# S3 store. Observed via icegate_maintain::gc::sweep::run_sweep — the GC orphan
+# sweep, which runs on a timer in the maintain service.
+#
+# The pattern deliberately matches create_s3_store as well. Today that function
+# (builder.rs:53) is only reached through create_object_store, so either anchor
+# would work — but it is `pub`, so a future direct caller would otherwise surface
+# this same leak as a brand-new failure with nothing pointing back here.
+#
+# Measured: 5,080 bytes / 115 allocations in icegate-maintain's gc_sweep_it.
+#
+# BLAST RADIUS. The `create_*_store` glob also matches two further `pub` functions
+# in the same module — create_local_store (builder.rs:174) and create_memory_store
+# (builder.rs:190) — both reached through create_object_store and both used
+# pervasively by the suite. A future leak under either would be swallowed here.
+# Narrow to *create_object_store* plus *create_s3_store* if that becomes a concern.
+#
+# TODO(icegate): investigate together with Exception 1 — a shared root cause in
+# how S3 clients are constructed per call is the obvious hypothesis. Delete this
+# entry with the fix.
+leak:*storage::builder::create_*_store*
+
+# ===========================================================================
+# EXCEPTION 3 — TEST SCAFFOLDING, not shipped code. A deliberate `Box::leak`,
+# repeated as an idiom in six places, all in icegate-query:
+#
+#   crates/icegate-query/tests/loki/harness.rs:141    TestServer::start
+#   crates/icegate-query/tests/tempo/harness.rs:135   TestServer::start
+#   crates/icegate-query/benches/common/harness.rs:154
+#   crates/icegate-query/src/loki/routes.rs:111       (mod tests)
+#   crates/icegate-query/src/tempo/routes.rs:135      (mod tests)
+#   crates/icegate-query/src/prometheus/routes.rs:94  (mod tests)
+#
+# Each leaks a `tempfile::TempDir` holding the test warehouse, to keep the
+# directory alive while the server runs.
+#
+# Measured: 1,716 bytes / 88 allocations (loki_tests), 468 / 24 (tempo_tests),
+# 390 / 20 (query lib tests). Under the current patterns those land as
+# 88 + 24 = 112 on *harness::TestServer*start* and 20 on *routes::tests::build_state*.
+#
+# BLAST RADIUS. *harness::TestServer*start* is not namespaced to a crate, so it
+# also matches a third harness the list above does not name:
+# crates/icegate-query/tests/flight_sql/harness.rs:73 (TestServer::start, built
+# by --tests as flight_sql_tests). It contributes ~0 allocations today and is
+# still test scaffolding, so the "not shipped code" claim holds — but a future
+# leak in the Flight SQL harness would be swallowed here silently. Split into
+# *loki::harness::TestServer*start* / *tempo::harness::TestServer*start* if that
+# ever matters.
+#
+# Anchored on the first-party call sites, NOT on `tempfile::TempDir`. A type
+# anchor was tried first and rejected: although `tempfile` is a dev-dependency in
+# every first-party crate that names it, Cargo.lock lists it as a NORMAL
+# dependency of `datafusion` and `datafusion-execution` (Cargo does not resolve
+# external crates' dev-dependencies into the lock). `datafusion` is a normal
+# dependency of icegate-query, which ships the `query` binary, so a
+# `*tempfile*TempDir*` pattern would also cover DataFusion's DiskManager spill
+# path — masking a real production leak in exactly the kind of code a data engine
+# must not leak in.
+#
+# The bench harness needs no entry: `scripts/sanitize.sh` runs
+# `--lib --bins --tests`, which excludes benches.
+#
+# TODO(icegate): two real problems here, both worth fixing.
+#   1. The comment at loki/harness.rs:139 claims the tempdir "will be cleaned up
+#      when the process exits". It will not — `Box::leak` means `TempDir::drop`
+#      never runs, so the directory is never removed. This leaks disk, not just
+#      memory.
+#   2. docs/tests.md requires harnesses to own temporary directories through
+#      RAII-style guards that clean up on success, error, timeout, and panic.
+#      A leaked TempDir is precisely what that rule forbids.
+# The fix is to store the TempDir in the returned harness struct so RAII handles
+# it. Delete both entries then.
+leak:*harness::TestServer*start*
+leak:*routes::tests::build_state*
+
+# ===========================================================================
+# THIRD-PARTY — the only entry that satisfies rule 1 as originally written.
+#
+# apache-avro, reached through the iceberg fork's Avro value serialization
+# (iceberg::spec::values::serde::Record::serialize). The leaked blocks are
+# String clones the serializer retains for the life of the process; no
+# first-party frame appears in the stack.
+#
+# Measured whole-suite: 108 allocations / 1,188 bytes.
+#
+# No retirement TODO, deliberately: this is upstream retention we do not
+# control, so the header's "delete each entry as its defect is fixed" rule
+# applies to the three first-party exceptions, not to this one. It retires
+# only if the iceberg fork stops serializing through apache-avro.
+leak:*apache_avro*

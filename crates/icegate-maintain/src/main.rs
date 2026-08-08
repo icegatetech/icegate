@@ -13,7 +13,10 @@ use icegate_maintain::cli::{Cli, Commands};
 // and rarely returns memory to the OS, producing the staircase RSS growth seen
 // in the container. jemalloc reclaims aggressively via background threads.
 // Mirrors the ingest and query binaries.
-#[cfg(target_os = "linux")]
+//
+// The sanitizer runtimes intercept malloc/free themselves and cannot coexist with a
+// custom global allocator, so scripts/sanitize.sh passes --cfg icegate_sanitize.
+#[cfg(all(target_os = "linux", not(icegate_sanitize)))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

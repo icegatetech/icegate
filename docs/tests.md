@@ -251,3 +251,21 @@ cargo test -p icegate-catalog-s3 --all-targets --features rest
 
 The REST command is required when `icegate-catalog-s3` REST code or shared catalog behavior
 changes. Other optional features MUST be tested whenever the change can affect them.
+
+## Sanitizers
+
+The sanitizer targets run the test suite under LeakSanitizer or AddressSanitizer to protect
+the C dependencies, `unsafe` inside third-party Rust, and allocations unreachable at exit.
+They are not part of `make ci`. How to run them, what a green run does and does not prove,
+and how the suppression files are maintained: [config/sanitizers/README.md](../config/sanitizers/README.md).
+
+- A change to a C dependency, to a compression or TLS code path, or to the global allocator
+  SHOULD be verified under `make sanitize-address` and `make sanitize-leak` before merging.
+  Where a local run is impractical, the PR MUST carry the `sanitize` label so CI runs them
+  on it, and the result MUST be reported like any other test command.
+- A sanitizer run MUST NOT be counted as coverage for feature-gated code. It builds with no
+  `--features`, so anything behind a feature gate is skipped silently — that code still
+  needs the tests required above.
+- A leak or memory error in first-party code is a defect to fix, not to suppress. A
+  suppression matching a frame inside `icegate_*` MUST carry measured figures and a
+  retirement condition, as the existing exceptions in `config/sanitizers/lsan.supp` do.

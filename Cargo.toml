@@ -23,7 +23,7 @@ missing_docs = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
 dead_code = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(icegate_sanitize)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

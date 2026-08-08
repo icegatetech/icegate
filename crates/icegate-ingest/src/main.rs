@@ -6,7 +6,10 @@ use clap::Parser;
 use icegate_ingest::{cli::Cli, error::Result};
 use tokio::runtime::Builder;
 
-#[cfg(target_os = "linux")]
+// jemalloc installs itself as the global allocator, replacing malloc/free — which is
+// exactly what a sanitizer runtime must intercept. The two cannot coexist, so
+// scripts/sanitize.sh passes --cfg icegate_sanitize to opt back out.
+#[cfg(all(target_os = "linux", not(icegate_sanitize)))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
