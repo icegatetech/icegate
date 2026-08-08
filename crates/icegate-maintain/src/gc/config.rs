@@ -16,8 +16,15 @@ pub struct GcOrphansConfig {
     pub dry_run: bool,
     /// Grace period in seconds: an object is eligible for deletion only if its
     /// `last_modified` is older than this. Protects freshly written files and
-    /// in-flight compaction outputs not yet referenced by a manifest. `0` means
-    /// no grace period.
+    /// in-flight compaction outputs not yet referenced by a manifest, and keeps
+    /// a file a cached query provider may still name out of the sweep's reach —
+    /// the deployment contract is
+    /// `query.engine.max_age_secs < gc.orphans.min_age_secs`.
+    ///
+    /// `0` disables the grace period and is rejected by
+    /// `MaintainConfig::validate` while the sweep is enabled: `max_age_secs` is
+    /// positive by definition, so zero breaks the ordering whatever it is set
+    /// to.
     pub min_age_secs: u64,
     /// When `true`, also sweep orphaned Iceberg metadata files (manifests,
     /// manifest lists, superseded `*.metadata.json`); when `false`, only data
@@ -48,7 +55,9 @@ impl GcOrphansConfig {
     /// # Errors
     ///
     /// Returns [`MaintainError::Config`] if `delete_concurrency` or
-    /// `sweep_timeout_secs` is zero. `min_age_secs` of `0` is allowed (no grace).
+    /// `sweep_timeout_secs` is zero. `min_age_secs` of `0` passes here — the
+    /// grace-period contract also involves the `gc.enabled` master switch, so it
+    /// is checked by `MaintainConfig::validate`, which sees both blocks.
     pub fn validate(&self) -> Result<(), MaintainError> {
         if self.delete_concurrency == 0 {
             return Err(MaintainError::Config(
@@ -204,9 +213,14 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    /// `min_age_secs == 0` is the documented "no grace period" setting, and this
+    /// block cannot tell whether it is safe: that depends on whether the sweep
+    /// runs at all, which is the `gc.enabled` / `gc.orphans.enabled` pair only
+    /// `MaintainConfig` sees. With both on, zero also exposes a compaction
+    /// output written but not yet referenced by a manifest. The combined rule is
+    /// tested in `crate::config`.
     #[test]
-    fn validate_allows_zero_min_age() {
-        // `min_age_secs == 0` is the documented "no grace period" setting.
+    fn validate_allows_zero_min_age_on_its_own() {
         let mut config = valid_config();
         config.orphans.min_age_secs = 0;
         assert!(config.validate().is_ok());

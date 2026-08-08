@@ -22,6 +22,7 @@ use futures::TryStreamExt;
 use iceberg::Catalog;
 use icegate_common::{PRICES_TABLE, icegate_table_ident};
 use icegate_maintain::compact::config::{CompactionJobsManagerConfig, JobStateCodec, JobsStorageConfig};
+use icegate_maintain::migrate::config::SnapshotExpirationConfig;
 use icegate_maintain::migrate::operations::create_tables;
 use icegate_maintain::pricing::PricingRunner;
 use icegate_maintain::pricing::config::{PricingConfig, SourceConfig};
@@ -164,7 +165,9 @@ async fn first_crawl_appends_and_second_identical_crawl_commits_nothing() {
     let (_store, conn) = common::setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    create_tables(&dyn_catalog, false).await.expect("create tables");
+    create_tables(&dyn_catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create tables");
 
     let now = Utc::now();
     let stub = StubSource {
@@ -203,7 +206,9 @@ async fn a_changed_rate_appends_exactly_one_revision() {
     let (_store, conn) = common::setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    create_tables(&dyn_catalog, false).await.expect("create tables");
+    create_tables(&dyn_catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create tables");
 
     let config = PricingConfig::default();
     let first_valid_from = Utc::now();
@@ -264,7 +269,9 @@ async fn pricing_runner_builds_starts_and_drains() {
     let (_store, conn) = common::setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    create_tables(&dyn_catalog, false).await.expect("create tables");
+    create_tables(&dyn_catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create tables");
 
     let config = PricingConfig {
         enabled: true,

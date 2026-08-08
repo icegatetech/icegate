@@ -1,4 +1,5 @@
 {{- if .Values.migrate.enabled -}}
+{{- include "icegate.validateRetentionWindow" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,4 +17,9 @@ data:
       {{- include "icegate.catalogYaml" . | nindent 6 }}
     storage:
       {{- include "icegate.storageYaml" . | nindent 6 }}
+    snapshot_expiration:
+      enabled: {{ .Values.migrate.snapshotExpiration.enabled }}
+      min_snapshots_to_keep: {{ .Values.migrate.snapshotExpiration.minSnapshotsToKeep }}
+      max_snapshot_age_ms: {{ .Values.migrate.snapshotExpiration.maxSnapshotAgeMs | int }}
+      metadata_previous_versions_max: {{ .Values.migrate.snapshotExpiration.metadataPreviousVersionsMax }}
 {{- end }}

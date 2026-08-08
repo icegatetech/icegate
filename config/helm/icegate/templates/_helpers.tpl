@@ -175,6 +175,104 @@ backend: !s3
 {{- end }}
 
 {{/*
+Fail the render when the retention window, the query provider cache, and the GC
+grace period are not ordered so that a query can never plan against files that
+are already gone:
+
+  query.engine.maxAgeSecs * 1000 < migrate.snapshotExpiration.maxSnapshotAgeMs
+  query.engine.maxAgeSecs        < maintain.gc.orphans.minAgeSecs
+
+A snapshot must outlive every cached reference to it, and a file must be
+unreferenced for longer than a provider can be cached before the sweep may take
+it. The three values belong to three components with three config files; this
+chart is the only place all of them exist at once, so it is the only place the
+ordering can be checked ahead of a query failing at runtime. See
+`crates/icegate-maintain/README.md`.
+
+The first ordering is checked only while `migrate.snapshotExpiration.enabled`:
+with the policy stamped off, no snapshot is ever dropped and the two magnitudes
+constrain nothing. The second is checked whatever that policy says, matching
+`MaintainConfig::validate` — a grace period of zero also exposes a compaction
+output written but not yet referenced by a manifest, and the tables of the
+deployment carry the policy they were created with, not the one in these values.
+
+Alongside the ordering, each value is checked against the bounds its own
+component's validator enforces (`SnapshotExpirationConfig::validate`,
+`QueryEngineConfig::validate`). Those bounds are not the chart's to invent, but
+leaving them to the pod is worse than duplicating them: `configmap-migrate.yaml`
+is a `pre-install,pre-upgrade` hook, so a block the migrate pod refuses to load
+fails the release after the render has already told the operator it is sound.
+
+One rule stays out of reach: `maxAgeSecs >= refreshIntervalSecs` is checked only
+when `refreshIntervalSecs` is set in values, since with it omitted the bound is
+the engine's own default, resolved in code. So the guarantee is bounded — every
+rule whose operands the chart holds is mirrored here, and nothing beyond that.
+
+`query.engine.maxAgeSecs` is `required` rather than defaulted: the engine's own
+default lives in `crates/icegate-query/src/engine/config.rs` and must not be
+restated here, and a nil value would make `int` yield 0 and pass the orderings
+below in silence. `values.yaml` declares it once, and the same value renders into
+`configmap-query.yaml`. The whole `query.engine` map is optional in Helm's eyes,
+hence `(.Values.query.engine).maxAgeSecs`: the parenthesised form yields nil for
+a missing or explicitly null map and reaches the message below, where the plain
+path aborts the render with a nil-pointer message that names none of the
+operator's own values. `required` passes a zero through — it rejects nil and the
+empty string only — so the positivity of the value is a check of its own.
+
+Invoked from every `ConfigMap` that carries one of these values, so the render is
+checked whichever components are enabled.
+
+Usage: include "icegate.validateRetentionWindow" .
+*/}}
+{{- define "icegate.validateRetentionWindow" -}}
+{{- if .Values.query.enabled }}
+{{- $queryMaxAgeSecs := required "query.engine.maxAgeSecs is required: the chart checks it against migrate.snapshotExpiration.maxSnapshotAgeMs and maintain.gc.orphans.minAgeSecs, and cannot restate the engine's own default" (.Values.query.engine).maxAgeSecs | int }}
+{{- if le $queryMaxAgeSecs 0 }}
+{{- fail (printf "query.engine.maxAgeSecs (%d) must be greater than zero: the query pod refuses to start on a non-positive provider cache age, and every retention ordering below is stated against it" $queryMaxAgeSecs) }}
+{{- end }}
+{{- with (.Values.query.engine).refreshIntervalSecs }}
+{{- if lt $queryMaxAgeSecs (int .) }}
+{{- fail (printf "query.engine.maxAgeSecs (%d) must be at least query.engine.refreshIntervalSecs (%d): a provider would be stale before the background refresh that replaces it has run" $queryMaxAgeSecs (int .)) }}
+{{- end }}
+{{- end }}
+{{- if and .Values.migrate.enabled .Values.migrate.snapshotExpiration.enabled }}
+{{/* Both sides in milliseconds: flooring the window to whole seconds would
+     reject a 30001ms window against a 30s cache, which the ordering allows. */}}
+{{- $snapshotAgeMs := .Values.migrate.snapshotExpiration.maxSnapshotAgeMs | int }}
+{{- if ge (mul $queryMaxAgeSecs 1000) $snapshotAgeMs }}
+{{- fail (printf "query.engine.maxAgeSecs (%d) must be below migrate.snapshotExpiration.maxSnapshotAgeMs (%dms): a cached catalog provider would outlive the snapshot it planned against, and the sweep may already have collected that snapshot's files" $queryMaxAgeSecs $snapshotAgeMs) }}
+{{- end }}
+{{- end }}
+{{- if and .Values.maintain.enabled .Values.maintain.gc.enabled .Values.maintain.gc.orphans.enabled }}
+{{- if le (.Values.maintain.gc.orphans.minAgeSecs | int) $queryMaxAgeSecs }}
+{{- fail (printf "maintain.gc.orphans.minAgeSecs (%d) must exceed query.engine.maxAgeSecs (%d): the sweep would be free to delete a file while a cached catalog provider still plans reads against it" (.Values.maintain.gc.orphans.minAgeSecs | int) $queryMaxAgeSecs) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.maintain.enabled .Values.maintain.gc.enabled .Values.maintain.gc.orphans.enabled }}
+{{- if eq (.Values.maintain.gc.orphans.minAgeSecs | int) 0 }}
+{{- fail "maintain.gc.orphans.minAgeSecs must be greater than zero: a swept file has to stay unreferenced for longer than query.engine.maxAgeSecs, which is positive by definition, and the grace period is also what keeps a compaction output not yet referenced by any manifest out of the sweep's reach" }}
+{{- end }}
+{{- end }}
+{{/* The bounds of `SnapshotExpirationConfig::validate`, which the migrate pod
+     applies to the whole block whatever `enabled` says — a policy stamped off
+     still has to be a well-formed one. */}}
+{{- if .Values.migrate.enabled }}
+{{- $minSnapshotsToKeep := .Values.migrate.snapshotExpiration.minSnapshotsToKeep | int }}
+{{- $metadataPreviousVersionsMax := .Values.migrate.snapshotExpiration.metadataPreviousVersionsMax | int }}
+{{- if le $minSnapshotsToKeep 0 }}
+{{- fail (printf "migrate.snapshotExpiration.minSnapshotsToKeep (%d) must be greater than zero: a table that keeps no ancestor of its current snapshot has no history for an in-flight reader or the WAL offset to sit in" $minSnapshotsToKeep) }}
+{{- end }}
+{{- if le (.Values.migrate.snapshotExpiration.maxSnapshotAgeMs | int) 0 }}
+{{- fail (printf "migrate.snapshotExpiration.maxSnapshotAgeMs (%d) must be greater than zero" (.Values.migrate.snapshotExpiration.maxSnapshotAgeMs | int)) }}
+{{- end }}
+{{- if lt $metadataPreviousVersionsMax $minSnapshotsToKeep }}
+{{- fail (printf "migrate.snapshotExpiration.metadataPreviousVersionsMax (%d) must be at least migrate.snapshotExpiration.minSnapshotsToKeep (%d): the table would drop metadata.json versions covering snapshots it is still required to keep, and the S3 catalog resolves a lost commit ack by finding its own metadata file in the head's metadata-log" $metadataPreviousVersionsMax $minSnapshotsToKeep) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Render AWS credential env vars from an existing Secret.
 Usage: include "icegate.awsEnv" .
 */}}
