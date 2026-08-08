@@ -33,7 +33,7 @@ jobs:
       # would false-positive on the hand-written assembly aws-lc-sys and ring
       # ship. Running it nightly would spend a runner to rediscover that. The
       # `make sanitize-memory` target is retained for a manual re-check; both
-      # blockers and the remediation are in docs/tests.md.
+      # blockers and the remediation are in config/sanitizers/README.md.
       matrix:
         sanitizer: [address, leak]
     runs-on: ubuntu-latest

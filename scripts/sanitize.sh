@@ -142,8 +142,7 @@ case "$SANITIZER" in
         # zstd-sys, lz4-sys, aws-lc-sys, and ring is compiled by build scripts via
         # the cc crate, so without these an out-of-bounds inside those libraries is
         # invisible: ASan detects through compiler-inserted shadow checks, and
-        # uninstrumented code carries none. Assembly is left uninstrumented, which
-        # for ASan means missed coverage rather than MSan-style false positives.
+        # uninstrumented code carries none.
         #
         # Note what this actually couples: the image has no clang, so `cc` is GCC
         # and the C is instrumented by GCC's ASan (libzstd.a carries GCC's
@@ -153,13 +152,8 @@ case "$SANITIZER" in
         # config/sanitizers/toolchain pins only the LLVM half; the GCC half floats
         # with the unpinned `FROM rust:bookworm` base image.
         #
-        # Coverage reality: of the four libraries named above, only zstd is
-        # meaningfully exercised by this suite (it is the Parquet writer's default
-        # codec and the ingest/queue tests drive it). LZ4 is a non-default queue
-        # codec no test selects, and aws-lc-sys/ring are transitive and largely
-        # unentered because the container tests speak plain HTTP. So a clean run
-        # means "zstd is instrumented and clean", not "the C dependencies are
-        # clean".
+        # Instrumenting all four is not the same as exercising them: what a clean
+        # run actually covers is in config/sanitizers/README.md.
         export CFLAGS="${CFLAGS:-} -fsanitize=address -fno-omit-frame-pointer"
         export CXXFLAGS="${CXXFLAGS:-} -fsanitize=address -fno-omit-frame-pointer"
         # detect_leaks=0: ASan enables LeakSanitizer by default on Linux, which
@@ -177,8 +171,8 @@ case "$SANITIZER" in
         # This target does not currently work, and is retained only so the
         # finding is not rediscovered. It dies at the first C file below: MSan
         # is clang-only and `cc` here is GCC. Switching to clang does not fix
-        # it — see docs/tests.md for the second, independent blocker and the
-        # full remediation.
+        # it — see config/sanitizers/README.md for the second, independent
+        # blocker and the full remediation.
         RUSTFLAGS="$RUSTFLAGS -Zsanitizer-memory-track-origins"
         # Same linker reasoning as the address branch: -Zbuild-std plus
         # instrumentation exceeds aarch64's direct-call range under GNU ld.

@@ -125,7 +125,8 @@ sanitize-leak:
 # MemorySanitizer does not currently work, which is why it is excluded from
 # `sanitize`. It fails at the first C file (MSan is clang-only, `cc` is GCC), and
 # even with clang would false-positive on the hand-written assembly aws-lc-sys
-# and ring ship. Both blockers and the remediation are in docs/tests.md.
+# and ring ship. Both blockers and the remediation are in
+# config/sanitizers/README.md.
 sanitize-memory:
 	scripts/sanitize.sh memory
 
