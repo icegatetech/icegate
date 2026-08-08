@@ -86,12 +86,12 @@ antlr4rust = "0.5"
 # Sourced from the icegatetech/iceberg-rust fork (0.9.0 base).
 # Pinned to an immutable rev (not a branch) for reproducible builds; bump the SHA
 # deliberately when adopting fork updates rather than letting `develop` float.
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0c079645eb719f6d9eed1d230e97e92b6b21d725" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0c079645eb719f6d9eed1d230e97e92b6b21d725" }
-iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0c079645eb719f6d9eed1d230e97e92b6b21d725" }
-iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0c079645eb719f6d9eed1d230e97e92b6b21d725" }
-iceberg-storage-opendal = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0c079645eb719f6d9eed1d230e97e92b6b21d725", features = ["opendal-s3"] }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "0c079645eb719f6d9eed1d230e97e92b6b21d725" }
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
+iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
+iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
+iceberg-storage-opendal = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c", features = ["opendal-s3"] }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
 
 # DataFusion
 datafusion = "52.2"
