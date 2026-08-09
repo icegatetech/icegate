@@ -98,33 +98,33 @@ impl S3Catalog {
         } else {
             raw_storage
         };
-        Ok(Self::with_storage(
-            storage,
-            file_io,
-            tables_uri_prefix,
-            retrier,
-            cancel_token,
-        ))
+        Self::with_storage(storage, file_io, tables_uri_prefix, retrier, cancel_token)
     }
 
     /// Create a catalog with externally provided storage implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Iceberg`] when called outside a tokio context: the
+    /// runtime handed to every [`Table`] is borrowed from the ambient one, and
+    /// iceberg never spawns a runtime of its own.
     pub(crate) fn with_storage(
         storage: Arc<dyn CatalogStorage>,
         file_io: FileIO,
         tables_uri_prefix: String,
         retrier: Retrier,
         cancel_token: CancellationToken,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             storage,
             file_io,
             tables_uri_prefix,
             retrier,
             cancel_token,
-            // Every caller reaches this from inside a tokio context — `new` is
-            // async, and the test helpers run under `#[tokio::test]`.
-            runtime: Runtime::current(),
-        }
+            // `Runtime::current` would panic here instead; the fallible variant
+            // keeps the no-panic guarantee for a caller that is not on tokio.
+            runtime: Runtime::try_current()?,
+        })
     }
 
     fn compute_tables_uri_prefix(config: &S3CatalogConfig) -> String {
@@ -824,9 +824,12 @@ impl Catalog for S3Catalog {
     /// sweep walks. Dropping first would leave every file orphaned for the GC
     /// sweep to find later rather than reclaiming them here.
     ///
-    /// `drop_table_data` only deletes data files when the table's `gc.enabled`
-    /// property is true (the default), so a table sharing data files with another
-    /// is not corrupted by a purge. Metadata files are deleted either way.
+    /// `drop_table_data` deletes data files whenever the table's `gc.enabled`
+    /// property is true — and true is the default, so a purge takes the data with
+    /// it unless the table explicitly opts out. That property is the only guard:
+    /// a table sharing data files with another must carry `gc.enabled=false`, or
+    /// the purge deletes files the other table still references. Metadata files
+    /// are deleted either way.
     ///
     /// A failure partway through leaves the catalog entry already tombstoned and
     /// some files behind. That is not corruption — the entry is gone and the

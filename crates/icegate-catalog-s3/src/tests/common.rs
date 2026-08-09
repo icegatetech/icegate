@@ -27,6 +27,7 @@ use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::s3::S3CatalogStorage;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
+#[allow(clippy::expect_used)]
 fn test_catalog(storage: Arc<dyn CatalogStorage>, file_io: FileIO, tables_uri_prefix: String) -> S3Catalog {
     S3Catalog::with_storage(
         storage,
@@ -35,6 +36,7 @@ fn test_catalog(storage: Arc<dyn CatalogStorage>, file_io: FileIO, tables_uri_pr
         Retrier::new(cas_retrier_config_default()),
         tokio_util::sync::CancellationToken::new(),
     )
+    .expect("every test runs on tokio")
 }
 
 /// In-memory storage backend for unit tests.

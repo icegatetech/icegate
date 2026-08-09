@@ -501,3 +501,86 @@ fn parquet_stat_max_as_datum(
         _ => None,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use iceberg::spec::{MapType, NestedField, PrimitiveType, Schema, Type, VariantType};
+
+    use super::build_parquet_path_index;
+
+    /// A variant column is opaque to the walk: it has no children to descend
+    /// into, so — like a primitive — the path accumulated for it is the whole
+    /// path, and it must resolve to its own field ID rather than being skipped.
+    /// Expected paths are the parquet names the reader will see, written out
+    /// rather than derived from the visitor.
+    #[test]
+    fn a_variant_field_maps_its_own_path_to_its_field_id() {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "timestamp",
+                    Type::Primitive(PrimitiveType::Timestamptz),
+                )),
+                Arc::new(NestedField::optional(2, "payload", Type::Variant(VariantType))),
+                Arc::new(NestedField::required(
+                    3,
+                    "attributes",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::required(4, "key", Type::Primitive(PrimitiveType::String))),
+                        Arc::new(NestedField::optional(
+                            5,
+                            "value",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                    )),
+                )),
+            ])
+            .build()
+            .expect("schema");
+
+        let index = build_parquet_path_index(&schema).expect("build path index");
+
+        assert_eq!(
+            index.get("payload"),
+            Some(&2),
+            "the variant must carry its own field ID"
+        );
+        assert_eq!(index.get("timestamp"), Some(&1));
+        assert_eq!(index.get("attributes.key_value.key"), Some(&4));
+        assert_eq!(index.get("attributes.key_value.value"), Some(&5));
+        assert_eq!(
+            index.len(),
+            4,
+            "a variant contributes exactly one entry, like a primitive"
+        );
+    }
+
+    /// A variant nested inside a map value still terminates the walk at its own
+    /// path, so the map prefix is kept rather than collapsed to the value field.
+    #[test]
+    fn a_variant_inside_a_map_value_keeps_the_map_path_prefix() {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(2, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::optional(3, "value", Type::Variant(VariantType))),
+                )),
+            ))])
+            .build()
+            .expect("schema");
+
+        let index = build_parquet_path_index(&schema).expect("build path index");
+
+        assert_eq!(index.get("attributes.key_value.value"), Some(&3));
+        assert_eq!(index.get("attributes.key_value.key"), Some(&2));
+        assert_eq!(index.len(), 2);
+    }
+}
