@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt as _;
 use iceberg::io::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig, StorageFactory};
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
@@ -226,7 +227,37 @@ impl Storage for IceGateStorage {
         } else {
             format!("{relative}/")
         };
-        op.remove_all(&dir_path).await.map_err(from_opendal_error)?;
+        // `remove_all` is deprecated; it was exactly this call underneath.
+        op.delete_with(&dir_path).recursive(true).await.map_err(from_opendal_error)?;
+        Ok(())
+    }
+
+    /// Delete every path in the stream, batching through a single
+    /// [`opendal::Deleter`].
+    ///
+    /// One `IceGateStorage` addresses exactly one backend, so all paths resolve
+    /// to the same operator and can share a deleter — which lets S3 collapse
+    /// them into `DeleteObjects` batches rather than issuing a request per
+    /// object. The deleter is created lazily, so an empty stream costs nothing,
+    /// and `close` is what actually flushes the queued deletions.
+    async fn delete_stream(&self, mut paths: futures::stream::BoxStream<'static, String>) -> Result<()> {
+        let mut deleter: Option<opendal::Deleter> = None;
+
+        while let Some(path) = paths.next().await {
+            let (op, relative) = self.resolve_operator(&path)?;
+            let relative = relative.to_string();
+
+            if deleter.is_none() {
+                deleter = Some(op.deleter().await.map_err(from_opendal_error)?);
+            }
+            if let Some(deleter) = deleter.as_mut() {
+                deleter.delete(relative).await.map_err(from_opendal_error)?;
+            }
+        }
+
+        if let Some(mut deleter) = deleter {
+            deleter.close().await.map_err(from_opendal_error)?;
+        }
         Ok(())
     }
 

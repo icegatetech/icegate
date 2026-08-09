@@ -1,6 +1,6 @@
 //! Date grid UDF for aligning timestamps to time-bucketed grids.
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::{
     arrow::{
@@ -221,10 +221,6 @@ impl DateGrid {
 }
 
 impl ScalarUDFImpl for DateGrid {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "date_grid"
     }

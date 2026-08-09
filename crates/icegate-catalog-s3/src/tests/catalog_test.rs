@@ -36,6 +36,7 @@ fn unwrap_loaded(outcome: LoadOutcome) -> (Arc<CatalogRoot>, Version) {
     }
 }
 
+#[allow(clippy::expect_used)]
 fn test_catalog(storage: Arc<dyn CatalogStorage>, file_io: FileIO, tables_uri_prefix: String) -> S3Catalog {
     S3Catalog::with_storage(
         storage,
@@ -44,6 +45,7 @@ fn test_catalog(storage: Arc<dyn CatalogStorage>, file_io: FileIO, tables_uri_pr
         Retrier::new(cas_retrier_config_default()),
         tokio_util::sync::CancellationToken::new(),
     )
+    .expect("every test runs on tokio")
 }
 
 fn initial_metadata_location(table_location: &str) -> String {
@@ -784,6 +786,74 @@ async fn drop_table_not_found() {
         .expect_err("dropping missing table must fail");
 
     assert_eq!(error.kind(), ErrorKind::TableNotFound);
+}
+
+/// The purge tombstones the entry as well as sweeping files, so the catalog side
+/// of it is observable here. Deletion of the data and manifest files themselves
+/// belongs to `drop_table_data` against a real object store and is not covered at
+/// this layer — the in-memory harness keeps table metadata in the catalog
+/// storage, not behind the table's `FileIO`.
+#[tokio::test]
+async fn purge_table_removes_the_catalog_entry() {
+    let catalog = make_in_memory_catalog();
+    let namespace = NamespaceIdent::new("ns1".to_string());
+    let table = create_table(&catalog, &namespace, "tbl").await;
+
+    catalog.purge_table(table.identifier()).await.expect("purge table");
+
+    assert!(
+        !catalog.table_exists(table.identifier()).await.expect("check table"),
+        "a purged table must no longer exist"
+    );
+    assert!(
+        catalog.list_tables(&namespace).await.expect("list tables").is_empty(),
+        "a purged table must not still be listed by its namespace"
+    );
+    assert!(
+        catalog.namespace_exists(&namespace).await.expect("check namespace"),
+        "the purge is scoped to the table; its namespace must survive"
+    );
+}
+
+/// A purge walks one table's metadata. Nothing it deletes may be reachable from
+/// a sibling, and the sibling's own entry must be untouched by the root rewrite.
+#[tokio::test]
+async fn purge_table_leaves_a_sibling_table_intact() {
+    let catalog = make_in_memory_catalog();
+    let namespace = NamespaceIdent::new("ns1".to_string());
+    let purged = create_table(&catalog, &namespace, "purged").await;
+    let kept = create_table(&catalog, &namespace, "kept").await;
+
+    catalog.purge_table(purged.identifier()).await.expect("purge table");
+
+    assert_eq!(
+        catalog.list_tables(&namespace).await.expect("list tables"),
+        vec![kept.identifier().clone()],
+        "only the purged table may leave the namespace"
+    );
+    catalog.load_table(kept.identifier()).await.expect("sibling must still load");
+}
+
+/// The metadata load comes first, so a missing table fails before anything is
+/// tombstoned or deleted.
+#[tokio::test]
+async fn purge_table_not_found() {
+    let catalog = make_in_memory_catalog();
+    let namespace = NamespaceIdent::new("ns1".to_string());
+    let kept = create_table(&catalog, &namespace, "kept").await;
+    let missing = TableIdent::new(namespace.clone(), "missing".to_string());
+
+    let error = catalog
+        .purge_table(&missing)
+        .await
+        .expect_err("purging missing table must fail");
+
+    assert_eq!(error.kind(), ErrorKind::TableNotFound);
+    assert_eq!(
+        catalog.list_tables(&namespace).await.expect("list tables"),
+        vec![kept.identifier().clone()],
+        "a failed purge must not remove anything"
+    );
 }
 
 #[tokio::test]
@@ -2637,7 +2707,8 @@ async fn commit_transaction_exhausts_cas_budget_with_max_attempts_error() {
         "memory://catalog/tables".to_string(),
         Retrier::new(small_budget),
         tokio_util::sync::CancellationToken::new(),
-    );
+    )
+    .expect("every test runs on tokio");
     let namespace = NamespaceIdent::new("ns1".to_string());
     let table = create_table(&catalog, &namespace, "tbl").await;
 

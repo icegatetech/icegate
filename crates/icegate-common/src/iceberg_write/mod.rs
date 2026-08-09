@@ -216,7 +216,7 @@ async fn write_parquet_files_once(
 
     let generated_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
     let location_generator = TrackingLocationGenerator::new(
-        DefaultLocationGenerator::new(table_metadata.clone()).map_err(CommonError::Iceberg)?,
+        DefaultLocationGenerator::new(&table_metadata).map_err(CommonError::Iceberg)?,
         Arc::clone(&generated_paths),
     );
 

@@ -111,7 +111,10 @@ pub fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
     if let Some(allow_anonymous) = m.remove(S3_ALLOW_ANONYMOUS)
         && is_truthy(&allow_anonymous)
     {
-        cfg.allow_anonymous = true;
+        // `allow_anonymous` is deprecated in opendal 0.57; its builder simply set
+        // `skip_signature` from it, so this is the same behaviour. The public
+        // `S3_ALLOW_ANONYMOUS` config key is unchanged.
+        cfg.skip_signature = true;
     }
     if let Some(disable_ec2_metadata) = m.remove(S3_DISABLE_EC2_METADATA)
         && is_truthy(&disable_ec2_metadata)

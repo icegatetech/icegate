@@ -171,7 +171,7 @@ fn empty_string_map(arrow_schema: &ArrowSchema, rows: usize) -> Arc<dyn Array> {
 async fn write_one_file(table: &Table, batch: RecordBatch) -> DataFile {
     let metadata = table.metadata().clone();
     let file_io = table.file_io().clone();
-    let location_generator = DefaultLocationGenerator::new(metadata.clone()).unwrap();
+    let location_generator = DefaultLocationGenerator::new(&metadata).unwrap();
     let file_name_generator = DefaultFileNameGenerator::new(Uuid::now_v7().to_string(), None, DataFileFormat::Parquet);
     let parquet_builder =
         ParquetWriterBuilder::new(WriterProperties::builder().build(), metadata.current_schema().clone());
@@ -506,10 +506,7 @@ struct PruningFootprint {
 /// the result is the upper bound on what a scan for that partition must open.
 async fn measure_pruning_footprint(table: &Table, tenant_id: &str, timestamp_day: i32) -> PruningFootprint {
     let snapshot = table.metadata().current_snapshot().expect("current snapshot");
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), table.metadata())
-        .await
-        .expect("load manifest list");
+    let manifest_list = table.manifest_list_reader(snapshot).load().await.expect("load manifest list");
 
     let tenant_value = Datum::string(tenant_id);
     let day_value = Datum::int(timestamp_day);
@@ -703,10 +700,7 @@ async fn compactor_repacks_manifests_without_touching_data() {
     // 3b. Pruning metadata survives the rewrite: every repacked output DATA
     //     manifest carries partition summaries, one per partition-spec field
     //     (tenant_id, timestamp_day), so manifest pruning stays effective.
-    let manifest_list = snapshot
-        .load_manifest_list(after.file_io(), after.metadata())
-        .await
-        .expect("load manifest list");
+    let manifest_list = after.manifest_list_reader(snapshot).load().await.expect("load manifest list");
     let output_data_manifests: Vec<_> = manifest_list
         .entries()
         .iter()

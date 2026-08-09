@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
 use iceberg::Catalog;
 use icegate_common::{OperatorRegistry, icegate_table_ident};
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};

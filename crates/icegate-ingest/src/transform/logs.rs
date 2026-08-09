@@ -277,6 +277,7 @@ mod tests {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
                     attributes: vec![KeyValue {
+                        key_strindex: 0,
                         key: "service.name".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::StringValue("test-service".to_string())),
@@ -296,6 +297,7 @@ mod tests {
                             value: Some(Value::StringValue("Test log message".to_string())),
                         }),
                         attributes: vec![KeyValue {
+                            key_strindex: 0,
                             key: "custom.attr".to_string(),
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue("custom-value".to_string())),
@@ -336,12 +338,14 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![
                         KeyValue {
+                            key_strindex: 0,
                             key: "service.name".to_string(),
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue("demo".to_string())),
                             }),
                         },
                         KeyValue {
+                            key_strindex: 0,
                             key: "cloud.account.id".to_string(),
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue("acc-1".to_string())),
@@ -362,6 +366,7 @@ mod tests {
                             value: Some(Value::StringValue("hello".to_string())),
                         }),
                         attributes: vec![KeyValue {
+                            key_strindex: 0,
                             key: "foo".to_string(),
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue("bar".to_string())),

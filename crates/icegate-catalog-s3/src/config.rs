@@ -522,8 +522,10 @@ impl CatalogServerConfig {
             properties.insert("s3.access-key-id".to_string(), access_key_id.clone());
             properties.insert("s3.secret-access-key".to_string(), secret_access_key.clone());
         }
+        // `configured_scheme` is gone from this variant as of the iceberg bump —
+        // the scheme is taken from the `warehouse` property instead, which is
+        // already an `s3://` URI here.
         Ok(FileIOBuilder::new(std::sync::Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .with_props(properties)

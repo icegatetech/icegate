@@ -12,15 +12,15 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Valu
 /// Converts various OTLP value types to string representation.
 fn extract_any_value_string(value: Option<&AnyValue>) -> Option<String> {
     value.and_then(|v| {
-        v.value.as_ref().map(|val| match val {
-            Value::StringValue(s) => s.clone(),
-            Value::IntValue(i) => i.to_string(),
-            Value::DoubleValue(d) => d.to_string(),
-            Value::BoolValue(b) => b.to_string(),
-            Value::BytesValue(b) => hex::encode(b),
+        v.value.as_ref().and_then(|val| match val {
+            Value::StringValue(s) => Some(s.clone()),
+            Value::IntValue(i) => Some(i.to_string()),
+            Value::DoubleValue(d) => Some(d.to_string()),
+            Value::BoolValue(b) => Some(b.to_string()),
+            Value::BytesValue(b) => Some(hex::encode(b)),
             Value::ArrayValue(arr) => {
                 let items: Vec<String> = arr.values.iter().filter_map(|v| extract_any_value_string(Some(v))).collect();
-                format!("[{}]", items.join(", "))
+                Some(format!("[{}]", items.join(", ")))
             }
             Value::KvlistValue(kvs) => {
                 let pairs: Vec<String> = kvs
@@ -28,8 +28,16 @@ fn extract_any_value_string(value: Option<&AnyValue>) -> Option<String> {
                     .iter()
                     .filter_map(|kv| extract_any_value_string(kv.value.as_ref()).map(|v| format!("{}={}", kv.key, v)))
                     .collect();
-                format!("{{{}}}", pairs.join(", "))
+                Some(format!("{{{}}}", pairs.join(", ")))
             }
+            // TODO(otlp-strindex): DROPS DATA. OTLP 0.32 added string interning —
+            // the value is an index into the request's string table rather than an
+            // inline string, and that table is not plumbed through to this
+            // function. Resolving it requires threading the table from the request
+            // root through the transform. Until then an interned value yields no
+            // attribute at all, silently. Same in `serialize_any_value_to_json` and
+            // `any_value_to_json`; `KeyValue::key_strindex` is likewise ignored.
+            Value::StringValueStrindex(_) => None,
         })
     })
 }
@@ -81,23 +89,25 @@ pub(crate) fn serialize_any_value_to_json(value: Option<&AnyValue>) -> Option<St
                 }
                 serde_json::to_string(&json_object).ok()
             }
+            // See the TODO(otlp-strindex) note in `extract_any_value_string`.
+            Value::StringValueStrindex(_) => None,
         })
     })
 }
 
 /// Helper to convert `AnyValue` to `serde_json::Value` for JSON serialization.
 fn any_value_to_json(value: &AnyValue) -> Option<serde_json::Value> {
-    value.value.as_ref().map(|val| match val {
-        Value::StringValue(s) => serde_json::Value::String(s.clone()),
-        Value::IntValue(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
+    value.value.as_ref().and_then(|val| match val {
+        Value::StringValue(s) => Some(serde_json::Value::String(s.clone())),
+        Value::IntValue(i) => Some(serde_json::Value::Number(serde_json::Number::from(*i))),
         Value::DoubleValue(d) => {
-            serde_json::Number::from_f64(*d).map_or(serde_json::Value::Null, serde_json::Value::Number)
+            Some(serde_json::Number::from_f64(*d).map_or(serde_json::Value::Null, serde_json::Value::Number))
         }
-        Value::BoolValue(b) => serde_json::Value::Bool(*b),
-        Value::BytesValue(b) => serde_json::Value::String(hex::encode(b)),
+        Value::BoolValue(b) => Some(serde_json::Value::Bool(*b)),
+        Value::BytesValue(b) => Some(serde_json::Value::String(hex::encode(b))),
         Value::ArrayValue(arr) => {
             let items: Vec<serde_json::Value> = arr.values.iter().filter_map(any_value_to_json).collect();
-            serde_json::Value::Array(items)
+            Some(serde_json::Value::Array(items))
         }
         Value::KvlistValue(kvs) => {
             let mut map = serde_json::Map::new();
@@ -106,8 +116,10 @@ fn any_value_to_json(value: &AnyValue) -> Option<serde_json::Value> {
                     map.insert(kv.key.clone(), v);
                 }
             }
-            serde_json::Value::Object(map)
+            Some(serde_json::Value::Object(map))
         }
+        // See the TODO(otlp-strindex) note in `extract_any_value_string`.
+        Value::StringValueStrindex(_) => None,
     })
 }
 
@@ -211,6 +223,7 @@ const fn value_type_name(value: &Value) -> &'static str {
         Value::ArrayValue(_) => "array",
         Value::KvlistValue(_) => "kvlist",
         Value::BytesValue(_) => "bytes",
+        Value::StringValueStrindex(_) => "string_strindex",
     }
 }
 
@@ -810,12 +823,14 @@ mod tests {
             value: Some(Value::KvlistValue(KeyValueList {
                 values: vec![
                     KeyValue {
+                        key_strindex: 0,
                         key: "status".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::IntValue(200)),
                         }),
                     },
                     KeyValue {
+                        key_strindex: 0,
                         key: "message".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::StringValue("OK".to_string())),
@@ -847,23 +862,27 @@ mod tests {
             value: Some(Value::KvlistValue(KeyValueList {
                 values: vec![
                     KeyValue {
+                        key_strindex: 0,
                         key: "method".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::StringValue("POST".to_string())),
                         }),
                     },
                     KeyValue {
+                        key_strindex: 0,
                         key: "details".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::KvlistValue(KeyValueList {
                                 values: vec![
                                     KeyValue {
+                                        key_strindex: 0,
                                         key: "status".to_string(),
                                         value: Some(AnyValue {
                                             value: Some(Value::IntValue(200)),
                                         }),
                                     },
                                     KeyValue {
+                                        key_strindex: 0,
                                         key: "path".to_string(),
                                         value: Some(AnyValue {
                                             value: Some(Value::StringValue("/api/v1".to_string())),
@@ -941,16 +960,19 @@ mod tests {
             value: Some(Value::KvlistValue(KeyValueList {
                 values: vec![
                     KeyValue {
+                        key_strindex: 0,
                         key: "method".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::StringValue("POST".to_string())),
                         }),
                     },
                     KeyValue {
+                        key_strindex: 0,
                         key: "details".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::KvlistValue(KeyValueList {
                                 values: vec![KeyValue {
+                                    key_strindex: 0,
                                     key: "status".to_string(),
                                     value: Some(AnyValue {
                                         value: Some(Value::IntValue(200)),
@@ -1105,12 +1127,14 @@ mod tests {
     fn serialize_all_attrs_to_json_object_includes_every_attribute() {
         let attrs = vec![
             KeyValue {
+                key_strindex: 0,
                 key: "output".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::StringValue("done".to_string())),
                 }),
             },
             KeyValue {
+                key_strindex: 0,
                 key: "bash_command".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::StringValue("ls".to_string())),
@@ -1132,12 +1156,14 @@ mod tests {
     fn serialize_attrs_to_json_object_selects_named_keys() {
         let attrs = vec![
             KeyValue {
+                key_strindex: 0,
                 key: "full_command".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::StringValue("ls -la".to_string())),
                 }),
             },
             KeyValue {
+                key_strindex: 0,
                 key: "tool_name".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::StringValue("Bash".to_string())),

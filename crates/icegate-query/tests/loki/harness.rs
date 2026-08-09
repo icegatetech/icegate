@@ -282,7 +282,7 @@ pub async fn write_test_logs_for_tenant(
         ],
     )?;
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
@@ -444,7 +444,7 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         ],
     )?;
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new("data".to_string(), None, DataFileFormat::Parquet);
 
     let parquet_writer_builder = ParquetWriterBuilder::new(

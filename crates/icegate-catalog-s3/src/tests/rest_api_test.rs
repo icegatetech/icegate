@@ -1288,7 +1288,8 @@ async fn storage_failures_map_to_sanitized_retryable_and_terminal_responses() {
             "memory://catalog/tables".to_string(),
             crate::infra::retrier::Retrier::new(crate::config::cas_retrier_config_default()),
             tokio_util::sync::CancellationToken::new(),
-        );
+        )
+        .expect("every test runs on tokio");
         let app = build_router(Arc::new(catalog));
 
         let response = send(&app, "GET", "/v1/namespaces").await;

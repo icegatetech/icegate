@@ -20,10 +20,10 @@ use foyer::{DeviceBuilder as _, HybridCache};
 use futures::future::try_join_all;
 use opendal::raw::oio::{self, Read};
 use opendal::raw::{
-    Access, AccessorInfo, BytesContentRange, BytesRange, Layer, LayeredAccess, MaybeSend, OpDelete, OpList, OpRead,
-    OpStat, OpWrite, RpDelete, RpList, RpRead, RpStat, RpWrite,
+    Access, AccessorInfo, BytesRange, Layer, LayeredAccess, MaybeSend, OpDelete, OpList, OpRead, OpStat, OpWrite,
+    RpDelete, RpList, RpRead, RpStat, RpWrite,
 };
-use opendal::{Buffer, Error, ErrorKind, Metadata, Result};
+use opendal::{Buffer, EntryMode, Error, ErrorKind, Metadata, Result};
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{KeyValue, metrics::MeterProvider as _};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -745,13 +745,16 @@ impl<A: Access> std::fmt::Debug for CacheAccessor<A> {
 /// `total_size` is the full object size for the `Content-Range` header.
 /// Pass `None` when the total size is unknown (e.g. fast-path cache hits
 /// where no stat has been performed).
-fn make_read_response(data: Vec<u8>, range_start: u64, range_end: u64, total_size: Option<u64>) -> (RpRead, Buffer) {
+fn make_read_response(data: Vec<u8>, total_size: Option<u64>) -> (RpRead, Buffer) {
     let buf = Buffer::from(data);
-    let mut content_range = BytesContentRange::default().with_range(range_start, range_end - 1);
-    if let Some(size) = total_size {
-        content_range = content_range.with_size(size);
-    }
-    let rp = RpRead::new().with_size(Some(buf.len() as u64)).with_range(Some(content_range));
+    // opendal 0.57 reduced `RpRead` to an optional `Metadata`, dropping the
+    // explicit size/content-range fields. `content_length` there means the FULL
+    // object size, not the length of this (possibly ranged) read — so it is only
+    // meaningful when the caller knows the total. When it does not, report no
+    // metadata rather than passing off the chunk length as the object size.
+    let rp = total_size.map_or_else(RpRead::default, |size| {
+        RpRead::new(Metadata::new(EntryMode::FILE).with_content_length(size))
+    });
     (rp, buf)
 }
 
@@ -761,6 +764,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
     type Writer = CacheWriter<A>;
     type Lister = A::Lister;
     type Deleter = CacheDeleter<A>;
+    type Copier = A::Copier;
 
     fn inner(&self) -> &Self::Inner {
         &self.inner.accessor
@@ -810,7 +814,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                                 .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
                             inner.metrics.record_hit("fast_path", range_end - range_start);
                             inner.metrics.record_read_duration(start);
-                            return Ok(make_read_response(data, range_start, range_end, None));
+                            return Ok(make_read_response(data, None));
                         }
                     }
                 }
@@ -840,7 +844,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
 
             if range_start >= range_end {
                 inner.metrics.record_read_duration(start);
-                return Ok((RpRead::new(), Buffer::new()));
+                return Ok((RpRead::default(), Buffer::new()));
             }
 
             // Phase 1: Acquire lock briefly to check cache and compute gaps.
@@ -874,7 +878,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                             .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
                         inner.metrics.record_hit("lock_path", range_end - range_start);
                         inner.metrics.record_read_duration(start);
-                        return Ok(make_read_response(data, range_start, range_end, total_size));
+                        return Ok(make_read_response(data, total_size));
                     }
                 }
 
@@ -973,7 +977,7 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                     })?
                 }
             };
-            let response = make_read_response(data, range_start, range_end, total_size);
+            let response = make_read_response(data, total_size);
 
             inner.metrics.record_read_duration(start);
             Ok(response)
@@ -1135,14 +1139,16 @@ impl<A: Access> CacheDeleter<A> {
 }
 
 impl<A: Access> oio::Delete for CacheDeleter<A> {
-    fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
-        self.deleter.delete(path, args)?;
+    // opendal 0.57 made `delete` async and replaced `flush() -> Result<usize>`
+    // with `close() -> Result<()>`; queued deletions are now executed on close.
+    async fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
+        self.deleter.delete(path, args).await?;
         self.keys.push(CacheKey { path: path.to_string() });
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<usize> {
-        let count = self.deleter.flush().await?;
+    async fn close(&mut self) -> Result<()> {
+        self.deleter.close().await?;
         for key in &self.keys {
             tracing::trace!(path = key.path, "Cache evicted on delete");
             self.inner.cache.remove(key);
@@ -1150,7 +1156,7 @@ impl<A: Access> oio::Delete for CacheDeleter<A> {
             self.inner.locks.remove(key);
             self.inner.metrics.record_eviction();
         }
-        Ok(count)
+        Ok(())
     }
 }
 

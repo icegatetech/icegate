@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, Error as IcebergError, ErrorKind, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit,
-    TableCreation, TableIdent,
+    Catalog, Error as IcebergError, ErrorKind, Namespace, NamespaceIdent, Result as IcebergResult, Runtime,
+    TableCommit, TableCreation, TableIdent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -61,6 +61,10 @@ pub struct S3Catalog {
     tables_uri_prefix: String,
     retrier: Retrier,
     cancel_token: CancellationToken,
+    /// Runtime handed to every [`Table`] this catalog builds; iceberg uses it to
+    /// spawn scan and manifest work. Captured from the ambient tokio context at
+    /// construction, matching how the upstream catalogs default it.
+    runtime: Runtime,
 }
 
 impl fmt::Debug for S3Catalog {
@@ -94,30 +98,33 @@ impl S3Catalog {
         } else {
             raw_storage
         };
-        Ok(Self::with_storage(
-            storage,
-            file_io,
-            tables_uri_prefix,
-            retrier,
-            cancel_token,
-        ))
+        Self::with_storage(storage, file_io, tables_uri_prefix, retrier, cancel_token)
     }
 
     /// Create a catalog with externally provided storage implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Iceberg`] when called outside a tokio context: the
+    /// runtime handed to every [`Table`] is borrowed from the ambient one, and
+    /// iceberg never spawns a runtime of its own.
     pub(crate) fn with_storage(
         storage: Arc<dyn CatalogStorage>,
         file_io: FileIO,
         tables_uri_prefix: String,
         retrier: Retrier,
         cancel_token: CancellationToken,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             storage,
             file_io,
             tables_uri_prefix,
             retrier,
             cancel_token,
-        }
+            // `Runtime::current` would panic here instead; the fallible variant
+            // keeps the no-panic guarantee for a caller that is not on tokio.
+            runtime: Runtime::try_current()?,
+        })
     }
 
     fn compute_tables_uri_prefix(config: &S3CatalogConfig) -> String {
@@ -285,6 +292,7 @@ impl S3Catalog {
         let commit_states = Arc::new(Mutex::new(commit_states));
         let storage = Arc::clone(&self.storage);
         let file_io = self.file_io.clone();
+        let runtime = self.runtime.clone();
         let result_slot: Arc<Mutex<Option<Vec<Table>>>> = Arc::new(Mutex::new(None));
 
         self.retrier
@@ -293,11 +301,13 @@ impl S3Catalog {
                     let commit_states = Arc::clone(&commit_states);
                     let storage = Arc::clone(&storage);
                     let file_io = file_io.clone();
+                    let runtime = runtime.clone();
                     let result_slot = Arc::clone(&result_slot);
                     move || {
                         let commit_states = Arc::clone(&commit_states);
                         let storage = Arc::clone(&storage);
                         let file_io = file_io.clone();
+                        let runtime = runtime.clone();
                         let result_slot = Arc::clone(&result_slot);
                         async move {
                             let (mut root, version) = Self::load_root_for_mutation(&storage).await?;
@@ -347,7 +357,7 @@ impl S3Catalog {
                             // build is a pure, in-memory projection, so doing it
                             // first leaves no fallible step between a durable
                             // `save_root` and the `Ok` return.
-                            let tables = Self::build_tables(&commit_states, &file_io)?;
+                            let tables = Self::build_tables(&commit_states, &file_io, &runtime)?;
 
                             // Step 5: CAS-publish the merged root. On conflict we
                             // keep prepared metadata intact — the next round only
@@ -430,7 +440,11 @@ impl S3Catalog {
         Ok(head_locations)
     }
 
-    fn build_tables(commit_states: &HashMap<TableKey, CommitState>, file_io: &FileIO) -> Result<Vec<Table>> {
+    fn build_tables(
+        commit_states: &HashMap<TableKey, CommitState>,
+        file_io: &FileIO,
+        runtime: &Runtime,
+    ) -> Result<Vec<Table>> {
         commit_states
             .values()
             .map(|state| {
@@ -445,6 +459,7 @@ impl S3Catalog {
                     .metadata_location(table.updated.metadata_location().as_str().to_string())
                     .metadata(table.updated.metadata().clone())
                     .file_io(file_io.clone())
+                    .runtime(runtime.clone())
                     .build()
                     .map_err(Error::from)
             })
@@ -638,6 +653,7 @@ impl Catalog for S3Catalog {
                 .metadata_location(prepared_arc.updated.metadata_location().as_str().to_string())
                 .metadata(prepared_arc.updated.metadata().clone())
                 .file_io(self.file_io.clone())
+                .runtime(self.runtime.clone())
                 .build()
                 .map_err(Error::from)?;
 
@@ -669,6 +685,7 @@ impl Catalog for S3Catalog {
                 .metadata_location(entry.metadata_location().as_str().to_string())
                 .metadata(Arc::unwrap_or_clone(metadata))
                 .file_io(self.file_io.clone())
+                .runtime(self.runtime.clone())
                 .build()
                 .map_err(Error::from)
         }
@@ -748,6 +765,7 @@ impl Catalog for S3Catalog {
                 .metadata_location(metadata_location.clone())
                 .metadata(Arc::unwrap_or_clone(metadata))
                 .file_io(self.file_io.clone())
+                .runtime(self.runtime.clone())
                 .build()
                 .map_err(Error::from)?;
 
@@ -796,5 +814,30 @@ impl Catalog for S3Catalog {
                     "commit_transaction with one request must return one response",
                 )
             })
+    }
+
+    /// Drop the table and delete the files it references.
+    ///
+    /// Order matters: the metadata has to be loaded *before* the catalog entry is
+    /// tombstoned, because the tombstone is what makes the snapshots, manifest
+    /// lists and metadata log unreachable — and those are exactly what the file
+    /// sweep walks. Dropping first would leave every file orphaned for the GC
+    /// sweep to find later rather than reclaiming them here.
+    ///
+    /// `drop_table_data` deletes data files whenever the table's `gc.enabled`
+    /// property is true — and true is the default, so a purge takes the data with
+    /// it unless the table explicitly opts out. That property is the only guard:
+    /// a table sharing data files with another must carry `gc.enabled=false`, or
+    /// the purge deletes files the other table still references. Metadata files
+    /// are deleted either way.
+    ///
+    /// A failure partway through leaves the catalog entry already tombstoned and
+    /// some files behind. That is not corruption — the entry is gone and the
+    /// leftovers are unreferenced, so [`crate::services`]' GC sweep reclaims them
+    /// on a later pass. This matches how the upstream catalogs behave.
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        let table_info = self.load_table(table).await?;
+        self.drop_table(table).await?;
+        iceberg::drop_table_data(&table_info).await
     }
 }

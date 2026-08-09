@@ -1,6 +1,6 @@
 //! Parsing UDFs for converting strings to numbers (numeric, bytes, duration).
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::{
     arrow::{
@@ -45,10 +45,6 @@ impl ParseNumeric {
 }
 
 impl ScalarUDFImpl for ParseNumeric {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "parse_numeric"
     }
@@ -167,10 +163,6 @@ impl ParseBytes {
 }
 
 impl ScalarUDFImpl for ParseBytes {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "parse_bytes"
     }
@@ -330,10 +322,6 @@ impl ParseDuration {
 }
 
 impl ScalarUDFImpl for ParseDuration {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "parse_duration"
     }

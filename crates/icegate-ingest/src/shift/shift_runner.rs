@@ -970,7 +970,7 @@ mod tests {
 
     fn parquet_bytes_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> Vec<u8> {
         let mut buffer = Vec::new();
-        let props = WriterProperties::builder().set_max_row_group_size(2).build();
+        let props = WriterProperties::builder().set_max_row_group_row_count(Some(2)).build();
         {
             let mut writer = ArrowWriter::try_new(&mut buffer, batches[0].schema(), Some(props)).expect("arrow writer");
             for batch in batches {

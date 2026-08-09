@@ -727,6 +727,7 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
             let mut resource_attributes = group.resource_attributes;
             if !group.service.is_empty() && !resource_attributes.iter().any(|kv| kv.key == "service.name") {
                 resource_attributes.push(KeyValue {
+                    key_strindex: 0,
                     key: "service.name".to_string(),
                     value: Some(AnyValue {
                         value: Some(AnyVal::StringValue(group.service.clone())),
@@ -807,6 +808,7 @@ fn proto_attributes(map_arr: &MapArray, row: usize) -> Vec<KeyValue> {
             continue;
         }
         out.push(KeyValue {
+            key_strindex: 0,
             key: keys.value(i).to_string(),
             value: Some(AnyValue {
                 value: Some(AnyVal::StringValue(values.value(i).to_string())),

@@ -7,7 +7,7 @@
 //! **Before:** N logs → unnest → N×M rows → GROUP BY → result
 //! **After:**  N logs → GROUP BY labels → UDAF buckets internally → unnest → G rows per group
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use datafusion::{
     arrow::{
@@ -147,10 +147,6 @@ impl GridAgg {
 }
 
 impl AggregateUDFImpl for GridAgg {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "grid_agg"
     }

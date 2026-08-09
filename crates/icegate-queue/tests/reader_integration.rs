@@ -19,8 +19,8 @@ use icegate_queue::{
     WAL_ROW_GROUP_METADATA_KEY, WriteRequest, channel,
 };
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
 };
 use tokio::{
     sync::{Notify, oneshot},
@@ -279,8 +279,11 @@ impl ObjectStore for FailingMetadataObjectStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -291,12 +294,8 @@ impl ObjectStore for FailingMetadataObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -349,8 +348,11 @@ impl ObjectStore for DelayedObjectStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -361,12 +363,8 @@ impl ObjectStore for DelayedObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

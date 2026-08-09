@@ -134,7 +134,7 @@ impl StorageLayers {
     pub(crate) fn wrap_operator(&self, operator: Operator) -> Operator {
         // `Operator::layer()` returns `Operator` directly (type-erased), so no
         // `.finish()` is needed between the calls.
-        let mut operator = operator.layer(OtelTraceLayer);
+        let mut operator = operator.layer(OtelTraceLayer::new());
         if let Some(layer) = &self.metrics {
             operator = operator.layer(layer.clone());
         }

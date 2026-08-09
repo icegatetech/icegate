@@ -1,6 +1,6 @@
 //! Map filtering UDFs for `LogQL` keep/drop/by/without operations.
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
     arrow::{
@@ -68,10 +68,6 @@ impl MapKeepKeys {
 }
 
 impl ScalarUDFImpl for MapKeepKeys {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "map_keep_keys"
     }
@@ -132,10 +128,6 @@ impl MapDropKeys {
 }
 
 impl ScalarUDFImpl for MapDropKeys {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "map_drop_keys"
     }

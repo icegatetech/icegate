@@ -326,7 +326,7 @@ pub async fn write_test_spans_with_properties(
     let batch = RecordBatch::try_new(arrow_schema.clone(), columns)?;
 
     let unique_suffix = format!("tempo-{tenant_id}-{now_micros}");
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
     let parquet_writer_builder =
         ParquetWriterBuilder::new(writer_properties, table.metadata().current_schema().clone());

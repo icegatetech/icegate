@@ -8,7 +8,6 @@
 //! by the caller (the schema provider) so that each table's hot data is
 //! correctly scoped.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -103,10 +102,6 @@ impl IcegateTableProvider {
 
 #[async_trait]
 impl TableProvider for IcegateTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }

@@ -49,7 +49,7 @@ pub async fn collect_referenced_paths(table: &Table) -> Result<HashSet<ObjectPat
     // Every snapshot's manifest list, its manifests, and their files.
     for snapshot in metadata.snapshots() {
         referenced.insert(parse_object_key(snapshot.manifest_list())?);
-        let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
+        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
         for manifest_file in manifest_list.entries() {
             referenced.insert(parse_object_key(&manifest_file.manifest_path)?);
             let manifest = manifest_file.load_manifest(file_io).await?;

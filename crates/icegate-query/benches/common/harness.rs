@@ -520,7 +520,7 @@ async fn write_batch_to_table(
     batch: RecordBatch,
     unique_suffix: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(unique_suffix.to_string(), None, DataFileFormat::Parquet);
 
     let parquet_writer_builder = ParquetWriterBuilder::new(

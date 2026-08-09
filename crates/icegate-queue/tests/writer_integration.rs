@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use futures::TryStreamExt;
 use icegate_queue::{QueueConfig, QueueWriter, WriteRequest, channel};
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use tokio::sync::oneshot;
 

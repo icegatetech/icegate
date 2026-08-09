@@ -64,7 +64,7 @@ pub fn build_writer_properties(
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_data_page_size_limit(data_page_size_limit_bytes)
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_max_row_group_size(row_group_size);
+        .set_max_row_group_row_count(Some(row_group_size));
 
     // Dictionary is force-disabled on every column with an explicit
     // encoding override: parquet-rs treats `set_column_encoding` as a

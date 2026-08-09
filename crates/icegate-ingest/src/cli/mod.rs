@@ -41,7 +41,10 @@ impl Cli {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             Commands::Version => commands::version::execute(),
-            Commands::Run { config } => commands::run::execute(config).await,
+            // Boxed for the same reason as `icegate-maintain`'s entry point: the
+            // run future exceeds clippy's `large_futures` threshold, and this is
+            // a once-per-process dispatch.
+            Commands::Run { config } => Box::pin(commands::run::execute(config)).await,
         }
     }
 }

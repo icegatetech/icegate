@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{SecondsFormat, Utc};
 use opentelemetry::global;
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
-use tracing_opentelemetry::{OpenTelemetrySpanExt, OtelData};
+use tracing_opentelemetry::{OpenTelemetrySpanExt, get_otel_context};
 use tracing_subscriber::fmt::FormattedFields;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, JsonFields, Writer};
 use tracing_subscriber::registry::LookupSpan;
@@ -152,8 +153,37 @@ impl Drop for TracingGuard {
 /// span's instance fields rendered via `JsonFields`), `threadName`,
 /// `threadId`. New optional keys: `trace_id` (32-hex), `span_id`
 /// (16-hex).
-#[derive(Debug, Default, Clone, Copy)]
-struct TraceContextJsonFormatter;
+#[derive(Debug, Default, Clone)]
+struct TraceContextJsonFormatter {
+    /// Weak handle to the subscriber this formatter is installed in.
+    ///
+    /// `tracing-opentelemetry` 0.33 made the `OtelData` span extension private.
+    /// Its replacement, [`get_otel_context`], resolves a span's `OTel` context
+    /// but needs an explicit `Dispatch` — and inside `format_event` the ambient
+    /// dispatcher is `tracing`'s no-op recursion guard, which would yield an
+    /// invalid `SpanContext`. So the real one is captured once, by
+    /// [`Self::capture_dispatch`], from inside the scope where the subscriber is
+    /// active.
+    ///
+    /// Shared via `Arc` so the copy handed to `fmt::Layer` and the copy the
+    /// caller keeps for `capture_dispatch` fill the same slot; weak so the
+    /// formatter never keeps the subscriber alive.
+    dispatch: Arc<OnceLock<tracing::dispatcher::WeakDispatch>>,
+}
+
+impl TraceContextJsonFormatter {
+    /// Record the subscriber this formatter resolves `OTel` contexts against.
+    ///
+    /// Must be called where the target subscriber is the active default — after
+    /// `try_init` for a globally installed one, or inside the closure for
+    /// `with_default`. Without it the formatter still emits every other field;
+    /// only `trace_id` / `span_id` go missing.
+    fn capture_dispatch(&self) {
+        tracing::dispatcher::get_default(|dispatch| {
+            let _ = self.dispatch.set(dispatch.downgrade());
+        });
+    }
+}
 
 impl<S, N> FormatEvent<S, N> for TraceContextJsonFormatter
 where
@@ -191,21 +221,17 @@ where
         // `JsonFields` formatter the layer is configured with. We
         // mirror the previous `with_span_list(false)` behavior by
         // surfacing only the immediate span, not the ancestor chain.
-        // While here we also extract OTel `trace_id` / `span_id` from
-        // the span's `OtelData` extension that the
-        // `tracing_opentelemetry` layer attaches in `on_new_span`.
-        // Reading the extension via `ctx.lookup_current()` (rather
-        // than `Span::current().context()`) is required: inside
-        // `format_event` the active dispatcher is a no-op subscriber
-        // installed by `fmt::Layer` to prevent log recursion, so the
-        // dispatch-based `OpenTelemetrySpanExt::context()` returns an
-        // invalid SpanContext. The registry-based lookup uses the
-        // real subscriber and works correctly.
+        // While here we also attach the span's `OTel` `trace_id` /
+        // `span_id`, resolved through `get_otel_context` against the
+        // dispatcher captured in `self.dispatch` — see that field for
+        // why the ambient one cannot be used here.
         if let Some(span) = ctx.lookup_current() {
             let mut span_obj = Map::new();
             span_obj.insert("name".into(), Value::String(span.metadata().name().to_string()));
-            // Scope the `extensions` lock guard so it drops before
-            // the final `obj.insert(...)` (clippy::significant_drop_tightening).
+            // Scope the `extensions` lock guard so it drops before the
+            // `get_otel_context` call below — which must not be made while
+            // extensions are borrowed — and before the final `obj.insert(...)`
+            // (clippy::significant_drop_tightening).
             {
                 let extensions = span.extensions();
                 if let Some(formatted) = extensions.get::<FormattedFields<N>>() {
@@ -219,11 +245,17 @@ where
                         }
                     }
                 }
-                if let Some(otel_data) = extensions.get::<OtelData>() {
-                    if let (Some(trace_id), Some(span_id)) = (otel_data.trace_id(), otel_data.span_id()) {
-                        obj.insert("trace_id".into(), Value::String(trace_id.to_string()));
-                        obj.insert("span_id".into(), Value::String(span_id.to_string()));
-                    }
+            }
+            if let Some(cx) = self
+                .dispatch
+                .get()
+                .and_then(tracing::dispatcher::WeakDispatch::upgrade)
+                .and_then(|dispatch| get_otel_context(&span.id(), &dispatch))
+            {
+                let span_context = cx.span().span_context().clone();
+                if span_context.is_valid() {
+                    obj.insert("trace_id".into(), Value::String(span_context.trace_id().to_string()));
+                    obj.insert("span_id".into(), Value::String(span_context.span_id().to_string()));
                 }
             }
             obj.insert("span".into(), Value::Object(span_obj));
@@ -333,15 +365,19 @@ impl Visit for JsonValueVisitor {
 pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
     // If tracing is disabled, just initialize basic logging without OpenTelemetry
     if !config.enabled {
+        let formatter = TraceContextJsonFormatter::default();
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
-                    .event_format(TraceContextJsonFormatter)
+                    .event_format(formatter.clone())
                     .fmt_fields(JsonFields::new())
                     .with_filter(default_env_filter()),
             )
             .try_init()
             .ok();
+        // No OTel layer here, so this resolves to no trace context — captured
+        // anyway to keep both branches identical.
+        formatter.capture_dispatch();
 
         return Ok(TracingGuard { provider: None });
     }
@@ -405,10 +441,11 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
     // `config/kustomize/base/otel-collector/configmap.yaml`) then
     // lifts those JSON fields into the OTLP log record's dedicated
     // trace context fields, completing the trace ↔ logs correlation.
+    let formatter = TraceContextJsonFormatter::default();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
-                .event_format(TraceContextJsonFormatter)
+                .event_format(formatter.clone())
                 .fmt_fields(JsonFields::new())
                 .with_filter(default_env_filter()),
         )
@@ -419,6 +456,10 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
         )
         .try_init()
         .ok();
+
+    // Must run after `try_init` has installed the subscriber globally: this is
+    // the dispatcher the formatter resolves OTel contexts against.
+    formatter.capture_dispatch();
 
     Ok(TracingGuard {
         provider: Some(tracer_provider),
@@ -638,14 +679,16 @@ mod tests {
     #[test]
     fn formatter_emits_required_keys_for_event_without_span() {
         let writer = BufferWriter::default();
+        let formatter = TraceContextJsonFormatter::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
-                .event_format(TraceContextJsonFormatter)
+                .event_format(formatter.clone())
                 .fmt_fields(JsonFields::new())
                 .with_writer(writer.clone()),
         );
 
         tracing::subscriber::with_default(subscriber, || {
+            formatter.capture_dispatch();
             tracing::info!("hello");
         });
 
@@ -672,14 +715,16 @@ mod tests {
     #[test]
     fn formatter_omits_trace_id_when_no_otel_layer() {
         let writer = BufferWriter::default();
+        let formatter = TraceContextJsonFormatter::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
-                .event_format(TraceContextJsonFormatter)
+                .event_format(formatter.clone())
                 .fmt_fields(JsonFields::new())
                 .with_writer(writer.clone()),
         );
 
         tracing::subscriber::with_default(subscriber, || {
+            formatter.capture_dispatch();
             let span = tracing::info_span!("worker", topic = "logs");
             let _entered = span.enter();
             tracing::info!("flushed");
@@ -714,16 +759,18 @@ mod tests {
             .with_id_generator(RandomIdGenerator::default())
             .build();
         let tracer = provider.tracer("formatter-test");
+        let formatter = TraceContextJsonFormatter::default();
         let subscriber = tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
-                    .event_format(TraceContextJsonFormatter)
+                    .event_format(formatter.clone())
                     .fmt_fields(JsonFields::new())
                     .with_writer(writer.clone()),
             )
             .with(tracing_opentelemetry::layer().with_tracer(tracer));
 
         tracing::subscriber::with_default(subscriber, || {
+            formatter.capture_dispatch();
             let span = tracing::info_span!("request");
             let _entered = span.enter();
             tracing::info!("handled");
