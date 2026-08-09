@@ -15,6 +15,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::MaintainError;
 
+/// Property key marking a table as opted in to snapshot expiration.
+///
+/// Defined here rather than taken from [`TableProperties`]: the iceberg fork
+/// exposed constants for the whole `history.expire.*` family only on the
+/// snapshot-expiration branch. The rev we build against carries just the two
+/// keys the spec defines (`min-snapshots-to-keep`, `max-snapshot-age-ms`), and
+/// these two remain IceGate policy. The strings are the on-disk contract, so
+/// they are spelled out verbatim and asserted by `migrate_integration_test`.
+const PROPERTY_HISTORY_EXPIRE_ENABLED: &str = "history.expire.enabled";
+
+/// Property key naming the snapshot-summary key whose most recent carrier —
+/// and its ancestor chain — expiration must keep reachable. See
+/// [`PROPERTY_HISTORY_EXPIRE_ENABLED`] for why it is defined locally.
+const PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY: &str = "history.expire.preserve-summary-property";
+
 /// Number of newest ancestors of the current snapshot that always survive.
 ///
 /// IceGate does not use time travel, so history exists only to keep the WAL
@@ -87,16 +102,13 @@ impl SnapshotExpirationConfig {
         // so an explicit `false` is what distinguishes a table deliberately
         // opted out from one created before this policy existed.
         let mut properties = HashMap::from([
+            (PROPERTY_HISTORY_EXPIRE_ENABLED.to_string(), self.enabled.to_string()),
             (
-                TableProperties::PROPERTY_HISTORY_EXPIRE_ENABLED.to_string(),
-                self.enabled.to_string(),
-            ),
-            (
-                TableProperties::PROPERTY_HISTORY_EXPIRE_MIN_SNAPSHOTS_TO_KEEP.to_string(),
+                TableProperties::PROPERTY_MIN_SNAPSHOTS_TO_KEEP.to_string(),
                 self.min_snapshots_to_keep.to_string(),
             ),
             (
-                TableProperties::PROPERTY_HISTORY_EXPIRE_MAX_SNAPSHOT_AGE_MS.to_string(),
+                TableProperties::PROPERTY_MAX_SNAPSHOT_AGE_MS.to_string(),
                 self.max_snapshot_age_ms.to_string(),
             ),
             (
@@ -107,7 +119,7 @@ impl SnapshotExpirationConfig {
 
         if let Some(key) = preserved_summary_property {
             properties.insert(
-                TableProperties::PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY.to_string(),
+                PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY.to_string(),
                 key.to_string(),
             );
         }
@@ -154,7 +166,9 @@ mod tests {
     use iceberg::spec::TableProperties;
     use icegate_common::WAL_OFFSET_PROPERTY;
 
-    use super::SnapshotExpirationConfig;
+    use super::{
+        PROPERTY_HISTORY_EXPIRE_ENABLED, PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY, SnapshotExpirationConfig,
+    };
 
     #[test]
     fn defaults_keep_a_hundred_snapshots_for_thirty_minutes() {
@@ -191,15 +205,15 @@ mod tests {
         let properties = SnapshotExpirationConfig::default().build_table_properties(Some(WAL_OFFSET_PROPERTY));
 
         assert_eq!(
-            properties.get(TableProperties::PROPERTY_HISTORY_EXPIRE_ENABLED),
+            properties.get(PROPERTY_HISTORY_EXPIRE_ENABLED),
             Some(&"true".to_string())
         );
         assert_eq!(
-            properties.get(TableProperties::PROPERTY_HISTORY_EXPIRE_MIN_SNAPSHOTS_TO_KEEP),
+            properties.get(TableProperties::PROPERTY_MIN_SNAPSHOTS_TO_KEEP),
             Some(&"100".to_string())
         );
         assert_eq!(
-            properties.get(TableProperties::PROPERTY_HISTORY_EXPIRE_MAX_SNAPSHOT_AGE_MS),
+            properties.get(TableProperties::PROPERTY_MAX_SNAPSHOT_AGE_MS),
             Some(&"1800000".to_string())
         );
         assert_eq!(
@@ -207,7 +221,7 @@ mod tests {
             Some(&"200".to_string())
         );
         assert_eq!(
-            properties.get(TableProperties::PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY),
+            properties.get(PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY),
             Some(&"icegate.queue.offset".to_string())
         );
     }
@@ -220,7 +234,7 @@ mod tests {
         let properties = SnapshotExpirationConfig::default().build_table_properties(None);
 
         assert!(
-            !properties.contains_key(TableProperties::PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY),
+            !properties.contains_key(PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY),
             "a table with no offset-carrying snapshots must not name a preserved summary key"
         );
     }

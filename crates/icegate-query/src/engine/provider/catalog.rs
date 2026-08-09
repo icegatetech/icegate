@@ -5,7 +5,6 @@
 //! merges Iceberg + WAL data for the logs table. Other namespaces use
 //! standard `IcebergSchemaProvider` via `IcebergStaticTableProvider`.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -78,10 +77,6 @@ impl IcegateCatalogProvider {
 }
 
 impl CatalogProvider for IcegateCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
     }
@@ -127,10 +122,6 @@ struct StandardSchemaProvider {
 
 #[async_trait::async_trait]
 impl SchemaProvider for StandardSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables.keys().cloned().collect()
     }

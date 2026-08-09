@@ -193,7 +193,7 @@ async fn write_test_logs_with_metrics(
 
     let batch = build_test_record_batch(table, now_micros)?;
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
 
     let parquet_writer_builder = ParquetWriterBuilder::new(

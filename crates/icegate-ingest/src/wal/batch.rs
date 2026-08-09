@@ -523,6 +523,7 @@ mod tests {
             start_time_unix_nano: 1_000_000,
             end_time_unix_nano: 2_000_000,
             attributes: vec![KeyValue {
+                key_strindex: 0,
                 key: "gen_ai.operation.name".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::StringValue("chat".to_string())),

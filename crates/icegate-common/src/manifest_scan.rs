@@ -165,7 +165,7 @@ pub async fn list_manifest_entries(table: &Table) -> Result<Vec<ManifestFile>> {
         // No committed snapshot yet: nothing to enumerate.
         return Ok(Vec::new());
     };
-    let manifest_list = snapshot.load_manifest_list(table.file_io(), metadata).await?;
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
     Ok(manifest_list.consume_entries().into_iter().collect())
 }
 
@@ -198,7 +198,7 @@ async fn collect_data_file_stats(
     let names = descriptor.column_names();
 
     let file_io = table.file_io();
-    let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
 
     // Build one load+decode future per manifest eagerly, then drive them with a
     // bounded-concurrency, ORDER-PRESERVING `buffered` stream so the flattened

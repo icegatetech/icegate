@@ -389,6 +389,7 @@ mod tests {
 
     fn kv_str(key: &str, value: &str) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::StringValue(value.to_string())),
@@ -398,6 +399,7 @@ mod tests {
 
     fn kv_int(key: &str, value: i64) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::IntValue(value)),
@@ -407,6 +409,7 @@ mod tests {
 
     fn kv_dbl(key: &str, value: f64) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::DoubleValue(value)),
@@ -416,6 +419,7 @@ mod tests {
 
     fn kv_bool(key: &str, value: bool) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::BoolValue(value)),
@@ -507,6 +511,7 @@ mod tests {
                 kv_int("gen_ai.usage.input_tokens", 12),
                 kv_bool("gen_ai.request.stream", true),
                 KeyValue {
+                    key_strindex: 0,
                     key: "gen_ai.response.finish_reasons".to_string(),
                     value: Some(AnyValue {
                         value: Some(Value::ArrayValue(ArrayValue {

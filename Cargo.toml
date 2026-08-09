@@ -56,15 +56,18 @@ icegate-queue = { path = "crates/icegate-queue" }
 # It is not published to a registry, so a version IS a git rev. Pinned to an immutable
 # rev (not a branch) for reproducible builds; bump the SHA deliberately, together with a
 # run of the ingest/maintain integration tests that drive shift and compaction through it.
-jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "d64197ada9d34471374b2ca30c8a0f46de9d568d" }
+jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "19ccaf8e6da4730570738de4e2eafd327c431b2d" }
 
 # Arrow ecosystem (must match iceberg's version)
-arrow = { version = "57.0", default-features = false, features = ["prettyprint"] }
-arrow-flight = { version = "57.0", default-features = false, features = ["flight-sql"] }
-parquet = { version = "57.0", default-features = false, features = ["arrow", "object_store", "zstd"] }
-object_store = { version = "0.12", features = ["aws"] }
-opendal = { version = "0.55", features = ["services-s3", "services-fs", "layers-otel-trace", "layers-otel-metrics"]}
-object_store_opendal = { version = "0.55" }
+arrow = { version = "58.4", default-features = false, features = ["prettyprint"] }
+arrow-flight = { version = "58.4", default-features = false, features = ["flight-sql"] }
+parquet = { version = "58.4", default-features = false, features = ["arrow", "object_store", "zstd"] }
+object_store = { version = "0.13", features = ["aws"] }
+opendal = { version = "0.57", features = ["services-s3", "services-fs", "layers-otel-trace", "layers-otel-metrics"]}
+# Pinned exactly. 0.56/0.57 want object_store ^0.13.1, which is what parquet 58.4
+# uses; 0.58.x moves to opendal 0.58, whose Layer trait was redesigned around
+# `Servicer`/`apply_service` and would require rewriting CacheLayer/PrefetchLayer.
+object_store_opendal = { version = "=0.57.0" }
 foyer = { version = "0.22", features = ["serde"] }
 typetag = "0.2"
 # reqsign is a transitive dep of iceberg-storage-opendal; `reqwest_request` and
@@ -86,17 +89,21 @@ antlr4rust = "0.5"
 # Sourced from the icegatetech/iceberg-rust fork (0.9.0 base).
 # Pinned to an immutable rev (not a branch) for reproducible builds; bump the SHA
 # deliberately when adopting fork updates rather than letting `develop` float.
-iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
-iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
-iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
-iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
-iceberg-storage-opendal = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c", features = ["opendal-s3"] }
-iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c3183a49e97d7d11500cce2b655b3317febe088c" }
+iceberg = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c169cf64a4e4eaf8e6ce4312f2de87fb762a4614" }
+iceberg-catalog-rest = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c169cf64a4e4eaf8e6ce4312f2de87fb762a4614" }
+iceberg-catalog-s3tables = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c169cf64a4e4eaf8e6ce4312f2de87fb762a4614" }
+iceberg-catalog-glue = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c169cf64a4e4eaf8e6ce4312f2de87fb762a4614" }
+iceberg-storage-opendal = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c169cf64a4e4eaf8e6ce4312f2de87fb762a4614", features = ["opendal-s3"] }
+iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev = "c169cf64a4e4eaf8e6ce4312f2de87fb762a4614" }
 
 # DataFusion
-datafusion = "52.2"
-datafusion-tracing = "52.0"
-datafusion-flight-sql-server = "=0.4.15"
+datafusion = "54.1"
+datafusion-tracing = "54.0"
+# 0.4.15 builds against datafusion 52 / arrow-flight 57, which no longer unify
+# with the pins above (SQLOptions, SessionState and the FlightSqlService trait all
+# came out as distinct types). 0.4.18 targets datafusion ^54 / arrow-flight ^58.3,
+# and dropping the 52 subtree also removes the second object_store from the graph.
+datafusion-flight-sql-server = "=0.4.18"
 
 # Async runtime
 tokio = { version = "1.48.0", features = ["full", "tracing"] }
@@ -123,17 +130,19 @@ tonic = "0.14"
 prost = "0.14"
 
 # OpenTelemetry proto (with tonic service generation)
-opentelemetry-instrumentation-tokio = "0.1"
-opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic", "logs", "trace", "metrics"] }
-opentelemetry-resource-detectors = "0.10"
-opentelemetry = { version = "0.31.0", features = ["metrics", "trace"] }
-opentelemetry_sdk = { version = "0.31.0", features = ["metrics", "trace", "rt-tokio", "spec_unstable_metrics_views"] }
-opentelemetry-prometheus = "0.31.0"
+# The OpenTelemetry stack moves as a unit, and opendal 0.57's otel layers build
+# against opentelemetry 0.32 — so bumping opendal drags the whole set with it.
+opentelemetry-instrumentation-tokio = "0.2"
+opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "logs", "trace", "metrics"] }
+opentelemetry-resource-detectors = "0.11"
+opentelemetry = { version = "0.32.0", features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "trace", "rt-tokio", "spec_unstable_metrics_views"] }
+opentelemetry-prometheus = "0.32.0"
 prometheus = "0.14.0"
 
 # OpenTelemetry tracing integration
-tracing-opentelemetry = "0.32.1"
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33.0"
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "trace"] }
 
 # Logging
 tracing = "0.1"
@@ -164,3 +173,4 @@ testcontainers = { version = "0.27", features = ["http_wait"] }
 aws-config = "1.8"
 aws-sdk-s3 = "1.127"
 criterion = "0.8.2"
+

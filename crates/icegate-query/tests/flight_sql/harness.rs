@@ -411,7 +411,7 @@ async fn commit_data_file(
     batch: RecordBatch,
     file_suffix: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(file_suffix.to_string(), None, DataFileFormat::Parquet);
     let parquet_writer_builder = ParquetWriterBuilder::new(
         WriterProperties::builder().build(),

@@ -57,6 +57,7 @@ mod tests {
 
     fn kv_str(key: &str, value: &str) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::StringValue(value.to_string())),

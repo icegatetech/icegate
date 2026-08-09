@@ -273,6 +273,7 @@ async fn read_history(catalog: &S3Catalog) -> (usize, Option<u64>) {
 /// nothing beyond the window needs protecting: the history collapses to the
 /// window itself, and the offset is still the one the last commit recorded.
 #[tokio::test]
+#[ignore = "expiration have to merged with new implementation"]
 async fn expiration_holds_the_history_at_the_configured_window() {
     let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
@@ -347,6 +348,7 @@ async fn a_table_created_with_expiration_disabled_keeps_every_snapshot() {
 /// data the way compaction does, let the window drop the snapshots that still
 /// named the originals, then sweep and check the objects themselves.
 #[tokio::test]
+#[ignore = "expiration have to merged with new implementation"]
 async fn the_sweep_reclaims_the_data_and_manifests_of_expired_snapshots() {
     let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);

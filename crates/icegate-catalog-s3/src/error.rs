@@ -339,7 +339,10 @@ mod tests {
     fn object_store_unhandled_variant_maps_to_io() {
         // Any variant outside the explicit arms falls through to a non-retryable
         // I/O error; `NotImplemented` stands in for that catch-all.
-        let storage = StorageError::from(object_store::Error::NotImplemented);
+        let storage = StorageError::from(object_store::Error::NotImplemented {
+            operation: "test_operation".to_string(),
+            implementer: "test_implementer".to_string(),
+        });
 
         assert!(matches!(storage, StorageError::Io(_)));
         assert!(!storage.is_retryable());

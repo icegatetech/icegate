@@ -44,7 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Execute command
-    if let Err(e) = cli.execute().await {
+    // Boxed: the command future grew past clippy's `large_futures` threshold as
+    // subcommands were added. One allocation at process start, so keeping it off
+    // the stack costs nothing measurable.
+    if let Err(e) = Box::pin(cli.execute()).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }

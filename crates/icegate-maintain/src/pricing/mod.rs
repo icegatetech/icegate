@@ -728,6 +728,10 @@ mod tests {
             unreachable!("catalog must not be touched before config validation")
         }
 
+        async fn purge_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            unreachable!("catalog must not be touched before config validation")
+        }
+
         async fn table_exists(&self, _table: &iceberg::TableIdent) -> iceberg::Result<bool> {
             unreachable!("catalog must not be touched before config validation")
         }

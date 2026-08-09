@@ -434,6 +434,10 @@ impl Catalog for CapturingCatalog {
         unreachable!("not used in commit capture")
     }
 
+    async fn purge_table(&self, _table: &TableIdent) -> IcebergResult<()> {
+        unreachable!("not used in commit capture")
+    }
+
     async fn table_exists(&self, _table: &TableIdent) -> IcebergResult<bool> {
         unreachable!("not used in commit capture")
     }

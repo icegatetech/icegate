@@ -594,6 +594,7 @@ mod tests {
             resource_spans: vec![ResourceSpans {
                 resource: Some(Resource {
                     attributes: vec![KeyValue {
+                        key_strindex: 0,
                         key: "service.name".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::StringValue("svc".to_string())),
@@ -732,12 +733,14 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![
                         KeyValue {
+                            key_strindex: 0,
                             key: "service.name".to_string(),
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue("svc".to_string())),
                             }),
                         },
                         KeyValue {
+                            key_strindex: 0,
                             key: "cloud.account.id".to_string(),
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue("acc-1".to_string())),
@@ -759,6 +762,7 @@ mod tests {
                         start_time_unix_nano: 1,
                         end_time_unix_nano: 2,
                         attributes: vec![KeyValue {
+                            key_strindex: 0,
                             key: "http.method".to_string(),
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue("GET".to_string())),
@@ -852,6 +856,7 @@ mod tests {
                             time_unix_nano: 1_500,
                             name: "cache.hit".to_string(),
                             attributes: vec![KeyValue {
+                                key_strindex: 0,
                                 key: "db.system".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(Value::StringValue("postgres".to_string())),
@@ -1007,6 +1012,7 @@ mod tests {
 
         fn kv(k: &str, v: &str) -> KeyValue {
             KeyValue {
+                key_strindex: 0,
                 key: k.to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::StringValue(v.to_string())),

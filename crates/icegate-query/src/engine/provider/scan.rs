@@ -9,7 +9,6 @@
 //! - `metrics()` override that returns actual metrics (upstream returns `None`)
 //! - Metrics tracking via `ExecutionPlanMetricsSet`
 
-use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -50,7 +49,10 @@ pub(super) struct IcegateIcebergScan {
     /// Snapshot to scan (None = current).
     snapshot_id: Option<i64>,
     /// Pre-computed plan properties for DataFusion optimizer.
-    plan_properties: PlanProperties,
+    ///
+    /// `Arc` because DataFusion 54's `ExecutionPlan::properties` hands back
+    /// `&Arc<PlanProperties>` rather than `&PlanProperties`.
+    plan_properties: Arc<PlanProperties>,
     /// Projection column names, None means all columns.
     projection: Option<Vec<String>>,
     /// Iceberg predicates pushed down to the scan.
@@ -88,7 +90,7 @@ impl IcegateIcebergScan {
                 (projected, Some(names))
             }
         };
-        let plan_properties = Self::compute_properties(output_schema);
+        let plan_properties = Arc::new(Self::compute_properties(output_schema));
         let predicates = convert_filters_to_predicate(filters);
 
         Ok(Self {
@@ -117,10 +119,6 @@ impl ExecutionPlan for IcegateIcebergScan {
         "IcegateIcebergScan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]
     }
@@ -129,7 +127,7 @@ impl ExecutionPlan for IcegateIcebergScan {
         Ok(self)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

@@ -153,7 +153,7 @@ fn empty_string_map(arrow_schema: &ArrowSchema, rows: usize) -> Arc<dyn Array> {
 async fn write_one_file(table: &Table, batch: RecordBatch) -> DataFile {
     let metadata = table.metadata().clone();
     let file_io = table.file_io().clone();
-    let location_generator = DefaultLocationGenerator::new(metadata.clone()).unwrap();
+    let location_generator = DefaultLocationGenerator::new(&metadata).unwrap();
     let file_name_generator = DefaultFileNameGenerator::new(Uuid::now_v7().to_string(), None, DataFileFormat::Parquet);
     let parquet_builder =
         ParquetWriterBuilder::new(WriterProperties::builder().build(), metadata.current_schema().clone());

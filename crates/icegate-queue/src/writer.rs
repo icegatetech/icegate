@@ -9,7 +9,7 @@ use std::{
 use bytes::Bytes;
 use futures::{StreamExt, future::join_all};
 use icegate_common::parquet_writer::ColumnEncoding;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path};
 use parquet::{
     arrow::ArrowWriter,
     file::{
@@ -457,7 +457,7 @@ impl QueueWriter {
         let mut builder = WriterProperties::builder()
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_compression(compression)
-            .set_max_row_group_size(max_row_group_size)
+            .set_max_row_group_row_count(Some(max_row_group_size))
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_key_value_metadata(key_value_metadata);
 
@@ -873,7 +873,7 @@ const fn object_store_error_reason(error: &object_store::Error) -> &'static str 
         object_store::Error::NotFound { .. } => "not_found",
         object_store::Error::PermissionDenied { .. } => "permission_denied",
         object_store::Error::Unauthenticated { .. } => "unauthenticated",
-        object_store::Error::NotImplemented => "not_implemented",
+        object_store::Error::NotImplemented { .. } => "not_implemented",
         _ => "other",
     }
 }

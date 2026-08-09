@@ -1,6 +1,6 @@
 //! Map insertion UDF for adding/updating key-value pairs in maps.
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::{
     arrow::{
@@ -49,10 +49,6 @@ impl MapInsert {
 }
 
 impl ScalarUDFImpl for MapInsert {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "map_insert"
     }

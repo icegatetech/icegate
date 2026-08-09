@@ -4,7 +4,6 @@
 //! [`IcegateTableProvider`] (merged Iceberg + WAL) while delegating other
 //! tables to the standard `IcebergStaticTableProvider`.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -181,10 +180,6 @@ impl IcegateSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for IcegateSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables.keys().cloned().collect()
     }

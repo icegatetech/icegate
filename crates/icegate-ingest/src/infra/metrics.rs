@@ -11,8 +11,8 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use icegate_queue::{QueueWriterEvents, WriteBatchOutcome};
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
 };
 use opentelemetry::{
     KeyValue,
@@ -787,8 +787,15 @@ impl<M: S3RequestMetrics> ObjectStore for ObjectStoreMetricsDecorator<M> {
         outcome
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.inner.delete(location).await
+    // object_store 0.13 moved the single-item `delete`/`copy`/`copy_if_not_exists`
+    // helpers into the blanket `ObjectStoreExt` trait; implementors now provide
+    // `delete_stream` and `copy_opts` instead. Both were plain delegation here
+    // (only put/get/list are instrumented), so they stay plain delegation.
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -812,12 +819,8 @@ impl<M: S3RequestMetrics> ObjectStore for ObjectStoreMetricsDecorator<M> {
         outcome
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -1414,8 +1417,8 @@ mod tests {
     use futures::StreamExt;
     use icegate_queue::{ParquetQueueReader, Topic};
     use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
+        PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
     };
     use opentelemetry::KeyValue;
     use opentelemetry_sdk::metrics::{
@@ -1481,8 +1484,11 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
         }
 
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -1518,12 +1524,8 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

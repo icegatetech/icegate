@@ -1,6 +1,6 @@
 //! Array intersection UDAF for LogQL `absent_over_time` operations.
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::{
     arrow::{
@@ -63,10 +63,6 @@ impl ArrayIntersectAgg {
 }
 
 impl AggregateUDFImpl for ArrayIntersectAgg {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "array_intersect_agg"
     }

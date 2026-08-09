@@ -11,7 +11,7 @@ use iceberg::{
     arrow::ArrowFileReader,
     spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType, NestedFieldRef,
-        PrimitiveType, Schema, SchemaVisitor, Struct, StructType, Type, visit_schema,
+        PrimitiveType, Schema, SchemaVisitor, Struct, StructType, Type, VariantType, visit_schema,
     },
     table::Table,
 };
@@ -273,6 +273,15 @@ impl SchemaVisitor for ParquetPathVisitor {
     }
 
     fn primitive(&mut self, _p: &PrimitiveType) -> std::result::Result<Self::T, iceberg::Error> {
+        let full_name = self.field_names.join(".");
+        self.path_to_id.insert(full_name, self.current_field_id);
+        Ok(())
+    }
+
+    // Required since the iceberg bump added `VariantType`. A variant terminates
+    // the schema walk the same way a primitive does, so it maps its accumulated
+    // path to the current field id identically.
+    fn variant(&mut self, _v: &VariantType) -> std::result::Result<Self::T, iceberg::Error> {
         let full_name = self.field_names.join(".");
         self.path_to_id.insert(full_name, self.current_field_id);
         Ok(())

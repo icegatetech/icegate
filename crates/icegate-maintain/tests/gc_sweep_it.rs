@@ -37,7 +37,7 @@ use icegate_common::testing::create_s3_object_store;
 use icegate_maintain::gc::config::GcOrphansConfig;
 use icegate_maintain::gc::metrics::GcMetrics;
 use icegate_maintain::gc::sweep::run_sweep;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use tokio_util::sync::CancellationToken;
 

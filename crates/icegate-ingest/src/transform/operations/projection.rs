@@ -743,6 +743,7 @@ mod tests {
     /// Build a string-valued OTLP `KeyValue` for tests.
     fn kv_str(key: &str, value: &str) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::StringValue(value.to_string())),
@@ -753,6 +754,7 @@ mod tests {
     /// Build an OTLP `KeyValue` with an int value.
     fn kv_int(key: &str, value: i64) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::IntValue(value)),
@@ -763,6 +765,7 @@ mod tests {
     /// Build an OTLP `KeyValue` with a double value.
     fn kv_dbl(key: &str, value: f64) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::DoubleValue(value)),
@@ -834,6 +837,7 @@ mod tests {
     fn attribute_view_skips_keys_with_no_value() {
         // A KeyValue whose value is None must not register as present.
         let attrs = vec![KeyValue {
+            key_strindex: 0,
             key: "gen_ai.system".to_string(),
             value: None,
         }];
@@ -939,6 +943,7 @@ mod tests {
             kv_int("gen_ai.usage.input_tokens", 12),
             kv_int("gen_ai.usage.output_tokens", 34),
             KeyValue {
+                key_strindex: 0,
                 key: "gen_ai.response.finish_reasons".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::ArrayValue(ArrayValue {
@@ -994,6 +999,7 @@ mod tests {
             kv_int("gen_ai.usage.prompt_tokens", 5),
             kv_int("gen_ai.usage.completion_tokens", 9),
             KeyValue {
+                key_strindex: 0,
                 key: "gen_ai.is_streaming".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::BoolValue(true)),

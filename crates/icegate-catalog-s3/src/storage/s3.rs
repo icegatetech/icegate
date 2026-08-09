@@ -70,7 +70,7 @@ impl S3CatalogStorage {
             Path::from_iter([warehouse.as_str(), CATALOG_SEGMENT])
         };
 
-        let root_path = catalog_prefix.child(root_codec.root_filename());
+        let root_path = catalog_prefix.join(root_codec.root_filename());
 
         Ok(Self {
             store,

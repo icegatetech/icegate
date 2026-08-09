@@ -60,7 +60,6 @@
 //! `tenant_id` are both non-nullable strings. Requesting ascending order
 //! leaves no provider anything to reorder.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -101,10 +100,6 @@ impl TenantScopedCatalogProvider {
 }
 
 impl CatalogProvider for TenantScopedCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.inner.schema_names()
     }
@@ -130,10 +125,6 @@ struct TenantScopedSchemaProvider {
 impl SchemaProvider for TenantScopedSchemaProvider {
     fn owner_name(&self) -> Option<&str> {
         self.inner.owner_name()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn table_names(&self) -> Vec<String> {
@@ -268,10 +259,6 @@ impl TenantScopedTableProvider {
 
 #[async_trait]
 impl TableProvider for TenantScopedTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.filtered_schema)
     }
@@ -384,7 +371,6 @@ impl TableProvider for TenantScopedTableProvider {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::any::Any;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -536,10 +522,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for SchemaOrderTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }

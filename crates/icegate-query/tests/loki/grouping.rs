@@ -227,7 +227,7 @@ async fn write_grouping_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> 
 
     let batch = build_grouping_test_record_batch(table, now_micros)?;
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
@@ -560,7 +560,7 @@ async fn write_binary_grouping_test_logs(
 
     let batch = build_binary_grouping_test_batch(table, now_micros)?;
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(unique_suffix, None, DataFileFormat::Parquet);
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
