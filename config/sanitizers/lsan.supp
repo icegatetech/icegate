@@ -5,93 +5,81 @@
 #   2. No entry may match a frame inside icegate_* — suppressing our own code
 #      defeats the point of the target.
 #
-# Rule 2 currently has THREE documented exceptions, all recorded on 2026-08-05
-# from the first real `make sanitize-leak` run. They exist so the nightly job
-# produces an actionable signal while known defects are investigated — not
-# because the leaks are benign. Two of them are on production code paths.
+# Rule 2 currently has ONE documented exception, and it is TEST SCAFFOLDING.
+# There is no longer a first-party production-path suppression in this file, and
+# adding one back needs the dated accounting described at the bottom of this
+# header — not a pattern and a paragraph.
 #
-# Suppressed volume, final green run: 434,699 bytes across 9,930 allocations
-# (9,578 create_operator + 114 create_*_store + 110 TestServer::start
-# + 20 build_state + 108 apache_avro). That number is the honest cost of this
-# file: a green run means "no NEW leaks", not "no leaks".
+# TWO first-party production entries were deleted rather than corrected, both for
+# the same reason: each was written against a pre-#174 tree and cited code that no
+# longer existed by the time this file was committed at 066fa48.
 #
-# Per-entry counts below are from the run that first identified each leak, so
-# they differ from the totals above by ~1%. That much drift between runs is
-# normal; a larger change is worth investigating.
+#   * create_operator, which built a fresh opendal S3 backend per file operation
+#     (~9,578 of the original baseline's 9,930 allocations). #174 replaced it with
+#     `storage::registry::OperatorRegistry`, which builds one operator per
+#     identity and shares it. The entry was dead on arrival: at 066fa48,
+#     `git grep create_operator` matched only this file.
+#   * create_object_store / create_s3_store, cited at builder.rs:213 and :53 with
+#     5,080 bytes / 115 allocations in gc_sweep_it. Neither symbol exists in the
+#     tree, and builder.rs is 53 lines holding only create_local_store and
+#     create_memory_store — #174 moved S3 object stores onto the cached operator
+#     (registry.rs:223). Its `create_*_store` glob did still match the two
+#     local/memory functions, whose volume has never been measured; deleting it
+#     lets the first full nightly say whether they leak at all, instead of
+#     answering that question with a stale figure.
 #
-# Every first-party entry must be deleted as its defect is fixed, and adding a
-# fourth EXCEPTION needs the same dated accounting — otherwise this target
-# quietly becomes a rubber stamp. (Three exceptions, four first-party patterns:
-# Exception 3 needs two anchors to cover its five call sites.)
+# The whole-suite total those figures fed is gone with them. No current total
+# replaces it, deliberately: the only scheduled run to date (2026-08-09, on
+# 066fa48) aborted inside `icegate-common --lib` before `--no-fail-fast` was added
+# to scripts/sanitize.sh, having run 2 of the workspace's test binaries. Every
+# icegate-query target was skipped, so EXCEPTION 1's two patterns and the
+# apache_avro entry were not exercised at all, and their figures below are still
+# the 2026-08-05 pre-#174 measurements. Re-measure across a full run before
+# writing a total back, and treat those three numbers as unverified until then.
+#
+# That run was red on 2,608 bytes / 46 allocations that nothing here matched.
+# The last two THIRD-PARTY entries in this file now cover exactly those 46 — no
+# more and no fewer, verified by `print_suppressions=1` reporting 36 + 10
+# hits — which is why the file grew rather than the code changing. Measured 2026-08-09 by
+# running the instrumented `icegate-common --lib` binary under three option sets
+# (aarch64: 2,608 bytes / 46 allocations; CI's x86_64: 2,448 / 46 — so the defect
+# is not architecture-specific):
+#
+#   * NO suppression here matches any of it. `print_suppressions=1` prints no
+#     "Suppressions used" table at all, and the totals with this file, with an
+#     empty file, and with CI's exact options agree to within one allocation.
+#   * There are ZERO Direct leaks even with suppressions disabled entirely. That
+#     rules out a suppressed root and means a reference cycle: every leaked block
+#     is reachable from another leaked block.
+#   * Every leaked object is third-party — 17 opentelemetry NoopSyncInstrument,
+#     17 opentelemetry_sdk ResolvedMeasures, plus opendal AccessorInfo /
+#     MetricsHttpFetcher / TokioExecutor and reqwest Client. Not one first-party
+#     allocation is in the set; first-party frames are call sites only, dominated
+#     by the OtelMetricsLayer registration at layers.rs:118 (once per registry)
+#     and the AccessorInfo built under registry.rs:265.
+#   * It is gated on a configured meter — no meter, no instruments, no leak — and
+#     bounded by registry count, not by traffic. It is NOT the per-operation
+#     shape that made the create_operator leak alarming.
+#
+# So it belongs with apache_avro as upstream retention rather than as a
+# first-party EXCEPTION, and that is where it is recorded — two entries, because
+# no single anchor covers both halves: the instrument/fetcher half always carries
+# an `opendal_layer_otelmetrics` frame and the AccessorInfo half never does. The
+# wide anchors (*opentelemetry_sdk*, *opendal*) were rejected for the reason the
+# deleted create_operator entry gave: they suppress those libraries across the
+# whole workspace. Breaking the cycle upstream retires both entries.
+#
+# What a green run means is unchanged: "no NEW leaks", not "no leaks".
+#
+# Every first-party entry must be deleted as its defect is fixed — both deletions
+# above are that rule being applied late, and the lesson is that an entry outlives
+# the code it names silently. Adding a SECOND exception needs measurement from a
+# full run on the current tree, naming the run, or this target quietly becomes a
+# rubber stamp. (One exception, two first-party patterns: EXCEPTION 1 needs two
+# anchors to cover its six call sites.)
 
 # ===========================================================================
-# EXCEPTION 1 — PRODUCTION PATH. Largest single source by two orders of
-# magnitude. Suppressed to keep the signal usable, NOT benign.
-#
-# IceGateStorage::create_operator (crates/icegate-common/src/storage/icegate_storage.rs:143)
-# builds a brand-new opendal S3 backend on every call — and with it a new
-# AccessorInfo, HTTP client, and connection pool. It is called once per Iceberg
-# file operation through IceGateStorage::write / read / metadata.
-#
-# Measured whole-suite: 9,505 allocations / 422,712 bytes.
-# Scales with file-operation count: 67 allocations across the 3 operations in
-# icegate_common::catalog::builder::tests::s3_catalog_file_io_reads_with_explicit_credentials
-# (catalog/builder.rs:502/:505/:506), rising to 270 in manifest_scan_it — roughly 22 per
-# operation.
-#
-# The same function already hoists the cache layer out of the per-call path (see
-# the comment at icegate_storage.rs:184) because it runs hot. The S3 backend
-# itself was not given that treatment.
-#
-# Reports are Indirect with no Direct root, which points at a structure owned
-# inside opendal/reqwest rather than a Box of ours — a lead, not a diagnosis.
-#
-# BLAST RADIUS — read before trusting a green run. LSan matches if ANY frame in
-# the allocation stack matches, so this suppresses everything allocated anywhere
-# beneath create_operator (icegate_storage.rs:99), which is reached from all
-# eight FileIO call sites (:210-:253), not only the three named above. That
-# subtree also constructs OtelTraceLayer (:178), OtelMetricsLayer (:181), the
-# CacheLayer clone (:187), and PrefetchLayer/PrefetchMetrics (:196) — a new leak
-# in any of those would be swallowed by this entry.
-#
-# An `*opendal*` or `*reqwest*` anchor was considered and rejected as WIDER, not
-# narrower: it would suppress those libraries everywhere in the workspace, while
-# this pattern is at least confined to allocations under our own call.
-#
-# TODO(icegate): a per-operation leak on the Iceberg write path matches the
-# shape of the ingest and maintain OOM incidents. Delete this entry with the fix.
-leak:*IceGateStorage*create_operator*
-
-# ===========================================================================
-# EXCEPTION 2 — PRODUCTION PATH. Same shape of defect as Exception 1, but a
-# different code path and a different object-store abstraction (`object_store`
-# rather than `opendal`), so it is a second bug, not the same one seen twice.
-#
-# icegate_common::storage::builder::create_object_store
-# (crates/icegate-common/src/storage/builder.rs:213) leaks when constructing an
-# S3 store. Observed via icegate_maintain::gc::sweep::run_sweep — the GC orphan
-# sweep, which runs on a timer in the maintain service.
-#
-# The pattern deliberately matches create_s3_store as well. Today that function
-# (builder.rs:53) is only reached through create_object_store, so either anchor
-# would work — but it is `pub`, so a future direct caller would otherwise surface
-# this same leak as a brand-new failure with nothing pointing back here.
-#
-# Measured: 5,080 bytes / 115 allocations in icegate-maintain's gc_sweep_it.
-#
-# BLAST RADIUS. The `create_*_store` glob also matches two further `pub` functions
-# in the same module — create_local_store (builder.rs:174) and create_memory_store
-# (builder.rs:190) — both reached through create_object_store and both used
-# pervasively by the suite. A future leak under either would be swallowed here.
-# Narrow to *create_object_store* plus *create_s3_store* if that becomes a concern.
-#
-# TODO(icegate): investigate together with Exception 1 — a shared root cause in
-# how S3 clients are constructed per call is the obvious hypothesis. Delete this
-# entry with the fix.
-leak:*storage::builder::create_*_store*
-
-# ===========================================================================
-# EXCEPTION 3 — TEST SCAFFOLDING, not shipped code. A deliberate `Box::leak`,
+# EXCEPTION 1 — TEST SCAFFOLDING, not shipped code. A deliberate `Box::leak`,
 # repeated as an idiom in six places, all in icegate-query:
 #
 #   crates/icegate-query/tests/loki/harness.rs:141    TestServer::start
@@ -144,8 +132,13 @@ leak:*harness::TestServer*start*
 leak:*routes::tests::build_state*
 
 # ===========================================================================
-# THIRD-PARTY — the only entry that satisfies rule 1 as originally written.
+# THIRD-PARTY — entries that satisfy rule 1 as originally written: each names the
+# library and why the allocation is not ours. The header's "delete each entry as
+# its defect is fixed" rule applies to the first-party EXCEPTION above, not to
+# these three; they retire when upstream stops retaining, which is why each
+# carries a retirement condition instead of a TODO.
 #
+# ---------------------------------------------------------------------------
 # apache-avro, reached through the iceberg fork's Avro value serialization
 # (iceberg::spec::values::serde::Record::serialize). The leaked blocks are
 # String clones the serializer retains for the life of the process; no
@@ -153,8 +146,70 @@ leak:*routes::tests::build_state*
 #
 # Measured whole-suite: 108 allocations / 1,188 bytes.
 #
-# No retirement TODO, deliberately: this is upstream retention we do not
-# control, so the header's "delete each entry as its defect is fixed" rule
-# applies to the three first-party exceptions, not to this one. It retires
-# only if the iceberg fork stops serializing through apache-avro.
+# Retires only if the iceberg fork stops serializing through apache-avro.
 leak:*apache_avro*
+
+# ---------------------------------------------------------------------------
+# opendal's OpenTelemetry metrics bridge, plus the OTel instruments it registers.
+#
+# `OtelMetricsLayer::builder().register(meter)` — called once per registry at
+# storage/layers.rs:118 — registers opendal's instrument set against the meter,
+# and applying the layer swaps the accessor's HTTP client for a
+# MetricsHttpFetcher. None of it is released at exit, and with ALL suppressions
+# disabled LSan still reports every block Indirect with ZERO Direct roots: the
+# retention is a reference cycle inside the OTel/opendal object graph, not a Box
+# of ours that went missing. No first-party allocation is in the set; the
+# first-party frames are call sites.
+#
+# Measured 2026-08-09, `icegate-common --lib`: 36 of that binary's 46
+# allocations, 1,576 of its 2,608 bytes —
+#     17 x  40 B  opentelemetry_sdk ResolvedMeasures<f64|u64|i64>
+#     17 x  16 B  opentelemetry NoopSyncInstrument
+#      2 x 312 B  MetricsHttpFetcher<OtelMetricsInterceptor>
+#
+# Why this is safe to suppress where create_operator was not: it is gated on a
+# configured meter (no meter, no instruments, no leak — so every IoHandle::noop()
+# caller is unaffected) and bounded by REGISTRY count, not by request or
+# file-operation count. One registry per IoHandle, and IoHandle is built once per
+# service at startup (catalog/builder.rs:72/:76). create_operator scaled with
+# every Iceberg file operation; this does not scale at all.
+#
+# BLAST RADIUS. Anchored on the bridge crate, whose entire job is this one layer,
+# so what it can hide is a different leak in the same bridge. Deliberately NOT
+# *opentelemetry_sdk* or *opendal*: either would suppress those libraries across
+# the whole workspace, including the query engine's own metrics and every opendal
+# I/O path.
+#
+# Retires when opendal breaks the cycle, or when the layer stops replacing the
+# accessor's HTTP client. Re-measure rather than trusting the figures above.
+leak:*opendal_layer_otelmetrics*
+
+# ---------------------------------------------------------------------------
+# opendal's S3 backend construction — the other half of the same cycle.
+#
+# `S3Builder::build` allocates the backend's AccessorInfo, its reqwest client and
+# a TokioExecutor, reached through storage/registry.rs:265. A separate entry
+# because these stacks carry no `opendal_layer_otelmetrics` frame, so the entry
+# above cannot cover them.
+#
+# Measured 2026-08-09, `icegate-common --lib`: the remaining 10 of 46
+# allocations, 1,032 of 2,608 bytes —
+#      2 x 416 B  opendal_core AccessorInfo
+#      5 x  24 B  opendal-core / opendal-service-s3 backend internals
+#      2 x  16 B  as above
+#      1 x  48 B  as above
+#
+# One set per operator built, and operators are cached: the registry keys them by
+# credentials plus bucket and never evicts, warning once past
+# OPERATOR_WARN_THRESHOLD (storage/registry.rs). Bounded by distinct
+# credential/bucket pairs per process, not by traffic.
+#
+# BLAST RADIUS. Anchored on the builder's `build`, so it covers operator
+# CONSTRUCTION only — a leak in an S3 read, write, list, or stat carries no
+# S3Builder frame and still fails the run. The crate is named in the pattern
+# deliberately: a bare *S3Builder*build* would also match `object_store`'s
+# AmazonS3Builder, which icegate-catalog-s3 uses for an unrelated store
+# (storage/s3.rs:38) and icegate-common's own test helpers use as well.
+#
+# Retires with the cycle upstream, or if opendal stops retaining AccessorInfo.
+leak:*opendal_service_s3::backend::S3Builder*build*
