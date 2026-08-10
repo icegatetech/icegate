@@ -456,11 +456,12 @@ async fn run_services(
     let shift_metrics = metrics_runtime.as_ref().map_or_else(ShiftMetrics::new_disabled, |runtime| {
         ShiftMetrics::new(&runtime.meter())
     });
-    let jobsmanager_metrics = metrics_runtime
-        .as_ref()
-        .map_or_else(jobmanager::Metrics::new_disabled, |runtime| {
-            jobmanager::Metrics::new(&runtime.meter())
-        });
+    // Without a metrics runtime there is no meter to record into, so the pool is handed the
+    // crate's no-op sink rather than instruments nothing collects.
+    let jobsmanager_metrics: Arc<dyn jobmanager::MetricsSink> = metrics_runtime.as_ref().map_or_else(
+        || Arc::new(jobmanager::NoopMetrics) as Arc<dyn jobmanager::MetricsSink>,
+        |runtime| Arc::new(jobmanager::OtelMetrics::new(&runtime.meter())),
+    );
     let otlp_metrics = metrics_runtime
         .as_ref()
         .map_or_else(OtlpMetrics::new_disabled, |runtime| OtlpMetrics::new(&runtime.meter()));

@@ -16,18 +16,16 @@ pub mod reachable;
 /// The orphan-file sweep: list, diff against the referenced set, and delete.
 pub mod sweep;
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Duration as ChronoDuration;
+use async_trait::async_trait;
 use iceberg::Catalog;
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, OperatorRegistry, SPANS_TABLE};
 use jobmanager::{
-    CachedStorage, Error as JobError, ImmutableTask, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionRegistry,
-    JobManager, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage,
-    TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    Error as JobError, JobsManager, JobsManagerHandle, OtelMetrics, TaskCode, TaskContext, TaskDefinition,
+    TaskExecutor, TaskOutcome, TaskResult,
 };
-use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
 
 use crate::error::{MaintainError, Result};
@@ -95,24 +93,14 @@ struct GcExecutor {
 }
 
 impl GcExecutor {
-    async fn run(
-        &self,
-        task: &dyn ImmutableTask,
-        manager: &dyn JobManager,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<(), JobError> {
+    async fn run(&self, ctx: &TaskContext) -> std::result::Result<TaskOutcome, JobError> {
         let span = info_span!("gc_sweep", table = self.table);
-        self.run_sweep_task(task, manager, cancel).instrument(span).await
+        self.run_sweep_task(ctx).instrument(span).await
     }
 
-    async fn run_sweep_task(
-        &self,
-        task: &dyn ImmutableTask,
-        manager: &dyn JobManager,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<(), JobError> {
+    async fn run_sweep_task(&self, ctx: &TaskContext) -> std::result::Result<TaskOutcome, JobError> {
         if !self.orphans.enabled {
-            return manager.complete_task(task.id(), Vec::new());
+            return Ok(TaskOutcome::empty());
         }
         let start = std::time::Instant::now();
         let now = chrono::Utc::now();
@@ -123,10 +111,10 @@ impl GcExecutor {
             &self.orphans,
             now,
             &self.metrics,
-            cancel,
+            ctx.cancel_token(),
         )
         .await
-        .map_err(|e| JobError::TaskExecution(format!("gc sweep of table '{}' failed: {e}", self.table)))?;
+        .map_err(|e| JobError::Other(format!("gc sweep of table '{}' failed: {e}", self.table)))?;
         self.metrics.record_duration(self.table, start.elapsed().as_secs_f64());
         tracing::info!(
             table = self.table,
@@ -136,16 +124,15 @@ impl GcExecutor {
             dry_run = self.orphans.dry_run,
             "gc sweep complete"
         );
-        manager.complete_task(task.id(), Vec::new())
+        Ok(TaskOutcome::empty())
     }
 }
 
-/// Wrap a [`GcExecutor`] as a jobmanager [`TaskExecutorFn`].
-fn gc_executor_fn(executor: Arc<GcExecutor>) -> TaskExecutorFn {
-    Arc::new(move |task, manager, cancel| {
-        let executor = Arc::clone(&executor);
-        Box::pin(async move { executor.run(task.as_ref(), manager, &cancel).await })
-    })
+#[async_trait]
+impl TaskExecutor for GcExecutor {
+    async fn execute(&self, ctx: TaskContext) -> TaskResult {
+        Ok(self.run(&ctx).await?)
+    }
 }
 
 /// Runs orphan-file garbage collection inside the maintain process.
@@ -199,15 +186,23 @@ impl GcRunner {
             ));
         }
 
-        let interval_secs = i64::try_from(config.jobsmanager.scan_interval_secs)
-            .map_err(|_| MaintainError::Config("gc.jobsmanager.scan_interval_secs is too large".to_string()))?;
-        let interval = ChronoDuration::seconds(interval_secs);
-        let timeout_secs = i64::try_from(config.orphans.sweep_timeout_secs)
-            .map_err(|_| MaintainError::Config("gc.orphans.sweep_timeout_secs is too large".to_string()))?;
-        let timeout = ChronoDuration::seconds(timeout_secs);
+        let interval = Duration::from_secs(config.jobsmanager.scan_interval_secs);
+        let timeout = Duration::from_secs(config.orphans.sweep_timeout_secs);
 
         let metrics = GcMetrics::new();
-        let mut job_defs: Vec<JobDefinition> = Vec::with_capacity(specs.len());
+        // Enable the jobmanager's own metrics (job/task durations and statuses,
+        // task-steal events, optimistic-concurrency save retries, and job-state
+        // storage S3 latency / cache hits): `GcMetrics` covers sweep outcomes but
+        // not this job-execution machinery. Binds to the global meter installed by
+        // `MetricsRuntime`; inert when metrics are disabled (no provider set).
+        let mut builder = JobsManager::builder()
+            .s3(config.jobsmanager.storage.to_s3_storage_config()?)
+            .workers(config.jobsmanager.worker_count)
+            .poll_interval(Duration::from_millis(config.jobsmanager.poll_interval_ms))
+            .metrics(Arc::new(OtelMetrics::new(&opentelemetry::global::meter(
+                "icegate-maintain",
+            ))));
+
         for spec in specs {
             let executor = Arc::new(GcExecutor {
                 catalog: Arc::clone(&catalog),
@@ -216,50 +211,16 @@ impl GcRunner {
                 orphans: config.orphans.clone(),
                 metrics: metrics.clone(),
             });
-            let initial =
-                TaskDefinition::new(TaskCode::new(GC_TASK_CODE), Vec::new(), timeout).map_err(map_job_error)?;
-            let mut executors: HashMap<TaskCode, TaskExecutorFn> = HashMap::new();
-            executors.insert(TaskCode::new(GC_TASK_CODE), gc_executor_fn(executor));
-
-            let mut job_def = JobDefinition::new(JobCode::new(spec.job_name), vec![initial], executors)
-                .map_err(map_job_error)?
-                .with_iteration_interval(interval)
-                .map_err(map_job_error)?;
-            if let Some(max) = max_iterations {
-                job_def = job_def.with_max_iterations(max).map_err(map_job_error)?;
-            }
-            job_defs.push(job_def);
+            builder = builder.job(spec.job_name, move |job| {
+                job.every(interval);
+                if let Some(max) = max_iterations {
+                    job.max_iterations(max);
+                }
+                job.add_task(TaskDefinition::new(TaskCode::new(GC_TASK_CODE), timeout), executor);
+            });
         }
 
-        let job_registry = Arc::new(JobRegistry::new(job_defs).map_err(map_job_error)?);
-        // Enable the jobmanager's own metrics (job/task durations and statuses,
-        // task-steal events, optimistic-concurrency save retries, and job-state
-        // storage S3 latency / cache hits): `GcMetrics` covers sweep outcomes but
-        // not this job-execution machinery. Binds to the global meter installed by
-        // `MetricsRuntime`; inert when metrics are disabled (no provider set).
-        let job_metrics = JobMetrics::new(&opentelemetry::global::meter("icegate-maintain"));
-        let registry_dyn: Arc<dyn JobDefinitionRegistry> = job_registry.clone();
-        let s3_storage = Arc::new(
-            S3Storage::new(
-                config.jobsmanager.storage.to_s3_storage_config()?,
-                registry_dyn,
-                job_metrics.clone(),
-            )
-            .await
-            .map_err(map_job_error)?,
-        );
-        let cached_storage = Arc::new(CachedStorage::new(s3_storage, job_metrics.clone()));
-
-        let manager_config = JobsManagerConfig {
-            worker_count: config.jobsmanager.worker_count,
-            worker_config: WorkerConfig {
-                poll_interval: std::time::Duration::from_millis(config.jobsmanager.poll_interval_ms),
-                ..Default::default()
-            },
-            cleaner_config: JobCleanerConfig::default(),
-        };
-        let manager =
-            JobsManager::new(cached_storage, manager_config, job_registry, job_metrics).map_err(map_job_error)?;
+        let manager = builder.build().await.map_err(map_job_error)?;
         Ok(Self { manager })
     }
 

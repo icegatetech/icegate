@@ -1,9 +1,8 @@
 //! Compactor service assembly.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Duration as ChronoDuration;
 use iceberg::Catalog;
 use icegate_common::iceberg_write::WriteConfig;
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
@@ -14,11 +13,7 @@ use icegate_common::parquet_encoding::{
 };
 use icegate_common::parquet_writer::ColumnEncoding;
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
-use jobmanager::{
-    CachedStorage, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionRegistry, JobRegistry, JobsManager,
-    JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage, TaskCode, TaskDefinition, TaskExecutorFn,
-    WorkerConfig,
-};
+use jobmanager::{JobsManager, JobsManagerHandle, TaskCode, TaskDefinition};
 
 use crate::compact::config::CompactionConfig;
 use crate::compact::data::planner::PlannerLimits;
@@ -27,7 +22,6 @@ use crate::compact::manifest::rewrite::ManifestCompactExecutor;
 use crate::compact::metrics::CompactMetrics;
 use crate::compact::tasks::{
     CompactFilesRunner, CompactManifestRunner, FILES_TASK_CODE, MANIFEST_TASK_CODE, PLAN_TASK_CODE, PlanTaskRunner,
-    manifest_executor_fn, plan_executor_fn, rewrite_executor_fn,
 };
 use crate::error::{MaintainError, Result};
 
@@ -203,7 +197,13 @@ impl Compactor {
         let manifest_rewrite_timeout = manifest_rewrite_timeout(config)?;
         let iteration_interval = scan_interval(config)?;
 
-        let mut job_defs: Vec<JobDefinition> = Vec::with_capacity(specs.len());
+        // The pool records nothing: compaction's own instruments are `CompactMetrics`, and the
+        // jobmanager's job/task/storage measurements are not collected for this component.
+        let mut builder = JobsManager::builder()
+            .s3(config.jobsmanager.storage.to_s3_storage_config()?)
+            .workers(config.jobsmanager.worker_count)
+            .poll_interval(Duration::from_millis(config.jobsmanager.poll_interval_ms));
+
         for spec in specs {
             // One metrics instance per job, cloned into every task runner so the
             // PLAN, REWRITE, and MANIFEST paths record to the same instruments
@@ -237,51 +237,23 @@ impl Compactor {
                 spec.table,
             ));
 
-            let initial_plan = TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), Vec::new(), rewrite_timeout)
-                .map_err(map_job_error)?;
-
-            let mut executors: HashMap<TaskCode, TaskExecutorFn> = HashMap::new();
-            executors.insert(TaskCode::new(PLAN_TASK_CODE), plan_executor_fn(plan_runner));
-            executors.insert(TaskCode::new(FILES_TASK_CODE), rewrite_executor_fn(rewrite_runner));
-            executors.insert(TaskCode::new(MANIFEST_TASK_CODE), manifest_executor_fn(manifest_runner));
-
-            let mut job_def = JobDefinition::new(JobCode::new(spec.job_name), vec![initial_plan], executors)
-                .map_err(map_job_error)?
-                .with_iteration_interval(iteration_interval)
-                .map_err(map_job_error)?;
-            if let Some(max) = max_iterations {
-                job_def = job_def.with_max_iterations(max).map_err(map_job_error)?;
-            }
-            job_defs.push(job_def);
+            builder = builder.job(spec.job_name, move |job| {
+                job.every(iteration_interval);
+                if let Some(max) = max_iterations {
+                    job.max_iterations(max);
+                }
+                job.add_task(
+                    TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), rewrite_timeout),
+                    plan_runner,
+                );
+                // REWRITE and MANIFEST tasks are created by PLAN at runtime, so only their
+                // executors are registered here.
+                job.add_task_executor(TaskCode::new(FILES_TASK_CODE), rewrite_runner);
+                job.add_task_executor(TaskCode::new(MANIFEST_TASK_CODE), manifest_runner);
+            });
         }
 
-        let job_registry = Arc::new(JobRegistry::new(job_defs).map_err(map_job_error)?);
-        let metrics = JobMetrics::new_disabled();
-
-        // `S3Storage::new` takes the registry as a trait object; coerce the
-        // concrete `Arc<JobRegistry>` clone up front so the call site is explicit.
-        let registry_dyn: Arc<dyn JobDefinitionRegistry> = job_registry.clone();
-        let s3_storage = Arc::new(
-            S3Storage::new(
-                config.jobsmanager.storage.to_s3_storage_config()?,
-                registry_dyn,
-                metrics.clone(),
-            )
-            .await
-            .map_err(map_job_error)?,
-        );
-        let cached_storage = Arc::new(CachedStorage::new(s3_storage, metrics.clone()));
-
-        let manager_config = JobsManagerConfig {
-            worker_count: config.jobsmanager.worker_count,
-            worker_config: WorkerConfig {
-                poll_interval: std::time::Duration::from_millis(config.jobsmanager.poll_interval_ms),
-                ..Default::default()
-            },
-            cleaner_config: JobCleanerConfig::default(),
-        };
-
-        let manager = JobsManager::new(cached_storage, manager_config, job_registry, metrics).map_err(map_job_error)?;
+        let manager = builder.build().await.map_err(map_job_error)?;
 
         Ok(Self { manager })
     }
@@ -308,14 +280,13 @@ impl CompactorHandle {
     }
 }
 
-/// Convert the compaction `scan_interval_secs` into a positive [`ChronoDuration`]
+/// Convert the compaction `scan_interval_secs` into a positive [`Duration`]
 /// for the jobmanager iteration (discovery) interval.
 ///
 /// # Errors
 ///
-/// Returns [`MaintainError::Config`] if the configured interval is zero or
-/// overflows an `i64` number of seconds.
-fn scan_interval(config: &CompactionConfig) -> Result<ChronoDuration> {
+/// Returns [`MaintainError::Config`] if the configured interval is zero.
+fn scan_interval(config: &CompactionConfig) -> Result<Duration> {
     positive_duration(
         config.jobsmanager.scan_interval_secs,
         "compaction.jobsmanager.scan_interval_secs",
@@ -323,42 +294,39 @@ fn scan_interval(config: &CompactionConfig) -> Result<ChronoDuration> {
 }
 
 /// Convert the compaction `rewrite_timeout_secs` into a positive
-/// [`ChronoDuration`] for the per-REWRITE (and initial PLAN) task deadline.
+/// [`Duration`] for the per-REWRITE (and initial PLAN) task deadline.
 ///
 /// # Errors
 ///
-/// Returns [`MaintainError::Config`] if the configured timeout is zero or
-/// overflows an `i64` number of seconds.
-fn rewrite_timeout(config: &CompactionConfig) -> Result<ChronoDuration> {
+/// Returns [`MaintainError::Config`] if the configured timeout is zero.
+fn rewrite_timeout(config: &CompactionConfig) -> Result<Duration> {
     positive_duration(config.data.rewrite_timeout_secs, "compaction.data.rewrite_timeout_secs")
 }
 
 /// Convert the compaction `manifest_rewrite_timeout_secs` into a positive
-/// [`ChronoDuration`] for the `compact_manifest` task deadline.
+/// [`Duration`] for the `compact_manifest` task deadline.
 ///
 /// # Errors
 ///
-/// Returns [`MaintainError::Config`] if the configured timeout is zero or
-/// overflows an `i64` number of seconds.
-fn manifest_rewrite_timeout(config: &CompactionConfig) -> Result<ChronoDuration> {
+/// Returns [`MaintainError::Config`] if the configured timeout is zero.
+fn manifest_rewrite_timeout(config: &CompactionConfig) -> Result<Duration> {
     positive_duration(
         config.manifest.rewrite_timeout_secs,
         "compaction.manifest.rewrite_timeout_secs",
     )
 }
 
-/// Convert a positive seconds count into a [`ChronoDuration`], rejecting zero
-/// and `i64` overflow. `field` names the config key for the error message.
+/// Convert a positive seconds count into a [`Duration`], rejecting zero.
+/// `field` names the config key for the error message.
 ///
 /// # Errors
 ///
-/// Returns [`MaintainError::Config`] if `secs` is zero or exceeds `i64`.
-fn positive_duration(secs: u64, field: &str) -> Result<ChronoDuration> {
+/// Returns [`MaintainError::Config`] if `secs` is zero.
+fn positive_duration(secs: u64, field: &str) -> Result<Duration> {
     if secs == 0 {
         return Err(MaintainError::Config(format!("{field} must be greater than zero")));
     }
-    let secs = i64::try_from(secs).map_err(|_| MaintainError::Config(format!("{field} exceeds i64")))?;
-    Ok(ChronoDuration::seconds(secs))
+    Ok(Duration::from_secs(secs))
 }
 
 /// Map a jobmanager (or other [`Display`](std::fmt::Display)) error into a

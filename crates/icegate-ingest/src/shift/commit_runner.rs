@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use icegate_queue::Topic;
-use jobmanager::{Error, ImmutableTask, JobManager};
-use tokio_util::sync::CancellationToken;
+use jobmanager::{Error, TaskContext};
 
 use super::{
     executor::{CommitInput, ShiftOutput, TaskStatus},
@@ -21,8 +20,6 @@ pub enum CommitFailureReason {
     NoParquet,
     /// Failed to (de)serialize task payloads.
     Serialization,
-    /// Task cancelled before completion.
-    Cancelled,
 }
 
 impl CommitFailureReason {
@@ -33,7 +30,6 @@ impl CommitFailureReason {
             Self::Commit => "commit",
             Self::NoParquet => "no_parquet",
             Self::Serialization => "serialization",
-            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -73,12 +69,7 @@ pub struct CommitResult {
 #[async_trait]
 pub trait CommitTaskRunner: Send + Sync {
     /// Execute a commit task.
-    async fn run(
-        &self,
-        task: Arc<dyn ImmutableTask>,
-        manager: &dyn JobManager,
-        cancel_token: &CancellationToken,
-    ) -> Result<CommitResult, CommitTaskFailure>;
+    async fn run(&self, ctx: &TaskContext) -> Result<CommitResult, CommitTaskFailure>;
 }
 
 /// Commit task runner implementation.
@@ -105,25 +96,17 @@ impl<S> CommitTaskRunner for CommitTaskRunnerImpl<S>
 where
     S: Storage + 'static,
 {
-    #[tracing::instrument(name="commit_run", skip(self, task, manager, cancel_token), fields(task_id = %task.id()))]
-    async fn run(
-        &self,
-        task: Arc<dyn ImmutableTask>,
-        manager: &dyn JobManager,
-        cancel_token: &CancellationToken,
-    ) -> Result<CommitResult, CommitTaskFailure> {
-        let task_id = *task.id();
+    #[tracing::instrument(name="commit_run", skip(self, ctx), fields(task_id = %ctx.id()))]
+    async fn run(&self, ctx: &TaskContext) -> Result<CommitResult, CommitTaskFailure> {
+        let cancel_token = ctx.cancel_token();
         if cancel_token.is_cancelled() {
-            manager
-                .complete_task(&task_id, Vec::new())
-                .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Cancelled, err))?;
             return Ok(CommitResult {
                 status: TaskStatus::Cancelled,
                 already_committed: false,
             });
         }
 
-        let input: CommitInput = super::executor::parse_task_input(task.as_ref())
+        let input: CommitInput = super::executor::parse_task_input(ctx.input())
             .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Serialization, err))?;
 
         // TODO(low): Move to CommitTaskRunnerWithMetrics aka instrumentation.
@@ -132,49 +115,53 @@ where
             icegate_common::add_span_link(tc);
         }
 
-        let committed_offset = self.storage.get_last_offset(cancel_token).await.map_err(|err| {
-            CommitTaskFailure::new(CommitFailureReason::Commit, Error::TaskExecution(err.to_string()))
-        })?;
+        let committed_offset = self
+            .storage
+            .get_last_offset(cancel_token)
+            .await
+            .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Commit, Error::Other(err.to_string())))?;
         if committed_offset.is_some_and(|offset| offset >= input.last_offset) {
             tracing::info!(
                 "commit: offset {} already committed (last_offset={})",
                 committed_offset.unwrap_or(0),
                 input.last_offset
             );
-            manager
-                .complete_task(&task_id, Vec::new())
-                .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Commit, err))?;
             return Ok(CommitResult {
                 status: TaskStatus::Ok,
                 already_committed: true,
             });
         }
 
-        if task.depends_on().is_empty() {
+        let shift_task_ids = ctx.task().depends_on();
+        if shift_task_ids.is_empty() {
+            // Guard: the plan task creates the commit task with its shift tasks as dependencies
+            // and fails the iteration rather than planning zero of them, so a dependency-less
+            // commit task means the fan-out was assembled wrongly.
             return Err(CommitTaskFailure::new(
                 CommitFailureReason::NoParquet,
-                Error::TaskExecution("commit task has no dependencies".to_string()),
+                Error::Other("commit task has no dependencies".to_string()),
             ));
         }
 
         let mut parquet_files = Vec::new();
         let mut shift_trace_contexts = Vec::new();
 
-        for dep_task_id in task.depends_on() {
-            let dep_task = manager
+        for dep_task_id in shift_task_ids {
+            let dep_task = ctx
+                .job()
                 .get_task(dep_task_id)
                 .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Commit, err))?;
             if dep_task.get_output().is_empty() {
                 return Err(CommitTaskFailure::new(
                     CommitFailureReason::NoParquet,
-                    Error::TaskExecution(format!("shift task '{dep_task_id}' produced empty output")),
+                    Error::Other(format!("shift task '{dep_task_id}' produced empty output")),
                 ));
             }
 
             let output: ShiftOutput = serde_json::from_slice(dep_task.get_output()).map_err(|err| {
                 CommitTaskFailure::new(
                     CommitFailureReason::Serialization,
-                    Error::TaskExecution(format!("failed to parse shift output for '{dep_task_id}': {err}")),
+                    Error::Other(format!("failed to parse shift output for '{dep_task_id}': {err}")),
                 )
             })?;
             parquet_files.extend(output.parquet_files);
@@ -189,26 +176,23 @@ where
         icegate_common::add_span_links(shift_trace_contexts.iter().map(String::as_str));
 
         if parquet_files.is_empty() {
+            // Guard: a shift task that wrote no parquet file fails with its own `NoParquet`
+            // reason, so every dependency that completed carries at least one path.
             return Err(CommitTaskFailure::new(
                 CommitFailureReason::NoParquet,
-                Error::TaskExecution("commit received no parquet files from shift tasks".to_string()),
+                Error::Other("commit received no parquet files from shift tasks".to_string()),
             ));
         }
 
-        let data_files = self.storage.get_data_files(&parquet_files, cancel_token).await.map_err(|err| {
-            CommitTaskFailure::new(CommitFailureReason::GetDataFiles, Error::TaskExecution(err.to_string()))
-        })?;
+        let data_files =
+            self.storage.get_data_files(&parquet_files, cancel_token).await.map_err(|err| {
+                CommitTaskFailure::new(CommitFailureReason::GetDataFiles, Error::Other(err.to_string()))
+            })?;
 
         self.storage
             .commit(data_files, &self.topic, input.last_offset, cancel_token)
             .await
-            .map_err(|err| {
-                CommitTaskFailure::new(CommitFailureReason::Commit, Error::TaskExecution(err.to_string()))
-            })?;
-
-        manager
-            .complete_task(&task_id, Vec::new())
-            .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Commit, err))?;
+            .map_err(|err| CommitTaskFailure::new(CommitFailureReason::Commit, Error::Other(err.to_string())))?;
 
         Ok(CommitResult {
             status: TaskStatus::Ok,

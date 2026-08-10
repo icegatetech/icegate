@@ -46,16 +46,16 @@ pub mod writer;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use iceberg::Catalog;
 use jobmanager::{
-    CachedStorage, Error as JobError, ImmutableTask, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionRegistry,
-    JobManager, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics as JobMetrics, S3Storage,
-    TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    Error as JobError, JobsManager, JobsManagerHandle, OtelMetrics, TaskCode, TaskContext, TaskDefinition,
+    TaskExecutor, TaskOutcome, TaskResult,
 };
 use reqwest::Client;
-use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
 
 use crate::error::{MaintainError, Result};
@@ -394,21 +394,7 @@ struct PricingExecutor {
 }
 
 impl PricingExecutor {
-    async fn run(
-        &self,
-        task: &dyn ImmutableTask,
-        manager: &dyn JobManager,
-        _cancel: &CancellationToken,
-    ) -> std::result::Result<(), JobError> {
-        let span = info_span!("pricing_crawl");
-        self.run_crawl_task(task, manager).instrument(span).await
-    }
-
-    async fn run_crawl_task(
-        &self,
-        task: &dyn ImmutableTask,
-        manager: &dyn JobManager,
-    ) -> std::result::Result<(), JobError> {
+    async fn run_crawl_task(&self) -> std::result::Result<TaskOutcome, JobError> {
         let now = Utc::now();
         run_crawl(
             &self.catalog,
@@ -419,17 +405,24 @@ impl PricingExecutor {
             now,
         )
         .await
-        .map_err(|e| JobError::TaskExecution(format!("pricing crawl failed: {e}")))?;
-        manager.complete_task(task.id(), Vec::new())
+        .map_err(|e| JobError::Other(format!("pricing crawl failed: {e}")))?;
+        Ok(TaskOutcome::empty())
     }
 }
 
-/// Wrap a [`PricingExecutor`] as a jobmanager [`TaskExecutorFn`].
-fn pricing_executor_fn(executor: Arc<PricingExecutor>) -> TaskExecutorFn {
-    Arc::new(move |task, manager, cancel| {
-        let executor = Arc::clone(&executor);
-        Box::pin(async move { executor.run(task.as_ref(), manager, &cancel).await })
-    })
+#[async_trait]
+impl TaskExecutor for PricingExecutor {
+    // TODO(med): honor the task cancellation token, as the gc and compaction executors do
+    // (`gc::GcExecutor::run_sweep_task`, `compact::tasks`). A crawl currently runs to the end
+    // on shutdown: every source is fetched, then the guard, diff, and append tail run against
+    // the catalog. The HTTP client timeout bounds one fetch but not that tail, so a drain waits
+    // for the whole crawl, or the append lands after the drain has started. Pass the token into
+    // `run_crawl`, check it before the append, and resolve a cancelled crawl to
+    // `TaskOutcome::Cancelled` — the crawl is idempotent, so re-running it next cycle is safe.
+    async fn execute(&self, _ctx: TaskContext) -> TaskResult {
+        let span = info_span!("pricing_crawl");
+        Ok(self.run_crawl_task().instrument(span).await?)
+    }
 }
 
 /// Runs the LLM pricing crawler inside the maintain process.
@@ -474,20 +467,16 @@ impl PricingRunner {
         // `scan_interval_secs`: this job has a single task, so its discovery loop
         // period *is* the crawl period, and reading the jobmanager field would
         // silently ignore the interval the operator configured.
-        let interval_secs = i64::try_from(config.interval_secs)
-            .map_err(|_| MaintainError::Config("pricing.interval_secs is too large".to_string()))?;
-        let interval = ChronoDuration::seconds(interval_secs);
+        let interval = Duration::from_secs(config.interval_secs);
         // The task deadline is its own knob, not the per-source HTTP timeout:
         // sources fetch concurrently (see `run_crawl`), so a crawl costs one HTTP
         // round trip plus the guard/diff/append tail, and a task that overruns its
         // deadline becomes pickup-eligible again — a second worker would crawl
         // concurrently and append every revision twice.
-        let crawl_timeout_secs = i64::try_from(config.crawl_timeout_secs)
-            .map_err(|_| MaintainError::Config("pricing.crawl_timeout_secs is too large".to_string()))?;
-        let timeout = ChronoDuration::seconds(crawl_timeout_secs);
+        let timeout = Duration::from_secs(config.crawl_timeout_secs);
 
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .timeout(Duration::from_secs(config.timeout_secs))
             .build()
             .map_err(|e| MaintainError::Config(format!("pricing: failed to build HTTP client: {e}")))?;
 
@@ -500,48 +489,28 @@ impl PricingRunner {
             metrics,
         });
 
-        let initial =
-            TaskDefinition::new(TaskCode::new(PRICING_TASK_CODE), Vec::new(), timeout).map_err(map_job_error)?;
-        let mut executors: HashMap<TaskCode, TaskExecutorFn> = HashMap::new();
-        executors.insert(TaskCode::new(PRICING_TASK_CODE), pricing_executor_fn(executor));
-
-        let mut job_def = JobDefinition::new(JobCode::new(PRICING_JOB_NAME), vec![initial], executors)
-            .map_err(map_job_error)?
-            .with_iteration_interval(interval)
-            .map_err(map_job_error)?;
-        if let Some(max) = max_iterations {
-            job_def = job_def.with_max_iterations(max).map_err(map_job_error)?;
-        }
-
-        let job_registry = Arc::new(JobRegistry::new(vec![job_def]).map_err(map_job_error)?);
         // Enable the jobmanager's own metrics (job/task durations and statuses,
         // task-steal events, optimistic-concurrency save retries, and job-state
-        // storage S3 latency / cache hits), mirroring GcRunner/Compactor: binds to
-        // the global meter installed by `MetricsRuntime`; inert when metrics are
-        // disabled (no provider set).
-        let job_metrics = JobMetrics::new(&opentelemetry::global::meter("icegate-maintain"));
-        let registry_dyn: Arc<dyn JobDefinitionRegistry> = job_registry.clone();
-        let s3_storage = Arc::new(
-            S3Storage::new(
-                config.jobsmanager.storage.to_s3_storage_config()?,
-                registry_dyn,
-                job_metrics.clone(),
-            )
+        // storage S3 latency / cache hits), mirroring GcRunner: binds to the global
+        // meter installed by `MetricsRuntime`; inert when metrics are disabled (no
+        // provider set).
+        let manager = JobsManager::builder()
+            .s3(config.jobsmanager.storage.to_s3_storage_config()?)
+            .workers(config.jobsmanager.worker_count)
+            .poll_interval(Duration::from_millis(config.jobsmanager.poll_interval_ms))
+            .metrics(Arc::new(OtelMetrics::new(&opentelemetry::global::meter(
+                "icegate-maintain",
+            ))))
+            .job(PRICING_JOB_NAME, move |job| {
+                job.every(interval);
+                if let Some(max) = max_iterations {
+                    job.max_iterations(max);
+                }
+                job.add_task(TaskDefinition::new(TaskCode::new(PRICING_TASK_CODE), timeout), executor);
+            })
+            .build()
             .await
-            .map_err(map_job_error)?,
-        );
-        let cached_storage = Arc::new(CachedStorage::new(s3_storage, job_metrics.clone()));
-
-        let manager_config = JobsManagerConfig {
-            worker_count: config.jobsmanager.worker_count,
-            worker_config: WorkerConfig {
-                poll_interval: std::time::Duration::from_millis(config.jobsmanager.poll_interval_ms),
-                ..Default::default()
-            },
-            cleaner_config: JobCleanerConfig::default(),
-        };
-        let manager =
-            JobsManager::new(cached_storage, manager_config, job_registry, job_metrics).map_err(map_job_error)?;
+            .map_err(map_job_error)?;
         Ok(Self { manager })
     }
 

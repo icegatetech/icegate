@@ -5,6 +5,7 @@ use std::time::Duration;
 use jobmanager::{JobStateCodecKind, S3StorageConfig};
 use serde::{Deserialize, Serialize};
 
+use super::timeout::validate_timeout_ms;
 use crate::error::IngestError;
 
 /// Job state serialization format.
@@ -365,43 +366,19 @@ pub struct ShiftTimeoutsConfig {
 impl ShiftTimeoutsConfig {
     /// Validates timeout configuration values.
     pub fn validate(&self) -> Result<(), IngestError> {
-        if self.plan_base_ms == 0 {
-            return Err(IngestError::Config(
-                "timeouts.plan_base_ms must be greater than zero".to_string(),
-            ));
-        }
-        if self.shift_base_ms == 0 {
-            return Err(IngestError::Config(
-                "timeouts.shift_base_ms must be greater than zero".to_string(),
-            ));
-        }
-        if self.shift_per_record_batch_ms == 0 {
-            return Err(IngestError::Config(
-                "timeouts.shift_per_record_batch_ms must be greater than zero".to_string(),
-            ));
-        }
-        if self.shift_per_segment_ms == 0 {
-            return Err(IngestError::Config(
-                "timeouts.shift_per_segment_ms must be greater than zero".to_string(),
-            ));
-        }
-        if self.commit_base_ms == 0 {
-            return Err(IngestError::Config(
-                "timeouts.commit_base_ms must be greater than zero".to_string(),
-            ));
-        }
-        if self.commit_per_parquet_file_ms == 0 {
-            return Err(IngestError::Config(
-                "timeouts.commit_per_parquet_file_ms must be greater than zero".to_string(),
-            ));
-        }
+        validate_timeout_ms("timeouts.plan_base_ms", self.plan_base_ms)?;
+        validate_timeout_ms("timeouts.shift_base_ms", self.shift_base_ms)?;
+        validate_timeout_ms("timeouts.shift_per_record_batch_ms", self.shift_per_record_batch_ms)?;
+        validate_timeout_ms("timeouts.shift_per_segment_ms", self.shift_per_segment_ms)?;
+        validate_timeout_ms("timeouts.commit_base_ms", self.commit_base_ms)?;
+        validate_timeout_ms("timeouts.commit_per_parquet_file_ms", self.commit_per_parquet_file_ms)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ShiftConfig, ShiftJobsManagerConfig, default_jobs_manager_worker_count};
+    use super::{ShiftConfig, ShiftJobsManagerConfig, ShiftTimeoutsConfig, default_jobs_manager_worker_count};
 
     #[test]
     fn shift_read_default_input_bytes_bounds() {
@@ -464,6 +441,48 @@ mod tests {
             matches!(err, crate::error::IngestError::Config(_)),
             "expected config error, got: {err}"
         );
+    }
+
+    /// A zero deadline expires the task the moment a worker picks it up, so the task is
+    /// re-picked forever and never completes — the configuration must be rejected at load
+    /// instead. The table lists every field so a timeout added to [`ShiftTimeoutsConfig`] but
+    /// left out of its `validate` fails here rather than in production.
+    #[test]
+    fn shift_validate_rejects_a_zero_timeout_in_every_field() {
+        let zero_setters: [(&str, fn(&mut ShiftTimeoutsConfig)); 6] = [
+            ("plan_base_ms", |timeouts| timeouts.plan_base_ms = 0),
+            ("shift_base_ms", |timeouts| timeouts.shift_base_ms = 0),
+            ("shift_per_record_batch_ms", |timeouts| {
+                timeouts.shift_per_record_batch_ms = 0;
+            }),
+            ("shift_per_segment_ms", |timeouts| timeouts.shift_per_segment_ms = 0),
+            ("commit_base_ms", |timeouts| timeouts.commit_base_ms = 0),
+            ("commit_per_parquet_file_ms", |timeouts| {
+                timeouts.commit_per_parquet_file_ms = 0;
+            }),
+        ];
+
+        for (field, set_zero) in zero_setters {
+            let mut config = ShiftConfig::default();
+            set_zero(&mut config.timeouts);
+
+            let err = config.validate().expect_err(&format!("a zero {field} must be invalid"));
+
+            assert!(
+                matches!(err, crate::error::IngestError::Config(_)),
+                "expected config error for a zero {field}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_validate_rejects_timeout_above_jobmanager_range() {
+        let mut config = ShiftConfig::default();
+        config.timeouts.plan_base_ms = u64::MAX;
+
+        let err = config.validate().expect_err("timeout must be invalid");
+
+        assert!(matches!(err, crate::error::IngestError::Config(_)));
     }
 
     #[test]

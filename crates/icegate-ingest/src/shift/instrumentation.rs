@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use icegate_common::merge::MergePosition;
 use icegate_queue::{ExtractField, QueueReader, RecordBatchStream, SegmentsPlan, Topic};
-use jobmanager::{Error, JobManager};
+use jobmanager::{Error, TaskContext};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -19,6 +19,33 @@ use super::{
     shift_runner::{ShiftTaskFailure, ShiftTaskFailureReason, ShiftTaskResult, ShiftTaskRunner},
 };
 use crate::infra::metrics::ShiftMetrics;
+
+/// Outcome label of a single instrumented call to the queue or to storage.
+///
+/// Deliberately not [`TaskStatus`]: a task status is what a runner reports about the whole task it
+/// ran, while one dependency call either succeeds or fails and has no other outcome to report.
+#[derive(Copy, Clone)]
+enum OperationOutcome {
+    /// The call returned a value.
+    Ok,
+    /// The call returned an error.
+    Error,
+}
+
+impl OperationOutcome {
+    /// Return a stable string representation for metrics.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+
+    /// Label for a call that produced `result`.
+    const fn from_result<T, E>(result: &Result<T, E>) -> Self {
+        if result.is_ok() { Self::Ok } else { Self::Error }
+    }
+}
 
 /// Plan task runner wrapper that records metrics.
 pub struct PlanTaskRunnerWithMetrics<R> {
@@ -46,40 +73,44 @@ impl<R> PlanTaskRunner for PlanTaskRunnerWithMetrics<R>
 where
     R: PlanTaskRunner + 'static,
 {
-    async fn run(
-        &self,
-        task_id: uuid::Uuid,
-        manager: &dyn JobManager,
-        cancel_token: &CancellationToken,
-    ) -> Result<PlanTaskResult, Error> {
+    async fn run(&self, ctx: &TaskContext) -> Result<PlanTaskResult, Error> {
         let start = Instant::now();
-        let result = self.inner.run(task_id, manager, cancel_token).await;
+        let result = self.inner.run(ctx).await;
         match result {
             Ok(plan_result) => {
                 self.metrics
                     .record_plan_duration(start.elapsed(), &self.topic, plan_result.status.as_str());
 
-                let backlog = plan_result.last_offset.map_or(0, |last_offset| {
-                    if last_offset >= plan_result.start_offset {
-                        last_offset - plan_result.start_offset + 1
-                    } else {
-                        0
-                    }
-                });
+                // Both ends of the range are needed: a plan interrupted before it read the
+                // committed offset has no start to measure the backlog from.
+                let backlog =
+                    plan_result
+                        .start_offset
+                        .zip(plan_result.last_offset)
+                        .map_or(0, |(start_offset, last_offset)| {
+                            if last_offset >= start_offset {
+                                last_offset - start_offset + 1
+                            } else {
+                                0
+                            }
+                        });
                 self.metrics.record_backlog_segments(backlog, &self.topic);
 
-                if matches!(plan_result.status, TaskStatus::Ok | TaskStatus::Empty) {
-                    self.metrics.add_planned_segments(plan_result.segments_count, &self.topic);
-                    self.metrics
-                        .add_planned_record_batches(plan_result.record_batches_total, &self.topic);
-                    self.metrics.add_planned_tasks(plan_result.shift_task_ids.len(), &self.topic);
-                    self.metrics.record_task_success(super::PLAN_TASK_CODE, &self.topic);
-                } else if matches!(plan_result.status, TaskStatus::Cancelled) {
-                    self.metrics
-                        .record_task_failure(super::PLAN_TASK_CODE, "cancelled", &self.topic);
-                } else {
-                    self.metrics
-                        .record_task_failure(super::PLAN_TASK_CODE, plan_result.status.as_str(), &self.topic);
+                match plan_result.status {
+                    TaskStatus::Ok | TaskStatus::Empty => {
+                        self.metrics.add_planned_segments(plan_result.segments_count, &self.topic);
+                        self.metrics
+                            .add_planned_record_batches(plan_result.record_batches_total, &self.topic);
+                        self.metrics.add_planned_tasks(plan_result.shift_tasks_scheduled, &self.topic);
+                        self.metrics.record_task_success(super::PLAN_TASK_CODE, &self.topic);
+                    }
+                    TaskStatus::Cancelled => {
+                        self.metrics.record_task_failure(
+                            super::PLAN_TASK_CODE,
+                            plan_result.status.as_str(),
+                            &self.topic,
+                        );
+                    }
                 }
 
                 if let Some(summary) = &plan_result.plan_summary {
@@ -106,9 +137,12 @@ where
                 Ok(plan_result)
             }
             Err(err) => {
-                // TODO(med): map error types to TaskStatus, for example, cancel to Cancelled (this will require refactoring in the Job Manager)
+                // Everything reaching this arm really failed: the runner reports a shutdown as
+                // `TaskStatus::Cancelled`, including one that surfaced as an error from the queue
+                // or storage call it was waiting on. The failure reason stays a single label
+                // because the runner does not classify its errors beyond the plan task boundary.
                 self.metrics
-                    .record_plan_duration(start.elapsed(), &self.topic, TaskStatus::Error.as_str());
+                    .record_plan_duration(start.elapsed(), &self.topic, OperationOutcome::Error.as_str());
                 self.metrics
                     .record_task_failure(super::PLAN_TASK_CODE, "queue_plan", &self.topic);
                 Err(err)
@@ -210,13 +244,8 @@ impl<R> ShiftTaskRunner for ShiftTaskRunnerWithMetrics<R>
 where
     R: ShiftTaskRunner + 'static,
 {
-    async fn run(
-        &self,
-        task: Arc<dyn jobmanager::ImmutableTask>,
-        manager: &dyn JobManager,
-        cancel_token: &CancellationToken,
-    ) -> Result<ShiftTaskResult, ShiftTaskFailure> {
-        let result = self.inner.run(task, manager, cancel_token).await;
+    async fn run(&self, ctx: &TaskContext) -> Result<ShiftTaskResult, ShiftTaskFailure> {
+        let result = self.inner.run(ctx).await;
         match &result {
             Ok(shift_result) => match shift_result.status {
                 TaskStatus::Ok => {
@@ -238,13 +267,6 @@ where
                     self.metrics.record_task_failure(
                         super::SHIFT_TASK_CODE,
                         ShiftTaskFailureReason::EmptyBatches.as_str(),
-                        &self.topic,
-                    );
-                }
-                TaskStatus::Error | TaskStatus::Timeout => {
-                    self.metrics.record_task_failure(
-                        super::SHIFT_TASK_CODE,
-                        ShiftTaskFailureReason::Write.as_str(),
                         &self.topic,
                     );
                 }
@@ -284,13 +306,8 @@ impl<R> CommitTaskRunner for CommitTaskRunnerWithMetrics<R>
 where
     R: CommitTaskRunner + 'static,
 {
-    async fn run(
-        &self,
-        task: Arc<dyn jobmanager::ImmutableTask>,
-        manager: &dyn JobManager,
-        cancel_token: &CancellationToken,
-    ) -> Result<CommitResult, CommitTaskFailure> {
-        let result = self.inner.run(task, manager, cancel_token).await;
+    async fn run(&self, ctx: &TaskContext) -> Result<CommitResult, CommitTaskFailure> {
+        let result = self.inner.run(ctx).await;
         match &result {
             Ok(commit_result) => {
                 if commit_result.already_committed {
@@ -347,16 +364,11 @@ where
         let result = self.inner.plan_segments(topic, start_offset, fields, cancel_token).await;
         // Per-task input bytes are recorded by the plan-runner once it shapes
         // chunks; this surface only records the queue read duration.
-        match &result {
-            Ok(_) => {
-                self.metrics
-                    .record_queue_plan_duration(start.elapsed(), topic.as_str(), TaskStatus::Ok.as_str());
-            }
-            Err(_) => {
-                self.metrics
-                    .record_queue_plan_duration(start.elapsed(), topic.as_str(), TaskStatus::Error.as_str());
-            }
-        }
+        self.metrics.record_queue_plan_duration(
+            start.elapsed(),
+            topic.as_str(),
+            OperationOutcome::from_result(&result).as_str(),
+        );
         result
     }
 
@@ -369,18 +381,11 @@ where
     ) -> icegate_queue::Result<RecordBatchStream> {
         let start = Instant::now();
         let result = self.inner.read_segment(topic, offset, record_batch_idxs, cancel_token).await;
-        match &result {
-            Ok(_) => self.metrics.record_queue_read_segment_duration(
-                start.elapsed(),
-                topic.as_str(),
-                TaskStatus::Ok.as_str(),
-            ),
-            Err(_) => self.metrics.record_queue_read_segment_duration(
-                start.elapsed(),
-                topic.as_str(),
-                TaskStatus::Error.as_str(),
-            ),
-        }
+        self.metrics.record_queue_read_segment_duration(
+            start.elapsed(),
+            topic.as_str(),
+            OperationOutcome::from_result(&result).as_str(),
+        );
         result
     }
 }
@@ -414,13 +419,11 @@ where
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> crate::error::Result<Option<u64>> {
         let start = Instant::now();
         let result = self.inner.get_last_offset(cancel_token).await;
-        let duration = start.elapsed();
-        let status = if result.is_ok() {
-            TaskStatus::Ok.as_str()
-        } else {
-            TaskStatus::Error.as_str()
-        };
-        self.metrics.record_get_last_offset_duration(duration, &self.topic, status);
+        self.metrics.record_get_last_offset_duration(
+            start.elapsed(),
+            &self.topic,
+            OperationOutcome::from_result(&result).as_str(),
+        );
         result
     }
 
@@ -431,15 +434,11 @@ where
     ) -> crate::error::Result<WrittenDataFiles> {
         let start = Instant::now();
         let result = self.inner.write_record_batches(batches, cancel_token).await;
-        match &result {
-            Ok(_) => self
-                .metrics
-                .record_parquet_write_duration(start.elapsed(), &self.topic, TaskStatus::Ok.as_str()),
-            Err(_) => {
-                self.metrics
-                    .record_parquet_write_duration(start.elapsed(), &self.topic, TaskStatus::Error.as_str());
-            }
-        }
+        self.metrics.record_parquet_write_duration(
+            start.elapsed(),
+            &self.topic,
+            OperationOutcome::from_result(&result).as_str(),
+        );
         result
     }
 
@@ -450,15 +449,11 @@ where
     ) -> crate::error::Result<Vec<iceberg::spec::DataFile>> {
         let start = Instant::now();
         let result = self.inner.get_data_files(parquet_paths, cancel_token).await;
-        match &result {
-            Ok(_) => self
-                .metrics
-                .record_get_data_files_duration(start.elapsed(), &self.topic, TaskStatus::Ok.as_str()),
-            Err(_) => {
-                self.metrics
-                    .record_get_data_files_duration(start.elapsed(), &self.topic, TaskStatus::Error.as_str());
-            }
-        }
+        self.metrics.record_get_data_files_duration(
+            start.elapsed(),
+            &self.topic,
+            OperationOutcome::from_result(&result).as_str(),
+        );
         result
     }
 
@@ -471,14 +466,11 @@ where
     ) -> crate::error::Result<usize> {
         let start = Instant::now();
         let result = self.inner.commit(data_files, record_type, last_offset, cancel_token).await;
-        match &result {
-            Ok(_) => self
-                .metrics
-                .record_commit_duration(start.elapsed(), &self.topic, TaskStatus::Ok.as_str()),
-            Err(_) => self
-                .metrics
-                .record_commit_duration(start.elapsed(), &self.topic, TaskStatus::Error.as_str()),
-        }
+        self.metrics.record_commit_duration(
+            start.elapsed(),
+            &self.topic,
+            OperationOutcome::from_result(&result).as_str(),
+        );
         result
     }
 }
