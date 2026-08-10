@@ -51,7 +51,7 @@
 #   * There are ZERO Direct leaks even with suppressions disabled entirely. That
 #     rules out a suppressed root and means a reference cycle: every leaked block
 #     is reachable from another leaked block.
-#   * Every leaked object is third-party — 34 opentelemetry NoopSyncInstrument,
+#   * Every leaked object is third-party — 17 opentelemetry NoopSyncInstrument,
 #     17 opentelemetry_sdk ResolvedMeasures, plus opendal AccessorInfo /
 #     MetricsHttpFetcher / TokioExecutor and reqwest Client. Not one first-party
 #     allocation is in the set; first-party frames are call sites only, dominated
@@ -76,7 +76,7 @@
 # the code it names silently. Adding a SECOND exception needs measurement from a
 # full run on the current tree, naming the run, or this target quietly becomes a
 # rubber stamp. (One exception, two first-party patterns: EXCEPTION 1 needs two
-# anchors to cover its five call sites.)
+# anchors to cover its six call sites.)
 
 # ===========================================================================
 # EXCEPTION 1 — TEST SCAFFOLDING, not shipped code. A deliberate `Box::leak`,
