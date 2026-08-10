@@ -190,7 +190,16 @@ esac
 # They would run uninstrumented and without --cfg icegate_sanitize — passing while
 # detecting nothing. `--all-targets` is not the answer either: it would pull in the
 # two `harness = false` criterion benches, one of which starts an S3 container.
-CARGO_ARGS+=(--workspace --lib --bins --tests --target "$TARGET" -j "$JOBS")
+#
+# --no-fail-fast because a sanitizer report is not a failing test: the binary
+# passes every test, then the runtime finds leaks and exits non-zero at process
+# exit. Cargo stops after the first test executable that fails, so without this
+# one crate's leak means every later crate never runs — and the report reads as
+# the whole workspace's leak total when it is only the first binary's. That is
+# not hypothetical: the 2026-08-09 nightly aborted inside `icegate-common --lib`
+# having executed 2 of the workspace's test binaries, and the two suppression
+# patterns covering icegate-query were never exercised.
+CARGO_ARGS+=(--workspace --lib --bins --tests --no-fail-fast --target "$TARGET" -j "$JOBS")
 
 export RUSTFLAGS
 # Layout note for anyone inspecting artifacts: this toolchain places compiled

@@ -21,9 +21,15 @@ not part of `make ci` — CI runs them nightly and on any PR labelled `sanitize`
 ## Reading a green run honestly
 
 A green `make sanitize-leak` means **no new leaks**, not no leaks. `lsan.supp` suppresses a
-documented baseline that includes first-party defects on production paths. Each entry
-records what leaks, how much, and the fix that retires it. Read that file before concluding
-the codebase is leak-free.
+documented baseline: upstream retention we do not control, plus one first-party entry that
+covers test scaffolding. Each entry records what leaks, how much, and the condition that
+retires it. Read that file before concluding the codebase is leak-free.
+
+No first-party *production* path is suppressed today, and that is a property worth keeping —
+adding one back means the nightly stops reporting a real defect. Two such entries were
+deleted in August 2026 once the code they named had been refactored away; `lsan.supp`'s
+header records both, because the failure mode they share is that a suppression outlives its
+subject in silence.
 
 **The sanitizer suite covers less than `make ci` does.** It runs no `--features`, so
 `crates/icegate-catalog-s3`'s `catalog` binary — which declares
