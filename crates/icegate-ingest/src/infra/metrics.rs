@@ -1406,6 +1406,153 @@ impl QueueWriterEvents for WalWriterMetrics {
     }
 }
 
+/// Reading recorded measurements back in a test: a meter provider that exports into memory, and
+/// the lookups over what it exported.
+///
+/// Lives here rather than beside any one test module because more than one of them asserts on
+/// these metrics, and how a measurement is found by name and labels should be defined once.
+///
+/// Two matching rules, and the choice between them is the assertion's own:
+///
+/// * [`find_histogram_count`] matches a data point whose labels are **exactly** the expected set.
+///   Use it where the label set is the contract - an extra label is a dimension change that breaks
+///   the dashboards keyed on the metric, and this is what catches it.
+/// * [`find_counter_total`] and [`find_gauge_value`] match a data point carrying **at least** the
+///   expected labels. Use them where a case addresses one slice of a metric that legitimately
+///   carries more dimensions than the case names (a task counter also labelled by failure reason,
+///   for instance), and assert the full set in a dedicated test instead.
+///
+/// Counters and histograms are exported cumulatively, and a provider exports again when it shuts
+/// down, so every lookup reads the last export that carried the metric rather than adding the
+/// exports up.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use opentelemetry::KeyValue;
+    use opentelemetry_sdk::metrics::{
+        InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        data::{AggregatedMetrics, MetricData},
+    };
+
+    /// Meter provider recording into memory, together with the exporter its measurements land in.
+    ///
+    /// Measurements reach the exporter only after `SdkMeterProvider::force_flush`.
+    pub(crate) fn build_meter_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        (provider, exporter)
+    }
+
+    fn metric_labels(data_point: &[KeyValue]) -> Vec<(String, String)> {
+        let mut labels = data_point
+            .iter()
+            .map(|kv| (kv.key.as_str().to_string(), kv.value.as_str().into_owned()))
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels
+    }
+
+    fn labels_contain(labels: &[(String, String)], expected: &[(&str, &str)]) -> bool {
+        expected.iter().all(|(key, value)| {
+            labels
+                .iter()
+                .any(|(label_key, label_value)| label_key == key && label_value == value)
+        })
+    }
+
+    fn labels_match(labels: &[(String, String)], expected: &[(&str, &str)]) -> bool {
+        labels.len() == expected.len() && labels_contain(labels, expected)
+    }
+
+    /// Number of values recorded into the histogram `metric_name` under exactly `expected_labels`;
+    /// a data point carrying any further label is a different measurement and is not counted.
+    pub(crate) fn find_histogram_count(
+        exporter: &InMemoryMetricExporter,
+        metric_name: &str,
+        expected_labels: &[(&str, &str)],
+    ) -> u64 {
+        let mut latest = None;
+        for_each_export(exporter, metric_name, |data| {
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = data else {
+                return;
+            };
+            let mut export_total = None;
+            for point in histogram.data_points() {
+                let labels = metric_labels(&point.attributes().cloned().collect::<Vec<_>>());
+                if labels_match(&labels, expected_labels) {
+                    export_total = Some(export_total.unwrap_or(0_u64).saturating_add(point.count()));
+                }
+            }
+            if export_total.is_some() {
+                latest = export_total;
+            }
+        });
+        latest.unwrap_or(0)
+    }
+
+    /// Total the counter `metric_name` reached across the data points carrying at least
+    /// `expected_labels`; zero when it was never incremented with them.
+    pub(crate) fn find_counter_total(
+        exporter: &InMemoryMetricExporter,
+        metric_name: &str,
+        expected_labels: &[(&str, &str)],
+    ) -> u64 {
+        let mut latest = None;
+        for_each_export(exporter, metric_name, |data| {
+            let AggregatedMetrics::U64(MetricData::Sum(sum)) = data else {
+                return;
+            };
+            let mut export_total = None;
+            for point in sum.data_points() {
+                let labels = metric_labels(&point.attributes().cloned().collect::<Vec<_>>());
+                if labels_contain(&labels, expected_labels) {
+                    export_total = Some(export_total.unwrap_or(0_u64).saturating_add(point.value()));
+                }
+            }
+            if export_total.is_some() {
+                latest = export_total;
+            }
+        });
+        latest.unwrap_or(0)
+    }
+
+    /// Last value the gauge `metric_name` was set to on a data point carrying at least
+    /// `expected_labels`, or `None` when it was never set with them.
+    pub(crate) fn find_gauge_value(
+        exporter: &InMemoryMetricExporter,
+        metric_name: &str,
+        expected_labels: &[(&str, &str)],
+    ) -> Option<u64> {
+        let mut latest = None;
+        for_each_export(exporter, metric_name, |data| {
+            let AggregatedMetrics::U64(MetricData::Gauge(gauge)) = data else {
+                return;
+            };
+            for point in gauge.data_points() {
+                let labels = metric_labels(&point.attributes().cloned().collect::<Vec<_>>());
+                if labels_contain(&labels, expected_labels) {
+                    latest = Some(point.value());
+                }
+            }
+        });
+        latest
+    }
+
+    /// Hand every export of `metric_name` to `read`, in export order.
+    fn for_each_export(exporter: &InMemoryMetricExporter, metric_name: &str, mut read: impl FnMut(&AggregatedMetrics)) {
+        let resource_metrics = exporter.get_finished_metrics().expect("failed to read metrics");
+        for rm in resource_metrics {
+            for sm in rm.scope_metrics() {
+                for metric in sm.metrics() {
+                    if metric.name() == metric_name {
+                        read(metric.data());
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -1420,14 +1567,12 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
         PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
     };
-    use opentelemetry::KeyValue;
-    use opentelemetry_sdk::metrics::{
-        InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
-        data::{AggregatedMetrics, MetricData},
-    };
     use tokio_util::sync::CancellationToken;
 
-    use super::*;
+    use super::{
+        test_support::{build_meter_provider, find_histogram_count},
+        *,
+    };
 
     struct FlakyListStore {
         inner: Arc<dyn ObjectStore>,
@@ -1527,60 +1672,6 @@ mod tests {
         async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
-    }
-
-    fn metric_labels(data_point: &[KeyValue]) -> Vec<(String, String)> {
-        let mut labels = data_point
-            .iter()
-            .map(|kv| (kv.key.as_str().to_string(), kv.value.as_str().into_owned()))
-            .collect::<Vec<_>>();
-        labels.sort();
-        labels
-    }
-
-    fn labels_match(labels: &[(String, String)], expected: &[(&str, &str)]) -> bool {
-        if labels.len() != expected.len() {
-            return false;
-        }
-        expected.iter().all(|(key, value)| {
-            labels
-                .iter()
-                .any(|(label_key, label_value)| label_key == key && label_value == value)
-        })
-    }
-
-    fn build_meter_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
-        let exporter = InMemoryMetricExporter::default();
-        let reader = PeriodicReader::builder(exporter.clone()).build();
-        let provider = SdkMeterProvider::builder().with_reader(reader).build();
-        (provider, exporter)
-    }
-
-    fn find_histogram_count(
-        exporter: &InMemoryMetricExporter,
-        metric_name: &str,
-        expected_labels: &[(&str, &str)],
-    ) -> u64 {
-        let mut total = 0_u64;
-        let resource_metrics = exporter.get_finished_metrics().expect("failed to read metrics");
-        for rm in resource_metrics {
-            for sm in rm.scope_metrics() {
-                for metric in sm.metrics() {
-                    if metric.name() != metric_name {
-                        continue;
-                    }
-                    if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() {
-                        for point in histogram.data_points() {
-                            let labels = metric_labels(&point.attributes().cloned().collect::<Vec<_>>());
-                            if labels_match(&labels, expected_labels) {
-                                total = total.saturating_add(point.count());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        total
     }
 
     #[tokio::test]

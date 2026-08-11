@@ -17,7 +17,7 @@ Two axes: the compaction **domain** (data files vs manifests) and the **layer**
 
 | Path                           | Layer    | Where to look                                                                                       |
 |--------------------------------|----------|-----------------------------------------------------------------------------------------------------|
-| [`compactor.rs`](compactor.rs) | assembly | Per-table job specs and the `Compactor` service — the only module touching the jobmanager registry. |
+| [`compactor.rs`](compactor.rs) | assembly | Per-table job specs and the `Compactor` service — the only module describing jobs to the jobmanager. |
 | [`data/`](data/)               | domain   | Data-file compaction.                                                                               |
 | [`manifest/`](manifest/)       | domain   | Manifest compaction.                                                                                |
 
@@ -48,21 +48,21 @@ flowchart TD
 
     subgraph P["compact_plan task"]
         PLAN["load_table fresh"] --> HS{"current_snapshot?"}
-        HS -->|None| DONE0["complete_task"]
+        HS -->|None| DONE0["return Completed"]
         HS -->|Some| ENUM["enumerate + plan_rewrite_groups"]
         ENUM --> FAN["add_task ×N + add_task manifest"]
-        FAN --> DONEP["complete_task"]
+        FAN --> DONEP["return Completed"]
     end
 
     FAN --> F1
     FAN --> F2
     FAN --> FN
-    FAN -.->|"Blocked, deps = [id₁..idₙ]"| MAN
+    FAN -.->|"Blocked, deps = [ref₁..refₙ]"| MAN
 
     subgraph W["N × compact_files tasks"]
-        F1["#1: merge → write"] --> K1{{"commit"}} --> D1["complete_task"]
-        F2["#2: merge → write"] --> K2{{"commit"}} --> D2["complete_task"]
-        FN["#N: merge → write"] --> KN{{"commit"}} --> DN["complete_task"]
+        F1["#1: merge → write"] --> K1{{"commit"}} --> D1["return Completed"]
+        F2["#2: merge → write"] --> K2{{"commit"}} --> D2["return Completed"]
+        FN["#N: merge → write"] --> KN{{"commit"}} --> DN["return Completed"]
         F1 -.->|"maybe failed"| D1
     end
 
@@ -71,7 +71,7 @@ flowchart TD
     DN ==>|Completed| MAN
 
     subgraph M["compact_manifest task (gate for complete compact_files tasks)"]
-        MAN["load fresh + plan repack"] --> KM{{"commit"}} --> DM["complete_task"]
+        MAN["load fresh + plan repack"] --> KM{{"commit"}} --> DM["return Completed"]
         MAN -.->|"Skip / NoReduction"| DM
     end
 

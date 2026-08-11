@@ -67,7 +67,9 @@ impl Cli {
     pub async fn execute(self) -> Result<(), MaintainError> {
         match self.command {
             Commands::Migrate { command } => commands::migrate::execute(command).await,
-            Commands::Run { config } => commands::run::execute(config).await,
+            // Boxed because assembling the maintenance pools inline makes the future exceed the
+            // workspace's `future-size-threshold`.
+            Commands::Run { config } => Box::pin(commands::run::execute(config)).await,
         }
     }
 }

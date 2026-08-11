@@ -12,6 +12,10 @@ pub mod iceberg_storage;
 pub mod instrumentation;
 /// Parquet metadata reader utilities for shift operations.
 pub mod parquet_meta_reader;
+#[cfg(test)]
+mod pipeline_it_tests;
+#[cfg(test)]
+mod pipeline_tests;
 /// Plan task runner for shift operations.
 pub mod plan_runner;
 mod planner;
@@ -19,17 +23,18 @@ mod planner_partitioning;
 mod row_groups_merger;
 /// Shift task runner for shift operations.
 pub mod shift_runner;
+#[cfg(test)]
+mod test_utils;
 /// Task timeout estimation utilities.
 mod timeout;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use chrono::Duration as ChronoDuration;
 use commit_runner::CommitTaskRunnerImpl;
 pub(crate) use config::ShiftConfig;
 pub(crate) use executor::{
-    COMMIT_TASK_CODE, CommitInput, Executor, PLAN_TASK_CODE, PlannedRowGroup, SHIFT_TASK_CODE, SegmentToRead,
-    ShiftInput, ShiftOutput,
+    COMMIT_TASK_CODE, CommitExecutor, CommitInput, PLAN_TASK_CODE, PlanExecutor, PlannedRowGroup, SHIFT_TASK_CODE,
+    SegmentToRead, ShiftExecutor, ShiftInput, ShiftOutput,
 };
 use iceberg::Catalog;
 pub(crate) use iceberg_storage::IcebergStorage;
@@ -40,10 +45,7 @@ use instrumentation::{
     CommitTaskRunnerWithMetrics, PlanTaskRunnerWithMetrics, QueueReaderWithMetrics, RowGroupsMergerObserverWithMetrics,
     ShiftTaskRunnerWithMetrics, StorageWithMetrics,
 };
-use jobmanager::{
-    CachedStorage, JobCleanerConfig, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle,
-    Metrics as JobMetrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, WorkerConfig,
-};
+use jobmanager::{JobsManager, JobsManagerHandle, MetricsSink, S3StorageConfig, TaskDefinition};
 use plan_runner::PlanTaskRunnerImpl;
 pub use planner_partitioning::{CURRENT_PLANNER_PARTITION_SPEC, PlannerPartitionSpec};
 use shift_runner::ShiftTaskRunnerImpl;
@@ -96,14 +98,57 @@ pub struct ShifterHandle {
 
 impl Shifter {
     /// Create a new shifter instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError`] if the shift configuration is invalid, no job is configured, a
+    /// task runner rejects its settings, or the jobs manager cannot be built.
     pub async fn new(
         catalog: Arc<dyn Catalog>,
         queue_reader: Arc<ParquetQueueReader>,
         shift_config: Arc<ShiftConfig>,
         jobs_storage: S3StorageConfig,
         shift_metrics: ShiftMetrics,
-        jobs_manager_metrics: JobMetrics,
+        jobs_manager_metrics: Arc<dyn MetricsSink>,
         jobs: &[ShiftJobSpec],
+    ) -> Result<Self> {
+        Self::new_with_max_iterations(
+            catalog,
+            queue_reader,
+            shift_config,
+            jobs_storage,
+            shift_metrics,
+            jobs_manager_metrics,
+            jobs,
+            None,
+        )
+        .await
+    }
+
+    /// Create a shifter whose jobs stop after `max_iterations` plan cycles.
+    ///
+    /// With `max_iterations = Some(1)` each job runs one plan iteration - fanning out its shift
+    /// tasks and draining them through the commit task - and never starts a second one. `None`
+    /// runs every job on the configured interval, which is what [`Self::new`] does.
+    ///
+    /// This is a test seam: production callers use [`Self::new`]. The component test drives the
+    /// real assembly through it rather than rebuilding the task topology, so a task that is no
+    /// longer registered here fails that test instead of passing a parallel copy of the wiring.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::new`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_max_iterations(
+        catalog: Arc<dyn Catalog>,
+        queue_reader: Arc<ParquetQueueReader>,
+        shift_config: Arc<ShiftConfig>,
+        jobs_storage: S3StorageConfig,
+        shift_metrics: ShiftMetrics,
+        jobs_manager_metrics: Arc<dyn MetricsSink>,
+        jobs: &[ShiftJobSpec],
+        max_iterations: Option<u64>,
     ) -> Result<Self> {
         shift_config.validate()?;
         if jobs.is_empty() {
@@ -111,10 +156,15 @@ impl Shifter {
         }
 
         let queue_reader = Arc::new(QueueReaderWithMetrics::new(queue_reader, shift_metrics.clone()));
-        let timeouts = TimeoutEstimator::new(&shift_config.timeouts)?;
+        let timeouts = TimeoutEstimator::new(&shift_config.timeouts);
         let plan_timeout = timeouts.plan_timeout();
+        let iteration_interval = Duration::from_millis(shift_config.jobsmanager.iteration_interval_millisecs);
 
-        let mut job_defs: Vec<JobDefinition> = Vec::with_capacity(jobs.len());
+        let mut builder = JobsManager::builder()
+            .s3(jobs_storage)
+            .workers(shift_config.jobsmanager.worker_count)
+            .poll_interval(Duration::from_millis(shift_config.jobsmanager.poll_interval_ms))
+            .metrics(jobs_manager_metrics);
 
         for spec in jobs {
             let storage = Arc::new(IcebergStorage::new(
@@ -168,55 +218,23 @@ impl Shifter {
                 spec.topic,
             ));
 
-            let executor = Arc::new(Executor::new(plan_runner, shift_runner, commit_runner));
-
-            let initial_task =
-                TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), vec![], plan_timeout).map_err(map_shift_error)?;
-
-            let mut executors = HashMap::new();
-            executors.insert(TaskCode::new(PLAN_TASK_CODE), Arc::clone(&executor).plan_executor());
-            executors.insert(TaskCode::new(SHIFT_TASK_CODE), Arc::clone(&executor).shift_executor());
-            executors.insert(TaskCode::new(COMMIT_TASK_CODE), Arc::clone(&executor).commit_executor());
-
-            let iteration_interval_ms =
-                i64::try_from(shift_config.jobsmanager.iteration_interval_millisecs).map_err(|_| {
-                    IngestError::Shift(format!(
-                        "jobsmanager.iteration_interval_millisecs {} exceeds i64",
-                        shift_config.jobsmanager.iteration_interval_millisecs
-                    ))
-                })?;
-            let job_def = JobDefinition::new(spec.job_name.into(), vec![initial_task], executors)
-                .map_err(map_shift_error)?
-                .with_iteration_interval(ChronoDuration::milliseconds(iteration_interval_ms))
-                .map_err(map_shift_error)?;
-            job_defs.push(job_def);
+            builder = builder.job(spec.job_name, move |job| {
+                job.every(iteration_interval);
+                if let Some(max_iterations) = max_iterations {
+                    job.max_iterations(max_iterations);
+                }
+                job.add_task(
+                    TaskDefinition::new(PLAN_TASK_CODE, plan_timeout),
+                    Arc::new(PlanExecutor::new(plan_runner)),
+                );
+                // The shift and commit tasks are created by the plan task at runtime, so only
+                // their executors are registered here.
+                job.add_task_executor(SHIFT_TASK_CODE, Arc::new(ShiftExecutor::new(shift_runner)));
+                job.add_task_executor(COMMIT_TASK_CODE, Arc::new(CommitExecutor::new(commit_runner)));
+            });
         }
 
-        let job_registry = Arc::new(JobRegistry::new(job_defs).map_err(map_shift_error)?);
-
-        let s3_storage = Arc::new(
-            S3Storage::new(jobs_storage, job_registry.clone(), jobs_manager_metrics.clone())
-                .await
-                .map_err(map_shift_error)?,
-        );
-        let cached_storage = Arc::new(CachedStorage::new(s3_storage, jobs_manager_metrics.clone()));
-
-        let manager_config = JobsManagerConfig {
-            worker_count: shift_config.jobsmanager.worker_count,
-            worker_config: WorkerConfig {
-                poll_interval: Duration::from_millis(shift_config.jobsmanager.poll_interval_ms),
-                ..Default::default()
-            },
-            cleaner_config: JobCleanerConfig::default(),
-        };
-
-        let manager = JobsManager::new(
-            cached_storage,
-            manager_config,
-            job_registry,
-            jobs_manager_metrics.clone(),
-        )
-        .map_err(map_shift_error)?;
+        let manager = builder.build().await.map_err(map_shift_error)?;
 
         Ok(Self { manager })
     }

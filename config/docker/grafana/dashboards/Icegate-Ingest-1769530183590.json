@@ -5804,7 +5804,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (status) (increase(icegate_jobmanager_job_duration_seconds_count{job=\"ingest\"}[1m]))\n",
+          "expr": "sum by (status) (increase(jobmanager_job_duration_seconds_count{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{status}}",
           "range": true,
           "refId": "A"
@@ -5897,7 +5897,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "(\n  sum(rate(icegate_jobmanager_job_duration_seconds_count{job=\"ingest\", status=\"Completed\"}[1m]))\n)\n/\nclamp_min(\n  (\n    sum(rate(icegate_jobmanager_job_duration_seconds_count{job=\"ingest\"}[1m]))\n  ),\n  1e-12\n)\n",
+          "expr": "(\n  sum(rate(jobmanager_job_duration_seconds_count{job=\"ingest\", status=\"Completed\"}[1m]))\n)\n/\nclamp_min(\n  (\n    sum(rate(jobmanager_job_duration_seconds_count{job=\"ingest\"}[1m]))\n  ),\n  1e-12\n)\n",
           "legendFormat": "overall",
           "range": true,
           "refId": "A"
@@ -5991,7 +5991,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, code) (rate(icegate_jobmanager_job_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, code) (rate(jobmanager_job_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{code}} p95",
           "range": true,
           "refId": "A"
@@ -5999,7 +5999,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, code) (rate(icegate_jobmanager_job_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, code) (rate(jobmanager_job_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{code}} p50",
           "range": true,
           "refId": "B"
@@ -6092,7 +6092,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_count{job=\"ingest\", status=\"Failed\"}[1m]))\n",
+          "expr": "sum by (job_code, task_code) (rate(jobmanager_task_duration_seconds_count{job=\"ingest\", status=\"Failed\"}[1m]))\n",
           "legendFormat": "{{job_code}}-{{task_code}}",
           "range": true,
           "refId": "A"
@@ -6186,7 +6186,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, job_code, task_code) (rate(jobmanager_task_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{job_code}}-{{task_code}} p95",
           "range": true,
           "refId": "A"
@@ -6194,7 +6194,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job_code, task_code) (rate(icegate_jobmanager_task_duration_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, job_code, task_code) (rate(jobmanager_task_duration_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{job_code}}-{{task_code}} p50",
           "range": true,
           "refId": "B"
@@ -6288,7 +6288,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(icegate_jobmanager_storage_s3_latency_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(jobmanager_storage_s3_latency_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{operation}} p95",
           "range": true,
           "refId": "A"
@@ -6296,7 +6296,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, operation) (rate(icegate_jobmanager_storage_s3_latency_seconds_bucket{job=\"ingest\"}[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, operation) (rate(jobmanager_storage_s3_latency_seconds_bucket{job=\"ingest\"}[1m])))",
           "legendFormat": "{{operation}} p50",
           "range": true,
           "refId": "B"
@@ -6389,7 +6389,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (operation, http_status) (increase(icegate_jobmanager_storage_s3_latency_seconds_count{http_status!=\"OK\", job=\"ingest\"}[1m]))\n",
+          "expr": "sum by (operation, http_status) (rate(jobmanager_storage_s3_latency_seconds_count{http_status!=\"OK\", job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{operation}}-{{http_status}}",
           "range": true,
           "refId": "A"
@@ -6482,7 +6482,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "(\n  sum by (method) (rate(icegate_jobmanager_storage_cache_hits_ratio_total{job=\"ingest\"}[1m]))\n)\n/\nclamp_min(\n  (\n    sum by (method) (rate(icegate_jobmanager_storage_cache_hits_ratio_total{job=\"ingest\"}[1m])) +\n    sum by (method) (rate(icegate_jobmanager_storage_cache_misses_ratio_total{job=\"ingest\"}[1m]))\n  ),\n  1e-12\n)\n",
+          "expr": "(\n  sum by (method) (rate(jobmanager_storage_cache_hits_ratio_total{job=\"ingest\"}[1m]))\n)\n/\nclamp_min(\n  (\n    sum by (method) (rate(jobmanager_storage_cache_hits_ratio_total{job=\"ingest\"}[1m])) +\n    sum by (method) (rate(jobmanager_storage_cache_misses_ratio_total{job=\"ingest\"}[1m]))\n  ),\n  1e-12\n)\n",
           "legendFormat": "{{method}}",
           "range": true,
           "refId": "A"
@@ -6575,7 +6575,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (operation) (irate(icegate_jobmanager_storage_s3_latency_seconds_count{job=\"ingest\"}[1m]))\n",
+          "expr": "sum by (operation) (irate(jobmanager_storage_s3_latency_seconds_count{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{operation}}",
           "range": true,
           "refId": "A"
@@ -6668,7 +6668,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (job_code, task_code, phase) (increase(icegate_jobmanager_task_stolen_ratio_total{job=\"ingest\"}[1m]))\n",
+          "expr": "sum by (job_code, task_code, phase) (increase(jobmanager_task_stolen_ratio_total{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{job_code}}-{{task_code}}-{{phase}}",
           "range": true,
           "refId": "A"
@@ -6761,7 +6761,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "sum by (job_code, phase) (increase(icegate_jobmanager_save_conflict_retry_ratio_total{job=\"ingest\"}[1m]))\n",
+          "expr": "sum by (job_code, phase) (increase(jobmanager_save_conflict_retry_ratio_total{job=\"ingest\"}[1m]))\n",
           "legendFormat": "{{job_code}}-{{phase}}",
           "range": true,
           "refId": "A"

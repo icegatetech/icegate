@@ -73,6 +73,9 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+# The shift end-to-end test drives the production assembly against a real object store, which the
+# `testing` feature provides (container bootstrap plus bucket/object-store helpers).
+icegate-common = { workspace = true, features = ["testing", "shed-tonic"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 flate2 = "1"
 zstd = "0.13"

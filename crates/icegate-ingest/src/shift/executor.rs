@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use jobmanager::{ImmutableTask, JobManager, TaskExecutorFn};
+use async_trait::async_trait;
+use jobmanager::{TaskContext, TaskExecutor, TaskOutcome, TaskResult};
 use serde::{Deserialize, Serialize};
 
 use super::{commit_runner::CommitTaskRunner, plan_runner::PlanTaskRunner, shift_runner::ShiftTaskRunner};
@@ -18,15 +19,14 @@ pub const SHIFT_TASK_CODE: &str = "shift";
 pub const COMMIT_TASK_CODE: &str = "commit";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-/// Task execution status used for metrics and control flow.
+/// How a task runner finished the task it was given.
+///
+/// Every variant is a run that produced no error: a failure is reported as `Err` by the runner and
+/// never reaches this type, so a status here always closes or re-opens the task rather than
+/// failing it.
 pub enum TaskStatus {
     /// Task completed successfully.
     Ok,
-    /// Task failed with an error.
-    Error,
-    /// Task exceeded its timeout.
-    #[allow(dead_code)]
-    Timeout,
     /// Task was cancelled.
     Cancelled,
     /// Task produced no work to do.
@@ -38,10 +38,21 @@ impl TaskStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            Self::Error => "error",
-            Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::Empty => "empty",
+        }
+    }
+
+    /// Outcome the worker applies to a task that finished with this status,
+    /// storing `output` as its result.
+    ///
+    /// A cancelled task resolves to [`TaskOutcome::Cancelled`]: the shutdown that stopped it left
+    /// its work undone, so the task stays open and is executed again instead of being recorded as
+    /// a completion that shifted nothing.
+    fn into_outcome(self, output: Vec<u8>) -> TaskOutcome {
+        match self {
+            Self::Cancelled => TaskOutcome::Cancelled,
+            Self::Ok | Self::Empty => TaskOutcome::Completed(output),
         }
     }
 }
@@ -96,87 +107,114 @@ pub struct CommitInput {
     pub trace_context: Option<String>,
 }
 
-/// Shared executor dependencies for shift tasks.
-#[allow(clippy::struct_field_names)]
-pub struct Executor<PR, SR, CR> {
-    plan_runner: Arc<PR>,
-    shift_runner: Arc<SR>,
-    commit_runner: Arc<CR>,
+/// Executor of the plan task: reads the WAL plan and fans out the shift and commit tasks.
+pub struct PlanExecutor<R> {
+    runner: Arc<R>,
 }
 
-impl<PR, SR, CR> Executor<PR, SR, CR>
+impl<R> PlanExecutor<R> {
+    /// Wraps `runner` as the executor registered under [`PLAN_TASK_CODE`].
+    pub const fn new(runner: Arc<R>) -> Self {
+        Self { runner }
+    }
+}
+
+#[async_trait]
+impl<R> TaskExecutor for PlanExecutor<R>
 where
-    PR: PlanTaskRunner + 'static,
-    SR: ShiftTaskRunner + 'static,
-    CR: CommitTaskRunner + 'static,
+    R: PlanTaskRunner + 'static,
 {
-    /// Creates a new executor and initializes shared dependencies.
-    pub const fn new(plan_runner: Arc<PR>, shift_runner: Arc<SR>, commit_runner: Arc<CR>) -> Self {
-        Self {
-            plan_runner,
-            shift_runner,
-            commit_runner,
+    async fn execute(&self, ctx: TaskContext) -> TaskResult {
+        let result = self.runner.run(&ctx).await?;
+        Ok(result.status.into_outcome(Vec::new()))
+    }
+}
+
+/// Executor of the shift task: writes one chunk of WAL row groups as Iceberg parquet files.
+pub struct ShiftExecutor<R> {
+    runner: Arc<R>,
+}
+
+impl<R> ShiftExecutor<R> {
+    /// Wraps `runner` as the executor registered under [`SHIFT_TASK_CODE`].
+    pub const fn new(runner: Arc<R>) -> Self {
+        Self { runner }
+    }
+}
+
+#[async_trait]
+impl<R> TaskExecutor for ShiftExecutor<R>
+where
+    R: ShiftTaskRunner + 'static,
+{
+    /// The written parquet paths are the task's output payload: the commit task reads them back
+    /// from the tasks it depends on, so returning them is what hands the fan-out its input.
+    async fn execute(&self, ctx: TaskContext) -> TaskResult {
+        let result = self
+            .runner
+            .run(&ctx)
+            .await
+            .map_err(super::shift_runner::ShiftTaskFailure::into_error)?;
+        Ok(result.status.into_outcome(result.output))
+    }
+}
+
+/// Executor of the commit task: commits the shifted parquet files as one Iceberg snapshot.
+pub struct CommitExecutor<R> {
+    runner: Arc<R>,
+}
+
+impl<R> CommitExecutor<R> {
+    /// Wraps `runner` as the executor registered under [`COMMIT_TASK_CODE`].
+    pub const fn new(runner: Arc<R>) -> Self {
+        Self { runner }
+    }
+}
+
+#[async_trait]
+impl<R> TaskExecutor for CommitExecutor<R>
+where
+    R: CommitTaskRunner + 'static,
+{
+    async fn execute(&self, ctx: TaskContext) -> TaskResult {
+        let result = self
+            .runner
+            .run(&ctx)
+            .await
+            .map_err(super::commit_runner::CommitTaskFailure::into_error)?;
+        Ok(result.status.into_outcome(Vec::new()))
+    }
+}
+
+pub(crate) fn parse_task_input<T: for<'de> Deserialize<'de>>(input: &[u8]) -> Result<T, jobmanager::Error> {
+    serde_json::from_slice(input).map_err(|e| jobmanager::Error::Other(format!("failed to parse task input: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TaskOutcome, TaskStatus};
+
+    /// A shutdown observed mid-task must leave the task open. Completing it instead would record
+    /// an iteration that shifted nothing as successful, and its WAL segments would only be picked
+    /// up by the next plan.
+    #[test]
+    fn a_cancelled_task_is_left_open_rather_than_completed() {
+        assert_eq!(
+            TaskStatus::Cancelled.into_outcome(b"ignored".to_vec()),
+            TaskOutcome::Cancelled
+        );
+    }
+
+    /// Every other status closes the task, carrying whatever payload the runner produced - the
+    /// shift task's parquet paths are what the commit task reads back.
+    #[test]
+    fn a_finished_task_completes_with_the_payload_it_produced() {
+        for status in [TaskStatus::Ok, TaskStatus::Empty] {
+            assert_eq!(
+                status.into_outcome(b"output".to_vec()),
+                TaskOutcome::Completed(b"output".to_vec()),
+                "status {status:?} must complete the task"
+            );
         }
     }
-    /// Creates executor for the plan task.
-    pub fn plan_executor(self: Arc<Self>) -> TaskExecutorFn {
-        Arc::new(
-            move |task: Arc<dyn ImmutableTask>, manager: &dyn JobManager, cancel_token| {
-                let executor = Arc::clone(&self);
-                let task_id = *task.id();
-
-                let fut = async move {
-                    executor.plan_runner.run(task_id, manager, &cancel_token).await?;
-                    Ok(())
-                };
-
-                Box::pin(fut)
-            },
-        )
-    }
-
-    /// Creates executor for the shift task.
-    pub fn shift_executor(self: Arc<Self>) -> TaskExecutorFn {
-        Arc::new(
-            move |task: Arc<dyn ImmutableTask>, manager: &dyn JobManager, cancel_token| {
-                let executor = Arc::clone(&self);
-
-                let fut = async move {
-                    executor
-                        .shift_runner
-                        .run(task, manager, &cancel_token)
-                        .await
-                        .map(|_| ())
-                        .map_err(super::shift_runner::ShiftTaskFailure::into_error)
-                };
-
-                Box::pin(fut)
-            },
-        )
-    }
-
-    /// Creates executor for the commit task.
-    pub fn commit_executor(self: Arc<Self>) -> TaskExecutorFn {
-        Arc::new(
-            move |task: Arc<dyn ImmutableTask>, manager: &dyn JobManager, cancel_token| {
-                let executor = Arc::clone(&self);
-
-                let fut = async move {
-                    executor
-                        .commit_runner
-                        .run(task, manager, &cancel_token)
-                        .await
-                        .map(|_| ())
-                        .map_err(super::commit_runner::CommitTaskFailure::into_error)
-                };
-
-                Box::pin(fut)
-            },
-        )
-    }
-}
-
-pub(crate) fn parse_task_input<T: for<'de> Deserialize<'de>>(task: &dyn ImmutableTask) -> Result<T, jobmanager::Error> {
-    serde_json::from_slice(task.get_input())
-        .map_err(|e| jobmanager::Error::TaskExecution(format!("failed to parse task input: {e}")))
 }

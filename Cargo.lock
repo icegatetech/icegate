@@ -4013,7 +4013,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=c169cf64a4e4eaf8e6ce4312f2de87fb762a4614#c169cf64a4e4eaf8e6ce4312f2de87fb762a4614"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4070,7 +4070,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=c169cf64a4e4eaf8e6ce4312f2de87fb762a4614#c169cf64a4e4eaf8e6ce4312f2de87fb762a4614"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4085,7 +4085,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=c169cf64a4e4eaf8e6ce4312f2de87fb762a4614#c169cf64a4e4eaf8e6ce4312f2de87fb762a4614"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4104,7 +4104,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-s3tables"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=c169cf64a4e4eaf8e6ce4312f2de87fb762a4614#c169cf64a4e4eaf8e6ce4312f2de87fb762a4614"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4117,7 +4117,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=c169cf64a4e4eaf8e6ce4312f2de87fb762a4614#c169cf64a4e4eaf8e6ce4312f2de87fb762a4614"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4133,7 +4133,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=c169cf64a4e4eaf8e6ce4312f2de87fb762a4614#c169cf64a4e4eaf8e6ce4312f2de87fb762a4614"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4700,7 +4700,7 @@ dependencies = [
 [[package]]
 name = "jobmanager"
 version = "0.1.0"
-source = "git+https://github.com/icegatetech/jobmanager?rev=19ccaf8e6da4730570738de4e2eafd327c431b2d#19ccaf8e6da4730570738de4e2eafd327c431b2d"
+source = "git+https://github.com/icegatetech/jobmanager?rev=e280a2c937c4a6850608f587adb7f10aa8923258#e280a2c937c4a6850608f587adb7f10aa8923258"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4710,7 +4710,6 @@ dependencies = [
  "dashmap",
  "futures-util",
  "opentelemetry",
- "opentelemetry_sdk",
  "parking_lot",
  "rand 0.9.5",
  "serde",
