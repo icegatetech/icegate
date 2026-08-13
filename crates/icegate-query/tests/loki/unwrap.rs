@@ -12,13 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use datafusion::arrow::{
-    array::{
-        ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
-        TimestampMicrosecondArray,
-    },
-    datatypes::DataType,
-};
+use datafusion::arrow::array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch, StringArray, TimestampMicrosecondArray};
 use datafusion::parquet::file::properties::WriterProperties;
 use iceberg::{
     Catalog,
@@ -38,7 +32,7 @@ use iceberg::{
 use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
 use serde_json::Value;
 
-use super::harness::TestServer;
+use super::harness::{TestServer, build_attribute_map, map_entry_fields};
 
 /// Build a `RecordBatch` with test logs containing numeric attributes for unwrap testing
 fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch, Box<dyn std::error::Error>> {
@@ -93,60 +87,25 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(9);
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            _ => panic!("Expected Struct type for map entries"),
-        },
-        _ => panic!("Expected Map type for attributes field"),
-    };
+    // Each value is a measurement of THIS log record (its latency, its
+    // response size, ...), so log is the only level that genuinely fits;
+    // resource/scope stay empty. `unwrap`'s label lookup (`attribute_lookup`)
+    // and grouping's (`merged_attributes`) both resolve across all three
+    // levels, so which column these live in does not change any assertion.
+    let row0: [(&str, &str); 2] = [("latency_ms", "120"), ("response_bytes", "2048")]; // Row 0
+    let row1: [(&str, &str); 2] = [("latency_ms", "150"), ("response_bytes", "3072")]; // Row 1
+    let row2: [(&str, &str); 3] = [("latency_ms", "90"), ("response_bytes", "1024"), ("duration_str", "5m")]; // Row 2
+    let row3: [(&str, &str); 1] = [("counter", "100")]; // Row 3
+    let row4: [(&str, &str); 1] = [("counter", "120")]; // Row 4: increasing counter for rate_counter test
+    let log_rows: [&[(&str, &str)]; 5] = [&row0, &row1, &row2, &row3, &row4];
 
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let key_builder = StringBuilder::new();
-    let value_builder = StringBuilder::new();
-    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-
-    // Row 0: latency_ms=120, response_bytes=2048
-    attributes_builder.keys().append_value("latency_ms");
-    attributes_builder.values().append_value("120");
-    attributes_builder.keys().append_value("response_bytes");
-    attributes_builder.values().append_value("2048");
-    attributes_builder.append(true)?;
-
-    // Row 1: latency_ms=150, response_bytes=3072
-    attributes_builder.keys().append_value("latency_ms");
-    attributes_builder.values().append_value("150");
-    attributes_builder.keys().append_value("response_bytes");
-    attributes_builder.values().append_value("3072");
-    attributes_builder.append(true)?;
-
-    // Row 2: latency_ms=90, response_bytes=1024, duration_str=5m
-    attributes_builder.keys().append_value("latency_ms");
-    attributes_builder.values().append_value("90");
-    attributes_builder.keys().append_value("response_bytes");
-    attributes_builder.values().append_value("1024");
-    attributes_builder.keys().append_value("duration_str");
-    attributes_builder.values().append_value("5m");
-    attributes_builder.append(true)?;
-
-    // Row 3: counter=100
-    attributes_builder.keys().append_value("counter");
-    attributes_builder.values().append_value("100");
-    attributes_builder.append(true)?;
-
-    // Row 4: counter=120 (increasing counter for rate_counter test)
-    attributes_builder.keys().append_value("counter");
-    attributes_builder.values().append_value("120");
-    attributes_builder.append(true)?;
-
-    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+    let empty_rows: [&[(&str, &str)]; 5] = [&[], &[], &[], &[], &[]];
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &empty_rows);
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &empty_rows);
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let log_attributes = build_attribute_map(log_key_field, log_value_field, &log_rows);
 
     // trace_id / span_id are FIXED_LEN_BYTE_ARRAY in storage; the per-row
     // value is just `i` repeated for 16 / 8 bytes.
@@ -163,7 +122,7 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
     RecordBatch::try_new(
-        arrow_schema.clone(),
+        arrow_schema,
         vec![
             tenant_id,
             service_name,
@@ -174,7 +133,9 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
             span_id,
             severity_text,
             body,
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )
     .map_err(Into::into)

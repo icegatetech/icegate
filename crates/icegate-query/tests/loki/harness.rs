@@ -15,7 +15,7 @@ use datafusion::{
             ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
             TimestampMicrosecondArray,
         },
-        datatypes::DataType,
+        datatypes::{DataType, FieldRef, Schema},
     },
     parquet::file::properties::WriterProperties,
 };
@@ -45,6 +45,65 @@ use reqwest::Client;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+// ============================================================================
+// Attribute map fixture builders
+// ============================================================================
+//
+// The logs table stores attributes as three separate MAP columns —
+// `resource_attributes`, `scope_attributes`, `log_attributes` — one per OTLP
+// level (see SCHEMA.md), each with its own Iceberg field-id metadata. Every
+// fixture in this test suite needs to build all three, so the shared
+// (key_field, value_field) extraction and MapArray construction live here
+// instead of being copy-pasted per file.
+
+/// Extract the key/value `Field`s of the MAP-typed column at `field_idx` in
+/// `arrow_schema`.
+///
+/// Each of `resource_attributes` / `scope_attributes` / `log_attributes`
+/// carries distinct Iceberg field-id metadata, so callers MUST pass the index
+/// matching the level they are about to build with [`build_attribute_map`] —
+/// reusing another level's fields here makes the built array's `DataType`
+/// disagree with the target schema field, and `RecordBatch::try_new` rejects
+/// that as a genuine mismatch rather than accepting it silently.
+///
+/// # Panics
+/// Panics if `field_idx` is not a `Map<Struct>` column — a fixture-authoring
+/// error the test should fail loudly on, not a runtime condition to recover
+/// from.
+pub fn map_entry_fields(arrow_schema: &Schema, field_idx: usize) -> (FieldRef, FieldRef) {
+    match arrow_schema.field(field_idx).data_type() {
+        DataType::Map(entries_field, _) => match entries_field.data_type() {
+            DataType::Struct(fields) => (Arc::clone(&fields[0]), Arc::clone(&fields[1])),
+            other => panic!("expected Struct type for map entries, got {other:?}"),
+        },
+        other => panic!("expected Map type for attributes field, got {other:?}"),
+    }
+}
+
+/// Build one level's attribute `MapArray` from each row's `(key, value)`
+/// pairs. `rows.len()` becomes the array's row count, so callers building a
+/// multi-column `RecordBatch` must pass one entry per row even when a given
+/// row's map is empty. `key_field`/`value_field` must come from
+/// [`map_entry_fields`] for the same column position this array is placed at.
+pub fn build_attribute_map(key_field: FieldRef, value_field: FieldRef, rows: &[&[(&str, &str)]]) -> ArrayRef {
+    let field_names = MapFieldNames {
+        entry: "key_value".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut builder = MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field)
+        .with_values_field(value_field);
+    for pairs in rows {
+        for (k, v) in *pairs {
+            builder.keys().append_value(*k);
+            builder.values().append_value(*v);
+        }
+        builder.append(true).expect("append map row");
+    }
+    Arc::new(builder.finish())
+}
 
 /// Test server configuration and handles
 pub struct TestServer {
@@ -205,26 +264,6 @@ pub async fn write_test_logs_for_tenant(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(9);
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            _ => panic!("Expected Struct type for map entries"),
-        },
-        _ => panic!("Expected Map type for attributes field"),
-    };
-
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let key_builder = StringBuilder::new();
-    let value_builder = StringBuilder::new();
-    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-
     // Test data trace_id and span_id values as hex strings
     let trace_ids = [
         "0102030405060708090a0b0c0d0e0f10",
@@ -238,17 +277,24 @@ pub async fn write_test_logs_for_tenant(
         format!("{} message 3", body_prefix),
     ];
 
-    for body in &bodies {
-        // tenant_marker
-        attributes_builder.keys().append_value("tenant_marker");
-        attributes_builder.values().append_value(tenant_id);
-        // body (duplicate indexed column into attributes)
-        attributes_builder.keys().append_value("body");
-        attributes_builder.values().append_value(body.as_str());
-        attributes_builder.append(true)?;
-    }
+    // `tenant.marker` is constant for every record this writer instance
+    // emits, so it belongs at the resource level; `body` duplicates the
+    // typed column per record, so it stays a log attribute. Stored dotted
+    // ('tenant.marker', not 'tenant_marker') so the read path's '.' -> '_'
+    // normalisation is actually exercised — both spellings produce the same
+    // wire label, so nothing downstream depends on which one is stored.
+    let resource_pairs: [(&str, &str); 1] = [("tenant.marker", tenant_id)];
+    let resource_rows: [&[(&str, &str)]; 3] = [&resource_pairs, &resource_pairs, &resource_pairs];
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &resource_rows);
 
-    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &[&[], &[], &[]]);
+
+    let log_pairs: Vec<[(&str, &str); 1]> = bodies.iter().map(|b| [("body", b.as_str())]).collect();
+    let log_rows: Vec<&[(&str, &str)]> = log_pairs.iter().map(<[(&str, &str); 1]>::as_slice).collect();
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let log_attributes = build_attribute_map(log_key_field, log_value_field, &log_rows);
 
     // trace_id is now stored as raw 16-byte FIXED_LEN_BYTE_ARRAY; decode hex
     // fixtures into bytes to match the production schema.
@@ -267,7 +313,7 @@ pub async fn write_test_logs_for_tenant(
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
     let batch = RecordBatch::try_new(
-        arrow_schema.clone(),
+        arrow_schema,
         vec![
             tenant_id_arr,
             service_name_arr,
@@ -278,7 +324,9 @@ pub async fn write_test_logs_for_tenant(
             span_id,
             severity_text,
             body,
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )?;
 
@@ -350,26 +398,6 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(9);
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            _ => panic!("Expected Struct type for map entries"),
-        },
-        _ => panic!("Expected Map type for attributes field"),
-    };
-
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let key_builder = StringBuilder::new();
-    let value_builder = StringBuilder::new();
-    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-
     // Test data trace_id and span_id values as hex strings
     let trace_ids = [
         "0102030405060708090a0b0c0d0e0f10",
@@ -383,35 +411,41 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         "Database connection slow",
     ];
 
-    // Indexed top-level columns are NOT mirrored into the attributes map —
+    // Indexed top-level columns are NOT mirrored into the attributes maps —
     // the read pipeline reconstructs the merged labels view from the typed
     // columns at materialisation time (see loki/formatters.rs::extract_labels).
-    // Row 0
-    attributes_builder.keys().append_value("user_id");
-    attributes_builder.values().append_value("user-123");
-    attributes_builder.keys().append_value("request_id");
-    attributes_builder.values().append_value("req-456");
-    attributes_builder.keys().append_value("body");
-    attributes_builder.values().append_value(bodies[0]);
-    attributes_builder.append(true)?;
-    // Row 1
-    attributes_builder.keys().append_value("page");
-    attributes_builder.values().append_value("/dashboard");
-    attributes_builder.keys().append_value("latency_ms");
-    attributes_builder.values().append_value("120");
-    attributes_builder.keys().append_value("body");
-    attributes_builder.values().append_value(bodies[1]);
-    attributes_builder.append(true)?;
-    // Row 2
-    attributes_builder.keys().append_value("db_host");
-    attributes_builder.values().append_value("db-primary");
-    attributes_builder.keys().append_value("query_time_ms");
-    attributes_builder.values().append_value("250");
-    attributes_builder.keys().append_value("body");
-    attributes_builder.values().append_value(bodies[2]);
-    attributes_builder.append(true)?;
+    //
+    // Every attribute here is genuinely log-record-level (it describes THIS
+    // event, not the reporting resource or the instrumentation scope), so
+    // resource_attributes/scope_attributes are legitimately empty — that is
+    // itself a realistic OTel shape, not a fixture gap. Keys are stored
+    // dotted (`user.id`, not `user_id`) so the read path's '.' -> '_'
+    // normalisation is actually exercised; pipeline.rs/labels.rs assert on
+    // the post-normalization wire names (`user_id`, `request_id`), which are
+    // unchanged by the storage spelling.
+    // Row 0: "User logged in successfully"
+    let row0_pairs: [(&str, &str); 3] = [("user.id", "user-123"), ("request.id", "req-456"), ("body", bodies[0])];
+    // Row 1: "Page rendered in 120ms"
+    let row1_pairs: [(&str, &str); 3] = [
+        ("http.target", "/dashboard"),
+        ("http.duration_ms", "120"),
+        ("body", bodies[1]),
+    ];
+    // Row 2: "Database connection slow"
+    let row2_pairs: [(&str, &str); 3] = [
+        ("server.address", "db-primary"),
+        ("db.query_time_ms", "250"),
+        ("body", bodies[2]),
+    ];
 
-    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &[&[], &[], &[]]);
+
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &[&[], &[], &[]]);
+
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let log_attributes = build_attribute_map(log_key_field, log_value_field, &[&row0_pairs, &row1_pairs, &row2_pairs]);
 
     // trace_id / span_id are now FIXED_LEN_BYTE_ARRAY — decode hex fixtures.
     let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
@@ -429,7 +463,7 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
     let batch = RecordBatch::try_new(
-        arrow_schema.clone(),
+        arrow_schema,
         vec![
             tenant_id,
             service_name,
@@ -440,7 +474,9 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
             span_id,
             severity_text,
             body,
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )?;
 

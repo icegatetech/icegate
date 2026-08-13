@@ -45,13 +45,20 @@ impl ComparisonOp {
 
 /// Scope tag for an attribute reference in a `TraceQL` field expression.
 ///
-/// `TraceQL` distinguishes attributes by the OTLP entity they belong to:
-/// the span itself, its parent resource, an event, or a link. The
-/// [`Scope::Any`] variant maps to `TraceQL`'s leading-dot shorthand
-/// (e.g., `.http.status_code`) which lets the engine search any scope.
+/// `TraceQL` distinguishes attributes by the OTLP entity they belong to: the
+/// span itself, its parent resource, an event, or a link. There is no
+/// separate scope for OTLP `InstrumentationScope.attributes` — `TraceQL`/
+/// Tempo has no instrumentation-scope query scope, so those attributes
+/// resolve through [`Self::Span`] (see
+/// `traceql::datafusion::selectors::span_attribute_lhs`), exactly as if
+/// they had been physically written into `span_attributes` (which is what
+/// ingest did before the OTel-native storage split). The [`Scope::Any`]
+/// variant maps to `TraceQL`'s leading-dot shorthand (e.g.,
+/// `.http.status_code`) which lets the engine search any scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
-    /// `span.foo`
+    /// `span.foo` — also reaches `OTel` `InstrumentationScope.attributes`,
+    /// which have no `TraceQL` scope of their own.
     Span,
     /// `resource.foo`
     Resource,

@@ -26,8 +26,9 @@ use icegate_common::{
     ICEGATE_NAMESPACE,
     catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
     schema::{
-        COL_ATTRIBUTES, COL_BODY, COL_INGESTED_TIMESTAMP, COL_OBSERVED_TIMESTAMP, COL_SERVICE_NAME, COL_SEVERITY_TEXT,
-        COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID, logs_partition_spec, logs_schema, logs_sort_order,
+        COL_BODY, COL_INGESTED_TIMESTAMP, COL_LOG_ATTRIBUTES, COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES,
+        COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP,
+        COL_TRACE_ID, logs_partition_spec, logs_schema, logs_sort_order,
     },
 };
 use icegate_queue::{PreparedWalRowGroup, RowGroupPlanEntry, SegmentsPlan};
@@ -431,15 +432,29 @@ fn build_segments_plan(segments: &[WalSegment]) -> SegmentsPlan {
     }
 }
 
-/// A logs batch on the canonical schema: `(tenant_id, service_name, timestamp, row tag)` per row.
+/// A logs batch on the canonical schema: `(tenant_id, service_name, timestamp, row tag)` per row,
+/// built against an explicit Arrow schema.
 ///
 /// The row tag lands in `body` as `msg-<tag>`, which is what pins a row's identity through the
 /// pipeline - the canonical schema carries no synthetic row id, and `body` is the only field the
 /// sort key ignores. Every other column is filled with a fixed value: the cases here are about
 /// partitioning, ordering, and what reaches Iceberg, not about the payload.
+///
+/// `schema` matters: a freshly derived [`crate::transform::logs_arrow_schema`] is only
+/// self-consistent in isolation. `create_logs_table` (this module) builds its catalog with
+/// `CatalogBackend::Memory` — the plain upstream `MemoryCatalogBuilder` — which reassigns
+/// nested field ids (map children in particular) on `create_table`, so a batch destined for
+/// the real writer must carry the created table's own current schema, not a freshly derived
+/// one; see `icegate_common::iceberg_write`'s `spans_batch` helper for the identical
+/// requirement on the spans side. This is specific to the `Memory` backend: the production
+/// `S3Catalog` preserves the caller's field ids verbatim instead (`IcebergTableMetadata::create`
+/// in `icegate-catalog-s3/src/domain/root.rs`, pinned by its `create_preserves_caller_field_ids`
+/// regression test). Fixtures that never reach a real Iceberg writer (e.g. sorter-only tests)
+/// may pass a fresh [`crate::transform::logs_arrow_schema`]; one that writes through
+/// `create_logs_table` must pass `schema_to_arrow_schema(table.metadata().current_schema())`.
 #[allow(clippy::needless_pass_by_value)]
-pub(super) fn logs_ingest_batch(rows: Vec<(&str, Option<&str>, i64, i64)>) -> RecordBatch {
-    let schema = Arc::new(crate::transform::logs_arrow_schema());
+pub(super) fn logs_ingest_batch_with_schema(schema: &Schema, rows: Vec<(&str, Option<&str>, i64, i64)>) -> RecordBatch {
+    let schema = Arc::new(schema.clone());
     let row_count = rows.len();
     let timestamps = rows.iter().map(|(_, _, timestamp, _)| *timestamp).collect::<Vec<_>>();
     let timestamps: ArrayRef = Arc::new(TimestampMicrosecondArray::from(timestamps));
@@ -477,7 +492,18 @@ pub(super) fn logs_ingest_batch(rows: Vec<(&str, Option<&str>, i64, i64)>) -> Re
                     .collect::<Vec<_>>(),
             )) as ArrayRef,
         ),
-        (COL_ATTRIBUTES, empty_attributes_column(&schema, row_count)),
+        (
+            COL_RESOURCE_ATTRIBUTES,
+            empty_attributes_column(&schema, COL_RESOURCE_ATTRIBUTES, row_count),
+        ),
+        (
+            COL_SCOPE_ATTRIBUTES,
+            empty_attributes_column(&schema, COL_SCOPE_ATTRIBUTES, row_count),
+        ),
+        (
+            COL_LOG_ATTRIBUTES,
+            empty_attributes_column(&schema, COL_LOG_ATTRIBUTES, row_count),
+        ),
     ]);
     let columns = schema
         .fields()
@@ -501,23 +527,39 @@ pub(super) fn row_tag_body(row_tag: i64) -> String {
 
 /// Two ingest batches over two tenants, in the order they were received - unsorted, interleaved,
 /// and with a tie on the full sort key inside each tenant. One batch per WAL segment.
+///
+/// Built against a freshly derived schema; see [`logs_ingest_batch_with_schema`] for when that is
+/// (and is not) safe. A test that writes through the real catalog must use
+/// [`two_tenant_ingest_batches_with_schema`] instead.
 pub(super) fn two_tenant_ingest_batches() -> [RecordBatch; 2] {
+    two_tenant_ingest_batches_with_schema(&crate::transform::logs_arrow_schema())
+}
+
+/// As [`two_tenant_ingest_batches`], but built against an explicit Arrow schema — see
+/// [`logs_ingest_batch_with_schema`].
+pub(super) fn two_tenant_ingest_batches_with_schema(schema: &Schema) -> [RecordBatch; 2] {
     [
-        logs_ingest_batch(vec![
-            ("tenant-b", Some("svc-z"), 10, 900),
-            ("tenant-a", Some("svc-1"), 100, 101),
-            ("tenant-a", Some("svc-1"), 100, 102),
-            ("tenant-b", Some("svc-y"), 20, 901),
-            ("tenant-a", Some("svc-0"), 110, 103),
-            ("tenant-a", Some("svc-a"), 50, 104),
-        ]),
-        logs_ingest_batch(vec![
-            ("tenant-a", Some("svc-1"), 100, 201),
-            ("tenant-b", Some("svc-x"), 30, 902),
-            ("tenant-a", Some("svc-2"), 90, 202),
-            ("tenant-a", Some("svc-1"), 100, 203),
-            ("tenant-b", Some("svc-a"), 70, 903),
-        ]),
+        logs_ingest_batch_with_schema(
+            schema,
+            vec![
+                ("tenant-b", Some("svc-z"), 10, 900),
+                ("tenant-a", Some("svc-1"), 100, 101),
+                ("tenant-a", Some("svc-1"), 100, 102),
+                ("tenant-b", Some("svc-y"), 20, 901),
+                ("tenant-a", Some("svc-0"), 110, 103),
+                ("tenant-a", Some("svc-a"), 50, 104),
+            ],
+        ),
+        logs_ingest_batch_with_schema(
+            schema,
+            vec![
+                ("tenant-a", Some("svc-1"), 100, 201),
+                ("tenant-b", Some("svc-x"), 30, 902),
+                ("tenant-a", Some("svc-2"), 90, 202),
+                ("tenant-a", Some("svc-1"), 100, 203),
+                ("tenant-b", Some("svc-a"), 70, 903),
+            ],
+        ),
     ]
 }
 
@@ -534,12 +576,12 @@ pub(super) fn expected_row_bodies(tenant: &str) -> Vec<String> {
     row_tags.iter().copied().map(row_tag_body).collect()
 }
 
-/// An empty `MAP<Utf8,Utf8>` column of length `row_count`, typed exactly like the `attributes`
-/// field of `schema`, so it satisfies the required map of the canonical logs schema.
-fn empty_attributes_column(schema: &Schema, row_count: usize) -> ArrayRef {
-    let attributes = schema.field_with_name(COL_ATTRIBUTES).expect("attributes field");
+/// An empty `MAP<Utf8,Utf8>` column of length `row_count`, typed exactly like the named
+/// attribute-map field of `schema`, so it satisfies that required map of the canonical logs schema.
+fn empty_attributes_column(schema: &Schema, column: &str, row_count: usize) -> ArrayRef {
+    let attributes = schema.field_with_name(column).unwrap_or_else(|_| panic!("{column} field"));
     let DataType::Map(entry_field, ordered) = attributes.data_type() else {
-        panic!("attributes must be a Map");
+        panic!("{column} must be a Map");
     };
     let DataType::Struct(entry_fields) = entry_field.data_type() else {
         panic!("map entry must be a Struct");

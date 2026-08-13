@@ -2,4 +2,5 @@
 
 mod echo;
 mod harness;
+mod search;
 mod tags;

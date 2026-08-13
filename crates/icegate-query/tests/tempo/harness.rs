@@ -181,6 +181,43 @@ pub async fn write_test_spans_with_properties(
     tenant_id: &str,
     writer_properties: WriterProperties,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    write_spans_fixture(table, catalog, tenant_id, writer_properties, &[&[], &[], &[]]).await
+}
+
+/// Like [`write_test_spans`] but sets each row's `scope_attributes` (`OTel`
+/// `InstrumentationScope.attributes`) to the given per-row key/value pairs
+/// instead of leaving them empty. `scope_attribute_rows` must have exactly
+/// three entries, one per row of the fixed fixture — see
+/// [`write_spans_fixture`]. Every other column matches [`write_test_spans`].
+pub async fn write_test_spans_with_scope_attributes(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        WriterProperties::builder().build(),
+        scope_attribute_rows,
+    )
+    .await
+}
+
+/// Shared row-assembly core for [`write_test_spans_with_properties`] and
+/// [`write_test_spans_with_scope_attributes`] — writes the fixed
+/// three-span fixture (frontend/frontend/backend) every Tempo test in this
+/// crate builds on. Only the writer properties and the `scope_attributes`
+/// contents vary between callers; everything else (resource/span
+/// attributes, ids, timestamps) is fixed.
+async fn write_spans_fixture(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    writer_properties: WriterProperties,
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
@@ -281,6 +318,11 @@ pub async fn write_test_spans_with_properties(
             &[("db.statement", "SELECT * FROM users")],
         ],
     )?;
+    // Build scope_attributes map (OTel InstrumentationScope.attributes).
+    // Content is caller-supplied — empty by default via
+    // `write_test_spans`/`write_test_spans_with_properties`, populated by
+    // `write_test_spans_with_scope_attributes`.
+    let scope_attributes = build_attribute_map(&arrow_schema, col_idx("scope_attributes"), scope_attribute_rows)?;
 
     let flags: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(0)]));
     let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(0)]));
@@ -310,6 +352,7 @@ pub async fn write_test_spans_with_properties(
     by_name.insert("status_message", status_message);
     by_name.insert("resource_attributes", resource_attributes);
     by_name.insert("span_attributes", span_attributes);
+    by_name.insert("scope_attributes", scope_attributes);
     by_name.insert("flags", flags);
     by_name.insert("dropped_attributes_count", dropped_attributes_count);
     by_name.insert("dropped_events_count", dropped_events_count);
@@ -365,8 +408,8 @@ fn empty_list_array_for_field(field: &Field, length: usize) -> ArrayRef {
 }
 
 /// Build a `MapArray` for an iceberg `MAP<STRING,STRING>` column given
-/// per-row key/value pairs. Used for the post-split `resource_attributes`
-/// and `span_attributes` columns.
+/// per-row key/value pairs. Used for the per-OTLP-level `resource_attributes`,
+/// `scope_attributes`, and `span_attributes` columns.
 fn build_attribute_map(
     arrow_schema: &datafusion::arrow::datatypes::Schema,
     col_index: usize,

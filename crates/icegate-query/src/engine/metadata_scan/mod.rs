@@ -85,6 +85,20 @@ pub struct MetadataScanConfig {
     /// 2026-04-19 split) have `resource_attributes` and `span_attributes`
     /// scanned via two separate configs.
     pub map_column: &'static str,
+    /// Whether `/label_values`-style matching normalizes a stored map key
+    /// before comparing it to the requested name, replacing every `.` with
+    /// `_`.
+    ///
+    /// Attribute keys are always stored OTel-dotted (`user.id`). Loki label
+    /// names are restricted to `[a-zA-Z_][a-zA-Z0-9_]*`, so Loki callers
+    /// request the wire-form name (`user_id`) and need this set. `TraceQL`
+    /// attribute names carry no such restriction and are requested dotted
+    /// (`user.id`), so Tempo/spans configs need this unset — normalizing
+    /// unconditionally would compare a normalized stored key against a
+    /// still-dotted request and stop matching entries that are already
+    /// exact. See `values::stored_key_matches_label` for the matching rule
+    /// and its over-approximation trade-off on normalization collisions.
+    pub normalize_keys: bool,
 }
 
 impl MetadataScanConfig {

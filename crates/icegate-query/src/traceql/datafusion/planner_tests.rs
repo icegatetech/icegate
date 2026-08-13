@@ -51,8 +51,11 @@ use crate::{
 /// [`MapBuilder`]'s defaults (`entries`/`keys`/`values`) so the schema
 /// matches the array type produced by [`make_fixture_batch`] exactly.
 ///
-/// Two separate MAP columns (`resource_attributes`, `span_attributes`)
-/// mirror the post-2026-04-19 spans schema split.
+/// Three separate MAP columns (`resource_attributes`, `span_attributes`,
+/// `scope_attributes`) mirror the OTel-native spans schema split —
+/// `scope_attributes` holds `OTel` `InstrumentationScope.attributes`, which
+/// `span_attribute_lhs` folds into the `span` scope (`TraceQL`/Tempo has no
+/// instrumentation-scope query scope of its own).
 fn fixture_schema() -> Arc<Schema> {
     fn map_field(name: &str) -> Field {
         Field::new(
@@ -95,6 +98,7 @@ fn fixture_schema() -> Arc<Schema> {
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         map_field("resource_attributes"),
         map_field("span_attributes"),
+        map_field("scope_attributes"),
     ]))
 }
 
@@ -105,7 +109,13 @@ fn fixture_schema() -> Arc<Schema> {
 /// `resource_attributes` holds `service.name` and `k8s.namespace.name` for
 /// every row. `span_attributes` holds `http.method` for every row, plus
 /// `only.span = "yes"` on the middle row (the error span) so tests can
-/// assert span-only routing.
+/// assert span-only routing. `scope_attributes` is empty on every row
+/// except the first, which carries a scope-only key (`otel.scope.name`,
+/// absent from `span_attributes`) and a key that collides with
+/// `span_attributes` under a DIFFERENT value (`http.method`: `"POST"` in
+/// scope vs. `"GET"` in span) — see
+/// `span_scope_filter_reads_scope_attributes_when_absent_from_span_attributes`
+/// and `span_scope_filter_prefers_span_attributes_on_collision`.
 fn make_fixture_batch(schema: Arc<Schema>) -> RecordBatch {
     let tenants = StringArray::from(vec!["t1", "t1", "t2"]);
     // service_name column is populated at ingest from resource.service.name;
@@ -163,6 +173,21 @@ fn make_fixture_batch(schema: Arc<Schema>) -> RecordBatch {
     }
     let span_attrs: ArrayRef = Arc::new(span_b.finish());
 
+    // scope_attributes: only the first (ok) row carries anything — a
+    // scope-only key plus a key that collides with that same row's
+    // span_attributes under a different value, to prove both halves of the
+    // C2 fix (`span_attribute_lhs` reads `scope_attributes` when absent
+    // from `span_attributes`, and `span_attributes` wins on collision).
+    let mut scope_b = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    scope_b.keys().append_value("otel.scope.name");
+    scope_b.values().append_value("checkout-worker");
+    scope_b.keys().append_value("http.method");
+    scope_b.values().append_value("POST");
+    scope_b.append(true).expect("row0 scope_attrs row");
+    scope_b.append(true).expect("row1 scope_attrs row (empty)");
+    scope_b.append(true).expect("row2 scope_attrs row (empty)");
+    let scope_attrs: ArrayRef = Arc::new(scope_b.finish());
+
     RecordBatch::try_new(
         schema,
         vec![
@@ -178,6 +203,7 @@ fn make_fixture_batch(schema: Arc<Schema>) -> RecordBatch {
             Arc::new(timestamps),
             resource_attrs,
             span_attrs,
+            scope_attrs,
         ],
     )
     .expect("record batch")
@@ -343,6 +369,38 @@ async fn span_scope_filter_uses_span_attributes_column() {
     assert_eq!(total, 1);
 }
 
+/// C2 regression: `TraceQL`/Tempo has no instrumentation-scope query scope,
+/// so `otel.scope.name` — present ONLY in the first row's
+/// `scope_attributes`, never in `span_attributes` — must still resolve
+/// through `span.<key>`. See `traceql::datafusion::selectors::span_attribute_lhs`.
+#[tokio::test]
+async fn span_scope_filter_reads_scope_attributes_when_absent_from_span_attributes() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let total = run_and_count(ctx, qctx, r#"{ span.otel.scope.name = "checkout-worker" }"#).await;
+    assert_eq!(total, 1);
+}
+
+/// C2 collision-precedence regression: the fixture's first row carries
+/// `http.method="GET"` in `span_attributes` and a colliding
+/// `http.method="POST"` in `scope_attributes`. `span_attributes` must win
+/// — the precedence ingest's pre-migration physical fold had — so
+/// querying for the shadowed scope-level value must match nothing (not
+/// even the row it was shadowed on), while
+/// `span_scope_filter_uses_span_attributes_column`,
+/// `resource_service_name_quoted_eq_returns_matching_rows`, and friends
+/// pin that the span-level value keeps resolving normally.
+#[tokio::test]
+async fn span_scope_filter_prefers_span_attributes_on_collision() {
+    let ctx = fixture_session();
+    let qctx = make_query_ctx("t1");
+    let total = run_and_count(ctx, qctx, r#"{ span.http.method = "POST" }"#).await;
+    assert_eq!(
+        total, 0,
+        "the scope-level POST value must be fully shadowed by the span-level GET"
+    );
+}
+
 #[tokio::test]
 async fn resource_scope_filter_uses_resource_attributes_column() {
     // `resource.k8s.namespace.name = "icegate"` should match all t1 rows
@@ -499,6 +557,14 @@ fn multi_trace_fixture_session() -> SessionContext {
     span_b.append(true).expect("B-root row (no span attrs)");
     let span_attrs: ArrayRef = Arc::new(span_b.finish());
 
+    // scope_attributes: empty on every row — this fixture's tests exercise
+    // trace-limit / root-recovery behaviour, not attribute-map routing.
+    let mut scope_b = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for _ in 0..3 {
+        scope_b.append(true).expect("scope_attrs row (empty)");
+    }
+    let scope_attrs: ArrayRef = Arc::new(scope_b.finish());
+
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -514,6 +580,7 @@ fn multi_trace_fixture_session() -> SessionContext {
             Arc::new(timestamps),
             resource_attrs,
             span_attrs,
+            scope_attrs,
         ],
     )
     .expect("record batch");

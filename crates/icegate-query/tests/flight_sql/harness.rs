@@ -265,6 +265,9 @@ pub async fn write_spans_file(
     }
 
     let attribute_rows: Vec<&[(&str, &str)]> = vec![&[("http.method", "GET")]; row_count];
+    // scope_attributes carries no content in this narrow fixture, same as the
+    // scope/log levels in `write_logs_file` below.
+    let empty_rows: Vec<&[(&str, &str)]> = vec![&[]; row_count];
     let timestamps: Vec<i64> = (0..row_count).map(|i| now_micros - (i as i64) * 1000).collect();
     let zeros: ArrayRef = Arc::new(Int32Array::from(vec![Some(0); row_count]));
 
@@ -325,6 +328,10 @@ pub async fn write_spans_file(
     by_name.insert(
         schema::COL_SPAN_ATTRIBUTES,
         build_attribute_map(&arrow_schema, schema::COL_SPAN_ATTRIBUTES, &attribute_rows)?,
+    );
+    by_name.insert(
+        schema::COL_SCOPE_ATTRIBUTES,
+        build_attribute_map(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES, &empty_rows)?,
     );
     // `icegate_common::schema` exports no `COL_*` constant for these four, so
     // they stay literals; the emptiness assertion below still catches drift.
@@ -511,31 +518,23 @@ pub async fn write_logs_file(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema
-        .field_with_name("attributes")
-        .expect("logs schema must contain an `attributes` field");
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            other => panic!("expected Struct entries, got {other:?}"),
-        },
-        other => panic!("expected Map attributes column, got {other:?}"),
-    };
+    // The logs schema splits attributes across three per-OTLP-level MAP
+    // columns (see `icegate_common::schema::logs_schema`) rather than the
+    // single merged `attributes` column this fixture used before that
+    // split. `tenant.marker` is resource-level (constant per reporting
+    // resource) and stored dotted — like real ingest output — so a test
+    // that reads it back exercises the '.' -> '_' wire-name normalization
+    // instead of a fixture that never needed it; mirrors the convention in
+    // `tests/loki/harness.rs::write_test_logs_for_tenant`. scope/log levels
+    // are legitimately empty: this fixture carries no per-scope or
+    // per-record attributes.
+    let resource_pairs: Vec<[(&str, &str); 1]> = tenant_ids.iter().map(|t| [("tenant.marker", *t)]).collect();
+    let resource_rows: Vec<&[(&str, &str)]> = resource_pairs.iter().map(<[(&str, &str); 1]>::as_slice).collect();
+    let resource_attributes = build_attribute_map(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES, &resource_rows)?;
 
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let mut attributes_builder = MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new())
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-    for tenant_id in tenant_ids {
-        attributes_builder.keys().append_value("tenant_marker");
-        attributes_builder.values().append_value(tenant_id);
-        attributes_builder.append(true)?;
-    }
-    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+    let empty_rows: Vec<&[(&str, &str)]> = vec![&[]; row_count];
+    let scope_attributes = build_attribute_map(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES, &empty_rows)?;
+    let log_attributes = build_attribute_map(&arrow_schema, schema::COL_LOG_ATTRIBUTES, &empty_rows)?;
 
     // Distinct trace/span ids per row, derived from the row index so the
     // values stay unique without a fixed lookup table. The full index is
@@ -563,7 +562,9 @@ pub async fn write_logs_file(
             span_id,
             severity_text,
             body,
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )?;
 

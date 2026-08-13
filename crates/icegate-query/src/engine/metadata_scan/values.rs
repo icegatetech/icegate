@@ -177,17 +177,37 @@ pub async fn stream_map_values(
     let mut num_batches: usize = 0;
     while let Some(batch) = stream.try_next().await? {
         num_batches += 1;
-        collect_map_values_from_batch(&batch, config.map_column, label_name, out)?;
+        collect_map_values_from_batch(&batch, config.map_column, label_name, config.normalize_keys, out)?;
     }
     tracing::Span::current().record("num_batches", num_batches);
 
     Ok(())
 }
 
+/// Whether a raw stored map key satisfies a request for `label_name`,
+/// under the table's [`MetadataScanConfig::normalize_keys`] policy.
+///
+/// `normalize_keys` selects between the two callers of this matching rule:
+/// Loki requests the wire-form name (dots replaced by underscores) and
+/// needs the stored side normalized before comparison; Tempo/`TraceQL`
+/// requests the dotted name as stored and needs an exact comparison, since
+/// normalizing the stored side would stop matching entries that are
+/// already exact. Skipping the allocation when `stored_key` has no `.` is
+/// safe under both policies — normalization is a no-op on a key with
+/// nothing to replace.
+fn stored_key_matches_label(stored_key: &str, label_name: &str, normalize_keys: bool) -> bool {
+    if normalize_keys && stored_key.contains('.') {
+        stored_key.replace('.', "_") == label_name
+    } else {
+        stored_key == label_name
+    }
+}
+
 fn collect_map_values_from_batch(
     batch: &RecordBatch,
     map_column: &str,
     label_name: &str,
+    normalize_keys: bool,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
     let attr_idx = batch
@@ -211,12 +231,30 @@ fn collect_map_values_from_batch(
         .ok_or_else(|| MetadataScanError::Schema(format!("'{map_column}' map values are not StringArray")))?;
 
     for i in 0..keys.len() {
-        if keys.is_valid(i) && keys.value(i) == label_name && values.is_valid(i) {
-            // `BTreeSet::insert` already short-circuits on duplicates and
-            // returns `bool` — a separate `contains` check is a wasted
-            // O(log n) tree walk per row.
-            out.insert(values.value(i).to_string());
+        if !keys.is_valid(i) || !values.is_valid(i) {
+            continue;
         }
+        if !stored_key_matches_label(keys.value(i), label_name, normalize_keys) {
+            continue;
+        }
+        // Two distinct raw keys in the SAME row can both normalize to
+        // `label_name` (e.g. `k8s.pod.name` and `k8s_pod_name` both
+        // present — ingest dedupes only by the raw string, never by
+        // normalized form). The row's actually-DISPLAYED value follows a
+        // first-wins rule over stored order (see `loki/formatters.rs`'s
+        // `extract_attributes_map` and the `map_get_by_normalized_key` /
+        // `map_merge_normalized` UDFs under `logql/datafusion/udf/`), but
+        // every matching key's value is unioned into `out` here regardless
+        // of precedence. That OVER-APPROXIMATES: this enumeration can list
+        // a value that no row would ever actually display, because a
+        // higher-precedence key shadowed it. Acceptable for an enumeration
+        // endpoint — Loki's own label-value listing is itself approximate
+        // — but written down so it isn't mistaken for an exact set.
+        //
+        // `BTreeSet::insert` already short-circuits on duplicates and
+        // returns `bool` — a separate `contains` check is a wasted O(log
+        // n) tree walk per row.
+        out.insert(values.value(i).to_string());
     }
 
     Ok(())
@@ -224,7 +262,15 @@ fn collect_map_values_from_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::{LabelKind, classify_label};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Array, ArrayRef, MapArray, RecordBatch, StringArray, StructArray};
+    use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+    use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
+    use icegate_common::schema::{COL_LOG_ATTRIBUTES, COL_SPAN_ATTRIBUTES};
+
+    use super::{LabelKind, classify_label, collect_map_values_from_batch, stored_key_matches_label};
     use crate::engine::metadata_scan::MetadataScanConfig;
 
     const LOG_CFG: MetadataScanConfig = MetadataScanConfig {
@@ -232,6 +278,7 @@ mod tests {
         label_aliases: &[("level", "severity_text"), ("service", "service_name")],
         excluded_map_keys: &[],
         map_column: "attributes",
+        normalize_keys: true,
     };
 
     #[test]
@@ -251,5 +298,122 @@ mod tests {
     fn classify_map_attribute_for_non_indexed() {
         assert_eq!(classify_label("pod", &LOG_CFG), LabelKind::MapAttribute);
         assert_eq!(classify_label("namespace", &LOG_CFG), LabelKind::MapAttribute);
+    }
+
+    #[test]
+    fn stored_key_matches_label_cases() {
+        // (stored_key, label_name, normalize_keys, expected)
+        let cases = [
+            // Loki semantics: normalize_keys = true, request is wire-form.
+            ("user.id", "user_id", true, true),
+            // A still-dotted request never matches under normalization: Loki
+            // label names cannot contain dots so no real caller sends one,
+            // but the rule itself must not special-case it.
+            ("user.id", "user.id", true, false),
+            // No dot to replace: the allocation-free short-circuit path
+            // must still compare correctly.
+            ("pod", "pod", true, true),
+            // Tempo/TraceQL semantics: normalize_keys = false, the dotted
+            // request matches the dotted stored key exactly (AS STORED).
+            ("http.method", "http.method", false, true),
+            // The opt-in gate: without normalize_keys, a wire-form request
+            // must not reach a dotted stored key.
+            ("http.method", "http_method", false, false),
+            ("user.id", "user_id", false, false),
+            // Exact match never depends on the flag.
+            ("pod", "pod", false, true),
+        ];
+        for (stored_key, label_name, normalize_keys, expected) in cases {
+            assert_eq!(
+                stored_key_matches_label(stored_key, label_name, normalize_keys),
+                expected,
+                "stored_key={stored_key:?} label_name={label_name:?} normalize_keys={normalize_keys}"
+            );
+        }
+    }
+
+    /// One-row MAP<Utf8,Utf8> `RecordBatch` with a single map column named
+    /// `map_column`, holding `pairs` as that row's entries — mirrors
+    /// ingest's shape, where entries are deduplicated only by the raw key
+    /// string, never by its normalized form.
+    fn batch_with_map(map_column: &str, pairs: &[(&str, &str)]) -> RecordBatch {
+        let keys = StringArray::from(pairs.iter().map(|(k, _)| *k).collect::<Vec<_>>());
+        let values = StringArray::from(pairs.iter().map(|(_, v)| *v).collect::<Vec<_>>());
+        let entry_fields: Fields = vec![
+            Arc::new(Field::new("key", DataType::Utf8, false)),
+            Arc::new(Field::new("value", DataType::Utf8, true)),
+        ]
+        .into();
+        let entries = StructArray::new(
+            entry_fields.clone(),
+            vec![Arc::new(keys) as ArrayRef, Arc::new(values) as ArrayRef],
+            None,
+        );
+        let entry_field = Arc::new(Field::new("key_value", DataType::Struct(entry_fields), false));
+        let pair_count = i32::try_from(pairs.len()).expect("test fixture pair count fits in i32");
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, pair_count]));
+        let map_array = MapArray::new(entry_field, offsets, entries, None, false);
+
+        // Derive the outer field's type from the array itself so it always
+        // agrees with the nested struct/offset shape `MapArray::new` built,
+        // rather than hand-duplicating that shape and risking drift.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            map_column,
+            map_array.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(map_array)]).expect("valid record batch")
+    }
+
+    #[test]
+    fn dotted_stored_key_reachable_by_underscored_name_when_normalizing() {
+        let batch = batch_with_map(COL_LOG_ATTRIBUTES, &[("user.id", "user-123")]);
+        let mut out = BTreeSet::new();
+        collect_map_values_from_batch(&batch, COL_LOG_ATTRIBUTES, "user_id", true, &mut out).expect("collect");
+        assert_eq!(out, BTreeSet::from(["user-123".to_string()]));
+    }
+
+    #[test]
+    fn dotted_stored_key_matches_only_as_stored_when_not_normalizing() {
+        // Tempo/TraceQL semantics: attribute names are dotted and must be
+        // matched exactly as stored — this is what makes the opt-out on
+        // the Tempo/spans configs meaningful rather than incidental.
+        let batch = batch_with_map(COL_SPAN_ATTRIBUTES, &[("http.method", "GET")]);
+        let mut out = BTreeSet::new();
+        collect_map_values_from_batch(&batch, COL_SPAN_ATTRIBUTES, "http.method", false, &mut out).expect("collect");
+        assert_eq!(out, BTreeSet::from(["GET".to_string()]));
+    }
+
+    #[test]
+    fn underscored_name_does_not_reach_dotted_key_when_not_normalizing() {
+        // Proves the opt-in flag genuinely gates rather than being a no-op:
+        // without normalize_keys, a wire-form request must not match a
+        // dotted stored key.
+        let batch = batch_with_map(COL_SPAN_ATTRIBUTES, &[("http.method", "GET")]);
+        let mut out = BTreeSet::new();
+        collect_map_values_from_batch(&batch, COL_SPAN_ATTRIBUTES, "http_method", false, &mut out).expect("collect");
+        assert!(
+            out.is_empty(),
+            "wire-form request must not match a dotted key AS STORED: {out:?}"
+        );
+    }
+
+    #[test]
+    fn normalization_collision_unions_both_raw_keys_values() {
+        // `k8s.pod.name` and `k8s_pod_name` are distinct raw keys that
+        // ingest permits to coexist in one row (dedup is by the raw
+        // string, never by normalized form). Both normalize to the same
+        // wire name, so both values are unioned into the result — the
+        // over-approximation documented on `collect_map_values_from_batch`.
+        let batch = batch_with_map(
+            COL_LOG_ATTRIBUTES,
+            &[("k8s.pod.name", "dotted-value"), ("k8s_pod_name", "underscored-value")],
+        );
+        let mut out = BTreeSet::new();
+        collect_map_values_from_batch(&batch, COL_LOG_ATTRIBUTES, "k8s_pod_name", true, &mut out).expect("collect");
+        assert_eq!(
+            out,
+            BTreeSet::from(["dotted-value".to_string(), "underscored-value".to_string()])
+        );
     }
 }

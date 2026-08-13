@@ -139,7 +139,12 @@ async fn test_label_values_endpoint() -> Result<(), Box<dyn std::error::Error>> 
         value_strs
     );
 
-    // Test label values for an attribute (not indexed column)
+    // Test label values for an attribute (not indexed column). `write_test_logs`
+    // stores this key dotted (`user.id`, only on row 0 — see harness.rs), so this
+    // only comes back non-empty if the '.' -> '_' wire-name normalization is
+    // applied when matching the stored key against the requested label. An empty
+    // result here is a regression, not a legitimate "no data" case, so the
+    // assertion must not be guarded by `if !values.is_empty()`.
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/label/user_id/values", server.base_url))
@@ -154,14 +159,55 @@ async fn test_label_values_endpoint() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(body["status"], "success");
 
     let values = body["data"].as_array().expect("data should be an array");
-    if !values.is_empty() {
-        let value_strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
-        assert!(
-            value_strs.contains(&"user-123"),
-            "user_id values should include 'user-123', got: {:?}",
-            value_strs
-        );
-    }
+    let value_strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        value_strs,
+        vec!["user-123"],
+        "user_id values should be exactly ['user-123'] (dotted 'user.id' resolved via its wire name), got: {:?}",
+        value_strs
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Dedicated regression coverage for the dotted-key -> wire-name mapping in
+/// `/label_values`: `write_test_logs` stores `request.id` (dotted, OTel-native)
+/// on row 0's `log_attributes`; Loki label names cannot contain dots, so the
+/// only way a real client can ever request this value is via the underscored
+/// wire name `request_id`. Kept independent of `test_label_values_endpoint`'s
+/// `user_id` case so the dotted -> underscored mapping is proven on a second,
+/// distinct attribute rather than resting on a single example.
+#[tokio::test]
+async fn test_label_values_endpoint_resolves_dotted_key_by_wire_name() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/label/request_id/values", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let values = body["data"].as_array().expect("data should be an array");
+    let value_strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        value_strs,
+        vec!["req-456"],
+        "underscored wire name 'request_id' must resolve the dotted stored key 'request.id', got: {:?}",
+        value_strs
+    );
 
     server.shutdown().await;
     Ok(())

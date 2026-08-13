@@ -10,7 +10,10 @@ use datafusion::{
 
 use super::{
     udaf::ArrayIntersectAgg,
-    udf::{DateGrid, MapDropKeys, MapInsert, MapKeepKeys, ParseBytes, ParseDuration, ParseNumeric},
+    udf::{
+        DateGrid, MapDropKeys, MapGetByNormalizedKey, MapInsert, MapKeepKeys, MapMergeNormalized, ParseBytes,
+        ParseDuration, ParseNumeric,
+    },
 };
 
 /// Registry for all `LogQL` UDFs and UDAFs.
@@ -19,6 +22,8 @@ use super::{
 /// - `map_keep_keys`: Filters a map to keep only specified keys
 /// - `map_drop_keys`: Filters a map to remove specified keys
 /// - `map_insert`: Inserts a key-value pair into a map
+/// - `map_get_by_normalized_key(map, name)`: Value whose key normalizes to `name`
+/// - `map_merge_normalized(resource, scope, log)`: One wire-shaped map from the three levels
 /// - `date_grid`: Generates grid timestamps for range aggregations
 /// - `parse_numeric`: Parses string to Float64
 /// - `parse_bytes`: Parses humanized byte strings (10KB, 5.5MB) to Float64
@@ -40,6 +45,8 @@ impl UdfRegistry {
     /// - `map_keep_keys(map, keys_array)`: Keeps only keys present in array
     /// - `map_drop_keys(map, keys_array)`: Removes keys present in array
     /// - `map_insert(map, key, value)`: Inserts key-value pair into map
+    /// - `map_get_by_normalized_key(map, name)`: Value whose key normalizes to `name`
+    /// - `map_merge_normalized(resource, scope, log)`: One wire-shaped map from the three levels
     /// - `date_grid(timestamp, start, end, step, range, offset, inverse)`: Generates grid timestamps
     /// - `parse_numeric(value)`: Parses string to Float64
     /// - `parse_bytes(value)`: Parses humanized byte string to Float64
@@ -52,6 +59,8 @@ impl UdfRegistry {
         session_ctx.register_udf(ScalarUDF::from(MapKeepKeys::new()));
         session_ctx.register_udf(ScalarUDF::from(MapDropKeys::new()));
         session_ctx.register_udf(ScalarUDF::from(MapInsert::new()));
+        session_ctx.register_udf(ScalarUDF::from(MapGetByNormalizedKey::new()));
+        session_ctx.register_udf(ScalarUDF::from(MapMergeNormalized::new()));
         session_ctx.register_udf(ScalarUDF::from(DateGrid::new()));
         session_ctx.register_udf(ScalarUDF::from(ParseNumeric::new()));
         session_ctx.register_udf(ScalarUDF::from(ParseBytes::new()));

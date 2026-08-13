@@ -10,12 +10,15 @@ use arrow::{
     datatypes::Schema,
 };
 use iceberg::arrow::schema_to_arrow_schema;
-use icegate_common::{DEFAULT_TENANT_ID, schema::COL_SERVICE_NAME};
+use icegate_common::{
+    DEFAULT_TENANT_ID,
+    schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES},
+};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use super::attributes::{
-    add_flattened_attributes, extract_map_fields_from_schema, extract_string_value, is_zero_bytes,
-    serialize_any_value_to_json,
+    dedupe_dotted_attributes, extract_map_fields_from_schema_named, extract_string_value, is_zero_bytes,
+    merge_dotted_levels, serialize_any_value_to_json,
 };
 
 /// Returns the Arrow schema for logs, derived from the Iceberg schema.
@@ -36,8 +39,9 @@ pub fn logs_arrow_schema() -> Schema {
 
 /// Transforms an OTLP logs export request to an Arrow `RecordBatch`.
 ///
-/// Extracts all log records from the request, merging resource and scope
-/// attributes into each log record's attributes.
+/// Extracts all log records from the request. Resource, scope, and log-record
+/// attributes are written to their own `MAP<String, String>` column, keyed by
+/// their dotted OTLP name — see [`logs_arrow_schema`].
 ///
 /// # Arguments
 ///
@@ -79,9 +83,12 @@ pub fn logs_to_record_batch(
         return Ok(None);
     }
 
-    // Get the Arrow schema to extract correct field types for map builder
+    // Get the Arrow schema to extract correct field types for the map builders
     let schema = logs_arrow_schema();
-    let (key_field, value_field) = extract_map_fields_from_schema(&schema)?;
+    let (resource_key_field, resource_value_field) =
+        extract_map_fields_from_schema_named(&schema, COL_RESOURCE_ATTRIBUTES)?;
+    let (scope_key_field, scope_value_field) = extract_map_fields_from_schema_named(&schema, COL_SCOPE_ATTRIBUTES)?;
+    let (log_key_field, log_value_field) = extract_map_fields_from_schema_named(&schema, COL_LOG_ATTRIBUTES)?;
 
     // Initialize builders
     let mut tenant_id_builder = StringBuilder::with_capacity(total_records, total_records * 16);
@@ -94,15 +101,27 @@ pub fn logs_to_record_batch(
     let mut severity_text_builder = StringBuilder::with_capacity(total_records, total_records * 8);
     let mut body_builder = StringBuilder::with_capacity(total_records, total_records * 256);
 
-    // Create map builder with correct field names matching Iceberg schema
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let mut attributes_builder = MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new())
+    /// Build a MAP<Utf8,Utf8> builder wired to the Iceberg field metadata.
+    fn attribute_map_builder(
+        key_field: arrow::datatypes::FieldRef,
+        value_field: arrow::datatypes::FieldRef,
+    ) -> MapBuilder<StringBuilder, StringBuilder> {
+        MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            StringBuilder::new(),
+            StringBuilder::new(),
+        )
         .with_keys_field(key_field)
-        .with_values_field(value_field);
+        .with_values_field(value_field)
+    }
+
+    let mut resource_attrs_builder = attribute_map_builder(resource_key_field, resource_value_field);
+    let mut scope_attrs_builder = attribute_map_builder(scope_key_field, scope_value_field);
+    let mut log_attrs_builder = attribute_map_builder(log_key_field, log_value_field);
 
     let tenant = tenant_id.unwrap_or(DEFAULT_TENANT_ID);
 
@@ -169,26 +188,34 @@ pub fn logs_to_record_batch(
                     body_builder.append_null();
                 }
 
-                // attributes (merged from resource, scope, and log record).
+                // One map per OTLP level. Each level is deduplicated through a
+                // BTreeMap: a MAP<K,V> column must not carry a duplicate key,
+                // and readers disagree on how to resolve one if it does.
                 //
-                // Indexed top-level columns are deliberately NOT mirrored into this MAP —
-                // the read pipeline projects them as separate Arrow columns and
-                // `loki/formatters.rs::extract_labels` merges them into the final
-                // labels view at row materialisation time.
+                // Indexed top-level columns (trace_id, span_id, severity_text,
+                // service_name) are deliberately NOT mirrored into these MAPs —
+                // the read pipeline projects them as separate Arrow columns.
                 //
-                // Resource flattening additionally skips the OTLP keys whose
-                // normalised form collides with a promoted top-level column
-                // (`service.name` → `service_name`). Without the skip these
-                // would be written to the MAP a second time, polluting the
-                // per-row group key
-                // dictionary. Scope and log-record attributes are not filtered
-                // — a user-supplied `service_name` log attribute (rare, but
-                // semantically meaningful as an override) still flows through.
-                add_flattened_attributes(resource_attrs, &mut attributes_builder, LOG_PROMOTED_RESOURCE_KEYS);
-                add_flattened_attributes(scope_attrs, &mut attributes_builder, &[]);
-                add_flattened_attributes(&log_record.attributes, &mut attributes_builder, &[]);
+                // `service.name` is promoted to its own column, so it is dropped
+                // from the resource level only — a log-record attribute of the
+                // same name is a deliberate override and still lands in
+                // `log_attributes`.
+                for (key, value) in &merge_dotted_levels(&[resource_attrs], LOG_PROMOTED_RESOURCE_KEYS) {
+                    resource_attrs_builder.keys().append_value(key);
+                    resource_attrs_builder.values().append_value(value);
+                }
+                for (key, value) in &dedupe_dotted_attributes(scope_attrs) {
+                    scope_attrs_builder.keys().append_value(key);
+                    scope_attrs_builder.values().append_value(value);
+                }
+                for (key, value) in &dedupe_dotted_attributes(&log_record.attributes) {
+                    log_attrs_builder.keys().append_value(key);
+                    log_attrs_builder.values().append_value(value);
+                }
 
-                attributes_builder.append(true).expect("append map entry");
+                resource_attrs_builder.append(true).expect("append resource_attributes");
+                scope_attrs_builder.append(true).expect("append scope_attributes");
+                log_attrs_builder.append(true).expect("append log_attributes");
             }
         }
     }
@@ -205,7 +232,9 @@ pub fn logs_to_record_batch(
         Arc::new(span_id_builder.finish()),
         Arc::new(severity_text_builder.finish()),
         Arc::new(body_builder.finish()),
-        Arc::new(attributes_builder.finish()),
+        Arc::new(resource_attrs_builder.finish()),
+        Arc::new(scope_attrs_builder.finish()),
+        Arc::new(log_attrs_builder.finish()),
     ];
 
     RecordBatch::try_new(schema, columns).map(Some).map_err(|e| {
@@ -214,12 +243,12 @@ pub fn logs_to_record_batch(
     })
 }
 
-/// Resource-attribute keys (in their normalised form) that already have a
-/// dedicated top-level Iceberg column on the logs table. Skipped during
-/// resource flattening to keep the attributes MAP free of redundant copies
-/// — both to shrink Parquet pages and to keep the row-group key dictionary
-/// uncluttered.
-const LOG_PROMOTED_RESOURCE_KEYS: &[&str] = &[COL_SERVICE_NAME];
+/// Resource-attribute keys, in their OTLP dotted form, that already have a
+/// dedicated top-level column on the logs table. Dropped from the resource
+/// level so the MAP holds no redundant copy — smaller Parquet pages and a
+/// tidier row-group key dictionary. A more specific level may still supply
+/// the same key as a deliberate override.
+const LOG_PROMOTED_RESOURCE_KEYS: &[&str] = &["service.name"];
 
 /// Validates and writes raw `trace_id` and `span_id` bytes directly into the
 /// top-level fixed-size binary builders.
@@ -320,18 +349,17 @@ mod tests {
 
         let batch = batch.expect("batch should exist");
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 10);
+        // 9 scalar columns + 3 attribute maps (resource/scope/log).
+        assert_eq!(batch.num_columns(), 12);
     }
 
     /// The logs ingest path must NOT mirror indexed top-level columns into
-    /// the `attributes` MAP. Only OTLP-supplied attributes belong there.
-    /// The merged labels view is reconstructed at read time by
+    /// any of the three attribute MAPs. Only OTLP-supplied attributes belong
+    /// there. The merged labels view is reconstructed at read time by
     /// `loki/formatters.rs::extract_labels`.
     #[test]
-    fn logs_to_record_batch_does_not_mirror_indexed_columns_into_attributes_map() {
-        use std::collections::BTreeMap;
-
-        use arrow::array::{Array, MapArray, StringArray};
+    fn logs_to_record_batch_does_not_mirror_indexed_columns_into_attribute_maps() {
+        use arrow::array::StringArray;
 
         let request = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -412,48 +440,113 @@ mod tests {
             .expect("StringArray");
         assert_eq!(severity.value(0), "ERROR");
 
-        // Pull the row's attribute MAP into a BTreeMap for assertions.
-        let attrs_map = batch
-            .column_by_name("attributes")
-            .expect("attributes col")
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .expect("MapArray");
-        let entries = attrs_map.value(0);
-        let entries_struct = entries
-            .as_any()
-            .downcast_ref::<arrow::array::StructArray>()
-            .expect("struct entries");
-        let keys = entries_struct.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
-        let values = entries_struct.column(1).as_any().downcast_ref::<StringArray>().expect("values");
-        let pairs: BTreeMap<String, String> = (0..keys.len())
-            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
-            .collect();
+        // Pull each level's attribute MAP into a plain map for assertions.
+        let resource = map_pairs(&batch, "resource_attributes");
+        let log = map_pairs(&batch, "log_attributes");
 
         // The user-supplied log attribute survives unchanged.
-        assert_eq!(pairs.get("foo"), Some(&"bar".to_string()));
+        assert_eq!(log.get("foo"), Some(&"bar".to_string()));
 
-        // `cloud.account.id` is no longer a promoted top-level column —
-        // it flows into the attributes MAP via the resource flattening pass
-        // like any other resource attribute (normalised dots → underscores).
-        assert_eq!(pairs.get("cloud_account_id"), Some(&"acc-1".to_string()));
+        // Non-promoted resource attributes flow into `resource_attributes`
+        // with their dotted OTLP key intact — no dot-to-underscore
+        // normalisation, unlike the pre-split behaviour.
+        assert_eq!(resource.get("cloud.account.id"), Some(&"acc-1".to_string()));
 
-        // Indexed-column mirrors must NOT appear in the attributes MAP:
+        // Indexed-column mirrors must NOT appear in either attribute MAP:
         //
-        // - `trace_id` and `span_id`: removed by deleting
-        //   `add_indexed_columns_to_attributes` (these are OTLP LogRecord
-        //   top-level fields, never resource attributes).
-        // - `severity_text` and `level`: same — they came from the deleted
-        //   helper, not from any OTLP attribute key.
-        // - `service_name`: would otherwise be normalised in by
-        //   `add_flattened_attributes` (`service.name` → `service_name`).
-        //   Suppressed via `LOG_PROMOTED_RESOURCE_KEYS` to keep the per-row-
-        //   group key dictionary free of redundant entries.
-        for mirror in ["trace_id", "span_id", "severity_text", "level", "service_name"] {
+        // - `trace_id` and `span_id`: OTLP LogRecord top-level fields, never
+        //   resource/scope/log attributes.
+        // - `severity_text` and `level`: same — never OTLP attribute keys.
+        // - `service.name`: promoted to its own top-level column and
+        //   suppressed via `LOG_PROMOTED_RESOURCE_KEYS`.
+        // - `service_name`: the pre-split normalised form; keys stay dotted
+        //   now, so this underscored form can never be produced at all.
+        for mirror in [
+            "trace_id",
+            "span_id",
+            "severity_text",
+            "level",
+            "service.name",
+            "service_name",
+        ] {
             assert!(
-                !pairs.contains_key(mirror),
-                "mirror `{mirror}` must not appear in attributes MAP, got pairs: {pairs:?}"
+                !resource.contains_key(mirror) && !log.contains_key(mirror),
+                "mirror `{mirror}` must not appear in an attribute MAP, got resource: {resource:?}, log: {log:?}"
             );
         }
+    }
+
+    #[test]
+    fn logs_route_attributes_to_their_own_maps_with_dots_intact() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
+                    attributes: vec![
+                        kv("service.name", "api"),
+                        kv("k8s.pod.name", "web-1"),
+                        kv("shared.key", "from-resource"),
+                    ],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(opentelemetry_proto::tonic::common::v1::InstrumentationScope {
+                        attributes: vec![kv("otel.scope.name", "lib"), kv("shared.key", "from-scope")],
+                        ..Default::default()
+                    }),
+                    log_records: vec![LogRecord {
+                        attributes: vec![kv("http.method", "GET"), kv("shared.key", "from-log")],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let batch = logs_to_record_batch(&request, Some("t1")).expect("transform").expect("batch");
+
+        let resource = map_pairs(&batch, "resource_attributes");
+        let scope = map_pairs(&batch, "scope_attributes");
+        let log = map_pairs(&batch, "log_attributes");
+
+        // Dots survive; service.name is promoted to its own column and suppressed.
+        assert_eq!(resource.get("k8s.pod.name").map(String::as_str), Some("web-1"));
+        assert!(!resource.contains_key("service.name"));
+        assert!(!resource.contains_key("k8s_pod_name"));
+
+        assert_eq!(scope.get("otel.scope.name").map(String::as_str), Some("lib"));
+        assert_eq!(log.get("http.method").map(String::as_str), Some("GET"));
+
+        // A key at all three levels appears once per map, at its own value.
+        assert_eq!(resource.get("shared.key").map(String::as_str), Some("from-resource"));
+        assert_eq!(scope.get("shared.key").map(String::as_str), Some("from-scope"));
+        assert_eq!(log.get("shared.key").map(String::as_str), Some("from-log"));
+    }
+
+    fn kv(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue(value.to_string())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Collect one row's MAP column into a plain map for assertions.
+    fn map_pairs(batch: &RecordBatch, column: &str) -> std::collections::BTreeMap<String, String> {
+        use arrow::array::{Array, MapArray, StringArray};
+        let arr = batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("{column} column"))
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap_or_else(|| panic!("{column} must be MapArray"));
+        let entries = arr.value(0);
+        let keys = entries.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+        let values = entries.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+        (0..keys.len())
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect()
     }
 }

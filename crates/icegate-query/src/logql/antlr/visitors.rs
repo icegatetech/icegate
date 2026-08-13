@@ -322,9 +322,6 @@ fn collect_grouping_labels(ctx: &GroupingLabelsContextAll) -> Vec<GroupingLabel>
     // groupingLabels: groupingLabel (COMMA groupingLabel)*
     for label_ctx in ctx.groupingLabel_all() {
         let mut label = String::new();
-        if let Some(prefix) = label_ctx.PREFIX() {
-            label.push_str(&prefix.get_text());
-        }
         if let Some(attr) = label_ctx.ATTRIBUTE() {
             label.push_str(&attr.get_text());
         }
@@ -383,9 +380,6 @@ fn collect_labels_from_list(ctx: &GroupingLabelListContextAll, labels: &mut Vec<
 
     if let Some(label_ctx) = ctx.groupingLabel() {
         let mut label = String::new();
-        if let Some(prefix) = label_ctx.PREFIX() {
-            label.push_str(&prefix.get_text());
-        }
         if let Some(attr) = label_ctx.ATTRIBUTE() {
             label.push_str(&attr.get_text());
         }

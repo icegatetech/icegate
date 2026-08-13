@@ -11,7 +11,7 @@ use icegate_common::DEFAULT_TENANT_ID;
 
 use super::attributes::{
     dedupe_dotted_attributes, extract_map_fields_from_nested_struct, extract_map_fields_from_schema_named,
-    extract_string_value, flatten_any_value_dotted, is_zero_bytes, merge_dotted_attributes, u32_count_to_i32,
+    extract_string_value, flatten_any_value_dotted, is_zero_bytes, u32_count_to_i32,
 };
 
 /// Returns the Arrow schema for spans, derived from the Iceberg spans schema.
@@ -46,12 +46,13 @@ pub fn spans_arrow_schema() -> Schema {
 /// dropped silently and counted in the second return value so the caller
 /// can surface partial-success metrics.
 ///
-/// Produces every column in the spans schema: top-level fields, separate
-/// `resource_attributes` and `span_attributes` maps (the latter merging
-/// scope-level and span-level attributes with span winning on collision),
-/// and the nested `events` / `links` `List<Struct>` arrays. Links with
-/// invalid `trace_id` / `span_id` are dropped from the list and counted
-/// into the parent span's `dropped_links_count`.
+/// Produces every column in the spans schema: top-level fields, one
+/// independent map per OTLP level (`resource_attributes`,
+/// `scope_attributes`, `span_attributes` — no cross-level folding, so the
+/// same key may appear in more than one map), and the nested `events` /
+/// `links` `List<Struct>` arrays. Links with invalid `trace_id` / `span_id`
+/// are dropped from the list and counted into the parent span's
+/// `dropped_links_count`.
 ///
 /// # Arguments
 ///
@@ -99,6 +100,8 @@ pub fn spans_to_record_batch(
         extract_map_fields_from_schema_named(&schema, icegate_common::schema::COL_RESOURCE_ATTRIBUTES)?;
     let (span_attr_key_field, span_attr_value_field) =
         extract_map_fields_from_schema_named(&schema, icegate_common::schema::COL_SPAN_ATTRIBUTES)?;
+    let (scope_attr_key_field, scope_attr_value_field) =
+        extract_map_fields_from_schema_named(&schema, icegate_common::schema::COL_SCOPE_ATTRIBUTES)?;
 
     // Top-level column builders. Events and links are written as all-null
     // placeholders; Tasks 14 and 15 replace these with real list builders.
@@ -139,6 +142,18 @@ pub fn spans_to_record_batch(
     )
     .with_keys_field(span_attr_key_field)
     .with_values_field(span_attr_value_field);
+
+    let mut scope_attrs_builder = MapBuilder::new(
+        Some(MapFieldNames {
+            entry: "key_value".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        }),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    )
+    .with_keys_field(scope_attr_key_field)
+    .with_values_field(scope_attr_value_field);
     let mut flags_builder = Int32Builder::with_capacity(total_spans);
     let mut dropped_attributes_count_builder = Int32Builder::with_capacity(total_spans);
     let mut dropped_events_count_builder = Int32Builder::with_capacity(total_spans);
@@ -356,18 +371,16 @@ pub fn spans_to_record_batch(
                     resource_attrs_builder.values().append_value(value);
                 }
 
-                // Scope + span attributes fold into `span_attributes` with
-                // explicit per-span de-duplication: insertion order into a
-                // `MapBuilder` is preserved, but downstream `MAP<K,V>`
-                // readers vary on duplicate-key resolution (some surface
-                // both, some last-write-wins). We avoid relying on
-                // reader-specific semantics by merging into a `BTreeMap`
-                // first — scope first, then span — so span attrs win on
-                // collision (last-write-wins) and the sorted key order
-                // gives a deterministic on-disk attribute layout.
+                // Scope and span attributes each keep their own column. With no
+                // fold there is no precedence to apply: a key present at both
+                // levels is stored twice, once per level, and the read path
+                // resolves it.
                 let scope_attrs = scope_spans.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
-                let merged_span_attrs = merge_dotted_attributes(scope_attrs, &span.attributes);
-                for (key, value) in &merged_span_attrs {
+                for (key, value) in &dedupe_dotted_attributes(scope_attrs) {
+                    scope_attrs_builder.keys().append_value(key);
+                    scope_attrs_builder.values().append_value(value);
+                }
+                for (key, value) in &dedupe_dotted_attributes(&span.attributes) {
                     span_attrs_builder.keys().append_value(key);
                     span_attrs_builder.values().append_value(value);
                 }
@@ -376,6 +389,7 @@ pub fn spans_to_record_batch(
                     .append(true)
                     .expect("append resource_attributes map entry");
                 span_attrs_builder.append(true).expect("append span_attributes map entry");
+                scope_attrs_builder.append(true).expect("append scope_attributes map entry");
 
                 // Events list<struct>: one row per parent span.
                 {
@@ -549,6 +563,7 @@ pub fn spans_to_record_batch(
         events_array,
         links_array,
         Arc::new(span_attrs_builder.finish()),
+        Arc::new(scope_attrs_builder.finish()),
     ];
 
     let batch = RecordBatch::try_new(Arc::new(schema), columns).map_err(|e| {
@@ -1003,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn spans_split_attributes_into_resource_and_span_columns() {
+    fn spans_split_attributes_into_resource_scope_and_span_columns() {
         use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
         use opentelemetry_proto::tonic::common::v1::any_value::Value;
         use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
@@ -1063,10 +1078,16 @@ mod tests {
         let batch = maybe_batch.expect("batch produced");
         assert_eq!(batch.num_rows(), 1);
 
-        // Collect the two attribute maps into (key, value) vecs for row 0.
+        // Collect the three attribute maps into (key, value) vecs for row 0.
         let resource_attrs_col = batch
             .column_by_name("resource_attributes")
             .expect("resource_attributes column")
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .expect("MapArray");
+        let scope_attrs_col = batch
+            .column_by_name("scope_attributes")
+            .expect("scope_attributes column")
             .as_any()
             .downcast_ref::<arrow::array::MapArray>()
             .expect("MapArray");
@@ -1078,18 +1099,26 @@ mod tests {
             .expect("MapArray");
 
         let resource_row = map_row_as_pairs(resource_attrs_col, 0);
+        let scope_row = map_row_as_pairs(scope_attrs_col, 0);
         let span_row = map_row_as_pairs(span_attrs_col, 0);
 
         // Resource-only keys land in resource_attributes.
         assert!(resource_row.iter().any(|(k, v)| k == "service.name" && v == "ingest-test"));
         assert!(resource_row.iter().any(|(k, v)| k == "k8s.namespace.name" && v == "icegate"));
 
-        // Span + scope keys land in span_attributes. No resource-level keys leak.
+        // Scope-only keys land in scope_attributes now, not span_attributes —
+        // the fold is gone, so nothing promotes a scope key onto the span level.
+        assert!(scope_row.iter().any(|(k, v)| k == "scope.only.key" && v == "SV"));
+        assert!(
+            !span_row.iter().any(|(k, _)| k == "scope.only.key"),
+            "scope attributes must not leak into span_attributes"
+        );
+
+        // Span-only keys land in span_attributes.
         assert!(span_row.iter().any(|(k, v)| k == "http.method" && v == "GET"));
         assert!(span_row.iter().any(|(k, v)| k == "span.only.key" && v == "SVAL"));
-        assert!(span_row.iter().any(|(k, v)| k == "scope.only.key" && v == "SV"));
 
-        // Regression: indexed-column mirror keys must NOT appear in either map.
+        // Regression: indexed-column mirror keys must NOT appear in any map.
         for mirror in &[
             "service_name",
             "trace_id",
@@ -1102,6 +1131,10 @@ mod tests {
             assert!(
                 !resource_row.iter().any(|(k, _)| k == mirror),
                 "mirror key `{mirror}` leaked into resource_attributes"
+            );
+            assert!(
+                !scope_row.iter().any(|(k, _)| k == mirror),
+                "mirror key `{mirror}` leaked into scope_attributes"
             );
             assert!(
                 !span_row.iter().any(|(k, _)| k == mirror),
@@ -1139,6 +1172,111 @@ mod tests {
             .expect("values StringArray");
         (0..keys.len())
             .filter(|i| !values.is_null(*i))
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn spans_keep_scope_attributes_out_of_span_attributes() {
+        let batch = spans_batch_with(
+            &[kv("service.name", "api")],
+            &[kv("otel.scope.name", "lib"), kv("shared.key", "from-scope")],
+            &[kv("http.method", "GET"), kv("shared.key", "from-span")],
+        );
+
+        let scope = map_pairs(&batch, "scope_attributes");
+        let span = map_pairs(&batch, "span_attributes");
+
+        assert_eq!(scope.get("otel.scope.name").map(String::as_str), Some("lib"));
+        assert!(
+            !span.contains_key("otel.scope.name"),
+            "scope attributes must no longer be folded into span_attributes"
+        );
+
+        // Same key at both levels: each keeps its own value, no precedence applied.
+        assert_eq!(scope.get("shared.key").map(String::as_str), Some("from-scope"));
+        assert_eq!(span.get("shared.key").map(String::as_str), Some("from-span"));
+    }
+
+    /// Build a one-span batch: one `ResourceSpans` -> one `ScopeSpans`
+    /// (carrying `scope_attrs`) -> one `Span` (carrying `span_attrs`), run
+    /// through `spans_to_record_batch`. Shared by tests that assert on the
+    /// resulting per-level attribute maps.
+    fn spans_batch_with(resource_attrs: &[KeyValue], scope_attrs: &[KeyValue], span_attrs: &[KeyValue]) -> RecordBatch {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: resource_attrs.to_vec(),
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "test-scope".to_string(),
+                        version: String::new(),
+                        attributes: scope_attrs.to_vec(),
+                        dropped_attributes_count: 0,
+                    }),
+                    spans: vec![Span {
+                        trace_id: vec![1u8; 16],
+                        span_id: vec![2u8; 8],
+                        parent_span_id: vec![],
+                        trace_state: String::new(),
+                        flags: 0,
+                        name: "op".to_string(),
+                        kind: 2,
+                        start_time_unix_nano: 1_000_000_000,
+                        end_time_unix_nano: 1_000_010_000,
+                        attributes: span_attrs.to_vec(),
+                        dropped_attributes_count: 0,
+                        events: vec![],
+                        dropped_events_count: 0,
+                        links: vec![],
+                        dropped_links_count: 0,
+                        status: None,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (batch, _drops) = spans_to_record_batch(&request, Some("t1")).expect("spans transform");
+        batch.expect("batch produced")
+    }
+
+    // `key_strindex` has no default in the OTLP proto's generated `KeyValue`
+    // struct (see the `TODO(otlp-strindex)` note in `attributes.rs`), so
+    // every literal in this file sets it explicitly even though these tests
+    // only ever exercise the inline `key` string form.
+    fn kv(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key_strindex: 0,
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue(value.to_string())),
+            }),
+        }
+    }
+
+    /// Collect one row's MAP column into a plain map for assertions.
+    fn map_pairs(batch: &RecordBatch, column: &str) -> std::collections::BTreeMap<String, String> {
+        use arrow::array::{Array, MapArray, StringArray};
+        let arr = batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("{column} column"))
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap_or_else(|| panic!("{column} must be MapArray"));
+        let entries = arr.value(0);
+        let keys = entries.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+        let values = entries.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+        (0..keys.len())
             .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
             .collect()
     }

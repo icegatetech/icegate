@@ -3,7 +3,7 @@
 //! Extracts the common query execution flow from handlers, including
 //! parsing, planning, and execution of `LogQL` queries.
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use chrono::{DateTime, Duration, Utc};
 use datafusion::{
@@ -109,6 +109,21 @@ fn make_query_error_send(err: QueryError) -> QueryError {
 #[allow(clippy::needless_pass_by_value)]
 fn join_error(e: tokio::task::JoinError) -> LokiError {
     LokiError(QueryError::Internal(format!("task panicked: {e}")))
+}
+
+// ============================================================================
+// Label-name normalization
+// ============================================================================
+
+/// Render a stored attribute key as the Loki label name that addresses it.
+///
+/// Mirrors the read-time `.` → `_` mapping applied by the `map_get_by_normalized_key`
+/// and `map_merge_normalized` UDFs and by `loki::formatters::extract_attributes_map`
+/// — duplicated rather than shared because those live in the DataFusion/row-batch
+/// paths and this caller only needs the plain string transform. Allocation-free for
+/// the common already-underscored key.
+fn normalize_label_name(raw: String) -> String {
+    if raw.contains('.') { raw.replace('.', "_") } else { raw }
 }
 
 // ============================================================================
@@ -315,9 +330,10 @@ impl QueryExecutor {
 
     /// Execute a labels metadata query.
     ///
-    /// Dispatches to `crate::engine::metadata_scan`, which reads only
-    /// Parquet row-group statistics and the `attributes` MAP column — no
-    /// full-row scans.
+    /// Dispatches to `crate::engine::metadata_scan` once per stored
+    /// attribute map (`resource_attributes`, `scope_attributes`,
+    /// `log_attributes`), which reads only Parquet row-group statistics and
+    /// MAP dictionary pages — no full-row scans.
     ///
     /// NOTE: This intentionally bypasses WAL and scans only committed
     /// Iceberg data. Label discovery from uncommitted WAL segments is
@@ -336,19 +352,32 @@ impl QueryExecutor {
         );
 
         let selector = self.parse_selector_opt(params.query.clone()).await?;
-        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_METADATA_CONFIG);
+        // `indexed_columns` and `label_aliases` are identical across every
+        // element of `LOGS_METADATA_CONFIGS` (only `map_column` differs, and
+        // `selector_predicate` never reads it), so translating against any
+        // one element is equivalent to translating against all three.
+        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_METADATA_CONFIGS[0]);
 
         let table = self.load_logs_table().await?;
-        let labels = crate::engine::metadata_scan::scan_labels(
-            &table,
-            &query_ctx.tenant_id,
-            query_ctx.start,
-            query_ctx.end,
-            &super::LOGS_METADATA_CONFIG,
-            extra,
-        )
-        .await
-        .map_err(|e| LokiError(QueryError::from(e)))?;
+        let mut labels: BTreeSet<String> = BTreeSet::new();
+        for config in &super::LOGS_METADATA_CONFIGS {
+            let scanned = crate::engine::metadata_scan::scan_labels(
+                &table,
+                &query_ctx.tenant_id,
+                query_ctx.start,
+                query_ctx.end,
+                config,
+                extra.clone(),
+            )
+            .await
+            .map_err(|e| LokiError(QueryError::from(e)))?;
+            // Normalizing into the same `BTreeSet` is what dedupes by wire
+            // name across levels: two levels holding raw keys that share a
+            // wire name (e.g. `k8s.pod.name` in one map, `k8s_pod_name` in
+            // another) collapse into a single insert here rather than
+            // surfacing as two labels.
+            labels.extend(scanned.into_iter().map(normalize_label_name));
+        }
 
         Ok(labels.into_iter().collect())
     }
@@ -375,20 +404,30 @@ impl QueryExecutor {
         let selector = self.parse_selector_opt(params.query.clone()).await?;
         // `/label_values` uses the superset config so high-cardinality ids
         // (`trace_id`, `span_id`) can still be enumerated explicitly.
-        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_VALUES_METADATA_CONFIG);
+        // `indexed_columns` and `label_aliases` are identical across every
+        // element of `LOGS_VALUES_METADATA_CONFIGS` (see `execute_labels`),
+        // so translating against any one element covers all three.
+        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_VALUES_METADATA_CONFIGS[0]);
 
         let table = self.load_logs_table().await?;
-        let values = crate::engine::metadata_scan::scan_label_values(
-            &table,
-            &query_ctx.tenant_id,
-            query_ctx.start,
-            query_ctx.end,
-            &super::LOGS_VALUES_METADATA_CONFIG,
-            label_name,
-            extra,
-        )
-        .await
-        .map_err(|e| LokiError(QueryError::from(e)))?;
+        let mut values: BTreeSet<String> = BTreeSet::new();
+        for config in &super::LOGS_VALUES_METADATA_CONFIGS {
+            let scanned = crate::engine::metadata_scan::scan_label_values(
+                &table,
+                &query_ctx.tenant_id,
+                query_ctx.start,
+                query_ctx.end,
+                config,
+                label_name,
+                extra.clone(),
+            )
+            .await
+            .map_err(|e| LokiError(QueryError::from(e)))?;
+            // Unlike label names, values need no wire normalization — just
+            // the union across the three per-level maps, deduplicated so a
+            // value present at more than one level surfaces once.
+            values.extend(scanned);
+        }
 
         Ok(values.into_iter().collect())
     }

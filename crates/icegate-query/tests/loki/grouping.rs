@@ -10,13 +10,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::{
-    array::{
-        ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
-        TimestampMicrosecondArray,
-    },
-    datatypes::DataType,
-};
+use datafusion::arrow::array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch, StringArray, TimestampMicrosecondArray};
 use datafusion::parquet::file::properties::WriterProperties;
 use iceberg::{
     Catalog,
@@ -36,7 +30,7 @@ use iceberg::{
 use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
 use serde_json::Value;
 
-use super::harness::TestServer;
+use super::harness::{TestServer, build_attribute_map, map_entry_fields};
 
 /// Build a `RecordBatch` with test logs containing multiple labels for grouping tests
 #[allow(clippy::too_many_lines)]
@@ -98,93 +92,39 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(9);
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            _ => panic!("Expected Struct type for map entries"),
-        },
-        _ => panic!("Expected Map type for attributes field"),
-    };
+    // `node`/`pod`/`instance` identify the reporting Kubernetes resource, so
+    // they belong at the resource level (the brief's own `k8s.pod.name`
+    // example); `value` is the per-event metric these tests unwrap, so it
+    // stays a log attribute. Every grouping/aggregation path here resolves
+    // labels through the merged view across all three levels (see
+    // `attribute_lookup`/`merged_attributes` in the LogQL planner), so which
+    // column a key lives in does not change any of these tests' outcomes.
+    let resource_pairs: [[(&str, &str); 3]; 6] = [
+        [("node", "node1"), ("pod", "pod-a"), ("instance", "inst1")], // Row 0: api
+        [("node", "node1"), ("pod", "pod-b"), ("instance", "inst2")], // Row 1: api
+        [("node", "node2"), ("pod", "pod-c"), ("instance", "inst3")], // Row 2: api
+        [("node", "node1"), ("pod", "pod-d"), ("instance", "inst4")], // Row 3: backend
+        [("node", "node2"), ("pod", "pod-e"), ("instance", "inst5")], // Row 4: backend
+        [("node", "node2"), ("pod", "pod-f"), ("instance", "inst6")], // Row 5: backend
+    ];
+    let resource_rows: Vec<&[(&str, &str)]> = resource_pairs.iter().map(<[(&str, &str); 3]>::as_slice).collect();
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &resource_rows);
 
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let key_builder = StringBuilder::new();
-    let value_builder = StringBuilder::new();
-    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &[&[], &[], &[], &[], &[], &[]]);
 
-    // Row 0: api service, node=node1, pod=pod-a, instance=inst1, value=100
-    attributes_builder.keys().append_value("node");
-    attributes_builder.values().append_value("node1");
-    attributes_builder.keys().append_value("pod");
-    attributes_builder.values().append_value("pod-a");
-    attributes_builder.keys().append_value("instance");
-    attributes_builder.values().append_value("inst1");
-    attributes_builder.keys().append_value("value");
-    attributes_builder.values().append_value("100");
-    attributes_builder.append(true)?;
-
-    // Row 1: api service, node=node1, pod=pod-b, instance=inst2, value=150
-    attributes_builder.keys().append_value("node");
-    attributes_builder.values().append_value("node1");
-    attributes_builder.keys().append_value("pod");
-    attributes_builder.values().append_value("pod-b");
-    attributes_builder.keys().append_value("instance");
-    attributes_builder.values().append_value("inst2");
-    attributes_builder.keys().append_value("value");
-    attributes_builder.values().append_value("150");
-    attributes_builder.append(true)?;
-
-    // Row 2: api service, node=node2, pod=pod-c, instance=inst3, value=200
-    attributes_builder.keys().append_value("node");
-    attributes_builder.values().append_value("node2");
-    attributes_builder.keys().append_value("pod");
-    attributes_builder.values().append_value("pod-c");
-    attributes_builder.keys().append_value("instance");
-    attributes_builder.values().append_value("inst3");
-    attributes_builder.keys().append_value("value");
-    attributes_builder.values().append_value("200");
-    attributes_builder.append(true)?;
-
-    // Row 3: backend service, node=node1, pod=pod-d, instance=inst4, value=120
-    attributes_builder.keys().append_value("node");
-    attributes_builder.values().append_value("node1");
-    attributes_builder.keys().append_value("pod");
-    attributes_builder.values().append_value("pod-d");
-    attributes_builder.keys().append_value("instance");
-    attributes_builder.values().append_value("inst4");
-    attributes_builder.keys().append_value("value");
-    attributes_builder.values().append_value("120");
-    attributes_builder.append(true)?;
-
-    // Row 4: backend service, node=node2, pod=pod-e, instance=inst5, value=180
-    attributes_builder.keys().append_value("node");
-    attributes_builder.values().append_value("node2");
-    attributes_builder.keys().append_value("pod");
-    attributes_builder.values().append_value("pod-e");
-    attributes_builder.keys().append_value("instance");
-    attributes_builder.values().append_value("inst5");
-    attributes_builder.keys().append_value("value");
-    attributes_builder.values().append_value("180");
-    attributes_builder.append(true)?;
-
-    // Row 5: backend service, node=node2, pod=pod-f, instance=inst6, value=220
-    attributes_builder.keys().append_value("node");
-    attributes_builder.values().append_value("node2");
-    attributes_builder.keys().append_value("pod");
-    attributes_builder.values().append_value("pod-f");
-    attributes_builder.keys().append_value("instance");
-    attributes_builder.values().append_value("inst6");
-    attributes_builder.keys().append_value("value");
-    attributes_builder.values().append_value("220");
-    attributes_builder.append(true)?;
-
-    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+    let log_pairs: [[(&str, &str); 1]; 6] = [
+        [("value", "100")],
+        [("value", "150")],
+        [("value", "200")],
+        [("value", "120")],
+        [("value", "180")],
+        [("value", "220")],
+    ];
+    let log_rows: Vec<&[(&str, &str)]> = log_pairs.iter().map(<[(&str, &str); 1]>::as_slice).collect();
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let log_attributes = build_attribute_map(log_key_field, log_value_field, &log_rows);
 
     // trace_id / span_id are FIXED_LEN_BYTE_ARRAY in storage; the per-row
     // value is just `i` repeated for 16 / 8 bytes.
@@ -201,7 +141,7 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
     RecordBatch::try_new(
-        arrow_schema.clone(),
+        arrow_schema,
         vec![
             tenant_id,
             service_name,
@@ -212,7 +152,9 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
             span_id,
             severity_text,
             body,
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )
     .map_err(Into::into)
@@ -805,31 +747,16 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema.field(9);
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            _ => panic!("Expected Struct type for map entries"),
-        },
-        _ => panic!("Expected Map type for attributes field"),
-    };
-
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let key_builder = StringBuilder::new();
-    let value_builder = StringBuilder::new();
-    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-
-    // Create minimal empty maps for each row
-    for _ in 0..4 {
-        attributes_builder.append(true)?; // Empty map entry
-    }
-    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+    // Minimal empty maps for each row and each level — this fixture only
+    // exercises binary-column (trace_id/span_id) grouping, so no attribute
+    // data is needed.
+    let empty_rows: [&[(&str, &str)]; 4] = [&[], &[], &[], &[]];
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &empty_rows);
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &empty_rows);
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let log_attributes = build_attribute_map(log_key_field, log_value_field, &empty_rows);
 
     // Need to add missing columns
     let observed_timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
@@ -844,7 +771,7 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
     ]));
 
     RecordBatch::try_new(
-        arrow_schema.clone(),
+        arrow_schema,
         vec![
             tenant_id,
             service_name,
@@ -855,7 +782,9 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
             span_id,
             severity_text,
             body,
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )
     .map_err(Into::into)

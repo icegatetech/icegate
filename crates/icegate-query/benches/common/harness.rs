@@ -15,7 +15,7 @@ use datafusion::arrow::array::{
     ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder,
     TimestampMicrosecondArray,
 };
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::parquet::file::properties::WriterProperties;
 use iceberg::Catalog;
 use iceberg::spec::DataFileFormat;
@@ -45,6 +45,41 @@ fn build_fixed_binary_array(hex: &str, count: usize, byte_width: i32) -> ArrayRe
     let mut builder = FixedSizeBinaryBuilder::with_capacity(count, byte_width);
     for _ in 0..count {
         builder.append_value(&bytes).expect("append fixed binary");
+    }
+    Arc::new(builder.finish())
+}
+
+/// Build a `MAP<Utf8,Utf8>` column from per-row key/value pairs, typed
+/// exactly like the named attribute-map field of `arrow_schema`. Shared by
+/// all three `write_benchmark_logs*` fixtures below now that logs attributes
+/// are split into one column per OTLP level (`resource_attributes`,
+/// `scope_attributes`, `log_attributes`) instead of a single merged
+/// `attributes` map — see `icegate_common::schema::logs_schema`.
+fn build_attribute_map(arrow_schema: &Schema, name: &str, rows: &[&[(&str, &str)]]) -> ArrayRef {
+    let field = arrow_schema
+        .field_with_name(name)
+        .expect("attribute map column present in schema");
+    let (key_field, value_field) = match field.data_type() {
+        DataType::Map(entries_field, _) => match entries_field.data_type() {
+            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
+            other => panic!("expected Struct type for `{name}` map entries, got {other:?}"),
+        },
+        other => panic!("expected Map type for `{name}` field, got {other:?}"),
+    };
+    let field_names = MapFieldNames {
+        entry: "key_value".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut builder = MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field)
+        .with_values_field(value_field);
+    for pairs in rows {
+        for (k, v) in *pairs {
+            builder.keys().append_value(*k);
+            builder.values().append_value(*v);
+        }
+        builder.append(true).expect("append map row");
     }
     Arc::new(builder.finish())
 }
@@ -220,37 +255,20 @@ pub async fn write_benchmark_logs(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema
-        .field_with_name("attributes")
-        .expect("Schema must contain an 'attributes' field");
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            _ => panic!("Expected Struct type for map entries"),
-        },
-        _ => panic!("Expected Map type for attributes field"),
-    };
-
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let key_builder = StringBuilder::new();
-    let value_builder = StringBuilder::new();
-    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-
-    for _ in 0..count {
-        attributes_builder.keys().append_value("dataset");
-        attributes_builder.values().append_value("baseline");
-        attributes_builder.keys().append_value("env");
-        attributes_builder.values().append_value("prod");
-        attributes_builder.append(true)?;
-    }
-
-    let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
+    // `dataset`/`env` are constant for every row this benchmark writes, so —
+    // mirroring the resource-vs-log split documented in
+    // `tests/loki/harness.rs` — both describe the reporting resource, not an
+    // individual log record, and land in `resource_attributes`. Neither is
+    // stored dotted: both are single-token bench-only labels with no natural
+    // dotted split, and the `loki_queries` benchmarks match on these exact
+    // bare wire names (`.` -> `_` normalization would only change that name
+    // if a dot were present — see `map_normalized_lookup::normalize_key`).
+    let resource_pairs: [(&str, &str); 2] = [("dataset", "baseline"), ("env", "prod")];
+    let resource_rows: Vec<&[(&str, &str)]> = vec![resource_pairs.as_slice(); count];
+    let resource_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES, &resource_rows);
+    let empty_rows: Vec<&[(&str, &str)]> = vec![&[]; count];
+    let scope_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES, &empty_rows);
+    let log_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_LOG_ATTRIBUTES, &empty_rows);
 
     // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
     // schema; decode the hex fixtures into raw bytes once and reuse them
@@ -270,7 +288,9 @@ pub async fn write_benchmark_logs(
             span_id_arr,
             severity_text_arr,
             body_arr,
-            attributes_arr,
+            resource_attributes_arr,
+            scope_attributes_arr,
+            log_attributes_arr,
         ],
     )?;
 
@@ -339,41 +359,40 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema
-        .field_with_name("attributes")
-        .expect("Schema must contain an 'attributes' field");
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            _ => panic!("Expected Struct type for map entries"),
-        },
-        _ => panic!("Expected Map type for attributes field"),
-    };
+    // `dataset` is constant for every row (resource-level, matching
+    // `write_benchmark_logs` above). `latency`/`request_time`/`response_size`
+    // are per-request measurements that genuinely describe THIS log record,
+    // not the reporting resource, so they land in `log_attributes` instead.
+    // `request_time`/`response_size` are stored dotted (`request.time`,
+    // `response.size`) — the embedded `_` is exactly where a `.` normalizes
+    // back to on read (see `map_normalized_lookup::normalize_key`), so the
+    // `loki_queries` benchmarks' bare `request_time`/`response_size` matchers
+    // still resolve. `dataset`/`latency` have no such split point without
+    // changing their post-normalization wire name, so they stay undotted.
+    let resource_pairs: [(&str, &str); 1] = [("dataset", "numeric")];
+    let resource_rows: Vec<&[(&str, &str)]> = vec![resource_pairs.as_slice(); count];
+    let resource_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES, &resource_rows);
+    let empty_rows: Vec<&[(&str, &str)]> = vec![&[]; count];
+    let scope_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES, &empty_rows);
 
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let key_builder = StringBuilder::new();
-    let value_builder = StringBuilder::new();
-    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-
-    for (latency, request_time, response_size) in &random_values {
-        attributes_builder.keys().append_value("dataset");
-        attributes_builder.values().append_value("numeric");
-        attributes_builder.keys().append_value("latency");
-        attributes_builder.values().append_value(latency.to_string());
-        attributes_builder.keys().append_value("request_time");
-        attributes_builder.values().append_value(request_time.to_string());
-        attributes_builder.keys().append_value("response_size");
-        attributes_builder.values().append_value(response_size.to_string());
-        attributes_builder.append(true)?;
-    }
-
-    let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
+    let value_strings: Vec<(String, String, String)> = random_values
+        .iter()
+        .map(|(latency, request_time, response_size)| {
+            (latency.to_string(), request_time.to_string(), response_size.to_string())
+        })
+        .collect();
+    let log_pairs: Vec<[(&str, &str); 3]> = value_strings
+        .iter()
+        .map(|(latency, request_time, response_size)| {
+            [
+                ("latency", latency.as_str()),
+                ("request.time", request_time.as_str()),
+                ("response.size", response_size.as_str()),
+            ]
+        })
+        .collect();
+    let log_rows: Vec<&[(&str, &str)]> = log_pairs.iter().map(<[(&str, &str); 3]>::as_slice).collect();
+    let log_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_LOG_ATTRIBUTES, &log_rows);
 
     // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
     // schema; decode the hex fixtures into raw bytes once and reuse them
@@ -393,7 +412,9 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
             span_id_arr,
             severity_text_arr,
             body_arr,
-            attributes_arr,
+            resource_attributes_arr,
+            scope_attributes_arr,
+            log_attributes_arr,
         ],
     )?;
 
@@ -451,42 +472,30 @@ pub async fn write_benchmark_logs_with_varied_labels(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema
-        .field_with_name("attributes")
-        .expect("Schema must contain an 'attributes' field");
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            _ => panic!("Expected Struct type for map entries"),
-        },
-        _ => panic!("Expected Map type for attributes field"),
-    };
-
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let key_builder = StringBuilder::new();
-    let value_builder = StringBuilder::new();
-    let mut attributes_builder = MapBuilder::new(Some(field_names), key_builder, value_builder)
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-
-    for i in 0..count {
-        let namespace = namespaces[i % namespaces.len()];
-        let pod = pods[i % pods.len()];
-
-        attributes_builder.keys().append_value("dataset");
-        attributes_builder.values().append_value("varied");
-        attributes_builder.keys().append_value("namespace");
-        attributes_builder.values().append_value(namespace);
-        attributes_builder.keys().append_value("pod");
-        attributes_builder.values().append_value(pod);
-        attributes_builder.append(true)?;
-    }
-
-    let attributes_arr: ArrayRef = Arc::new(attributes_builder.finish());
+    // `namespace`/`pod` mirror OTel's canonical `k8s.namespace.name` /
+    // `k8s.pod.name` resource attributes, and `dataset` is this benchmark's
+    // own constant-per-write resource marker (see `write_benchmark_logs`
+    // above) — all three genuinely describe the reporting resource, not the
+    // individual log record, so all three land in `resource_attributes`
+    // (varying per row is realistic here: a flattened multi-resource table
+    // legitimately holds rows contributed by many different pods). Kept
+    // undotted: the real `k8s.namespace.name` spelling would normalize to
+    // wire label `k8s_namespace_name`, breaking the `by (namespace, pod)` /
+    // `without (pod)` grouping the `loki_queries` benchmarks match on.
+    let resource_pairs: Vec<[(&str, &str); 3]> = (0..count)
+        .map(|i| {
+            [
+                ("dataset", "varied"),
+                ("namespace", namespaces[i % namespaces.len()]),
+                ("pod", pods[i % pods.len()]),
+            ]
+        })
+        .collect();
+    let resource_rows: Vec<&[(&str, &str)]> = resource_pairs.iter().map(<[(&str, &str); 3]>::as_slice).collect();
+    let resource_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES, &resource_rows);
+    let empty_rows: Vec<&[(&str, &str)]> = vec![&[]; count];
+    let scope_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES, &empty_rows);
+    let log_attributes_arr = build_attribute_map(&arrow_schema, schema::COL_LOG_ATTRIBUTES, &empty_rows);
 
     // trace_id / span_id are FIXED_LEN_BYTE_ARRAY (16 / 8) in the logs
     // schema; decode the hex fixtures into raw bytes once and reuse them
@@ -506,7 +515,9 @@ pub async fn write_benchmark_logs_with_varied_labels(
             span_id_arr,
             severity_text_arr,
             body_arr,
-            attributes_arr,
+            resource_attributes_arr,
+            scope_attributes_arr,
+            log_attributes_arr,
         ],
     )?;
 

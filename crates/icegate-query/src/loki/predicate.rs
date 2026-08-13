@@ -88,6 +88,7 @@ mod tests {
         ],
         excluded_map_keys: &[],
         map_column: "attributes",
+        normalize_keys: true,
     };
 
     #[test]

@@ -14,7 +14,9 @@
 use icegate_common::{ICEGATE_NAMESPACE, SPANS_TABLE};
 use serde_json::Value;
 
-use super::harness::{TestServer, write_test_spans, write_test_spans_with_properties};
+use super::harness::{
+    TestServer, write_test_spans, write_test_spans_with_properties, write_test_spans_with_scope_attributes,
+};
 
 #[tokio::test]
 async fn v1_tags_returns_attribute_keys_and_intrinsics() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,6 +54,59 @@ async fn v1_tags_returns_attribute_keys_and_intrinsics() -> Result<(), Box<dyn s
     // TraceQL intrinsics should appear.
     assert!(tag_strs.contains(&"duration"), "expected duration in {:?}", tag_strs);
     assert!(tag_strs.contains(&"name"), "expected name intrinsic in {:?}", tag_strs);
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Task 10 regression: `spans` gained a dedicated `scope_attributes`
+/// column (`OTel` `InstrumentationScope.attributes`) instead of folding it
+/// into `span_attributes`. Proves the v1 flat tag list actually returns a
+/// scope-level key — a scan config pointing at the right column is not the
+/// same as the endpoint returning it.
+#[tokio::test]
+async fn v1_tags_include_the_scope_attribute_key() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+    // Dotted key on every row — TraceQL matches attribute names exactly as
+    // stored (normalize_keys: false), unlike Loki's dot-to-underscore wire
+    // form.
+    write_test_spans_with_scope_attributes(
+        &table,
+        &catalog,
+        "tempo-tenant",
+        &[
+            &[("instrumentation.name", "checkout-worker")],
+            &[("instrumentation.name", "checkout-worker")],
+            &[("instrumentation.name", "checkout-worker")],
+        ],
+    )
+    .await?;
+
+    let resp = server
+        .client
+        .get(format!("{}/api/search/tags", server.base_url))
+        .header("X-Scope-OrgID", "tempo-tenant")
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+    assert_eq!(status, 200, "Response body: {}", body);
+
+    let tags: Vec<&str> = body["tagNames"]
+        .as_array()
+        .expect("tagNames array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        tags.contains(&"instrumentation.name"),
+        "expected scope-attribute key in v1 flat tag list: {:?}",
+        tags
+    );
 
     server.shutdown().await;
     Ok(())
@@ -124,6 +179,16 @@ async fn v2_tags_groups_by_scope() -> Result<(), Box<dyn std::error::Error>> {
         span
     );
 
+    // There is no dedicated instrumentation-scope group — `TraceQL`/Tempo
+    // has no query scope for `scope_attributes`, so it is never advertised
+    // as its own `ScopeGroup` (its keys fold into `span` instead; see
+    // `v2_tags_place_the_scope_attribute_key_in_the_span_group`).
+    assert!(
+        !by_name.contains_key("scope"),
+        "no dedicated scope group should exist: {:?}",
+        by_name.keys().collect::<Vec<_>>()
+    );
+
     // Intrinsic scope must include the standard TraceQL names.
     let intrinsic = by_name.get("intrinsic").expect("intrinsic scope present");
     assert!(intrinsic.contains(&"duration"), "expected duration: {:?}", intrinsic);
@@ -133,6 +198,141 @@ async fn v2_tags_groups_by_scope() -> Result<(), Box<dyn std::error::Error>> {
     // Event and link scopes must exist (even if empty).
     assert!(by_name.contains_key("event"), "event scope missing");
     assert!(by_name.contains_key("link"), "link scope missing");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Companion to [`v2_tags_groups_by_scope`]: proves the scope-attribute key
+/// surfaces in the v2 grouped response under the `span` group — `TraceQL`/
+/// Tempo has no instrumentation-scope query scope, so `scope_attributes`
+/// keys fold into `span` exactly as they did when ingest physically wrote
+/// them into `span_attributes` before the OTel-native storage split — and
+/// is NOT advertised under `resource`. This is the design-defect regression
+/// the fold protects: advertising the key under `resource` would let a
+/// client (e.g. Grafana's query builder) build a
+/// `resource.instrumentation.name = "..."` selector that is guaranteed to
+/// return nothing, because `resource_attributes` never holds that key —
+/// see the `tempo::metadata` module docs.
+#[tokio::test]
+async fn v2_tags_place_the_scope_attribute_key_in_the_span_group() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+    write_test_spans_with_scope_attributes(
+        &table,
+        &catalog,
+        "tempo-tenant",
+        &[
+            &[("instrumentation.name", "checkout-worker")],
+            &[("instrumentation.name", "checkout-worker")],
+            &[("instrumentation.name", "checkout-worker")],
+        ],
+    )
+    .await?;
+
+    let resp = server
+        .client
+        .get(format!("{}/api/v2/search/tags", server.base_url))
+        .header("X-Scope-OrgID", "tempo-tenant")
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+    assert_eq!(status, 200, "Response body: {}", body);
+
+    let scopes = body["scopes"].as_array().expect("scopes array");
+    let by_name: std::collections::HashMap<&str, Vec<&str>> = scopes
+        .iter()
+        .map(|s| {
+            let name = s["name"].as_str().unwrap();
+            let tags: Vec<&str> = s["tags"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+            (name, tags)
+        })
+        .collect();
+
+    assert!(
+        !by_name.contains_key("scope"),
+        "no dedicated scope group should exist: {:?}",
+        by_name.keys().collect::<Vec<_>>()
+    );
+
+    let span = by_name.get("span").expect("span scope present");
+    assert!(
+        span.contains(&"instrumentation.name"),
+        "expected scope-attribute key folded into the span group: {:?}",
+        span
+    );
+
+    let resource = by_name.get("resource").expect("resource scope present");
+    assert!(
+        !resource.contains(&"instrumentation.name"),
+        "scope-attribute key leaked into the resource group — its resource.instrumentation.name \
+         selector cannot read scope_attributes: {:?}",
+        resource
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Regression for the `?scope=` filter now that scope attributes fold into
+/// `span` (no dedicated instrumentation-scope group exists): filtering to
+/// `resource` must NOT surface the scope-attribute key, and filtering to
+/// `span` MUST — directly covering the parent task's requirement that
+/// `?scope=span` returns it.
+#[tokio::test]
+async fn v2_tags_scope_filter_span_returns_the_scope_attribute_key() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+    write_test_spans_with_scope_attributes(
+        &table,
+        &catalog,
+        "tempo-tenant",
+        &[
+            &[("instrumentation.name", "checkout-worker")],
+            &[("instrumentation.name", "checkout-worker")],
+            &[("instrumentation.name", "checkout-worker")],
+        ],
+    )
+    .await?;
+
+    for (scope, expect_key) in [("resource", false), ("span", true)] {
+        let resp = server
+            .client
+            .get(format!("{}/api/v2/search/tags?scope={scope}", server.base_url))
+            .header("X-Scope-OrgID", "tempo-tenant")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        assert_eq!(status, 200, "scope={scope} response body: {body}");
+
+        let scopes = body["scopes"].as_array().expect("scopes array");
+        assert_eq!(scopes.len(), 1, "scope={scope} expected single scope, got {:?}", scopes);
+        assert_eq!(
+            scopes[0]["name"], scope,
+            "scope={scope} unexpected group name in {:?}",
+            scopes
+        );
+        let tags: Vec<&str> = scopes[0]["tags"]
+            .as_array()
+            .expect("tags array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            tags.contains(&"instrumentation.name"),
+            expect_key,
+            "scope={scope} expected instrumentation.name present={expect_key}: {:?}",
+            tags
+        );
+    }
 
     server.shutdown().await;
     Ok(())
@@ -274,6 +474,73 @@ async fn tag_values_for_span_attribute() -> Result<(), Box<dyn std::error::Error
         .filter_map(|v| v.as_str())
         .collect();
     assert!(values.contains(&"GET"), "expected GET in tagValues: {:?}", values);
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Regression for `list_tag_values` now that scope attributes fold into
+/// the `span` `TraceQL` group (`TraceQL`/Tempo has no instrumentation-scope
+/// query scope): their values must be reachable through the SAME prefixes
+/// tag enumeration now advertises them under — `span.` and the unscoped `.`
+/// form — and NOT through `resource.`. Reaching them via `resource.` would
+/// silently return an empty dropdown for a tag Grafana just discovered
+/// under the `span` group. The old `scope.` prefix is no longer special-
+/// cased at all — `TagRef::parse` now treats it as an ordinary (empty)
+/// intrinsic lookup, the same harmless no-op any other bogus prefix gets,
+/// rather than being misrouted to a scope that no longer exists. Also
+/// proves the exact dotted value round-trips unmodified (no Loki-style
+/// dot-to-underscore normalization) through every prefix that DOES
+/// resolve.
+#[tokio::test]
+async fn tag_values_for_scope_attribute_reachable_via_span_and_unscoped_prefixes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+    write_test_spans_with_scope_attributes(
+        &table,
+        &catalog,
+        "tempo-tenant",
+        &[
+            &[("instrumentation.name", "checkout-worker")],
+            &[("instrumentation.name", "checkout-worker")],
+            &[("instrumentation.name", "checkout-worker")],
+        ],
+    )
+    .await?;
+
+    for (path, expect_value) in [
+        ("resource.instrumentation.name", false),
+        ("scope.instrumentation.name", false),
+        ("span.instrumentation.name", true),
+        (".instrumentation.name", true),
+    ] {
+        let resp = server
+            .client
+            .get(format!("{}/api/search/tag/{path}/values", server.base_url))
+            .header("X-Scope-OrgID", "tempo-tenant")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        assert_eq!(status, 200, "path={path} response body: {body}");
+
+        let values: Vec<&str> = body["tagValues"]
+            .as_array()
+            .expect("tagValues array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            values.contains(&"checkout-worker"),
+            expect_value,
+            "path={path} expected dotted-as-stored value present={expect_value}: {:?}",
+            values
+        );
+    }
 
     server.shutdown().await;
     Ok(())

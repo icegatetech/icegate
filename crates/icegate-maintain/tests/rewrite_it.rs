@@ -49,7 +49,10 @@ use icegate_common::iceberg_write::WriteConfig;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS};
-use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
+use icegate_common::schema::{
+    COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, logs_partition_spec, logs_schema,
+    logs_sort_order,
+};
 use icegate_maintain::compact::data::rewrite::{CompactFilesExecutor, RewriteInput, RewriteOutcome};
 use icegate_maintain::compact::metrics::CompactMetrics;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -109,7 +112,13 @@ fn logs_batch(rows: &[(&str, i64)], unique_offset: usize) -> RecordBatch {
     let trace_id = FixedSizeBinaryArray::try_from_iter(trace_vals.iter().map(|v| v.to_vec())).unwrap();
     let span_vals: Vec<[u8; 8]> = (0..n).map(|i| [u8::try_from((unique_offset + i) % 256).unwrap(); 8]).collect();
     let span_id = FixedSizeBinaryArray::try_from_iter(span_vals.iter().map(|v| v.to_vec())).unwrap();
-    let attributes = empty_string_map(&arrow_schema, n);
+    // This fixture's row-set/order assertions read only `body`/`service_name`/
+    // `timestamp` (see `append_rows`), so no attribute content is needed at
+    // any OTLP level — all three per-level maps are empty rather than the
+    // single empty `attributes` map this used before the schema split.
+    let resource_attributes = empty_string_map(&arrow_schema, COL_RESOURCE_ATTRIBUTES, n);
+    let scope_attributes = empty_string_map(&arrow_schema, COL_SCOPE_ATTRIBUTES, n);
+    let log_attributes = empty_string_map(&arrow_schema, COL_LOG_ATTRIBUTES, n);
 
     RecordBatch::try_new(
         arrow_schema,
@@ -125,18 +134,21 @@ fn logs_batch(rows: &[(&str, i64)], unique_offset: usize) -> RecordBatch {
             Arc::new(StringArray::from(
                 (0..n).map(|i| Some(format!("msg-{}", unique_offset + i))).collect::<Vec<_>>(),
             )),
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )
     .expect("record batch")
 }
 
 /// Build an empty `MAP<Utf8,Utf8>` column of length `rows` typed exactly like
-/// the `attributes` field of the iceberg-derived arrow schema.
-fn empty_string_map(arrow_schema: &ArrowSchema, rows: usize) -> Arc<dyn Array> {
-    let attr_field = arrow_schema.field_with_name("attributes").unwrap();
+/// the named attribute-map field (`resource_attributes` / `scope_attributes`
+/// / `log_attributes`) of the iceberg-derived arrow schema.
+fn empty_string_map(arrow_schema: &ArrowSchema, name: &str, rows: usize) -> Arc<dyn Array> {
+    let attr_field = arrow_schema.field_with_name(name).unwrap();
     let DataType::Map(entry_field, ordered) = attr_field.data_type() else {
-        panic!("attributes must be a Map");
+        panic!("{name} must be a Map");
     };
     let DataType::Struct(kv_fields) = entry_field.data_type() else {
         panic!("map entry must be a Struct");

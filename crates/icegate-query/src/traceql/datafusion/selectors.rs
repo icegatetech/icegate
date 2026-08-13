@@ -3,15 +3,15 @@
 use std::ops::Not;
 
 use datafusion::{
-    functions::regex::regexp_like,
+    functions::{core::expr_fn::coalesce, regex::regexp_like},
     functions_nested::{extract::array_element, map_extract::map_extract},
     logical_expr::{Expr, lit},
     prelude::{DataFrame, col},
     scalar::ScalarValue,
 };
 use icegate_common::schema::{
-    COL_DURATION_MICROS, COL_KIND, COL_NAME, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES,
-    COL_SPAN_ID, COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TRACE_ID,
+    COL_DURATION_MICROS, COL_KIND, COL_NAME, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME,
+    COL_SPAN_ATTRIBUTES, COL_SPAN_ID, COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TRACE_ID,
 };
 
 use super::planner::not_implemented;
@@ -121,8 +121,13 @@ pub(crate) fn intrinsic_column(i: IntrinsicField) -> Expr {
 ///
 /// Routing:
 /// - `Scope::Resource` / `Scope::Parent(Resource)` -> `resource_attributes[name]`
-/// - `Scope::Span`     / `Scope::Parent(Span)`     -> `span_attributes[name]`
-/// - `Scope::Any` (`.name` shorthand) -> `(resource_cmp) OR (span_cmp)`
+/// - `Scope::Span`     / `Scope::Parent(Span)`     -> `COALESCE(span_attributes[name], scope_attributes[name])`
+///   — `TraceQL`/Tempo has no instrumentation-scope query scope, so a key
+///   that lives only in `scope_attributes` (`OTel`
+///   `InstrumentationScope.attributes`) is reachable ONLY through `span`,
+///   with `span_attributes` winning on collision; see [`span_attribute_lhs`].
+/// - `Scope::Any` (`.name` shorthand) -> `(resource_cmp) OR (span_cmp)` —
+///   already covers a scope-only key because `span_cmp` folds it in.
 /// - `Scope::Event` / `Scope::Link`   -> NULL predicate (v1 unmodelled)
 ///
 /// Well-known indexed resource keys (`service.name`) are short-circuited
@@ -173,12 +178,44 @@ pub(crate) fn resource_attribute_lhs(name: &str) -> Expr {
 
 /// LHS expression for a span-scoped attribute lookup.
 ///
-/// No indexed short-circuit: span-scoped keys live only in the per-span
-/// attributes map. (The top-level `service_name` column carries
-/// resource-level values, so a `span.service.name` filter must stay
-/// inside `span_attributes`.)
+/// Reads `span_attributes` first, falling back to `scope_attributes`
+/// (`OTel` `InstrumentationScope.attributes`) when the key is absent from
+/// the span map. `TraceQL`/Tempo has no instrumentation-scope query scope
+/// — an earlier, incorrect design gave it a dedicated `scope.` selector and
+/// tag-discovery group; the owner's correction removed both, so `span` is
+/// now the ONLY `TraceQL` scope that can reach a `scope_attributes`-only
+/// key (`Scope::Any`'s unscoped `.<name>` shorthand reaches it too, by
+/// composing this function — see [`attribute_compare`]). `COALESCE` gives
+/// `span_attributes` priority on key collision, matching the precedence
+/// ingest's pre-migration physical fold had, when scope attributes were
+/// written directly into the same map as span attributes and a span-level
+/// key silently overwrote a same-named scope-level one. Do not
+/// "simplify" this back to reading only `span_attributes` — that
+/// regresses exactly the bug this function fixes (see the C2 regression
+/// tests in `tests/tempo/search.rs`).
+///
+/// No indexed short-circuit: span-scoped (and folded-in scope-scoped) keys
+/// live only in these two attribute maps. (The top-level `service_name`
+/// column carries resource-level values, so a `span.service.name` filter
+/// must stay inside the maps.)
 pub(crate) fn span_attribute_lhs(name: &str) -> Expr {
-    array_element(map_extract(col(COL_SPAN_ATTRIBUTES), lit(name)), lit(1_i64))
+    coalesce(vec![
+        array_element(map_extract(col(COL_SPAN_ATTRIBUTES), lit(name)), lit(1_i64)),
+        scope_attribute_lhs(name),
+    ])
+}
+
+/// Low-level LHS expression reading directly from the `scope_attributes`
+/// map (`OTel` `InstrumentationScope.attributes`).
+///
+/// Not a per-scope routing target on its own — `TraceQL`/Tempo has no
+/// instrumentation-scope query scope, so [`attribute_compare`] never calls
+/// this directly. [`span_attribute_lhs`] uses it as the fallback arm of its
+/// `COALESCE`. Keys are matched exactly as stored — `TraceQL` attribute
+/// names are not subject to Loki's label-name restriction, so dots are
+/// used directly and never rewritten.
+fn scope_attribute_lhs(name: &str) -> Expr {
+    array_element(map_extract(col(COL_SCOPE_ATTRIBUTES), lit(name)), lit(1_i64))
 }
 
 /// Map a `TraceQL` attribute name onto the spans-table column that holds the
@@ -273,6 +310,42 @@ mod tests {
         let e = intrinsic_column(IntrinsicField::Status);
         // Just check that it doesn't panic and returns a plain column ref.
         assert!(matches!(e, Expr::Column(_)));
+    }
+
+    #[test]
+    fn scope_attribute_lhs_targets_the_scope_map() {
+        // Cheap fast-fail companion to the execution-level proof in
+        // `tests/tempo/`: catches a copy-paste from `span_attribute_lhs` /
+        // `resource_attribute_lhs` that forgot to swap the column, without
+        // needing a running query engine.
+        let rendered = format!("{}", scope_attribute_lhs("otel.scope.name"));
+        assert!(rendered.contains(COL_SCOPE_ATTRIBUTES));
+        assert!(!rendered.contains(COL_SPAN_ATTRIBUTES));
+        assert!(!rendered.contains(COL_RESOURCE_ATTRIBUTES));
+    }
+
+    // C2 fast-fail companion to the execution-level proof in
+    // `tests/tempo/search.rs`: pins that `span_attribute_lhs` still reads
+    // BOTH `span_attributes` and `scope_attributes` — `TraceQL`/Tempo has no
+    // instrumentation-scope query scope, so `span` is the only place a
+    // `scope_attributes`-only key is reachable from. Catches a regression
+    // that "simplifies" the `COALESCE` back down to a single-column lookup,
+    // without needing a running query engine.
+    #[test]
+    fn span_attribute_lhs_reads_both_span_and_scope_maps() {
+        let rendered = format!("{}", span_attribute_lhs("otel.scope.name"));
+        assert!(
+            rendered.contains(COL_SPAN_ATTRIBUTES),
+            "missing span_attributes: {rendered}"
+        );
+        assert!(
+            rendered.contains(COL_SCOPE_ATTRIBUTES),
+            "missing scope_attributes: {rendered}"
+        );
+        assert!(
+            !rendered.contains(COL_RESOURCE_ATTRIBUTES),
+            "must not read resource_attributes: {rendered}"
+        );
     }
 
     #[test]

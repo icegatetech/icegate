@@ -45,7 +45,12 @@
 //!   chain.
 //! - `Scope::Any` (`.foo`) attribute references — would require
 //!   OR-of-MAPs, which is itself non-pushdownable.
-//! - `Scope::Event`, `Scope::Link`, `Scope::Parent(_)` attributes.
+//! - `Scope::Event`, `Scope::Link`, `Scope::Parent(_)` attributes — none of
+//!   these have an indexed column, so every key falls under the
+//!   MAP-attribute rule above. (There is no `Scope::Instrumentation`:
+//!   `TraceQL`/Tempo has no instrumentation-scope query scope — those
+//!   attributes resolve through `Scope::Span` instead, and are dropped by
+//!   the same MAP-attribute rule as any other span attribute.)
 //! - Unmodelled intrinsics (`duration`, `traceDuration`, `rootName`,
 //!   `rootServiceName`, `statusMessage`, `Parent`, `event:*`, `link:*`).
 //! - Type-mismatched literals (string literal against `status_code`,
@@ -234,9 +239,14 @@ fn translate_compare(
 /// expansion has a non-pushdownable span side and the OR rule requires
 /// both sides to translate. Event/link/parent attribute scopes drop
 /// because they live in nested `LIST<STRUCT>` columns and aren't
-/// modelled for metadata-scan pruning today. Intrinsics not listed
-/// here (`duration`, `traceDuration`, `rootName`, `rootServiceName`,
-/// `statusMessage`, `Parent`, `event:*`, `link:*`) drop too.
+/// modelled for metadata-scan pruning today. `OTel`
+/// `InstrumentationScope.attributes` have no scope of their own — they
+/// fold into `Scope::Span` (see `traceql::common::Scope::Span`) and drop
+/// under that same rule: unlike `resource.service.name`, no key is ever
+/// promoted to an indexed column, so every lookup stays in the MAP.
+/// Intrinsics not listed here (`duration`, `traceDuration`, `rootName`,
+/// `rootServiceName`, `statusMessage`, `Parent`, `event:*`, `link:*`)
+/// drop too.
 fn indexed_column_for(field: &FieldRef) -> Option<&'static str> {
     match field {
         FieldRef::Intrinsic(IntrinsicField::Name) => Some(COL_NAME),

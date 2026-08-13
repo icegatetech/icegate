@@ -42,10 +42,10 @@ matchers
 
 // Single matcher, e.g., foo="bar", foo=~"val.*"
 matcher
-    : PREFIX? ATTRIBUTE EQ STRING  #matcherEq
-    | PREFIX? ATTRIBUTE NE STRING  #matcherNeq
-    | PREFIX? ATTRIBUTE RE STRING  #matcherRe
-    | PREFIX? ATTRIBUTE NRE STRING #matcherNre
+    : ATTRIBUTE EQ STRING  #matcherEq
+    | ATTRIBUTE NE STRING  #matcherNeq
+    | ATTRIBUTE RE STRING  #matcherRe
+    | ATTRIBUTE NRE STRING #matcherNre
     ;
 
 /*------------------------------------------------------------------
@@ -379,7 +379,7 @@ groupingLabelList
     ;
 
 groupingLabel
-    : PREFIX? ATTRIBUTE
+    : ATTRIBUTE
     ;
 
 groupingLabels
