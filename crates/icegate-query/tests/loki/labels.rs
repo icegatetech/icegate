@@ -63,11 +63,22 @@ async fn test_labels_endpoint() -> Result<(), Box<dyn std::error::Error>> {
         label_strs
     );
 
-    // Should include attribute keys from test data
+    // Should include attribute keys from test data, under their wire names —
+    // the fixture stores these dotted (`user.id`, `http.target`,
+    // `server.address`), so this also pins the '.' -> '_' rendering.
+    for expected in ["user_id", "request_id", "http_target", "server_address"] {
+        assert!(
+            label_strs.contains(&expected),
+            "labels should include log-level attribute `{expected}`, got: {label_strs:?}"
+        );
+    }
+
+    // The scope level must be enumerated too: it is a separate stored MAP
+    // column, so a regression that dropped it would leave every other
+    // assertion here passing.
     assert!(
-        label_strs.contains(&"user_id") || label_strs.contains(&"page") || label_strs.contains(&"db_host"),
-        "labels should include attribute keys from test data, got: {:?}",
-        label_strs
+        label_strs.contains(&"otel_scope_name"),
+        "labels should include the scope-level attribute `otel_scope_name`, got: {label_strs:?}"
     );
 
     server.shutdown().await;

@@ -3,13 +3,14 @@
 //! Extracts the common query execution flow from handlers, including
 //! parsing, planning, and execution of `LogQL` queries.
 
-use std::{collections::BTreeSet, sync::Arc, time::Instant};
+use std::{borrow::Cow, collections::BTreeSet, sync::Arc, time::Instant};
 
 use chrono::{DateTime, Duration, Utc};
 use datafusion::{
     arrow::array::RecordBatch,
     prelude::{DataFrame, SessionContext},
 };
+use icegate_common::attribute_key::normalize_attribute_key;
 
 use super::{
     error::{LokiError, LokiResult},
@@ -115,15 +116,17 @@ fn join_error(e: tokio::task::JoinError) -> LokiError {
 // Label-name normalization
 // ============================================================================
 
-/// Render a stored attribute key as the Loki label name that addresses it.
+/// Render an owned stored attribute key as the Loki label name addressing it.
 ///
-/// Mirrors the read-time `.` → `_` mapping applied by the `map_get_by_normalized_key`
-/// and `map_merge_normalized` UDFs and by `loki::formatters::extract_attributes_map`
-/// — duplicated rather than shared because those live in the DataFusion/row-batch
-/// paths and this caller only needs the plain string transform. Allocation-free for
-/// the common already-underscored key.
-fn normalize_label_name(raw: String) -> String {
-    if raw.contains('.') { raw.replace('.', "_") } else { raw }
+/// Thin owned-value adapter over [`icegate_common::attribute_key::normalize_attribute_key`],
+/// which every path resolving a stored key against a wire name shares; label
+/// enumeration is the one caller that already owns its keys (they come out of a
+/// `BTreeSet`) and wants them back owned.
+fn normalize_label_name(stored_key: String) -> String {
+    match normalize_attribute_key(&stored_key) {
+        Cow::Borrowed(_) => stored_key,
+        Cow::Owned(wire_name) => wire_name,
+    }
 }
 
 // ============================================================================

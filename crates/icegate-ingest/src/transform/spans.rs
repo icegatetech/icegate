@@ -258,7 +258,16 @@ pub fn spans_to_record_batch(
             .find(|kv| kv.key == "service.name")
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
+        // Flattened once per ResourceSpans / ScopeSpans and reused by every
+        // span beneath: both inputs are fixed at their own nesting level, so
+        // re-flattening them per span would rebuild an identical BTreeMap (and
+        // every key/value String in it) for each row of the export.
+        let merged_resource_attrs = dedupe_dotted_attributes(resource_attrs);
+
         for scope_spans in &resource_spans.scope_spans {
+            let scope_attrs = scope_spans.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
+            let merged_scope_attrs = dedupe_dotted_attributes(scope_attrs);
+
             for span in &scope_spans.spans {
                 // Hoist all fixed-size-binary length validation to a single
                 // block. `try_into` carries the length check at the type
@@ -360,12 +369,11 @@ pub fn spans_to_record_batch(
                     }
                 }
 
-                // Resource attributes go to `resource_attributes`. Dedupe
+                // Resource attributes go to `resource_attributes`. Deduped
                 // ahead of the `MapBuilder` for the same reason as the
                 // scope+span path below: downstream `MAP<K,V>` readers
                 // disagree on duplicate-key resolution, so we collapse to a
-                // single entry per key here.
-                let merged_resource_attrs = dedupe_dotted_attributes(resource_attrs);
+                // single entry per key.
                 for (key, value) in &merged_resource_attrs {
                     resource_attrs_builder.keys().append_value(key);
                     resource_attrs_builder.values().append_value(value);
@@ -375,8 +383,7 @@ pub fn spans_to_record_batch(
                 // fold there is no precedence to apply: a key present at both
                 // levels is stored twice, once per level, and the read path
                 // resolves it.
-                let scope_attrs = scope_spans.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
-                for (key, value) in &dedupe_dotted_attributes(scope_attrs) {
+                for (key, value) in &merged_scope_attrs {
                     scope_attrs_builder.keys().append_value(key);
                     scope_attrs_builder.values().append_value(value);
                 }

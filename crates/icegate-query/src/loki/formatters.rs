@@ -15,9 +15,13 @@ use datafusion::arrow::{
     },
     datatypes::Schema,
 };
-use icegate_common::schema::{
-    COL_BODY, COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT,
-    COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID, LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS, LOG_SERIES_LABEL_COLUMNS,
+use icegate_common::{
+    attribute_key::normalize_attribute_key,
+    schema::{
+        COL_BODY, COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME,
+        COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID, LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS,
+        LOG_SERIES_LABEL_COLUMNS,
+    },
 };
 
 use super::models::{MetricSeries, QueryResult, QueryStats, ResultType, Stream};
@@ -325,16 +329,13 @@ fn extract_attributes_map(
                 // so it resets at every level boundary (see doc comment above).
                 let mut seen_in_level: HashSet<Arc<str>> = HashSet::with_capacity(end - start);
                 for i in start..end {
+                    // A NULL key or value makes the entry invisible rather than
+                    // valueless, so it does not claim the wire name — the same
+                    // rule the two UDFs apply (see `icegate_common::attribute_key`).
                     if !keys.is_null(i) && !values.is_null(i) {
-                        let key = keys.value(i);
-                        // Stored keys are dotted OTel-native; Loki label names admit neither
-                        // dots nor colons, so the wire name is the key with '.' -> '_'. The
-                        // series path arrives pre-normalized, and normalizing again is a no-op.
-                        let name = if key.contains('.') {
-                            interner.intern(&key.replace('.', "_"))
-                        } else {
-                            interner.intern(key)
-                        };
+                        // The series path arrives pre-normalized, and
+                        // normalizing again is a no-op.
+                        let name = interner.intern(&normalize_attribute_key(keys.value(i)));
                         if seen_in_level.insert(Arc::clone(&name)) {
                             labels.insert(name, interner.intern(values.value(i)));
                         }

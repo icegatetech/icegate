@@ -288,8 +288,14 @@ pub async fn write_test_logs_for_tenant(
     let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
     let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &resource_rows);
 
+    // Scope level: the instrumentation library that produced the record.
+    // Populated so a regression that stopped reading `scope_attributes`
+    // entirely cannot pass — an empty map at this level is indistinguishable
+    // from a dropped one.
+    let scope_pairs: [(&str, &str); 1] = [("otel.scope.name", "test-instrumentation")];
+    let scope_rows: [&[(&str, &str)]; 3] = [&scope_pairs, &scope_pairs, &scope_pairs];
     let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
-    let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &[&[], &[], &[]]);
+    let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &scope_rows);
 
     let log_pairs: Vec<[(&str, &str); 1]> = bodies.iter().map(|b| [("body", b.as_str())]).collect();
     let log_rows: Vec<&[(&str, &str)]> = log_pairs.iter().map(<[(&str, &str); 1]>::as_slice).collect();
@@ -415,14 +421,17 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
     // the read pipeline reconstructs the merged labels view from the typed
     // columns at materialisation time (see loki/formatters.rs::extract_labels).
     //
-    // Every attribute here is genuinely log-record-level (it describes THIS
-    // event, not the reporting resource or the instrumentation scope), so
-    // resource_attributes/scope_attributes are legitimately empty — that is
-    // itself a realistic OTel shape, not a fixture gap. Keys are stored
-    // dotted (`user.id`, not `user_id`) so the read path's '.' -> '_'
-    // normalisation is actually exercised; pipeline.rs/labels.rs assert on
-    // the post-normalization wire names (`user_id`, `request_id`), which are
-    // unchanged by the storage spelling.
+    // The bulk of these attributes are genuinely log-record-level (they
+    // describe THIS event), but the scope level carries `otel.scope.name` on
+    // every row: with all three maps read, merged, and normalized by the same
+    // pipeline, a fixture that left a level empty could not tell a dropped
+    // level from an absent one. `resource_attributes` is covered by
+    // grouping.rs's node/pod/instance fixture.
+    //
+    // Keys are stored dotted (`user.id`, not `user_id`) so the read path's
+    // '.' -> '_' normalisation is actually exercised; pipeline.rs/labels.rs
+    // assert on the post-normalization wire names (`user_id`, `request_id`),
+    // which are unchanged by the storage spelling.
     // Row 0: "User logged in successfully"
     let row0_pairs: [(&str, &str); 3] = [("user.id", "user-123"), ("request.id", "req-456"), ("body", bodies[0])];
     // Row 1: "Page rendered in 120ms"
@@ -441,8 +450,13 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
     let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
     let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &[&[], &[], &[]]);
 
+    let scope_pairs: [(&str, &str); 1] = [("otel.scope.name", "test-instrumentation")];
     let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
-    let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &[&[], &[], &[]]);
+    let scope_attributes = build_attribute_map(
+        scope_key_field,
+        scope_value_field,
+        &[&scope_pairs, &scope_pairs, &scope_pairs],
+    );
 
     let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
     let log_attributes = build_attribute_map(log_key_field, log_value_field, &[&row0_pairs, &row1_pairs, &row2_pairs]);

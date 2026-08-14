@@ -129,8 +129,14 @@ const SPANS_VALUES_RESOURCE_CONFIG: MetadataScanConfig = MetadataScanConfig {
 /// against scope-scoped keys (`OTel` `InstrumentationScope.attributes`).
 /// Unioned into the `span.<key>` lookup in [`list_tag_values`] — see
 /// [`SPANS_SCOPE_CONFIG`].
+///
+/// `indexed_columns` is empty for the same reason as [`SPANS_SCOPE_CONFIG`]:
+/// no top-level column is promoted from this map. Because this config is only
+/// ever scanned *alongside* [`SPANS_VALUES_SPAN_CONFIG`], which already covers
+/// the indexed columns, repeating them here would decode the same dictionary
+/// page a second time for a result that cannot differ.
 const SPANS_VALUES_SCOPE_CONFIG: MetadataScanConfig = MetadataScanConfig {
-    indexed_columns: SPAN_INDEXED_ATTRIBUTE_COLUMNS,
+    indexed_columns: &[],
     label_aliases: &[],
     excluded_map_keys: &[],
     map_column: COL_SCOPE_ATTRIBUTES,

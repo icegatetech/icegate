@@ -5,6 +5,7 @@ use arrow::{
     array::MapFieldNames,
     datatypes::{DataType, Fields, Schema},
 };
+use icegate_common::attribute_key::{matches_wire_name, normalize_attribute_key};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
 
 /// Extracts a string value from an OTLP `AnyValue` reference.
@@ -468,11 +469,18 @@ pub(crate) fn extract_map_fields_from_nested_struct(
 
 /// Merge dotted-flattened attributes from several precedence levels into one
 /// sorted, deduplicated map. Levels apply in order, so a later (more specific)
-/// level overwrites an earlier one on key collision. Any dotted key in
+/// level overwrites an earlier one on key collision. Any key in
 /// `skip_in_first` is dropped **only** from the first (most-general) level —
 /// used to suppress keys already promoted to a dedicated top-level column while
 /// still letting a more-specific level re-supply an override (mirrors the logs
 /// `LOG_PROMOTED_RESOURCE_KEYS` rule).
+///
+/// Suppression matches by **wire name**, not by the raw dotted string: a
+/// promoted `service.name` also drops a resource attribute spelled
+/// `service_name`. Both reach the query layer as the label `service_name`, and
+/// the attribute maps are applied after the promoted columns when labels are
+/// built — so letting the second spelling through would put the map's value on
+/// the wire in place of the promoted column's.
 pub(crate) fn merge_dotted_levels(
     levels: &[&[KeyValue]],
     skip_in_first: &[&str],
@@ -481,7 +489,11 @@ pub(crate) fn merge_dotted_levels(
     for (level_idx, attrs) in levels.iter().enumerate() {
         for kv in *attrs {
             for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-                if level_idx == 0 && skip_in_first.contains(&key.as_str()) {
+                if level_idx == 0
+                    && skip_in_first
+                        .iter()
+                        .any(|promoted| matches_wire_name(&key, &normalize_attribute_key(promoted)))
+                {
                     continue;
                 }
                 merged.insert(key, value);

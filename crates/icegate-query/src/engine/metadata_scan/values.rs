@@ -17,6 +17,7 @@ use datafusion::arrow::array::{Array, MapArray, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
 use iceberg::expr::Predicate;
+use icegate_common::attribute_key::matches_wire_name;
 use icegate_common::schema::COL_TENANT_ID;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -192,12 +193,15 @@ pub async fn stream_map_values(
 /// needs the stored side normalized before comparison; Tempo/`TraceQL`
 /// requests the dotted name as stored and needs an exact comparison, since
 /// normalizing the stored side would stop matching entries that are
-/// already exact. Skipping the allocation when `stored_key` has no `.` is
-/// safe under both policies — normalization is a no-op on a key with
-/// nothing to replace.
+/// already exact.
+///
+/// The normalizing arm defers to
+/// [`icegate_common::attribute_key::matches_wire_name`] so this shares one
+/// definition of the mapping with the matcher, merge, and displayed-label
+/// paths.
 fn stored_key_matches_label(stored_key: &str, label_name: &str, normalize_keys: bool) -> bool {
-    if normalize_keys && stored_key.contains('.') {
-        stored_key.replace('.', "_") == label_name
+    if normalize_keys {
+        matches_wire_name(stored_key, label_name)
     } else {
         stored_key == label_name
     }

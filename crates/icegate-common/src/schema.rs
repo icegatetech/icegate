@@ -41,19 +41,19 @@ pub const PRICE_DECIMAL_SCALE: u32 = 10;
 ///
 /// # Field IDs
 /// Field IDs are assigned sequentially to match Iceberg catalog behavior.
-/// Each map's key/value ids follow its parent: 10/11/12, 13/14/15, 16/17/18.
+/// Each map's key/value ids follow its parent: 13/14/15, 16/17/18, 19/20/21.
+///
+/// Ids 10-12 are **retired**: they belonged to the pre-split merged
+/// `attributes` map. A field id is what Iceberg matches on, so reusing 10 for
+/// `resource_attributes` would make every old data file's merged, underscored
+/// map read back as this column — silently, since the name is only a label.
+/// Old data survives the mandated drop-and-recreate inside queued WAL segments,
+/// which are shifted against the current schema, so the ids must stay distinct.
+/// Same reasoning as the appended ids on `spans` and `metrics`.
 pub fn logs_schema() -> Result<Schema> {
     // One MAP<String, String> per OTLP level. Parent/key/value ids are
     // consecutive per map, which is what the Iceberg catalog expects.
     let resource_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(11, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            12,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-    let scope_attributes_map = Type::Map(MapType::new(
         Arc::new(NestedField::required(14, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             15,
@@ -61,10 +61,18 @@ pub fn logs_schema() -> Result<Schema> {
             Type::Primitive(PrimitiveType::String),
         )),
     ));
-    let log_attributes_map = Type::Map(MapType::new(
+    let scope_attributes_map = Type::Map(MapType::new(
         Arc::new(NestedField::required(17, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             18,
+            "value",
+            Type::Primitive(PrimitiveType::String),
+        )),
+    ));
+    let log_attributes_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(20, "key", Type::Primitive(PrimitiveType::String))),
+        Arc::new(NestedField::required(
+            21,
             "value",
             Type::Primitive(PrimitiveType::String),
         )),
@@ -124,13 +132,15 @@ pub fn logs_schema() -> Result<Schema> {
             Arc::new(NestedField::optional(9, "body", Type::Primitive(PrimitiveType::String))),
             // Attributes, one column per OTLP level. Keys keep their dotted
             // OTel-native form; nothing normalises them on the write path.
+            // Ids start at 13, past the retired 10-12 of the merged map they
+            // replaced — see this function's doc.
             Arc::new(NestedField::required(
-                10,
+                13,
                 "resource_attributes",
                 resource_attributes_map,
             )),
-            Arc::new(NestedField::required(13, "scope_attributes", scope_attributes_map)),
-            Arc::new(NestedField::required(16, "log_attributes", log_attributes_map)),
+            Arc::new(NestedField::required(16, "scope_attributes", scope_attributes_map)),
+            Arc::new(NestedField::required(19, "log_attributes", log_attributes_map)),
         ])
         .build()?;
 
@@ -1129,19 +1139,16 @@ pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// # Field IDs
 /// Field IDs are assigned sequentially to match Iceberg catalog behavior.
-/// Each map's key/value ids follow its parent: 10/11/12, 13/14/15, 16/17/18.
+/// Each map's key/value ids follow its parent: 13/14/15, 16/17/18, 19/20/21.
+///
+/// Ids 10-12 are **retired** for the same reason as on `logs`: they belonged
+/// to the pre-split merged `attributes` map, and Iceberg matches on the id, so
+/// reusing them would make an old data file's merged map read back as
+/// `resource_attributes`.
 pub fn events_schema() -> Result<Schema> {
     // One MAP<String, String> per OTLP level. Parent/key/value ids are
     // consecutive per map, which is what the Iceberg catalog expects.
     let resource_attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(11, "key", Type::Primitive(PrimitiveType::String))),
-        Arc::new(NestedField::required(
-            12,
-            "value",
-            Type::Primitive(PrimitiveType::String),
-        )),
-    ));
-    let scope_attributes_map = Type::Map(MapType::new(
         Arc::new(NestedField::required(14, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             15,
@@ -1149,10 +1156,18 @@ pub fn events_schema() -> Result<Schema> {
             Type::Primitive(PrimitiveType::String),
         )),
     ));
-    let log_attributes_map = Type::Map(MapType::new(
+    let scope_attributes_map = Type::Map(MapType::new(
         Arc::new(NestedField::required(17, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             18,
+            "value",
+            Type::Primitive(PrimitiveType::String),
+        )),
+    ));
+    let log_attributes_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(20, "key", Type::Primitive(PrimitiveType::String))),
+        Arc::new(NestedField::required(
+            21,
             "value",
             Type::Primitive(PrimitiveType::String),
         )),
@@ -1212,13 +1227,15 @@ pub fn events_schema() -> Result<Schema> {
             )),
             // Attributes, one column per OTLP level. Keys keep their dotted
             // OTel-native form; nothing normalises them on the write path.
+            // Ids start at 13, past the retired 10-12 of the merged map they
+            // replaced — see this function's doc.
             Arc::new(NestedField::required(
-                10,
+                13,
                 "resource_attributes",
                 resource_attributes_map,
             )),
-            Arc::new(NestedField::required(13, "scope_attributes", scope_attributes_map)),
-            Arc::new(NestedField::required(16, "log_attributes", log_attributes_map)),
+            Arc::new(NestedField::required(16, "scope_attributes", scope_attributes_map)),
+            Arc::new(NestedField::required(19, "log_attributes", log_attributes_map)),
         ])
         .build()?;
 
@@ -1904,7 +1921,7 @@ mod tests {
     fn test_logs_schema() {
         let schema = logs_schema().expect("Failed to create logs schema");
         // highest_field_id includes nested field IDs from the three attribute maps
-        assert_eq!(schema.highest_field_id(), 18);
+        assert_eq!(schema.highest_field_id(), 21);
         assert!(schema.field_by_name("tenant_id").is_some());
         assert!(schema.field_by_name("timestamp").is_some());
         assert!(schema.field_by_name("body").is_some());
@@ -1924,9 +1941,9 @@ mod tests {
         );
 
         for (name, parent, key, value) in [
-            ("resource_attributes", 10, 11, 12),
-            ("scope_attributes", 13, 14, 15),
-            ("log_attributes", 16, 17, 18),
+            ("resource_attributes", 13, 14, 15),
+            ("scope_attributes", 16, 17, 18),
+            ("log_attributes", 19, 20, 21),
         ] {
             let field = schema.field_by_name(name).unwrap_or_else(|| panic!("{name} field"));
             assert_eq!(field.id, parent, "{name} parent id");
@@ -1935,6 +1952,30 @@ mod tests {
             };
             assert_eq!(map.key_field.id, key, "{name} key id");
             assert_eq!(map.value_field.id, value, "{name} value id");
+        }
+    }
+
+    #[test]
+    fn retired_merged_attributes_ids_are_not_reused_on_logs_or_events() {
+        // Iceberg identifies a column by field id, not by name, so reusing an
+        // id changes what old data means rather than what it is called. Ids
+        // 10-12 belonged to the pre-split merged `attributes` map on both
+        // tables; a data file still carrying them — a WAL segment queued
+        // across the upgrade, say — must not read back as one of the new
+        // per-level maps. `spans` and `metrics` avoid this by appending, and
+        // these two must not quietly diverge from that.
+        for (table, schema) in [
+            ("logs", logs_schema().expect("logs schema")),
+            ("events", events_schema().expect("events schema")),
+        ] {
+            for field in schema.as_struct().fields() {
+                assert!(
+                    field.id > 12 || !matches!(&*field.field_type, Type::Map(_)),
+                    "{table}: attribute map `{}` reuses retired id {}",
+                    field.name,
+                    field.id
+                );
+            }
         }
     }
 
@@ -2176,7 +2217,7 @@ mod tests {
     fn test_events_schema() {
         let schema = events_schema().expect("Failed to create events schema");
         // highest_field_id includes nested field IDs from the three attribute maps
-        assert_eq!(schema.highest_field_id(), 18);
+        assert_eq!(schema.highest_field_id(), 21);
         assert!(schema.field_by_name("event_domain").is_some());
         assert!(schema.field_by_name("event_name").is_some());
         assert!(
@@ -2195,9 +2236,9 @@ mod tests {
         );
 
         for (name, parent, key, value) in [
-            ("resource_attributes", 10, 11, 12),
-            ("scope_attributes", 13, 14, 15),
-            ("log_attributes", 16, 17, 18),
+            ("resource_attributes", 13, 14, 15),
+            ("scope_attributes", 16, 17, 18),
+            ("log_attributes", 19, 20, 21),
         ] {
             let field = schema.field_by_name(name).unwrap_or_else(|| panic!("{name} field"));
             assert_eq!(field.id, parent, "{name} parent id");

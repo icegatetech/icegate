@@ -138,8 +138,15 @@ pub fn logs_to_record_batch(
             .find(|kv| kv.key == "service.name")
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
+        // Flattened once per ResourceLogs / ScopeLogs and reused by every log
+        // record beneath: both inputs are fixed at their own nesting level, so
+        // re-flattening them per record would rebuild an identical BTreeMap
+        // (and every key/value String in it) for each row of the export.
+        let resource_attributes = merge_dotted_levels(&[resource_attrs], LOG_PROMOTED_RESOURCE_KEYS);
+
         for scope_logs in &resource_logs.scope_logs {
             let scope_attrs = scope_logs.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
+            let scope_attributes = dedupe_dotted_attributes(scope_attrs);
 
             for log_record in &scope_logs.log_records {
                 // tenant_id
@@ -200,11 +207,11 @@ pub fn logs_to_record_batch(
                 // from the resource level only — a log-record attribute of the
                 // same name is a deliberate override and still lands in
                 // `log_attributes`.
-                for (key, value) in &merge_dotted_levels(&[resource_attrs], LOG_PROMOTED_RESOURCE_KEYS) {
+                for (key, value) in &resource_attributes {
                     resource_attrs_builder.keys().append_value(key);
                     resource_attrs_builder.values().append_value(value);
                 }
-                for (key, value) in &dedupe_dotted_attributes(scope_attrs) {
+                for (key, value) in &scope_attributes {
                     scope_attrs_builder.keys().append_value(key);
                     scope_attrs_builder.values().append_value(value);
                 }
@@ -459,8 +466,10 @@ mod tests {
         // - `severity_text` and `level`: same — never OTLP attribute keys.
         // - `service.name`: promoted to its own top-level column and
         //   suppressed via `LOG_PROMOTED_RESOURCE_KEYS`.
-        // - `service_name`: the pre-split normalised form; keys stay dotted
-        //   now, so this underscored form can never be produced at all.
+        // - `service_name`: a producer may emit this spelling directly, and it
+        //   reaches the query layer as the same label as `service.name`, so it
+        //   is suppressed too. This fixture does not supply it — see
+        //   `a_resource_attribute_spelled_service_name_is_suppressed_too`.
         for mirror in [
             "trace_id",
             "span_id",
@@ -521,6 +530,48 @@ mod tests {
         assert_eq!(resource.get("shared.key").map(String::as_str), Some("from-resource"));
         assert_eq!(scope.get("shared.key").map(String::as_str), Some("from-scope"));
         assert_eq!(log.get("shared.key").map(String::as_str), Some("from-log"));
+    }
+
+    #[test]
+    fn a_resource_attribute_spelled_service_name_is_suppressed_too() {
+        // Both spellings reach Loki as the label `service_name`, and the
+        // attribute maps are applied AFTER the promoted columns when labels
+        // are built — so an unsuppressed `service_name` entry would put
+        // "legacy-alias" on the wire in place of the promoted column's "api".
+        // Prometheus-to-OTel bridges emit the underscored form routinely.
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
+                    attributes: vec![kv("service.name", "api"), kv("service_name", "legacy-alias")],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let batch = logs_to_record_batch(&request, Some("t1")).expect("transform").expect("batch");
+        let resource = map_pairs(&batch, "resource_attributes");
+
+        assert!(
+            !resource.contains_key("service_name"),
+            "underscored spelling must not survive into resource_attributes: {resource:?}"
+        );
+        assert!(!resource.contains_key("service.name"));
+
+        let service_name = batch
+            .column_by_name("service_name")
+            .expect("service_name col")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("StringArray");
+        assert_eq!(service_name.value(0), "api");
     }
 
     fn kv(key: &str, value: &str) -> KeyValue {

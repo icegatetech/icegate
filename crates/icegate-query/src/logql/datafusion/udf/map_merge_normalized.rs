@@ -1,6 +1,10 @@
 //! Merge the per-level attribute maps into one wire-shaped map.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, btree_map::Entry},
+    sync::Arc,
+};
 
 use datafusion::{
     arrow::{
@@ -11,13 +15,14 @@ use datafusion::{
     common::{Result, exec_err, plan_err},
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility},
 };
+use icegate_common::attribute_key::normalize_attribute_key;
 
 /// UDF: `map_merge_normalized(resource, scope, log)`.
 ///
 /// Collapses the three per-level attribute maps into the single flat map the
-/// Loki wire format exposes, keys normalized to `[a-zA-Z_][a-zA-Z0-9_]*` by
-/// replacing `.` with `_`. Two precedence rules apply, and they point in
-/// opposite directions:
+/// Loki wire format exposes, keys rendered as wire names by
+/// [`icegate_common::attribute_key`]. Two precedence rules apply, and they
+/// point in opposite directions:
 ///
 /// - **Across levels**: applied resource -> scope -> log, so the most
 ///   specific level wins — the same precedence the matcher path resolves
@@ -35,10 +40,14 @@ use datafusion::{
 ///   while its series identity and displayed labels showed a different value
 ///   for the same label.
 ///
-/// A single `BTreeMap` pass cannot express both rules at once: the
-/// within-level rule needs first-insert-wins, the cross-level rule needs
-/// last-insert-wins. Each level is therefore resolved against its own
-/// collisions first, and only the per-level results are merged across levels.
+/// One `BTreeMap` expresses both rules by storing the index of the level that
+/// wrote each entry: an entry owned by an earlier level is overwritten, one
+/// owned by the current level is kept.
+///
+/// An entry whose key or value is NULL is *absent* — it does not claim the
+/// wire name, so a later colliding key still wins it. This is the same rule
+/// `map_get_by_normalized_key` and `loki::formatters::extract_attributes_map`
+/// apply, and it has to stay that way for the reason given above.
 ///
 /// Series identity, `by`/`without` grouping, and key serialization all operate
 /// on one map, so merging here keeps that logic identical to the pre-split
@@ -95,58 +104,90 @@ impl ScalarUDFImpl for MapMergeNormalized {
             });
         }
 
-        let mut keys_out = StringBuilder::new();
-        let mut values_out = StringBuilder::new();
+        // The entries arrays and their children are properties of the batch,
+        // not of a row, so each level is resolved once here rather than on
+        // every iteration. Row boundaries come from `value_offsets`, which
+        // index into the (unsliced) children even for a sliced MapArray.
+        let mut resolved_levels: Vec<(&MapArray, &StringArray, &StringArray)> = Vec::with_capacity(levels.len());
+        for level in &levels {
+            let Some(map) = level.as_any().downcast_ref::<MapArray>() else {
+                return exec_err!("map_merge_normalized arguments must be MAP columns");
+            };
+            let entries = map.entries();
+            let Some(keys) = entries.column(0).as_any().downcast_ref::<StringArray>() else {
+                return exec_err!("map_merge_normalized expects Utf8 map keys");
+            };
+            let Some(values) = entries.column(1).as_any().downcast_ref::<StringArray>() else {
+                return exec_err!("map_merge_normalized expects Utf8 map values");
+            };
+            resolved_levels.push((map, keys, values));
+        }
+
+        // One entry per level per row is a deliberate over-estimate of the
+        // distinct merged keys; it costs one allocation instead of growing the
+        // buffers repeatedly across a whole batch.
+        let entry_estimate = args.number_rows * resolved_levels.len();
+        let mut keys_out = StringBuilder::with_capacity(entry_estimate, entry_estimate * 32);
+        let mut values_out = StringBuilder::with_capacity(entry_estimate, entry_estimate * 32);
         let mut offsets: Vec<i32> = Vec::with_capacity(args.number_rows + 1);
         offsets.push(0);
         let mut total: i32 = 0;
 
+        // Reused across rows: `clear` keeps the allocated nodes, so a batch
+        // pays for one map rather than one per row. Borrowed keys and values
+        // point straight into the Arrow buffers, so a merged row allocates
+        // only for a key that actually carries a `.`.
+        //
+        // The stored level index is what lets ONE map express both rules at
+        // once: an entry written by an EARLIER level is overwritten (cross
+        // level, most specific wins), while one written by the CURRENT level
+        // is kept (intra level, first raw key in stored order wins). A second
+        // per-level map would need its keys cloned into this one.
+        let mut merged: BTreeMap<Cow<'_, str>, (usize, &str)> = BTreeMap::new();
+
         for row in 0..args.number_rows {
-            // Cross-level pass: each level's own collisions are resolved
-            // first (below), then later levels overwrite earlier ones here —
-            // resource -> scope -> log, so BTreeMap::extend's
-            // overwrite-on-collision semantics give log the win. BTreeMap
-            // also gives the sorted output order.
-            let mut merged: BTreeMap<String, String> = BTreeMap::new();
-            for level in &levels {
-                let Some(map) = level.as_any().downcast_ref::<MapArray>() else {
-                    return exec_err!("map_merge_normalized arguments must be MAP columns");
-                };
+            merged.clear();
+            for (level_idx, &(map, keys, values)) in resolved_levels.iter().enumerate() {
                 if map.is_null(row) {
                     continue;
                 }
-                let entries = map.value(row);
-                let Some(keys) = entries.column(0).as_any().downcast_ref::<StringArray>() else {
-                    return exec_err!("map_merge_normalized expects Utf8 map keys");
-                };
-                let Some(values) = entries.column(1).as_any().downcast_ref::<StringArray>() else {
-                    return exec_err!("map_merge_normalized expects Utf8 map values");
-                };
+                #[allow(clippy::cast_sign_loss)]
+                let start = map.value_offsets()[row] as usize;
+                #[allow(clippy::cast_sign_loss)]
+                let end = map.value_offsets()[row + 1] as usize;
 
-                // Intra-level pass: entry(...).or_insert_with(...) only
-                // writes on the first sight of a normalized key, so within
-                // THIS level the first raw key in stored order wins on a
-                // collision — matching map_get_by_normalized_key's
-                // scan-and-break tie-break (see the struct doc for why the
-                // two rules must agree).
-                let mut level_resolved: BTreeMap<String, String> = BTreeMap::new();
-                for i in 0..keys.len() {
-                    if keys.is_null(i) {
+                for i in start..end {
+                    // A NULL key or value makes the entry invisible, exactly
+                    // as in the lookup UDF and the formatter: it does not
+                    // claim the wire name, so a later colliding key still
+                    // wins it.
+                    if keys.is_null(i) || values.is_null(i) {
                         continue;
                     }
-                    let value = if values.is_null(i) { "" } else { values.value(i) };
-                    level_resolved
-                        .entry(keys.value(i).replace('.', "_"))
-                        .or_insert_with(|| value.to_string());
+                    match merged.entry(normalize_attribute_key(keys.value(i))) {
+                        Entry::Vacant(slot) => {
+                            slot.insert((level_idx, values.value(i)));
+                        }
+                        Entry::Occupied(mut slot) if slot.get().0 != level_idx => {
+                            slot.insert((level_idx, values.value(i)));
+                        }
+                        Entry::Occupied(_) => {}
+                    }
                 }
-                merged.extend(level_resolved);
             }
 
-            for (key, value) in &merged {
+            for (key, (_, value)) in &merged {
                 keys_out.append_value(key);
                 values_out.append_value(value);
             }
-            total += i32::try_from(merged.len()).map_err(|_| {
+            let row_entries = i32::try_from(merged.len()).map_err(|_| {
+                datafusion::error::DataFusionError::Execution("attribute map too large for i32 offsets".into())
+            })?;
+            // The accumulator, not the per-row count, is what can overflow —
+            // and a wrapped `total` would make the offsets non-monotonic and
+            // trip `OffsetBuffer::new`'s assertion, i.e. panic where this
+            // error exists to return cleanly instead.
+            total = total.checked_add(row_entries).ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution("attribute map too large for i32 offsets".into())
             })?;
             offsets.push(total);
@@ -199,7 +240,11 @@ mod tests {
 
     use super::MapMergeNormalized;
 
-    fn map_of(pairs: &[(&str, &str)]) -> ArrayRef {
+    /// Values are `Option` so the NULL-value contract can be exercised even
+    /// though the Iceberg schema declares the value field `required` — the UDF
+    /// defends against NULL regardless, and that defence must agree with
+    /// `map_get_by_normalized_key`'s.
+    fn map_of_nullable(pairs: &[(&str, Option<&str>)]) -> ArrayRef {
         use datafusion::arrow::{
             array::StructArray,
             buffer::{OffsetBuffer, ScalarBuffer},
@@ -228,12 +273,23 @@ mod tests {
         scope: &[(&str, &str)],
         log: &[(&str, &str)],
     ) -> std::collections::BTreeMap<String, String> {
+        fn to_nullable<'a>(pairs: &[(&'a str, &'a str)]) -> Vec<(&'a str, Option<&'a str>)> {
+            pairs.iter().map(|(k, v)| (*k, Some(*v))).collect()
+        }
+        merge_arrays(&to_nullable(resource), &to_nullable(scope), &to_nullable(log))
+    }
+
+    fn merge_arrays(
+        resource: &[(&str, Option<&str>)],
+        scope: &[(&str, Option<&str>)],
+        log: &[(&str, Option<&str>)],
+    ) -> std::collections::BTreeMap<String, String> {
         let udf = MapMergeNormalized::new();
         let args = ScalarFunctionArgs {
             args: vec![
-                ColumnarValue::Array(map_of(resource)),
-                ColumnarValue::Array(map_of(scope)),
-                ColumnarValue::Array(map_of(log)),
+                ColumnarValue::Array(map_of_nullable(resource)),
+                ColumnarValue::Array(map_of_nullable(scope)),
+                ColumnarValue::Array(map_of_nullable(log)),
             ],
             arg_fields: vec![],
             number_rows: 1,
@@ -306,5 +362,24 @@ mod tests {
         let out = merge(&[("z.last", "z")], &[("a.first", "a")], &[]);
         let keys: Vec<&str> = out.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["a_first", "z_last"]);
+    }
+
+    #[test]
+    fn a_null_valued_entry_is_absent_and_does_not_shadow_a_broader_level() {
+        // The agreement with `map_get_by_normalized_key`: there, a NULL-valued
+        // `pod` in log_attributes lets the coalesce fall through to resource,
+        // so the row MATCHES {pod="web-1"}. If the merge stored `pod -> ""`
+        // instead, the matched row would then be displayed and grouped as
+        // `pod=""` — matching on one value while showing another.
+        let merged = merge_arrays(&[("pod", Some("web-1"))], &[], &[("pod", None)]);
+        assert_eq!(merged.get("pod").map(String::as_str), Some("web-1"));
+    }
+
+    #[test]
+    fn a_null_valued_entry_does_not_claim_the_wire_name_from_a_later_key() {
+        // Intra-level counterpart, mirroring the lookup UDF's test of the same
+        // name: the invisible entry must not consume the first-wins slot.
+        let merged = merge_arrays(&[], &[], &[("http.method", None), ("http_method", Some("GET"))]);
+        assert_eq!(merged.get("http_method").map(String::as_str), Some("GET"));
     }
 }

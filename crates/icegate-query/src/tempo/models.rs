@@ -213,15 +213,22 @@ pub struct TagsV1Response {
 /// Grafana's query builder).
 #[derive(Debug, Serialize)]
 pub struct TagsV2Response {
-    /// One group per `TraceQL` scope: `resource`, `scope`, `span`, …
+    /// One group per `TraceQL` scope: `resource`, `span`, `intrinsic`,
+    /// `event`, `link`.
+    ///
+    /// There is deliberately no `scope` group: `TraceQL`/Tempo has no
+    /// instrumentation-scope query scope, so OTLP
+    /// `InstrumentationScope.attributes` are unioned into the `span` group
+    /// (the only prefix that can select them). Advertising a group whose
+    /// prefix cannot select anything would hand clients a guaranteed-empty
+    /// query.
     pub scopes: Vec<ScopeGroup>,
 }
 
 /// A single scope within a [`TagsV2Response`].
 #[derive(Debug, Serialize)]
 pub struct ScopeGroup {
-    /// Scope identifier (`resource`, `scope`, `span`, `intrinsic`, `event`,
-    /// `link`).
+    /// Scope identifier (`resource`, `span`, `intrinsic`, `event`, `link`).
     pub name: String,
     /// Tag names within this scope.
     pub tags: Vec<String>,

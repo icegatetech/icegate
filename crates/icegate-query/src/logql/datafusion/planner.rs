@@ -580,11 +580,13 @@ impl DataFusionPlanner {
     /// MAP columns cannot be used directly in GROUP BY, so we serialize keys/values
     /// to strings for grouping, then preserve the original MAP using `last_value`.
     ///
-    /// `schema` is the schema of the `DataFrame` these expressions will run
-    /// against — passed through to [`merged_attributes`] so it resolves
-    /// against whichever attribute shape (per-level or already-merged) that
-    /// `DataFrame` currently carries.
-    fn build_label_grouping_exprs(schema: &DFSchema, include_timestamp: bool) -> Vec<Expr> {
+    /// `attrs` is the attributes-map expression to serialize, and it is used
+    /// TWICE (once for keys, once for values). Callers MUST therefore pass a
+    /// column reference to an already-materialized merge — see
+    /// [`Self::stage_merged_attributes`] — rather than a bare
+    /// [`merged_attributes`] call: inlining the UDF here would re-run it per
+    /// row per use, which is the cost `plan_series` documents avoiding.
+    fn build_label_grouping_exprs(attrs: &Expr, include_timestamp: bool) -> Vec<Expr> {
         use datafusion::functions_nested::{map_keys::map_keys, map_values::map_values, string::array_to_string};
 
         let mut grouping_exprs = Vec::new();
@@ -592,9 +594,28 @@ impl DataFusionPlanner {
             grouping_exprs.push(col("grid_timestamp"));
         }
         grouping_exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
-        grouping_exprs.push(array_to_string(map_keys(merged_attributes(schema)), lit("|||")).alias(COL_ATTR_KEYS));
-        grouping_exprs.push(array_to_string(map_values(merged_attributes(schema)), lit("|||")).alias(COL_ATTR_VALS));
+        grouping_exprs.push(array_to_string(map_keys(attrs.clone()), lit("|||")).alias(COL_ATTR_KEYS));
+        grouping_exprs.push(array_to_string(map_values(attrs.clone()), lit("|||")).alias(COL_ATTR_VALS));
         grouping_exprs
+    }
+
+    /// Materialize [`merged_attributes`] into [`MERGED_ATTRIBUTES_COLUMN`] and
+    /// return the reference to it.
+    ///
+    /// An aggregation reads the merged map three times — serialized keys,
+    /// serialized values, and the preserved map itself — and every one of
+    /// those is a separate `map_merge_normalized` invocation per scanned row
+    /// unless the merge is staged into a column first. `plan_series` already
+    /// stages it for exactly this reason; this is that step, shared.
+    ///
+    /// Schema-aware through [`merged_attributes`], so calling it on a
+    /// `DataFrame` whose pipeline already merged (a `drop`/`keep` stage, or an
+    /// inner aggregation) re-uses that column instead of re-reading per-level
+    /// columns that no longer exist.
+    fn stage_merged_attributes(df: DataFrame) -> Result<(DataFrame, Expr)> {
+        let merged_expr = merged_attributes(df.schema());
+        let df = df.with_column(MERGED_ATTRIBUTES_COLUMN, merged_expr)?;
+        Ok((df, col(MERGED_ATTRIBUTES_COLUMN)))
     }
 
     /// Build grouping expressions and filtered attributes expression.
@@ -880,23 +901,20 @@ impl DataFusionPlanner {
         // would both re-read the (still-present but now stale for this
         // purpose) raw columns and silently discard the filtering just applied.
         //
-        // Both branches read `df.schema()` before this: an inner pipeline
-        // stage (e.g. `drop`/`keep`) may have already collapsed the three
-        // per-level columns into `attributes` by this point, and
-        // `merged_attributes`/`build_label_grouping_exprs` must see that to
-        // avoid referencing columns that no longer exist (the C1 bug).
+        // Staging happens before the branch, so `merged_attributes` sees the
+        // pre-merge schema: an inner pipeline stage (e.g. `drop`/`keep`) may
+        // have already collapsed the three per-level columns into
+        // `attributes`, and it must resolve against that rather than
+        // referencing columns that no longer exist (the C1 bug).
+        let (mut df, merged_col) = Self::stage_merged_attributes(df)?;
         let (grouping_exprs, attrs_for_preserve) = if let Some(ref grouping) = agg.grouping {
-            let merged_expr = merged_attributes(df.schema());
             let (grouping_exprs, filtered_attrs_expr) =
-                Self::build_grouping_with_filtered_attrs(&merged_expr, grouping, false);
+                Self::build_grouping_with_filtered_attrs(&merged_col, grouping, false);
             df = df.with_column(MERGED_ATTRIBUTES_COLUMN, filtered_attrs_expr)?;
             (grouping_exprs, col(MERGED_ATTRIBUTES_COLUMN))
         } else {
             // false = no grid_timestamp (UDAF handles it)
-            (
-                Self::build_label_grouping_exprs(df.schema(), false),
-                merged_attributes(df.schema()),
-            )
+            (Self::build_label_grouping_exprs(&merged_col, false), merged_col)
         };
 
         // 10. Aggregate: GROUP BY labels only, UDAF accumulates into grid buckets
@@ -1014,18 +1032,16 @@ impl DataFusionPlanner {
         ];
         df = df.with_column("inverse_grid_timestamps", date_grid_udf.call(date_grid_args))?;
 
-        // 6. Build label grouping expressions (same pattern as other range aggregations)
-        let grouping_exprs = Self::build_label_grouping_exprs(df.schema(), false); // exclude timestamp for absent
+        // 6. Build label grouping expressions (same pattern as other range
+        // aggregations). Staging is schema-aware, so an inner `drop`/`keep`
+        // stage that already merged is re-used rather than re-merged.
+        let (mut df, merged_col) = Self::stage_merged_attributes(df)?;
+        let grouping_exprs = Self::build_label_grouping_exprs(&merged_col, false); // exclude timestamp for absent
 
         // 7. Aggregate using array_intersect_agg UDAF
         // This finds grid points present in ALL inverse arrays (= absent points)
         let array_intersect_udaf = AggregateUDF::from(super::udaf::ArrayIntersectAgg::new());
-        // grouping_exprs above never materializes `attributes` itself (this
-        // function does not apply by/without filtering), but the inner
-        // LogExpr's own pipeline might have (e.g. a `drop`/`keep` stage) —
-        // merged_attributes(df.schema()) checks for that rather than
-        // assuming the three raw columns are still there.
-        let attrs_for_preserve = merged_attributes(df.schema());
+        let attrs_for_preserve = merged_col;
         df = df.aggregate(
             grouping_exprs,
             vec![
@@ -1123,23 +1139,19 @@ impl DataFusionPlanner {
 
         // 6. Build label grouping with pushdown support
         //
-        // See the identical split in plan_unwrap_range_aggregation: the
-        // by/without branch materializes `attributes` via with_column, so the
-        // aggregate must read that back rather than recompute the merge. Both
-        // branches also need df.schema() read before that with_column, since
-        // an inner `drop`/`keep` stage may have already merged it.
+        // See the identical split in plan_unwrap_range_aggregation: the merge
+        // is staged into a column first so the three reads below cost one
+        // evaluation per row, and the by/without branch then replaces that
+        // column with its filtered form.
+        let (mut df, merged_col) = Self::stage_merged_attributes(df)?;
         let (grouping_exprs, attrs_for_preserve) = if let Some(ref grouping) = agg.grouping {
-            let merged_expr = merged_attributes(df.schema());
             let (grouping_exprs, filtered_attrs_expr) =
-                Self::build_grouping_with_filtered_attrs(&merged_expr, grouping, false);
+                Self::build_grouping_with_filtered_attrs(&merged_col, grouping, false);
             df = df.with_column(MERGED_ATTRIBUTES_COLUMN, filtered_attrs_expr)?;
             (grouping_exprs, col(MERGED_ATTRIBUTES_COLUMN))
         } else {
             // false = no grid_timestamp (UDAF handles it)
-            (
-                Self::build_label_grouping_exprs(df.schema(), false),
-                merged_attributes(df.schema()),
-            )
+            (Self::build_label_grouping_exprs(&merged_col, false), merged_col)
         };
 
         // 7. Aggregate: GROUP BY labels only, UDAF accumulates into grid buckets
@@ -1347,14 +1359,27 @@ impl DataFusionPlanner {
             // Get both grouping expressions and filtered attributes in one call
             // This avoids duplicate computation of indexed columns and attribute labels
             //
-            // Unlike the range-aggregation callers, `df` here is the INNER
-            // metric's already-planned output: the per-level columns are gone
-            // and a single merged `attributes` column already exists (see
-            // build_grouping_with_filtered_attrs's doc), so filter that
-            // directly instead of recomputing a merge that has no columns
-            // left to read.
+            // `df` here is the INNER metric's already-planned output, so the
+            // per-level columns are gone and the merged `attributes` column is
+            // what remains — but only when the inner stage kept any labels at
+            // all. An ungrouped inner vector aggregation collapses every
+            // series and emits just `timestamp` + `value`, so there is nothing
+            // to group by; without this check the plan would reference a
+            // column that does not exist and fail as an internal error rather
+            // than a query one.
+            if !schema_has_merged_attributes(df.schema()) {
+                return Err(QueryError::Plan(
+                    "grouping requires labels, but the inner aggregation collapsed all series and kept none; \
+                     add a `by`/`without` clause to the inner aggregation"
+                        .to_string(),
+                ));
+            }
+            // Routed through `merged_attributes` rather than naming the column
+            // directly so every attribute-reading site resolves the shape the
+            // same way (see `schema_has_merged_attributes`).
+            let attrs = merged_attributes(df.schema());
             let (mut grouping_exprs, filtered_attrs_expr) =
-                Self::build_grouping_with_filtered_attrs(&col(MERGED_ATTRIBUTES_COLUMN), grouping, false);
+                Self::build_grouping_with_filtered_attrs(&attrs, grouping, false);
             grouping_exprs.push(col(COL_TIMESTAMP));
 
             // Replace attributes column with filtered version BEFORE aggregation
@@ -2042,9 +2067,32 @@ mod attribute_lookup_tests {
         },
         common::DFSchema,
         datasource::MemTable,
+        logical_expr::Expr,
         prelude::SessionContext,
+        scalar::ScalarValue,
     };
     use icegate_common::schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES};
+
+    /// The `(column, key)` a `map_get_by_normalized_key(col, lit)` call reads.
+    ///
+    /// Inspects the expression tree rather than its rendering: `docs/tests.md`
+    /// rules out substring checks on a formatted plan as a semantic oracle,
+    /// and argument ORDER is precisely what this test is about — a textual
+    /// scan cannot distinguish argument position from incidental spelling.
+    fn map_lookup_target(expr: &Expr) -> (&str, &str) {
+        let Expr::ScalarFunction(lookup) = expr else {
+            panic!("expected a scalar function, got {expr:?}");
+        };
+        assert_eq!(lookup.func.name(), "map_get_by_normalized_key");
+        assert_eq!(lookup.args.len(), 2, "lookup takes (map, name)");
+        let Expr::Column(column) = &lookup.args[0] else {
+            panic!("first argument must be a column, got {:?}", lookup.args[0]);
+        };
+        let Expr::Literal(ScalarValue::Utf8(Some(key)), _) = &lookup.args[1] else {
+            panic!("second argument must be a Utf8 literal, got {:?}", lookup.args[1]);
+        };
+        (column.name(), key.as_str())
+    }
 
     #[test]
     fn attribute_lookup_coalesces_log_then_scope_then_resource() {
@@ -2054,16 +2102,23 @@ mod attribute_lookup_tests {
         // so its absence is all this shape test needs, regardless of what
         // else the schema does or doesn't contain.
         let expr = super::attribute_lookup("k8s_pod_name", &DFSchema::empty());
-        let rendered = format!("{expr}");
 
-        // All three columns participate, innermost-first in precedence order.
-        let log_at = rendered.find("log_attributes").expect("log_attributes present");
-        let scope_at = rendered.find("scope_attributes").expect("scope_attributes present");
-        let resource_at = rendered.find("resource_attributes").expect("resource_attributes present");
-        assert!(log_at < scope_at, "log must precede scope");
-        assert!(scope_at < resource_at, "scope must precede resource");
-        assert!(rendered.contains("map_get_by_normalized_key"));
-        assert!(rendered.contains("k8s_pod_name"));
+        let Expr::ScalarFunction(coalesce) = &expr else {
+            panic!("attribute_lookup must produce a coalesce, got {expr:?}");
+        };
+        assert_eq!(coalesce.func.name(), "coalesce");
+
+        // `coalesce` returns its first non-NULL argument, so argument order IS
+        // the precedence: most specific level first.
+        let targets: Vec<(&str, &str)> = coalesce.args.iter().map(map_lookup_target).collect();
+        assert_eq!(
+            targets,
+            vec![
+                (COL_LOG_ATTRIBUTES, "k8s_pod_name"),
+                (COL_SCOPE_ATTRIBUTES, "k8s_pod_name"),
+                (COL_RESOURCE_ATTRIBUTES, "k8s_pod_name"),
+            ]
+        );
     }
 
     /// One-row fixture carrying ONLY the already-merged `attributes` column
