@@ -23,7 +23,7 @@ Running rules:
   `cargo test <name>` for the code you touched.
 - Format only the affected crate: `cargo +nightly fmt -p <crate>` (plain `cargo fmt` ignores `rustfmt.toml`).
 
-### Docs
+## Docs
 
 - **A convention is only what is documented** in these three files. The mere presence of a pattern
   in the code is **NOT** a convention — someone may have committed junk. Do not justify a decision
@@ -35,6 +35,22 @@ Running rules:
 - `docs/` holds only cross-cutting policy ([tests.md](docs/tests.md)).
   Never add a `docs/<module>.md` — a deep-dive for a subsystem goes in a README beside its code.
 - Design notes, specs, and plans are working artifacts: keep them in `.tmp/`, not in `docs/`.
+
+### Third-party systems in code and docs
+
+- **A third-party name is an identifier, not a claim.** Free wherever it names or
+  carries an external system: code that talks to it, config that points at it, a
+  wire protocol we implement, data that came from it.
+- **A claim about someone else's behaviour must be pinned by our test.** "Client X
+  falls back to v1 on 404" is allowed only where a test of ours fails if it stops
+  being true — cite that test. Unpinned lore ("X usually does Y", "X is expected to")
+  is banned: nothing catches it going stale.
+- **Never compare.** No "faster than X", "unlike X", "X cannot do Y", no claim about
+  another product's quality, market position, or roadmap. Drop the comparison; the
+  name itself may stay where it identifies the system. Comparative material lives in
+  the marketing repo, not here.
+- The trademark position for the names used in this repo is stated once in
+  [README.md](README.md#trademarks) — do not restate it per file.
 
 ## Crates and where code goes
 

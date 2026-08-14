@@ -23,8 +23,8 @@ use super::{
 /// Build the Tempo HTTP router.
 ///
 /// Endpoint mapping:
-/// - `GET  /api/traces/{trace_id}`          — trace lookup by id.
-/// - `GET  /api/v2/traces/{trace_id}`       — v2 alias of trace lookup.
+/// - `GET  /api/traces/{trace_id}`          — trace lookup by id (bare OTLP).
+/// - `GET  /api/v2/traces/{trace_id}`       — same lookup in the `TraceByIDResponse` envelope.
 /// - `GET  / POST /api/search`              — `TraceQL` search.
 /// - `GET  /api/search/tags`                — v1 flat tag list.
 /// - `GET  /api/v2/search/tags`             — v2 scoped tag list (Grafana).
@@ -50,7 +50,7 @@ use super::{
 pub fn routes(state: TempoState, pressure: MemoryPressure) -> Router {
     Router::new()
         .route("/api/traces/{trace_id}", get(handlers::get_trace))
-        .route("/api/v2/traces/{trace_id}", get(handlers::get_trace))
+        .route("/api/v2/traces/{trace_id}", get(handlers::get_trace_v2))
         .route(
             "/api/search",
             get(handlers::search_traces).post(handlers::search_traces),
