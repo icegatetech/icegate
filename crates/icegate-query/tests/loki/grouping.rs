@@ -27,7 +27,10 @@ use iceberg::{
         },
     },
 };
-use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
+use icegate_common::{
+    ICEGATE_NAMESPACE, LOGS_TABLE,
+    schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES},
+};
 use serde_json::Value;
 
 use super::harness::{TestServer, build_attribute_map, map_entry_fields};
@@ -108,10 +111,10 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         [("node", "node2"), ("pod", "pod-f"), ("instance", "inst6")], // Row 5: backend
     ];
     let resource_rows: Vec<&[(&str, &str)]> = resource_pairs.iter().map(<[(&str, &str); 3]>::as_slice).collect();
-    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, COL_RESOURCE_ATTRIBUTES);
     let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &resource_rows);
 
-    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, COL_SCOPE_ATTRIBUTES);
     let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &[&[], &[], &[], &[], &[], &[]]);
 
     let log_pairs: [[(&str, &str); 1]; 6] = [
@@ -123,7 +126,7 @@ fn build_grouping_test_record_batch(table: &Table, now_micros: i64) -> Result<Re
         [("value", "220")],
     ];
     let log_rows: Vec<&[(&str, &str)]> = log_pairs.iter().map(<[(&str, &str); 1]>::as_slice).collect();
-    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, COL_LOG_ATTRIBUTES);
     let log_attributes = build_attribute_map(log_key_field, log_value_field, &log_rows);
 
     // trace_id / span_id are FIXED_LEN_BYTE_ARRAY in storage; the per-row
@@ -751,11 +754,11 @@ fn build_binary_grouping_test_batch(table: &Table, now_micros: i64) -> Result<Re
     // exercises binary-column (trace_id/span_id) grouping, so no attribute
     // data is needed.
     let empty_rows: [&[(&str, &str)]; 4] = [&[], &[], &[], &[]];
-    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, COL_RESOURCE_ATTRIBUTES);
     let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &empty_rows);
-    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, COL_SCOPE_ATTRIBUTES);
     let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &empty_rows);
-    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, COL_LOG_ATTRIBUTES);
     let log_attributes = build_attribute_map(log_key_field, log_value_field, &empty_rows);
 
     // Need to add missing columns

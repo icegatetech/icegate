@@ -2312,6 +2312,7 @@ mod merged_attributes_tests {
         },
         common::DFSchema,
         datasource::MemTable,
+        logical_expr::Expr,
         prelude::SessionContext,
     };
     use icegate_common::schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES};
@@ -2321,17 +2322,26 @@ mod merged_attributes_tests {
         // See attribute_lookup_tests's identical use of an empty schema: it
         // only needs to lack MERGED_ATTRIBUTES_COLUMN by name to exercise
         // the not-yet-merged branch this shape test targets.
-        let rendered = format!("{}", super::merged_attributes(&DFSchema::empty()));
+        let expr = super::merged_attributes(&DFSchema::empty());
+        let Expr::ScalarFunction(merge) = &expr else {
+            panic!("merged_attributes must produce a scalar function, got {expr:?}");
+        };
+        assert_eq!(merge.func.name(), "map_merge_normalized");
 
         // Argument order IS precedence order for MapMergeNormalized (resource
-        // first, log last — see its doc comment), so the rendered call
-        // arguments must appear in that order.
-        let resource_at = rendered.find("resource_attributes").expect("resource_attributes present");
-        let scope_at = rendered.find("scope_attributes").expect("scope_attributes present");
-        let log_at = rendered.find("log_attributes").expect("log_attributes present");
-        assert!(resource_at < scope_at, "resource must precede scope");
-        assert!(scope_at < log_at, "scope must precede log");
-        assert!(rendered.contains("map_merge_normalized"));
+        // first, log last — see its doc comment).
+        let columns: Vec<&str> = merge
+            .args
+            .iter()
+            .map(|arg| match arg {
+                Expr::Column(column) => column.name(),
+                other => panic!("every merge argument must be a column, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            vec![COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_LOG_ATTRIBUTES]
+        );
     }
 
     /// `MAP<Utf8, Utf8>` field shape produced by [`MapBuilder`]'s default

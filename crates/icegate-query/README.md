@@ -135,7 +135,7 @@ When adding support for a new client, the bare-minimum smoke test is:
 - **Parameter binding**: `do_put_prepared_statement_query` is not implemented — most clients fall back to inlined literal SQL.
 - **TLS**: no built-in TLS; terminate at the gateway. Plain gRPC only.
 - **Cancellation**: queries are cancelled when the gRPC stream is dropped by the client; there is no cooperative server-side cancel beyond that.
-- **Arrow `Map` columns over older drivers**: the attribute columns are `Map<Utf8, Utf8>` — `resource_attributes`, `scope_attributes`, and one record-level map per table (`log_attributes` on `logs`/`events`, `span_attributes` on `spans`, `data_point_attributes` on `metrics`). JDBC drivers <17.0 and `pyarrow` <14 may render them as `List<Struct<key, value>>`. Workaround: project specific keys (`resource_attributes['service.version']`) which collapses to `Utf8`. Keys are stored in OTel-native dotted form, so address them as `service.version`, not `service_version`; the dot-to-underscore mapping applies only to the Loki label API.
+- **Arrow `Map` columns over older drivers**: the attribute columns are `Map<Utf8, Utf8>` — `resource_attributes`, `scope_attributes`, and one record-level map per table (`log_attributes` on `logs`/`events`, `span_attributes` on `spans`, `data_point_attributes` on `metrics`). JDBC drivers <17.0 and `pyarrow` <14 may render them as `List<Struct<key, value>>`. Workaround: project-specific keys (`resource_attributes['service.version']`) which collapses to `Utf8`. Keys are stored in OTel-native dotted form, so address them as `service.version`, not `service_version`; the dot-to-underscore mapping applies only to the Loki label API.
 
 ## Configuration
 

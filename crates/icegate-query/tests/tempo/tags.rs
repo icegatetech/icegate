@@ -11,11 +11,14 @@
     clippy::uninlined_format_args
 )]
 
+use std::collections::BTreeSet;
+
 use icegate_common::{ICEGATE_NAMESPACE, SPANS_TABLE};
 use serde_json::Value;
 
 use super::harness::{
     TestServer, write_test_spans, write_test_spans_with_properties, write_test_spans_with_scope_attributes,
+    write_test_spans_with_span_and_scope_attributes,
 };
 
 #[tokio::test]
@@ -540,6 +543,112 @@ async fn tag_values_for_scope_attribute_reachable_via_span_and_unscoped_prefixes
             "path={path} expected dotted-as-stored value present={expect_value}: {:?}",
             values
         );
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tag_values_coalesce_span_over_scope_for_scoped_and_unscoped_lookups() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (server, catalog) = TestServer::start().await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+
+    write_test_spans_with_span_and_scope_attributes(
+        &table,
+        &catalog,
+        "tempo-tenant",
+        &[
+            &[("collision.key", "span-first")],
+            &[],
+            &[("collision.key", "span-third")],
+        ],
+        &[
+            &[("collision.key", "scope-shadowed-first")],
+            &[("collision.key", "scope-fallback")],
+            &[("collision.key", "scope-shadowed-third")],
+        ],
+    )
+    .await?;
+
+    let expected = BTreeSet::from([
+        "scope-fallback".to_string(),
+        "span-first".to_string(),
+        "span-third".to_string(),
+    ]);
+    for path in ["span.collision.key", ".collision.key"] {
+        let response = server
+            .client
+            .get(format!("{}/api/search/tag/{path}/values", server.base_url))
+            .header("X-Scope-OrgID", "tempo-tenant")
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, 200, "path={path} response body: {body}");
+        let values: BTreeSet<String> = body["tagValues"]
+            .as_array()
+            .expect("tagValues array")
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(values, expected, "path={path}");
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn span_service_name_values_read_raw_span_and_scope_keys() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, SPANS_TABLE])?)
+        .await?;
+
+    write_test_spans_with_span_and_scope_attributes(
+        &table,
+        &catalog,
+        "tempo-tenant",
+        &[&[("service.name", "span-service")], &[], &[]],
+        &[&[], &[("service.name", "scope-service")], &[]],
+    )
+    .await?;
+
+    for (path, expected) in [
+        (
+            "span.service.name",
+            BTreeSet::from(["scope-service".to_string(), "span-service".to_string()]),
+        ),
+        (
+            ".service.name",
+            BTreeSet::from([
+                "backend".to_string(),
+                "frontend".to_string(),
+                "scope-service".to_string(),
+                "span-service".to_string(),
+            ]),
+        ),
+    ] {
+        let response = server
+            .client
+            .get(format!("{}/api/search/tag/{path}/values", server.base_url))
+            .header("X-Scope-OrgID", "tempo-tenant")
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, 200, "path={path} response body: {body}");
+        let values: BTreeSet<String> = body["tagValues"]
+            .as_array()
+            .expect("tagValues array")
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(values, expected, "path={path}");
     }
 
     server.shutdown().await;

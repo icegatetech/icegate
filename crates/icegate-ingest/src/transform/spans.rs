@@ -3,15 +3,16 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::{
-    array::{ArrayBuilder, ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringBuilder},
+    array::{ArrayBuilder, ArrayRef, FixedSizeBinaryBuilder, MapBuilder, RecordBatch, StringBuilder},
     datatypes::{DataType, Schema},
 };
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::DEFAULT_TENANT_ID;
 
 use super::attributes::{
-    dedupe_dotted_attributes, extract_map_fields_from_nested_struct, extract_map_fields_from_schema_named,
-    extract_string_value, flatten_any_value_dotted, is_zero_bytes, u32_count_to_i32,
+    attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_nested_struct,
+    extract_map_fields_from_schema_named, extract_string_value, flatten_any_value_dotted, is_zero_bytes,
+    u32_count_to_i32,
 };
 
 /// Returns the Arrow schema for spans, derived from the Iceberg spans schema.
@@ -119,41 +120,9 @@ pub fn spans_to_record_batch(
     let mut kind_builder = Int32Builder::with_capacity(total_spans);
     let mut status_code_builder = Int32Builder::with_capacity(total_spans);
     let mut status_message_builder = StringBuilder::with_capacity(total_spans, total_spans * 32);
-    let mut resource_attrs_builder = MapBuilder::new(
-        Some(MapFieldNames {
-            entry: "key_value".to_string(),
-            key: "key".to_string(),
-            value: "value".to_string(),
-        }),
-        StringBuilder::new(),
-        StringBuilder::new(),
-    )
-    .with_keys_field(resource_attr_key_field)
-    .with_values_field(resource_attr_value_field);
-
-    let mut span_attrs_builder = MapBuilder::new(
-        Some(MapFieldNames {
-            entry: "key_value".to_string(),
-            key: "key".to_string(),
-            value: "value".to_string(),
-        }),
-        StringBuilder::new(),
-        StringBuilder::new(),
-    )
-    .with_keys_field(span_attr_key_field)
-    .with_values_field(span_attr_value_field);
-
-    let mut scope_attrs_builder = MapBuilder::new(
-        Some(MapFieldNames {
-            entry: "key_value".to_string(),
-            key: "key".to_string(),
-            value: "value".to_string(),
-        }),
-        StringBuilder::new(),
-        StringBuilder::new(),
-    )
-    .with_keys_field(scope_attr_key_field)
-    .with_values_field(scope_attr_value_field);
+    let mut resource_attrs_builder = attribute_map_builder(resource_attr_key_field, resource_attr_value_field);
+    let mut span_attrs_builder = attribute_map_builder(span_attr_key_field, span_attr_value_field);
+    let mut scope_attrs_builder = attribute_map_builder(scope_attr_key_field, scope_attr_value_field);
     let mut flags_builder = Int32Builder::with_capacity(total_spans);
     let mut dropped_attributes_count_builder = Int32Builder::with_capacity(total_spans);
     let mut dropped_events_count_builder = Int32Builder::with_capacity(total_spans);
@@ -184,19 +153,7 @@ pub fn spans_to_record_batch(
         vec![
             Box::new(TimestampMicrosecondBuilder::new()) as Box<dyn ArrayBuilder>,
             Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
-            Box::new(
-                MapBuilder::new(
-                    Some(MapFieldNames {
-                        entry: "key_value".to_string(),
-                        key: "key".to_string(),
-                        value: "value".to_string(),
-                    }),
-                    StringBuilder::new(),
-                    StringBuilder::new(),
-                )
-                .with_keys_field(event_attr_key_field)
-                .with_values_field(event_attr_value_field),
-            ) as Box<dyn ArrayBuilder>,
+            Box::new(attribute_map_builder(event_attr_key_field, event_attr_value_field)) as Box<dyn ArrayBuilder>,
             Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
         ],
     ))
@@ -228,19 +185,7 @@ pub fn spans_to_record_batch(
             Box::new(FixedSizeBinaryBuilder::new(16)) as Box<dyn ArrayBuilder>, // trace_id (16 bytes)
             Box::new(FixedSizeBinaryBuilder::new(8)) as Box<dyn ArrayBuilder>,  // span_id (8 bytes)
             Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,            // trace_state (nullable)
-            Box::new(
-                MapBuilder::new(
-                    Some(MapFieldNames {
-                        entry: "key_value".to_string(),
-                        key: "key".to_string(),
-                        value: "value".to_string(),
-                    }),
-                    StringBuilder::new(),
-                    StringBuilder::new(),
-                )
-                .with_keys_field(link_attr_key_field)
-                .with_values_field(link_attr_value_field),
-            ) as Box<dyn ArrayBuilder>,
+            Box::new(attribute_map_builder(link_attr_key_field, link_attr_value_field)) as Box<dyn ArrayBuilder>,
             Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>, // dropped_attributes_count
             Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>, // flags (nullable)
         ],

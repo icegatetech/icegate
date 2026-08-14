@@ -54,7 +54,8 @@ impl ComparisonOp {
 /// they had been physically written into `span_attributes` (which is what
 /// ingest did before the OTel-native storage split). The [`Scope::Any`]
 /// variant maps to `TraceQL`'s leading-dot shorthand (e.g.,
-/// `.http.status_code`) which lets the engine search any scope.
+/// `.http.status_code`) which searches resource and span scopes, including
+/// the instrumentation-scope fallback reached through span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
     /// `span.foo` — also reaches `OTel` `InstrumentationScope.attributes`,
@@ -68,7 +69,7 @@ pub enum Scope {
     Link,
     /// `parent.span.foo` / `parent.resource.foo`
     Parent(ParentScope),
-    /// `.foo` — any scope. Resolved at planning time.
+    /// `.foo` — resource and span scopes. Resolved at planning time.
     Any,
 }
 

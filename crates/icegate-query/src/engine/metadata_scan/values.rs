@@ -185,6 +185,66 @@ pub async fn stream_map_values(
     Ok(())
 }
 
+/// Project two MAP columns and collect values with per-row primary precedence.
+///
+/// A fallback value is collected only when the same row has no non-null match
+/// in the primary map. Missing map columns contribute no values, which preserves
+/// metadata-scan behavior across schema evolution.
+///
+/// # Errors
+///
+/// Returns `MetadataScanError::Parquet` if projected record-batch reads fail,
+/// or `MetadataScanError::Schema` if a projected map has an unexpected type.
+#[tracing::instrument(skip_all, fields(primary_map = primary_config.map_column, fallback_map = fallback_config.map_column, label_name = label_name, num_batches = tracing::field::Empty, pruned_rgs = tracing::field::Empty))]
+pub async fn stream_coalesced_map_values(
+    builder: ParquetRecordBatchStreamBuilder<ArrowFileReader>,
+    predicate: &Predicate,
+    primary_config: &MetadataScanConfig,
+    fallback_config: &MetadataScanConfig,
+    label_name: &str,
+    out: &mut BTreeSet<String>,
+) -> Result<(), MetadataScanError> {
+    if is_system_reserved_value_column(label_name) {
+        return Ok(());
+    }
+
+    let schema_descr = builder.parquet_schema();
+    let projected_columns: Vec<&str> = [primary_config.map_column, fallback_config.map_column]
+        .into_iter()
+        .filter(|map_column| {
+            (0..schema_descr.num_columns()).any(|i| {
+                schema_descr
+                    .column(i)
+                    .path()
+                    .parts()
+                    .first()
+                    .is_some_and(|part| part == map_column)
+            })
+        })
+        .collect();
+    if projected_columns.is_empty() {
+        return Ok(());
+    }
+
+    let metadata = builder.metadata();
+    let total_rgs = metadata.num_row_groups();
+    let surviving: Vec<usize> = (0..total_rgs)
+        .filter(|&i| parquet_reader::row_group_can_match(metadata.row_group(i), predicate))
+        .collect();
+    tracing::Span::current().record("pruned_rgs", total_rgs - surviving.len());
+
+    let mask = ProjectionMask::columns(schema_descr, projected_columns);
+    let mut stream = builder.with_projection(mask).with_row_groups(surviving).build()?;
+
+    let mut num_batches = 0_usize;
+    while let Some(batch) = stream.try_next().await? {
+        num_batches += 1;
+        collect_coalesced_map_values_from_batch(&batch, primary_config, fallback_config, label_name, out)?;
+    }
+    tracing::Span::current().record("num_batches", num_batches);
+    Ok(())
+}
+
 /// Whether a raw stored map key satisfies a request for `label_name`,
 /// under the table's [`MetadataScanConfig::normalize_keys`] policy.
 ///
@@ -261,6 +321,90 @@ fn collect_map_values_from_batch(
         out.insert(values.value(i).to_string());
     }
 
+    Ok(())
+}
+
+struct MapValues<'a> {
+    map: &'a MapArray,
+    keys: &'a StringArray,
+    values: &'a StringArray,
+}
+
+fn map_values_from_batch<'a>(
+    batch: &'a RecordBatch,
+    map_column: &str,
+) -> Result<Option<MapValues<'a>>, MetadataScanError> {
+    let Ok(index) = batch.schema().index_of(map_column) else {
+        return Ok(None);
+    };
+    let map = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| MetadataScanError::Schema(format!("'{map_column}' column is not a MapArray")))?;
+    let keys = map
+        .keys()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| MetadataScanError::Schema(format!("'{map_column}' map keys are not StringArray")))?;
+    let values = map
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| MetadataScanError::Schema(format!("'{map_column}' map values are not StringArray")))?;
+    Ok(Some(MapValues { map, keys, values }))
+}
+
+fn collect_map_values_for_row(
+    map_values: &MapValues<'_>,
+    row: usize,
+    label_name: &str,
+    normalize_keys: bool,
+    out: &mut BTreeSet<String>,
+) -> Result<bool, MetadataScanError> {
+    if !map_values.map.is_valid(row) {
+        return Ok(false);
+    }
+    let offsets = map_values.map.value_offsets();
+    let start = usize::try_from(offsets[row])
+        .map_err(|_| MetadataScanError::Schema("map row start offset is negative".to_string()))?;
+    let end = usize::try_from(offsets[row + 1])
+        .map_err(|_| MetadataScanError::Schema("map row end offset is negative".to_string()))?;
+
+    let mut matched = false;
+    for index in start..end {
+        if !map_values.keys.is_valid(index) || !map_values.values.is_valid(index) {
+            continue;
+        }
+        if stored_key_matches_label(map_values.keys.value(index), label_name, normalize_keys) {
+            out.insert(map_values.values.value(index).to_string());
+            matched = true;
+        }
+    }
+    Ok(matched)
+}
+
+fn collect_coalesced_map_values_from_batch(
+    batch: &RecordBatch,
+    primary_config: &MetadataScanConfig,
+    fallback_config: &MetadataScanConfig,
+    label_name: &str,
+    out: &mut BTreeSet<String>,
+) -> Result<(), MetadataScanError> {
+    let primary = map_values_from_batch(batch, primary_config.map_column)?;
+    let fallback = map_values_from_batch(batch, fallback_config.map_column)?;
+
+    for row in 0..batch.num_rows() {
+        let has_primary = match &primary {
+            Some(values) => collect_map_values_for_row(values, row, label_name, primary_config.normalize_keys, out)?,
+            None => false,
+        };
+        if !has_primary {
+            if let Some(values) = &fallback {
+                collect_map_values_for_row(values, row, label_name, fallback_config.normalize_keys, out)?;
+            }
+        }
+    }
     Ok(())
 }
 

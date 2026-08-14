@@ -1429,6 +1429,18 @@ pub trait LogQLParserBaseListener<'input>:
      * Enter a parse tree produced by \{@link LogQLParserBaseParser#s}.
      * @param ctx the parse tree
      */
+    fn enter_labelname(&mut self, _ctx: &LabelNameContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_labelname(&mut self, _ctx: &LabelNameContext<'input>) {}
+
+
+    /**
+     * Enter a parse tree produced by \{@link LogQLParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
     fn enter_duration(&mut self, _ctx: &DurationContext<'input>) {}
     /**
      * Exit a parse tree produced by \{@link  LogQLParserBaseParser#s}.

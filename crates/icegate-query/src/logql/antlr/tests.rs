@@ -539,6 +539,13 @@ fn test_underscored_label_names_still_parse() {
 }
 
 #[test]
+fn test_ip_token_is_accepted_as_a_label_name() {
+    assert_parses(r#"{ip="value"}"#);
+    assert_parses(r#"sum by (ip) (rate({ip!="loopback"}[5m]))"#);
+    assert_parses(r#"{job="app"} | ip = ip("192.0.2.0/24")"#);
+}
+
+#[test]
 fn test_grouping_empty() {
     assert_parses(r#"sum by () (rate({job="mysql"}[5m]))"#);
     assert_parses(r#"avg without () (count_over_time({job="app"}[1m]))"#);

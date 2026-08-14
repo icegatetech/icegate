@@ -42,10 +42,10 @@ matchers
 
 // Single matcher, e.g., foo="bar", foo=~"val.*"
 matcher
-    : ATTRIBUTE EQ STRING  #matcherEq
-    | ATTRIBUTE NE STRING  #matcherNeq
-    | ATTRIBUTE RE STRING  #matcherRe
-    | ATTRIBUTE NRE STRING #matcherNre
+    : labelName EQ STRING  #matcherEq
+    | labelName NE STRING  #matcherNeq
+    | labelName RE STRING  #matcherRe
+    | labelName NRE STRING #matcherNre
     ;
 
 /*------------------------------------------------------------------
@@ -144,8 +144,8 @@ labelFormatOps
     ;
 
 labelFormatOp
-    : ATTRIBUTE EQ ATTRIBUTE      #labelFormatRename
-    | ATTRIBUTE EQ STRING         #labelFormatTemplate
+    : labelName EQ labelName      #labelFormatRename
+    | labelName EQ STRING         #labelFormatTemplate
     ;
 
 lineFormatExpr
@@ -178,7 +178,7 @@ dropKeepList
 
 dropKeepItem
     : matcher      #dropKeepMatcher    // Matcher: level="debug", level=~".*"
-    | ATTRIBUTE    #dropKeepSimple     // Simple name: level
+    | labelName    #dropKeepSimple     // Simple name: level
     ;
 
 // JSON parser - extracts fields from JSON logs
@@ -190,8 +190,8 @@ jsonParser
 // Label extraction supports both simple field names and JSON path syntax
 // Examples: field, field="value", field="$.nested.path"
 labelExtractionExpr
-    : ATTRIBUTE EQ STRING  #labelExtractionWithPath
-    | ATTRIBUTE            #labelExtractionSimple
+    : labelName EQ STRING  #labelExtractionWithPath
+    | labelName            #labelExtractionSimple
     ;
 
 labelExtractions
@@ -213,26 +213,26 @@ labelFilter
 // Number filter - filters labels by numeric comparisons
 // Example: | status_code > 500, | counter >= -1
 numberFilter
-    : ATTRIBUTE comparisonOp literalExpr
+    : labelName comparisonOp literalExpr
     ;
 
 // Duration filter - filters labels by duration comparisons
 // Example: | duration > 10s, | latency >= 100ms
 durationFilter
-    : ATTRIBUTE comparisonOp duration
+    : labelName comparisonOp duration
     ;
 
 // Bytes filter - filters labels by byte size comparisons
 // Example: | bytes_consumed > 20MB, | size <= 1GB
 bytesFilter
-    : ATTRIBUTE comparisonOp BYTES
+    : labelName comparisonOp BYTES
     ;
 
 // IP label filter - filters labels by IP address patterns
 // Example: | client_ip = ip("192.168.0.0/16")
 ipLabelFilter
-    : ATTRIBUTE EQ ipFn
-    | ATTRIBUTE NE ipFn
+    : labelName EQ ipFn
+    | labelName NE ipFn
     ;
 
 // Comparison operators for numeric, duration, and bytes filters
@@ -379,7 +379,7 @@ groupingLabelList
     ;
 
 groupingLabel
-    : ATTRIBUTE
+    : labelName
     ;
 
 groupingLabels
@@ -440,12 +440,12 @@ atModifier
 /*------------------------------------------------------------------
  *  UNWRAP EXPRESSIONS
  *  Note: Conversion function names (bytes, duration, duration_seconds) are parsed
- *  as ATTRIBUTE to avoid keyword conflicts with field names. Validation that the
+ *  as labelName to avoid keyword conflicts with field names. Validation that the
  *  conversion function name is valid should be done at runtime/transpilation.
  *------------------------------------------------------------------*/
 unwrapExpr
-    : PIPE UNWRAP ATTRIBUTE                                                #unwrapBasic
-    | PIPE UNWRAP ATTRIBUTE LPAREN ATTRIBUTE RPAREN                        #unwrapWithConversion
+    : PIPE UNWRAP labelName                                                #unwrapBasic
+    | PIPE UNWRAP labelName LPAREN labelName RPAREN                        #unwrapWithConversion
     | unwrapExpr PIPE labelFilter                                          #unwrapWithFilter
     ;
 
@@ -476,7 +476,15 @@ vectorExpr
  *  VARIABLE EXPRESSIONS
  *------------------------------------------------------------------*/
 variableExpr
+    : labelName
+    ;
+
+// Identifiers used as label names. `ip` remains its dedicated token so the
+// ip(...) filter function keeps its existing lexer behavior, while label
+// contexts accept the same spelling as any other identifier.
+labelName
     : ATTRIBUTE
+    | IP
     ;
 
 /*------------------------------------------------------------------

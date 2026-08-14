@@ -30,9 +30,10 @@ use opentelemetry_proto::tonic::{
 };
 
 use super::attributes::{
-    dedupe_dotted_attributes, extract_map_fields_from_nested_struct, extract_map_fields_from_schema_named,
-    extract_string_value, flatten_any_value_dotted, is_zero_bytes, list_element_field, list_struct_fields,
-    map_field_names, merge_dotted_levels, nanos_to_micros, now_micros, u32_count_to_i32, u64_to_i64,
+    attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_nested_struct,
+    extract_map_fields_from_schema_named, extract_string_value, flatten_any_value_dotted, is_zero_bytes,
+    list_element_field, list_struct_fields, merge_dotted_levels, nanos_to_micros, now_micros, u32_count_to_i32,
+    u64_to_i64,
 };
 
 /// Process-wide cache of the derived metrics Arrow schema.
@@ -264,19 +265,10 @@ impl MetricColumns {
             extract_map_fields_from_nested_struct(&exemplar_fields, "attributes")?;
         let (metadata_key, metadata_val) = extract_map_fields_from_schema_named(&schema, COL_METADATA)?;
 
-        let data_point_attributes =
-            MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
-                .with_keys_field(dp_key)
-                .with_values_field(dp_val);
-        let resource_attributes = MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
-            .with_keys_field(resource_key)
-            .with_values_field(resource_val);
-        let scope_attributes = MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
-            .with_keys_field(scope_key)
-            .with_values_field(scope_val);
-        let metadata = MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
-            .with_keys_field(metadata_key)
-            .with_values_field(metadata_val);
+        let data_point_attributes = attribute_map_builder(dp_key, dp_val);
+        let resource_attributes = attribute_map_builder(resource_key, resource_val);
+        let scope_attributes = attribute_map_builder(scope_key, scope_val);
+        let metadata = attribute_map_builder(metadata_key, metadata_val);
 
         // quantile struct: (quantile: Double, value: Double) in schema order.
         let quantile_values = ListBuilder::new(StructBuilder::new(
@@ -297,11 +289,7 @@ impl MetricColumns {
                 Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
                 Box::new(FixedSizeBinaryBuilder::new(8)) as Box<dyn ArrayBuilder>,
                 Box::new(FixedSizeBinaryBuilder::new(16)) as Box<dyn ArrayBuilder>,
-                Box::new(
-                    MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
-                        .with_keys_field(exemplar_attr_key)
-                        .with_values_field(exemplar_attr_val),
-                ) as Box<dyn ArrayBuilder>,
+                Box::new(attribute_map_builder(exemplar_attr_key, exemplar_attr_val)) as Box<dyn ArrayBuilder>,
             ],
         ))
         .with_field(exemplar_el);

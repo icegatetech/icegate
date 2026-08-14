@@ -242,6 +242,72 @@ pub async fn scan_label_values(
     Ok(result)
 }
 
+/// Compute distinct MAP values with per-row primary-over-fallback precedence.
+///
+/// Both configs are treated as MAP sources even when `label_name` resembles an
+/// indexed column. For each row, matching values from `primary_config` are
+/// collected when present; `fallback_config` contributes only when that row has
+/// no non-null primary match. This mirrors a `COALESCE(primary[key],
+/// fallback[key])` lookup without materializing unrelated columns.
+///
+/// # Errors
+///
+/// Returns an error if Iceberg planning fails, a referenced Parquet file cannot
+/// be read, or either projected attribute column has an unexpected Arrow type.
+#[tracing::instrument(
+    skip(table, primary_config, fallback_config, extra_predicate),
+    fields(
+        tenant_id = %tenant_id,
+        label_name = %label_name,
+        num_files = tracing::field::Empty,
+    )
+)]
+pub async fn scan_coalesced_map_label_values(
+    table: &Table,
+    tenant_id: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    primary_config: &MetadataScanConfig,
+    fallback_config: &MetadataScanConfig,
+    label_name: &str,
+    extra_predicate: Predicate,
+) -> Result<BTreeSet<String>, MetadataScanError> {
+    let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
+    let plan_stream = plan_files(table, &predicate).await?;
+    let file_io = table.file_io().clone();
+
+    let label_name = label_name.to_string();
+    let mut num_files: usize = 0;
+    let mut stream = plan_stream
+        .map_err(MetadataScanError::Iceberg)
+        .map_ok(|task| {
+            let file_io = file_io.clone();
+            let label_name = label_name.clone();
+            let predicate = predicate.clone();
+            async move {
+                scan_coalesced_map_label_values_for_file(
+                    &file_io,
+                    task,
+                    &predicate,
+                    primary_config,
+                    fallback_config,
+                    &label_name,
+                )
+                .await
+            }
+        })
+        .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
+
+    let mut result = BTreeSet::new();
+    while let Some(file_values) = stream.next().await {
+        result.extend(file_values?);
+        num_files += 1;
+    }
+    tracing::Span::current().record("num_files", num_files);
+
+    Ok(result)
+}
+
 /// Compute the distinct INT32 values of a single named column in `table`
 /// for the given tenant, time range, and additional predicate.
 ///
@@ -368,6 +434,30 @@ async fn scan_label_values_for_file(
         }
     }
 
+    Ok(out)
+}
+
+/// Process one Parquet file for a coalesced MAP tag-value enumeration.
+#[tracing::instrument(skip_all, fields(file = %task.data_file_path))]
+async fn scan_coalesced_map_label_values_for_file(
+    file_io: &iceberg::io::FileIO,
+    task: FileScanTask,
+    predicate: &Predicate,
+    primary_config: &MetadataScanConfig,
+    fallback_config: &MetadataScanConfig,
+    label_name: &str,
+) -> Result<BTreeSet<String>, MetadataScanError> {
+    let builder = parquet_reader::open_builder(file_io, &task).await?;
+    let mut out = BTreeSet::new();
+    values::stream_coalesced_map_values(
+        builder,
+        predicate,
+        primary_config,
+        fallback_config,
+        label_name,
+        &mut out,
+    )
+    .await?;
     Ok(out)
 }
 

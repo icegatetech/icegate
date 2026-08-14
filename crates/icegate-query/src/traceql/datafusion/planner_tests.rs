@@ -20,7 +20,7 @@ use datafusion::{
     datasource::MemTable,
     prelude::SessionContext,
 };
-use icegate_common::SPANS_TABLE_FQN;
+use icegate_common::{SPANS_TABLE_FQN, schema::COL_SCOPE_ATTRIBUTES};
 
 /// Pad an ASCII label up to `N` bytes with trailing zeros so it round-trips
 /// through a `FIXED_LEN_BYTE_ARRAY(N)` column. Lexicographic ordering of
@@ -98,7 +98,7 @@ fn fixture_schema() -> Arc<Schema> {
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         map_field("resource_attributes"),
         map_field("span_attributes"),
-        map_field("scope_attributes"),
+        map_field(COL_SCOPE_ATTRIBUTES),
     ]))
 }
 

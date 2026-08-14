@@ -3,10 +3,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{
-        ArrayRef, FixedSizeBinaryBuilder, MapBuilder, MapFieldNames, RecordBatch, StringBuilder,
-        TimestampMicrosecondArray,
-    },
+    array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch, StringBuilder, TimestampMicrosecondArray},
     datatypes::Schema,
 };
 use iceberg::arrow::schema_to_arrow_schema;
@@ -17,8 +14,8 @@ use icegate_common::{
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use super::attributes::{
-    dedupe_dotted_attributes, extract_map_fields_from_schema_named, extract_string_value, is_zero_bytes,
-    merge_dotted_levels, serialize_any_value_to_json,
+    attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named, extract_string_value,
+    is_zero_bytes, merge_dotted_levels, serialize_any_value_to_json,
 };
 
 /// Returns the Arrow schema for logs, derived from the Iceberg schema.
@@ -100,24 +97,6 @@ pub fn logs_to_record_batch(
     let mut span_id_builder = FixedSizeBinaryBuilder::with_capacity(total_records, 8);
     let mut severity_text_builder = StringBuilder::with_capacity(total_records, total_records * 8);
     let mut body_builder = StringBuilder::with_capacity(total_records, total_records * 256);
-
-    /// Build a MAP<Utf8,Utf8> builder wired to the Iceberg field metadata.
-    fn attribute_map_builder(
-        key_field: arrow::datatypes::FieldRef,
-        value_field: arrow::datatypes::FieldRef,
-    ) -> MapBuilder<StringBuilder, StringBuilder> {
-        MapBuilder::new(
-            Some(MapFieldNames {
-                entry: "key_value".to_string(),
-                key: "key".to_string(),
-                value: "value".to_string(),
-            }),
-            StringBuilder::new(),
-            StringBuilder::new(),
-        )
-        .with_keys_field(key_field)
-        .with_values_field(value_field)
-    }
 
     let mut resource_attrs_builder = attribute_map_builder(resource_key_field, resource_value_field);
     let mut scope_attrs_builder = attribute_map_builder(scope_key_field, scope_value_field);
@@ -220,9 +199,21 @@ pub fn logs_to_record_batch(
                     log_attrs_builder.values().append_value(value);
                 }
 
-                resource_attrs_builder.append(true).expect("append resource_attributes");
-                scope_attrs_builder.append(true).expect("append scope_attributes");
-                log_attrs_builder.append(true).expect("append log_attributes");
+                resource_attrs_builder.append(true).map_err(|error| {
+                    crate::error::IngestError::Validation(format!(
+                        "failed to append '{COL_RESOURCE_ATTRIBUTES}' map entry: {error}"
+                    ))
+                })?;
+                scope_attrs_builder.append(true).map_err(|error| {
+                    crate::error::IngestError::Validation(format!(
+                        "failed to append '{COL_SCOPE_ATTRIBUTES}' map entry: {error}"
+                    ))
+                })?;
+                log_attrs_builder.append(true).map_err(|error| {
+                    crate::error::IngestError::Validation(format!(
+                        "failed to append '{COL_LOG_ATTRIBUTES}' map entry: {error}"
+                    ))
+                })?;
             }
         }
     }

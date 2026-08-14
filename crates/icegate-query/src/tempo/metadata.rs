@@ -22,9 +22,9 @@
 //! `span_attributes` before the OTel-native storage split. So only two
 //! `TraceQL` scope groups are driven by attribute maps — `resource` and
 //! `span` — and `span`'s group listing ([`list_tags_v2`]) and tag-values
-//! lookup ([`list_tag_values`]) union `span_attributes` with
-//! `scope_attributes`, with `span_attributes` winning on key collision (the
-//! same precedence the pre-migration physical fold had). Each map's
+//! lookup ([`list_tag_values`]) coalesces `span_attributes` with
+//! `scope_attributes` per row, with `span_attributes` winning on key collision
+//! (the same precedence the pre-migration physical fold had). Each map's
 //! dotted-prefix address on `/api/search/tag/{name}/values` is `resource.`
 //! or `span.` — plus the unscoped `.` form, which searches both. A tag is
 //! never advertised under a group whose prefix cannot actually select it:
@@ -127,7 +127,8 @@ const SPANS_VALUES_RESOURCE_CONFIG: MetadataScanConfig = MetadataScanConfig {
 
 /// Metadata-scan config for span tag-value lookup (`/tag/<name>/values`)
 /// against scope-scoped keys (`OTel` `InstrumentationScope.attributes`).
-/// Unioned into the `span.<key>` lookup in [`list_tag_values`] — see
+/// Used as the per-row fallback for the `span.<key>` lookup in
+/// [`list_tag_values`] — see
 /// [`SPANS_SCOPE_CONFIG`].
 ///
 /// `indexed_columns` is empty for the same reason as [`SPANS_SCOPE_CONFIG`]:
@@ -389,48 +390,35 @@ pub async fn list_tag_values(
             // `span.<key>` also reaches `scope_attributes` — `TraceQL`/
             // Tempo has no dedicated instrumentation-scope query scope, so
             // a key that physically lives only in `scope_attributes` must
-            // still resolve here (see the module docs). Plain union: this
-            // is distinct-value enumeration for a dropdown, not the
-            // per-row read `span_attribute_lhs` does, so there is no
-            // same-row collision to break a tie on.
-            let mapped = map_attribute_to_column(key).unwrap_or(key);
-            values = metadata_scan::scan_label_values(
+            // still resolve here (see the module docs). The two maps are
+            // coalesced per row so a span value shadows a scope value for
+            // the same key, matching `span_attribute_lhs`.
+            values = metadata_scan::scan_coalesced_map_label_values(
                 &table,
                 tenant_id,
                 start_dt,
                 end_dt,
                 &SPANS_VALUES_SPAN_CONFIG,
-                mapped,
-                extra_predicate.clone(),
-            )
-            .await
-            .map_err(|e| TempoError(QueryError::from(e)))?;
-            let scope_values = metadata_scan::scan_label_values(
-                &table,
-                tenant_id,
-                start_dt,
-                end_dt,
                 &SPANS_VALUES_SCOPE_CONFIG,
-                mapped,
+                key,
                 extra_predicate,
             )
             .await
             .map_err(|e| TempoError(QueryError::from(e)))?;
-            values.extend(scope_values);
         }
         TagRef::UnscopedAttribute(key) => {
             // `.foo` — scope underspecified by the caller. Unlike the
-            // resource arm above (reads exactly one map), this unions all
-            // three underlying MAP columns: span_attributes,
-            // resource_attributes, and scope_attributes.
+            // resource arm above (reads exactly one scope), this unions
+            // resource values with the per-row coalesced span/scope value.
             let mapped = map_attribute_to_column(key).unwrap_or(key);
-            let span_values = metadata_scan::scan_label_values(
+            let span_values = metadata_scan::scan_coalesced_map_label_values(
                 &table,
                 tenant_id,
                 start_dt,
                 end_dt,
                 &SPANS_VALUES_SPAN_CONFIG,
-                mapped,
+                &SPANS_VALUES_SCOPE_CONFIG,
+                key,
                 extra_predicate.clone(),
             )
             .await
@@ -446,20 +434,8 @@ pub async fn list_tag_values(
             )
             .await
             .map_err(|e| TempoError(QueryError::from(e)))?;
-            let scope_values = metadata_scan::scan_label_values(
-                &table,
-                tenant_id,
-                start_dt,
-                end_dt,
-                &SPANS_VALUES_SCOPE_CONFIG,
-                mapped,
-                extra_predicate,
-            )
-            .await
-            .map_err(|e| TempoError(QueryError::from(e)))?;
             values.extend(span_values);
             values.extend(res_values);
-            values.extend(scope_values);
         }
         TagRef::Scoped {
             scope: Scope::Event | Scope::Link | Scope::Intrinsic,

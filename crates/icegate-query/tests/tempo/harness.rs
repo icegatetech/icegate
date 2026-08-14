@@ -35,7 +35,9 @@ use iceberg::{
     },
 };
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE, catalog::CatalogBuilder, schema,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE,
+    catalog::CatalogBuilder,
+    schema::{self, COL_SCOPE_ATTRIBUTES},
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
@@ -181,7 +183,16 @@ pub async fn write_test_spans_with_properties(
     tenant_id: &str,
     writer_properties: WriterProperties,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    write_spans_fixture(table, catalog, tenant_id, writer_properties, &[&[], &[], &[]]).await
+    let span_attribute_rows = default_span_attribute_rows();
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        writer_properties,
+        &span_attribute_rows,
+        &[&[], &[], &[]],
+    )
+    .await
 }
 
 /// Like [`write_test_spans`] but sets each row's `scope_attributes` (`OTel`
@@ -195,27 +206,57 @@ pub async fn write_test_spans_with_scope_attributes(
     tenant_id: &str,
     scope_attribute_rows: &[&[(&str, &str)]],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let span_attribute_rows = default_span_attribute_rows();
     write_spans_fixture(
         table,
         catalog,
         tenant_id,
         WriterProperties::builder().build(),
+        &span_attribute_rows,
         scope_attribute_rows,
     )
     .await
 }
 
+/// Like [`write_test_spans`] but sets both span- and scope-level attribute
+/// maps from caller-supplied rows. Each slice must contain exactly three rows.
+pub async fn write_test_spans_with_span_and_scope_attributes(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    span_attribute_rows: &[&[(&str, &str)]],
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        WriterProperties::builder().build(),
+        span_attribute_rows,
+        scope_attribute_rows,
+    )
+    .await
+}
+
+const fn default_span_attribute_rows() -> [&'static [(&'static str, &'static str)]; 3] {
+    [
+        &[("http.method", "GET"), ("http.url", "/api/health")],
+        &[("http.method", "GET"), ("http.url", "/api/users")],
+        &[("db.statement", "SELECT * FROM users")],
+    ]
+}
+
 /// Shared row-assembly core for [`write_test_spans_with_properties`] and
 /// [`write_test_spans_with_scope_attributes`] — writes the fixed
 /// three-span fixture (frontend/frontend/backend) every Tempo test in this
-/// crate builds on. Only the writer properties and the `scope_attributes`
-/// contents vary between callers; everything else (resource/span
-/// attributes, ids, timestamps) is fixed.
+/// crate builds on. The writer properties and per-row span/scope attributes
+/// vary between callers; everything else is fixed.
 async fn write_spans_fixture(
     table: &Table,
     catalog: &Arc<dyn Catalog>,
     tenant_id: &str,
     writer_properties: WriterProperties,
+    span_attribute_rows: &[&[(&str, &str)]],
     scope_attribute_rows: &[&[(&str, &str)]],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -309,20 +350,12 @@ async fn write_spans_fixture(
         ],
     )?;
     // Build span_attributes map (OTel Span attrs — e.g. http.method, db.statement).
-    let span_attributes = build_attribute_map(
-        &arrow_schema,
-        col_idx("span_attributes"),
-        &[
-            &[("http.method", "GET"), ("http.url", "/api/health")],
-            &[("http.method", "GET"), ("http.url", "/api/users")],
-            &[("db.statement", "SELECT * FROM users")],
-        ],
-    )?;
+    let span_attributes = build_attribute_map(&arrow_schema, col_idx("span_attributes"), span_attribute_rows)?;
     // Build scope_attributes map (OTel InstrumentationScope.attributes).
     // Content is caller-supplied — empty by default via
     // `write_test_spans`/`write_test_spans_with_properties`, populated by
     // `write_test_spans_with_scope_attributes`.
-    let scope_attributes = build_attribute_map(&arrow_schema, col_idx("scope_attributes"), scope_attribute_rows)?;
+    let scope_attributes = build_attribute_map(&arrow_schema, col_idx(COL_SCOPE_ATTRIBUTES), scope_attribute_rows)?;
 
     let flags: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(0)]));
     let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(0)]));
@@ -352,7 +385,7 @@ async fn write_spans_fixture(
     by_name.insert("status_message", status_message);
     by_name.insert("resource_attributes", resource_attributes);
     by_name.insert("span_attributes", span_attributes);
-    by_name.insert("scope_attributes", scope_attributes);
+    by_name.insert(COL_SCOPE_ATTRIBUTES, scope_attributes);
     by_name.insert("flags", flags);
     by_name.insert("dropped_attributes_count", dropped_attributes_count);
     by_name.insert("dropped_events_count", dropped_events_count);

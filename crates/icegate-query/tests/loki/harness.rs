@@ -57,22 +57,23 @@ use tokio_util::sync::CancellationToken;
 // (key_field, value_field) extraction and MapArray construction live here
 // instead of being copy-pasted per file.
 
-/// Extract the key/value `Field`s of the MAP-typed column at `field_idx` in
+/// Extract the key/value `Field`s of the named MAP-typed column in
 /// `arrow_schema`.
 ///
 /// Each of `resource_attributes` / `scope_attributes` / `log_attributes`
-/// carries distinct Iceberg field-id metadata, so callers MUST pass the index
+/// carries distinct Iceberg field-id metadata, so callers MUST pass the name
 /// matching the level they are about to build with [`build_attribute_map`] —
 /// reusing another level's fields here makes the built array's `DataType`
 /// disagree with the target schema field, and `RecordBatch::try_new` rejects
 /// that as a genuine mismatch rather than accepting it silently.
 ///
 /// # Panics
-/// Panics if `field_idx` is not a `Map<Struct>` column — a fixture-authoring
+/// Panics if `field_name` is missing or is not a `Map<Struct>` column — a fixture-authoring
 /// error the test should fail loudly on, not a runtime condition to recover
 /// from.
-pub fn map_entry_fields(arrow_schema: &Schema, field_idx: usize) -> (FieldRef, FieldRef) {
-    match arrow_schema.field(field_idx).data_type() {
+pub fn map_entry_fields(arrow_schema: &Schema, field_name: &str) -> (FieldRef, FieldRef) {
+    let field = arrow_schema.field_with_name(field_name).expect("attribute map field");
+    match field.data_type() {
         DataType::Map(entries_field, _) => match entries_field.data_type() {
             DataType::Struct(fields) => (Arc::clone(&fields[0]), Arc::clone(&fields[1])),
             other => panic!("expected Struct type for map entries, got {other:?}"),
@@ -85,7 +86,7 @@ pub fn map_entry_fields(arrow_schema: &Schema, field_idx: usize) -> (FieldRef, F
 /// pairs. `rows.len()` becomes the array's row count, so callers building a
 /// multi-column `RecordBatch` must pass one entry per row even when a given
 /// row's map is empty. `key_field`/`value_field` must come from
-/// [`map_entry_fields`] for the same column position this array is placed at.
+/// [`map_entry_fields`] for the same named column this array is placed at.
 pub fn build_attribute_map(key_field: FieldRef, value_field: FieldRef, rows: &[&[(&str, &str)]]) -> ArrayRef {
     let field_names = MapFieldNames {
         entry: "key_value".to_string(),
@@ -285,7 +286,7 @@ pub async fn write_test_logs_for_tenant(
     // wire label, so nothing downstream depends on which one is stored.
     let resource_pairs: [(&str, &str); 1] = [("tenant.marker", tenant_id)];
     let resource_rows: [&[(&str, &str)]; 3] = [&resource_pairs, &resource_pairs, &resource_pairs];
-    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES);
     let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &resource_rows);
 
     // Scope level: the instrumentation library that produced the record.
@@ -294,12 +295,12 @@ pub async fn write_test_logs_for_tenant(
     // from a dropped one.
     let scope_pairs: [(&str, &str); 1] = [("otel.scope.name", "test-instrumentation")];
     let scope_rows: [&[(&str, &str)]; 3] = [&scope_pairs, &scope_pairs, &scope_pairs];
-    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES);
     let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &scope_rows);
 
     let log_pairs: Vec<[(&str, &str); 1]> = bodies.iter().map(|b| [("body", b.as_str())]).collect();
     let log_rows: Vec<&[(&str, &str)]> = log_pairs.iter().map(<[(&str, &str); 1]>::as_slice).collect();
-    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, schema::COL_LOG_ATTRIBUTES);
     let log_attributes = build_attribute_map(log_key_field, log_value_field, &log_rows);
 
     // trace_id is now stored as raw 16-byte FIXED_LEN_BYTE_ARRAY; decode hex
@@ -447,18 +448,18 @@ pub async fn write_test_logs(table: &Table, catalog: &Arc<dyn Catalog>) -> Resul
         ("body", bodies[2]),
     ];
 
-    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES);
     let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &[&[], &[], &[]]);
 
     let scope_pairs: [(&str, &str); 1] = [("otel.scope.name", "test-instrumentation")];
-    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES);
     let scope_attributes = build_attribute_map(
         scope_key_field,
         scope_value_field,
         &[&scope_pairs, &scope_pairs, &scope_pairs],
     );
 
-    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, schema::COL_LOG_ATTRIBUTES);
     let log_attributes = build_attribute_map(log_key_field, log_value_field, &[&row0_pairs, &row1_pairs, &row2_pairs]);
 
     // trace_id / span_id are now FIXED_LEN_BYTE_ARRAY — decode hex fixtures.

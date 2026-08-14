@@ -2,7 +2,7 @@
 //! OTLP transforms.
 
 use arrow::{
-    array::MapFieldNames,
+    array::{MapBuilder, MapFieldNames, StringBuilder},
     datatypes::{DataType, Fields, Schema},
 };
 use icegate_common::attribute_key::{matches_wire_name, normalize_attribute_key};
@@ -371,6 +371,19 @@ pub(crate) fn map_field_names() -> MapFieldNames {
     }
 }
 
+/// Build a `MAP<Utf8,Utf8>` builder wired to schema-derived key/value fields.
+///
+/// The field names match the canonical Iceberg-to-Arrow map layout used by
+/// every ingest transform.
+pub(crate) fn attribute_map_builder(
+    key_field: arrow::datatypes::FieldRef,
+    value_field: arrow::datatypes::FieldRef,
+) -> MapBuilder<StringBuilder, StringBuilder> {
+    MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field)
+        .with_values_field(value_field)
+}
+
 /// Current wall-clock time in microseconds since the Unix epoch.
 ///
 /// # Errors
@@ -485,15 +498,12 @@ pub(crate) fn merge_dotted_levels(
     levels: &[&[KeyValue]],
     skip_in_first: &[&str],
 ) -> std::collections::BTreeMap<String, String> {
+    let skip_wire_names: Vec<_> = skip_in_first.iter().map(|promoted| normalize_attribute_key(promoted)).collect();
     let mut merged = std::collections::BTreeMap::new();
     for (level_idx, attrs) in levels.iter().enumerate() {
         for kv in *attrs {
             for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-                if level_idx == 0
-                    && skip_in_first
-                        .iter()
-                        .any(|promoted| matches_wire_name(&key, &normalize_attribute_key(promoted)))
-                {
+                if level_idx == 0 && skip_wire_names.iter().any(|wire_name| matches_wire_name(&key, wire_name)) {
                     continue;
                 }
                 merged.insert(key, value);

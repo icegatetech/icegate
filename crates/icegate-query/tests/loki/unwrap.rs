@@ -29,7 +29,10 @@ use iceberg::{
         },
     },
 };
-use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
+use icegate_common::{
+    ICEGATE_NAMESPACE, LOGS_TABLE,
+    schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES},
+};
 use serde_json::Value;
 
 use super::harness::{TestServer, build_attribute_map, map_entry_fields};
@@ -100,11 +103,11 @@ fn build_test_record_batch(table: &Table, now_micros: i64) -> Result<RecordBatch
     let log_rows: [&[(&str, &str)]; 5] = [&row0, &row1, &row2, &row3, &row4];
 
     let empty_rows: [&[(&str, &str)]; 5] = [&[], &[], &[], &[], &[]];
-    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, 9);
+    let (resource_key_field, resource_value_field) = map_entry_fields(&arrow_schema, COL_RESOURCE_ATTRIBUTES);
     let resource_attributes = build_attribute_map(resource_key_field, resource_value_field, &empty_rows);
-    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, 10);
+    let (scope_key_field, scope_value_field) = map_entry_fields(&arrow_schema, COL_SCOPE_ATTRIBUTES);
     let scope_attributes = build_attribute_map(scope_key_field, scope_value_field, &empty_rows);
-    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, 11);
+    let (log_key_field, log_value_field) = map_entry_fields(&arrow_schema, COL_LOG_ATTRIBUTES);
     let log_attributes = build_attribute_map(log_key_field, log_value_field, &log_rows);
 
     // trace_id / span_id are FIXED_LEN_BYTE_ARRAY in storage; the per-row
