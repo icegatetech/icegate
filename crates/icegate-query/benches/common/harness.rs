@@ -55,6 +55,10 @@ pub struct TestServer {
     pub base_url: String,
     pub cancel_token: CancellationToken,
     server_handle: tokio::task::JoinHandle<()>,
+    /// Owns the temporary warehouse directory; held purely for its
+    /// `Drop`, which removes the directory when the server is dropped.
+    #[allow(dead_code)]
+    temp_dir: tempfile::TempDir,
 }
 
 impl TestServer {
@@ -148,26 +152,34 @@ impl TestServer {
             }
         };
 
-        // SAFETY: Intentionally leak the TempDir to keep it alive for the benchmark/server lifetime.
-        // The spawned server requires a persistent filesystem path that outlives this function.
-        // This is an acceptable leak in the benchmark harness context.
-        Box::leak(Box::new(warehouse_path));
-
         Ok((
             Self {
                 client: Client::new(),
                 base_url: format!("http://127.0.0.1:{actual_port}"),
                 cancel_token,
                 server_handle,
+                temp_dir: warehouse_path,
             },
             catalog,
         ))
     }
 
-    /// Shutdown the test server
-    pub async fn shutdown(self) {
+    /// Shut the server down, draining the spawn task.
+    ///
+    /// Surfaces a panic from the server task and fails on timeout rather
+    /// than swallowing both, so a crashing or hung server can't silently
+    /// skew a benchmark (and leak the background task).
+    pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.server_handle).await;
+        match tokio::time::timeout(Duration::from_secs(5), &mut self.server_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
+            Ok(Err(join_err)) => panic!("Loki benchmark server task failed to join: {join_err}"),
+            Err(_elapsed) => {
+                self.server_handle.abort();
+                panic!("Loki benchmark server did not shut down within 5s");
+            }
+        }
     }
 }
 

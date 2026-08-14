@@ -42,8 +42,13 @@ use icegate_query::{
     tempo::TempoConfig,
 };
 use reqwest::Client;
-use tokio::time::Duration;
+use tokio::{sync::oneshot, time::Duration};
 use tokio_util::sync::CancellationToken;
+
+/// Readiness poll budget for a freshly bound Tempo server. Generous because the
+/// sanitizer builds run this same harness at a fraction of normal speed.
+const READY_ATTEMPTS: u32 = 50;
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Test server running a Tempo HTTP API on an ephemeral port.
 pub struct TestServer {
@@ -51,6 +56,10 @@ pub struct TestServer {
     pub base_url: String,
     pub cancel_token: CancellationToken,
     server_handle: tokio::task::JoinHandle<()>,
+    /// Owns the temporary warehouse directory; held purely for its
+    /// `Drop`, which removes the directory when the server is dropped.
+    #[allow(dead_code)]
+    temp_dir: tempfile::TempDir,
 }
 
 impl TestServer {
@@ -68,17 +77,14 @@ impl TestServer {
             cache: None,
         };
 
-        // Pick a random-but-free ephemeral port. We bind via TempoConfig
-        // on 0.0.0.0:0 effectively by using the OS assigned port. TempoConfig
-        // has no port_tx plumbing, so instead we probe a free port first.
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let actual_port = probe.local_addr()?.port();
-        drop(probe);
-
+        // Port 0: the OS assigns a free port and the server reports it back over
+        // `port_tx`. Probing for a port here and handing the number to the server
+        // instead would reopen a race — the probe listener has to close before the
+        // server can bind, and anything on the host can take the port in between.
         let tempo_config = TempoConfig {
             enabled: true,
             host: "127.0.0.1".to_string(),
-            port: actual_port,
+            port: 0,
         };
 
         let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new()).await?;
@@ -111,28 +117,42 @@ impl TestServer {
         let cancel_token_clone = cancel_token.clone();
         let server_engine = Arc::clone(&query_engine);
 
+        let (port_tx, port_rx) = oneshot::channel::<u16>();
+
         let server_handle = tokio::spawn(async move {
-            icegate_query::tempo::run(
+            icegate_query::tempo::run_with_port_tx(
                 server_engine,
                 tempo_config,
                 cancel_token_clone,
+                Some(port_tx),
                 icegate_common::MemoryPressure::inert(),
             )
             .await
             .unwrap();
         });
 
-        // Wait for the server to be reachable.
+        let actual_port = tokio::time::timeout(Duration::from_secs(10), port_rx)
+            .await
+            .expect("Timed out waiting for server to bind")
+            .expect("Failed to receive port from server");
+
+        // A bound port is not a serving router, so confirm readiness before
+        // handing the harness back. Failing here rather than pressing on turns a
+        // dead server into a clear message instead of an opaque connection error
+        // from whichever request the test happens to send first.
         let client = Client::new();
         let base_url = format!("http://127.0.0.1:{actual_port}");
-        for _ in 0..50 {
+        let mut is_ready = false;
+        for _ in 0..READY_ATTEMPTS {
             if client.get(format!("{base_url}/ready")).send().await.is_ok() {
+                is_ready = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
-
-        Box::leak(Box::new(warehouse_path));
+        if !is_ready {
+            return Err(format!("Tempo server at {base_url} never became ready").into());
+        }
 
         Ok((
             Self {
@@ -140,15 +160,28 @@ impl TestServer {
                 base_url,
                 cancel_token,
                 server_handle,
+                temp_dir: warehouse_path,
             },
             catalog,
         ))
     }
 
-    /// Shut the server down and wait briefly for the task to exit.
-    pub async fn shutdown(self) {
+    /// Shut the server down, draining the spawn task.
+    ///
+    /// Surfaces a panic from the server task and fails on timeout rather
+    /// than swallowing both, so a crashing or hung server can't silently
+    /// pass the test (and leak the background task).
+    pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.server_handle).await;
+        match tokio::time::timeout(Duration::from_secs(5), &mut self.server_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
+            Ok(Err(join_err)) => panic!("Tempo server task failed to join: {join_err}"),
+            Err(_elapsed) => {
+                self.server_handle.abort();
+                panic!("Tempo server did not shut down within 5s");
+            }
+        }
     }
 }
 
