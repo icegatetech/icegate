@@ -37,7 +37,7 @@ use iceberg::{
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE,
     catalog::CatalogBuilder,
-    schema::{self, COL_SCOPE_ATTRIBUTES},
+    schema::{self, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES},
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
@@ -261,6 +261,17 @@ async fn write_spans_fixture(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    assert_eq!(
+        span_attribute_rows.len(),
+        3,
+        "span_attribute_rows must contain exactly three rows"
+    );
+    assert_eq!(
+        scope_attribute_rows.len(),
+        3,
+        "scope_attribute_rows must contain exactly three rows"
+    );
+
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
         table.metadata().current_schema(),
@@ -350,7 +361,7 @@ async fn write_spans_fixture(
         ],
     )?;
     // Build span_attributes map (OTel Span attrs — e.g. http.method, db.statement).
-    let span_attributes = build_attribute_map(&arrow_schema, col_idx("span_attributes"), span_attribute_rows)?;
+    let span_attributes = build_attribute_map(&arrow_schema, col_idx(COL_SPAN_ATTRIBUTES), span_attribute_rows)?;
     // Build scope_attributes map (OTel InstrumentationScope.attributes).
     // Content is caller-supplied — empty by default via
     // `write_test_spans`/`write_test_spans_with_properties`, populated by
