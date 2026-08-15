@@ -3,19 +3,25 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::{
-    array::{ArrayBuilder, ArrayRef, FixedSizeBinaryBuilder, MapBuilder, RecordBatch, StringBuilder},
-    datatypes::{DataType, Schema},
+    array::{
+        ArrayBuilder, ArrayRef, FixedSizeBinaryBuilder, Int32Builder, MapBuilder, RecordBatch, StringBuilder,
+        TimestampMicrosecondBuilder,
+    },
+    datatypes::{DataType, Schema, TimeUnit},
 };
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::{
     DEFAULT_TENANT_ID,
-    schema::{COL_EVENTS, COL_LINKS, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES},
+    schema::{
+        COL_ATTRIBUTES, COL_DROPPED_ATTRIBUTES_COUNT, COL_EVENTS, COL_FLAGS, COL_LINKS, COL_NAME,
+        COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID,
+        COL_TRACE_STATE,
+    },
 };
 
 use super::attributes::{
     attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_nested_struct,
-    extract_map_fields_from_schema_named, extract_string_value, flatten_any_value_dotted, is_zero_bytes, now_micros,
-    u32_count_to_i32,
+    extract_map_fields_from_schema_named, extract_string_value, is_zero_bytes, now_micros, u32_count_to_i32,
 };
 
 /// Process-wide cache of the derived spans Arrow schema.
@@ -48,14 +54,64 @@ pub fn spans_arrow_schema() -> crate::error::Result<Arc<Schema>> {
 
 /// Error for a `StructBuilder` field slot that the schema says must exist.
 ///
-/// Each `field_builder::<T>(i)` below is infallible by construction: the
-/// `StructBuilder` is built from the schema's own field list, in order, with a
-/// matching builder per field. Reporting instead of panicking keeps a schema
-/// change that desynchronises the two from taking down the ingest request path.
+/// Both the slot order and the slot types come from the schema's own `Fields`
+/// (see [`nested_struct_builders`] and [`nested_field_index`]), so a lookup only
+/// fails if the schema changed under us. Reporting instead of panicking keeps
+/// that from taking down the ingest request path.
 fn field_builder_missing(parent_column: &str, field: &str) -> crate::error::IngestError {
     crate::error::IngestError::Validation(format!(
         "'{parent_column}' struct builder is missing the '{field}' field slot"
     ))
+}
+
+/// Build one `StructBuilder` slot per field of a nested list-element struct.
+///
+/// `StructBuilder::new` pairs its `fields` and `builders` arguments by position,
+/// so both must come from the same source or a schema reorder silently binds a
+/// field to the wrong builder. Deriving the list here from `fields` makes that
+/// impossible. Only the Arrow types the spans schema uses inside `events` and
+/// `links` are handled; a new type is a schema change that must be taught here.
+fn nested_struct_builders(
+    fields: &arrow::datatypes::Fields,
+    parent_column: &str,
+) -> crate::error::Result<Vec<Box<dyn ArrayBuilder>>> {
+    fields
+        .iter()
+        .map(|field| -> crate::error::Result<Box<dyn ArrayBuilder>> {
+            Ok(match field.data_type() {
+                DataType::Timestamp(TimeUnit::Microsecond, _) => Box::new(TimestampMicrosecondBuilder::new()),
+                DataType::Utf8 => Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+                DataType::Int32 => Box::new(Int32Builder::new()),
+                DataType::FixedSizeBinary(width) => Box::new(FixedSizeBinaryBuilder::new(*width)),
+                DataType::Map(..) => {
+                    let (key_field, value_field) = extract_map_fields_from_nested_struct(fields, field.name())?;
+                    Box::new(attribute_map_builder(key_field, value_field))
+                }
+                other => {
+                    return Err(crate::error::IngestError::Validation(format!(
+                        "'{parent_column}.{}' has unsupported type {other}",
+                        field.name()
+                    )));
+                }
+            })
+        })
+        .collect()
+}
+
+/// Position of `field` within a nested list-element struct.
+///
+/// `StructBuilder` addresses slots by index, so the index must be read from the
+/// same `Fields` the builder was constructed from rather than written as a
+/// literal that a schema reorder would invalidate.
+fn nested_field_index(
+    fields: &arrow::datatypes::Fields,
+    parent_column: &str,
+    field: &str,
+) -> crate::error::Result<usize> {
+    fields
+        .iter()
+        .position(|candidate| candidate.name() == field)
+        .ok_or_else(|| field_builder_missing(parent_column, field))
 }
 
 /// Transforms an OTLP traces export request to an Arrow `RecordBatch`.
@@ -95,7 +151,7 @@ pub fn spans_to_record_batch(
     request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
     tenant_id: Option<&str>,
 ) -> crate::error::Result<(Option<RecordBatch>, usize)> {
-    use arrow::array::{Int32Builder, Int64Array, ListBuilder, StructBuilder, TimestampMicrosecondBuilder};
+    use arrow::array::{Int64Array, ListBuilder, StructBuilder};
 
     let ingested_timestamp = now_micros()?;
 
@@ -142,8 +198,8 @@ pub fn spans_to_record_batch(
     let mut dropped_events_count_builder = Int32Builder::with_capacity(total_spans);
     let mut dropped_links_count_builder = Int32Builder::with_capacity(total_spans);
 
-    // Events list<struct> builder: struct fields (in schema order) are
-    // (timestamp, name, attributes: Map<Utf8,Utf8>, dropped_attributes_count).
+    // Events list<struct> builder. Slot order and slot types both come from
+    // `event_struct_fields`, so the schema alone decides the layout.
     let events_field = schema
         .field_with_name(COL_EVENTS)
         .map_err(|error| crate::error::IngestError::Validation(format!("schema is missing '{COL_EVENTS}': {error}")))?
@@ -162,22 +218,19 @@ pub fn spans_to_record_batch(
             ));
         }
     };
-    let (event_attr_key_field, event_attr_value_field) =
-        extract_map_fields_from_nested_struct(&event_struct_fields, "attributes")?;
-
     let mut events_builder = ListBuilder::new(StructBuilder::new(
         event_struct_fields.iter().cloned().collect::<Vec<_>>(),
-        vec![
-            Box::new(TimestampMicrosecondBuilder::new()) as Box<dyn ArrayBuilder>,
-            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
-            Box::new(attribute_map_builder(event_attr_key_field, event_attr_value_field)) as Box<dyn ArrayBuilder>,
-            Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
-        ],
+        nested_struct_builders(&event_struct_fields, COL_EVENTS)?,
     ))
     .with_field(events_element_field);
 
-    // Links list<struct> builder: struct fields (in schema order) are
-    // (trace_id, span_id, trace_state?, attributes: Map, dropped_attributes_count, flags?).
+    let event_timestamp_slot = nested_field_index(&event_struct_fields, COL_EVENTS, COL_TIMESTAMP)?;
+    let event_name_slot = nested_field_index(&event_struct_fields, COL_EVENTS, COL_NAME)?;
+    let event_attributes_slot = nested_field_index(&event_struct_fields, COL_EVENTS, COL_ATTRIBUTES)?;
+    let event_dropped_slot = nested_field_index(&event_struct_fields, COL_EVENTS, COL_DROPPED_ATTRIBUTES_COUNT)?;
+
+    // Links list<struct> builder, derived from `link_struct_fields` exactly as
+    // the events builder above.
     let links_field = schema
         .field_with_name(COL_LINKS)
         .map_err(|error| crate::error::IngestError::Validation(format!("schema is missing '{COL_LINKS}': {error}")))?
@@ -196,21 +249,18 @@ pub fn spans_to_record_batch(
             ));
         }
     };
-    let (link_attr_key_field, link_attr_value_field) =
-        extract_map_fields_from_nested_struct(&link_struct_fields, "attributes")?;
-
     let mut links_builder = ListBuilder::new(StructBuilder::new(
         link_struct_fields.iter().cloned().collect::<Vec<_>>(),
-        vec![
-            Box::new(FixedSizeBinaryBuilder::new(16)) as Box<dyn ArrayBuilder>, // trace_id (16 bytes)
-            Box::new(FixedSizeBinaryBuilder::new(8)) as Box<dyn ArrayBuilder>,  // span_id (8 bytes)
-            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,            // trace_state (nullable)
-            Box::new(attribute_map_builder(link_attr_key_field, link_attr_value_field)) as Box<dyn ArrayBuilder>,
-            Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>, // dropped_attributes_count
-            Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>, // flags (nullable)
-        ],
+        nested_struct_builders(&link_struct_fields, COL_LINKS)?,
     ))
     .with_field(links_element_field);
+
+    let link_trace_id_slot = nested_field_index(&link_struct_fields, COL_LINKS, COL_TRACE_ID)?;
+    let link_span_id_slot = nested_field_index(&link_struct_fields, COL_LINKS, COL_SPAN_ID)?;
+    let link_trace_state_slot = nested_field_index(&link_struct_fields, COL_LINKS, COL_TRACE_STATE)?;
+    let link_attributes_slot = nested_field_index(&link_struct_fields, COL_LINKS, COL_ATTRIBUTES)?;
+    let link_dropped_slot = nested_field_index(&link_struct_fields, COL_LINKS, COL_DROPPED_ATTRIBUTES_COUNT)?;
+    let link_flags_slot = nested_field_index(&link_struct_fields, COL_LINKS, COL_FLAGS)?;
 
     let tenant = tenant_id.unwrap_or(DEFAULT_TENANT_ID);
     let empty_attrs: Vec<opentelemetry_proto::tonic::common::v1::KeyValue> = Vec::new();
@@ -378,21 +428,24 @@ pub fn spans_to_record_batch(
                     let struct_builder = events_builder.values();
                     for event in &span.events {
                         struct_builder
-                            .field_builder::<TimestampMicrosecondBuilder>(0)
-                            .ok_or_else(|| field_builder_missing("events", "timestamp"))?
+                            .field_builder::<TimestampMicrosecondBuilder>(event_timestamp_slot)
+                            .ok_or_else(|| field_builder_missing(COL_EVENTS, COL_TIMESTAMP))?
                             .append_value((event.time_unix_nano / 1000) as i64);
                         struct_builder
-                            .field_builder::<StringBuilder>(1)
-                            .ok_or_else(|| field_builder_missing("events", "name"))?
+                            .field_builder::<StringBuilder>(event_name_slot)
+                            .ok_or_else(|| field_builder_missing(COL_EVENTS, COL_NAME))?
                             .append_value(&event.name);
                         let attr_b = struct_builder
-                            .field_builder::<MapBuilder<StringBuilder, StringBuilder>>(2)
-                            .ok_or_else(|| field_builder_missing("events", "attributes"))?;
-                        for kv in &event.attributes {
-                            for (k, v) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-                                attr_b.keys().append_value(&k);
-                                attr_b.values().append_value(v);
-                            }
+                            .field_builder::<MapBuilder<StringBuilder, StringBuilder>>(event_attributes_slot)
+                            .ok_or_else(|| field_builder_missing(COL_EVENTS, COL_ATTRIBUTES))?;
+                        // Deduped for the same reason as the top-level attribute
+                        // maps: `flatten_any_value_dotted` can emit one key twice
+                        // (duplicate OTLP keys, or a direct `a.b` colliding with a
+                        // nested `a` -> `b`), and downstream `MAP<K,V>` readers
+                        // disagree on duplicate-key resolution.
+                        for (key, value) in &dedupe_dotted_attributes(&event.attributes) {
+                            attr_b.keys().append_value(key);
+                            attr_b.values().append_value(value);
                         }
                         attr_b.append(true).map_err(|error| {
                             crate::error::IngestError::Validation(format!(
@@ -400,8 +453,8 @@ pub fn spans_to_record_batch(
                             ))
                         })?;
                         struct_builder
-                            .field_builder::<Int32Builder>(3)
-                            .ok_or_else(|| field_builder_missing("events", "dropped_attributes_count"))?
+                            .field_builder::<Int32Builder>(event_dropped_slot)
+                            .ok_or_else(|| field_builder_missing(COL_EVENTS, COL_DROPPED_ATTRIBUTES_COUNT))?
                             .append_value(u32_count_to_i32(
                                 event.dropped_attributes_count,
                                 "event.dropped_attributes_count",
@@ -435,29 +488,32 @@ pub fn spans_to_record_batch(
                             }
                         };
                         struct_builder
-                            .field_builder::<FixedSizeBinaryBuilder>(0)
-                            .ok_or_else(|| field_builder_missing("links", "trace_id"))?
+                            .field_builder::<FixedSizeBinaryBuilder>(link_trace_id_slot)
+                            .ok_or_else(|| field_builder_missing(COL_LINKS, COL_TRACE_ID))?
                             .append_value(link_trace_id_arr)?;
                         struct_builder
-                            .field_builder::<FixedSizeBinaryBuilder>(1)
-                            .ok_or_else(|| field_builder_missing("links", "span_id"))?
+                            .field_builder::<FixedSizeBinaryBuilder>(link_span_id_slot)
+                            .ok_or_else(|| field_builder_missing(COL_LINKS, COL_SPAN_ID))?
                             .append_value(link_span_id_arr)?;
                         let ts_b = struct_builder
-                            .field_builder::<StringBuilder>(2)
-                            .ok_or_else(|| field_builder_missing("links", "trace_state"))?;
+                            .field_builder::<StringBuilder>(link_trace_state_slot)
+                            .ok_or_else(|| field_builder_missing(COL_LINKS, COL_TRACE_STATE))?;
                         if link.trace_state.is_empty() {
                             ts_b.append_null();
                         } else {
                             ts_b.append_value(&link.trace_state);
                         }
                         let attr_b = struct_builder
-                            .field_builder::<MapBuilder<StringBuilder, StringBuilder>>(3)
-                            .ok_or_else(|| field_builder_missing("links", "attributes"))?;
-                        for kv in &link.attributes {
-                            for (k, v) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-                                attr_b.keys().append_value(&k);
-                                attr_b.values().append_value(v);
-                            }
+                            .field_builder::<MapBuilder<StringBuilder, StringBuilder>>(link_attributes_slot)
+                            .ok_or_else(|| field_builder_missing(COL_LINKS, COL_ATTRIBUTES))?;
+                        // Deduped for the same reason as the top-level attribute
+                        // maps: `flatten_any_value_dotted` can emit one key twice
+                        // (duplicate OTLP keys, or a direct `a.b` colliding with a
+                        // nested `a` -> `b`), and downstream `MAP<K,V>` readers
+                        // disagree on duplicate-key resolution.
+                        for (key, value) in &dedupe_dotted_attributes(&link.attributes) {
+                            attr_b.keys().append_value(key);
+                            attr_b.values().append_value(value);
                         }
                         attr_b.append(true).map_err(|error| {
                             crate::error::IngestError::Validation(format!(
@@ -465,15 +521,15 @@ pub fn spans_to_record_batch(
                             ))
                         })?;
                         struct_builder
-                            .field_builder::<Int32Builder>(4)
-                            .ok_or_else(|| field_builder_missing("links", "dropped_attributes_count"))?
+                            .field_builder::<Int32Builder>(link_dropped_slot)
+                            .ok_or_else(|| field_builder_missing(COL_LINKS, COL_DROPPED_ATTRIBUTES_COUNT))?
                             .append_value(u32_count_to_i32(
                                 link.dropped_attributes_count,
                                 "link.dropped_attributes_count",
                             )?);
                         let flags_b = struct_builder
-                            .field_builder::<Int32Builder>(5)
-                            .ok_or_else(|| field_builder_missing("links", "flags"))?;
+                            .field_builder::<Int32Builder>(link_flags_slot)
+                            .ok_or_else(|| field_builder_missing(COL_LINKS, COL_FLAGS))?;
                         if link.flags == 0 {
                             flags_b.append_null();
                         } else {
@@ -1253,6 +1309,162 @@ mod tests {
             value: Some(AnyValue {
                 value: Some(Value::StringValue(value.to_string())),
             }),
+        }
+    }
+
+    /// The point of deriving both halves from `Fields`: a reordered struct must
+    /// still bind every name to a builder of the right type. The previous fixed
+    /// 0..N layout would have paired `name` with the timestamp builder here.
+    #[test]
+    fn nested_struct_builders_follow_field_order_not_a_fixed_layout() {
+        use arrow::datatypes::{Field, Fields};
+
+        // Deliberately not the order the spans schema declares.
+        let fields = Fields::from(vec![
+            Field::new(COL_NAME, DataType::Utf8, false),
+            Field::new(COL_DROPPED_ATTRIBUTES_COUNT, DataType::Int32, false),
+            Field::new(COL_TIMESTAMP, DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        ]);
+
+        assert_eq!(nested_field_index(&fields, COL_EVENTS, COL_NAME).expect("name slot"), 0);
+        assert_eq!(
+            nested_field_index(&fields, COL_EVENTS, COL_DROPPED_ATTRIBUTES_COUNT).expect("dropped slot"),
+            1
+        );
+        assert_eq!(
+            nested_field_index(&fields, COL_EVENTS, COL_TIMESTAMP).expect("timestamp slot"),
+            2
+        );
+
+        let mut builders = nested_struct_builders(&fields, COL_EVENTS).expect("builders");
+        assert_eq!(builders.len(), 3);
+        assert!(builders[0].as_any_mut().downcast_mut::<StringBuilder>().is_some());
+        assert!(builders[1].as_any_mut().downcast_mut::<Int32Builder>().is_some());
+        assert!(builders[2].as_any_mut().downcast_mut::<TimestampMicrosecondBuilder>().is_some());
+    }
+
+    #[test]
+    fn nested_field_index_reports_the_missing_field_by_name() {
+        use arrow::datatypes::{Field, Fields};
+
+        let fields = Fields::from(vec![Field::new(COL_NAME, DataType::Utf8, false)]);
+        let error = nested_field_index(&fields, COL_LINKS, COL_TRACE_ID).expect_err("must not resolve");
+        let message = error.to_string();
+        assert!(message.contains(COL_LINKS), "{message}");
+        assert!(message.contains(COL_TRACE_ID), "{message}");
+    }
+
+    #[test]
+    fn nested_struct_builders_rejects_a_type_it_was_not_taught() {
+        use arrow::datatypes::{Field, Fields};
+
+        let fields = Fields::from(vec![Field::new("ratio", DataType::Float64, false)]);
+        // `Vec<Box<dyn ArrayBuilder>>` is not `Debug`, so `expect_err` is unavailable.
+        let Err(error) = nested_struct_builders(&fields, COL_EVENTS) else {
+            panic!("an untaught field type must not produce a builder");
+        };
+        assert!(error.to_string().contains("ratio"), "{error}");
+    }
+
+    /// `flatten_any_value_dotted` emits `a.b` twice for this input: once from
+    /// the direct `a.b` key, once from flattening the nested `a` -> `b` kvlist.
+    /// The nested event and link maps must collapse that to a single entry, as
+    /// the top-level attribute maps already do — a `MAP<K,V>` carrying the key
+    /// twice is resolved differently by different readers.
+    #[test]
+    fn nested_event_and_link_attributes_collapse_colliding_dotted_keys() {
+        use arrow::array::{ListArray, MapArray, StructArray};
+        use opentelemetry_proto::tonic::{
+            collector::trace::v1::ExportTraceServiceRequest,
+            common::v1::KeyValueList,
+            trace::v1::{
+                ResourceSpans, ScopeSpans, Span,
+                span::{Event, Link},
+            },
+        };
+
+        // Order matters: the nested form is inserted second, so last-write-wins
+        // in the `BTreeMap` makes "nested" the surviving value.
+        let colliding = || {
+            vec![
+                kv("a.b", "direct"),
+                KeyValue {
+                    key_strindex: 0,
+                    key: "a".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::KvlistValue(KeyValueList {
+                            values: vec![kv("b", "nested")],
+                        })),
+                    }),
+                },
+            ]
+        };
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![1u8; 16],
+                        span_id: vec![2u8; 8],
+                        parent_span_id: vec![],
+                        trace_state: String::new(),
+                        name: "op".to_string(),
+                        kind: 0,
+                        start_time_unix_nano: 1_000,
+                        end_time_unix_nano: 2_000,
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                        events: vec![Event {
+                            time_unix_nano: 1_500,
+                            name: "evt".to_string(),
+                            attributes: colliding(),
+                            dropped_attributes_count: 0,
+                        }],
+                        dropped_events_count: 0,
+                        links: vec![Link {
+                            trace_id: vec![9u8; 16],
+                            span_id: vec![8u8; 8],
+                            trace_state: String::new(),
+                            attributes: colliding(),
+                            dropped_attributes_count: 0,
+                            flags: 0,
+                        }],
+                        dropped_links_count: 0,
+                        status: None,
+                        flags: 0,
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let (batch, _) = spans_to_record_batch(&request, None).expect("spans transform");
+        let batch = batch.expect("batch produced");
+
+        for column in [COL_EVENTS, COL_LINKS] {
+            let list = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("{column} column"))
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap_or_else(|| panic!("{column} must be a ListArray"));
+            let row = list.value(0);
+            let entries = row.as_any().downcast_ref::<StructArray>().expect("struct");
+            let attrs = entries
+                .column_by_name("attributes")
+                .expect("attributes")
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .expect("attributes must be a MapArray");
+
+            assert_eq!(
+                map_row_as_pairs(attrs, 0),
+                vec![("a.b".to_string(), "nested".to_string())],
+                "{column}.attributes must carry 'a.b' exactly once"
+            );
         }
     }
 

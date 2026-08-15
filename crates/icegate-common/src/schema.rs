@@ -309,10 +309,14 @@ pub fn spans_schema() -> Result<Schema> {
                 )),
             )),
             // Flags and monitoring
-            Arc::new(NestedField::optional(18, "flags", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(
+                18,
+                COL_FLAGS,
+                Type::Primitive(PrimitiveType::Int),
+            )),
             Arc::new(NestedField::optional(
                 19,
-                "dropped_attributes_count",
+                COL_DROPPED_ATTRIBUTES_COUNT,
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
@@ -346,7 +350,7 @@ pub fn spans_schema() -> Result<Schema> {
                         )),
                         Arc::new(NestedField::required(
                             26,
-                            "attributes",
+                            COL_ATTRIBUTES,
                             Type::Map(MapType::new(
                                 Arc::new(NestedField::required(27, "key", Type::Primitive(PrimitiveType::String))),
                                 Arc::new(NestedField::required(
@@ -358,7 +362,7 @@ pub fn spans_schema() -> Result<Schema> {
                         )),
                         Arc::new(NestedField::required(
                             29,
-                            "dropped_attributes_count",
+                            COL_DROPPED_ATTRIBUTES_COUNT,
                             Type::Primitive(PrimitiveType::Int),
                         )),
                     ])),
@@ -391,7 +395,7 @@ pub fn spans_schema() -> Result<Schema> {
                         )),
                         Arc::new(NestedField::required(
                             35,
-                            "attributes",
+                            COL_ATTRIBUTES,
                             Type::Map(MapType::new(
                                 Arc::new(NestedField::required(36, "key", Type::Primitive(PrimitiveType::String))),
                                 Arc::new(NestedField::required(
@@ -403,10 +407,14 @@ pub fn spans_schema() -> Result<Schema> {
                         )),
                         Arc::new(NestedField::required(
                             38,
-                            "dropped_attributes_count",
+                            COL_DROPPED_ATTRIBUTES_COUNT,
                             Type::Primitive(PrimitiveType::Int),
                         )),
-                        Arc::new(NestedField::optional(39, "flags", Type::Primitive(PrimitiveType::Int))),
+                        Arc::new(NestedField::optional(
+                            39,
+                            COL_FLAGS,
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
                     ])),
                     true,
                 )))),
@@ -1392,7 +1400,7 @@ pub fn metrics_schema() -> Result<Schema> {
             "trace_id",
             Type::Primitive(PrimitiveType::Fixed(16)),
         )),
-        Arc::new(NestedField::required(43, "attributes", exemplar_attributes_map)),
+        Arc::new(NestedField::required(43, COL_ATTRIBUTES, exemplar_attributes_map)),
     ]));
 
     let schema = Schema::builder()
@@ -1556,7 +1564,11 @@ pub fn metrics_schema() -> Result<Schema> {
                 )))),
             )),
             // Flags and exemplars
-            Arc::new(NestedField::optional(30, "flags", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(
+                30,
+                COL_FLAGS,
+                Type::Primitive(PrimitiveType::Int),
+            )),
             Arc::new(NestedField::optional(
                 31,
                 "exemplars",
@@ -1747,6 +1759,18 @@ pub const COL_STATUS_MESSAGE: &str = "status_message";
 pub const COL_EVENTS: &str = "events";
 /// Spans table — `links` column (ARRAY of struct).
 pub const COL_LINKS: &str = "links";
+/// Nested `attributes` map inside the `events`, `links`, and `exemplars` structs.
+///
+/// Distinct from the top-level per-OTLP-level attribute columns
+/// ([`COL_RESOURCE_ATTRIBUTES`] and friends): this one is a struct field, not a
+/// table column.
+pub const COL_ATTRIBUTES: &str = "attributes";
+/// Spans — OTLP-reported count of attributes dropped before export (`INT`).
+/// Present on the span itself and inside the `events` / `links` structs.
+pub const COL_DROPPED_ATTRIBUTES_COUNT: &str = "dropped_attributes_count";
+/// Spans/metrics — W3C trace flags (`INT`). Present on the span itself and
+/// inside the `links` struct.
+pub const COL_FLAGS: &str = "flags";
 /// Logs/events/spans — observed-by-collector timestamp (`TIMESTAMP`).
 pub const COL_OBSERVED_TIMESTAMP: &str = "observed_timestamp";
 /// Logs/events/spans/metrics — write-side timestamp captured by ingest (`TIMESTAMP`).
