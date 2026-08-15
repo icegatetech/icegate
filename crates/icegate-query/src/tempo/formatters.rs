@@ -1,12 +1,14 @@
 //! `RecordBatch` → Tempo response formatters.
 //!
-//! Three responsibilities:
+//! Responsibilities:
 //! - [`spans_to_otlp_json`] — convert a list of span batches into the
 //!   OTLP `resourceSpans[].scopeSpans[].spans[]` JSON shape (used for
 //!   `GET /api/traces/{traceID}` with `Accept: application/json`).
 //! - [`spans_to_otlp_proto`] — same rows, encoded as the OTLP `TracesData`
-//!   protobuf message. This is what Grafana's Tempo data source expects by
-//!   default (`Accept: application/protobuf`).
+//!   protobuf message, the body served under `Accept: application/protobuf`.
+//! - [`encode_trace_response_v2_proto`] / [`build_trace_response_v2_json`] —
+//!   the same payload wrapped in the `TraceByIDResponse` envelope that
+//!   `GET /api/v2/traces/{traceID}` returns.
 //! - [`spansets_to_search_response`] — convert a planner output into
 //!   the Tempo search JSON shape (`{traces, metrics}`).
 
@@ -654,20 +656,21 @@ fn build_matched_span(
 }
 
 // =========================================================================
-// OTLP protobuf formatter (Grafana's default Content-Type)
+// OTLP protobuf formatter (`Accept: application/protobuf`)
 // =========================================================================
 
 /// Convert spans into OTLP `TracesData` protobuf bytes.
 ///
-/// Grafana's Tempo data source expects protobuf by default; returning JSON
-/// makes it fail with `proto: illegal wireType 6`. This encoder groups spans
+/// This is the whole body of `GET /api/traces/{traceID}` under
+/// `Accept: application/protobuf`; serving the JSON rendering there instead
+/// yields bytes no protobuf decoder can read. The encoder groups spans
 /// by `service_name` (our proxy for a resource) and by instrumentation scope
 /// (just "icegate" since the spans schema doesn't preserve scope metadata),
 /// matching what the JSON formatter emits structurally.
 ///
 /// Trace and span IDs are hex-decoded back to raw bytes for the proto
-/// `bytes` fields; invalid hex collapses to empty bytes (proto will then
-/// carry zero-length IDs, matching how Grafana renders orphaned rows).
+/// `bytes` fields; invalid hex collapses to empty bytes, so such a span
+/// carries zero-length IDs rather than failing the whole response.
 ///
 /// # Errors
 ///
@@ -676,6 +679,92 @@ fn build_matched_span(
 pub fn spans_to_otlp_proto(batches: &[RecordBatch]) -> crate::error::Result<Vec<u8>> {
     let data = spans_to_traces_data(batches)?;
     Ok(data.encode_to_vec())
+}
+
+// =========================================================================
+// Tempo v2 trace-by-id envelope (`TraceByIDResponse`)
+// =========================================================================
+
+/// `PartialStatus::PARTIAL`; `COMPLETE` is 0 and stays unencoded (proto3
+/// omits default-valued scalars).
+const V2_STATUS_PARTIAL: i32 = 1;
+
+/// Explanation carried by the `message` field of a partially returned trace.
+const V2_PARTIAL_MESSAGE: &str = "trace exceeded the server-side span cap and was truncated";
+
+/// Wire form of Tempo's `TraceByIDResponse` — the body of
+/// `GET /api/v2/traces/{traceID}`.
+///
+/// `trace` is `tempopb.Trace`, whose only field is
+/// `repeated ResourceSpans resourceSpans = 1`; that layout is byte-identical
+/// to an OTLP [`TracesData`], so the v1 payload type is reused here rather
+/// than restated. Field 2 (`metrics`, inspected-bytes counters) is not
+/// modelled: we have nothing to report there and proto3 leaves an unset
+/// message absent.
+#[derive(prost::Message)]
+struct TraceByIdResponse {
+    /// The trace payload. Always `Some` on the response path — an empty
+    /// trace is answered with 404 by the handler, never with an empty
+    /// envelope.
+    #[prost(message, optional, tag = "1")]
+    trace: Option<TracesData>,
+    /// `PartialStatus`: 0 (`COMPLETE`) or [`V2_STATUS_PARTIAL`].
+    #[prost(int32, tag = "3")]
+    status: i32,
+    /// Human-readable detail for a partial trace; empty when complete.
+    #[prost(string, tag = "4")]
+    message: String,
+}
+
+/// Encode spans as a Tempo `TraceByIDResponse` protobuf message.
+///
+/// `GET /api/v2/traces/{traceID}` returns this envelope; the bare OTLP
+/// payload of [`spans_to_otlp_proto`] is the v1 body and is not a valid
+/// `TraceByIDResponse`, so the two route versions are not interchangeable
+/// (test `v2_envelope_embeds_trace_as_field_one`).
+///
+/// `truncated` maps to `status = PARTIAL` plus a `message`; a complete trace
+/// leaves both unset, since proto3 does not encode default-valued fields.
+///
+/// # Errors
+///
+/// Returns [`crate::error::QueryError::Internal`] if a column has an
+/// unexpected type.
+pub fn encode_trace_response_v2_proto(batches: &[RecordBatch], truncated: bool) -> crate::error::Result<Vec<u8>> {
+    // Encoding the whole envelope in one pass writes the trace straight into
+    // the output buffer; encoding the trace on its own first would cost a
+    // second buffer and a full copy of a trace up to `MAX_TRACE_SPANS` spans.
+    let mut response = TraceByIdResponse {
+        trace: Some(spans_to_traces_data(batches)?),
+        ..Default::default()
+    };
+    if truncated {
+        response.status = V2_STATUS_PARTIAL;
+        response.message = V2_PARTIAL_MESSAGE.to_string();
+    }
+    Ok(response.encode_to_vec())
+}
+
+/// Build the JSON rendering of the same `TraceByIDResponse` envelope.
+///
+/// Serves `Accept: application/json` callers of the v2 route. Enum values
+/// follow protobuf JSON mapping and are emitted as their names.
+///
+/// # Errors
+///
+/// Returns [`crate::error::QueryError::Internal`] if a column has an
+/// unexpected type.
+pub fn build_trace_response_v2_json(batches: &[RecordBatch], truncated: bool) -> crate::error::Result<Value> {
+    let trace = spans_to_otlp_json(batches)?;
+    let mut response = Map::new();
+    response.insert("trace".to_string(), trace);
+    if truncated {
+        response.insert("status".to_string(), json!("PARTIAL"));
+        response.insert("message".to_string(), json!(V2_PARTIAL_MESSAGE));
+    } else {
+        response.insert("status".to_string(), json!("COMPLETE"));
+    }
+    Ok(Value::Object(response))
 }
 
 /// Group accumulator for proto `ResourceSpans` construction.
@@ -1675,6 +1764,85 @@ mod proto_tests {
             "expected span_attributes to win the http.method collision and the scope-only \
              otel.scope.name key to surface: {pairs:?}"
         );
+    }
+
+    /// The v2 body is a `TraceByIDResponse`, so a decoder following that
+    /// contract reads field 1 as an embedded message; a bare `TracesData`
+    /// there would be read as garbage. The envelope must carry the v1
+    /// payload verbatim as embedded field 1, and nothing else when the
+    /// trace is complete.
+    #[test]
+    fn v2_envelope_embeds_trace_as_field_one() {
+        let batches = vec![single_span_batch()];
+        let envelope = encode_trace_response_v2_proto(&batches, false).expect("v2 encode");
+        let bare = spans_to_otlp_proto(&batches).expect("proto encode");
+
+        let mut buf = envelope.as_slice();
+        let (tag, wire_type) = prost::encoding::decode_key(&mut buf).expect("envelope key");
+        assert_eq!(tag, 1, "trace must be field 1");
+        assert_eq!(wire_type, prost::encoding::WireType::LengthDelimited);
+        let len = prost::encoding::decode_varint(&mut buf).expect("trace length");
+        assert_eq!(len, u64::try_from(bare.len()).expect("length fits u64"));
+        assert_eq!(buf, bare.as_slice(), "embedded payload must equal the v1 body");
+        assert_eq!(
+            TracesData::decode(buf).expect("embedded trace decode").resource_spans.len(),
+            1,
+            "tempopb.Trace and TracesData share the resourceSpans = 1 layout"
+        );
+    }
+
+    /// A truncated trace must additionally carry `status = PARTIAL` and the
+    /// message explaining the cap, so a consumer can tell a partial trace
+    /// from a complete one without counting spans.
+    #[test]
+    fn v2_envelope_marks_truncated_trace_partial() {
+        let batches = vec![single_span_batch()];
+        let envelope = encode_trace_response_v2_proto(&batches, true).expect("v2 encode");
+        let bare = spans_to_otlp_proto(&batches).expect("proto encode");
+
+        // Skip the embedded trace: key, length, payload.
+        let mut buf = envelope.as_slice();
+        let _ = prost::encoding::decode_key(&mut buf).expect("envelope key");
+        let _ = prost::encoding::decode_varint(&mut buf).expect("trace length");
+        buf = &buf[bare.len()..];
+
+        let (status_tag, status_wire) = prost::encoding::decode_key(&mut buf).expect("status key");
+        assert_eq!(status_tag, 3, "status must be field 3");
+        assert_eq!(status_wire, prost::encoding::WireType::Varint);
+        assert_eq!(
+            prost::encoding::decode_varint(&mut buf).expect("status value"),
+            1,
+            "PARTIAL is 1"
+        );
+
+        let (message_tag, message_wire) = prost::encoding::decode_key(&mut buf).expect("message key");
+        assert_eq!(message_tag, 4, "message must be field 4");
+        assert_eq!(message_wire, prost::encoding::WireType::LengthDelimited);
+        let message_len = prost::encoding::decode_varint(&mut buf).expect("message length");
+        assert_eq!(
+            message_len,
+            u64::try_from(V2_PARTIAL_MESSAGE.len()).expect("length fits u64")
+        );
+        assert_eq!(buf, V2_PARTIAL_MESSAGE.as_bytes());
+    }
+
+    /// The JSON rendering of the v2 route mirrors the protobuf envelope:
+    /// the OTLP payload nests under `trace`, with the status alongside it.
+    #[test]
+    fn v2_json_envelope_nests_trace_and_status() {
+        let batches = vec![single_span_batch()];
+
+        let complete = build_trace_response_v2_json(&batches, false).expect("v2 json");
+        assert_eq!(complete["status"], "COMPLETE");
+        assert!(complete.get("message").is_none(), "complete traces carry no message");
+        assert_eq!(
+            complete["trace"]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+            "GET /api"
+        );
+
+        let partial = build_trace_response_v2_json(&batches, true).expect("v2 json");
+        assert_eq!(partial["status"], "PARTIAL");
+        assert_eq!(partial["message"], V2_PARTIAL_MESSAGE);
     }
 }
 

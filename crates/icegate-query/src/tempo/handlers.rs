@@ -19,14 +19,16 @@ use serde_json::json;
 use super::{
     error::{TempoError, TempoResult},
     executor,
-    formatters::{spans_to_otlp_json, spans_to_otlp_proto},
+    formatters::{
+        build_trace_response_v2_json, encode_trace_response_v2_proto, spans_to_otlp_json, spans_to_otlp_proto,
+    },
     metadata,
     models::{
         Scope, SearchParams, TagValuesQueryParams, TagValuesResponse, TagValuesV2Metrics, TagValuesV2Response,
         TagsQueryParams, TagsV1Response, TagsV2Response, TraceLookupParams,
     },
     server::TempoState,
-    trace_by_id::{default_window, fetch},
+    trace_by_id::{FetchResult, default_window, fetch},
     validation,
 };
 use crate::{error::QueryError, traceql::iceberg_predicate::translate_query_to_predicate_excluding};
@@ -125,10 +127,11 @@ fn wants_protobuf(headers: &HeaderMap) -> bool {
 // Trace-by-ID
 // ============================================================================
 
-/// Handle `GET /api/traces/{trace_id}` (and the `/api/v2/...` alias).
+/// Handle `GET /api/traces/{trace_id}` — the v1 trace lookup.
 ///
-/// Returns the matching spans encoded as OTLP `resourceSpans` JSON, or 404
-/// when no spans match the trace ID under the requesting tenant.
+/// Returns the matching spans as a bare OTLP payload (`TracesData` protobuf
+/// or its JSON rendering), or 404 when no spans match the trace ID under the
+/// requesting tenant.
 ///
 /// # Errors
 ///
@@ -141,41 +144,100 @@ pub async fn get_trace(
     Path(trace_id): Path<String>,
     Query(params): Query<TraceLookupParams>,
 ) -> TempoResult<Response> {
-    let tenant_id = extract_tenant_id(&headers);
+    let Some(result) = fetch_requested_trace(state, &headers, &trace_id, &params).await? else {
+        return Ok(build_trace_not_found_response());
+    };
+
+    let mut resp = if wants_protobuf(&headers) {
+        build_proto_response(spans_to_otlp_proto(&result.batches)?)
+    } else {
+        (StatusCode::OK, Json(spans_to_otlp_json(&result.batches)?)).into_response()
+    };
+    set_truncated_header(&mut resp, result.truncated);
+    Ok(resp)
+}
+
+/// Handle `GET /api/v2/traces/{trace_id}` — the v2 trace lookup.
+///
+/// Same data as [`get_trace`], wrapped in the `TraceByIDResponse` envelope.
+/// The envelope is not cosmetic: it is the v2 body contract, and a v1 body
+/// served here is not decodable as one (test
+/// `v2_wraps_trace_in_trace_by_id_response`).
+///
+/// Truncation is reported twice over: as `status = PARTIAL` inside the
+/// envelope and as the `x-icegate-truncated` header the v1 route also sets.
+///
+/// # Errors
+///
+/// Returns a [`super::error::TempoError`] (rendered as JSON) if the engine
+/// session cannot be created, the planner fails, or execution errors out.
+#[tracing::instrument(skip_all, fields(tenant_id, trace_id = %trace_id))]
+pub async fn get_trace_v2(
+    State(state): State<TempoState>,
+    headers: HeaderMap,
+    Path(trace_id): Path<String>,
+    Query(params): Query<TraceLookupParams>,
+) -> TempoResult<Response> {
+    let Some(result) = fetch_requested_trace(state, &headers, &trace_id, &params).await? else {
+        return Ok(build_trace_not_found_response());
+    };
+
+    let mut resp = if wants_protobuf(&headers) {
+        build_proto_response(encode_trace_response_v2_proto(&result.batches, result.truncated)?)
+    } else {
+        let body = build_trace_response_v2_json(&result.batches, result.truncated)?;
+        (StatusCode::OK, Json(body)).into_response()
+    };
+    set_truncated_header(&mut resp, result.truncated);
+    Ok(resp)
+}
+
+/// Resolve a trace-lookup request into the spans it matched.
+///
+/// Shared by both API versions: extracts the tenant, resolves the time
+/// window (falling back to [`default_window`]), validates the inputs, and
+/// runs the fetch. Returns `None` when the trace has no spans under the
+/// requesting tenant, which each caller renders as 404.
+async fn fetch_requested_trace(
+    state: TempoState,
+    headers: &HeaderMap,
+    trace_id: &str,
+    params: &TraceLookupParams,
+) -> TempoResult<Option<FetchResult>> {
+    let tenant_id = extract_tenant_id(headers);
     tracing::Span::current().record("tenant_id", tenant_id.as_str());
 
     let now = Utc::now();
     let (default_start, default_end) = default_window(now);
     let start = params.start.map(parse_epoch_seconds).transpose()?.unwrap_or(default_start);
     let end = params.end.map(parse_epoch_seconds).transpose()?.unwrap_or(default_end);
-    validation::validate_trace_id(&trace_id).map_err(TempoError::new)?;
+    validation::validate_trace_id(trace_id).map_err(TempoError::new)?;
     validation::validate_query_window(start, end).map_err(TempoError::new)?;
 
-    let result = fetch(state.engine, &tenant_id, &trace_id, start, end).await?;
-    if result.batches.iter().all(|b| b.num_rows() == 0) {
-        return Ok((StatusCode::NOT_FOUND, Json(json!({"error": "trace not found"}))).into_response());
-    }
+    let result = fetch(state.engine, &tenant_id, trace_id, start, end).await?;
+    let is_empty = result.batches.iter().all(|b| b.num_rows() == 0);
+    Ok((!is_empty).then_some(result))
+}
 
-    // Surface truncation to the caller via response header — the body
-    // payload itself stays valid OTLP so existing decoders keep working.
-    let truncated_header_value = axum::http::HeaderValue::from_static("true");
-    let truncated_pair = result.truncated.then_some(("x-icegate-truncated", truncated_header_value));
+/// Render protobuf bytes with the OTLP protobuf content type.
+fn build_proto_response(bytes: Vec<u8>) -> Response {
+    let content_type = axum::http::HeaderValue::from_static("application/protobuf");
+    ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+}
 
-    if wants_protobuf(&headers) {
-        let bytes = spans_to_otlp_proto(&result.batches)?;
-        let content_type = axum::http::HeaderValue::from_static("application/protobuf");
-        let mut resp = ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
-        if let Some((name, value)) = truncated_pair {
-            resp.headers_mut().insert(name, value);
-        }
-        Ok(resp)
-    } else {
-        let body = spans_to_otlp_json(&result.batches)?;
-        let mut resp = (StatusCode::OK, Json(body)).into_response();
-        if let Some((name, value)) = truncated_pair {
-            resp.headers_mut().insert(name, value);
-        }
-        Ok(resp)
+/// Build the 404 body both trace-lookup routes return for an unknown trace.
+fn build_trace_not_found_response() -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "trace not found"}))).into_response()
+}
+
+/// Flag a partial trace on the response.
+///
+/// The body payload itself stays a valid, decodable trace, so consumers that
+/// ignore the header keep working — they just see fewer spans.
+fn set_truncated_header(resp: &mut Response, truncated: bool) {
+    if truncated {
+        resp.headers_mut()
+            .insert("x-icegate-truncated", axum::http::HeaderValue::from_static("true"));
     }
 }
 
@@ -183,7 +245,7 @@ pub async fn get_trace(
 // TraceQL search
 // ============================================================================
 
-/// Handle `GET`/`POST /api/search` (and the `/api/v2/...` alias).
+/// Handle `GET`/`POST /api/search`.
 ///
 /// Parses the `TraceQL` query in `params.q`, plans it, executes against
 /// the spans table, and returns a Tempo `SearchResponse`.
