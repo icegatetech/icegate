@@ -503,7 +503,6 @@ fn parquet_stat_max_as_datum(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
 

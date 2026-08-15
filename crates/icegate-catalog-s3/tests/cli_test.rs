@@ -2,8 +2,6 @@
 //! binary reports, and the failure paths `execute` must surface before a
 //! server is considered started.
 
-#![allow(clippy::expect_used)]
-
 use clap::Parser;
 use icegate_catalog_s3::CatalogServerConfigError;
 use icegate_catalog_s3::cli::{CatalogCli, CliError};

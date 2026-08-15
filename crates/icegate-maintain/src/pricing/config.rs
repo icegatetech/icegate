@@ -213,7 +213,7 @@ mod tests {
     // `field_reassign_with_default` is allowed here because these tests build a
     // `PricingConfig::default()` and then override only the field(s) under test,
     // which is clearer than repeating the whole struct with update syntax.
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::field_reassign_with_default)]
+    #![allow(clippy::field_reassign_with_default)]
 
     use super::PricingConfig;
 

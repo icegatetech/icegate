@@ -1,10 +1,5 @@
 //! Read-only enforcement: DDL/DML must be rejected.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::print_stdout,
-    clippy::uninlined_format_args
-)]
+#![allow(clippy::print_stdout, clippy::uninlined_format_args)]
 
 use super::harness::{TestServer, execute_sql};
 

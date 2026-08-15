@@ -2,8 +2,6 @@
 //! command accepts, and the validation that must reject a configuration before
 //! a listener is bound or S3 is touched.
 
-#![allow(clippy::expect_used)]
-
 use std::path::PathBuf;
 
 use icegate_catalog_s3::{CatalogApiConfigError, CatalogPrefix, CatalogServerConfig, CatalogServerConfigError};

@@ -2,7 +2,6 @@
 //! joinable through the tenant-scoped Flight SQL endpoint. It carries no
 //! `tenant_id`, so the tenant decorator has to pass it through unwrapped — the
 //! guarantee the whole conversation-cost feature depends on.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
 

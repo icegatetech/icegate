@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -36,7 +34,6 @@ fn unwrap_loaded(outcome: LoadOutcome) -> (Arc<CatalogRoot>, Version) {
     }
 }
 
-#[allow(clippy::expect_used)]
 fn test_catalog(storage: Arc<dyn CatalogStorage>, file_io: FileIO, tables_uri_prefix: String) -> S3Catalog {
     S3Catalog::with_storage(
         storage,

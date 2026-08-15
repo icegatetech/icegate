@@ -1,7 +1,5 @@
 //! Tests for label metadata endpoints (labels, label values, series)
 #![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
     clippy::print_stdout,
     clippy::uninlined_format_args,
     clippy::cast_possible_truncation

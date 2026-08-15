@@ -247,8 +247,6 @@ impl From<Error> for iceberg::Error {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
-
     use super::*;
 
     /// Box a message as the `source` payload expected by `object_store::Error`

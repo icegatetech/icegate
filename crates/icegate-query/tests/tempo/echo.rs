@@ -1,7 +1,7 @@
 //! Tests for `GET /api/echo` — Grafana's Tempo data source uses this
 //! endpoint to verify that search is reachable. The response contract
 //! (HTTP 200, body `echo`) is fixed by the upstream Tempo API spec.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::uninlined_format_args)]
+#![allow(clippy::uninlined_format_args)]
 
 use super::harness::TestServer;
 

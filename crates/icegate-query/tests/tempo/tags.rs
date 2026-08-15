@@ -4,12 +4,7 @@
 //! `/api/v2/search/tag/{name}/values` (where `inspectedBytes` is
 //! serialised as a string and the `status` enum uses keyword-typed
 //! variants like `STATUS_CODE_OK`).
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::print_stdout,
-    clippy::uninlined_format_args
-)]
+#![allow(clippy::print_stdout, clippy::uninlined_format_args)]
 
 use std::collections::BTreeSet;
 

@@ -369,8 +369,6 @@ impl TableProvider for TenantScopedTableProvider {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;

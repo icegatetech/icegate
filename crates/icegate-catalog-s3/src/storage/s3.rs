@@ -288,8 +288,6 @@ fn validate_config(config: &S3CatalogConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 

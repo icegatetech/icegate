@@ -166,7 +166,7 @@ pub fn quantize_observation(rate: &mut RateObservation) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
+    #![allow(clippy::float_cmp)]
 
     use super::{carries_subgrid_precision, quantize_rate, rate_to_unscaled, unscaled_to_rate};
 
