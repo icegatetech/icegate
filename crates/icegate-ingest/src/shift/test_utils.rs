@@ -532,7 +532,7 @@ pub(super) fn row_tag_body(row_tag: i64) -> String {
 /// (and is not) safe. A test that writes through the real catalog must use
 /// [`two_tenant_ingest_batches_with_schema`] instead.
 pub(super) fn two_tenant_ingest_batches() -> [RecordBatch; 2] {
-    two_tenant_ingest_batches_with_schema(&crate::transform::logs_arrow_schema())
+    two_tenant_ingest_batches_with_schema(&crate::transform::logs_arrow_schema().expect("logs arrow schema"))
 }
 
 /// As [`two_tenant_ingest_batches`], but built against an explicit Arrow schema — see

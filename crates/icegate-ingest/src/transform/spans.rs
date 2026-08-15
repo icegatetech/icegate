@@ -7,37 +7,55 @@ use arrow::{
     datatypes::{DataType, Schema},
 };
 use iceberg::arrow::schema_to_arrow_schema;
-use icegate_common::DEFAULT_TENANT_ID;
+use icegate_common::{
+    DEFAULT_TENANT_ID,
+    schema::{COL_EVENTS, COL_LINKS, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES},
+};
 
 use super::attributes::{
     attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_nested_struct,
-    extract_map_fields_from_schema_named, extract_string_value, flatten_any_value_dotted, is_zero_bytes,
+    extract_map_fields_from_schema_named, extract_string_value, flatten_any_value_dotted, is_zero_bytes, now_micros,
     u32_count_to_i32,
 };
 
-/// Returns the Arrow schema for spans, derived from the Iceberg spans schema.
+/// Process-wide cache of the derived spans Arrow schema.
+static SPANS_ARROW_SCHEMA: OnceLock<std::result::Result<Arc<Schema>, String>> = OnceLock::new();
+
+/// Returns the Arrow schema for spans, derived once from the Iceberg spans
+/// schema and cached for the lifetime of the process.
 ///
-/// Uses `icegate_common::schema::spans_schema()` as the source of truth
-/// and converts it to Arrow format using
-/// `iceberg::arrow::schema_to_arrow_schema()`.
+/// Uses `icegate_common::schema::spans_schema()` as the source of truth and
+/// converts it to Arrow via `iceberg::arrow::schema_to_arrow_schema()`. The
+/// conversion is memoised because it runs twice per traces request (alongside
+/// operations); cloning the cached `Arc` is cheap.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the Iceberg schema cannot be created or converted to Arrow.
-/// This should never happen in practice as the schema is statically defined.
-#[allow(clippy::expect_used)]
-pub fn spans_arrow_schema() -> Schema {
-    // Cached: the schema is static, but rebuilding it from the Iceberg schema and
-    // converting to Arrow on every request is wasted work (twice per traces
-    // request, alongside operations). Cloning the cached `Schema` is cheap because
-    // Arrow `Fields` are `Arc`-backed.
-    static SCHEMA: OnceLock<Schema> = OnceLock::new();
-    SCHEMA
-        .get_or_init(|| {
-            let iceberg_schema = icegate_common::schema::spans_schema().expect("spans_schema should always be valid");
-            schema_to_arrow_schema(&iceberg_schema).expect("spans schema conversion should succeed")
-        })
-        .clone()
+/// Returns `IngestError::Validation` if the Iceberg spans schema cannot be built
+/// or converted to Arrow. The schema is statically defined, so this does not
+/// happen in practice.
+pub fn spans_arrow_schema() -> crate::error::Result<Arc<Schema>> {
+    match SPANS_ARROW_SCHEMA.get_or_init(|| {
+        let iceberg_schema = icegate_common::schema::spans_schema().map_err(|e| e.to_string())?;
+        schema_to_arrow_schema(&iceberg_schema).map(Arc::new).map_err(|e| e.to_string())
+    }) {
+        Ok(schema) => Ok(Arc::clone(schema)),
+        Err(message) => Err(crate::error::IngestError::Validation(format!(
+            "failed to build spans Arrow schema: {message}"
+        ))),
+    }
+}
+
+/// Error for a `StructBuilder` field slot that the schema says must exist.
+///
+/// Each `field_builder::<T>(i)` below is infallible by construction: the
+/// `StructBuilder` is built from the schema's own field list, in order, with a
+/// matching builder per field. Reporting instead of panicking keeps a schema
+/// change that desynchronises the two from taking down the ingest request path.
+fn field_builder_missing(parent_column: &str, field: &str) -> crate::error::IngestError {
+    crate::error::IngestError::Validation(format!(
+        "'{parent_column}' struct builder is missing the '{field}' field slot"
+    ))
 }
 
 /// Transforms an OTLP traces export request to an Arrow `RecordBatch`.
@@ -71,7 +89,6 @@ pub fn spans_arrow_schema() -> Schema {
 #[allow(clippy::cast_possible_wrap)]
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cast_sign_loss)]
-#[allow(clippy::expect_used)]
 #[allow(clippy::too_many_lines)]
 #[tracing::instrument(skip(request))]
 pub fn spans_to_record_batch(
@@ -80,10 +97,7 @@ pub fn spans_to_record_batch(
 ) -> crate::error::Result<(Option<RecordBatch>, usize)> {
     use arrow::array::{Int32Builder, Int64Array, ListBuilder, StructBuilder, TimestampMicrosecondBuilder};
 
-    let ingested_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_micros() as i64;
+    let ingested_timestamp = now_micros()?;
 
     let total_spans: usize = request
         .resource_spans
@@ -96,13 +110,13 @@ pub fn spans_to_record_batch(
         return Ok((None, 0));
     }
 
-    let schema = spans_arrow_schema();
+    let schema = spans_arrow_schema()?;
     let (resource_attr_key_field, resource_attr_value_field) =
-        extract_map_fields_from_schema_named(&schema, icegate_common::schema::COL_RESOURCE_ATTRIBUTES)?;
+        extract_map_fields_from_schema_named(&schema, COL_RESOURCE_ATTRIBUTES)?;
     let (span_attr_key_field, span_attr_value_field) =
-        extract_map_fields_from_schema_named(&schema, icegate_common::schema::COL_SPAN_ATTRIBUTES)?;
+        extract_map_fields_from_schema_named(&schema, COL_SPAN_ATTRIBUTES)?;
     let (scope_attr_key_field, scope_attr_value_field) =
-        extract_map_fields_from_schema_named(&schema, icegate_common::schema::COL_SCOPE_ATTRIBUTES)?;
+        extract_map_fields_from_schema_named(&schema, COL_SCOPE_ATTRIBUTES)?;
 
     // Top-level column builders. Events and links are written as all-null
     // placeholders; Tasks 14 and 15 replace these with real list builders.
@@ -130,7 +144,10 @@ pub fn spans_to_record_batch(
 
     // Events list<struct> builder: struct fields (in schema order) are
     // (timestamp, name, attributes: Map<Utf8,Utf8>, dropped_attributes_count).
-    let events_field = schema.field_with_name("events").expect("events field").clone();
+    let events_field = schema
+        .field_with_name(COL_EVENTS)
+        .map_err(|error| crate::error::IngestError::Validation(format!("schema is missing '{COL_EVENTS}': {error}")))?
+        .clone();
     let events_element_field = match events_field.data_type() {
         DataType::List(inner) => inner.clone(),
         _ => {
@@ -161,7 +178,10 @@ pub fn spans_to_record_batch(
 
     // Links list<struct> builder: struct fields (in schema order) are
     // (trace_id, span_id, trace_state?, attributes: Map, dropped_attributes_count, flags?).
-    let links_field = schema.field_with_name("links").expect("links field").clone();
+    let links_field = schema
+        .field_with_name(COL_LINKS)
+        .map_err(|error| crate::error::IngestError::Validation(format!("schema is missing '{COL_LINKS}': {error}")))?
+        .clone();
     let links_element_field = match links_field.data_type() {
         DataType::List(inner) => inner.clone(),
         _ => {
@@ -337,11 +357,21 @@ pub fn spans_to_record_batch(
                     span_attrs_builder.values().append_value(value);
                 }
 
-                resource_attrs_builder
-                    .append(true)
-                    .expect("append resource_attributes map entry");
-                span_attrs_builder.append(true).expect("append span_attributes map entry");
-                scope_attrs_builder.append(true).expect("append scope_attributes map entry");
+                resource_attrs_builder.append(true).map_err(|error| {
+                    crate::error::IngestError::Validation(format!(
+                        "failed to append '{COL_RESOURCE_ATTRIBUTES}' map entry: {error}"
+                    ))
+                })?;
+                span_attrs_builder.append(true).map_err(|error| {
+                    crate::error::IngestError::Validation(format!(
+                        "failed to append '{COL_SPAN_ATTRIBUTES}' map entry: {error}"
+                    ))
+                })?;
+                scope_attrs_builder.append(true).map_err(|error| {
+                    crate::error::IngestError::Validation(format!(
+                        "failed to append '{COL_SCOPE_ATTRIBUTES}' map entry: {error}"
+                    ))
+                })?;
 
                 // Events list<struct>: one row per parent span.
                 {
@@ -349,25 +379,29 @@ pub fn spans_to_record_batch(
                     for event in &span.events {
                         struct_builder
                             .field_builder::<TimestampMicrosecondBuilder>(0)
-                            .expect("event timestamp builder")
+                            .ok_or_else(|| field_builder_missing("events", "timestamp"))?
                             .append_value((event.time_unix_nano / 1000) as i64);
                         struct_builder
                             .field_builder::<StringBuilder>(1)
-                            .expect("event name builder")
+                            .ok_or_else(|| field_builder_missing("events", "name"))?
                             .append_value(&event.name);
                         let attr_b = struct_builder
                             .field_builder::<MapBuilder<StringBuilder, StringBuilder>>(2)
-                            .expect("event attrs builder");
+                            .ok_or_else(|| field_builder_missing("events", "attributes"))?;
                         for kv in &event.attributes {
                             for (k, v) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
                                 attr_b.keys().append_value(&k);
                                 attr_b.values().append_value(v);
                             }
                         }
-                        attr_b.append(true).expect("append event attrs map");
+                        attr_b.append(true).map_err(|error| {
+                            crate::error::IngestError::Validation(format!(
+                                "failed to append event attributes map entry: {error}"
+                            ))
+                        })?;
                         struct_builder
                             .field_builder::<Int32Builder>(3)
-                            .expect("event dropped count builder")
+                            .ok_or_else(|| field_builder_missing("events", "dropped_attributes_count"))?
                             .append_value(u32_count_to_i32(
                                 event.dropped_attributes_count,
                                 "event.dropped_attributes_count",
@@ -402,15 +436,15 @@ pub fn spans_to_record_batch(
                         };
                         struct_builder
                             .field_builder::<FixedSizeBinaryBuilder>(0)
-                            .expect("link trace_id builder")
+                            .ok_or_else(|| field_builder_missing("links", "trace_id"))?
                             .append_value(link_trace_id_arr)?;
                         struct_builder
                             .field_builder::<FixedSizeBinaryBuilder>(1)
-                            .expect("link span_id builder")
+                            .ok_or_else(|| field_builder_missing("links", "span_id"))?
                             .append_value(link_span_id_arr)?;
                         let ts_b = struct_builder
                             .field_builder::<StringBuilder>(2)
-                            .expect("link trace_state builder");
+                            .ok_or_else(|| field_builder_missing("links", "trace_state"))?;
                         if link.trace_state.is_empty() {
                             ts_b.append_null();
                         } else {
@@ -418,22 +452,28 @@ pub fn spans_to_record_batch(
                         }
                         let attr_b = struct_builder
                             .field_builder::<MapBuilder<StringBuilder, StringBuilder>>(3)
-                            .expect("link attrs builder");
+                            .ok_or_else(|| field_builder_missing("links", "attributes"))?;
                         for kv in &link.attributes {
                             for (k, v) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
                                 attr_b.keys().append_value(&k);
                                 attr_b.values().append_value(v);
                             }
                         }
-                        attr_b.append(true).expect("append link attrs map");
+                        attr_b.append(true).map_err(|error| {
+                            crate::error::IngestError::Validation(format!(
+                                "failed to append link attributes map entry: {error}"
+                            ))
+                        })?;
                         struct_builder
                             .field_builder::<Int32Builder>(4)
-                            .expect("link dropped count builder")
+                            .ok_or_else(|| field_builder_missing("links", "dropped_attributes_count"))?
                             .append_value(u32_count_to_i32(
                                 link.dropped_attributes_count,
                                 "link.dropped_attributes_count",
                             )?);
-                        let flags_b = struct_builder.field_builder::<Int32Builder>(5).expect("link flags builder");
+                        let flags_b = struct_builder
+                            .field_builder::<Int32Builder>(5)
+                            .ok_or_else(|| field_builder_missing("links", "flags"))?;
                         if link.flags == 0 {
                             flags_b.append_null();
                         } else {
@@ -518,7 +558,7 @@ pub fn spans_to_record_batch(
         Arc::new(scope_attrs_builder.finish()),
     ];
 
-    let batch = RecordBatch::try_new(Arc::new(schema), columns).map_err(|e| {
+    let batch = RecordBatch::try_new(schema, columns).map_err(|e| {
         tracing::error!("Failed to create spans RecordBatch: {e}");
         crate::error::IngestError::Validation(format!("Failed to create spans RecordBatch: {e}"))
     })?;
@@ -534,7 +574,7 @@ mod tests {
 
     #[test]
     fn spans_arrow_schema_has_nested_events_and_links() {
-        let schema = spans_arrow_schema();
+        let schema = spans_arrow_schema().expect("spans arrow schema");
         assert!(schema.field_with_name("trace_id").is_ok());
         assert!(schema.field_with_name("events").is_ok());
         assert!(schema.field_with_name("links").is_ok());

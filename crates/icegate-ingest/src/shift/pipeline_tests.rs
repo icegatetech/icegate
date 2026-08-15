@@ -196,7 +196,7 @@ async fn run_single_task_job(definition: TaskDefinition, executor: Arc<dyn TaskE
 /// (and is not) safe. A test that writes through the real catalog must use
 /// [`two_tenant_wal_segments_with_schema`] instead.
 fn two_tenant_wal_segments() -> Vec<WalSegment> {
-    two_tenant_wal_segments_with_schema(&crate::transform::logs_arrow_schema())
+    two_tenant_wal_segments_with_schema(&crate::transform::logs_arrow_schema().expect("logs arrow schema"))
 }
 
 /// As [`two_tenant_wal_segments`], but built against an explicit Arrow schema — see

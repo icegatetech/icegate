@@ -1,6 +1,6 @@
 //! OTLP logs -> Arrow transform.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::{
     array::{ArrayRef, FixedSizeBinaryBuilder, RecordBatch, StringBuilder, TimestampMicrosecondArray},
@@ -15,23 +15,35 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use super::attributes::{
     attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named, extract_string_value,
-    is_zero_bytes, merge_dotted_levels, serialize_any_value_to_json,
+    is_zero_bytes, merge_dotted_levels, now_micros, serialize_any_value_to_json,
 };
 
-/// Returns the Arrow schema for logs, derived from the Iceberg schema.
+/// Process-wide cache of the derived logs Arrow schema.
+static LOGS_ARROW_SCHEMA: OnceLock<std::result::Result<Arc<Schema>, String>> = OnceLock::new();
+
+/// Returns the Arrow schema for logs, derived once from the Iceberg logs schema
+/// and cached for the lifetime of the process.
 ///
-/// Uses `icegate_common::schema::logs_schema()` as the source of truth
-/// and converts it to Arrow format using
-/// `iceberg::arrow::schema_to_arrow_schema()`.
+/// Uses `icegate_common::schema::logs_schema()` as the source of truth and
+/// converts it to Arrow via `iceberg::arrow::schema_to_arrow_schema()`. The
+/// result is memoised in a [`OnceLock`] so the allocation-heavy Iceberg -> Arrow
+/// conversion runs at most once instead of on every ingest request.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the Iceberg schema cannot be created or converted to Arrow.
-/// This should never happen in practice as the schema is statically defined.
-#[allow(clippy::expect_used)]
-pub fn logs_arrow_schema() -> Schema {
-    let iceberg_schema = icegate_common::schema::logs_schema().expect("logs_schema should always be valid");
-    schema_to_arrow_schema(&iceberg_schema).expect("schema conversion should succeed")
+/// Returns `IngestError::Validation` if the Iceberg logs schema cannot be built
+/// or converted to Arrow. The schema is statically defined, so this does not
+/// happen in practice.
+pub fn logs_arrow_schema() -> crate::error::Result<Arc<Schema>> {
+    match LOGS_ARROW_SCHEMA.get_or_init(|| {
+        let iceberg_schema = icegate_common::schema::logs_schema().map_err(|e| e.to_string())?;
+        schema_to_arrow_schema(&iceberg_schema).map(Arc::new).map_err(|e| e.to_string())
+    }) {
+        Ok(schema) => Ok(Arc::clone(schema)),
+        Err(message) => Err(crate::error::IngestError::Validation(format!(
+            "failed to build logs Arrow schema: {message}"
+        ))),
+    }
 }
 
 /// Transforms an OTLP logs export request to an Arrow `RecordBatch`.
@@ -57,16 +69,12 @@ pub fn logs_arrow_schema() -> Schema {
 /// - `RecordBatch` creation fails
 #[allow(clippy::cast_possible_wrap)]
 #[allow(clippy::cast_possible_truncation)] // Timestamp fits in i64 for practical purposes
-#[allow(clippy::expect_used)] // Byte lengths are validated before append
 #[tracing::instrument(skip(request))]
 pub fn logs_to_record_batch(
     request: &ExportLogsServiceRequest,
     tenant_id: Option<&str>,
 ) -> crate::error::Result<Option<RecordBatch>> {
-    let ingested_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_micros() as i64;
+    let ingested_timestamp = now_micros()?;
 
     // Count total log records for capacity hints
     let total_records: usize = request
@@ -81,7 +89,7 @@ pub fn logs_to_record_batch(
     }
 
     // Get the Arrow schema to extract correct field types for the map builders
-    let schema = logs_arrow_schema();
+    let schema = logs_arrow_schema()?;
     let (resource_key_field, resource_value_field) =
         extract_map_fields_from_schema_named(&schema, COL_RESOURCE_ATTRIBUTES)?;
     let (scope_key_field, scope_value_field) = extract_map_fields_from_schema_named(&schema, COL_SCOPE_ATTRIBUTES)?;
@@ -219,7 +227,6 @@ pub fn logs_to_record_batch(
     }
 
     // Build arrays
-    let schema = Arc::new(schema);
     let columns: Vec<ArrayRef> = vec![
         Arc::new(tenant_id_builder.finish()),
         Arc::new(service_name_builder.finish()),
