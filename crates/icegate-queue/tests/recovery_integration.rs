@@ -13,7 +13,7 @@ async fn test_recovery_empty_store() -> Result<(), Box<dyn std::error::Error>> {
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     // First write should start at offset 0
     let batch = common::test_batch(10, 1)?;
@@ -51,7 +51,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
         let config = QueueConfig::new("queue");
         let (tx, rx) = channel(config.common.channel_capacity);
         let writer = QueueWriter::new(config, store.clone());
-        let handle = writer.start(rx);
+        let handle = writer.start(rx).await.unwrap();
 
         for _ in 0..3 {
             let (response_tx, response_rx) = oneshot::channel();
@@ -75,7 +75,7 @@ async fn test_recovery_continues_from_max_offset() -> Result<(), Box<dyn std::er
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
@@ -111,7 +111,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
         let config = QueueConfig::new("queue");
         let (tx, rx) = channel(config.common.channel_capacity);
         let writer = QueueWriter::new(config, store.clone());
-        let handle = writer.start(rx);
+        let handle = writer.start(rx).await.unwrap();
 
         // Write 3 segments to "logs"
         for _ in 0..3 {
@@ -164,7 +164,7 @@ async fn test_recovery_multiple_topics() -> Result<(), Box<dyn std::error::Error
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     // Verify "logs" continues from offset 3
     let (response_tx, response_rx) = oneshot::channel();
@@ -235,7 +235,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
         let config = QueueConfig::new("my-queue");
         let (tx, rx) = channel(config.common.channel_capacity);
         let writer = QueueWriter::new(config, store.clone());
-        let handle = writer.start(rx);
+        let handle = writer.start(rx).await.unwrap();
 
         for _ in 0..2 {
             let (response_tx, response_rx) = oneshot::channel();
@@ -259,7 +259,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
     let config = QueueConfig::new("my-queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(WriteRequest {
@@ -287,7 +287,7 @@ async fn test_recovery_with_base_path() -> Result<(), Box<dyn std::error::Error>
     let config_different = QueueConfig::new("different-queue");
     let (tx_diff, rx_diff) = channel(config_different.common.channel_capacity);
     let writer_diff = QueueWriter::new(config_different, store.clone());
-    let handle_diff = writer_diff.start(rx_diff);
+    let handle_diff = writer_diff.start(rx_diff).await.unwrap();
 
     let (response_tx, response_rx) = oneshot::channel();
     tx_diff

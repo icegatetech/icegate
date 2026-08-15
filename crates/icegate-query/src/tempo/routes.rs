@@ -1,10 +1,12 @@
 //! Tempo API routes
 
+use std::time::Duration;
+
 use axum::{Router, extract::DefaultBodyLimit, http::StatusCode, routing::get};
 use icegate_common::{MemoryPressure, ShedPolicy, default_shed_response, shed_when_pressured};
 use tower_http::timeout::TimeoutLayer;
 
-/// HTTP status returned when a request exceeds [`REQUEST_TIMEOUT`].
+/// HTTP status returned when a request exceeds the configured query duration.
 /// `503 Service Unavailable` matches axum's recommendation for an
 /// upstream timeout; Grafana surfaces it as a transient error rather
 /// than blaming the query for being malformed.
@@ -14,11 +16,7 @@ const TIMEOUT_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
 /// is Grafana's search-tab liveness probe and must keep answering `200`.
 const TEMPO_SHED_BYPASS: &[&str] = &["/ready", "/api/echo"];
 
-use super::{
-    handlers,
-    server::TempoState,
-    validation::{MAX_BODY_BYTES, REQUEST_TIMEOUT},
-};
+use super::{handlers, server::TempoState, validation::MAX_BODY_BYTES};
 
 /// Build the Tempo HTTP router.
 ///
@@ -44,10 +42,13 @@ use super::{
 ///   [`MAX_BODY_BYTES`]. Axum's default of 2 `MiB` is far larger than any
 ///   legitimate Tempo request body and would let an attacker drive the
 ///   lexer / parser with megabyte-sized `q=` parameters.
-/// - [`TimeoutLayer`] with [`REQUEST_TIMEOUT`] guarantees the server
-///   never holds a request open indefinitely on a downstream catalog
-///   hang or runaway scan.
+/// - [`TimeoutLayer`] with `engine.max_query_duration_secs` guarantees
+///   the server never holds a request open indefinitely on a downstream
+///   catalog hang or runaway scan. The value comes from the engine
+///   config rather than a constant because it is one side of the WAL
+///   retention contract (see [`crate::engine::QueryEngineConfig`]).
 pub fn routes(state: TempoState, pressure: MemoryPressure) -> Router {
+    let query_timeout = Duration::from_secs(state.engine.config().max_query_duration_secs);
     Router::new()
         .route("/api/traces/{trace_id}", get(handlers::get_trace))
         .route("/api/v2/traces/{trace_id}", get(handlers::get_trace))
@@ -63,7 +64,7 @@ pub fn routes(state: TempoState, pressure: MemoryPressure) -> Router {
         .route("/api/echo", get(handlers::echo))
         .route("/ready", get(handlers::ready))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(TimeoutLayer::with_status_code(TIMEOUT_STATUS, REQUEST_TIMEOUT))
+        .layer(TimeoutLayer::with_status_code(TIMEOUT_STATUS, query_timeout))
         .layer(axum::middleware::from_fn(move |req, next| {
             shed_when_pressured(
                 ShedPolicy::new(pressure.clone(), "tempo", TEMPO_SHED_BYPASS, false),
@@ -166,5 +167,25 @@ mod tests {
         let app = routes(build_state().await, pressured_guard());
         let response = app.oneshot(get_request("/api/echo")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Driven over real HTTP: the timeout now comes from the engine config
+    /// rather than a constant, so the wiring — not just the layer — is what is
+    /// under test. The catalog behind the engine never answers.
+    #[tokio::test]
+    async fn a_search_exceeding_the_deadline_answers_503() {
+        let state = TempoState {
+            engine: crate::test_support::build_stalling_engine(1),
+        };
+        let (base_url, server) = crate::test_support::serve_router(routes(state, MemoryPressure::inert())).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/api/search?q=%7B%7D"))
+            .send()
+            .await
+            .expect("the server must answer, not hang");
+
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        server.abort();
     }
 }

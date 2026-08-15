@@ -11,7 +11,11 @@ pub mod compact;
 pub mod config;
 /// Background orphan-file garbage collection.
 pub mod gc;
+/// Worker pool and job-state storage configuration shared by the services.
+pub mod jobs;
 /// Schema migration operations.
 pub mod migrate;
 /// Background LLM pricing crawler.
 pub mod pricing;
+/// Background WAL segment cleanup.
+pub mod wal_cleanup;

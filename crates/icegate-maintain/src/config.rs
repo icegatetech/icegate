@@ -6,12 +6,14 @@
 use std::path::Path;
 
 use icegate_common::{CatalogConfig, MetricsConfig, StorageConfig, TracingConfig};
+use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::compact::config::CompactionConfig;
 use crate::error::MaintainError;
 use crate::gc::config::GcConfig;
 use crate::migrate::config::SnapshotExpirationConfig;
+use crate::wal_cleanup::config::WalCleanupConfig;
 
 /// Maintain binary configuration
 ///
@@ -33,6 +35,23 @@ pub struct MaintainConfig {
     /// service. Disabled by default; ignored by the one-shot `migrate` commands.
     #[serde(default)]
     pub gc: GcConfig,
+    /// WAL segment cleanup for the long-running `run` service. Runs on its own
+    /// worker pool ([`crate::wal_cleanup::runner`]). Disabled by default; ignored by the
+    /// one-shot `migrate` commands.
+    ///
+    /// The config key is the field name, `wal_cleanup`. Serde drops an unknown
+    /// key in silence, so a config file that spells it otherwise leaves cleanup
+    /// on its built-in defaults — switched off — while the file says otherwise;
+    /// the chart and Compose render this exact key, and a test parses the block
+    /// in the shape the chart produces.
+    #[serde(default)]
+    pub wal_cleanup: WalCleanupConfig,
+    /// WAL queue location. Cleanup addresses the queue through it, so it must
+    /// name the same `base_path` the ingest service writes to — a different
+    /// bucket than the tables live in, resolved through the same storage
+    /// credentials.
+    #[serde(default)]
+    pub queue: QueueConfig,
     /// LLM pricing crawler configuration for the long-running `run` service.
     /// Disabled by default; ignored by the one-shot `migrate` commands.
     #[serde(default)]
@@ -68,37 +87,48 @@ impl MaintainConfig {
         Ok(config)
     }
 
-    /// Validate the always-required shared configuration: catalog, storage, and
-    /// the (optional) metrics endpoint.
+    /// Validate everything that can be judged from the config file alone:
+    /// catalog, storage, the (optional) metrics endpoint, snapshot expiration,
+    /// the orphan grace period, and the WAL-cleanup tunables together with the
+    /// queue location they address.
     ///
-    /// The component-specific `compaction`, `gc`, `pricing`, and `tracing`
-    /// blocks are deliberately NOT validated here. Each carries requirements the
-    /// one-shot `migrate` commands never satisfy — job-state storage for the
-    /// first three, an OTLP endpoint for `tracing`, whose default is enabled —
-    /// and those commands share this `MaintainConfig` while using only the
-    /// `catalog` and `storage` blocks. Each is instead validated where the `run`
-    /// service consumes it (`Compactor::new` / `GcRunner::new` /
-    /// `PricingRunner::new`, and the tracing init in the `run` command), so a
-    /// `migrate` config that omits them still loads. (Validating `gc` here
-    /// previously broke `migrate create` on the minimal migrate config.)
+    /// What is NOT validated here is a service's job-state storage — the
+    /// `jobsmanager` block of `compaction`, `gc`, `pricing` and `wal_cleanup`
+    /// alike.
+    /// The one-shot `migrate` commands share this `MaintainConfig` and carry
+    /// none of those blocks, so their defaults hold an empty endpoint and
+    /// bucket; checking them here would fail a command that never starts the
+    /// service they configure. (Validating `gc` here once did exactly that to
+    /// `migrate create`.) Each runner validates its own block instead, at the
+    /// point it builds the pool: `Compactor::new`, `GcRunner::new`,
+    /// `PricingRunner::new`, `WalCleanupRunner::new`. `tracing` is left out for
+    /// the same shape of reason — its default is enabled and it then requires an
+    /// OTLP endpoint a `migrate` config has no reason to carry — and is
+    /// validated by the `run` command before the exporter is built.
     ///
-    /// `snapshot_expiration` is the exception: it is the `migrate` commands' own
-    /// block, it requires nothing of the environment, and its values leave the
-    /// process as table properties every later writer resolves — a bad window
-    /// caught here is a failed `migrate`, the same window caught on a commit is
-    /// a failed ingest.
+    /// `snapshot_expiration` is validated here because it is the `migrate`
+    /// commands' own block: it requires nothing of the environment, and its
+    /// values leave the process as table properties every later writer resolves
+    /// — a bad window caught here is a failed `migrate`, the same window caught
+    /// on a commit is a failed ingest. The WAL block qualifies on the same
+    /// terms: its tunables are pure numbers, and cleanup stays off in a
+    /// `migrate` config, which makes both checks below no-ops there.
     ///
     /// # Errors
     ///
-    /// Returns an error if the catalog, storage, metrics, or snapshot-expiration
-    /// configuration is invalid, or if the orphan sweep would run with no grace
-    /// period (see [`Self::validate_orphan_grace_period`]).
+    /// Returns an error if the catalog, storage, metrics, snapshot-expiration or
+    /// WAL-cleanup configuration is invalid, if the orphan sweep would run with
+    /// no grace period (see [`Self::validate_orphan_grace_period`]), or if
+    /// cleanup is enabled against a queue location it cannot address (see
+    /// [`Self::validate_wal_queue_location`]).
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.catalog.validate()?;
         self.storage.validate()?;
         self.metrics.validate()?;
         self.snapshot_expiration.validate()?;
         self.validate_orphan_grace_period()?;
+        self.wal_cleanup.validate()?;
+        self.validate_wal_queue_location()?;
         Ok(())
     }
 
@@ -140,6 +170,43 @@ impl MaintainConfig {
                  and the grace period is also what keeps a compaction output not yet referenced \
                  by any manifest out of the sweep's reach"
                     .to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reject a queue location WAL cleanup cannot address.
+    ///
+    /// Bound to `wal_cleanup.enabled`, which is what lets [`Self::validate`] run it on
+    /// every config load: the one-shot `migrate` commands carry no `queue` block
+    /// at all, and they leave cleanup disabled, so the check returns before it
+    /// reads one.
+    ///
+    /// The check is what turns a missing or misspelled `queue.common.base_path`
+    /// into a failed startup. `OperatorRegistry::resolve_object_store` answers an
+    /// unrecognised path with a fresh in-memory store, and cleanup against that
+    /// store finds no segment ever, so the queue grows without a single error in
+    /// the log — only a `wal_cleanup.segments.found` pinned at zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintainError::Config`] when cleanup is enabled and the queue
+    /// block is invalid or names no persistent object store.
+    fn validate_wal_queue_location(&self) -> Result<(), MaintainError> {
+        if !self.wal_cleanup.enabled {
+            return Ok(());
+        }
+        let base_path = &self.queue.common.base_path;
+        self.queue.validate().map_err(|e| {
+            MaintainError::Config(format!(
+                "wal cleanup is enabled, so the queue block must be the one ingest writes to: {e}"
+            ))
+        })?;
+        if !icegate_common::is_persistent_base_path(base_path) {
+            return Err(MaintainError::Config(format!(
+                "queue.common.base_path {base_path:?} names no object store: a path without an \
+                 s3://, s3a://, file:// or / prefix resolves to process memory, where wal cleanup \
+                 would report zero segments found on every cycle while the queue keeps growing"
             )));
         }
         Ok(())
@@ -394,6 +461,155 @@ gc:
         let config: MaintainConfig = serde_yaml::from_str(&yaml).expect("parse chart-style maintain config");
 
         config.validate().expect("the sweep validates on a positive grace period");
+    }
+
+    /// The `wal_cleanup` and `queue` blocks in the shape `configmap-maintain.yaml`
+    /// renders them. Serde drops unknown keys in silence, so a renamed field
+    /// would leave cleanup running on built-in defaults while the `ConfigMap`
+    /// claims otherwise — and for a destructive loop that means deleting on a
+    /// retention window nobody configured.
+    #[test]
+    fn the_wal_cleanup_block_the_chart_renders_lands_on_the_config() {
+        let yaml = r"
+catalog:
+  backend: !rest
+    uri: http://nessie:19120/iceberg
+  warehouse: s3://warehouse/
+storage:
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: http://localhost:9000
+queue:
+  common:
+    base_path: s3://queue/
+wal_cleanup:
+  enabled: true
+  dry_run: false
+  logs_enabled: true
+  spans_enabled: true
+  metrics_enabled: true
+  operations_enabled: false
+  keep_segments_count: 2000
+  max_deletes_per_cycle: 1000
+  delete_concurrency: 8
+  cleanup_timeout_secs: 120
+  jobsmanager:
+    scan_interval_secs: 300
+    worker_count: 2
+    poll_interval_ms: 1000
+    storage:
+      endpoint: http://localhost:9000
+      bucket: jobs
+      prefix: wal_cleanup
+      region: us-east-1
+      job_state_codec: json
+      request_timeout_secs: 5
+";
+        let config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse chart-style wal_cleanup config");
+
+        assert!(config.wal_cleanup.enabled);
+        assert!(!config.wal_cleanup.operations_enabled);
+        assert_eq!(config.wal_cleanup.keep_segments_count, 2_000);
+        assert_eq!(config.wal_cleanup.max_deletes_per_cycle, 1_000);
+        assert_eq!(config.wal_cleanup.delete_concurrency, 8);
+        assert_eq!(config.wal_cleanup.cleanup_timeout_secs, 120);
+        assert_eq!(config.wal_cleanup.jobsmanager.scan_interval_secs, 300);
+        assert_eq!(config.wal_cleanup.jobsmanager.worker_count, 2);
+        assert_eq!(config.wal_cleanup.jobsmanager.storage.prefix, "wal_cleanup");
+        assert_eq!(config.wal_cleanup.jobsmanager.storage.bucket, "jobs");
+        assert_eq!(config.queue.common.base_path, "s3://queue/");
+        config.validate().expect("the chart-rendered block must validate");
+        // The runner's own gate, which `validate` deliberately leaves alone: the
+        // chart renders a populated job-state storage, so it passes here too.
+        config
+            .wal_cleanup
+            .jobsmanager
+            .validate("wal_cleanup")
+            .expect("the chart-rendered job-state storage must validate");
+    }
+
+    /// A config with neither block still loads: the one-shot `migrate` commands
+    /// share this struct and carry no `wal_cleanup`/`queue` keys, and their
+    /// defaults leave cleanup switched off.
+    #[test]
+    fn a_config_without_a_wal_cleanup_block_leaves_cleanup_disabled() {
+        let yaml = r"
+catalog:
+  backend: !rest
+    uri: http://nessie:19120/iceberg
+  warehouse: s3://warehouse/
+storage:
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: http://localhost:9000
+";
+        let config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse config without a wal_cleanup block");
+
+        assert!(!config.wal_cleanup.enabled);
+        assert!(config.queue.common.base_path.is_empty());
+        config
+            .validate()
+            .expect("a config without cleanup, and with no job-state storage, must load");
+    }
+
+    /// Cleanup enabled with no `queue` block. The empty `base_path` resolves to
+    /// an in-memory store, so every cycle would report zero segments found while
+    /// the real queue grows — the pod must refuse to start instead.
+    #[test]
+    fn enabled_cleanup_without_a_queue_block_is_rejected() {
+        let yaml = r"
+catalog:
+  backend: !rest
+    uri: http://nessie:19120/iceberg
+  warehouse: s3://warehouse/
+storage:
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: http://localhost:9000
+wal_cleanup:
+  enabled: true
+";
+        let config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse cleanup without a queue block");
+
+        let error = config
+            .validate()
+            .expect_err("enabled cleanup with no queue location must fail startup");
+        assert!(
+            error.to_string().contains("base_path"),
+            "the failure must name the field to fix, got: {error}"
+        );
+    }
+
+    /// The same refusal for a path that parses but names no store: `s3:/` with
+    /// one slash is the typo the operator actually makes, and it is accepted by
+    /// serde, by `validate`, and by the object-store resolution alike.
+    #[test]
+    fn enabled_cleanup_with_an_unrecognised_queue_scheme_is_rejected() {
+        let yaml = r"
+catalog:
+  backend: !rest
+    uri: http://nessie:19120/iceberg
+  warehouse: s3://warehouse/
+storage:
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: http://localhost:9000
+queue:
+  common:
+    base_path: 's3:/queue/'
+wal_cleanup:
+  enabled: true
+";
+        let config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse cleanup with a misspelled scheme");
+
+        assert!(
+            config.validate().is_err(),
+            "a path resolving to process memory must fail startup"
+        );
     }
 
     /// Serde ignores unknown keys, so a `ConfigMap` key with no matching field

@@ -47,6 +47,9 @@ data:
       {{- with .Values.query.engine.maxAgeSecs }}
       max_age_secs: {{ . }}
       {{- end }}
+      {{- with .Values.query.engine.maxQueryDurationSecs }}
+      max_query_duration_secs: {{ . }}
+      {{- end }}
       # WAL query settings (affects DataFusion queries only, not /labels /label_values /series).
       wal_query_enabled: {{ .Values.query.engine.walQueryEnabled }}
       {{- with .Values.query.engine.walMetadataSizeHint }}

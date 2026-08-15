@@ -1,18 +1,31 @@
 //! Prometheus API routes
 
+use std::time::Duration;
+
 use axum::{
     Router,
+    http::StatusCode,
     routing::{get, post},
 };
 use icegate_common::{MemoryPressure, ShedPolicy, default_shed_response, shed_when_pressured};
+use tower_http::timeout::TimeoutLayer;
 
 use super::{handlers, server::PrometheusState};
 
 /// Readiness path exempt from memory-pressure shedding.
 const PROMETHEUS_SHED_BYPASS: &[&str] = &["/-/ready"];
 
-/// Create Prometheus API router
+/// HTTP status returned when a request exceeds the configured query duration,
+/// matching the Loki and Tempo routers.
+const TIMEOUT_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
+
+/// Create Prometheus API router.
+///
+/// Carries the same `engine.max_query_duration_secs` [`TimeoutLayer`] as the
+/// other HTTP APIs; see [`crate::engine::QueryEngineConfig`] for why that number
+/// is also what WAL retention is derived from.
 pub fn routes(state: PrometheusState, pressure: MemoryPressure) -> Router {
+    let query_timeout = Duration::from_secs(state.engine.config().max_query_duration_secs);
     Router::new()
         // Query endpoints
         .route("/api/v1/query", post(handlers::query))
@@ -23,6 +36,7 @@ pub fn routes(state: PrometheusState, pressure: MemoryPressure) -> Router {
         .route("/api/v1/label/{name}/values", get(handlers::label_values))
         // Health check
         .route("/-/ready", get(handlers::ready))
+        .layer(TimeoutLayer::with_status_code(TIMEOUT_STATUS, query_timeout))
         .layer(axum::middleware::from_fn(move |req, next| {
             shed_when_pressured(
                 ShedPolicy::new(pressure.clone(), "prometheus", PROMETHEUS_SHED_BYPASS, false),
@@ -119,4 +133,10 @@ mod tests {
         let response = app.oneshot(get_request("/-/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    // A "query exceeds the deadline" case cannot be driven through this router
+    // yet: every Prometheus handler is still a `501` stub (`handlers.rs`), so no
+    // request reaches the engine and the timeout can never fire. The layer is
+    // wired here the same way Loki and Tempo wire theirs (both covered by a
+    // transport test); add the case with the first handler that executes a query.
 }

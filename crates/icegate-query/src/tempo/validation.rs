@@ -58,14 +58,6 @@ pub const MAX_TAG_NAME_LEN: usize = 256;
 /// 2 `MiB` of attacker-supplied form data before any validator fires.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// Per-request wall-clock timeout.
-///
-/// Search queries occasionally take seconds when a wide window forces a
-/// large metadata scan; 30 s is a comfortable ceiling that still
-/// guarantees the tokio reactor never holds a tempo-side request open
-/// indefinitely (e.g., on a downstream catalog hang).
-pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Hard ceiling on total spans returned from a single search request.
 ///
 /// Acts as a safety net for `spss=0` (no per-trace cap) so a single

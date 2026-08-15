@@ -4290,6 +4290,7 @@ dependencies = [
  "iceberg",
  "icegate-catalog-s3",
  "icegate-common",
+ "icegate-queue",
  "jobmanager",
  "object_store",
  "opentelemetry",
@@ -4299,6 +4300,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.20",
  "tikv-jemallocator",
@@ -4329,6 +4331,9 @@ dependencies = [
  "datafusion-tracing",
  "futures",
  "hex",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
  "iceberg",
  "iceberg-datafusion",
  "icegate-common",
@@ -4700,7 +4705,7 @@ dependencies = [
 [[package]]
 name = "jobmanager"
 version = "0.1.0"
-source = "git+https://github.com/icegatetech/jobmanager?rev=e280a2c937c4a6850608f587adb7f10aa8923258#e280a2c937c4a6850608f587adb7f10aa8923258"
+source = "git+https://github.com/icegatetech/jobmanager?rev=820bbe524170c8dbbe07463b4e0538e353b8de60#820bbe524170c8dbbe07463b4e0538e353b8de60"
 dependencies = [
  "async-trait",
  "aws-config",

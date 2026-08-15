@@ -36,14 +36,14 @@ async fn setup_object_store_and_bucket(bucket_name: &str) -> (S3TestContainer, A
 }
 
 /// Helper to start queue writer and return writer handle and write channel.
-fn start_writer(
+async fn start_writer(
     store: Arc<dyn object_store::ObjectStore>,
     base_path: &str,
 ) -> (JoinHandle<icegate_queue::Result<()>>, icegate_queue::WriteChannel) {
     let config = QueueConfig::new(base_path);
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store).with_events(Arc::new(NoopQueueWriterEvents));
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.expect("Failed to start queue writer");
     (handle, tx)
 }
 
@@ -81,7 +81,7 @@ fn queue_benchmarks(c: &mut Criterion) {
         group.bench_function("small_batches", |b| {
             b.iter(|| {
                 rt.block_on(async {
-                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue").await;
                     let batches = generate_batches_for_throughput(10, 100);
                     for batch in batches {
                         write_batch(&tx, "small", batch).await;
@@ -96,7 +96,7 @@ fn queue_benchmarks(c: &mut Criterion) {
         group.bench_function("large_batches", |b| {
             b.iter(|| {
                 rt.block_on(async {
-                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue").await;
                     let batches = generate_batches_for_throughput(10, 10_000);
                     for batch in batches {
                         write_batch(&tx, "large", batch).await;
@@ -111,7 +111,7 @@ fn queue_benchmarks(c: &mut Criterion) {
         group.bench_function("concurrent_topics", |b| {
             b.iter(|| {
                 rt.block_on(async {
-                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue").await;
                     let batches_topic1 = generate_batches_for_throughput(10, 100);
                     let batches_topic2 = generate_batches_for_throughput(10, 100);
                     let batches_topic3 = generate_batches_for_throughput(10, 100);
@@ -135,7 +135,7 @@ fn queue_benchmarks(c: &mut Criterion) {
     {
         // Pre-write segments for read benchmarks
         rt.block_on(async {
-            let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+            let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue").await;
             let batches = generate_batches_for_throughput(10, 100);
             for batch in batches {
                 write_batch(&tx, "reads", batch).await;
@@ -205,7 +205,7 @@ fn queue_benchmarks(c: &mut Criterion) {
                 let topic = format!("e2e_{}", E2E_COUNTER.fetch_add(1, Ordering::Relaxed));
                 rt.block_on(async {
                     // Write phase
-                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue");
+                    let (writer_handle, tx) = start_writer(Arc::clone(&store), "queue").await;
                     let batches = generate_batches_with_grouping(5, 100, 5);
                     for batch in batches {
                         write_batch(&tx, &topic, batch).await;

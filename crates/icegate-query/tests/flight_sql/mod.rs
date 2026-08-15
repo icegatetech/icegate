@@ -1,5 +1,6 @@
 //! Flight SQL gRPC integration tests.
 
+mod deadline;
 mod harness;
 mod metadata;
 mod pricing;

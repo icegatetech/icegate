@@ -15,7 +15,7 @@
 //! unused `QueryMetrics` argument is deliberately not carried here so the
 //! signature doesn't imply observability that isn't wired.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::execution::context::SQLOptions;
@@ -29,6 +29,7 @@ use tonic::service::interceptor::InterceptedService;
 use super::FlightSqlConfig;
 use super::provider::IceGateSessionStateProvider;
 use crate::engine::QueryEngine;
+use crate::infra::deadline::ResponseDeadlineLayer;
 
 /// Build the SQL execution options enforced on every client query.
 ///
@@ -89,6 +90,7 @@ pub async fn run_with_port_tx(
         let _ = tx.send(local_addr.port());
     }
 
+    let query_deadline_secs = engine.config().max_query_duration_secs;
     let provider = Box::new(IceGateSessionStateProvider::new(engine));
     let service = FlightSqlService::new_with_provider(provider).with_sql_options(read_only_sql_options());
     let svc = FlightServiceServer::new(service)
@@ -99,7 +101,18 @@ pub async fn run_with_port_tx(
     // HTTP/2 HEADERS time, before protobuf decode / session build.
     let intercepted = InterceptedService::new(svc, MemoryShedInterceptor::new(pressure, "flight_sql"));
 
+    // `DoGet` streams, so the response future resolves long before the query
+    // does: only a deadline that spans the BODY bounds how long a Flight SQL
+    // query may hold a catalog provider (see `crate::infra::deadline`).
+    let query_deadline = Duration::from_secs(query_deadline_secs);
+
     tonic::transport::Server::builder()
+        // The pair covers both halves of a Flight SQL call: `timeout` bounds the
+        // response future (planning, and every unary RPC), the layer bounds the
+        // body that `DoGet` streams afterwards. Either alone leaves the other
+        // half unbounded.
+        .timeout(query_deadline)
+        .layer(ResponseDeadlineLayer::new(query_deadline))
         .add_service(intercepted)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             cancel_token.cancelled().await;

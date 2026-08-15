@@ -24,7 +24,7 @@ mod row_groups_merger;
 /// Shift task runner for shift operations.
 pub mod shift_runner;
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;
 /// Task timeout estimation utilities.
 mod timeout;
 

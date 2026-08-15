@@ -4,11 +4,15 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::compact::config::{CompactionJobsManagerConfig, JobsStorageConfig};
 use crate::error::MaintainError;
+use crate::jobs::{JobsManagerConfig, JobsStorageConfig};
 
 /// Region sentinel for providers that publish one worldwide price.
 pub const GLOBAL_REGION: &str = "global";
+
+/// Config block the crawler's tunables are read from, used in validation
+/// messages.
+pub(crate) const PRICING_CONFIG_BLOCK: &str = "pricing";
 
 /// One upstream rate source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +77,7 @@ pub struct PricingConfig {
     /// The `Default` below sets a distinct `"pricing"` storage prefix; the
     /// discovery cadence comes from [`Self::interval_secs`], not from
     /// `jobsmanager.scan_interval_secs`, since this job has a single task.
-    pub jobsmanager: CompactionJobsManagerConfig,
+    pub jobsmanager: JobsManagerConfig,
 }
 
 impl Default for PricingConfig {
@@ -103,12 +107,12 @@ impl Default for PricingConfig {
             // A distinct job-state prefix, for the same reason `GcConfig` sets
             // one: three jobmanagers share a bucket, and each has its own job
             // registry, so they must not share a prefix.
-            jobsmanager: CompactionJobsManagerConfig {
+            jobsmanager: JobsManagerConfig {
                 storage: JobsStorageConfig {
                     prefix: "pricing".to_string(),
                     ..JobsStorageConfig::default()
                 },
-                ..CompactionJobsManagerConfig::default()
+                ..JobsManagerConfig::default()
             },
         }
     }
@@ -203,7 +207,7 @@ impl PricingConfig {
         // the same reason `GcConfig::validate` validates its own: a zero
         // `worker_count` would otherwise start a jobmanager that reports
         // success and then never crawls.
-        self.jobsmanager.validate()?;
+        self.jobsmanager.validate(PRICING_CONFIG_BLOCK)?;
         Ok(())
     }
 }

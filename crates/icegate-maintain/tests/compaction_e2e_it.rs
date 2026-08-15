@@ -51,15 +51,14 @@ use icegate_catalog_s3::S3Catalog;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats, list_manifest_entries};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
-use icegate_common::{WAL_OFFSET_PROPERTY, resolve_wal_offset};
-use icegate_maintain::compact::config::{
-    CompactionConfig, CompactionJobsManagerConfig, DataCompactionConfig, JobsStorageConfig, ManifestCompactionConfig,
-};
+use icegate_common::{WAL_OFFSET_PROPERTY, resolve_committed_offset};
+use icegate_maintain::compact::config::{CompactionConfig, DataCompactionConfig, ManifestCompactionConfig};
 use icegate_maintain::compact::manifest::rewrite::{
     MANIFEST_REWRITE_MARKER_KEY, ManifestCompactExecutor, ManifestCompactInput, ManifestCompactOutcome,
 };
 use icegate_maintain::compact::metrics::CompactMetrics;
 use icegate_maintain::compact::{Compactor, CompactorHandle};
+use icegate_maintain::jobs::{JobsManagerConfig, JobsStorageConfig};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
@@ -276,7 +275,7 @@ fn compaction_config(conn: &StorageConn) -> CompactionConfig {
         bucket: BUCKET_NAME.to_string(),
         prefix: "compactor".to_string(),
         region: "us-east-1".to_string(),
-        job_state_codec: icegate_maintain::compact::config::JobStateCodec::Json,
+        job_state_codec: icegate_maintain::jobs::JobStateCodec::Json,
         request_timeout_secs: 30,
         access_key_id: Some(conn.access_key.clone()),
         secret_access_key: Some(conn.secret_key.clone()),
@@ -312,7 +311,7 @@ fn compaction_config(conn: &StorageConn) -> CompactionConfig {
             max_manifests_per_commit: 64,
             rewrite_timeout_secs: 600,
         },
-        jobsmanager: CompactionJobsManagerConfig {
+        jobsmanager: JobsManagerConfig {
             // Tight loop so the single iteration runs promptly.
             scan_interval_secs: 1,
             worker_count: 1,
@@ -806,7 +805,7 @@ async fn manifest_compaction_carries_wal_offset_forward() {
 
     let before = catalog.load_table(&ident).await.unwrap();
     assert_eq!(
-        resolve_wal_offset(before.metadata()).expect("resolve before"),
+        resolve_committed_offset(before.metadata()).expect("resolve before"),
         Some(WAL_OFFSET),
         "the seeded base snapshot must carry the WAL offset"
     );
@@ -825,7 +824,7 @@ async fn manifest_compaction_carries_wal_offset_forward() {
     // after manifest compaction.
     let after = catalog.load_table(&ident).await.unwrap();
     assert_eq!(
-        resolve_wal_offset(after.metadata()).expect("resolve after"),
+        resolve_committed_offset(after.metadata()).expect("resolve after"),
         Some(WAL_OFFSET),
         "manifest compaction must carry the WAL offset forward onto the replace snapshot"
     );

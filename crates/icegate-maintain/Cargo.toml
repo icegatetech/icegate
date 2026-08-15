@@ -19,6 +19,10 @@ path = "src/main.rs"
 
 [dependencies]
 icegate-common = { workspace = true }
+# WAL cleanup deletes queue segments, and the segment key format has exactly one
+# owner: this crate drives `icegate_queue::QueueCleaner` rather than rebuilding
+# keys of its own, so a change to the layout cannot leave cleanup behind.
+icegate-queue = { workspace = true }
 jobmanager = { workspace = true }
 
 # Iceberg
@@ -87,3 +91,6 @@ icegate-common = { workspace = true, features = ["testing"] }
 # then drive compaction against it as an `Arc<dyn Catalog>`.
 icegate-catalog-s3 = { workspace = true }
 testcontainers = { workspace = true }
+# The WAL-cleanup cycle test runs on a memory catalog, which still needs a
+# warehouse directory on disk.
+tempfile = { workspace = true }

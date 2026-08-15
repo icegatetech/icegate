@@ -1,7 +1,7 @@
 //! Queue writer for durable Parquet segments on object storage. A common component for storage, it doesn't know what data it uses.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -28,8 +28,18 @@ use crate::{
     channel::{PreparedWalRowGroup, WriteReceiver, WriteRequest},
     config::QueueConfig,
     error::{QueueError, Result},
-    segment::SegmentId,
+    segment::{SegmentId, parse_segment_offset, topic_prefix},
 };
+
+/// Offsets a caller knows to be consumed downstream, one per topic.
+///
+/// Named after the key, not just the value: a caller that resolves these offsets
+/// per topic also holds the committed offsets of a single downstream table, and
+/// the two must not read as the same thing at a call site.
+///
+/// Lives beside [`QueueWriter::with_committed_offsets`], the only thing that
+/// takes one: it is an input to writer recovery, not a channel type.
+pub type CommittedOffsetsByTopic = HashMap<Topic, u64>;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct RowGroupMetadataEntry {
@@ -77,6 +87,12 @@ pub struct QueueWriter {
     /// per-topic map. Topics absent from the map fall back to
     /// parquet-rs defaults.
     column_encodings: HashMap<Topic, &'static [ColumnEncoding]>,
+
+    /// Per-topic offsets the caller knows to be consumed downstream.
+    ///
+    /// Injected via [`Self::with_committed_offsets`]; empty unless the caller
+    /// supplies it.
+    committed_offsets: CommittedOffsetsByTopic,
 }
 
 impl QueueWriter {
@@ -90,6 +106,7 @@ impl QueueWriter {
             events: Arc::new(NoopQueueWriterEvents),
             bloom_filter_columns: HashMap::new(),
             column_encodings: HashMap::new(),
+            committed_offsets: HashMap::new(),
         }
     }
 
@@ -97,6 +114,21 @@ impl QueueWriter {
     #[must_use]
     pub fn with_events(mut self, events: Arc<dyn QueueWriterEvents>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Declare, per topic, the offset up to and including which the queue has
+    /// already been consumed downstream.
+    ///
+    /// The map is the CALLER's knowledge; this crate has no idea where it comes
+    /// from (in IceGate it is the offset the Shifter recorded on its last
+    /// Iceberg commit). Recovery uses it as the floor of the maximum search, so
+    /// a topic whose lower segments were cleaned away still resumes at the right
+    /// counter, and it makes an empty topic prefix detectable as the anomaly it
+    /// is: something was committed, yet nothing survives to have committed it.
+    #[must_use]
+    pub fn with_committed_offsets(mut self, offsets: CommittedOffsetsByTopic) -> Self {
+        self.committed_offsets = offsets;
         self
     }
 
@@ -132,15 +164,27 @@ impl QueueWriter {
         self
     }
 
-    /// Starts the writer, consuming from the provided receiver.
+    /// Recovers the per-topic offset counters, then starts the writer consuming
+    /// from the provided receiver.
     ///
-    /// This method spawns background tasks:
-    /// 1. Main task that processes write requests and accumulates batches
-    /// 2. Flush ticker that periodically checks for time-based flushes
+    /// Recovery runs BEFORE anything is spawned and its failure is returned to
+    /// the caller, so a queue state that cannot be resumed (see
+    /// [`Self::recover_offsets`]) stops the caller's startup instead of reaching
+    /// the request loop, where the first write would claim an offset that is
+    /// already taken.
+    ///
+    /// Once recovery succeeds, two background tasks are spawned:
+    /// 1. the main task that processes write requests and accumulates batches;
+    /// 2. a flush ticker that periodically checks for time-based flushes.
     ///
     /// Returns a handle to the main task.
-    pub fn start(self, mut receiver: WriteReceiver) -> tokio::task::JoinHandle<Result<()>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError`] when offset recovery fails.
+    pub async fn start(self, mut receiver: WriteReceiver) -> Result<tokio::task::JoinHandle<Result<()>>> {
         let writer = Arc::new(self);
+        writer.recover_offsets().await?;
         let flush_writer = Arc::clone(&writer);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -168,10 +212,7 @@ impl QueueWriter {
         });
 
         // Main request processing task
-        tokio::spawn(async move {
-            // Recover offsets from existing segments before processing
-            writer.recover().await?;
-
+        let handle = tokio::spawn(async move {
             info!("Queue writer started");
 
             while let Some(request) = receiver.recv().await {
@@ -204,7 +245,9 @@ impl QueueWriter {
 
             info!("Queue writer stopped (channel closed)");
             Ok(())
-        })
+        });
+
+        Ok(handle)
     }
 
     /// Handles a single write request by accumulating all of its batches.
@@ -700,93 +743,154 @@ impl QueueWriter {
             .collect())
     }
 
-    /// Finds the offset of the first existing segment for a topic.
-    ///
-    /// Lists one item from the topic prefix via `store.list()` to find the
-    /// lowest-offset segment. This handles cases where early segments have
-    /// been cleared by TTL, so segment 0 may no longer exist.
-    ///
-    /// Returns `None` if no segments exist for the topic.
-    async fn find_first_segment_offset(&self, topic: &Topic) -> Result<Option<u64>> {
-        let prefix = if self.config.common.base_path.is_empty() {
-            Path::from(format!("{topic}/"))
-        } else {
-            Path::from(format!("{}/{topic}/", self.config.common.base_path))
-        };
-
-        let mut stream = self.store.list(Some(&prefix));
-        let Some(meta) = stream.next().await else {
-            return Ok(None);
-        };
-        let meta = meta?;
-
-        // Strip base_path prefix to get the relative path for SegmentId parsing
-        let location_str = meta.location.as_ref();
-        let relative_str = if self.config.common.base_path.is_empty() {
-            location_str
-        } else {
-            let prefix_to_strip = format!("{}/", self.config.common.base_path);
-            location_str.strip_prefix(&prefix_to_strip).unwrap_or(location_str)
-        };
-
-        let segment_id = SegmentId::from_relative_path(&Path::from(relative_str))?;
-        Ok(Some(segment_id.offset))
+    /// Builds the object store prefix holding one topic's segments.
+    fn topic_prefix(&self, topic: &Topic) -> Path {
+        topic_prefix(&self.config.common.base_path, topic)
     }
 
-    /// Finds the maximum segment offset for a topic using binary search.
-    ///
-    /// Uses exponential search to find an upper bound, then binary search
-    /// to narrow down to the exact maximum offset. This runs in O(log N)
-    /// HEAD requests, avoiding the need to list all segments.
-    async fn find_max_offset(&self, topic: &Topic) -> Result<Option<u64>> {
-        // Find the first existing segment (handles TTL-cleared early segments)
-        let Some(seed) = self.find_first_segment_offset(topic).await? else {
-            return Ok(None);
-        };
+    /// Parses the segment offset out of a listed object key, or `None` when the
+    /// key is not a segment (see [`parse_segment_offset`]).
+    fn segment_offset_of(&self, location: &Path) -> Option<u64> {
+        parse_segment_offset(&self.config.common.base_path, location)
+    }
 
-        // Phase 1: Exponential search upward from seed to find upper bound
-        let mut step: u64 = 1;
-        while self.segment_exists(&SegmentId::new(topic, seed.saturating_add(step))).await? {
-            step = step.saturating_mul(2);
-            if seed.saturating_add(step) == u64::MAX {
-                break;
+    /// Reports whether the topic holds any segment above `offset`.
+    ///
+    /// The predicate is monotone in `offset` for ANY surviving set of segments:
+    /// true while `offset` is below the maximum, false at and above it, holes
+    /// included. That is what a point "does segment N exist" probe cannot offer
+    /// once WAL cleanup has punched a hole, and the maximum search below depends
+    /// on it. The answer also does not depend on the order the listing yields
+    /// (`ObjectStore::list_with_offset` guarantees none): what is asked of the
+    /// listing is whether a matching key exists at all, not which key comes first.
+    async fn exists_above(&self, topic: &Topic, offset: u64) -> Result<bool> {
+        let prefix = self.topic_prefix(topic);
+        let start = self.segment_full_path(&SegmentId::new(topic, offset));
+        let mut stream = self.store.list_with_offset(Some(&prefix), &start);
+        while let Some(meta) = stream.next().await {
+            let meta = meta?;
+            if self.segment_offset_of(&meta.location).is_some_and(|found| found > offset) {
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
 
-        // Phase 2: Binary search between seed + step/2 and seed + step
-        let mut lo = seed.saturating_add(step / 2);
-        let mut hi = seed.saturating_add(step);
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            if self.segment_exists(&SegmentId::new(topic, mid)).await? {
+    /// Finds the offset of an arbitrary existing segment for a topic, used to
+    /// seed the maximum search.
+    ///
+    /// Any surviving segment is a valid seed: the seed only has to be at or
+    /// below the maximum, and every existing segment is. The listing order is
+    /// not guaranteed, so this is deliberately not "the lowest" — asking for
+    /// that would mean draining the whole topic prefix for no gain.
+    ///
+    /// Returns `None` when the topic prefix holds no segment at all.
+    async fn find_existing_segment_offset(&self, topic: &Topic) -> Result<Option<u64>> {
+        let prefix = self.topic_prefix(topic);
+        let mut stream = self.store.list(Some(&prefix));
+        while let Some(meta) = stream.next().await {
+            let meta = meta?;
+            if let Some(offset) = self.segment_offset_of(&meta.location) {
+                return Ok(Some(offset));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Finds the highest segment offset at or above `base` for a topic.
+    ///
+    /// Searches for the smallest `X >= base` where [`Self::exists_above`] is
+    /// false: that `X` is the maximum, or `base` itself when nothing was ever
+    /// written above it. Exponential probing establishes the upper bound, then
+    /// binary search closes in — O(log N) listings, no full enumeration.
+    ///
+    /// `base` MUST be an offset the caller knows to be at or below the maximum
+    /// (an existing segment, or a committed offset), otherwise the returned
+    /// value is `base`.
+    async fn find_max_offset(&self, topic: &Topic, base: u64) -> Result<u64> {
+        if !self.exists_above(topic, base).await? {
+            return Ok(base);
+        }
+
+        // Phase 1: double the step until the predicate flips. `exists_above` is
+        // false at `u64::MAX` (no key can sort above the last offset), so the
+        // saturating step always terminates the loop.
+        let mut lo = base;
+        let mut step: u64 = 1;
+        let hi = loop {
+            let probe = base.saturating_add(step);
+            if !self.exists_above(topic, probe).await? {
+                break probe;
+            }
+            lo = probe;
+            step = step.saturating_mul(2);
+        };
+
+        // Phase 2: binary search the flip point in `(lo, hi]`, holding the
+        // invariant `exists_above(lo) && !exists_above(hi)`.
+        let mut hi = hi;
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if self.exists_above(topic, mid).await? {
                 lo = mid;
             } else {
-                hi = mid - 1;
+                hi = mid;
             }
         }
 
-        Ok(Some(lo))
+        Ok(hi)
     }
 
-    /// Recovers offset state from existing segments on startup.
+    /// Recovers the per-topic offset counters from object storage on startup.
     ///
-    /// Discovers topics via directory listing, then uses exponential +
-    /// binary search to find the maximum offset per topic in O(log N)
-    /// HEAD requests. This avoids listing all segments, which breaks
-    /// at ~1000 segments on S3-compatible stores.
-    async fn recover(&self) -> Result<()> {
-        let topics = self.discover_topics().await?;
+    /// Every topic that has a prefix in the store OR a committed offset from
+    /// [`Self::with_committed_offsets`] is examined — a topic whose segments
+    /// were all cleaned away has no prefix to discover, and it is exactly the
+    /// one whose committed offset must still be honoured. Per topic, the search
+    /// for the maximum starts at the committed offset when there is one and at
+    /// an arbitrary surviving segment otherwise, then walks up in O(log N)
+    /// listings rather than enumerating the topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::Recovery`] when a topic has a committed offset but
+    /// no segment at all: something downstream consumed segments that the store
+    /// says never existed, so any counter this writer picked would risk
+    /// overwriting live data. `Some(0)` counts — segment 0 was committed, so an
+    /// empty prefix is just as impossible there.
+    ///
+    /// Returns [`QueueError::Write`] if the recovered maximum is `u64::MAX` and
+    /// the counter cannot be advanced past it.
+    async fn recover_offsets(&self) -> Result<()> {
+        // Sorted so the recovery log reads in a stable order across restarts.
+        let mut topics: BTreeSet<Topic> = self.discover_topics().await?.into_iter().collect();
+        topics.extend(self.committed_offsets.keys().cloned());
 
         for topic in &topics {
-            if let Some(max_offset) = self.find_max_offset(topic).await? {
-                let next_offset = max_offset.checked_add(1).ok_or_else(|| QueueError::Write {
-                    topic: topic.clone(),
-                    offset: max_offset,
-                    source: "offset space exhausted during recovery (u64::MAX reached)".into(),
-                })?;
-                self.set_offset(topic, next_offset).await;
-                info!("Recovered topic '{}': next offset = {}", topic, next_offset);
-            }
+            let committed = self.committed_offsets.get(topic).copied();
+            let existing = self.find_existing_segment_offset(topic).await?;
+            let base = match (committed, existing) {
+                (Some(committed), None) => {
+                    return Err(QueueError::Recovery {
+                        topic: topic.clone(),
+                        reason: format!(
+                            "offset {committed} is recorded as committed downstream, but the topic prefix \
+                             holds no segment: refusing to start on a queue whose history cannot be resumed"
+                        ),
+                    });
+                }
+                (None, None) => continue,
+                (None, Some(existing)) => existing,
+                (Some(committed), Some(_)) => committed,
+            };
+            let max_offset = self.find_max_offset(topic, base).await?;
+            let next_offset = max_offset.checked_add(1).ok_or_else(|| QueueError::Write {
+                topic: topic.clone(),
+                offset: max_offset,
+                source: "offset space exhausted during recovery (u64::MAX reached)".into(),
+            })?;
+            self.set_offset(topic, next_offset).await;
+            info!("Recovered topic '{}': next offset = {}", topic, next_offset);
         }
 
         if !topics.is_empty() {
@@ -968,7 +1072,7 @@ mod tests {
         let writer = QueueWriter::new(config, store);
 
         let (tx, rx) = channel(10);
-        let _handle = writer.start(rx);
+        let _handle = writer.start(rx).await.unwrap();
 
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -999,7 +1103,7 @@ mod tests {
         let writer = QueueWriter::new(config, store);
 
         let (tx, rx) = channel(10);
-        let handle = writer.start(rx);
+        let handle = writer.start(rx).await.unwrap();
 
         let (first_response_tx, first_response_rx) = oneshot::channel();
         tx.send(WriteRequest {
@@ -1088,7 +1192,7 @@ mod tests {
         let writer = QueueWriter::new(config, store);
 
         // Recovery on empty store should succeed
-        writer.recover().await.unwrap();
+        writer.recover_offsets().await.unwrap();
 
         // First write should start at offset 0
         let offset = writer.write_batches(&"logs".to_string(), vec![prepared_batch()]).await.unwrap();
@@ -1118,7 +1222,7 @@ mod tests {
         // Create new writer (simulating restart) and recover
         let config2 = QueueConfig::new("queue");
         let writer2 = QueueWriter::new(config2, store);
-        writer2.recover().await.unwrap();
+        writer2.recover_offsets().await.unwrap();
 
         // New write should continue from offset 3
         let offset = writer2
@@ -1151,7 +1255,7 @@ mod tests {
         // Create new writer and recover
         let config2 = QueueConfig::new("queue");
         let writer2 = QueueWriter::new(config2, store);
-        writer2.recover().await.unwrap();
+        writer2.recover_offsets().await.unwrap();
 
         // Writes should continue from recovered offsets
         let logs_offset = writer2
@@ -1182,7 +1286,7 @@ mod tests {
         // Simulate restart
         let config2 = QueueConfig::new("queue");
         let writer2 = QueueWriter::new(config2, store);
-        writer2.recover().await.unwrap();
+        writer2.recover_offsets().await.unwrap();
 
         let offset = writer2
             .write_batches(&"logs".to_string(), vec![prepared_batch()])
@@ -1215,7 +1319,7 @@ mod tests {
         // Create new writer (simulating restart) and recover
         let config2 = QueueConfig::new("queue");
         let writer2 = QueueWriter::new(config2, store);
-        writer2.recover().await.unwrap();
+        writer2.recover_offsets().await.unwrap();
 
         // New write should continue from offset 10 (after the last existing segment 9)
         let offset = writer2
@@ -1223,6 +1327,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(offset, 10);
+    }
+
+    /// A segment payload written straight into the store, bypassing the writer.
+    /// Recovery reads keys only, so one well-formed file serves every offset.
+    fn segment_payload() -> Bytes {
+        let props = WriterProperties::builder().build();
+        QueueWriter::batches_to_parquet(props, &[prepared_batch()]).unwrap()
+    }
+
+    /// Place a segment object for `topic` at `offset` under the `queue` base path.
+    async fn put_segment(store: &InMemory, topic: &str, offset: u64, payload: &Bytes) {
+        let path = Path::from(format!("queue/{}", SegmentId::new(topic, offset).to_relative_path()));
+        store.put(&path, PutPayload::from_bytes(payload.clone())).await.unwrap();
+    }
+
+    /// WAL cleanup deletes a contiguous tail, and it can leave a HOLE when a
+    /// later cycle stops early: here 400..499 is missing while 500..999 survives.
+    /// A point "does segment N exist" probe is not monotone across that hole and
+    /// settles on 399; the maximum must still come out as 999, or the writer
+    /// would overwrite live segments after a restart.
+    #[tokio::test]
+    async fn recovery_finds_the_maximum_across_a_hole_left_by_cleanup() {
+        let store = Arc::new(InMemory::new());
+        let payload = segment_payload();
+        for offset in (300..400).chain(500..1000) {
+            put_segment(&store, "logs", offset, &payload).await;
+        }
+
+        let writer = QueueWriter::new(QueueConfig::new("queue"), Arc::clone(&store) as _);
+        writer.recover_offsets().await.unwrap();
+
+        let offset = writer.write_batches(&"logs".to_string(), vec![prepared_batch()]).await.unwrap();
+        assert_eq!(offset, 1000);
+    }
+
+    /// Foreign objects sharing the topic prefix sort ABOVE every zero-padded
+    /// segment key (digits precede letters), so a listing filter that only
+    /// checks the `.parquet` suffix would report "a segment exists above N" for
+    /// every N and drive the search off the end of the offset space.
+    #[tokio::test]
+    async fn recovery_ignores_foreign_objects_under_the_topic_prefix() {
+        let store = Arc::new(InMemory::new());
+        let payload = segment_payload();
+        for offset in 0..3 {
+            put_segment(&store, "logs", offset, &payload).await;
+        }
+        for foreign in ["queue/logs/notes.parquet", "queue/logs/README.txt"] {
+            store
+                .put(&Path::from(foreign), PutPayload::from_bytes(payload.clone()))
+                .await
+                .unwrap();
+        }
+
+        let writer = QueueWriter::new(QueueConfig::new("queue"), Arc::clone(&store) as _);
+        writer.recover_offsets().await.unwrap();
+
+        let offset = writer.write_batches(&"logs".to_string(), vec![prepared_batch()]).await.unwrap();
+        assert_eq!(offset, 3);
+    }
+
+    /// One surviving segment is both the seed and the maximum: the counter
+    /// resumes right above it, not at zero and not past a probe of its own.
+    #[tokio::test]
+    async fn recovery_resumes_above_a_lone_surviving_segment() {
+        let store = Arc::new(InMemory::new());
+        put_segment(&store, "logs", 7, &segment_payload()).await;
+
+        let writer = QueueWriter::new(QueueConfig::new("queue"), Arc::clone(&store) as _);
+        writer.recover_offsets().await.unwrap();
+
+        let offset = writer.write_batches(&"logs".to_string(), vec![prepared_batch()]).await.unwrap();
+        assert_eq!(offset, 7 + 1);
+    }
+
+    /// Cleanup removed everything the Shifter had committed and the topic now
+    /// holds only older-looking segments: the committed offset is the floor, so
+    /// the counter resumes above IT rather than above the surviving segments —
+    /// reusing a committed offset would make the Shifter shift the same offset
+    /// twice with different content.
+    #[tokio::test]
+    async fn recovery_resumes_above_the_committed_offset_when_it_exceeds_every_segment() {
+        let store = Arc::new(InMemory::new());
+        let payload = segment_payload();
+        for offset in 0..3 {
+            put_segment(&store, "logs", offset, &payload).await;
+        }
+
+        let writer = QueueWriter::new(QueueConfig::new("queue"), Arc::clone(&store) as _)
+            .with_committed_offsets(HashMap::from([("logs".to_string(), 10)]));
+        writer.recover_offsets().await.unwrap();
+
+        let offset = writer.write_batches(&"logs".to_string(), vec![prepared_batch()]).await.unwrap();
+        assert_eq!(offset, 11);
+    }
+
+    /// The committed offset seeds the search, and segments still exist above it
+    /// with a hole in between. The true maximum wins over the seed.
+    #[tokio::test]
+    async fn recovery_finds_the_maximum_above_a_committed_offset_with_a_hole() {
+        let store = Arc::new(InMemory::new());
+        let payload = segment_payload();
+        for offset in (0..2).chain(100..106) {
+            put_segment(&store, "logs", offset, &payload).await;
+        }
+
+        let writer = QueueWriter::new(QueueConfig::new("queue"), Arc::clone(&store) as _)
+            .with_committed_offsets(HashMap::from([("logs".to_string(), 3)]));
+        writer.recover_offsets().await.unwrap();
+
+        let offset = writer.write_batches(&"logs".to_string(), vec![prepared_batch()]).await.unwrap();
+        assert_eq!(offset, 106);
+    }
+
+    /// A committed offset with an empty topic prefix is unresumable: something
+    /// downstream consumed segments the store says never existed. Recovery must
+    /// fail rather than pick a counter that could overwrite live data. The topic
+    /// has no prefix to discover either, so this also proves the committed map
+    /// itself drives the examination.
+    #[tokio::test]
+    async fn recovery_fails_when_a_committed_topic_has_no_segments() {
+        let store = Arc::new(InMemory::new());
+
+        let writer = QueueWriter::new(QueueConfig::new("queue"), store)
+            .with_committed_offsets(HashMap::from([("logs".to_string(), 5)]));
+
+        let error = writer
+            .recover_offsets()
+            .await
+            .expect_err("a committed topic with no segments must not recover");
+        assert!(matches!(error, QueueError::Recovery { .. }));
+    }
+
+    /// Recovery is what `start` runs before it spawns anything, so a queue whose
+    /// history cannot be resumed stops the caller's startup (in IceGate, the
+    /// ingest process reports readiness only once this returned a handle). A
+    /// writer started anyway would claim an offset that is already taken on its
+    /// first write, long after the process claimed to be up.
+    #[tokio::test]
+    async fn start_refuses_a_queue_whose_history_cannot_be_resumed() {
+        let store = Arc::new(InMemory::new());
+        let writer = QueueWriter::new(QueueConfig::new("queue"), Arc::clone(&store) as _)
+            .with_committed_offsets(HashMap::from([("logs".to_string(), 5)]));
+        let (_tx, rx) = channel(10);
+
+        let error = writer
+            .start(rx)
+            .await
+            .expect_err("an unresumable queue must not start the writer");
+
+        assert!(matches!(error, QueueError::Recovery { .. }));
+        let keys: Vec<Path> = store
+            .list(None)
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .expect("list the store");
+        assert!(keys.is_empty(), "no task may have run and written, got: {keys:?}");
+    }
+
+    /// `Some(0)` is a committed offset like any other — segment 0 was committed,
+    /// so an empty prefix is just as impossible as it is for a higher offset.
+    #[tokio::test]
+    async fn recovery_fails_when_committed_offset_zero_has_no_segments() {
+        let store = Arc::new(InMemory::new());
+
+        let writer = QueueWriter::new(QueueConfig::new("queue"), store)
+            .with_committed_offsets(HashMap::from([("logs".to_string(), 0)]));
+
+        let error = writer
+            .recover_offsets()
+            .await
+            .expect_err("committed offset 0 with no segments must not recover");
+        assert!(matches!(error, QueueError::Recovery { .. }));
     }
 
     #[tokio::test]

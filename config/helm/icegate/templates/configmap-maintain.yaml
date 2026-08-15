@@ -72,6 +72,33 @@ data:
           region: {{ .Values.maintain.gc.jobsmanager.storage.region | default .Values.aws.region | quote }}
           job_state_codec: {{ .Values.maintain.gc.jobsmanager.storage.jobStateCodec }}
           request_timeout_secs: {{ .Values.maintain.gc.jobsmanager.storage.requestTimeoutSecs }}
+    {{/* WAL cleanup reads the queue location from the same values block the
+         ingest and query ConfigMaps render, so all three address one queue. */}}
+    queue:
+      common:
+        base_path: {{ .Values.queue.common.basePath | quote }}
+    wal_cleanup:
+      enabled: {{ .Values.maintain.walCleanup.enabled }}
+      dry_run: {{ .Values.maintain.walCleanup.dryRun }}
+      logs_enabled: {{ .Values.maintain.walCleanup.topics.logs }}
+      spans_enabled: {{ .Values.maintain.walCleanup.topics.spans }}
+      metrics_enabled: {{ .Values.maintain.walCleanup.topics.metrics }}
+      operations_enabled: {{ .Values.maintain.walCleanup.topics.operations }}
+      keep_segments_count: {{ .Values.maintain.walCleanup.keepSegmentsCount }}
+      max_deletes_per_cycle: {{ .Values.maintain.walCleanup.maxDeletesPerCycle | int }}
+      delete_concurrency: {{ .Values.maintain.walCleanup.deleteConcurrency }}
+      cleanup_timeout_secs: {{ .Values.maintain.walCleanup.cleanupTimeoutSecs }}
+      jobsmanager:
+        scan_interval_secs: {{ .Values.maintain.walCleanup.jobsmanager.scanIntervalSecs }}
+        worker_count: {{ .Values.maintain.walCleanup.jobsmanager.workerCount }}
+        poll_interval_ms: {{ .Values.maintain.walCleanup.jobsmanager.pollIntervalMs }}
+        storage:
+          endpoint: {{ .Values.maintain.walCleanup.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          bucket: {{ .Values.maintain.walCleanup.jobsmanager.storage.bucket | quote }}
+          prefix: {{ .Values.maintain.walCleanup.jobsmanager.storage.prefix | quote }}
+          region: {{ .Values.maintain.walCleanup.jobsmanager.storage.region | default .Values.aws.region | quote }}
+          job_state_codec: {{ .Values.maintain.walCleanup.jobsmanager.storage.jobStateCodec }}
+          request_timeout_secs: {{ .Values.maintain.walCleanup.jobsmanager.storage.requestTimeoutSecs }}
     pricing:
       enabled: {{ .Values.maintain.pricing.enabled }}
       interval_secs: {{ .Values.maintain.pricing.intervalSecs }}

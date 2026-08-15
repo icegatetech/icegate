@@ -13,14 +13,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{TryStreamExt, stream::BoxStream};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use icegate_queue::{
-    ExtractField, ExtractedValue, FieldExtractor, ParquetQueueReader, QueueConfig, QueueWriter, SegmentsPlan,
-    WAL_ROW_GROUP_METADATA_KEY, WriteRequest, channel,
+    DeleteLimits, ExtractField, ExtractedValue, FieldExtractor, ParquetQueueReader, QueueCleaner, QueueConfig,
+    QueueError, QueueWriter, SegmentsPlan, WAL_ROW_GROUP_METADATA_KEY, WriteRequest, channel,
 };
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
-    PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
 };
 use tokio::{
     sync::{Notify, oneshot},
@@ -376,7 +376,7 @@ async fn test_list_segments() -> Result<(), Box<dyn std::error::Error>> {
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let batch = common::test_batch(10, 1)?;
     for _ in 0..5 {
@@ -417,7 +417,7 @@ async fn test_list_segments_with_offset() -> Result<(), Box<dyn std::error::Erro
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let batch = common::test_batch(10, 1)?;
     for _ in 0..5 {
@@ -469,7 +469,7 @@ async fn test_read_single_segment() -> Result<(), Box<dyn std::error::Error>> {
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let original_batch = common::test_batch(100, 5)?;
     let (response_tx, response_rx) = oneshot::channel();
@@ -515,7 +515,7 @@ async fn test_read_segment_uses_configured_record_batch_size() -> Result<(), Box
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let original_batch = common::test_batch(25, 1)?;
     let (response_tx, response_rx) = oneshot::channel();
@@ -560,7 +560,7 @@ async fn test_read_specific_row_groups() -> Result<(), Box<dyn std::error::Error
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let batch = common::test_batch(100, 3)?;
     let (response_tx, response_rx) = oneshot::channel();
@@ -604,7 +604,7 @@ async fn test_plan_segments_with_grouping() -> Result<(), Box<dyn std::error::Er
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     // Write 3 segments with single tenant_id per batch
     // This ensures each segment/row group has a unique tenant_id value
@@ -663,7 +663,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result() -> Result<(), Bo
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, base_store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     for _ in 0..8 {
         let batch = common::test_batch(200, 1)?;
@@ -761,7 +761,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_with_skewed_metada
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, base_store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     for _ in 0..8 {
         let batch = common::test_batch(200, 1)?;
@@ -854,7 +854,7 @@ async fn test_plan_segments_parallelism_preserves_plan_result_on_blocking_metada
     let config = QueueConfig::new("queue").with_max_row_group_size(2);
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, base_store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     for _ in 0..4 {
         // Build exactly 64 input row groups (2 rows each) to force blocking metadata path.
@@ -949,7 +949,7 @@ async fn test_plan_segments_parallel_fails_fast_on_metadata_error_without_partia
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, base_store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     for _ in 0..4 {
         let batch = common::test_batch(100, 1)?;
@@ -1000,7 +1000,7 @@ async fn test_plan_segments_parallel_fails_fast_on_non_first_metadata_error_with
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, base_store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     for _ in 0..4 {
         let batch = common::test_batch(100, 1)?;
@@ -1061,7 +1061,7 @@ async fn test_plan_segments_extracts_all_three_field_types() -> Result<(), Box<d
     let config = QueueConfig::new("queue").with_flush_interval_ms(50);
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     // Two row groups with disjoint account / timestamp / boundary — the
     // assertions below pin every extractor result to the *correct*
@@ -1163,5 +1163,271 @@ async fn test_plan_segments_extracts_all_three_field_types() -> Result<(), Box<d
     assert_extracted(0, "svc-a", (100, 400), &expected_boundary_a);
     assert_extracted(1, "svc-b", (900, 1_500), &expected_boundary_b);
 
+    Ok(())
+}
+
+/// Segments `0..SEEDED_SEGMENT_COUNT` written to a topic, of which
+/// `0..=RETENTION_DELETE_BOUND` are then removed by retention cleanup — the
+/// world a reader meets after the tail below a committed offset has been
+/// reclaimed.
+const SEEDED_SEGMENT_COUNT: u64 = 8;
+/// Inclusive bound retention cleanup deletes up to in [`seed_topic_with_deleted_tail`].
+const RETENTION_DELETE_BOUND: u64 = 4;
+/// Lowest offset surviving that cleanup.
+const LOWEST_SURVIVING_OFFSET: u64 = RETENTION_DELETE_BOUND + 1;
+
+/// Offset of the segment removed inside the range by
+/// [`seed_topic_with_a_missing_segment`].
+const MISSING_OFFSET: u64 = 5;
+
+/// Write [`SEEDED_SEGMENT_COUNT`] segments through the production writer.
+async fn write_segments(store: &Arc<dyn ObjectStore>, topic: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = QueueConfig::new("queue");
+    let (tx, rx) = channel(config.common.channel_capacity);
+    let writer = QueueWriter::new(config, store.clone());
+    let handle = writer.start(rx).await?;
+
+    for _ in 0..SEEDED_SEGMENT_COUNT {
+        let batch = common::test_batch(10, 1)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteRequest {
+            topic: topic.to_string(),
+            row_groups: common::prepared_row_groups(vec![batch]),
+            response_tx,
+            trace_context: None,
+        })
+        .await
+        .map_err(|_| "the writer closed the request channel")?;
+        assert!(response_rx.await?.is_success());
+    }
+    drop(tx);
+    handle.await??;
+    Ok(())
+}
+
+/// Write [`SEEDED_SEGMENT_COUNT`] segments and delete the tail at or below
+/// [`RETENTION_DELETE_BOUND`] through the production cleaner.
+async fn seed_topic_with_deleted_tail(
+    store: &Arc<dyn ObjectStore>,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_segments(store, topic).await?;
+
+    let summary = QueueCleaner::new("queue", store.clone())
+        .delete_segments_upto(
+            &topic.to_string(),
+            RETENTION_DELETE_BOUND,
+            &DeleteLimits {
+                max_deletes: 100,
+                concurrency: 4,
+                dry_run: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        summary.deleted, LOWEST_SURVIVING_OFFSET,
+        "the fixture must actually delete the tail the cases are about"
+    );
+    Ok(())
+}
+
+/// A reader asking from an offset whose segments retention has removed must be
+/// TOLD, not handed the survivors: a shorter list is indistinguishable from a
+/// complete one, and reading it as complete drops committed rows in silence.
+#[tokio::test]
+async fn listing_from_below_a_deleted_tail_reports_the_gap() -> Result<(), Box<dyn std::error::Error>> {
+    let (_container, store, _bucket) = common::setup_queue_test().await?;
+    seed_topic_with_deleted_tail(&store, "logs").await?;
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let error = reader
+        .list_segment_files(&"logs".to_string(), 0, &CancellationToken::new())
+        .await
+        .expect_err("a listing that starts above what was asked for must not pass as complete");
+
+    assert!(
+        matches!(
+            error,
+            QueueError::SegmentsGone {
+                requested_offset: 0,
+                lowest_offset: LOWEST_SURVIVING_OFFSET,
+                ..
+            }
+        ),
+        "expected SegmentsGone(0, {LOWEST_SURVIVING_OFFSET}), got: {error}"
+    );
+    Ok(())
+}
+
+/// The shift path reads the same listing and must fail the same way: planning a
+/// truncated set of segments would commit the queue past rows that were never
+/// read.
+#[tokio::test]
+async fn planning_from_below_a_deleted_tail_reports_the_gap() -> Result<(), Box<dyn std::error::Error>> {
+    let (_container, store, _bucket) = common::setup_queue_test().await?;
+    seed_topic_with_deleted_tail(&store, "logs").await?;
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let error = reader
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &CancellationToken::new())
+        .await
+        .expect_err("a plan over a truncated segment set must not be built");
+
+    assert!(
+        matches!(
+            error,
+            QueueError::SegmentsGone {
+                requested_offset: 0,
+                lowest_offset: LOWEST_SURVIVING_OFFSET,
+                ..
+            }
+        ),
+        "expected SegmentsGone(0, {LOWEST_SURVIVING_OFFSET}), got: {error}"
+    );
+    Ok(())
+}
+
+/// The same store, asked from the lowest surviving offset: nothing is missing,
+/// so the reader answers with every segment left.
+#[tokio::test]
+async fn listing_from_the_lowest_surviving_offset_returns_every_segment() -> Result<(), Box<dyn std::error::Error>> {
+    let (_container, store, _bucket) = common::setup_queue_test().await?;
+    seed_topic_with_deleted_tail(&store, "logs").await?;
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let files = reader
+        .list_segment_files(&"logs".to_string(), LOWEST_SURVIVING_OFFSET, &CancellationToken::new())
+        .await?;
+
+    let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
+    assert_eq!(
+        paths,
+        (LOWEST_SURVIVING_OFFSET..SEEDED_SEGMENT_COUNT)
+            .map(|offset| format!("queue/logs/{offset:0>20}.parquet"))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// Write [`SEEDED_SEGMENT_COUNT`] segments and remove [`MISSING_OFFSET`] from
+/// the middle of them.
+///
+/// That is the state retention cleanup leaves when the store refuses one
+/// segment and the cycle steps over it: the neighbours below and above are gone
+/// or kept independently of it, so the surviving run has a hole rather than a
+/// higher floor. The key is deleted directly because the cleaner's bound is
+/// inclusive and cannot single out one offset.
+async fn seed_topic_with_a_missing_segment(
+    store: &Arc<dyn ObjectStore>,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_segments(store, topic).await?;
+    store
+        .delete(&Path::from(format!("queue/{topic}/{MISSING_OFFSET:0>20}.parquet")))
+        .await?;
+
+    let remaining = store.list(Some(&Path::from(format!("queue/{topic}")))).count().await;
+    assert_eq!(
+        remaining,
+        usize::try_from(SEEDED_SEGMENT_COUNT - 1)?,
+        "the fixture must leave exactly one hole"
+    );
+    Ok(())
+}
+
+/// A segment removed from the MIDDLE of the range costs the caller the same
+/// rows as one removed below it, and is just as invisible in the answer: the
+/// segments above the hole would be read as following the ones below it. The
+/// reader must report it instead of handing over the shorter list.
+#[tokio::test]
+async fn listing_across_a_missing_segment_reports_the_gap() -> Result<(), Box<dyn std::error::Error>> {
+    let (_container, store, _bucket) = common::setup_queue_test().await?;
+    seed_topic_with_a_missing_segment(&store, "logs").await?;
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let error = reader
+        .list_segment_files(&"logs".to_string(), 0, &CancellationToken::new())
+        .await
+        .expect_err("a listing broken in the middle must not pass as complete");
+
+    assert!(
+        matches!(
+            error,
+            QueueError::SegmentMissing {
+                requested_offset: 0,
+                missing_offset: MISSING_OFFSET,
+                ..
+            }
+        ),
+        "expected SegmentMissing(0, {MISSING_OFFSET}), got: {error}"
+    );
+    Ok(())
+}
+
+/// The shift path reads the same listing and must fail the same way: planning
+/// across the hole would commit the queue past rows that were never read.
+#[tokio::test]
+async fn planning_across_a_missing_segment_reports_the_gap() -> Result<(), Box<dyn std::error::Error>> {
+    let (_container, store, _bucket) = common::setup_queue_test().await?;
+    seed_topic_with_a_missing_segment(&store, "logs").await?;
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let error = reader
+        .plan_segments(&"logs".to_string(), 0, &tenant_fields(), &CancellationToken::new())
+        .await
+        .expect_err("a plan across a hole must not be built");
+
+    assert!(
+        matches!(
+            error,
+            QueueError::SegmentMissing {
+                requested_offset: 0,
+                missing_offset: MISSING_OFFSET,
+                ..
+            }
+        ),
+        "expected SegmentMissing(0, {MISSING_OFFSET}), got: {error}"
+    );
+    Ok(())
+}
+
+/// The other side of the same hole: asked from the offset right above it, the
+/// listing is an unbroken run again and must be answered, not refused. A check
+/// that fired on any absent offset would leave the topic unreadable for good.
+#[tokio::test]
+async fn listing_from_above_a_missing_segment_returns_every_segment() -> Result<(), Box<dyn std::error::Error>> {
+    let (_container, store, _bucket) = common::setup_queue_test().await?;
+    seed_topic_with_a_missing_segment(&store, "logs").await?;
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    let files = reader
+        .list_segment_files(&"logs".to_string(), MISSING_OFFSET + 1, &CancellationToken::new())
+        .await?;
+
+    let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
+    assert_eq!(
+        paths,
+        (MISSING_OFFSET + 1..SEEDED_SEGMENT_COUNT)
+            .map(|offset| format!("queue/logs/{offset:0>20}.parquet"))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// A topic holding nothing at or above the requested offset is the steady state
+/// of a queue its consumer has caught up with, not a gap.
+#[tokio::test]
+async fn listing_a_topic_with_nothing_above_the_offset_is_empty_not_an_error() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_container, store, _bucket) = common::setup_queue_test().await?;
+
+    let reader = ParquetQueueReader::new("queue", store, 8192)?;
+    for start_offset in [0, LOWEST_SURVIVING_OFFSET, u64::MAX] {
+        let files = reader
+            .list_segment_files(&"logs".to_string(), start_offset, &CancellationToken::new())
+            .await?;
+        assert!(files.is_empty(), "an untouched topic holds nothing at {start_offset}");
+    }
     Ok(())
 }

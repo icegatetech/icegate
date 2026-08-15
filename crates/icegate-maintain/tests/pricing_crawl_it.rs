@@ -21,7 +21,7 @@ use common::{BUCKET_NAME, build_s3_catalog};
 use futures::TryStreamExt;
 use iceberg::Catalog;
 use icegate_common::{PRICES_TABLE, icegate_table_ident};
-use icegate_maintain::compact::config::{CompactionJobsManagerConfig, JobStateCodec, JobsStorageConfig};
+use icegate_maintain::jobs::{JobStateCodec, JobsManagerConfig, JobsStorageConfig};
 use icegate_maintain::migrate::config::SnapshotExpirationConfig;
 use icegate_maintain::migrate::operations::create_tables;
 use icegate_maintain::pricing::PricingRunner;
@@ -284,7 +284,7 @@ async fn pricing_runner_builds_starts_and_drains() {
             url: "http://127.0.0.1:1/model_prices.json".to_string(),
             owns: None,
         }],
-        jobsmanager: CompactionJobsManagerConfig {
+        jobsmanager: JobsManagerConfig {
             worker_count: 1,
             poll_interval_ms: 100,
             scan_interval_secs: 1,

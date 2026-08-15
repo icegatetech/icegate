@@ -32,4 +32,8 @@ pub mod tempo;
 /// TraceQL query language implementation
 pub mod traceql;
 
+/// Doubles and bootstrap shared by the crate's inline tests.
+#[cfg(test)]
+mod test_support;
+
 pub use config::QueryConfig;

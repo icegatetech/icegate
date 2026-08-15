@@ -5,244 +5,14 @@
 //! both background data-movement loops, but every field is optional in the
 //! config file via `#[serde(default)]` so a minimal config still loads.
 
-use std::time::Duration;
-
-use jobmanager::{JobStateCodecKind, S3StorageConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MaintainError;
+use crate::jobs::JobsManagerConfig;
 
-/// Job state serialization format.
-///
-/// Mirrors ingest's shift codec selection so the on-disk job-state encoding is
-/// configured identically for both background loops.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum JobStateCodec {
-    /// JSON-encoded job state.
-    #[default]
-    Json,
-    /// CBOR-encoded job state.
-    Cbor,
-}
-
-impl From<JobStateCodec> for JobStateCodecKind {
-    fn from(codec: JobStateCodec) -> Self {
-        match codec {
-            JobStateCodec::Json => Self::Json,
-            JobStateCodec::Cbor => Self::Cbor,
-        }
-    }
-}
-
-/// Job storage configuration for compaction operations.
-///
-/// Maintain-local mirror of ingest's `shift::config::JobsStorageConfig`. It is
-/// duplicated rather than imported because `icegate-maintain` depends only on
-/// `icegate-common` and `jobmanager`; pulling in `icegate-ingest` solely for
-/// this struct would couple maintenance to the ingest/WAL crate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct JobsStorageConfig {
-    /// S3 endpoint URL. Its scheme selects TLS: `https://` connects over TLS, `http://` does not.
-    pub endpoint: String,
-    /// Bucket name for job state.
-    pub bucket: String,
-    /// Prefix for job state objects.
-    pub prefix: String,
-    /// AWS region name.
-    pub region: String,
-    /// Job state serialization codec.
-    pub job_state_codec: JobStateCodec,
-    /// Request timeout for S3 operations, in seconds.
-    pub request_timeout_secs: u64,
-    /// Access key ID for S3 (falls back to env if not set).
-    pub access_key_id: Option<String>,
-    /// Secret access key for S3 (falls back to env if not set).
-    pub secret_access_key: Option<String>,
-}
-
-impl Default for JobsStorageConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: String::new(),
-            bucket: String::new(),
-            prefix: "compactor".to_string(),
-            region: "us-east-1".to_string(),
-            job_state_codec: JobStateCodec::default(),
-            request_timeout_secs: 5,
-            access_key_id: None,
-            secret_access_key: None,
-        }
-    }
-}
-
-impl JobsStorageConfig {
-    /// Validate job storage configuration values.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MaintainError::Config`] if any required field is empty or the
-    /// request timeout is zero.
-    pub fn validate(&self) -> Result<(), MaintainError> {
-        if self.endpoint.trim().is_empty() {
-            return Err(MaintainError::Config(
-                "compaction.jobsmanager.storage.endpoint cannot be empty".to_string(),
-            ));
-        }
-        if self.bucket.trim().is_empty() {
-            return Err(MaintainError::Config(
-                "compaction.jobsmanager.storage.bucket cannot be empty".to_string(),
-            ));
-        }
-        if self.prefix.trim().is_empty() {
-            return Err(MaintainError::Config(
-                "compaction.jobsmanager.storage.prefix cannot be empty".to_string(),
-            ));
-        }
-        if self.region.trim().is_empty() {
-            return Err(MaintainError::Config(
-                "compaction.jobsmanager.storage.region cannot be empty".to_string(),
-            ));
-        }
-        if self.request_timeout_secs == 0 {
-            return Err(MaintainError::Config(
-                "compaction.jobsmanager.storage.request_timeout_secs must be greater than zero".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Convert to a jobmanager [`S3StorageConfig`].
-    ///
-    /// Credentials are taken from the explicit fields when set, otherwise from
-    /// the `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MaintainError::Config`] if credentials are configured as empty
-    /// strings or cannot be resolved from the environment.
-    pub fn to_s3_storage_config(&self) -> Result<S3StorageConfig, MaintainError> {
-        let access_key_id = self.resolve_access_key_id()?;
-        let secret_access_key = self.resolve_secret_access_key()?;
-
-        Ok(S3StorageConfig::new(
-            self.endpoint.as_str(),
-            access_key_id,
-            secret_access_key,
-            self.bucket.as_str(),
-            self.region.as_str(),
-        )
-        .with_bucket_prefix(self.prefix.as_str())
-        .with_job_state_codec(self.job_state_codec.into())
-        .with_request_timeout(Duration::from_secs(self.request_timeout_secs)))
-    }
-
-    fn resolve_access_key_id(&self) -> Result<String, MaintainError> {
-        Self::resolve_credential(
-            self.access_key_id.as_deref(),
-            "AWS_ACCESS_KEY_ID",
-            "compaction.jobsmanager.storage.access_key_id",
-        )
-    }
-
-    fn resolve_secret_access_key(&self) -> Result<String, MaintainError> {
-        Self::resolve_credential(
-            self.secret_access_key.as_deref(),
-            "AWS_SECRET_ACCESS_KEY",
-            "compaction.jobsmanager.storage.secret_access_key",
-        )
-    }
-
-    /// Resolve a credential from an explicit value or an environment variable.
-    ///
-    /// `explicit` is the optional value from the config file, `env_var` is the
-    /// AWS environment variable to fall back to, and `field` names the config
-    /// field for error messages.
-    fn resolve_credential(explicit: Option<&str>, env_var: &str, field: &str) -> Result<String, MaintainError> {
-        if let Some(value) = explicit {
-            if value.trim().is_empty() {
-                return Err(MaintainError::Config(format!("{field} cannot be empty")));
-            }
-            return Ok(value.to_string());
-        }
-
-        let value = std::env::var(env_var)
-            .map_err(|_| MaintainError::Config(format!("{env_var} environment variable is not set")))?;
-        if value.trim().is_empty() {
-            return Err(MaintainError::Config(format!(
-                "{env_var} environment variable is empty"
-            )));
-        }
-        Ok(value)
-    }
-}
-
-/// Default number of concurrent rewrite workers.
-///
-/// Mirrors ingest's `default_jobs_manager_worker_count`: half of the available
-/// CPU parallelism (rounded up), leaving headroom for other work on the node.
-fn default_worker_count() -> usize {
-    std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get().div_ceil(2))
-}
-
-/// Jobs-manager settings for the compaction service.
-///
-/// Mirrors ingest's `shift::config::ShiftJobsManagerConfig` so both background
-/// loops expose operators the same
-/// `jobsmanager.{worker_count, poll_interval_ms, scan_interval_secs, storage}`
-/// shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CompactionJobsManagerConfig {
-    /// Number of concurrent rewrite tasks (jobmanager `JobsManagerConfig.worker_count`).
-    pub worker_count: usize,
-    /// Jobmanager worker poll interval, in milliseconds.
-    pub poll_interval_ms: u64,
-    /// Period of the discovery loop, in seconds (maps to the jobmanager
-    /// iteration interval).
-    pub scan_interval_secs: u64,
-    /// Jobs-state storage (S3), the same shape ingest's shift uses.
-    pub storage: JobsStorageConfig,
-}
-
-impl Default for CompactionJobsManagerConfig {
-    fn default() -> Self {
-        Self {
-            worker_count: default_worker_count(),
-            poll_interval_ms: 1_000,
-            scan_interval_secs: 300,
-            storage: JobsStorageConfig::default(),
-        }
-    }
-}
-
-impl CompactionJobsManagerConfig {
-    /// Validate the jobs-manager tunables and the job-state storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MaintainError::Config`] if a tunable is zero or the
-    /// [`JobsStorageConfig`] is invalid.
-    pub fn validate(&self) -> Result<(), MaintainError> {
-        if self.worker_count == 0 {
-            return Err(MaintainError::Config(
-                "compaction.jobsmanager.worker_count must be greater than zero".to_string(),
-            ));
-        }
-        if self.poll_interval_ms == 0 {
-            return Err(MaintainError::Config(
-                "compaction.jobsmanager.poll_interval_ms must be greater than zero".to_string(),
-            ));
-        }
-        if self.scan_interval_secs == 0 {
-            return Err(MaintainError::Config(
-                "compaction.jobsmanager.scan_interval_secs must be greater than zero".to_string(),
-            ));
-        }
-        self.storage.validate()
-    }
-}
+/// Config block the compaction service's tunables are read from, used in
+/// validation messages.
+pub(crate) const COMPACTION_CONFIG_BLOCK: &str = "compaction";
 
 /// Data-compaction tunables: how small Parquet data files are discovered,
 /// bin-packed into rewrite groups, and rewritten into fewer, larger files.
@@ -273,7 +43,7 @@ pub struct DataCompactionConfig {
     pub max_merge_size_ratio: u64,
     /// Deadline for a single REWRITE task (merge + encode + commit), in seconds.
     ///
-    /// Kept separate from [`CompactionJobsManagerConfig::scan_interval_secs`] so a
+    /// Kept separate from [`JobsManagerConfig::scan_interval_secs`] so a
     /// rewrite that legitimately runs longer than the discovery period is not
     /// declared expired — which would let another worker pick it up and duplicate
     /// the in-flight rewrite. Size it to a worst-case group: reading
@@ -453,7 +223,7 @@ pub struct CompactionConfig {
     pub manifest: ManifestCompactionConfig,
     /// Jobs-manager settings (worker pool, discovery interval, job-state storage),
     /// nested to mirror ingest's `shift.jobsmanager`.
-    pub jobsmanager: CompactionJobsManagerConfig,
+    pub jobsmanager: JobsManagerConfig,
 }
 
 impl Default for CompactionConfig {
@@ -466,7 +236,7 @@ impl Default for CompactionConfig {
             operations_enabled: true,
             data: DataCompactionConfig::default(),
             manifest: ManifestCompactionConfig::default(),
-            jobsmanager: CompactionJobsManagerConfig::default(),
+            jobsmanager: JobsManagerConfig::default(),
         }
     }
 }
@@ -484,17 +254,18 @@ impl CompactionConfig {
     /// # Errors
     ///
     /// Returns [`MaintainError::Config`] if any tunable is out of range or the
-    /// [`JobsStorageConfig`] is invalid.
+    /// [`JobsManagerConfig`] is invalid.
     pub fn validate(&self) -> Result<(), MaintainError> {
         self.data.validate()?;
         self.manifest.validate()?;
-        self.jobsmanager.validate()
+        self.jobsmanager.validate(COMPACTION_CONFIG_BLOCK)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobsStorageConfig;
 
     #[test]
     fn defaults_are_sane() {
@@ -512,24 +283,18 @@ mod tests {
         assert_eq!(c.manifest.rewrite_timeout_secs, 600);
     }
 
-    #[test]
-    fn default_worker_count_matches_available_parallelism() {
-        let c = CompactionConfig::default();
-        assert_eq!(c.jobsmanager.worker_count, default_worker_count());
-    }
-
     /// Defaults plus a populated job-state storage. The default `JobsStorageConfig`
     /// has empty endpoint/bucket (a real deployment must set them), so a bare
     /// default does not validate; tests of the numeric tunables start from here.
     fn valid_config() -> CompactionConfig {
         CompactionConfig {
-            jobsmanager: CompactionJobsManagerConfig {
+            jobsmanager: JobsManagerConfig {
                 storage: JobsStorageConfig {
                     endpoint: "http://localhost:9000".to_string(),
                     bucket: "jobs".to_string(),
                     ..JobsStorageConfig::default()
                 },
-                ..CompactionJobsManagerConfig::default()
+                ..JobsManagerConfig::default()
             },
             ..CompactionConfig::default()
         }

@@ -26,7 +26,7 @@ use icegate_common::{
     catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
     list_data_files_with_stats,
     parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS},
-    resolve_wal_offset,
+    resolve_committed_offset,
     schema::{logs_partition_spec, logs_schema, logs_sort_order},
     testing::{S3TestContainer, create_s3_bucket, create_s3_object_store},
 };
@@ -98,7 +98,7 @@ async fn write_wal_segments(storage: &ObjectStorage, base_path: &str) -> Arc<Par
     let writer = QueueWriter::new(queue_config, Arc::clone(&store))
         .with_bloom_filter_columns(HashMap::from([(LOGS_TOPIC.to_string(), LOGS_BLOOM_COLUMNS)]))
         .with_column_encodings(HashMap::from([(LOGS_TOPIC.to_string(), LOGS_COLUMN_ENCODINGS)]));
-    let writer_handle = writer.start(write_rx);
+    let writer_handle = writer.start(write_rx).await.expect("start WAL writer");
 
     for (segment_idx, batch) in two_tenant_ingest_batches().into_iter().enumerate() {
         // Two row groups per segment, so a shift task has something to merge across row groups
@@ -199,7 +199,7 @@ async fn wait_for_committed_offset(catalog: &Arc<dyn Catalog>, ident: &TableIden
     let deadline = Instant::now() + COMMIT_TIMEOUT;
     loop {
         let table = catalog.load_table(ident).await.expect("load logs table");
-        if let Some(offset) = resolve_wal_offset(table.metadata()).expect("read committed WAL offset") {
+        if let Some(offset) = resolve_committed_offset(table.metadata()).expect("read committed WAL offset") {
             return offset;
         }
         assert!(

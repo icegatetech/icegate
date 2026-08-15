@@ -1,9 +1,14 @@
-//! Background orphan-file garbage collection for Iceberg tables.
+//! Background reclamation of orphan Iceberg files.
 //!
-//! The garbage collector lists each table's object-storage prefix and deletes
+//! The orphan collector lists each table's object-storage prefix and deletes
 //! data and metadata files that the current table metadata no longer references
 //! and that are older than a grace period. It mirrors [`crate::compact`]: one
 //! jobmanager job per enabled table, run on a scan interval.
+//!
+//! The other deletion loop of the deployment, WAL segment cleanup, runs on its
+//! own pool ([`crate::wal_cleanup::runner`]) — a sweep may hold a worker for up to
+//! `gc.orphans.sweep_timeout_secs`, which would make the cleanup interval a
+//! lower bound rather than a cadence.
 
 /// GC configuration: grace period, table list, and scan interval.
 pub mod config;
@@ -29,7 +34,7 @@ use jobmanager::{
 use tracing::{Instrument, info_span};
 
 use crate::error::{MaintainError, Result};
-use crate::gc::config::{GcConfig, GcOrphansConfig};
+use crate::gc::config::{GC_CONFIG_BLOCK, GcConfig, GcOrphansConfig};
 use crate::gc::metrics::GcMetrics;
 use crate::gc::sweep::run_sweep;
 
@@ -47,6 +52,9 @@ struct GcTableSpec {
 
 /// Build the per-table specs for the enabled tables.
 fn enabled_gc_tables(config: &GcConfig) -> Vec<GcTableSpec> {
+    if !config.enabled {
+        return Vec::new();
+    }
     let mut specs = Vec::new();
     if config.logs_enabled {
         specs.push(GcTableSpec {
@@ -135,6 +143,16 @@ impl TaskExecutor for GcExecutor {
     }
 }
 
+/// Everything the runner registers jobs from, beside the catalog.
+pub struct GcRunnerSpec {
+    /// The process's operator registry: every table's sweep resolves its store
+    /// through it, so one bucket costs one `OpenDAL` operator no matter how many
+    /// tables are swept how often.
+    pub operator_registry: Arc<OperatorRegistry>,
+    /// Orphan-sweep configuration.
+    pub config: GcConfig,
+}
+
 /// Runs orphan-file garbage collection inside the maintain process.
 pub struct GcRunner {
     manager: JobsManager,
@@ -146,22 +164,15 @@ pub struct GcRunnerHandle {
 }
 
 impl GcRunner {
-    /// Build a runner with one GC job per enabled table.
-    ///
-    /// `operator_registry` is the process's registry: every table's sweep
-    /// resolves its store through it, so one bucket costs one `OpenDAL`
-    /// operator no matter how many tables are swept how often.
+    /// Build a runner with one orphan-sweep job per enabled table, as
+    /// [`GcRunnerSpec`] describes them.
     ///
     /// # Errors
     ///
-    /// Returns [`MaintainError`] if the config is invalid, no tables are enabled,
-    /// or the jobmanager storage cannot be constructed.
-    pub async fn new(
-        catalog: Arc<dyn Catalog>,
-        operator_registry: Arc<OperatorRegistry>,
-        config: &GcConfig,
-    ) -> Result<Self> {
-        Self::new_with_max_iterations(catalog, operator_registry, config, None).await
+    /// Returns [`MaintainError`] if the config block is invalid, no table is
+    /// enabled, or the jobmanager storage cannot be constructed.
+    pub async fn new(catalog: Arc<dyn Catalog>, spec: GcRunnerSpec) -> Result<Self> {
+        Self::new_with_max_iterations(catalog, spec, None).await
     }
 
     /// Test seam: like [`Self::new`] but caps each job at `max_iterations`
@@ -173,15 +184,19 @@ impl GcRunner {
     #[doc(hidden)]
     pub async fn new_with_max_iterations(
         catalog: Arc<dyn Catalog>,
-        operator_registry: Arc<OperatorRegistry>,
-        config: &GcConfig,
+        spec: GcRunnerSpec,
         max_iterations: Option<u64>,
     ) -> Result<Self> {
+        let GcRunnerSpec {
+            operator_registry,
+            config,
+        } = spec;
         config.validate()?;
-        let specs = enabled_gc_tables(config);
+        let specs = enabled_gc_tables(&config);
         if specs.is_empty() {
             return Err(MaintainError::Config(
-                "no gc tables enabled: at least one of logs/spans/events/metrics/operations must be enabled"
+                "no gc jobs enabled: enable gc for at least one of \
+                 logs/spans/events/metrics/operations"
                     .to_string(),
             ));
         }
@@ -196,7 +211,7 @@ impl GcRunner {
         // not this job-execution machinery. Binds to the global meter installed by
         // `MetricsRuntime`; inert when metrics are disabled (no provider set).
         let mut builder = JobsManager::builder()
-            .s3(config.jobsmanager.storage.to_s3_storage_config()?)
+            .s3(config.jobsmanager.storage.to_s3_storage_config(GC_CONFIG_BLOCK)?)
             .workers(config.jobsmanager.worker_count)
             .poll_interval(Duration::from_millis(config.jobsmanager.poll_interval_ms))
             .metrics(Arc::new(OtelMetrics::new(&opentelemetry::global::meter(
@@ -250,4 +265,31 @@ impl GcRunnerHandle {
 /// duration overflow) into [`MaintainError::Config`].
 fn map_job_error<E: std::fmt::Display>(error: E) -> MaintainError {
     MaintainError::Config(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enabled_gc_tables;
+    use crate::gc::config::GcConfig;
+
+    /// The master switch is honoured where the jobs are built, so a disabled
+    /// block registers no sweep at all rather than five no-op tasks.
+    #[test]
+    fn a_disabled_block_registers_no_sweep_job() {
+        assert!(enabled_gc_tables(&GcConfig::default()).is_empty());
+    }
+
+    /// All five tables, and only the enabled ones.
+    #[test]
+    fn every_enabled_table_gets_a_sweep_job() {
+        let config = GcConfig {
+            enabled: true,
+            events_enabled: false,
+            ..GcConfig::default()
+        };
+
+        let tables: Vec<&str> = enabled_gc_tables(&config).iter().map(|spec| spec.table).collect();
+
+        assert_eq!(tables, vec!["logs", "spans", "metrics", "operations"]);
+    }
 }

@@ -1,8 +1,13 @@
 //! Loki API routes
 
-use axum::{Router, routing::get};
+use std::time::Duration;
+
+use axum::{Router, http::StatusCode, routing::get};
 use icegate_common::{MemoryPressure, ShedPolicy, default_shed_response, shed_when_pressured};
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tower_http::{
+    timeout::TimeoutLayer,
+    trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
+};
 use tracing::Level;
 
 use super::{handlers, server::LokiState};
@@ -12,8 +17,20 @@ use super::{handlers, server::LokiState};
 /// when it is recovering.
 const LOKI_SHED_BYPASS: &[&str] = &["/ready"];
 
-/// Create Loki API router
+/// HTTP status returned when a request exceeds the configured query duration.
+/// Matches the Tempo router: Grafana reads `503` as a transient upstream
+/// failure rather than a malformed query.
+const TIMEOUT_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
+
+/// Create Loki API router.
+///
+/// Every route carries a [`TimeoutLayer`] set to
+/// `engine.max_query_duration_secs`. The handlers build their whole JSON
+/// response before returning, so the layer bounds execution and not just
+/// response construction — which is what lets WAL retention be derived from
+/// the same number (see [`crate::engine::QueryEngineConfig`]).
 pub fn routes(state: LokiState, pressure: MemoryPressure) -> Router {
+    let query_timeout = Duration::from_secs(state.engine.config().max_query_duration_secs);
     Router::new()
         // Query endpoints (Loki API supports both GET and POST)
         .route("/loki/api/v1/query", get(handlers::query).post(handlers::query))
@@ -33,6 +50,7 @@ pub fn routes(state: LokiState, pressure: MemoryPressure) -> Router {
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
+        .layer(TimeoutLayer::with_status_code(TIMEOUT_STATUS, query_timeout))
         // Outermost layer: shed new requests before any handler work while the
         // process is under memory pressure (health probes bypass).
         .layer(axum::middleware::from_fn(move |req, next| {
@@ -138,5 +156,34 @@ mod tests {
         let app = routes(build_state().await, pressured_guard());
         let response = app.oneshot(get_request("/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Over real HTTP, not `oneshot`: the timeout is part of the Loki protocol
+    /// contract now, and a client has to see `503` rather than an open socket.
+    /// The catalog behind the engine never answers, so the request can only end
+    /// at the deadline.
+    #[tokio::test]
+    async fn a_query_exceeding_the_deadline_answers_503() {
+        let state = LokiState {
+            engine: crate::test_support::build_stalling_engine(1),
+            metrics: Arc::new(QueryMetrics::new_disabled()),
+        };
+        let (base_url, server) = crate::test_support::serve_router(routes(state, MemoryPressure::inert())).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/loki/api/v1/query_range"))
+            .query(&[
+                ("query", "{service_name=\"svc\"}"),
+                // Fixed nanosecond bounds: the window only has to parse, since
+                // the catalog never answers the scan behind it.
+                ("start", "1700000000000000000"),
+                ("end", "1700000060000000000"),
+            ])
+            .send()
+            .await
+            .expect("the server must answer, not hang");
+
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        server.abort();
     }
 }

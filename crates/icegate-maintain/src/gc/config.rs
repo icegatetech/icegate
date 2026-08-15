@@ -2,8 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compact::config::{CompactionJobsManagerConfig, JobsStorageConfig};
 use crate::error::MaintainError;
+use crate::jobs::{JobsManagerConfig, JobsStorageConfig};
+
+/// Config block the sweep's tunables are read from, used in validation
+/// messages.
+pub(crate) const GC_CONFIG_BLOCK: &str = "gc";
 
 /// Tunables for the orphan-file sweep (the only GC phase in this build).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,10 +87,10 @@ impl GcOrphansConfig {
 
 /// Configuration for the background orphan-file garbage collector.
 ///
-/// Reuses [`CompactionJobsManagerConfig`] for the worker pool and job-state
-/// storage so operators configure both background loops the same way. The
-/// `Default` here overrides the job-state `prefix` to `"gc"` and the discovery
-/// cadence to daily so GC never collides with compaction's job state.
+/// Carries the shared [`JobsManagerConfig`] for its worker pool and job-state
+/// storage, so every maintain service is configured the same way. The `Default`
+/// here overrides the job-state `prefix` to `"gc"` and the discovery cadence to
+/// daily so GC never collides with another service's job state.
 // The five `*_enabled` flags are independent per-table toggles, mirroring
 // `CompactionConfig`.
 #[allow(clippy::struct_excessive_bools)]
@@ -108,10 +112,10 @@ pub struct GcConfig {
     pub operations_enabled: bool,
     /// Orphan-sweep tunables.
     pub orphans: GcOrphansConfig,
-    /// Worker pool, discovery interval, and job-state storage. Reused from
-    /// compaction; the `Default` below sets a distinct `"gc"` storage prefix and
-    /// a daily `scan_interval_secs`.
-    pub jobsmanager: CompactionJobsManagerConfig,
+    /// Worker pool, discovery interval, and job-state storage. The `Default`
+    /// below sets a distinct `"gc"` storage prefix and a daily
+    /// `scan_interval_secs`.
+    pub jobsmanager: JobsManagerConfig,
 }
 
 impl Default for GcConfig {
@@ -124,13 +128,13 @@ impl Default for GcConfig {
             metrics_enabled: true,
             operations_enabled: true,
             orphans: GcOrphansConfig::default(),
-            jobsmanager: CompactionJobsManagerConfig {
+            jobsmanager: JobsManagerConfig {
                 scan_interval_secs: 86_400,
                 storage: JobsStorageConfig {
                     prefix: "gc".to_string(),
                     ..JobsStorageConfig::default()
                 },
-                ..CompactionJobsManagerConfig::default()
+                ..JobsManagerConfig::default()
             },
         }
     }
@@ -142,13 +146,10 @@ impl GcConfig {
     /// # Errors
     ///
     /// Returns [`MaintainError::Config`] if the orphan tunables or the
-    /// [`CompactionJobsManagerConfig`] are invalid. (Job-state storage errors
-    /// are reported with a `compaction.jobsmanager.storage.*` field path because
-    /// the validator is shared; the values come from the `[gc.jobsmanager]`
-    /// block.)
+    /// [`JobsManagerConfig`] are invalid.
     pub fn validate(&self) -> Result<(), MaintainError> {
         self.orphans.validate()?;
-        self.jobsmanager.validate()
+        self.jobsmanager.validate(GC_CONFIG_BLOCK)
     }
 }
 

@@ -16,7 +16,12 @@ catalog:
     disk_dir: /tmp/icegate/cache
     disk_size_mb: 4096
 
-engine: {}
+# Hard ceiling on one query's wall clock, enforced on Loki, Prometheus, Tempo and
+# Flight SQL. Together with `max_age_secs` (left at the icegate-query default) it
+# bounds how long a query can outlive the catalog provider it was planned
+# against, and so how far behind the committed WAL boundary a live reader can be.
+engine:
+  max_query_duration_secs: 30
 
 queue:
   common:

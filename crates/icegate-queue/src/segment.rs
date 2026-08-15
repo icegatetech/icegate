@@ -68,6 +68,39 @@ impl SegmentId {
     }
 }
 
+/// Builds the object store prefix holding one topic's segments under
+/// `base_path` (empty `base_path` means the store root).
+pub(crate) fn topic_prefix(base_path: &str, topic: &Topic) -> Path {
+    if base_path.is_empty() {
+        Path::from(format!("{topic}/"))
+    } else {
+        Path::from(format!("{base_path}/{topic}/"))
+    }
+}
+
+/// Parses the segment offset out of a listed object key, or `None` when the key
+/// is not a segment this crate produced.
+///
+/// Foreign objects do land under a topic prefix (a stray upload, a bucket shared
+/// with another tool), and they sort ABOVE every zero-padded segment key because
+/// digits precede letters — so a `.parquet` suffix check alone would let one
+/// answer for the segments. Every listing-driven path (recovery, cleanup,
+/// reading) therefore parses the key and skips what does not parse.
+pub(crate) fn parse_segment_offset(base_path: &str, location: &Path) -> Option<u64> {
+    let location_str = location.as_ref();
+    if !location_str.ends_with(".parquet") {
+        return None;
+    }
+    let relative_str = if base_path.is_empty() {
+        location_str
+    } else {
+        location_str.strip_prefix(&format!("{base_path}/"))?
+    };
+    SegmentId::from_relative_path(&Path::from(relative_str))
+        .ok()
+        .map(|segment_id| segment_id.offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

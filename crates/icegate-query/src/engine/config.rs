@@ -22,6 +22,9 @@ const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 15;
 /// Default maximum age (in seconds) before the cached provider is considered stale.
 const DEFAULT_MAX_AGE_SECS: u64 = 30;
 
+/// Default hard ceiling (in seconds) on a single query's wall-clock time.
+const DEFAULT_MAX_QUERY_DURATION_SECS: u64 = 30;
+
 /// Default Parquet metadata size hint in bytes for WAL file footer reads.
 ///
 /// 64 KB is large enough to capture the entire footer of typical WAL files
@@ -65,6 +68,20 @@ pub struct QueryEngineConfig {
     /// block on a synchronous rebuild. Must be >= `refresh_interval_secs`.
     pub max_age_secs: u64,
 
+    /// Hard ceiling (in seconds) on the wall-clock time a single query may take,
+    /// enforced at every transport (Loki, Prometheus, Tempo, Flight SQL).
+    ///
+    /// It bounds how long a query can outlive the catalog provider it was
+    /// planned against, and so how far behind the current WAL boundary a live
+    /// reader can be: a query planned on a provider of age `max_age_secs` reads
+    /// the WAL from the boundary THAT provider recorded, for up to this long
+    /// after. WAL cleanup keeps a fixed number of segments below the committed
+    /// offset for exactly those readers
+    /// (`maintain.wal_cleanup.keep_segments_count`);
+    /// how many segments that window amounts to depends on the ingest rate, so
+    /// nothing checks the two against each other.
+    pub max_query_duration_secs: u64,
+
     /// Whether to include WAL (hot) segments in query results.
     ///
     /// When `false` (default), queries only read committed Iceberg data.
@@ -93,6 +110,7 @@ impl Default for QueryEngineConfig {
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             max_age_secs: DEFAULT_MAX_AGE_SECS,
+            max_query_duration_secs: DEFAULT_MAX_QUERY_DURATION_SECS,
             wal_query_enabled: false,
             wal_metadata_size_hint: Some(DEFAULT_WAL_METADATA_SIZE_HINT),
         }
@@ -128,6 +146,11 @@ impl QueryEngineConfig {
                 "max_age_secs must be >= refresh_interval_secs".into(),
             ));
         }
+        if self.max_query_duration_secs == 0 {
+            return Err(QueryError::Config(
+                "max_query_duration_secs must be greater than 0".into(),
+            ));
+        }
         if let Some(hint) = self.wal_metadata_size_hint {
             if hint == 0 {
                 return Err(QueryError::Config(
@@ -136,5 +159,36 @@ impl QueryEngineConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryEngineConfig;
+    use crate::error::QueryError;
+
+    /// Zero is the one value of the query ceiling that is not a short ceiling
+    /// but a broken service: every transport turns it into a timeout layer that
+    /// has already expired, so Loki and Tempo answer 503 and Flight SQL breaks
+    /// every stream, on queries that were never given a chance to run.
+    #[test]
+    fn a_zero_query_ceiling_is_rejected() {
+        let config = QueryEngineConfig {
+            max_query_duration_secs: 0,
+            ..QueryEngineConfig::default()
+        };
+
+        assert!(matches!(config.validate(), Err(QueryError::Config(_))));
+    }
+
+    /// The shipped default has to be one the binary accepts, and it has to leave
+    /// a query real time: the value is stated here rather than read off the
+    /// constant the code uses, so a change to it has to be made deliberately.
+    #[test]
+    fn the_default_query_ceiling_is_thirty_seconds_and_validates() {
+        let config = QueryEngineConfig::default();
+
+        assert_eq!(config.max_query_duration_secs, 30);
+        config.validate().expect("the default config must load");
     }
 }

@@ -2,33 +2,33 @@
 //!
 //! The Shifter records the last committed WAL queue offset in each
 //! WAL-to-Iceberg commit's snapshot summary under
-//! [`WAL_OFFSET_PROPERTY`](crate::WAL_OFFSET_PROPERTY). Two independent readers
-//! need it back: the query engine (to find the WAL/Iceberg boundary) and the
-//! Shifter itself (to resume shifting where it left off).
+//! [`WAL_OFFSET_PROPERTY`](crate::WAL_OFFSET_PROPERTY). Three independent readers
+//! need it back: the query engine (to find the WAL/Iceberg boundary), the
+//! Shifter itself (to resume shifting where it left off), and WAL cleanup (to
+//! decide which segments Iceberg no longer needs).
 //!
 //! Compaction commits `replace` snapshots that do NOT carry the offset
 //! property, so the offset MUST be resolved by walking the snapshot parent
 //! chain back to the most recent commit that recorded it. Reading only the
 //! current snapshot loses the offset after any compaction; the Shifter would
 //! then resume from offset 0 and re-commit the entire WAL, duplicating every
-//! already-committed row. Centralising the walk here keeps both readers on the
+//! already-committed row. Centralising the walk here keeps every reader on the
 //! identical, compaction-safe resolution.
 
 use std::collections::HashSet;
 
-use iceberg::spec::TableMetadata;
+use iceberg::spec::{Snapshot, SnapshotRef, TableMetadata};
 
 use crate::WAL_OFFSET_PROPERTY;
 use crate::error::{CommonError, Result};
 
 /// Safety cap on the snapshot parent-chain walk. Cyclic parent references are
 /// caught separately by the visited-set on the first repeat (see the loop in
-/// [`resolve_wal_offset`]); this bound guards only against an unexpectedly deep
-/// but acyclic history.
+/// [`resolve_committed_offset`]); this bound guards only against an
+/// unexpectedly deep but acyclic history.
 const MAX_SNAPSHOT_WALK: u32 = 1000;
 
-/// Resolve the last committed WAL offset by walking the snapshot parent chain,
-/// gating against a silent "no offset" that would re-shift the entire WAL.
+/// Resolve the WAL offset the table's current snapshot records as committed.
 ///
 /// Starts at the current snapshot and follows `parent_snapshot_id` links,
 /// returning the first [`WAL_OFFSET_PROPERTY`](crate::WAL_OFFSET_PROPERTY)
@@ -62,7 +62,7 @@ const MAX_SNAPSHOT_WALK: u32 = 1000;
 /// offset means a snapshot bypassed the Shifter-sets / compaction-propagates
 /// invariant and must be repaired — recreating the table resets it to the fresh
 /// (offset-0) state.
-pub fn resolve_wal_offset(metadata: &TableMetadata) -> Result<Option<u64>> {
+pub fn resolve_committed_offset(metadata: &TableMetadata) -> Result<Option<u64>> {
     // No snapshot at all: a freshly created table. Resuming from offset 0 is
     // correct (nothing committed yet), so this is NOT a gate failure.
     let Some(mut snapshot) = metadata.current_snapshot() else {
@@ -76,14 +76,9 @@ pub fn resolve_wal_offset(metadata: &TableMetadata) -> Result<Option<u64>> {
     // current snapshot and returns before the first insert, so this set never
     // allocates on that hot path.
     let mut visited: HashSet<i64> = HashSet::new();
+
     loop {
-        if let Some(raw) = snapshot.summary().additional_properties.get(WAL_OFFSET_PROPERTY) {
-            let offset = raw.parse::<u64>().map_err(|e| {
-                CommonError::WalOffset(format!(
-                    "malformed {WAL_OFFSET_PROPERTY} value {raw:?} in snapshot {}: {e}",
-                    snapshot.snapshot_id()
-                ))
-            })?;
+        if let Some(offset) = read_snapshot_offset(snapshot)? {
             return Ok(Some(offset));
         }
         if !visited.insert(snapshot.snapshot_id()) {
@@ -100,30 +95,61 @@ pub fn resolve_wal_offset(metadata: &TableMetadata) -> Result<Option<u64>> {
                 snapshot.snapshot_id()
             )));
         }
-        // GATE: the chain reaches the root and the table HAS snapshots, yet no
-        // offset was found anywhere. A freshly created table has no snapshot and
-        // returned `Ok(None)` above, so reaching here means a snapshot bypassed
-        // the Shifter-sets / compaction-propagates invariant. Refuse to default
-        // to 0 (it would re-shift the whole WAL); fail so the state is repaired.
-        let Some(parent_id) = snapshot.parent_snapshot_id() else {
-            return Err(CommonError::WalOffset(format!(
-                "table has snapshot(s) but none in the chain from {} carry {WAL_OFFSET_PROPERTY}: \
-                 refusing to resume the WAL from offset 0 (would re-commit the entire queue and \
-                 duplicate every row). The Shifter sets this on every commit and compaction propagates \
-                 it; a missing value means a snapshot bypassed that invariant. A freshly created table \
-                 (no snapshot) legitimately starts at 0.",
-                snapshot.snapshot_id()
-            )));
-        };
-        let Some(parent) = metadata.snapshot_by_id(parent_id) else {
-            return Err(CommonError::WalOffset(format!(
-                "snapshot {} references parent {parent_id} absent from table metadata: cannot \
-                 determine the WAL offset; refusing to resume from 0",
-                snapshot.snapshot_id()
-            )));
-        };
-        snapshot = parent;
+        snapshot = resolve_parent_snapshot(metadata, snapshot)?;
     }
+}
+
+/// The offset `snapshot` records, if it carries one.
+///
+/// # Errors
+///
+/// Returns [`CommonError::WalOffset`] when the recorded value is not a `u64`:
+/// a malformed offset is never a silent `None`, which would re-shift the queue.
+fn read_snapshot_offset(snapshot: &Snapshot) -> Result<Option<u64>> {
+    snapshot
+        .summary()
+        .additional_properties
+        .get(WAL_OFFSET_PROPERTY)
+        .map(|raw| {
+            raw.parse::<u64>().map_err(|e| {
+                CommonError::WalOffset(format!(
+                    "malformed {WAL_OFFSET_PROPERTY} value {raw:?} in snapshot {}: {e}",
+                    snapshot.snapshot_id()
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// The next snapshot of the walk.
+///
+/// # Errors
+///
+/// Returns [`CommonError::WalOffset`] when the chain ends here — at the root, or
+/// at a `parent_snapshot_id` the metadata no longer holds (the shape snapshot
+/// expiration leaves behind, since it drops ancestors without rewriting the
+/// surviving snapshot's parent link). Reaching either means the table HAS
+/// snapshots yet none of them carries the offset, so a snapshot bypassed the
+/// Shifter-sets / compaction-propagates invariant. Defaulting to 0 there would
+/// re-commit the whole WAL, so the walk fails instead.
+fn resolve_parent_snapshot<'a>(metadata: &'a TableMetadata, snapshot: &Snapshot) -> Result<&'a SnapshotRef> {
+    let Some(parent_id) = snapshot.parent_snapshot_id() else {
+        return Err(CommonError::WalOffset(format!(
+            "table has snapshot(s) but none in the chain from {} carry {WAL_OFFSET_PROPERTY}: \
+             refusing to resume the WAL from offset 0 (would re-commit the entire queue and \
+             duplicate every row). The Shifter sets this on every commit and compaction propagates \
+             it; a missing value means a snapshot bypassed that invariant. A freshly created table \
+             (no snapshot) legitimately starts at 0.",
+            snapshot.snapshot_id()
+        )));
+    };
+    metadata.snapshot_by_id(parent_id).ok_or_else(|| {
+        CommonError::WalOffset(format!(
+            "snapshot {} references parent {parent_id} absent from table metadata: cannot \
+             determine the WAL offset; refusing to resume from 0",
+            snapshot.snapshot_id()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -135,7 +161,7 @@ mod tests {
         TableMetadataBuilder, Type, UnboundPartitionSpec,
     };
 
-    use super::resolve_wal_offset;
+    use super::resolve_committed_offset;
     use crate::WAL_OFFSET_PROPERTY;
 
     const TEST_LOCATION: &str = "s3://bucket/test/location";
@@ -201,7 +227,7 @@ mod tests {
     fn gate_errors_when_no_snapshot_in_chain_has_offset() {
         let metadata = metadata_with_chain(vec![snapshot(1, None, 1, None), snapshot(2, Some(1), 2, None)]);
 
-        assert!(resolve_wal_offset(&metadata).is_err());
+        assert!(resolve_committed_offset(&metadata).is_err());
     }
 
     /// A single offset-less snapshot (chain of length one, parent at root) also
@@ -210,7 +236,7 @@ mod tests {
     fn gate_errors_for_lone_snapshot_without_offset() {
         let metadata = metadata_with_chain(vec![snapshot(1, None, 1, None)]);
 
-        assert!(resolve_wal_offset(&metadata).is_err());
+        assert!(resolve_committed_offset(&metadata).is_err());
     }
 
     /// A cyclic `parent_snapshot_id` chain (corrupt metadata: a snapshot whose
@@ -220,7 +246,7 @@ mod tests {
     fn gate_errors_on_cyclic_parent_chain() {
         let metadata = metadata_with_chain(vec![snapshot(1, Some(1), 1, None)]);
 
-        assert!(resolve_wal_offset(&metadata).is_err());
+        assert!(resolve_committed_offset(&metadata).is_err());
     }
 
     /// When the current snapshot carries the offset, it is returned directly.
@@ -228,7 +254,7 @@ mod tests {
     fn resolves_offset_from_current_snapshot() {
         let metadata = metadata_with_chain(vec![snapshot(1, None, 1, Some(7))]);
 
-        assert_eq!(resolve_wal_offset(&metadata).expect("ok"), Some(7));
+        assert_eq!(resolve_committed_offset(&metadata).expect("ok"), Some(7));
     }
 
     /// The walk is preserved for catalogs that expose full snapshot history: when
@@ -241,7 +267,10 @@ mod tests {
             snapshot(2, Some(1), 2, None),  // compaction replace (no offset)
         ]);
 
-        assert_eq!(resolve_wal_offset(&metadata).expect("walks to ancestor"), Some(42));
+        assert_eq!(
+            resolve_committed_offset(&metadata).expect("walks to ancestor"),
+            Some(42)
+        );
     }
 
     /// A freshly created table has NO snapshot, so it resolves to `None` — the
@@ -251,7 +280,7 @@ mod tests {
     fn resolves_none_for_freshly_created_table() {
         let metadata = metadata_with_chain(vec![]);
 
-        assert_eq!(resolve_wal_offset(&metadata).expect("ok"), None);
+        assert_eq!(resolve_committed_offset(&metadata).expect("ok"), None);
     }
 
     /// A recorded offset that is not a valid `u64` is a hard error, never a
@@ -273,19 +302,18 @@ mod tests {
             .build();
         let metadata = metadata_with_chain(vec![bad]);
 
-        assert!(resolve_wal_offset(&metadata).is_err());
+        assert!(resolve_committed_offset(&metadata).is_err());
     }
 
     /// A snapshot whose `parent_snapshot_id` references an id ABSENT from the
-    /// metadata (corrupt history, or an ancestor expired out from under the
-    /// chain) cannot resolve the offset and must error on the `snapshot_by_id`
-    /// miss — never resume from 0.
+    /// metadata, with no offset resolved yet: the committed offset cannot be
+    /// determined at all, so the walk errors rather than resuming from 0.
     #[test]
-    fn gate_errors_when_parent_snapshot_absent_from_metadata() {
+    fn gate_errors_when_parent_snapshot_absent_and_no_offset_resolved() {
         // Single snapshot pointing at a parent id that was never added.
         let metadata = metadata_with_chain(vec![snapshot(1, Some(999), 1, None)]);
 
-        assert!(resolve_wal_offset(&metadata).is_err());
+        assert!(resolve_committed_offset(&metadata).is_err());
     }
 
     /// A linear chain of offset-less snapshots longer than `MAX_SNAPSHOT_WALK`
@@ -302,6 +330,30 @@ mod tests {
             .collect();
         let metadata = metadata_with_chain(chain);
 
-        assert!(resolve_wal_offset(&metadata).is_err());
+        assert!(resolve_committed_offset(&metadata).is_err());
+    }
+
+    /// A chain truncated by snapshot expiration: the oldest surviving snapshot
+    /// points at a parent the metadata no longer holds. Resolution still answers
+    /// from the current snapshot, which carries the offset — the walk never
+    /// reaches the severed link.
+    #[test]
+    fn a_chain_truncated_by_expiration_resolves_from_the_current_snapshot() {
+        let metadata = metadata_with_chain(vec![
+            snapshot(1, Some(999), 1, Some(10)),
+            snapshot(2, Some(1), 2, Some(20)),
+        ]);
+
+        assert_eq!(resolve_committed_offset(&metadata).expect("ok"), Some(20));
+    }
+
+    /// The other half of that case: a truncated chain whose reachable snapshots
+    /// carry no offset fails, because the value that decides whether the whole
+    /// queue is re-shifted was never resolved.
+    #[test]
+    fn a_truncated_chain_without_any_offset_errors() {
+        let metadata = metadata_with_chain(vec![snapshot(1, Some(999), 1, None), snapshot(2, Some(1), 2, None)]);
+
+        assert!(resolve_committed_offset(&metadata).is_err());
     }
 }

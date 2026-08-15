@@ -29,6 +29,7 @@ use object_store_opendal::OpendalStore;
 use opendal::Operator;
 use opendal::services::S3Config;
 
+use super::base_path::{is_local_base_path, strip_s3_scheme};
 use super::builder::{ObjectStoreWithPath, create_local_store, create_memory_store};
 use super::config::StorageBackend;
 use super::icegate_s3::build_s3_operator;
@@ -199,9 +200,8 @@ impl OperatorRegistry {
     /// `from_opendal_error`), and [`CommonError::ObjectStore`] if a local store
     /// cannot be opened.
     pub fn resolve_object_store(&self, base_path: &str) -> Result<ObjectStoreWithPath> {
-        let Some(bucket_and_prefix) = base_path.strip_prefix("s3://").or_else(|| base_path.strip_prefix("s3a://"))
-        else {
-            return if base_path.starts_with("file://") || base_path.starts_with('/') {
+        let Some(bucket_and_prefix) = strip_s3_scheme(base_path) else {
+            return if is_local_base_path(base_path) {
                 create_local_store(base_path)
             } else {
                 Ok(create_memory_store(base_path))
@@ -362,6 +362,7 @@ mod tests {
     use tracing_subscriber::Registry as TracingRegistry;
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
+    use super::super::base_path::is_persistent_base_path;
     use super::super::icegate_s3::s3_config_parse;
     use super::*;
     use crate::storage::S3Config as BackendS3Config;
@@ -384,6 +385,26 @@ mod tests {
 
     fn registry() -> OperatorRegistry {
         OperatorRegistry::new(&StorageLayersConfig::default(), None)
+    }
+
+    /// The predicate a caller uses to reject a queue or warehouse location that
+    /// would silently resolve to process memory, so it has to agree with the
+    /// dispatch in [`OperatorRegistry::resolve_object_store`] case for case.
+    #[test]
+    fn persistent_base_paths_are_exactly_the_ones_backed_by_a_store() {
+        for path in [
+            "s3://queue/",
+            "s3a://queue/segments",
+            "file:///var/lib/queue",
+            "/var/lib/queue",
+        ] {
+            assert!(is_persistent_base_path(path), "{path} names a real store");
+        }
+        // The typo cases are what makes the fallback dangerous: each of these
+        // starts a process that accepts writes nothing can read back.
+        for path in ["", "s3:/queue/", "queue", "S3://queue/", "memory://queue"] {
+            assert!(!is_persistent_base_path(path), "{path} falls back to memory");
+        }
     }
 
     /// Two operators are the same instance when they share one accessor;
