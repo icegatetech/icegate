@@ -165,7 +165,37 @@ case "$SANITIZER" in
         # No -Zbuild-std: standalone LSan intercepts malloc at runtime rather
         # than instrumenting code, so an uninstrumented std costs it nothing.
         # That keeps the leak pass the cheap one.
-        export LSAN_OPTIONS="suppressions=$REPO_ROOT/config/sanitizers/lsan.supp"
+        #
+        # fast_unwind_on_malloc=0 is what makes the suppression file work at all.
+        # LSan defaults it to 1, which records each allocation stack by walking
+        # the frame-pointer chain; nothing here forces frame pointers, so the
+        # walk skips every frame between the allocator and whichever ancestor
+        # happened to keep one. The 2026-08-14 nightly captured 3 to 8 return
+        # addresses per allocation against a malloc_context_size of 30 — not
+        # truncation, an aborted unwind — and every stack jumped straight from
+        # `alloc::alloc::alloc` into libtest's run_test_in_process. Third-party
+        # frames were absent workspace-wide, so four of lsan.supp's five patterns
+        # could not match: only *apache_avro* fired, because it is the one anchor
+        # that sits on the leaf frame. All 13 binaries failed on leaks the file
+        # already accounts for.
+        #
+        # This is why a local run disagrees: aarch64 keeps a frame-pointer chain
+        # by ABI, so the fast unwinder walks it correctly and the same
+        # suppressions match. Every figure in lsan.supp measured under the local
+        # wrapper was measured on that shape, not on CI's. Do not treat a green
+        # aarch64 run as evidence about x86_64.
+        #
+        # 0 selects the CFI unwinder instead, which reconstructs the full chain
+        # from the unwind tables rustc always emits. It is slower per allocation;
+        # the budget is the 300-minute job timeout, against 11.5 minutes for the
+        # whole leak job before this change.
+        #
+        # -Cforce-frame-pointers=yes would instead repair the fast unwinder, and
+        # is the lever to reach for if that budget is ever a problem. It is not
+        # used here because it is only a partial fix: without -Zbuild-std the
+        # precompiled std is not rebuilt, so any frame passing through std still
+        # breaks the chain.
+        export LSAN_OPTIONS="suppressions=$REPO_ROOT/config/sanitizers/lsan.supp:fast_unwind_on_malloc=0"
         ;;
     memory)
         # This target does not currently work, and is retained only so the

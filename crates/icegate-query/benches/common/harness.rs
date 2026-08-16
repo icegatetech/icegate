@@ -26,6 +26,7 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
 };
@@ -36,6 +37,9 @@ use reqwest::Client;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+/// How long to wait for the server to report the port it bound.
+const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a `FixedSizeBinary(byte_width)` array by decoding `hex` once and
 /// repeating the resulting bytes `count` times. Used to seed identical
@@ -90,6 +94,10 @@ pub struct TestServer {
     pub base_url: String,
     pub cancel_token: CancellationToken,
     server_handle: tokio::task::JoinHandle<()>,
+    /// Owns the temporary warehouse directory; held purely for its
+    /// `Drop`, which removes the directory when the server is dropped.
+    #[allow(dead_code)]
+    temp_dir: tempfile::TempDir,
 }
 
 impl TestServer {
@@ -157,7 +165,7 @@ impl TestServer {
 
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
-        let server_handle = tokio::spawn(async move {
+        let mut server_handle = tokio::spawn(async move {
             let disabled_metrics = Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
             icegate_query::loki::run_with_port_tx(
                 server_engine,
@@ -171,22 +179,19 @@ impl TestServer {
             .unwrap();
         });
 
-        let actual_port = match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
+        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
             Ok(Ok(port)) => port,
-            Ok(Err(_)) => {
+            Ok(Err(_recv_err)) => {
                 cancel_token.cancel();
-                panic!("Failed to receive port from server");
+                drain_server_task(&mut server_handle, "Loki benchmark").await;
+                panic!("Loki benchmark server dropped the port channel before reporting a bound port");
             }
-            Err(_) => {
+            Err(_elapsed) => {
                 cancel_token.cancel();
-                panic!("Timed out waiting for server to start");
+                drain_server_task(&mut server_handle, "Loki benchmark").await;
+                panic!("Timed out waiting for Loki benchmark server to bind");
             }
         };
-
-        // SAFETY: Intentionally leak the TempDir to keep it alive for the benchmark/server lifetime.
-        // The spawned server requires a persistent filesystem path that outlives this function.
-        // This is an acceptable leak in the benchmark harness context.
-        Box::leak(Box::new(warehouse_path));
 
         Ok((
             Self {
@@ -194,15 +199,26 @@ impl TestServer {
                 base_url: format!("http://127.0.0.1:{actual_port}"),
                 cancel_token,
                 server_handle,
+                temp_dir: warehouse_path,
             },
             catalog,
         ))
     }
 
-    /// Shutdown the test server
-    pub async fn shutdown(self) {
+    /// Shut the server down, draining the spawn task.
+    ///
+    /// Surfaces a panic from the server task and fails on timeout rather
+    /// than swallowing both, so a crashing or hung server can't silently
+    /// skew a benchmark (and leak the background task).
+    pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.server_handle).await;
+        match drain_server_task(&mut self.server_handle, "Loki benchmark").await {
+            DrainOutcome::Finished => {}
+            DrainOutcome::Aborted => panic!(
+                "Loki benchmark server did not shut down within {}s",
+                SHUTDOWN_TIMEOUT.as_secs()
+            ),
+        }
     }
 }
 

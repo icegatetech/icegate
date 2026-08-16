@@ -5,6 +5,7 @@ readme = "../../README.md"
 keywords = ["iceberg", "s3", "catalog", "data-lake", "observability"]
 categories = ["database"]
 version = { workspace = true }
+rust-version = { workspace = true }
 edition = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }

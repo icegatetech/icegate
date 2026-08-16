@@ -87,7 +87,10 @@ mod tests {
         guard
     }
 
-    async fn build_state() -> LokiState {
+    /// Builds the router state over a fresh temp-dir warehouse, returning the
+    /// directory guard alongside it. The caller MUST hold the guard for as long
+    /// as it uses the state: dropping it removes the directory the catalog reads.
+    async fn build_state() -> (LokiState, tempfile::TempDir) {
         let warehouse = tempfile::tempdir().expect("tempdir");
         let catalog_config = CatalogConfig {
             backend: CatalogBackend::Memory,
@@ -107,12 +110,13 @@ mod tests {
             wal_store,
             wal_reader,
         ));
-        // Keep the temp warehouse alive for the lifetime of the engine.
-        Box::leak(Box::new(warehouse));
-        LokiState {
-            engine,
-            metrics: Arc::new(QueryMetrics::new_disabled()),
-        }
+        (
+            LokiState {
+                engine,
+                metrics: Arc::new(QueryMetrics::new_disabled()),
+            },
+            warehouse,
+        )
     }
 
     fn get_request(uri: &str) -> Request<Body> {
@@ -121,21 +125,24 @@ mod tests {
 
     #[tokio::test]
     async fn inert_guard_allows_requests() {
-        let app = routes(build_state().await, MemoryPressure::inert());
+        let (state, _warehouse) = build_state().await;
+        let app = routes(state, MemoryPressure::inert());
         let response = app.oneshot(get_request("/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn pressured_guard_sheds_work_path() {
-        let app = routes(build_state().await, pressured_guard());
+        let (state, _warehouse) = build_state().await;
+        let app = routes(state, pressured_guard());
         let response = app.oneshot(get_request("/loki/api/v1/query")).await.expect("response");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn pressured_guard_bypasses_ready() {
-        let app = routes(build_state().await, pressured_guard());
+        let (state, _warehouse) = build_state().await;
+        let app = routes(state, pressured_guard());
         let response = app.oneshot(get_request("/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }

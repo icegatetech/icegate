@@ -32,9 +32,13 @@ too-many-lines-threshold = 150
 # Single character binding names (allowed for short-lived variables)
 single-char-binding-names-threshold = 4
 
-# Enforce minimum Rust version. Tracks Cargo.toml's `rust-version`.
-# `Option::is_none_or` requires 1.82+; `BinaryHeap::peek_mut`-style mut
-# methods we already rely on require 1.92+.
+# Floor for Clippy's version-gated suggestions. Deliberately BELOW the workspace
+# `rust-version` in Cargo.toml, which is the real MSRV — Clippy prints a warning
+# about the gap on every run, and that is the intended reminder. Raising this to
+# match unmasks ~70 modernization suggestions (let-chains, `const fn`, larger
+# `Duration` units) that are a workspace-wide pass of their own, not a rider on
+# an unrelated change. Lagging is the safe direction: Clippy only ever suggests
+# less than the toolchain allows, never code the declared MSRV cannot build.
 msrv = "1.82.0"
 
 # Literal representation

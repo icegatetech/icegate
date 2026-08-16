@@ -2,6 +2,7 @@
 name = "icegate-queue"
 description = "Generic WAL-based data queue with Parquet on object storage"
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

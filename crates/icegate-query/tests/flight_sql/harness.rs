@@ -35,6 +35,7 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, METRICS_TABLE, PRICES_TABLE,
     SPANS_TABLE, TENANT_ID_HEADER, catalog::CatalogBuilder, schema,
@@ -49,6 +50,9 @@ use tonic::transport::{Channel, Endpoint};
 
 /// Severity values cycled across written log rows.
 const SEVERITIES: [&str; 3] = ["INFO", "WARN", "ERROR"];
+
+/// How long to wait for the server to report the port it bound.
+const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connected Flight SQL test server.
 ///
@@ -105,7 +109,7 @@ impl TestServer {
         let server_engine = Arc::clone(&query_engine);
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
-        let server_handle = tokio::spawn(async move {
+        let mut server_handle = tokio::spawn(async move {
             icegate_query::flight_sql::run_with_port_tx(
                 server_engine,
                 flight_sql_config,
@@ -117,10 +121,23 @@ impl TestServer {
             .unwrap();
         });
 
-        let actual_port = tokio::time::timeout(Duration::from_secs(10), port_rx)
-            .await
-            .expect("Timed out waiting for Flight SQL server to start")
-            .expect("Failed to receive port from server");
+        // Drain the task on either failure before unwinding: `warehouse_path` drops
+        // with this frame, so a detached server would go on serving from a deleted
+        // directory. `drain_server_task` resumes the task's own panic when it has
+        // one, which is the only place the real startup error survives.
+        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
+            Ok(Ok(port)) => port,
+            Ok(Err(_recv_err)) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Flight SQL").await;
+                panic!("Flight SQL server dropped the port channel before reporting a bound port");
+            }
+            Err(_elapsed) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Flight SQL").await;
+                panic!("Timed out waiting for Flight SQL server to bind");
+            }
+        };
 
         let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{actual_port}"))?;
         let channel = endpoint.connect().await?;
@@ -157,14 +174,12 @@ impl TestServer {
     /// pass the test (and leak the background task).
     pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        match tokio::time::timeout(Duration::from_secs(5), &mut self.server_handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
-            Ok(Err(join_err)) => panic!("Flight SQL server task failed to join: {join_err}"),
-            Err(_elapsed) => {
-                self.server_handle.abort();
-                panic!("Flight SQL server did not shut down within 5s");
-            }
+        match drain_server_task(&mut self.server_handle, "Flight SQL").await {
+            DrainOutcome::Finished => {}
+            DrainOutcome::Aborted => panic!(
+                "Flight SQL server did not shut down within {}s",
+                SHUTDOWN_TIMEOUT.as_secs()
+            ),
         }
     }
 }

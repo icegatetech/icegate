@@ -34,6 +34,7 @@ use iceberg::{
         },
     },
 };
+use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
 };
@@ -45,6 +46,9 @@ use reqwest::Client;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+/// How long to wait for the server to report the port it bound.
+const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Attribute map fixture builders
@@ -112,6 +116,10 @@ pub struct TestServer {
     pub base_url: String,
     pub cancel_token: CancellationToken,
     server_handle: tokio::task::JoinHandle<()>,
+    /// Owns the temporary warehouse directory; held purely for its
+    /// `Drop`, which removes the directory when the server is dropped.
+    #[allow(dead_code)]
+    temp_dir: tempfile::TempDir,
 }
 
 impl TestServer {
@@ -176,7 +184,7 @@ impl TestServer {
         // Create oneshot channel to receive the actual bound port
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
-        let server_handle = tokio::spawn(async move {
+        let mut server_handle = tokio::spawn(async move {
             let disabled_metrics = Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
             icegate_query::loki::run_with_port_tx(
                 server_engine,
@@ -190,15 +198,22 @@ impl TestServer {
             .unwrap();
         });
 
-        // Wait for the server to bind and receive the actual port
-        let actual_port = tokio::time::timeout(Duration::from_secs(10), port_rx)
-            .await
-            .expect("Timed out waiting for server to start")
-            .expect("Failed to receive port from server");
-
-        // Leak the tempdir to keep it alive for the duration of the test
-        // (it will be cleaned up when the process exits)
-        Box::leak(Box::new(warehouse_path));
+        // Wait for the server to bind and receive the actual port. Drain the task on
+        // either failure: `warehouse_path` drops as this frame unwinds, so a detached
+        // server would go on running against a deleted directory.
+        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
+            Ok(Ok(port)) => port,
+            Ok(Err(_recv_err)) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Loki").await;
+                panic!("Loki server dropped the port channel before reporting a bound port");
+            }
+            Err(_elapsed) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Loki").await;
+                panic!("Timed out waiting for Loki server to bind");
+            }
+        };
 
         Ok((
             Self {
@@ -206,15 +221,23 @@ impl TestServer {
                 base_url: format!("http://127.0.0.1:{actual_port}"),
                 cancel_token,
                 server_handle,
+                temp_dir: warehouse_path,
             },
             catalog,
         ))
     }
 
-    /// Shutdown the test server
-    pub async fn shutdown(self) {
+    /// Shut the server down, draining the spawn task.
+    ///
+    /// Surfaces a panic from the server task and fails on timeout rather
+    /// than swallowing both, so a crashing or hung server can't silently
+    /// pass the test (and leak the background task).
+    pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.server_handle).await;
+        match drain_server_task(&mut self.server_handle, "Loki").await {
+            DrainOutcome::Finished => {}
+            DrainOutcome::Aborted => panic!("Loki server did not shut down within {}s", SHUTDOWN_TIMEOUT.as_secs()),
+        }
     }
 }
 
