@@ -34,6 +34,7 @@ use iceberg::{
         },
     },
 };
+use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE, catalog::CatalogBuilder, schema,
 };
@@ -50,9 +51,8 @@ use tokio_util::sync::CancellationToken;
 const READY_ATTEMPTS: u32 = 50;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Grace period for the server task to wind down once cancelled, used both for
-/// an orderly shutdown and for draining the task after a failed startup.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the server to report the port it bound.
+const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Test server running a Tempo HTTP API on an ephemeral port.
 pub struct TestServer {
@@ -123,7 +123,7 @@ impl TestServer {
 
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
-        let server_handle = tokio::spawn(async move {
+        let mut server_handle = tokio::spawn(async move {
             icegate_query::tempo::run_with_port_tx(
                 server_engine,
                 tempo_config,
@@ -135,10 +135,23 @@ impl TestServer {
             .unwrap();
         });
 
-        let actual_port = tokio::time::timeout(Duration::from_secs(10), port_rx)
-            .await
-            .expect("Timed out waiting for server to bind")
-            .expect("Failed to receive port from server");
+        // Drain the task on either failure before unwinding: `warehouse_path` drops
+        // with this frame, so a detached server would go on serving from a deleted
+        // directory. `drain_server_task` resumes the task's own panic when it has
+        // one, which is the only place the real startup error survives.
+        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
+            Ok(Ok(port)) => port,
+            Ok(Err(_recv_err)) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Tempo").await;
+                panic!("Tempo server dropped the port channel before reporting a bound port");
+            }
+            Err(_elapsed) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Tempo").await;
+                panic!("Timed out waiting for Tempo server to bind");
+            }
+        };
 
         // A bound port is not a serving router, so confirm readiness before
         // handing the harness back. Failing here rather than pressing on turns a
@@ -155,11 +168,8 @@ impl TestServer {
             tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
         if !is_ready {
-            // Drain the server before returning: `warehouse_path` drops with this
-            // frame, so a detached task would go on serving from a directory that
-            // has been deleted under it.
             cancel_token.cancel();
-            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_handle).await;
+            drain_server_task(&mut server_handle, "Tempo").await;
             return Err(format!("Tempo server at {base_url} never became ready").into());
         }
 
@@ -182,19 +192,9 @@ impl TestServer {
     /// pass the test (and leak the background task).
     pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
-            Ok(Err(join_err)) => panic!("Tempo server task failed to join: {join_err}"),
-            Err(_elapsed) => {
-                self.server_handle.abort();
-                // `abort()` only schedules cancellation, so join the task before the
-                // panic unwinds and drops `temp_dir`. Bounded, because a task wedged
-                // in non-yielding code would never join at all, and a hung suite is a
-                // worse outcome than this panic.
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await;
-                panic!("Tempo server did not shut down within {}s", SHUTDOWN_TIMEOUT.as_secs());
-            }
+        match drain_server_task(&mut self.server_handle, "Tempo").await {
+            DrainOutcome::Finished => {}
+            DrainOutcome::Aborted => panic!("Tempo server did not shut down within {}s", SHUTDOWN_TIMEOUT.as_secs()),
         }
     }
 }

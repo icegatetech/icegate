@@ -5,6 +5,7 @@ readme = "README.md"
 keywords = ["iceberg", "datafusion", "logql", "flight-sql"]
 categories = ["database"]
 version = { workspace = true }
+rust-version = { workspace = true }
 edition = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -94,6 +95,7 @@ name = "loki_queries"
 harness = false
 
 [dev-dependencies]
+icegate-common = { workspace = true, features = ["test-harness"] }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }

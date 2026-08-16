@@ -26,6 +26,7 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
 };
@@ -37,9 +38,8 @@ use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Grace period for the server task to wind down once cancelled, used both for
-/// an orderly shutdown and for draining the task after a failed startup.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the server to report the port it bound.
+const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a `FixedSizeBinary(byte_width)` array by decoding `hex` once and
 /// repeating the resulting bytes `count` times. Used to seed identical
@@ -130,7 +130,7 @@ impl TestServer {
 
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
-        let server_handle = tokio::spawn(async move {
+        let mut server_handle = tokio::spawn(async move {
             let disabled_metrics = Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
             icegate_query::loki::run_with_port_tx(
                 server_engine,
@@ -144,19 +144,17 @@ impl TestServer {
             .unwrap();
         });
 
-        let actual_port = match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
+        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
             Ok(Ok(port)) => port,
             Ok(Err(_recv_err)) => {
                 cancel_token.cancel();
-                // Drain before unwinding: `warehouse_path` drops with this frame, so a
-                // detached server would go on running against a deleted directory.
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_handle).await;
-                panic!("Failed to receive port from server");
+                drain_server_task(&mut server_handle, "Loki benchmark").await;
+                panic!("Loki benchmark server dropped the port channel before reporting a bound port");
             }
             Err(_elapsed) => {
                 cancel_token.cancel();
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_handle).await;
-                panic!("Timed out waiting for server to start");
+                drain_server_task(&mut server_handle, "Loki benchmark").await;
+                panic!("Timed out waiting for Loki benchmark server to bind");
             }
         };
 
@@ -179,22 +177,12 @@ impl TestServer {
     /// skew a benchmark (and leak the background task).
     pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
-            Ok(Err(join_err)) => panic!("Loki benchmark server task failed to join: {join_err}"),
-            Err(_elapsed) => {
-                self.server_handle.abort();
-                // `abort()` only schedules cancellation, so join the task before the
-                // panic unwinds and drops `temp_dir`. Bounded, because a task wedged
-                // in non-yielding code would never join at all, and a hung run is a
-                // worse outcome than this panic.
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await;
-                panic!(
-                    "Loki benchmark server did not shut down within {}s",
-                    SHUTDOWN_TIMEOUT.as_secs()
-                );
-            }
+        match drain_server_task(&mut self.server_handle, "Loki benchmark").await {
+            DrainOutcome::Finished => {}
+            DrainOutcome::Aborted => panic!(
+                "Loki benchmark server did not shut down within {}s",
+                SHUTDOWN_TIMEOUT.as_secs()
+            ),
         }
     }
 }

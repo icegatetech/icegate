@@ -5,6 +5,7 @@ readme = "../../README.md"
 keywords = ["iceberg", "datafusion", "data-lake", "observability"]
 categories = ["database"]
 version = { workspace = true }
+rust-version = { workspace = true }
 edition = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -14,7 +15,10 @@ repository = { workspace = true }
 workspace = true
 
 [features]
-testing = ["testcontainers", "aws-config", "aws-sdk-s3"]
+testing = ["test-harness", "testcontainers", "aws-config", "aws-sdk-s3"]
+# Harness helpers for draining a spawned server task. tokio-only, so a test or
+# benchmark that needs them does not also build the testcontainers/S3 stack.
+test-harness = []
 # gRPC request-shedding interceptor. Only `icegate-query`/`icegate-ingest` (which
 # already depend on tonic) opt in; keeps `icegate-maintain`/jobmanager off tonic.
 shed-tonic = ["dep:tonic"]

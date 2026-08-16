@@ -34,6 +34,7 @@ use iceberg::{
         },
     },
 };
+use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
 };
@@ -46,9 +47,8 @@ use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Grace period for the server task to wind down once cancelled, used both for
-/// an orderly shutdown and for draining the task after a failed startup.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the server to report the port it bound.
+const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Test server configuration and handles
 pub struct TestServer {
@@ -124,7 +124,7 @@ impl TestServer {
         // Create oneshot channel to receive the actual bound port
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
-        let server_handle = tokio::spawn(async move {
+        let mut server_handle = tokio::spawn(async move {
             let disabled_metrics = Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
             icegate_query::loki::run_with_port_tx(
                 server_engine,
@@ -141,17 +141,17 @@ impl TestServer {
         // Wait for the server to bind and receive the actual port. Drain the task on
         // either failure: `warehouse_path` drops as this frame unwinds, so a detached
         // server would go on running against a deleted directory.
-        let actual_port = match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
+        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
             Ok(Ok(port)) => port,
             Ok(Err(_recv_err)) => {
                 cancel_token.cancel();
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_handle).await;
-                panic!("Failed to receive port from server");
+                drain_server_task(&mut server_handle, "Loki").await;
+                panic!("Loki server dropped the port channel before reporting a bound port");
             }
             Err(_elapsed) => {
                 cancel_token.cancel();
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_handle).await;
-                panic!("Timed out waiting for server to start");
+                drain_server_task(&mut server_handle, "Loki").await;
+                panic!("Timed out waiting for Loki server to bind");
             }
         };
 
@@ -174,19 +174,9 @@ impl TestServer {
     /// pass the test (and leak the background task).
     pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
-            Ok(Err(join_err)) => panic!("Loki server task failed to join: {join_err}"),
-            Err(_elapsed) => {
-                self.server_handle.abort();
-                // `abort()` only schedules cancellation, so join the task before the
-                // panic unwinds and drops `temp_dir`. Bounded, because a task wedged
-                // in non-yielding code would never join at all, and a hung suite is a
-                // worse outcome than this panic.
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await;
-                panic!("Loki server did not shut down within {}s", SHUTDOWN_TIMEOUT.as_secs());
-            }
+        match drain_server_task(&mut self.server_handle, "Loki").await {
+            DrainOutcome::Finished => {}
+            DrainOutcome::Aborted => panic!("Loki server did not shut down within {}s", SHUTDOWN_TIMEOUT.as_secs()),
         }
     }
 }
