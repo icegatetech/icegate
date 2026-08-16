@@ -224,7 +224,7 @@ pub async fn list_tags_v2(
             tenant_id,
             start_dt,
             end_dt,
-            &SPANS_RESOURCE_CONFIG,
+            &[SPANS_RESOURCE_CONFIG],
             extra_predicate.clone(),
         )
         .await
@@ -249,27 +249,16 @@ pub async fn list_tags_v2(
     // matters for the tag-VALUES path ([`list_tag_values`]), where the two
     // maps can hold different values for the same row.
     if scope_filter.is_none_or(|s| s == Scope::Span) {
-        let mut tags: BTreeSet<String> = metadata_scan::scan_labels(
+        let tags: BTreeSet<String> = metadata_scan::scan_labels(
             &table,
             tenant_id,
             start_dt,
             end_dt,
-            &SPANS_SPAN_CONFIG,
+            &[SPANS_SPAN_CONFIG, SPANS_SCOPE_CONFIG],
             extra_predicate.clone(),
         )
         .await
         .map_err(|e| TempoError(QueryError::from(e)))?;
-        let scope_tags: BTreeSet<String> = metadata_scan::scan_labels(
-            &table,
-            tenant_id,
-            start_dt,
-            end_dt,
-            &SPANS_SCOPE_CONFIG,
-            extra_predicate.clone(),
-        )
-        .await
-        .map_err(|e| TempoError(QueryError::from(e)))?;
-        tags.extend(scope_tags);
         groups.push(ScopeGroup {
             name: Scope::Span.as_str().to_string(),
             tags: tags.into_iter().collect(),
@@ -376,7 +365,7 @@ pub async fn list_tag_values(
                 tenant_id,
                 start_dt,
                 end_dt,
-                &SPANS_VALUES_RESOURCE_CONFIG,
+                &[SPANS_VALUES_RESOURCE_CONFIG],
                 mapped,
                 extra_predicate,
             )
@@ -428,7 +417,7 @@ pub async fn list_tag_values(
                 tenant_id,
                 start_dt,
                 end_dt,
-                &SPANS_VALUES_RESOURCE_CONFIG,
+                &[SPANS_VALUES_RESOURCE_CONFIG],
                 mapped,
                 extra_predicate.clone(),
             )
@@ -567,7 +556,7 @@ async fn scan_values_either(
         tenant_id,
         start,
         end,
-        &SPANS_VALUES_SPAN_CONFIG,
+        &[SPANS_VALUES_SPAN_CONFIG],
         column,
         extra_predicate,
     )

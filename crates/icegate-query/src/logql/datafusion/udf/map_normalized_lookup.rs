@@ -256,7 +256,7 @@ mod tests {
     fn a_null_valued_entry_does_not_claim_the_wire_name_from_a_later_key() {
         // The counterpart of the collision test above: because the first
         // entry is invisible, the second wins instead of the lookup
-        // short-circuiting to NULL. `map_merge_normalized` and
+        // short-circuiting to NULL. `merge_attribute_levels` and
         // `loki::formatters::extract_attributes_map` resolve the same row and
         // must reach the same value.
         assert_eq!(

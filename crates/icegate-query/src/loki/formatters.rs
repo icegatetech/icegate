@@ -292,7 +292,7 @@ fn extract_labels(
 /// `k8s.pod.name` and `k8s_pod_name` both present in `log_attributes` — the
 /// first key in stored order wins, and the rest are skipped rather than
 /// overwriting. This must agree with `map_get_by_normalized_key`'s
-/// scan-and-break tie-break and `map_merge_normalized`'s intra-level
+/// scan-and-break tie-break and `merge_attribute_levels`'s intra-level
 /// `or_insert_with` tie-break, because all three resolve the same stored
 /// data for the matcher, series-identity, and displayed-label paths
 /// respectively: if this one disagreed, a row could match a query through
@@ -846,7 +846,7 @@ mod tests {
     #[test]
     fn on_an_intra_level_normalization_collision_the_first_key_in_order_wins() {
         // Same fixture shape as map_get_by_normalized_key's and
-        // map_merge_normalized's identical tests: both raw keys live in ONE
+        // merge_attribute_levels's identical tests: both raw keys live in ONE
         // level (`log_attributes`), isolating the intra-level rule from the
         // cross-level one. Ingest's ascending BTreeMap order places the
         // dotted key first ('.' < '_'), so first-in-order is "dotted".
@@ -859,7 +859,7 @@ mod tests {
         // `seen_in_level` guard in extract_attributes_map, the LAST key
         // processed ("underscored") would win here instead — disagreeing
         // with the matcher path (map_get_by_normalized_key) and the merge
-        // path (map_merge_normalized) on which value a colliding label
+        // path (merge_attribute_levels) on which value a colliding label
         // displays for the same row.
         assert_eq!(labels.get("k8s_pod_name").map(|v| &**v), Some("dotted"));
         assert_eq!(labels.len(), 1, "one wire name yields one label");

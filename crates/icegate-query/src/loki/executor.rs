@@ -333,8 +333,8 @@ impl QueryExecutor {
 
     /// Execute a labels metadata query.
     ///
-    /// Dispatches to `crate::engine::metadata_scan` once per stored
-    /// attribute map (`resource_attributes`, `scope_attributes`,
+    /// Dispatches to `crate::engine::metadata_scan` once for all three stored
+    /// attribute maps (`resource_attributes`, `scope_attributes`,
     /// `log_attributes`), which reads only Parquet row-group statistics and
     /// MAP dictionary pages — no full-row scans.
     ///
@@ -362,25 +362,22 @@ impl QueryExecutor {
         let extra = super::predicate::selector_predicate(&selector, &super::LOGS_METADATA_CONFIGS[0]);
 
         let table = self.load_logs_table().await?;
-        let mut labels: BTreeSet<String> = BTreeSet::new();
-        for config in &super::LOGS_METADATA_CONFIGS {
-            let scanned = crate::engine::metadata_scan::scan_labels(
-                &table,
-                &query_ctx.tenant_id,
-                query_ctx.start,
-                query_ctx.end,
-                config,
-                extra.clone(),
-            )
-            .await
-            .map_err(|e| LokiError(QueryError::from(e)))?;
-            // Normalizing into the same `BTreeSet` is what dedupes by wire
-            // name across levels: two levels holding raw keys that share a
-            // wire name (e.g. `k8s.pod.name` in one map, `k8s_pod_name` in
-            // another) collapse into a single insert here rather than
-            // surfacing as two labels.
-            labels.extend(scanned.into_iter().map(normalize_label_name));
-        }
+        let scanned = crate::engine::metadata_scan::scan_labels(
+            &table,
+            &query_ctx.tenant_id,
+            query_ctx.start,
+            query_ctx.end,
+            &super::LOGS_METADATA_CONFIGS,
+            extra,
+        )
+        .await
+        .map_err(|e| LokiError(QueryError::from(e)))?;
+
+        // Normalizing into one `BTreeSet` is what dedupes by wire name across
+        // levels: two levels holding raw keys that share a wire name (e.g.
+        // `k8s.pod.name` in one map, `k8s_pod_name` in another) collapse into a
+        // single insert here rather than surfacing as two labels.
+        let labels: BTreeSet<String> = scanned.into_iter().map(normalize_label_name).collect();
 
         Ok(labels.into_iter().collect())
     }
@@ -413,24 +410,20 @@ impl QueryExecutor {
         let extra = super::predicate::selector_predicate(&selector, &super::LOGS_VALUES_METADATA_CONFIGS[0]);
 
         let table = self.load_logs_table().await?;
-        let mut values: BTreeSet<String> = BTreeSet::new();
-        for config in &super::LOGS_VALUES_METADATA_CONFIGS {
-            let scanned = crate::engine::metadata_scan::scan_label_values(
-                &table,
-                &query_ctx.tenant_id,
-                query_ctx.start,
-                query_ctx.end,
-                config,
-                label_name,
-                extra.clone(),
-            )
-            .await
-            .map_err(|e| LokiError(QueryError::from(e)))?;
-            // Unlike label names, values need no wire normalization — just
-            // the union across the three per-level maps, deduplicated so a
-            // value present at more than one level surfaces once.
-            values.extend(scanned);
-        }
+        // Unlike label names, values need no wire normalization — the scan
+        // already unions the three per-level maps, so a value present at more
+        // than one level surfaces once.
+        let values = crate::engine::metadata_scan::scan_label_values(
+            &table,
+            &query_ctx.tenant_id,
+            query_ctx.start,
+            query_ctx.end,
+            &super::LOGS_VALUES_METADATA_CONFIGS,
+            label_name,
+            extra,
+        )
+        .await
+        .map_err(|e| LokiError(QueryError::from(e)))?;
 
         Ok(values.into_iter().collect())
     }

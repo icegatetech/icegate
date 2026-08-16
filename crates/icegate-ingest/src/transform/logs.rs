@@ -14,8 +14,8 @@ use icegate_common::{
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use super::attributes::{
-    attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named, extract_string_value,
-    is_zero_bytes, merge_dotted_levels, now_micros, serialize_any_value_to_json,
+    SERVICE_NAME_KEY, attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named,
+    extract_string_value, is_zero_bytes, merge_dotted_levels, now_micros, serialize_any_value_to_json,
 };
 
 /// Process-wide cache of the derived logs Arrow schema.
@@ -122,7 +122,7 @@ pub fn logs_to_record_batch(
         // Extract service.name from resource attributes
         let service_name = resource_attrs
             .iter()
-            .find(|kv| kv.key == "service.name")
+            .find(|kv| kv.key == SERVICE_NAME_KEY)
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
         // Flattened once per ResourceLogs / ScopeLogs and reused by every log
@@ -253,7 +253,7 @@ pub fn logs_to_record_batch(
 /// level so the MAP holds no redundant copy — smaller Parquet pages and a
 /// tidier row-group key dictionary. A more specific level may still supply
 /// the same key as a deliberate override.
-const LOG_PROMOTED_RESOURCE_KEYS: &[&str] = &["service.name"];
+const LOG_PROMOTED_RESOURCE_KEYS: &[&str] = &[SERVICE_NAME_KEY];
 
 /// Validates and writes raw `trace_id` and `span_id` bytes directly into the
 /// top-level fixed-size binary builders.

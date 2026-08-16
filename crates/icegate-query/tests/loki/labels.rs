@@ -222,6 +222,51 @@ async fn test_label_values_endpoint_resolves_dotted_key_by_wire_name() -> Result
     Ok(())
 }
 
+/// `/label_values` must reach EVERY stored attribute map, not just
+/// `log_attributes`.
+///
+/// The three levels are enumerated by one scan over one projection of the data
+/// file (see `engine::metadata_scan::scan_label_values`), so a level dropped
+/// from that projection returns an empty list rather than an error — and every
+/// other value assertion in this file reads `log_attributes` or an indexed
+/// column, so none of them would fail. `write_test_logs` stores
+/// `otel.scope.name` in `scope_attributes` on all three rows, which is
+/// reachable only through the scope level.
+#[tokio::test]
+async fn test_label_values_endpoint_reads_the_scope_attribute_map() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/label/otel_scope_name/values", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let values = body["data"].as_array().expect("data should be an array");
+    let value_strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        value_strs,
+        vec!["test-instrumentation"],
+        "scope-level attribute values must be enumerated alongside the log level, got: {:?}",
+        value_strs
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_series_endpoint() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start().await?;

@@ -14,7 +14,6 @@
 )]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::sql::client::FlightSqlServiceClient;
@@ -35,7 +34,7 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
+use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, METRICS_TABLE, PRICES_TABLE,
     SPANS_TABLE, TENANT_ID_HEADER, catalog::CatalogBuilder, schema,
@@ -50,9 +49,6 @@ use tonic::transport::{Channel, Endpoint};
 
 /// Severity values cycled across written log rows.
 const SEVERITIES: [&str; 3] = ["INFO", "WARN", "ERROR"];
-
-/// How long to wait for the server to report the port it bound.
-const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connected Flight SQL test server.
 ///
@@ -125,7 +121,7 @@ impl TestServer {
         // with this frame, so a detached server would go on serving from a deleted
         // directory. `drain_server_task` resumes the task's own panic when it has
         // one, which is the only place the real startup error survives.
-        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
+        let actual_port = match tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx).await {
             Ok(Ok(port)) => port,
             Ok(Err(_recv_err)) => {
                 cancel_token.cancel();

@@ -8,6 +8,20 @@ use arrow::{
 use icegate_common::attribute_key::{matches_wire_name, normalize_attribute_key};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
 
+/// OTLP semantic-convention resource-attribute keys, in the dotted form they
+/// arrive on the wire, that the transforms read by name.
+///
+/// Spelled once here rather than per signal because every transform matches the
+/// same keys — to fill a promoted top-level column, and to suppress the now
+/// redundant map copy through [`merge_dotted_levels`]. They belong to this
+/// module and not to `icegate_common::schema`, which describes table columns:
+/// the dotted key is what OTLP puts in an attribute map, and the column it is
+/// promoted into is spelled differently and lives at a different layer
+/// (`service.name` -> `icegate_common::schema::COL_SERVICE_NAME`).
+pub(crate) const SERVICE_NAME_KEY: &str = "service.name";
+/// See [`SERVICE_NAME_KEY`]. Promoted to its own column on metrics only.
+pub(crate) const SERVICE_INSTANCE_ID_KEY: &str = "service.instance.id";
+
 /// Extracts a string value from an OTLP `AnyValue` reference.
 ///
 /// Converts various OTLP value types to string representation.

@@ -1768,8 +1768,12 @@ pub const COL_ATTRIBUTES: &str = "attributes";
 /// Spans — OTLP-reported count of attributes dropped before export (`INT`).
 /// Present on the span itself and inside the `events` / `links` structs.
 pub const COL_DROPPED_ATTRIBUTES_COUNT: &str = "dropped_attributes_count";
-/// Spans/metrics — W3C trace flags (`INT`). Present on the span itself and
-/// inside the `links` struct.
+/// Spans/metrics — OTLP `flags` bitmask (`INT`).
+///
+/// The bits differ per table: on spans (the span itself and the `links`
+/// struct) they are `SpanFlags`, carrying the W3C trace flags plus the
+/// remote-parent bit; on a metrics data point they are `DataPointFlags`,
+/// which are unrelated to W3C trace flags.
 pub const COL_FLAGS: &str = "flags";
 /// Logs/events/spans — observed-by-collector timestamp (`TIMESTAMP`).
 pub const COL_OBSERVED_TIMESTAMP: &str = "observed_timestamp";

@@ -23,7 +23,7 @@ use arrow::datatypes::Schema;
 use iceberg::arrow::schema_to_arrow_schema;
 
 use self::projection::{OperationRow, project_operation_row};
-use super::attributes::{extract_string_value, list_element_field, now_micros};
+use super::attributes::{SERVICE_NAME_KEY, extract_string_value, list_element_field, now_micros};
 
 /// Process-wide cache of the derived operations Arrow schema.
 static OPERATIONS_ARROW_SCHEMA: OnceLock<std::result::Result<Arc<Schema>, String>> = OnceLock::new();
@@ -127,7 +127,7 @@ pub fn operations_to_record_batch(
         let resource_attrs = resource_spans.resource.as_ref().map_or(&empty_attrs, |r| &r.attributes);
         let service_name = resource_attrs
             .iter()
-            .find(|kv| kv.key == "service.name")
+            .find(|kv| kv.key == SERVICE_NAME_KEY)
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
         for scope_spans in &resource_spans.scope_spans {

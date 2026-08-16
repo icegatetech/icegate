@@ -30,10 +30,10 @@ use opentelemetry_proto::tonic::{
 };
 
 use super::attributes::{
-    attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_nested_struct,
-    extract_map_fields_from_schema_named, extract_string_value, flatten_any_value_dotted, is_zero_bytes,
-    list_element_field, list_struct_fields, merge_dotted_levels, nanos_to_micros, now_micros, u32_count_to_i32,
-    u64_to_i64,
+    SERVICE_INSTANCE_ID_KEY, SERVICE_NAME_KEY, attribute_map_builder, dedupe_dotted_attributes,
+    extract_map_fields_from_nested_struct, extract_map_fields_from_schema_named, extract_string_value,
+    flatten_any_value_dotted, is_zero_bytes, list_element_field, list_struct_fields, merge_dotted_levels,
+    nanos_to_micros, now_micros, u32_count_to_i32, u64_to_i64,
 };
 
 /// Process-wide cache of the derived metrics Arrow schema.
@@ -76,10 +76,6 @@ const METRIC_TYPE_SUMMARY: &str = "summary";
 /// `aggregation_temporality` string values stored in the table (per `SCHEMA.md`).
 const AGG_TEMPORALITY_DELTA: &str = "DELTA";
 const AGG_TEMPORALITY_CUMULATIVE: &str = "CUMULATIVE";
-
-/// Resource-attribute keys (dotted form) promoted to dedicated top-level columns.
-const SERVICE_NAME_KEY: &str = "service.name";
-const SERVICE_INSTANCE_ID_KEY: &str = "service.instance.id";
 
 /// Promoted keys suppressed from the merged `attributes` MAP at the resource
 /// level so they are not stored twice (once in the column, once in the map) —

@@ -26,7 +26,7 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
+use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
 };
@@ -35,11 +35,7 @@ use icegate_query::loki::LokiConfig;
 use rand::Rng;
 use reqwest::Client;
 use tokio::sync::oneshot;
-use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-
-/// How long to wait for the server to report the port it bound.
-const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a `FixedSizeBinary(byte_width)` array by decoding `hex` once and
 /// repeating the resulting bytes `count` times. Used to seed identical
@@ -179,7 +175,7 @@ impl TestServer {
             .unwrap();
         });
 
-        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
+        let actual_port = match tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx).await {
             Ok(Ok(port)) => port,
             Ok(Err(_recv_err)) => {
                 cancel_token.cancel();

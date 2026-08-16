@@ -135,11 +135,11 @@ pub async fn collect_indexed_int_values_via_dict(
 /// Returns `MetadataScanError::Parquet` if projected record-batch reads
 /// fail, or `MetadataScanError::Schema` if the map column has an unexpected
 /// type.
-#[tracing::instrument(skip_all, fields(map_column = config.map_column, label_name = label_name, num_batches = tracing::field::Empty, pruned_rgs = tracing::field::Empty))]
+#[tracing::instrument(skip_all, fields(map_columns = tracing::field::Empty, label_name = label_name, num_batches = tracing::field::Empty, pruned_rgs = tracing::field::Empty))]
 pub async fn stream_map_values(
     builder: ParquetRecordBatchStreamBuilder<ArrowFileReader>,
     predicate: &Predicate,
-    config: &MetadataScanConfig,
+    configs: &[&MetadataScanConfig],
     label_name: &str,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MetadataScanError> {
@@ -150,17 +150,33 @@ pub async fn stream_map_values(
         return Ok(());
     }
     let schema_descr = builder.parquet_schema();
-    let has_map = (0..schema_descr.num_columns()).any(|i| {
-        schema_descr
-            .column(i)
-            .path()
-            .parts()
-            .first()
-            .is_some_and(|s| s == config.map_column)
-    });
-    if !has_map {
+    // Only configs whose map column exists in THIS file take part: a file
+    // written before a schema evolution carries some but not all of them, and
+    // projecting an absent column is an error rather than an empty result.
+    let present: Vec<&&MetadataScanConfig> = configs
+        .iter()
+        .filter(|config| {
+            (0..schema_descr.num_columns()).any(|i| {
+                schema_descr
+                    .column(i)
+                    .path()
+                    .parts()
+                    .first()
+                    .is_some_and(|s| *s == config.map_column)
+            })
+        })
+        .collect();
+    if present.is_empty() {
         return Ok(());
     }
+
+    // One projection over every surviving map column, so a request that spans
+    // the resource/scope/record levels costs one pass over the file rather
+    // than one per level.
+    let mut projected: Vec<&str> = present.iter().map(|config| config.map_column).collect();
+    projected.sort_unstable();
+    projected.dedup();
+    tracing::Span::current().record("map_columns", projected.join(","));
 
     // Row-group pruning: only scan row groups whose statistics
     // are compatible with the predicate (tenant_id, time range, etc.).
@@ -172,13 +188,15 @@ pub async fn stream_map_values(
     let pruned = total_rgs - surviving.len();
     tracing::Span::current().record("pruned_rgs", pruned);
 
-    let mask = ProjectionMask::columns(schema_descr, [config.map_column]);
+    let mask = ProjectionMask::columns(schema_descr, projected);
     let mut stream = builder.with_projection(mask).with_row_groups(surviving).build()?;
 
     let mut num_batches: usize = 0;
     while let Some(batch) = stream.try_next().await? {
         num_batches += 1;
-        collect_map_values_from_batch(&batch, config.map_column, label_name, config.normalize_keys, out)?;
+        for config in &present {
+            collect_map_values_from_batch(&batch, config.map_column, label_name, config.normalize_keys, out)?;
+        }
     }
     tracing::Span::current().record("num_batches", num_batches);
 
@@ -307,7 +325,7 @@ fn collect_map_values_from_batch(
         // normalized form). The row's actually-DISPLAYED value follows a
         // first-wins rule over stored order (see `loki/formatters.rs`'s
         // `extract_attributes_map` and the `map_get_by_normalized_key` /
-        // `map_merge_normalized` UDFs under `logql/datafusion/udf/`), but
+        // `merge_attribute_levels` UDFs under `logql/datafusion/udf/`), but
         // every matching key's value is unioned into `out` here regardless
         // of precedence. That OVER-APPROXIMATES: this enumeration can list
         // a value that no row would ever actually display, because a

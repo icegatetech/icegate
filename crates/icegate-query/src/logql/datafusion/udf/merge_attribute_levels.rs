@@ -17,7 +17,7 @@ use datafusion::{
 };
 use icegate_common::attribute_key::normalize_attribute_key;
 
-/// UDF: `map_merge_normalized(resource, scope, log)`.
+/// UDF: `merge_attribute_levels(resource, scope, log)`.
 ///
 /// Collapses the three per-level attribute maps into the single flat map the
 /// Loki wire format exposes, keys rendered as wire names by
@@ -56,18 +56,18 @@ use icegate_common::attribute_key::normalize_attribute_key;
 /// Output keys are sorted: grouping serializes them into a string, so a stable
 /// order is required for two identical label sets to group together.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct MapMergeNormalized {
+pub struct MergeAttributeLevels {
     signature: Signature,
 }
 
-impl Default for MapMergeNormalized {
+impl Default for MergeAttributeLevels {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MapMergeNormalized {
-    /// Creates a new `MapMergeNormalized` UDF.
+impl MergeAttributeLevels {
+    /// Creates a new `MergeAttributeLevels` UDF.
     pub fn new() -> Self {
         Self {
             signature: Signature::any(3, Volatility::Immutable),
@@ -75,9 +75,9 @@ impl MapMergeNormalized {
     }
 }
 
-impl ScalarUDFImpl for MapMergeNormalized {
+impl ScalarUDFImpl for MergeAttributeLevels {
     fn name(&self) -> &'static str {
-        "map_merge_normalized"
+        "merge_attribute_levels"
     }
 
     fn signature(&self) -> &Signature {
@@ -86,14 +86,14 @@ impl ScalarUDFImpl for MapMergeNormalized {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         if arg_types.len() != 3 {
-            return plan_err!("map_merge_normalized requires three map arguments");
+            return plan_err!("merge_attribute_levels requires three map arguments");
         }
         Ok(map_type())
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.len() != 3 {
-            return exec_err!("map_merge_normalized requires three map arguments");
+            return exec_err!("merge_attribute_levels requires three map arguments");
         }
 
         let mut levels: Vec<ArrayRef> = Vec::with_capacity(3);
@@ -111,14 +111,14 @@ impl ScalarUDFImpl for MapMergeNormalized {
         let mut resolved_levels: Vec<(&MapArray, &StringArray, &StringArray)> = Vec::with_capacity(levels.len());
         for level in &levels {
             let Some(map) = level.as_any().downcast_ref::<MapArray>() else {
-                return exec_err!("map_merge_normalized arguments must be MAP columns");
+                return exec_err!("merge_attribute_levels arguments must be MAP columns");
             };
             let entries = map.entries();
             let Some(keys) = entries.column(0).as_any().downcast_ref::<StringArray>() else {
-                return exec_err!("map_merge_normalized expects Utf8 map keys");
+                return exec_err!("merge_attribute_levels expects Utf8 map keys");
             };
             let Some(values) = entries.column(1).as_any().downcast_ref::<StringArray>() else {
-                return exec_err!("map_merge_normalized expects Utf8 map values");
+                return exec_err!("merge_attribute_levels expects Utf8 map values");
             };
             resolved_levels.push((map, keys, values));
         }
@@ -238,7 +238,7 @@ mod tests {
         logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl},
     };
 
-    use super::MapMergeNormalized;
+    use super::MergeAttributeLevels;
 
     /// Values are `Option` so the NULL-value contract can be exercised even
     /// though the Iceberg schema declares the value field `required` — the UDF
@@ -284,7 +284,7 @@ mod tests {
         scope: &[(&str, Option<&str>)],
         log: &[(&str, Option<&str>)],
     ) -> std::collections::BTreeMap<String, String> {
-        let udf = MapMergeNormalized::new();
+        let udf = MergeAttributeLevels::new();
         let args = ScalarFunctionArgs {
             args: vec![
                 ColumnarValue::Array(map_of_nullable(resource)),

@@ -34,7 +34,7 @@ use iceberg::{
         },
     },
 };
-use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
+use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
 };
@@ -44,11 +44,7 @@ use icegate_query::{
 };
 use reqwest::Client;
 use tokio::sync::oneshot;
-use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-
-/// How long to wait for the server to report the port it bound.
-const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Attribute map fixture builders
@@ -201,7 +197,7 @@ impl TestServer {
         // Wait for the server to bind and receive the actual port. Drain the task on
         // either failure: `warehouse_path` drops as this frame unwinds, so a detached
         // server would go on running against a deleted directory.
-        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
+        let actual_port = match tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx).await {
             Ok(Ok(port)) => port,
             Ok(Err(_recv_err)) => {
                 cancel_token.cancel();

@@ -17,7 +17,7 @@ const COL_MERGED_ATTRS: &str = "_merged_attrs";
 
 /// Name of the merged, normalized attribute map in a `LogQL` query
 /// pipeline's output schema: produced by the series/vector/range-aggregation
-/// plans below (via [`merged_attributes`] + `map_merge_normalized`) and read
+/// plans below (via [`merged_attributes`] + `merge_attribute_levels`) and read
 /// back by `loki::formatters` to build the response.
 ///
 /// A `DataFusion` `DataFrame`/`RecordBatch` column, not a stored table
@@ -192,7 +192,7 @@ fn merged_attributes(schema: &DFSchema) -> Expr {
     if schema_has_merged_attributes(schema) {
         col(MERGED_ATTRIBUTES_COLUMN)
     } else {
-        ScalarUDF::from(crate::logql::datafusion::udf::MapMergeNormalized::new()).call(vec![
+        ScalarUDF::from(crate::logql::datafusion::udf::MergeAttributeLevels::new()).call(vec![
             col(COL_RESOURCE_ATTRIBUTES),
             col(COL_SCOPE_ATTRIBUTES),
             col(COL_LOG_ATTRIBUTES),
@@ -604,7 +604,7 @@ impl DataFusionPlanner {
     ///
     /// An aggregation reads the merged map three times — serialized keys,
     /// serialized values, and the preserved map itself — and every one of
-    /// those is a separate `map_merge_normalized` invocation per scanned row
+    /// those is a separate `merge_attribute_levels` invocation per scanned row
     /// unless the merge is staged into a column first. `plan_series` already
     /// stages it for exactly this reason; this is that step, shared.
     ///
@@ -2296,9 +2296,9 @@ mod attribute_lookup_tests {
 mod merged_attributes_tests {
     //! Behavioral tests for the private [`super::merged_attributes`] helper.
     //!
-    //! [`super::udf::MapMergeNormalized`] already carries execution-based
+    //! [`super::udf::MergeAttributeLevels`] already carries execution-based
     //! coverage of the merge/normalize/precedence rules themselves (see
-    //! `udf::map_merge_normalized::tests`); these tests prove the planner
+    //! `udf::merge_attribute_levels::tests`); these tests prove the planner
     //! wires that UDF to the three correct columns, in the correct
     //! precedence order, including through a real `SessionContext`.
 
@@ -2326,9 +2326,9 @@ mod merged_attributes_tests {
         let Expr::ScalarFunction(merge) = &expr else {
             panic!("merged_attributes must produce a scalar function, got {expr:?}");
         };
-        assert_eq!(merge.func.name(), "map_merge_normalized");
+        assert_eq!(merge.func.name(), "merge_attribute_levels");
 
-        // Argument order IS precedence order for MapMergeNormalized (resource
+        // Argument order IS precedence order for MergeAttributeLevels (resource
         // first, log last — see its doc comment).
         let columns: Vec<&str> = merge
             .args

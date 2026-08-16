@@ -34,7 +34,7 @@ use iceberg::{
         },
     },
 };
-use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
+use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE,
     catalog::CatalogBuilder,
@@ -52,9 +52,6 @@ use tokio_util::sync::CancellationToken;
 /// sanitizer builds run this same harness at a fraction of normal speed.
 const READY_ATTEMPTS: u32 = 50;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// How long to wait for the server to report the port it bound.
-const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Test server running a Tempo HTTP API on an ephemeral port.
 pub struct TestServer {
@@ -141,7 +138,7 @@ impl TestServer {
         // with this frame, so a detached server would go on serving from a deleted
         // directory. `drain_server_task` resumes the task's own panic when it has
         // one, which is the only place the real startup error survives.
-        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
+        let actual_port = match tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx).await {
             Ok(Ok(port)) => port,
             Ok(Err(_recv_err)) => {
                 cancel_token.cancel();

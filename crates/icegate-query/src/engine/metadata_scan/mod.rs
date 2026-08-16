@@ -138,6 +138,14 @@ impl MetadataScanConfig {
 /// Compute the set of label/tag names visible in `table` for the given
 /// tenant, time range, and additional predicate.
 ///
+/// `configs` is the set of attribute levels to enumerate — one config per MAP
+/// column, since [`MetadataScanConfig`] addresses a single one. Every level is
+/// resolved from ONE Iceberg plan and ONE open of each data file: the levels of
+/// a table live in the same Parquet files, so planning and footer-decoding per
+/// level would repeat that work for a result that is unioned anyway. The
+/// returned set is the union across levels; per-level exclusions and wire-name
+/// rendering still apply within each level before it joins the union.
+///
 /// `extra_predicate` is AND'd with the tenant+time base predicate (see
 /// [`base_predicate`]). Pass [`Predicate::AlwaysTrue`] to disable.
 ///
@@ -146,9 +154,10 @@ impl MetadataScanConfig {
 /// Returns an error if iceberg planning fails or if a referenced Parquet file
 /// cannot be read.
 #[tracing::instrument(
-    skip(table, config, extra_predicate),
+    skip(table, configs, extra_predicate),
     fields(
         tenant_id = %tenant_id,
+        num_configs = configs.len(),
         num_files = tracing::field::Empty,
     )
 )]
@@ -157,7 +166,7 @@ pub async fn scan_labels(
     tenant_id: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    config: &MetadataScanConfig,
+    configs: &[MetadataScanConfig],
     extra_predicate: Predicate,
 ) -> Result<BTreeSet<String>, MetadataScanError> {
     let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
@@ -170,7 +179,7 @@ pub async fn scan_labels(
         .map_ok(|task| {
             let file_io = file_io.clone();
             let predicate = predicate.clone();
-            async move { scan_labels_for_file(&file_io, task, &predicate, config).await }
+            async move { scan_labels_for_file(&file_io, task, &predicate, configs).await }
         })
         .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
 
@@ -188,17 +197,32 @@ pub async fn scan_labels(
 /// tenant, time range, and additional predicate.
 ///
 /// `label_name` may be an alias (e.g. `"level"`) — the alias is resolved to
-/// its underlying column via `config.label_aliases`.
+/// its underlying column via each config's `label_aliases`.
+///
+/// `configs` is the set of attribute levels to enumerate; the result is their
+/// union. As in [`scan_labels`], the levels share one Iceberg plan and one open
+/// per data file. Within a file the work is split by how each config classifies
+/// `label_name`: levels resolving it to a top-level column contribute a
+/// dictionary read of that column (once per DISTINCT column, however many
+/// configs name it), and levels resolving it to a map key are served by a single
+/// projected pass over all their map columns at once.
+///
+/// The union is deliberate and matches the per-level enumeration this replaced:
+/// a value present at more than one level surfaces once, and no level shadows
+/// another. Value enumeration is an over-approximation — see
+/// `values::collect_map_values_from_batch`. Callers needing per-row precedence
+/// between two levels want [`scan_coalesced_map_label_values`] instead.
 ///
 /// # Errors
 ///
 /// Returns an error if iceberg planning fails or if a referenced Parquet file
 /// cannot be read.
 #[tracing::instrument(
-    skip(table, config, extra_predicate),
+    skip(table, configs, extra_predicate),
     fields(
         tenant_id = %tenant_id,
         label_name = %label_name,
+        num_configs = configs.len(),
         num_files = tracing::field::Empty,
     )
 )]
@@ -207,30 +231,49 @@ pub async fn scan_label_values(
     tenant_id: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    config: &MetadataScanConfig,
+    configs: &[MetadataScanConfig],
     label_name: &str,
     extra_predicate: Predicate,
 ) -> Result<BTreeSet<String>, MetadataScanError> {
     let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
-    let kind = values::classify_label(label_name, config);
+
+    // Classification is a property of (label, config), not of a file, so it is
+    // resolved once here instead of per data file. Distinct indexed columns
+    // rather than one per config: several levels resolving `label_name` to the
+    // same top-level column would otherwise re-read one dictionary page each.
+    let mut indexed_columns: Vec<String> = Vec::new();
+    let mut map_configs: Vec<&MetadataScanConfig> = Vec::new();
+    for config in configs {
+        match values::classify_label(label_name, config) {
+            values::LabelKind::Indexed => {
+                let column = config.resolve_column(label_name).to_string();
+                if !indexed_columns.contains(&column) {
+                    indexed_columns.push(column);
+                }
+            }
+            values::LabelKind::MapAttribute => map_configs.push(config),
+        }
+    }
+    let indexed_columns = &indexed_columns;
+    let map_configs = &map_configs;
+
     let plan_stream = plan_files(table, &predicate).await?;
     let file_io = table.file_io().clone();
 
-    let indexed_column = config.resolve_column(label_name).to_string();
     let label_name = label_name.to_string();
     let mut num_files: usize = 0;
-    let mut stream = plan_stream
-        .map_err(MetadataScanError::Iceberg)
-        .map_ok(|task| {
-            let file_io = file_io.clone();
-            let label = label_name.clone();
-            let indexed_column = indexed_column.clone();
-            let predicate = predicate.clone();
-            async move {
-                scan_label_values_for_file(&file_io, task, &predicate, config, kind, &label, &indexed_column).await
-            }
-        })
-        .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
+    let mut stream =
+        plan_stream
+            .map_err(MetadataScanError::Iceberg)
+            .map_ok(|task| {
+                let file_io = file_io.clone();
+                let label = label_name.clone();
+                let predicate = predicate.clone();
+                async move {
+                    scan_label_values_for_file(&file_io, task, &predicate, indexed_columns, map_configs, &label).await
+                }
+            })
+            .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
 
     let mut result: BTreeSet<String> = BTreeSet::new();
     while let Some(r) = stream.next().await {
@@ -393,45 +436,58 @@ async fn scan_labels_for_file(
     file_io: &iceberg::io::FileIO,
     task: FileScanTask,
     predicate: &Predicate,
-    config: &MetadataScanConfig,
+    configs: &[MetadataScanConfig],
 ) -> Result<BTreeSet<String>, MetadataScanError> {
+    // Opened once and reused across levels: the footer decode and the file
+    // handle are properties of the file, not of the level being enumerated.
     let (mut reader, metadata) = parquet_reader::open_file_direct(file_io, &task).await?;
 
     let mut out: BTreeSet<String> = BTreeSet::new();
-    labels::collect_indexed_from_metadata(&metadata, config, &mut out);
-    labels::collect_map_keys_via_dict(&mut reader, &metadata, predicate, config, &mut out).await?;
+    for config in configs {
+        // Each level accumulates into its OWN set, because
+        // `collect_map_keys_via_dict` finishes by applying that level's
+        // wire-name rendering and exclusions to everything in the set it was
+        // given. Sharing one set across levels would re-apply a later level's
+        // policy to an earlier level's names.
+        let mut level: BTreeSet<String> = BTreeSet::new();
+        labels::collect_indexed_from_metadata(&metadata, config, &mut level);
+        labels::collect_map_keys_via_dict(&mut reader, &metadata, predicate, config, &mut level).await?;
+        out.append(&mut level);
+    }
     Ok(out)
 }
 
 /// Process one Parquet file for a label/tag-value enumeration request.
 ///
-/// - Indexed case (e.g. `service_name`, `level`): open the file directly
-///   and read the column's dictionary page. No row batches.
-/// - MAP case (non-indexed labels): open the file via the record-batch
-///   stream builder and project the `attributes` column, so we can
-///   correlate `key == label_name` rows with their values.
-#[tracing::instrument(skip_all, fields(file = %task.data_file_path, kind = ?kind))]
+/// The two cases need different readers, so each is opened at most once and
+/// only when some config actually selected it:
+///
+/// - `indexed_columns` (e.g. `service_name`, `level`): open the file directly
+///   and read each column's dictionary page. No row batches.
+/// - `map_configs` (non-indexed labels): open the file via the record-batch
+///   stream builder and project every one of their map columns in a single
+///   pass, so we can correlate `key == label_name` rows with their values.
+#[tracing::instrument(skip_all, fields(file = %task.data_file_path))]
 async fn scan_label_values_for_file(
     file_io: &iceberg::io::FileIO,
     task: FileScanTask,
     predicate: &Predicate,
-    config: &MetadataScanConfig,
-    kind: values::LabelKind,
+    indexed_columns: &[String],
+    map_configs: &[&MetadataScanConfig],
     label_name: &str,
-    indexed_column: &str,
 ) -> Result<BTreeSet<String>, MetadataScanError> {
     let mut out: BTreeSet<String> = BTreeSet::new();
 
-    match kind {
-        values::LabelKind::Indexed => {
-            let (mut reader, metadata) = parquet_reader::open_file_direct(file_io, &task).await?;
-            values::collect_indexed_values_via_dict(&mut reader, &metadata, predicate, indexed_column, &mut out)
-                .await?;
+    if !indexed_columns.is_empty() {
+        let (mut reader, metadata) = parquet_reader::open_file_direct(file_io, &task).await?;
+        for column in indexed_columns {
+            values::collect_indexed_values_via_dict(&mut reader, &metadata, predicate, column, &mut out).await?;
         }
-        values::LabelKind::MapAttribute => {
-            let builder = parquet_reader::open_builder(file_io, &task).await?;
-            values::stream_map_values(builder, predicate, config, label_name, &mut out).await?;
-        }
+    }
+
+    if !map_configs.is_empty() {
+        let builder = parquet_reader::open_builder(file_io, &task).await?;
+        values::stream_map_values(builder, predicate, map_configs, label_name, &mut out).await?;
     }
 
     Ok(out)

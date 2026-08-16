@@ -5,10 +5,19 @@
 //! what makes draining the task non-optional: a task still running when that
 //! directory is removed serves from a deleted path, and under LeakSanitizer it
 //! also outlives the check. The harnesses are separate compilation units, so
-//! the drain sequence and its time limit live here rather than once per
-//! harness.
+//! the drain sequence and both of a harness-spawned server's time limits —
+//! startup ([`PORT_BIND_TIMEOUT`]) and shutdown ([`SHUTDOWN_TIMEOUT`]) — live
+//! here rather than once per harness.
 
 use tokio::{task::JoinHandle, time::Duration};
+
+/// How long a harness waits for its spawned server to report the port it bound.
+///
+/// The bind itself is immediate; the budget covers the catalog and warehouse
+/// setup a server does before it listens, which on a cold test machine is the
+/// slow part. A harness that exceeds it has a server that failed to start, so
+/// waiting longer only delays the failure.
+pub const PORT_BIND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Grace period for a cancelled server task to wind down.
 ///
