@@ -267,5 +267,5 @@ and how the suppression files are maintained: [config/sanitizers/README.md](../c
   `--features`, so anything behind a feature gate is skipped silently — that code still
   needs the tests required above.
 - A leak or memory error in first-party code is a defect to fix, not to suppress. A
-  suppression matching a frame inside `icegate_*` MUST carry measured figures and a
-  retirement condition, as the existing exceptions in `config/sanitizers/lsan.supp` do.
+  suppression matching a frame inside `icegate_*` MUST carry measured figures from a full
+  run on the current tree and a retirement condition.

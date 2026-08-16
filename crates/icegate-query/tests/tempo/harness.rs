@@ -50,6 +50,10 @@ use tokio_util::sync::CancellationToken;
 const READY_ATTEMPTS: u32 = 50;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Grace period for the server task to wind down once cancelled, used both for
+/// an orderly shutdown and for draining the task after a failed startup.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Test server running a Tempo HTTP API on an ephemeral port.
 pub struct TestServer {
     pub client: Client,
@@ -151,6 +155,11 @@ impl TestServer {
             tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
         if !is_ready {
+            // Drain the server before returning: `warehouse_path` drops with this
+            // frame, so a detached task would go on serving from a directory that
+            // has been deleted under it.
+            cancel_token.cancel();
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_handle).await;
             return Err(format!("Tempo server at {base_url} never became ready").into());
         }
 
@@ -173,13 +182,18 @@ impl TestServer {
     /// pass the test (and leak the background task).
     pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        match tokio::time::timeout(Duration::from_secs(5), &mut self.server_handle).await {
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await {
             Ok(Ok(())) => {}
             Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
             Ok(Err(join_err)) => panic!("Tempo server task failed to join: {join_err}"),
             Err(_elapsed) => {
                 self.server_handle.abort();
-                panic!("Tempo server did not shut down within 5s");
+                // `abort()` only schedules cancellation, so join the task before the
+                // panic unwinds and drops `temp_dir`. Bounded, because a task wedged
+                // in non-yielding code would never join at all, and a hung suite is a
+                // worse outcome than this panic.
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await;
+                panic!("Tempo server did not shut down within {}s", SHUTDOWN_TIMEOUT.as_secs());
             }
         }
     }

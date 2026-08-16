@@ -6,9 +6,7 @@
 # Same two rules as lsan.supp — every entry names the library and why the
 # allocation is not ours, and no entry may match a frame inside icegate_*.
 #
-# Note that lsan.supp now carries three documented exceptions to the second rule,
-# each covering a known first-party defect. Those were deliberate, individually
-# approved, and each carries measured figures and the fix that retires it. They
-# are not a precedent for this file: an ASan report is a memory error, not a
-# retained allocation, so there is no equivalent "known and bounded" category.
-# Suppressing one here would be hiding a bug outright.
+# An exception to the second rule in lsan.supp would not be a precedent for this
+# file: an ASan report is a memory error, not a retained allocation, so there is
+# no equivalent "known and bounded" category. Suppressing one here would be
+# hiding a bug outright.

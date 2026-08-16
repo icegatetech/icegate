@@ -37,6 +37,10 @@ use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+/// Grace period for the server task to wind down once cancelled, used both for
+/// an orderly shutdown and for draining the task after a failed startup.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Build a `FixedSizeBinary(byte_width)` array by decoding `hex` once and
 /// repeating the resulting bytes `count` times. Used to seed identical
 /// `trace_id` / `span_id` values across many synthetic rows.
@@ -142,12 +146,16 @@ impl TestServer {
 
         let actual_port = match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
             Ok(Ok(port)) => port,
-            Ok(Err(_)) => {
+            Ok(Err(_recv_err)) => {
                 cancel_token.cancel();
+                // Drain before unwinding: `warehouse_path` drops with this frame, so a
+                // detached server would go on running against a deleted directory.
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_handle).await;
                 panic!("Failed to receive port from server");
             }
-            Err(_) => {
+            Err(_elapsed) => {
                 cancel_token.cancel();
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_handle).await;
                 panic!("Timed out waiting for server to start");
             }
         };
@@ -171,13 +179,21 @@ impl TestServer {
     /// skew a benchmark (and leak the background task).
     pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        match tokio::time::timeout(Duration::from_secs(5), &mut self.server_handle).await {
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await {
             Ok(Ok(())) => {}
             Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
             Ok(Err(join_err)) => panic!("Loki benchmark server task failed to join: {join_err}"),
             Err(_elapsed) => {
                 self.server_handle.abort();
-                panic!("Loki benchmark server did not shut down within 5s");
+                // `abort()` only schedules cancellation, so join the task before the
+                // panic unwinds and drops `temp_dir`. Bounded, because a task wedged
+                // in non-yielding code would never join at all, and a hung run is a
+                // worse outcome than this panic.
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.server_handle).await;
+                panic!(
+                    "Loki benchmark server did not shut down within {}s",
+                    SHUTDOWN_TIMEOUT.as_secs()
+                );
             }
         }
     }
