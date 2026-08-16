@@ -13,7 +13,7 @@ Thank you for your interest in contributing to IceGate! This document provides g
 
 ### Prerequisites
 
-- **Rust** >= 1.92.0 (for Rust 2024 edition support)
+- **Rust** at or above the `rust-version` declared in the workspace [`Cargo.toml`](Cargo.toml)
 - **Cargo** (included with Rust)
 - **Git**
 - **Docker** and **Docker Compose** (for development environment)
@@ -28,7 +28,7 @@ Thank you for your interest in contributing to IceGate! This document provides g
 
 2. Verify your Rust installation:
    ```bash
-   rustc --version  # Should be 1.92.0 or later
+   rustc --version  # Must be at or above Cargo.toml's rust-version
    cargo --version
    ```
 

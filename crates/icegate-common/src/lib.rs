@@ -144,8 +144,8 @@ pub mod tracing;
 /// Compaction-safe resolution of the last committed WAL offset from snapshots.
 pub mod wal_offset;
 
-/// Testing utilities (available only with `testing` feature).
-#[cfg(feature = "testing")]
+/// Testing utilities (available with the `testing` or `test-harness` feature).
+#[cfg(any(feature = "testing", feature = "test-harness"))]
 pub mod testing;
 
 // Re-export commonly used types

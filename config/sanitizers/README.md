@@ -21,15 +21,16 @@ not part of `make ci` — CI runs them nightly and on any PR labelled `sanitize`
 ## Reading a green run honestly
 
 A green `make sanitize-leak` means **no new leaks**, not no leaks. `lsan.supp` suppresses a
-documented baseline: upstream retention we do not control, plus one first-party entry that
-covers test scaffolding. Each entry records what leaks, how much, and the condition that
-retires it. Read that file before concluding the codebase is leak-free.
+documented baseline of upstream retention we do not control. Each entry records what leaks,
+how much, and the condition that retires it. Read that file before concluding the codebase
+is leak-free — and note that no figure in it has yet been reproduced on CI's stack shape.
 
-No first-party *production* path is suppressed today, and that is a property worth keeping —
-adding one back means the nightly stops reporting a real defect. Two such entries were
-deleted in August 2026 once the code they named had been refactored away; `lsan.supp`'s
-header records both, because the failure mode they share is that a suppression outlives its
-subject in silence.
+No first-party path is suppressed today, production or test, and that is a property worth
+keeping — adding one back means the nightly stops reporting a real defect. Three such
+entries were deleted in August 2026: two once the code they named had been refactored away,
+and one once the harnesses stopped leaking their `TempDir`. The first two had gone stale
+without anyone noticing, which is the failure mode to watch — a suppression outlives its
+subject in silence. `git log config/sanitizers/lsan.supp` has the details.
 
 **The sanitizer suite covers less than `make ci` does.** It runs no `--features`, so
 `crates/icegate-catalog-s3`'s `catalog` binary — which declares
@@ -62,10 +63,10 @@ Two rules, stated in full at the top of `lsan.supp`: every entry names the libra
 the allocation is not ours, and no entry may match a frame inside `icegate_*`. A leak in
 first-party code is a bug to fix, not to suppress.
 
-`lsan.supp` carries documented exceptions to the second rule, each with measured figures
-and a retirement condition. Adding another needs the same accounting, or the target quietly
-becomes a rubber stamp. `asan.supp` gets no such exemption: an ASan report is a memory error
-rather than a retained allocation, so suppressing one hides a bug.
+`lsan.supp` carries no exception to the second rule today. Adding one needs measured figures
+from a full run on the current tree plus a retirement condition, or the target quietly
+becomes a rubber stamp. `asan.supp` gets no such exemption either: an ASan report is a memory
+error rather than a retained allocation, so suppressing one hides a bug.
 
 ## Maintaining the targets
 

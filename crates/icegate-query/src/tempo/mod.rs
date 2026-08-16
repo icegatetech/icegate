@@ -15,4 +15,4 @@ pub mod trace_by_id;
 mod validation;
 
 pub use config::TempoConfig;
-pub use server::run;
+pub use server::{run, run_with_port_tx};

@@ -798,7 +798,7 @@ mod tests {
             self.writes.lock().await.push(attempt_batches);
             if self
                 .fail_attempts_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     (remaining > 0).then_some(remaining.saturating_sub(1))
                 })
                 .is_ok()
