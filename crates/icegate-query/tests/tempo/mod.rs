@@ -2,4 +2,6 @@
 
 mod echo;
 mod harness;
+mod search;
 mod tags;
+mod trace_by_id;

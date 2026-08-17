@@ -14,7 +14,6 @@
 )]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::sql::client::FlightSqlServiceClient;
@@ -35,6 +34,7 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, METRICS_TABLE, PRICES_TABLE,
     SPANS_TABLE, TENANT_ID_HEADER, catalog::CatalogBuilder, schema,
@@ -113,7 +113,7 @@ impl TestServer {
         let server_engine = Arc::clone(&query_engine);
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
-        let server_handle = tokio::spawn(async move {
+        let mut server_handle = tokio::spawn(async move {
             icegate_query::flight_sql::run_with_port_tx(
                 server_engine,
                 flight_sql_config,
@@ -125,10 +125,23 @@ impl TestServer {
             .unwrap();
         });
 
-        let actual_port = tokio::time::timeout(Duration::from_secs(10), port_rx)
-            .await
-            .expect("Timed out waiting for Flight SQL server to start")
-            .expect("Failed to receive port from server");
+        // Drain the task on either failure before unwinding: `warehouse_path` drops
+        // with this frame, so a detached server would go on serving from a deleted
+        // directory. `drain_server_task` resumes the task's own panic when it has
+        // one, which is the only place the real startup error survives.
+        let actual_port = match tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx).await {
+            Ok(Ok(port)) => port,
+            Ok(Err(_recv_err)) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Flight SQL").await;
+                panic!("Flight SQL server dropped the port channel before reporting a bound port");
+            }
+            Err(_elapsed) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Flight SQL").await;
+                panic!("Timed out waiting for Flight SQL server to bind");
+            }
+        };
 
         let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{actual_port}"))?;
         let channel = endpoint.connect().await?;
@@ -165,14 +178,12 @@ impl TestServer {
     /// pass the test (and leak the background task).
     pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        match tokio::time::timeout(Duration::from_secs(5), &mut self.server_handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(join_err)) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
-            Ok(Err(join_err)) => panic!("Flight SQL server task failed to join: {join_err}"),
-            Err(_elapsed) => {
-                self.server_handle.abort();
-                panic!("Flight SQL server did not shut down within 5s");
-            }
+        match drain_server_task(&mut self.server_handle, "Flight SQL").await {
+            DrainOutcome::Finished => {}
+            DrainOutcome::Aborted => panic!(
+                "Flight SQL server did not shut down within {}s",
+                SHUTDOWN_TIMEOUT.as_secs()
+            ),
         }
     }
 }
@@ -273,6 +284,9 @@ pub async fn write_spans_file(
     }
 
     let attribute_rows: Vec<&[(&str, &str)]> = vec![&[("http.method", "GET")]; row_count];
+    // scope_attributes carries no content in this narrow fixture, same as the
+    // scope/log levels in `write_logs_file` below.
+    let empty_rows: Vec<&[(&str, &str)]> = vec![&[]; row_count];
     let timestamps: Vec<i64> = (0..row_count).map(|i| now_micros - (i as i64) * 1000).collect();
     let zeros: ArrayRef = Arc::new(Int32Array::from(vec![Some(0); row_count]));
 
@@ -333,6 +347,10 @@ pub async fn write_spans_file(
     by_name.insert(
         schema::COL_SPAN_ATTRIBUTES,
         build_attribute_map(&arrow_schema, schema::COL_SPAN_ATTRIBUTES, &attribute_rows)?,
+    );
+    by_name.insert(
+        schema::COL_SCOPE_ATTRIBUTES,
+        build_attribute_map(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES, &empty_rows)?,
     );
     // `icegate_common::schema` exports no `COL_*` constant for these four, so
     // they stay literals; the emptiness assertion below still catches drift.
@@ -519,31 +537,23 @@ pub async fn write_logs_file(
         table.metadata().current_schema(),
     )?);
 
-    let attributes_field = arrow_schema
-        .field_with_name("attributes")
-        .expect("logs schema must contain an `attributes` field");
-    let (key_field, value_field) = match attributes_field.data_type() {
-        DataType::Map(entries_field, _) => match entries_field.data_type() {
-            DataType::Struct(fields) => (fields[0].clone(), fields[1].clone()),
-            other => panic!("expected Struct entries, got {other:?}"),
-        },
-        other => panic!("expected Map attributes column, got {other:?}"),
-    };
+    // The logs schema splits attributes across three per-OTLP-level MAP
+    // columns (see `icegate_common::schema::logs_schema`) rather than the
+    // single merged `attributes` column this fixture used before that
+    // split. `tenant.marker` is resource-level (constant per reporting
+    // resource) and stored dotted — like real ingest output — so a test
+    // that reads it back exercises the '.' -> '_' wire-name normalization
+    // instead of a fixture that never needed it; mirrors the convention in
+    // `tests/loki/harness.rs::write_test_logs_for_tenant`. scope/log levels
+    // are legitimately empty: this fixture carries no per-scope or
+    // per-record attributes.
+    let resource_pairs: Vec<[(&str, &str); 1]> = tenant_ids.iter().map(|t| [("tenant.marker", *t)]).collect();
+    let resource_rows: Vec<&[(&str, &str)]> = resource_pairs.iter().map(<[(&str, &str); 1]>::as_slice).collect();
+    let resource_attributes = build_attribute_map(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES, &resource_rows)?;
 
-    let field_names = MapFieldNames {
-        entry: "key_value".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let mut attributes_builder = MapBuilder::new(Some(field_names), StringBuilder::new(), StringBuilder::new())
-        .with_keys_field(key_field)
-        .with_values_field(value_field);
-    for tenant_id in tenant_ids {
-        attributes_builder.keys().append_value("tenant_marker");
-        attributes_builder.values().append_value(tenant_id);
-        attributes_builder.append(true)?;
-    }
-    let attributes: ArrayRef = Arc::new(attributes_builder.finish());
+    let empty_rows: Vec<&[(&str, &str)]> = vec![&[]; row_count];
+    let scope_attributes = build_attribute_map(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES, &empty_rows)?;
+    let log_attributes = build_attribute_map(&arrow_schema, schema::COL_LOG_ATTRIBUTES, &empty_rows)?;
 
     // Distinct trace/span ids per row, derived from the row index so the
     // values stay unique without a fixed lookup table. The full index is
@@ -571,7 +581,9 @@ pub async fn write_logs_file(
             span_id,
             severity_text,
             body,
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )?;
 

@@ -3,7 +3,10 @@
 //! Converts DataFusion `RecordBatch` results to Loki-compatible response
 //! formats (streams for log queries, matrix for metric queries).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use datafusion::arrow::{
     array::{
@@ -12,12 +15,17 @@ use datafusion::arrow::{
     },
     datatypes::Schema,
 };
-use icegate_common::schema::{
-    COL_ATTRIBUTES, COL_BODY, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID,
-    LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS, LOG_SERIES_LABEL_COLUMNS,
+use icegate_common::{
+    attribute_key::normalize_attribute_key,
+    schema::{
+        COL_BODY, COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME,
+        COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID, LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS,
+        LOG_SERIES_LABEL_COLUMNS,
+    },
 };
 
 use super::models::{MetricSeries, QueryResult, QueryStats, ResultType, Stream};
+use crate::logql::datafusion::planner::MERGED_ATTRIBUTES_COLUMN;
 
 // ============================================================================
 // Formatting Result
@@ -105,7 +113,13 @@ pub struct BatchColumns {
     pub level: Option<usize>,
     pub trace_id: Option<usize>,
     pub span_id: Option<usize>,
-    pub attributes: Option<usize>,
+    /// Attribute map columns, innermost level last.
+    ///
+    /// `plan_series` hands back one already-merged, already-normalized map
+    /// aliased to `attributes`; `plan_log` hands back the three stored
+    /// columns. Whichever is present is resolved here so the row loop does not
+    /// have to branch.
+    pub attribute_maps: Vec<usize>,
 }
 
 impl BatchColumns {
@@ -119,7 +133,15 @@ impl BatchColumns {
             level: schema.index_of(LEVEL_ALIAS).ok(),
             trace_id: schema.index_of(COL_TRACE_ID).ok(),
             span_id: schema.index_of(COL_SPAN_ID).ok(),
-            attributes: schema.index_of(COL_ATTRIBUTES).ok(),
+            attribute_maps: [
+                COL_RESOURCE_ATTRIBUTES,
+                COL_SCOPE_ATTRIBUTES,
+                COL_LOG_ATTRIBUTES,
+                MERGED_ATTRIBUTES_COLUMN,
+            ]
+            .iter()
+            .filter_map(|name| schema.index_of(name).ok())
+            .collect(),
         }
     }
 }
@@ -140,7 +162,7 @@ impl MetricBatchColumns {
         Self {
             timestamp: schema.index_of(COL_TIMESTAMP).ok(),
             value: schema.index_of("value").ok(),
-            attributes: schema.index_of(COL_ATTRIBUTES).ok(),
+            attributes: schema.index_of(MERGED_ATTRIBUTES_COLUMN).ok(),
         }
     }
 
@@ -256,7 +278,7 @@ fn extract_labels(
         }
     }
 
-    if let Some(idx) = cols.attributes {
+    for &idx in &cols.attribute_maps {
         extract_attributes_map(batch, idx, row, &mut labels, interner);
     }
 
@@ -264,6 +286,26 @@ fn extract_labels(
 }
 
 /// Extract key-value pairs from attributes `MapArray` column.
+///
+/// On an intra-level normalization collision — two distinct raw (dotted)
+/// keys in THIS map that normalize to the same wire name, e.g.
+/// `k8s.pod.name` and `k8s_pod_name` both present in `log_attributes` — the
+/// first key in stored order wins, and the rest are skipped rather than
+/// overwriting. This must agree with `map_get_by_normalized_key`'s
+/// scan-and-break tie-break and `merge_attribute_levels`'s intra-level
+/// `or_insert_with` tie-break, because all three resolve the same stored
+/// data for the matcher, series-identity, and displayed-label paths
+/// respectively: if this one disagreed, a row could match a query through
+/// one value while the client is shown a different value for the same
+/// label. Ingest dedupes only by the raw dotted-key string (never by
+/// normalized form) and writes through a `BTreeMap`, so "first in stored
+/// order" is deterministic ascending order.
+///
+/// This function only guards collisions within its own call. Cross-level
+/// precedence (resource -> scope -> log, log wins) is the caller's
+/// responsibility: `extract_labels` invokes this once per level against the
+/// same `labels` map, and a later level's first-seen name still overwrites
+/// an earlier level's entry, same as before this guard existed.
 fn extract_attributes_map(
     batch: &RecordBatch,
     attr_idx: usize,
@@ -283,9 +325,20 @@ fn extract_attributes_map(
             let values = map_arr.values().as_any().downcast_ref::<StringArray>();
 
             if let (Some(keys), Some(values)) = (keys, values) {
+                // Wire names already written by THIS level; scoped to this call
+                // so it resets at every level boundary (see doc comment above).
+                let mut seen_in_level: HashSet<Arc<str>> = HashSet::with_capacity(end - start);
                 for i in start..end {
+                    // A NULL key or value makes the entry invisible rather than
+                    // valueless, so it does not claim the wire name — the same
+                    // rule the two UDFs apply (see `icegate_common::attribute_key`).
                     if !keys.is_null(i) && !values.is_null(i) {
-                        labels.insert(interner.intern(keys.value(i)), interner.intern(values.value(i)));
+                        // The series path arrives pre-normalized, and
+                        // normalizing again is a no-op.
+                        let name = interner.intern(&normalize_attribute_key(keys.value(i)));
+                        if seen_in_level.insert(Arc::clone(&name)) {
+                            labels.insert(name, interner.intern(values.value(i)));
+                        }
                     }
                 }
             }
@@ -531,7 +584,7 @@ pub fn batches_to_series_list(batches: &[RecordBatch]) -> Vec<HashMap<String, St
             .chain(std::iter::once(&LEVEL_ALIAS))
             .filter_map(|&name| schema.index_of(name).ok().map(|idx| (name, idx)))
             .collect();
-        let attr_idx = schema.index_of(COL_ATTRIBUTES).ok();
+        let attr_idx = schema.index_of(MERGED_ATTRIBUTES_COLUMN).ok();
 
         for row in 0..batch.num_rows() {
             let mut label_map = HashMap::with_capacity(indexed_indices.len() + 8);
@@ -631,7 +684,7 @@ mod tests {
         }
         map_builder.append(true).expect("append map row");
         let attributes_array = map_builder.finish();
-        let attributes_field = Field::new(COL_ATTRIBUTES, attributes_array.data_type().clone(), true);
+        let attributes_field = Field::new(MERGED_ATTRIBUTES_COLUMN, attributes_array.data_type().clone(), true);
 
         let service_arr: ArrayRef = Arc::new(StringArray::from(vec![service]));
         let severity_arr: ArrayRef = Arc::new(StringArray::from(vec![severity]));
@@ -712,5 +765,123 @@ mod tests {
 
         // Sanity: only the six keys above (five indexed + one user attr).
         assert_eq!(labels.len(), 6, "got labels: {labels:?}");
+    }
+
+    /// Build a one-row batch carrying the three stored attribute columns.
+    fn batch_with_level_maps(resource: &[(&str, &str)], scope: &[(&str, &str)], log: &[(&str, &str)]) -> RecordBatch {
+        use datafusion::arrow::{
+            array::{MapArray, StringArray, StructArray},
+            buffer::{OffsetBuffer, ScalarBuffer},
+            datatypes::{DataType, Field, Fields},
+        };
+
+        let entry_fields: Fields = vec![
+            Arc::new(Field::new("key", DataType::Utf8, false)),
+            Arc::new(Field::new("value", DataType::Utf8, true)),
+        ]
+        .into();
+
+        let map_of = |pairs: &[(&str, &str)]| -> Arc<MapArray> {
+            let keys = StringArray::from(pairs.iter().map(|(k, _)| *k).collect::<Vec<_>>());
+            let values = StringArray::from(pairs.iter().map(|(_, v)| *v).collect::<Vec<_>>());
+            let entries = StructArray::new(
+                entry_fields.clone(),
+                vec![Arc::new(keys) as _, Arc::new(values) as _],
+                None,
+            );
+            // Test fixtures never carry enough pairs to approach i32::MAX; `try_from`
+            // over `as` keeps this file clippy::pedantic-clean (no cast lints).
+            let pair_count = i32::try_from(pairs.len()).expect("test fixture pair count fits in i32");
+            Arc::new(MapArray::new(
+                Arc::new(Field::new("key_value", DataType::Struct(entry_fields.clone()), false)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, pair_count])),
+                entries,
+                None,
+                false,
+            ))
+        };
+
+        let map_field = |name: &str| {
+            Field::new(
+                name,
+                DataType::Map(
+                    Arc::new(Field::new("key_value", DataType::Struct(entry_fields.clone()), false)),
+                    false,
+                ),
+                false,
+            )
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            map_field(COL_RESOURCE_ATTRIBUTES),
+            map_field(COL_SCOPE_ATTRIBUTES),
+            map_field(COL_LOG_ATTRIBUTES),
+        ]));
+
+        RecordBatch::try_new(schema, vec![map_of(resource), map_of(scope), map_of(log)]).expect("batch")
+    }
+
+    #[test]
+    fn emitted_label_names_are_normalized_and_log_wins() {
+        // Row carrying all three stored columns, as `plan_log` returns them.
+        let batch = batch_with_level_maps(
+            &[("k8s.pod.name", "web-1"), ("shared.key", "resource")],
+            &[("otel.scope.name", "lib"), ("shared.key", "scope")],
+            &[("http.method", "GET"), ("shared.key", "log")],
+        );
+        let cols = BatchColumns::from_schema(&batch.schema());
+        let mut interner = StringInterner::new();
+        let labels = extract_labels(&batch, &cols, 0, &mut interner);
+
+        // Dots become underscores on the wire; the stored dotted name never leaks.
+        assert_eq!(labels.get("k8s_pod_name").map(|v| &**v), Some("web-1"));
+        assert!(!labels.contains_key("k8s.pod.name"));
+        assert_eq!(labels.get("otel_scope_name").map(|v| &**v), Some("lib"));
+        assert_eq!(labels.get("http_method").map(|v| &**v), Some("GET"));
+
+        // Precedence matches the matcher path: the log level wins.
+        assert_eq!(labels.get("shared_key").map(|v| &**v), Some("log"));
+    }
+
+    #[test]
+    fn on_an_intra_level_normalization_collision_the_first_key_in_order_wins() {
+        // Same fixture shape as map_get_by_normalized_key's and
+        // merge_attribute_levels's identical tests: both raw keys live in ONE
+        // level (`log_attributes`), isolating the intra-level rule from the
+        // cross-level one. Ingest's ascending BTreeMap order places the
+        // dotted key first ('.' < '_'), so first-in-order is "dotted".
+        let batch = batch_with_level_maps(&[], &[], &[("k8s.pod.name", "dotted"), ("k8s_pod_name", "underscored")]);
+        let cols = BatchColumns::from_schema(&batch.schema());
+        let mut interner = StringInterner::new();
+        let labels = extract_labels(&batch, &cols, 0, &mut interner);
+
+        // HashMap::insert overwrites unconditionally; without the per-level
+        // `seen_in_level` guard in extract_attributes_map, the LAST key
+        // processed ("underscored") would win here instead — disagreeing
+        // with the matcher path (map_get_by_normalized_key) and the merge
+        // path (merge_attribute_levels) on which value a colliding label
+        // displays for the same row.
+        assert_eq!(labels.get("k8s_pod_name").map(|v| &**v), Some("dotted"));
+        assert_eq!(labels.len(), 1, "one wire name yields one label");
+    }
+
+    #[test]
+    fn intra_level_and_cross_level_collision_rules_compose() {
+        // Resource sets `shared_key` cleanly (no collision there). Log
+        // carries an intra-level collision on that same wire name. Getting
+        // either rule wrong changes the outcome: if log's intra-level
+        // tie-break broke, log would surface "underscored-log"; if
+        // cross-level precedence broke, resource's "resource" would survive
+        // instead of log's winner. Only "dotted-log" satisfies both.
+        let batch = batch_with_level_maps(
+            &[("shared.key", "resource")],
+            &[],
+            &[("shared.key", "dotted-log"), ("shared_key", "underscored-log")],
+        );
+        let cols = BatchColumns::from_schema(&batch.schema());
+        let mut interner = StringInterner::new();
+        let labels = extract_labels(&batch, &cols, 0, &mut interner);
+
+        assert_eq!(labels.get("shared_key").map(|v| &**v), Some("dotted-log"));
     }
 }

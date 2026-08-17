@@ -205,7 +205,7 @@ mod tests {
     // `field_reassign_with_default` is allowed here for the same reason as in
     // `pricing::config::tests`: these tests build a `PricingConfig::default()`
     // and then override only the field(s) under test.
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::field_reassign_with_default)]
+    #![allow(clippy::field_reassign_with_default)]
 
     use chrono::DateTime;
 

@@ -154,8 +154,6 @@ impl CatalogCodec for JsonCatalogCodec {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
-
     use std::collections::HashMap;
 
     use uuid::Uuid;

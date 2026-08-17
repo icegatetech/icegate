@@ -794,6 +794,12 @@ pub trait LogQLParserVisitor<'input>: ParseTreeVisitor<'input,LogQLParserContext
 	fn visit_variableExpr(&mut self, ctx: &VariableExprContext<'input>) { self.visit_children(ctx) }
 
 	/**
+	 * Visit a parse tree produced by {@link LogQLParser#labelName}.
+	 * @param ctx the parse tree
+	 */
+	fn visit_labelName(&mut self, ctx: &LabelNameContext<'input>) { self.visit_children(ctx) }
+
+	/**
 	 * Visit a parse tree produced by {@link LogQLParser#duration}.
 	 * @param ctx the parse tree
 	 */
@@ -1823,6 +1829,14 @@ pub trait LogQLParserVisitorCompat<'input>:ParseTreeVisitorCompat<'input, Node= 
 		}
 
 	/**
+	 * Visit a parse tree produced by {@link LogQLParser#labelName}.
+	 * @param ctx the parse tree
+	 */
+		fn visit_labelName(&mut self, ctx: &LabelNameContext<'input>) -> Self::Return {
+			self.visit_children(ctx)
+		}
+
+	/**
 	 * Visit a parse tree produced by {@link LogQLParser#duration}.
 	 * @param ctx the parse tree
 	 */
@@ -2423,6 +2437,11 @@ where
 
 	fn visit_variableExpr(&mut self, ctx: &VariableExprContext<'input>){
 		let result = <Self as LogQLParserVisitorCompat>::visit_variableExpr(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+	}
+
+	fn visit_labelName(&mut self, ctx: &LabelNameContext<'input>){
+		let result = <Self as LogQLParserVisitorCompat>::visit_labelName(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
 	}
 

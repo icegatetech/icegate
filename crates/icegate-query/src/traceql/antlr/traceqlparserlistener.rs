@@ -1,4 +1,4 @@
-#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::unwrap_used)]
+#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::unwrap_used, unused_parens)]
 #![allow(nonstandard_style)]
 // Generated from antlr/TraceQLParser.g4 by ANTLR 4.13.2
 use antlr4rust::tree::ParseTreeListener;

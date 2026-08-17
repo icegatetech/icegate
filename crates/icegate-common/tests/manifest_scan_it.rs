@@ -41,7 +41,10 @@ use icegate_catalog_s3::{CatalogCodecKind, S3Catalog, S3CatalogConfig};
 use icegate_common::catalog::IoHandle;
 use icegate_common::list_data_files_with_stats;
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
-use icegate_common::schema::{logs_partition_spec, logs_schema, logs_sort_order};
+use icegate_common::schema::{
+    COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, logs_partition_spec, logs_schema,
+    logs_sort_order,
+};
 use icegate_common::testing::{S3TestContainer, create_s3_bucket};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -106,6 +109,16 @@ async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
 /// a single `(tenant_id, day)` partition. The schema is derived from the iceberg
 /// `logs` schema so field names, order, nullability, and field-id metadata match
 /// exactly what the writer expects.
+///
+/// Deriving the schema independently of the created table is safe here because this suite
+/// drives the real `S3Catalog`, which preserves the caller's field ids verbatim on
+/// `create_table` (see `IcebergTableMetadata::create` in
+/// `icegate-catalog-s3/src/domain/root.rs`, pinned by its `create_preserves_caller_field_ids`
+/// regression test). That is not true of every catalog backend: the `Memory` backend
+/// (plain upstream `MemoryCatalogBuilder`, used by `icegate-ingest`'s shift-pipeline tests)
+/// reassigns nested map field ids on `create_table`, so fixtures that exercise it must build
+/// from the created table's own schema instead — see `icegate-ingest`'s
+/// `shift::test_utils::logs_ingest_batch_with_schema`.
 fn logs_batch(service: &str, base_micros: i64, rows: usize) -> RecordBatch {
     let iceberg_schema = logs_schema().unwrap();
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).unwrap());
@@ -121,7 +134,9 @@ fn logs_batch(service: &str, base_micros: i64, rows: usize) -> RecordBatch {
 
     let severity = StringArray::from(vec![Some("INFO"); rows]);
     let body = StringArray::from((0..rows).map(|i| Some(format!("msg-{service}-{i}"))).collect::<Vec<_>>());
-    let attributes = build_empty_string_map(&arrow_schema, rows);
+    let resource_attributes = build_empty_string_map(&arrow_schema, COL_RESOURCE_ATTRIBUTES, rows);
+    let scope_attributes = build_empty_string_map(&arrow_schema, COL_SCOPE_ATTRIBUTES, rows);
+    let log_attributes = build_empty_string_map(&arrow_schema, COL_LOG_ATTRIBUTES, rows);
 
     RecordBatch::try_new(
         arrow_schema,
@@ -135,23 +150,27 @@ fn logs_batch(service: &str, base_micros: i64, rows: usize) -> RecordBatch {
             Arc::new(span_id),
             Arc::new(severity),
             Arc::new(body),
-            attributes,
+            resource_attributes,
+            scope_attributes,
+            log_attributes,
         ],
     )
     .expect("record batch")
 }
 
 /// Build an empty `MAP<Utf8,Utf8>` column of length `rows` whose type is exactly
-/// the `attributes` field of the target arrow schema (including the
+/// the named attribute-map field of the target arrow schema (including the
 /// `PARQUET:field_id` metadata on the key/value sub-fields and value
 /// nullability), so `RecordBatch::try_new` accepts it.
-fn build_empty_string_map(arrow_schema: &ArrowSchema, rows: usize) -> Arc<dyn Array> {
+fn build_empty_string_map(arrow_schema: &ArrowSchema, column: &str, rows: usize) -> Arc<dyn Array> {
     use arrow::array::{MapArray, StructArray};
     use arrow::buffer::OffsetBuffer;
 
-    let attr_field = arrow_schema.field_with_name("attributes").unwrap();
+    let attr_field = arrow_schema
+        .field_with_name(column)
+        .unwrap_or_else(|_| panic!("{column} field"));
     let DataType::Map(entry_field, ordered) = attr_field.data_type() else {
-        panic!("attributes must be a Map");
+        panic!("{column} must be a Map");
     };
     let DataType::Struct(kv_fields) = entry_field.data_type() else {
         panic!("map entry must be a Struct");

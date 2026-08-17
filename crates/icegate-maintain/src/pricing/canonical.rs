@@ -109,8 +109,6 @@ pub fn apply_canonical_ids(rates: &mut [RateObservation]) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use chrono::DateTime;
 
     use super::{apply_canonical_ids, derive_canonical_id};

@@ -10,8 +10,6 @@
 //! cargo test -p icegate-common --test operator_registry_it
 //! ```
 
-#![allow(clippy::expect_used)]
-
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 

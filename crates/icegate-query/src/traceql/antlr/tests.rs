@@ -209,6 +209,74 @@ fn parses_event_scoped_attribute() {
     }
 }
 
+/// `TraceQL`/Tempo has no instrumentation-scope query scope — the owner's
+/// correction that removed the earlier, incorrect `scope.` selector.
+/// `OTel` `InstrumentationScope.attributes` are reachable only through
+/// `span.<name>` (or the unscoped `.<name>` shorthand), exactly like any
+/// other span-scope attribute. `otel.scope.name` is the real `OTel`
+/// semantic-convention key for the instrumentation scope's name, so this
+/// doubles as a dotted-name check: the middle `scope` segment parses as a
+/// plain `identChain` part (there is no `SCOPE_INSTRUMENTATION` token to
+/// steal it) and both dots survive into `FieldRef::Attribute::name`
+/// unmodified — `TraceQL` attribute names are matched exactly as stored,
+/// unlike Loki's dot-to-underscore label normalization.
+#[test]
+fn parses_span_dot_attribute_with_dotted_scope_name() {
+    let e = parse(r#"{ span.otel.scope.name = "checkout-worker" }"#);
+    if let TraceQLExpr::Spanset(SpansetExpr::Selector(SpanSelector {
+        filter: Some(SpanFilter::Compare { field, .. }),
+    })) = e
+    {
+        assert_eq!(
+            field,
+            FieldRef::Attribute {
+                scope: Scope::Span,
+                name: "otel.scope.name".to_string()
+            }
+        );
+    } else {
+        panic!("unexpected AST shape");
+    }
+}
+
+/// The owner's correction removed the dedicated `SCOPE_INSTRUMENTATION`
+/// lexer token along with the `scope.` selector it backed. A query using
+/// that old prefix must now fail to parse — `scope` lexes as a plain
+/// `IDENT`, which is not a valid `fieldRef` start (same failure shape as
+/// any other unrecognised bare word, e.g. `{ bogus = 1 }`) — rather than
+/// silently resolving to an empty/no-op scope.
+#[test]
+fn scope_dot_prefix_is_no_longer_valid_syntax() {
+    parse_err(r#"{ scope.otel.scope.name = "checkout-worker" }"#);
+}
+
+/// Over-deletion / over-narrowing guard (mirrors the `LogQL` `PREFIX`-removal
+/// guard in `logql::antlr::tests::test_underscored_label_names_still_parse`):
+/// removing the `SCOPE_INSTRUMENTATION` lexer token must not stop `scope`
+/// from being used as an ordinary attribute-path segment under a real
+/// leading scope, exactly like `SCOPE_SPAN`/`SCOPE_RESOURCE`/etc. already
+/// are. `scope` now lexes as a plain `IDENT` (there is no keyword to
+/// shadow it), and `identPart` already accepts `IDENT` as its first
+/// alternative, so `resource.scope.name` must keep parsing unchanged.
+#[test]
+fn parses_scope_keyword_as_attribute_path_segment() {
+    let e = parse(r#"{ resource.scope.name = "x" }"#);
+    if let TraceQLExpr::Spanset(SpansetExpr::Selector(SpanSelector {
+        filter: Some(SpanFilter::Compare { field, .. }),
+    })) = e
+    {
+        assert_eq!(
+            field,
+            FieldRef::Attribute {
+                scope: Scope::Resource,
+                name: "scope.name".to_string()
+            }
+        );
+    } else {
+        panic!("unexpected AST shape");
+    }
+}
+
 // =========================================================================
 // Boolean composition inside selector
 // =========================================================================

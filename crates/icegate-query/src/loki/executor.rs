@@ -3,13 +3,14 @@
 //! Extracts the common query execution flow from handlers, including
 //! parsing, planning, and execution of `LogQL` queries.
 
-use std::{sync::Arc, time::Instant};
+use std::{borrow::Cow, collections::BTreeSet, sync::Arc, time::Instant};
 
 use chrono::{DateTime, Duration, Utc};
 use datafusion::{
     arrow::array::RecordBatch,
     prelude::{DataFrame, SessionContext},
 };
+use icegate_common::attribute_key::normalize_attribute_key;
 
 use super::{
     error::{LokiError, LokiResult},
@@ -109,6 +110,23 @@ fn make_query_error_send(err: QueryError) -> QueryError {
 #[allow(clippy::needless_pass_by_value)]
 fn join_error(e: tokio::task::JoinError) -> LokiError {
     LokiError(QueryError::Internal(format!("task panicked: {e}")))
+}
+
+// ============================================================================
+// Label-name normalization
+// ============================================================================
+
+/// Render an owned stored attribute key as the Loki label name addressing it.
+///
+/// Thin owned-value adapter over [`icegate_common::attribute_key::normalize_attribute_key`],
+/// which every path resolving a stored key against a wire name shares; label
+/// enumeration is the one caller that already owns its keys (they come out of a
+/// `BTreeSet`) and wants them back owned.
+fn normalize_label_name(stored_key: String) -> String {
+    match normalize_attribute_key(&stored_key) {
+        Cow::Borrowed(_) => stored_key,
+        Cow::Owned(wire_name) => wire_name,
+    }
 }
 
 // ============================================================================
@@ -315,9 +333,10 @@ impl QueryExecutor {
 
     /// Execute a labels metadata query.
     ///
-    /// Dispatches to `crate::engine::metadata_scan`, which reads only
-    /// Parquet row-group statistics and the `attributes` MAP column — no
-    /// full-row scans.
+    /// Dispatches to `crate::engine::metadata_scan` once for all three stored
+    /// attribute maps (`resource_attributes`, `scope_attributes`,
+    /// `log_attributes`), which reads only Parquet row-group statistics and
+    /// MAP dictionary pages — no full-row scans.
     ///
     /// NOTE: This intentionally bypasses WAL and scans only committed
     /// Iceberg data. Label discovery from uncommitted WAL segments is
@@ -336,19 +355,29 @@ impl QueryExecutor {
         );
 
         let selector = self.parse_selector_opt(params.query.clone()).await?;
-        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_METADATA_CONFIG);
+        // `indexed_columns` and `label_aliases` are identical across every
+        // element of `LOGS_METADATA_CONFIGS` (only `map_column` differs, and
+        // `selector_predicate` never reads it), so translating against any
+        // one element is equivalent to translating against all three.
+        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_METADATA_CONFIGS[0]);
 
         let table = self.load_logs_table().await?;
-        let labels = crate::engine::metadata_scan::scan_labels(
+        let scanned = crate::engine::metadata_scan::scan_labels(
             &table,
             &query_ctx.tenant_id,
             query_ctx.start,
             query_ctx.end,
-            &super::LOGS_METADATA_CONFIG,
+            &super::LOGS_METADATA_CONFIGS,
             extra,
         )
         .await
         .map_err(|e| LokiError(QueryError::from(e)))?;
+
+        // Normalizing into one `BTreeSet` is what dedupes by wire name across
+        // levels: two levels holding raw keys that share a wire name (e.g.
+        // `k8s.pod.name` in one map, `k8s_pod_name` in another) collapse into a
+        // single insert here rather than surfacing as two labels.
+        let labels: BTreeSet<String> = scanned.into_iter().map(normalize_label_name).collect();
 
         Ok(labels.into_iter().collect())
     }
@@ -375,15 +404,21 @@ impl QueryExecutor {
         let selector = self.parse_selector_opt(params.query.clone()).await?;
         // `/label_values` uses the superset config so high-cardinality ids
         // (`trace_id`, `span_id`) can still be enumerated explicitly.
-        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_VALUES_METADATA_CONFIG);
+        // `indexed_columns` and `label_aliases` are identical across every
+        // element of `LOGS_VALUES_METADATA_CONFIGS` (see `execute_labels`),
+        // so translating against any one element covers all three.
+        let extra = super::predicate::selector_predicate(&selector, &super::LOGS_VALUES_METADATA_CONFIGS[0]);
 
         let table = self.load_logs_table().await?;
+        // Unlike label names, values need no wire normalization — the scan
+        // already unions the three per-level maps, so a value present at more
+        // than one level surfaces once.
         let values = crate::engine::metadata_scan::scan_label_values(
             &table,
             &query_ctx.tenant_id,
             query_ctx.start,
             query_ctx.end,
-            &super::LOGS_VALUES_METADATA_CONFIG,
+            &super::LOGS_VALUES_METADATA_CONFIGS,
             label_name,
             extra,
         )

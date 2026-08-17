@@ -1,10 +1,5 @@
 //! Metadata RPCs (catalogs / schemas / tables).
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::print_stdout,
-    clippy::uninlined_format_args
-)]
+#![allow(clippy::print_stdout, clippy::uninlined_format_args)]
 
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::sql::CommandGetTables;

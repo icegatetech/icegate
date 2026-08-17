@@ -168,7 +168,7 @@ pub async fn append_prices(catalog: &Arc<dyn Catalog>, rates: &[RateObservation]
 mod tests {
     // `float_cmp`: rate values round-trip through the decimal grid exactly, so an
     // exact `assert_eq!` is the correct assertion, not an epsilon comparison.
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
+    #![allow(clippy::float_cmp)]
 
     use chrono::DateTime;
 

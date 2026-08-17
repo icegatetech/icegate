@@ -8,6 +8,26 @@ use std::{future::Future, pin::Pin};
 const COL_ATTR_KEYS: &str = "_attr_keys";
 /// Internal column name for serialized attribute values.
 const COL_ATTR_VALS: &str = "_attr_vals";
+/// Internal column name for a once-per-row materialized [`merged_attributes`]
+/// result. Never part of a query's output label set: every consumer either
+/// projects it away explicitly or, in an aggregate, simply omits it from the
+/// group/aggregate expression list, which drops it from that step's output
+/// schema.
+const COL_MERGED_ATTRS: &str = "_merged_attrs";
+
+/// Name of the merged, normalized attribute map in a `LogQL` query
+/// pipeline's output schema: produced by the series/vector/range-aggregation
+/// plans below (via [`merged_attributes`] + `merge_attribute_levels`) and read
+/// back by `loki::formatters` to build the response.
+///
+/// A `DataFusion` `DataFrame`/`RecordBatch` column, not a stored table
+/// column — no Iceberg table carries a top-level `attributes` field any
+/// more (see `icegate_common::schema`'s per-level maps —
+/// `resource_attributes`, `scope_attributes`, and
+/// `log_attributes`/`span_attributes`/`data_point_attributes` — which
+/// replaced it). Contrast [`COL_MERGED_ATTRS`] above, which stages the same
+/// merge but never leaves this file.
+pub(crate) const MERGED_ATTRIBUTES_COLUMN: &str = "attributes";
 
 /// Returns the `FixedSizeBinary` width in bytes for a binary identifier
 /// column on the `logs` table, or `None` for non-binary columns. Centralises
@@ -49,6 +69,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::functions_aggregate::expr_fn::{avg, bool_or, max, min, stddev, var_sample};
 use datafusion::{
     arrow::datatypes::{DataType, IntervalMonthDayNano},
+    common::DFSchema,
     functions::string::octet_length,
     functions_aggregate::expr_fn::{count, last_value, sum},
     functions_nested::make_array::make_array,
@@ -59,8 +80,9 @@ use datafusion::{
 use icegate_common::{
     LOGS_TABLE_FQN,
     schema::{
-        COL_ATTRIBUTES, COL_BODY, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP,
-        COL_TRACE_ID, LEVEL_ALIAS, LOG_INDEXED_ATTRIBUTE_COLUMNS, LOG_SERIES_LABEL_COLUMNS,
+        COL_BODY, COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME,
+        COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID, LEVEL_ALIAS,
+        LOG_INDEXED_ATTRIBUTE_COLUMNS, LOG_SERIES_LABEL_COLUMNS,
     },
 };
 
@@ -90,6 +112,92 @@ fn strip_schema_metadata(df: DataFrame) -> datafusion::error::Result<DataFrame> 
         .collect();
 
     df.select(select_exprs)
+}
+
+/// Returns `true` when `schema` already carries the single merged
+/// [`MERGED_ATTRIBUTES_COLUMN`] rather than the three per-level attribute
+/// columns (`log_attributes`/`scope_attributes`/`resource_attributes`).
+///
+/// A `LogQL` pipeline collapses the three per-level columns into the merged
+/// column the first time a stage needs to read or filter attributes as one
+/// map — see [`DataFusionPlanner::apply_attributes_filter`]. Every helper
+/// that builds an attribute-reading expression MUST re-check this against
+/// the schema of the `DataFrame` it will actually run against, rather than
+/// assume the pre-merge, freshly-scanned shape: a `LabelFilter` stage
+/// following `drop`/`keep`, or an aggregation whose inner pipeline included
+/// `drop`/`keep`, sees a schema where the three raw columns no longer
+/// exist — referencing them there is a schema error at plan construction
+/// (`No field named ...log_attributes`), not a row-level NULL. This was
+/// exactly the C1 regression: `attribute_lookup`/`merged_attributes` used to
+/// hardcode the pre-merge columns unconditionally.
+///
+/// This is the single source of truth for the check: [`attribute_lookup`],
+/// [`merged_attributes`], and (transitively, via `merged_attributes`)
+/// [`DataFusionPlanner::resolve_current_attributes`] all defer to it, so a
+/// future edit cannot make this determination two different ways that drift
+/// apart — the failure mode that produced C1 in the first place.
+fn schema_has_merged_attributes(schema: &DFSchema) -> bool {
+    schema.inner().fields().iter().any(|f| f.name() == MERGED_ATTRIBUTES_COLUMN)
+}
+
+/// Resolve a Loki label name against the attribute maps of the `DataFrame`
+/// whose schema is `schema`.
+///
+/// When [`schema_has_merged_attributes`] is `true`, the key is looked up
+/// directly in [`MERGED_ATTRIBUTES_COLUMN`] with a single UDF call and no
+/// coalesce: the merge that produced that column already applied the
+/// log -> scope -> resource precedence below, and its keys are already
+/// underscored wire names (`normalize_key` is then a no-op on them), so the
+/// same lookup UDF is correct unchanged on this shape. Do not "simplify"
+/// this by always coalescing the three per-level columns — once a pipeline
+/// stage has merged them, those columns no longer exist on the `DataFrame`
+/// and referencing them is a schema error, not a fallback.
+///
+/// Otherwise it resolves against the three raw per-level maps directly.
+/// Precedence is log -> scope -> resource, first map containing a matching
+/// key wins. `coalesce` gives exactly that: a key present with an
+/// empty-string value is non-NULL and stops the chain, which is the
+/// intended reading of "first hit wins".
+///
+/// The scope split is not addressable from `LogQL` — Loki label names admit no
+/// separator that could carry it — so precedence is the only disambiguator.
+fn attribute_lookup(label: &str, schema: &DFSchema) -> Expr {
+    use datafusion::functions::core::expr_fn::coalesce;
+
+    let udf = ScalarUDF::from(crate::logql::datafusion::udf::MapGetByNormalizedKey::new());
+
+    if schema_has_merged_attributes(schema) {
+        udf.call(vec![col(MERGED_ATTRIBUTES_COLUMN), lit(label)])
+    } else {
+        coalesce(vec![
+            udf.call(vec![col(COL_LOG_ATTRIBUTES), lit(label)]),
+            udf.call(vec![col(COL_SCOPE_ATTRIBUTES), lit(label)]),
+            udf.call(vec![col(COL_RESOURCE_ATTRIBUTES), lit(label)]),
+        ])
+    }
+}
+
+/// The attribute maps of the `DataFrame` whose schema is `schema`, as the
+/// single flat map the Loki wire format exposes. Series identity and
+/// grouping are defined over wire names, so they operate on this rather than
+/// on the per-level columns.
+///
+/// Schema-aware for the same reason, and by the same [`schema_has_merged_attributes`]
+/// check, as [`attribute_lookup`]: when an earlier stage in the same
+/// pipeline already produced [`MERGED_ATTRIBUTES_COLUMN`], the raw per-level
+/// columns this function would otherwise merge no longer exist on that
+/// `DataFrame`, so this returns the existing column directly instead of
+/// re-running the merge UDF against columns that are no longer there.
+fn merged_attributes(schema: &DFSchema) -> Expr {
+    if schema_has_merged_attributes(schema) {
+        col(MERGED_ATTRIBUTES_COLUMN)
+    } else {
+        ScalarUDF::from(crate::logql::datafusion::udf::MergeAttributeLevels::new()).call(vec![
+            col(COL_RESOURCE_ATTRIBUTES),
+            col(COL_SCOPE_ATTRIBUTES),
+            col(COL_LOG_ATTRIBUTES),
+        ])
+    }
 }
 
 /// A planner that converts `LogQL` expressions into `DataFusion` `DataFrame`s.
@@ -207,6 +315,16 @@ impl DataFusionPlanner {
             df = df.union(other_df)?;
         }
 
+        // Materialize the merge once per row. Left as two separate
+        // merged_attributes() calls (one for key extraction, one inside
+        // first_value's aggregate argument below), each would re-run the UDF
+        // — BTreeMap inserts plus a String allocation per attribute — over
+        // every scanned row before GROUP BY collapses duplicates. /series is
+        // hit constantly by Grafana's label browser, so that redundancy is
+        // on a hot path.
+        let merged_expr = merged_attributes(df.schema());
+        df = df.with_column(COL_MERGED_ATTRS, merged_expr)?;
+
         // Project series-visible indexed columns + serialized attributes as flat
         // strings. High-cardinality columns (trace_id, span_id) are excluded via
         // LOG_SERIES_LABEL_COLUMNS.
@@ -214,30 +332,33 @@ impl DataFusionPlanner {
         // Add `level` as alias of `severity_text` for Grafana compatibility
         select_cols.push(col(COL_SEVERITY_TEXT).alias(LEVEL_ALIAS));
 
-        // Strip high-cardinality keys (trace_id, span_id) from the attributes
-        // MAP before serialization. Without this, per-request unique values
-        // inside the MAP would make every row appear as a distinct series.
+        // Strip high-cardinality keys (trace_id, span_id) from the merged
+        // attributes MAP before serialization. Without this, per-request
+        // unique values inside the MAP would make every row appear as a
+        // distinct series.
         //
         // DataFusion lacks map_filter/map_remove, so we use array_except on
         // the keys array and serialize only the filtered keys for grouping.
-        // The full MAP is carried separately via first_value for the formatter.
-        let attrs = col(COL_ATTRIBUTES);
-
         use datafusion::functions_nested::except::array_except;
         let excluded_arr = make_array(SERIES_EXCLUDED_MAP_KEYS.iter().map(|&k| lit(k)).collect());
-        let clean_keys = array_except(map_keys(attrs.clone()), excluded_arr);
+        let clean_keys = array_except(map_keys(col(COL_MERGED_ATTRS)), excluded_arr);
 
         // Serialize filtered keys for grouping. Values for non-excluded keys
         // are consistent within a series, so grouping by keys alone is
         // sufficient for deduplication.
         select_cols.push(array_to_string(clean_keys, lit("|||")).alias(COL_ATTR_KEYS));
-        // Keep the full MAP for value extraction in the formatter.
-        select_cols.push(attrs);
+        // Carry the materialized merge through so first_value below can pick
+        // one representative row's attributes per group for the formatter,
+        // without recomputing it.
+        select_cols.push(col(COL_MERGED_ATTRS));
 
         let df = df.select(select_cols)?;
 
         // GROUP BY indexed columns + filtered attr keys. Use first_value to
         // keep one representative attributes MAP per group for the formatter.
+        // COL_MERGED_ATTRS is not part of group_cols, so — like every other
+        // column this aggregate doesn't name — it is dropped from the output
+        // schema; only the alias below survives, under the public name.
         use datafusion::functions_aggregate::first_last::first_value;
         let mut group_cols: Vec<Expr> = LOG_SERIES_LABEL_COLUMNS.iter().map(|c| col(*c)).collect();
         group_cols.push(col(LEVEL_ALIAS));
@@ -245,7 +366,7 @@ impl DataFusionPlanner {
 
         let df = df.aggregate(
             group_cols,
-            vec![first_value(col(COL_ATTRIBUTES), vec![]).alias(COL_ATTRIBUTES)],
+            vec![first_value(col(COL_MERGED_ATTRS), vec![]).alias(MERGED_ATTRIBUTES_COLUMN)],
         )?;
 
         // Safety cap to prevent OOM on high-cardinality results
@@ -285,7 +406,9 @@ impl DataFusionPlanner {
         // Note: trace_id/span_id may still be read for selector filters above,
         // but DataFusion's optimizer handles that — they are dropped from output.
         let mut series_cols: Vec<Expr> = LOG_SERIES_LABEL_COLUMNS.iter().map(|&c| col(c)).collect();
-        series_cols.push(col(COL_ATTRIBUTES));
+        series_cols.push(col(COL_RESOURCE_ATTRIBUTES));
+        series_cols.push(col(COL_SCOPE_ATTRIBUTES));
+        series_cols.push(col(COL_LOG_ATTRIBUTES));
 
         Ok(df.select(series_cols)?)
     }
@@ -456,7 +579,14 @@ impl DataFusionPlanner {
     ///
     /// MAP columns cannot be used directly in GROUP BY, so we serialize keys/values
     /// to strings for grouping, then preserve the original MAP using `last_value`.
-    fn build_label_grouping_exprs(include_timestamp: bool) -> Vec<Expr> {
+    ///
+    /// `attrs` is the attributes-map expression to serialize, and it is used
+    /// TWICE (once for keys, once for values). Callers MUST therefore pass a
+    /// column reference to an already-materialized merge — see
+    /// [`Self::stage_merged_attributes`] — rather than a bare
+    /// [`merged_attributes`] call: inlining the UDF here would re-run it per
+    /// row per use, which is the cost `plan_series` documents avoiding.
+    fn build_label_grouping_exprs(attrs: &Expr, include_timestamp: bool) -> Vec<Expr> {
         use datafusion::functions_nested::{map_keys::map_keys, map_values::map_values, string::array_to_string};
 
         let mut grouping_exprs = Vec::new();
@@ -464,14 +594,43 @@ impl DataFusionPlanner {
             grouping_exprs.push(col("grid_timestamp"));
         }
         grouping_exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
-        grouping_exprs.push(array_to_string(map_keys(col(COL_ATTRIBUTES)), lit("|||")).alias(COL_ATTR_KEYS));
-        grouping_exprs.push(array_to_string(map_values(col(COL_ATTRIBUTES)), lit("|||")).alias(COL_ATTR_VALS));
+        grouping_exprs.push(array_to_string(map_keys(attrs.clone()), lit("|||")).alias(COL_ATTR_KEYS));
+        grouping_exprs.push(array_to_string(map_values(attrs.clone()), lit("|||")).alias(COL_ATTR_VALS));
         grouping_exprs
+    }
+
+    /// Materialize [`merged_attributes`] into [`MERGED_ATTRIBUTES_COLUMN`] and
+    /// return the reference to it.
+    ///
+    /// An aggregation reads the merged map three times — serialized keys,
+    /// serialized values, and the preserved map itself — and every one of
+    /// those is a separate `merge_attribute_levels` invocation per scanned row
+    /// unless the merge is staged into a column first. `plan_series` already
+    /// stages it for exactly this reason; this is that step, shared.
+    ///
+    /// Schema-aware through [`merged_attributes`], so calling it on a
+    /// `DataFrame` whose pipeline already merged (a `drop`/`keep` stage, or an
+    /// inner aggregation) re-uses that column instead of re-reading per-level
+    /// columns that no longer exist.
+    fn stage_merged_attributes(df: DataFrame) -> Result<(DataFrame, Expr)> {
+        let merged_expr = merged_attributes(df.schema());
+        let df = df.with_column(MERGED_ATTRIBUTES_COLUMN, merged_expr)?;
+        Ok((df, col(MERGED_ATTRIBUTES_COLUMN)))
     }
 
     /// Build grouping expressions and filtered attributes expression.
     ///
     /// Consolidates grouping logic to avoid duplicate computation of indexed columns and attribute labels.
+    ///
+    /// `attrs` is the attributes-map expression to filter. Callers on a
+    /// freshly-scanned `DataFrame` (the three per-level columns still
+    /// separate) pass [`merged_attributes`]; callers where a single
+    /// `attributes` column has already been materialized earlier in the same
+    /// pipeline (e.g. the outer grouping of a vector aggregation, applied to
+    /// the inner range aggregation's already-merged output) pass
+    /// `col(MERGED_ATTRIBUTES_COLUMN)` instead — recomputing the merge there would both
+    /// re-read columns that no longer exist on that `DataFrame` and discard
+    /// any filtering the inner stage already applied.
     ///
     /// Returns:
     /// - Vec<Expr>: Grouping expressions (timestamp, indexed columns, serialized MAP keys/values)
@@ -486,6 +645,7 @@ impl DataFusionPlanner {
     /// 2. Apply `map_keep_keys` or `map_drop_keys` UDF to filter the attributes MAP
     /// 3. Serialize the filtered MAP keys/values for grouping
     fn build_grouping_with_filtered_attrs(
+        attrs: &Expr,
         grouping: &crate::logql::common::Grouping,
         include_timestamp: bool,
     ) -> (Vec<Expr>, Expr) {
@@ -547,7 +707,7 @@ impl DataFusionPlanner {
                     make_array(vec![lit(ScalarValue::Utf8(None)); attr_labels.len()])
                 };
 
-                let filtered_attrs = udf.call(vec![col(COL_ATTRIBUTES), label_array, null_values, null_ops]);
+                let filtered_attrs = udf.call(vec![attrs.clone(), label_array, null_values, null_ops]);
 
                 if attr_labels.is_empty() {
                     // No attributes to group by - use empty MAP serialization
@@ -587,7 +747,7 @@ impl DataFusionPlanner {
                 // Filter attributes MAP to drop specified labels
                 let filtered_attrs = if excluded_attr_labels.is_empty() {
                     // No attributes to exclude - keep full MAP
-                    col(COL_ATTRIBUTES)
+                    attrs.clone()
                 } else {
                     let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
                     let label_array = make_array(excluded_attr_labels.iter().map(|l| lit(*l)).collect());
@@ -597,15 +757,13 @@ impl DataFusionPlanner {
                     let null_values = make_array(vec![lit(ScalarValue::Utf8(None)); excluded_attr_labels.len()]);
                     let null_ops = make_array(vec![lit(ScalarValue::Utf8(None)); excluded_attr_labels.len()]);
 
-                    udf.call(vec![col(COL_ATTRIBUTES), label_array, null_values, null_ops])
+                    udf.call(vec![attrs.clone(), label_array, null_values, null_ops])
                 };
 
                 if excluded_attr_labels.is_empty() {
                     // No attributes to exclude - use full MAP serialization
-                    grouping_exprs
-                        .push(array_to_string(map_keys(col(COL_ATTRIBUTES)), lit("|||")).alias(COL_ATTR_KEYS));
-                    grouping_exprs
-                        .push(array_to_string(map_values(col(COL_ATTRIBUTES)), lit("|||")).alias(COL_ATTR_VALS));
+                    grouping_exprs.push(array_to_string(map_keys(attrs.clone()), lit("|||")).alias(COL_ATTR_KEYS));
+                    grouping_exprs.push(array_to_string(map_values(attrs.clone()), lit("|||")).alias(COL_ATTR_VALS));
                 } else {
                     // Serialize filtered MAP for grouping
                     grouping_exprs
@@ -622,8 +780,12 @@ impl DataFusionPlanner {
     /// Create aggregation expression to preserve the attributes MAP column.
     ///
     /// Uses `last_value()` to preserve one representative attributes MAP.
-    fn preserve_attributes_column() -> Expr {
-        last_value(col(COL_ATTRIBUTES), vec![]).alias(COL_ATTRIBUTES)
+    /// `attrs` is [`merged_attributes`] on a freshly-scanned `DataFrame`, or
+    /// `col(MERGED_ATTRIBUTES_COLUMN)` when an earlier step in the same pipeline (e.g.
+    /// `by`/`without` filtering) already materialized the merged column —
+    /// see [`Self::build_grouping_with_filtered_attrs`] for the same split.
+    fn preserve_attributes_column(attrs: Expr) -> Expr {
+        last_value(attrs, vec![]).alias(MERGED_ATTRIBUTES_COLUMN)
     }
 
     /// Plans unwrap-based range aggregations.
@@ -732,12 +894,27 @@ impl DataFusionPlanner {
         let grid_agg_udaf = AggregateUDF::from(grid_agg);
 
         // 9. Build label grouping with pushdown support (no grid_timestamp — UDAF handles it)
-        let grouping_exprs = if let Some(ref grouping) = agg.grouping {
-            let (grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
-            df = df.with_column(COL_ATTRIBUTES, filtered_attrs_expr)?;
-            grouping_exprs
+        //
+        // The `by`/`without` branch materializes a real `attributes` column via
+        // with_column below, so the aggregate must read it back through
+        // col(MERGED_ATTRIBUTES_COLUMN) rather than recomputing the merge — recomputing
+        // would both re-read the (still-present but now stale for this
+        // purpose) raw columns and silently discard the filtering just applied.
+        //
+        // Staging happens before the branch, so `merged_attributes` sees the
+        // pre-merge schema: an inner pipeline stage (e.g. `drop`/`keep`) may
+        // have already collapsed the three per-level columns into
+        // `attributes`, and it must resolve against that rather than
+        // referencing columns that no longer exist (the C1 bug).
+        let (mut df, merged_col) = Self::stage_merged_attributes(df)?;
+        let (grouping_exprs, attrs_for_preserve) = if let Some(ref grouping) = agg.grouping {
+            let (grouping_exprs, filtered_attrs_expr) =
+                Self::build_grouping_with_filtered_attrs(&merged_col, grouping, false);
+            df = df.with_column(MERGED_ATTRIBUTES_COLUMN, filtered_attrs_expr)?;
+            (grouping_exprs, col(MERGED_ATTRIBUTES_COLUMN))
         } else {
-            Self::build_label_grouping_exprs(false) // false = no grid_timestamp (UDAF handles it)
+            // false = no grid_timestamp (UDAF handles it)
+            (Self::build_label_grouping_exprs(&merged_col, false), merged_col)
         };
 
         // 10. Aggregate: GROUP BY labels only, UDAF accumulates into grid buckets
@@ -747,7 +924,7 @@ impl DataFusionPlanner {
                 grid_agg_udaf
                     .call(vec![col(COL_TIMESTAMP), col("unwrapped_value")])
                     .alias("_grid_values"),
-                Self::preserve_attributes_column(),
+                Self::preserve_attributes_column(attrs_for_preserve),
                 // Track if ANY sample had conversion error
                 bool_or(col("_has_unwrap_error")).alias("_group_has_error"),
             ],
@@ -756,12 +933,12 @@ impl DataFusionPlanner {
         // 11. Add __error__ label for groups with conversion errors
         let map_insert_udf = ScalarUDF::from(super::udf::MapInsert::new());
         df = df.with_column(
-            COL_ATTRIBUTES,
+            MERGED_ATTRIBUTES_COLUMN,
             when(
                 col("_group_has_error"),
-                map_insert_udf.call(vec![col(COL_ATTRIBUTES), lit("__error__"), lit("true")]),
+                map_insert_udf.call(vec![col(MERGED_ATTRIBUTES_COLUMN), lit("__error__"), lit("true")]),
             )
-            .otherwise(col(COL_ATTRIBUTES))?,
+            .otherwise(col(MERGED_ATTRIBUTES_COLUMN))?,
         )?;
 
         // 12. Add literal _grid_timestamps column, unnest both, filter NULLs
@@ -855,19 +1032,23 @@ impl DataFusionPlanner {
         ];
         df = df.with_column("inverse_grid_timestamps", date_grid_udf.call(date_grid_args))?;
 
-        // 6. Build label grouping expressions (same pattern as other range aggregations)
-        let grouping_exprs = Self::build_label_grouping_exprs(false); // exclude timestamp for absent
+        // 6. Build label grouping expressions (same pattern as other range
+        // aggregations). Staging is schema-aware, so an inner `drop`/`keep`
+        // stage that already merged is re-used rather than re-merged.
+        let (mut df, merged_col) = Self::stage_merged_attributes(df)?;
+        let grouping_exprs = Self::build_label_grouping_exprs(&merged_col, false); // exclude timestamp for absent
 
         // 7. Aggregate using array_intersect_agg UDAF
         // This finds grid points present in ALL inverse arrays (= absent points)
         let array_intersect_udaf = AggregateUDF::from(super::udaf::ArrayIntersectAgg::new());
+        let attrs_for_preserve = merged_col;
         df = df.aggregate(
             grouping_exprs,
             vec![
                 array_intersect_udaf
                     .call(vec![col("inverse_grid_timestamps")])
                     .alias("absent_timestamps"),
-                Self::preserve_attributes_column(),
+                Self::preserve_attributes_column(attrs_for_preserve),
             ],
         )?;
 
@@ -881,7 +1062,7 @@ impl DataFusionPlanner {
         // 10. Select final output columns (match other range aggregations)
         let mut select_exprs = vec![col(COL_TIMESTAMP), col("value")];
         select_exprs.extend(LOG_INDEXED_ATTRIBUTE_COLUMNS.iter().map(|c| col(*c)));
-        select_exprs.push(col(COL_ATTRIBUTES));
+        select_exprs.push(col(MERGED_ATTRIBUTES_COLUMN));
 
         Ok(df.select(select_exprs)?)
     }
@@ -957,12 +1138,20 @@ impl DataFusionPlanner {
         };
 
         // 6. Build label grouping with pushdown support
-        let grouping_exprs = if let Some(ref grouping) = agg.grouping {
-            let (grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
-            df = df.with_column(COL_ATTRIBUTES, filtered_attrs_expr)?;
-            grouping_exprs
+        //
+        // See the identical split in plan_unwrap_range_aggregation: the merge
+        // is staged into a column first so the three reads below cost one
+        // evaluation per row, and the by/without branch then replaces that
+        // column with its filtered form.
+        let (mut df, merged_col) = Self::stage_merged_attributes(df)?;
+        let (grouping_exprs, attrs_for_preserve) = if let Some(ref grouping) = agg.grouping {
+            let (grouping_exprs, filtered_attrs_expr) =
+                Self::build_grouping_with_filtered_attrs(&merged_col, grouping, false);
+            df = df.with_column(MERGED_ATTRIBUTES_COLUMN, filtered_attrs_expr)?;
+            (grouping_exprs, col(MERGED_ATTRIBUTES_COLUMN))
         } else {
-            Self::build_label_grouping_exprs(false) // false = no grid_timestamp (UDAF handles it)
+            // false = no grid_timestamp (UDAF handles it)
+            (Self::build_label_grouping_exprs(&merged_col, false), merged_col)
         };
 
         // 7. Aggregate: GROUP BY labels only, UDAF accumulates into grid buckets
@@ -970,7 +1159,7 @@ impl DataFusionPlanner {
             grouping_exprs,
             vec![
                 grid_agg_udaf.call(udaf_args).alias("_grid_values"),
-                Self::preserve_attributes_column(),
+                Self::preserve_attributes_column(attrs_for_preserve),
             ],
         )?;
 
@@ -1021,7 +1210,7 @@ impl DataFusionPlanner {
         LOG_INDEXED_ATTRIBUTE_COLUMNS
             .iter()
             .copied()
-            .chain(std::iter::once(COL_ATTRIBUTES))
+            .chain(std::iter::once(MERGED_ATTRIBUTES_COLUMN))
             .chain(with.iter().copied())
             .filter(|c| !without.contains(c))
             .map(ToString::to_string)
@@ -1053,7 +1242,7 @@ impl DataFusionPlanner {
                         seen.push(mapped);
                     }
                 }
-                exprs.push(col(COL_ATTRIBUTES));
+                exprs.push(col(MERGED_ATTRIBUTES_COLUMN));
                 exprs
             }
             Some(Grouping::Without(labels)) => {
@@ -1169,12 +1358,33 @@ impl DataFusionPlanner {
         let (group_exprs, preserve_attrs) = if let Some(ref grouping) = agg.grouping {
             // Get both grouping expressions and filtered attributes in one call
             // This avoids duplicate computation of indexed columns and attribute labels
-            let (mut grouping_exprs, filtered_attrs_expr) = Self::build_grouping_with_filtered_attrs(grouping, false);
+            //
+            // `df` here is the INNER metric's already-planned output, so the
+            // per-level columns are gone and the merged `attributes` column is
+            // what remains — but only when the inner stage kept any labels at
+            // all. An ungrouped inner vector aggregation collapses every
+            // series and emits just `timestamp` + `value`, so there is nothing
+            // to group by; without this check the plan would reference a
+            // column that does not exist and fail as an internal error rather
+            // than a query one.
+            if !schema_has_merged_attributes(df.schema()) {
+                return Err(QueryError::Plan(
+                    "grouping requires labels, but the inner aggregation collapsed all series and kept none; \
+                     add a `by`/`without` clause to the inner aggregation"
+                        .to_string(),
+                ));
+            }
+            // Routed through `merged_attributes` rather than naming the column
+            // directly so every attribute-reading site resolves the shape the
+            // same way (see `schema_has_merged_attributes`).
+            let attrs = merged_attributes(df.schema());
+            let (mut grouping_exprs, filtered_attrs_expr) =
+                Self::build_grouping_with_filtered_attrs(&attrs, grouping, false);
             grouping_exprs.push(col(COL_TIMESTAMP));
 
             // Replace attributes column with filtered version BEFORE aggregation
             // This ensures last_value preserves the filtered attributes
-            df = df.with_column(COL_ATTRIBUTES, filtered_attrs_expr)?;
+            df = df.with_column(MERGED_ATTRIBUTES_COLUMN, filtered_attrs_expr)?;
 
             // Return the grouping expressions and flag to preserve attributes
             (grouping_exprs, true)
@@ -1217,7 +1427,10 @@ impl DataFusionPlanner {
         // Only preserve attributes when grouping is specified
         // When collapsing all series (no grouping), we don't want any labels in output
         let agg_exprs = if preserve_attrs {
-            vec![aggr_expr, Self::preserve_attributes_column()]
+            vec![
+                aggr_expr,
+                Self::preserve_attributes_column(col(MERGED_ATTRIBUTES_COLUMN)),
+            ]
         } else {
             vec![aggr_expr]
         };
@@ -1232,7 +1445,7 @@ impl DataFusionPlanner {
     pub fn apply_selector(df: DataFrame, selector: Selector) -> Result<DataFrame> {
         let mut df = df;
         for matcher in selector.matchers {
-            let expr = Self::matcher_to_expr(&matcher);
+            let expr = Self::matcher_to_expr(&matcher, df.schema());
             df = df.filter(expr)?;
         }
         Ok(df)
@@ -1240,8 +1453,15 @@ impl DataFusionPlanner {
 
     /// Convert a `LabelMatcher` to a `DataFusion` filter expression.
     ///
-    /// Handles both indexed columns (e.g., `service_name`, `severity_text`) and
-    /// attributes from the MAP column.
+    /// Indexed columns (e.g., `service_name`, `severity_text`) are matched
+    /// directly. Every other label resolves through [`attribute_lookup`],
+    /// which searches `log_attributes`, then `scope_attributes`, then
+    /// `resource_attributes` and matches against the first of the three that
+    /// contains the key — a value present at a more specific level always
+    /// wins, even an empty-string one, over a less specific level's value —
+    /// unless `schema` (the schema of the `DataFrame` this expression will
+    /// run against) already carries the merged column, in which case it
+    /// looks the key up there instead; see [`attribute_lookup`].
     ///
     /// `trace_id` and `span_id` are stored as raw `FIXED_LEN_BYTE_ARRAY` and
     /// route through [`Self::binary_id_matcher_to_expr`] so all four match
@@ -1251,14 +1471,12 @@ impl DataFusionPlanner {
     ///   so DataFusion's three-valued logic doesn't drop the entire row set.
     /// - `=~` / `!~` hex-encodes the column before applying `regexp_like`,
     ///   matching the user's natural string view of the identifier.
-    pub fn matcher_to_expr(matcher: &LabelMatcher) -> Expr {
+    pub fn matcher_to_expr(matcher: &LabelMatcher, schema: &DFSchema) -> Expr {
         let mapped_label = Self::map_label_to_internal_name(&matcher.label);
         let col_expr = if Self::is_top_level_field(&matcher.label) {
             col(mapped_label)
         } else {
-            // Access attribute from the "attributes" map
-            // using get_field for map access
-            datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(matcher.label.as_str())])
+            attribute_lookup(matcher.label.as_str(), schema)
         };
 
         if let Some(width) = binary_id_width(mapped_label) {
@@ -1339,23 +1557,27 @@ impl DataFusionPlanner {
     /// # Arguments
     /// - `label`: The label name to extract
     /// - `conversion`: Optional conversion function (bytes, duration, etc.)
-    /// - `_schema`: `DataFrame` schema (unused, kept for consistency with signature)
+    /// - `schema`: schema of the `DataFrame` this expression will run
+    ///   against — passed through to [`attribute_lookup`] so a `drop`/`keep`
+    ///   stage earlier in the same pipeline (which collapses the per-level
+    ///   attribute columns into one before `unwrap` ever runs) is resolved
+    ///   correctly instead of referencing columns that no longer exist.
     ///
     /// # Returns
     /// `DataFusion` expression that evaluates to Float64 or NULL
     fn extract_unwrapped_value(
         label: &str,
         conversion: Option<crate::logql::log::UnwrapConversion>,
-        _schema: &datafusion::common::DFSchema,
+        schema: &DFSchema,
     ) -> Expr {
         use crate::logql::log::UnwrapConversion;
 
-        // 1. Extract label from attributes MAP or indexed column
+        // 1. Extract label from the attribute maps or indexed column
         let label_expr = if Self::is_top_level_field(label) {
             let internal_name = Self::map_label_to_internal_name(label);
             col(internal_name)
         } else {
-            datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(label)])
+            attribute_lookup(label, schema)
         };
 
         // 2. Apply conversion UDF (returns Float64 or NULL on error)
@@ -1535,20 +1757,55 @@ impl DataFusionPlanner {
         (keys, values, ops)
     }
 
+    /// The attributes-map expression a `drop`/`keep` pipeline stage should
+    /// filter: [`merged_attributes`] the first time a stage runs (`df` still
+    /// carries the three per-level columns from the scan), or the
+    /// already-materialized `attributes` column if an earlier stage in the
+    /// same pipeline already merged and filtered it. Recomputing the merge in
+    /// the second case would both discard the earlier stage's filtering and,
+    /// once [`Self::apply_attributes_filter`] has collapsed the per-level
+    /// columns away, reference columns that no longer exist.
+    ///
+    /// Delegates entirely to [`merged_attributes`] (and, through it, to
+    /// [`schema_has_merged_attributes`]) rather than re-checking `df`'s
+    /// schema here too: this exact "pre- or post-merge" question is asked
+    /// from several places in this file, and answering it with one shared
+    /// check — instead of a second inline copy that could quietly drift from
+    /// the first — is what keeps them all in agreement.
+    fn resolve_current_attributes(df: &DataFrame) -> Expr {
+        merged_attributes(df.schema())
+    }
+
     /// Apply a filter UDF to the attributes column and select all columns.
     ///
-    /// Replaces the attributes column with the filtered version and preserves all other columns.
+    /// Replaces the attributes source with the filtered version and preserves
+    /// all other columns. The source is either the single `attributes` column
+    /// (a later stage in the same pipeline) or the three per-level columns
+    /// (the first stage) — see [`Self::resolve_current_attributes`]. In the
+    /// latter case all three collapse into this one filtered output column:
+    /// `drop`/`keep` operate on wire names across every level at once, so
+    /// there is no per-level source left to keep once filtering has run.
     fn apply_attributes_filter(df: DataFrame, filtered_attrs: &Expr) -> Result<DataFrame> {
+        let mut merged_attrs_emitted = false;
         let select_exprs: Vec<Expr> = df
             .schema()
             .inner()
             .fields()
             .iter()
-            .map(|field| {
-                if field.name() == COL_ATTRIBUTES {
-                    filtered_attrs.clone().alias(COL_ATTRIBUTES)
+            .filter_map(|field| {
+                let name = field.name().as_str();
+                let is_attribute_source = name == MERGED_ATTRIBUTES_COLUMN
+                    || name == COL_RESOURCE_ATTRIBUTES
+                    || name == COL_SCOPE_ATTRIBUTES
+                    || name == COL_LOG_ATTRIBUTES;
+                if !is_attribute_source {
+                    return Some(col(name));
+                }
+                if merged_attrs_emitted {
+                    None
                 } else {
-                    col(field.name().as_str())
+                    merged_attrs_emitted = true;
+                    Some(filtered_attrs.clone().alias(MERGED_ATTRIBUTES_COLUMN))
                 }
             })
             .collect();
@@ -1569,7 +1826,7 @@ impl DataFusionPlanner {
         let (keys, values, ops) = Self::build_drop_keep_arrays(labels);
         let udf = ScalarUDF::from(super::udf::MapDropKeys::new());
         let filtered_attrs = udf.call(vec![
-            col(COL_ATTRIBUTES),
+            Self::resolve_current_attributes(&df),
             make_array(keys),
             make_array(values),
             make_array(ops),
@@ -1591,7 +1848,7 @@ impl DataFusionPlanner {
         let (keys, values, ops) = Self::build_drop_keep_arrays(labels);
         let udf = ScalarUDF::from(super::udf::MapKeepKeys::new());
         let filtered_attrs = udf.call(vec![
-            col(COL_ATTRIBUTES),
+            Self::resolve_current_attributes(&df),
             make_array(keys),
             make_array(values),
             make_array(ops),
@@ -1600,34 +1857,45 @@ impl DataFusionPlanner {
         Self::apply_attributes_filter(df, &filtered_attrs)
     }
 
+    /// Applies a `LogQL` `LabelFilter` pipeline stage: `| label ...`.
+    ///
+    /// Reads `df`'s schema before building the filter expression, not just
+    /// before evaluating it: this stage commonly follows `drop`/`keep` in
+    /// the same pipeline (e.g. `| drop user_id | request_id="…"`), so the
+    /// attribute shape it must resolve against — per-level or already
+    /// merged — is whatever `df` carries *at this point*, not at scan time.
+    /// See [`schema_has_merged_attributes`] for why this cannot be assumed.
     fn apply_label_filter(df: DataFrame, filter_expr: crate::logql::log::LabelFilterExpr) -> Result<DataFrame> {
-        let expr = Self::label_filter_to_expr(filter_expr)?;
+        let expr = Self::label_filter_to_expr(filter_expr, df.schema())?;
         Ok(df.filter(expr)?)
     }
 
+    /// Converts a `LabelFilterExpr` to a `DataFusion` predicate against the
+    /// attribute shape described by `schema` — see [`Self::apply_label_filter`]
+    /// for why the caller cannot use the pipeline's original scan schema.
     #[allow(clippy::items_after_statements)]
-    fn label_filter_to_expr(filter: crate::logql::log::LabelFilterExpr) -> Result<Expr> {
+    fn label_filter_to_expr(filter: crate::logql::log::LabelFilterExpr, schema: &DFSchema) -> Result<Expr> {
         use crate::logql::log::LabelFilterExpr;
 
         match filter {
             LabelFilterExpr::And(left, right) => {
-                let left_expr = Self::label_filter_to_expr(*left)?;
-                let right_expr = Self::label_filter_to_expr(*right)?;
+                let left_expr = Self::label_filter_to_expr(*left, schema)?;
+                let right_expr = Self::label_filter_to_expr(*right, schema)?;
                 Ok(left_expr.and(right_expr))
             }
             LabelFilterExpr::Or(left, right) => {
-                let left_expr = Self::label_filter_to_expr(*left)?;
-                let right_expr = Self::label_filter_to_expr(*right)?;
+                let left_expr = Self::label_filter_to_expr(*left, schema)?;
+                let right_expr = Self::label_filter_to_expr(*right, schema)?;
                 Ok(left_expr.or(right_expr))
             }
-            LabelFilterExpr::Parens(inner) => Self::label_filter_to_expr(*inner),
-            LabelFilterExpr::Matcher(matcher) => Ok(Self::matcher_to_expr(&matcher)),
+            LabelFilterExpr::Parens(inner) => Self::label_filter_to_expr(*inner, schema),
+            LabelFilterExpr::Matcher(matcher) => Ok(Self::matcher_to_expr(&matcher, schema)),
             LabelFilterExpr::Number { label, op, value } => {
                 let internal_name = Self::map_label_to_internal_name(&label);
                 let col_expr = if Self::is_top_level_field(internal_name) {
                     col(internal_name)
                 } else {
-                    datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(label)])
+                    attribute_lookup(&label, schema)
                 };
 
                 use crate::logql::common::ComparisonOp;
@@ -1647,7 +1915,7 @@ impl DataFusionPlanner {
                 let col_expr = if Self::is_top_level_field(internal_name) {
                     col(internal_name)
                 } else {
-                    datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(label)])
+                    attribute_lookup(&label, schema)
                 };
 
                 use crate::logql::common::ComparisonOp;
@@ -1670,7 +1938,7 @@ impl DataFusionPlanner {
                 let col_expr = if Self::is_top_level_field(internal_name) {
                     col(internal_name)
                 } else {
-                    datafusion::functions::core::get_field().call(vec![col(COL_ATTRIBUTES), lit(label)])
+                    attribute_lookup(&label, schema)
                 };
 
                 use crate::logql::common::ComparisonOp;
@@ -1703,8 +1971,21 @@ mod matcher_to_expr_tests {
     //! the row set under three-valued logic and (b) make `=~` / `!~` work
     //! against the user-visible hex representation rather than the raw
     //! binary column (which `regexp_like` cannot accept).
+    use datafusion::common::DFSchema;
+
     use super::DataFusionPlanner;
     use crate::logql::log::LabelMatcher;
+
+    /// `trace_id`/`span_id` are top-level indexed columns, so every matcher
+    /// in this module resolves through `col(mapped_label)` and never reaches
+    /// [`super::attribute_lookup`] — an empty schema is a valid stand-in
+    /// here because `matcher_to_expr`'s schema argument is simply unused on
+    /// this path, not because these tests care about the merged-vs-per-level
+    /// distinction (see `attribute_lookup_tests`/`merged_attributes_tests`
+    /// below for tests that do).
+    fn empty_schema() -> DFSchema {
+        DFSchema::empty()
+    }
 
     #[test]
     fn neq_on_trace_id_with_invalid_hex_matches_all_rows() {
@@ -1713,7 +1994,7 @@ mod matcher_to_expr_tests {
         // intent is the opposite: "match anything that is *not* this
         // (uninterpretable) literal" should yield every row.
         let m = LabelMatcher::neq("trace_id", "not-hex");
-        let expr = DataFusionPlanner::matcher_to_expr(&m);
+        let expr = DataFusionPlanner::matcher_to_expr(&m, &empty_schema());
         let s = format!("{expr:?}");
         assert!(
             s.contains("Boolean(true)"),
@@ -1728,7 +2009,7 @@ mod matcher_to_expr_tests {
         // reason; the post-fix expression is an explicit `false` literal so
         // the planner doesn't touch the row scanner at all.
         let m = LabelMatcher::eq("trace_id", "not-hex");
-        let expr = DataFusionPlanner::matcher_to_expr(&m);
+        let expr = DataFusionPlanner::matcher_to_expr(&m, &empty_schema());
         let s = format!("{expr:?}");
         assert!(
             s.contains("Boolean(false)"),
@@ -1743,7 +2024,7 @@ mod matcher_to_expr_tests {
         // representation before applying the regex. The expression must
         // contain RegexpLike AND EncodeFunc (wrapping the column).
         let m = LabelMatcher::re("trace_id", "^abc");
-        let expr = DataFusionPlanner::matcher_to_expr(&m);
+        let expr = DataFusionPlanner::matcher_to_expr(&m, &empty_schema());
         let s = format!("{expr:?}");
         assert!(s.contains("RegexpLike"), "expected RegexpLike call in: {s}");
         assert!(s.contains("EncodeFunc"), "expected EncodeFunc wrapper in: {s}");
@@ -1753,12 +2034,768 @@ mod matcher_to_expr_tests {
     #[test]
     fn eq_on_trace_id_with_valid_hex_uses_typed_binary_literal() {
         let m = LabelMatcher::eq("trace_id", "0102030405060708090a0b0c0d0e0f10");
-        let expr = DataFusionPlanner::matcher_to_expr(&m);
+        let expr = DataFusionPlanner::matcher_to_expr(&m, &empty_schema());
         let s = format!("{expr:?}");
         // Must reach a typed FixedSizeBinary equality, not collapse to a
         // boolean literal — the row scan still needs the typed predicate
         // to drive Iceberg pruning.
         assert!(s.contains("FixedSizeBinary"), "expected typed binary literal in: {s}");
         assert!(s.contains("trace_id"), "expected column reference in: {s}");
+    }
+}
+
+#[cfg(test)]
+mod attribute_lookup_tests {
+    //! Behavioral tests for the private [`super::attribute_lookup`] helper.
+    //!
+    //! The shape test below proves the precedence *order* baked into the
+    //! expression tree without ever executing it. `docs/tests.md` requires
+    //! execution-based coverage for planner semantics, so the remaining
+    //! tests build a one-row batch and evaluate `attribute_lookup` against
+    //! it through a real `SessionContext` — including the coalesce failure
+    //! mode a shape assertion cannot see: a value present but empty at a
+    //! specific level must stop the chain rather than let a less specific
+    //! level's value leak through.
+
+    use std::sync::Arc;
+
+    use datafusion::{
+        arrow::{
+            array::{Array, ArrayRef, MapBuilder, StringArray, StringBuilder},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        },
+        common::DFSchema,
+        datasource::MemTable,
+        logical_expr::Expr,
+        prelude::SessionContext,
+        scalar::ScalarValue,
+    };
+    use icegate_common::schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES};
+
+    /// The `(column, key)` a `map_get_by_normalized_key(col, lit)` call reads.
+    ///
+    /// Inspects the expression tree rather than its rendering: `docs/tests.md`
+    /// rules out substring checks on a formatted plan as a semantic oracle,
+    /// and argument ORDER is precisely what this test is about — a textual
+    /// scan cannot distinguish argument position from incidental spelling.
+    fn map_lookup_target(expr: &Expr) -> (&str, &str) {
+        let Expr::ScalarFunction(lookup) = expr else {
+            panic!("expected a scalar function, got {expr:?}");
+        };
+        assert_eq!(lookup.func.name(), "map_get_by_normalized_key");
+        assert_eq!(lookup.args.len(), 2, "lookup takes (map, name)");
+        let Expr::Column(column) = &lookup.args[0] else {
+            panic!("first argument must be a column, got {:?}", lookup.args[0]);
+        };
+        let Expr::Literal(ScalarValue::Utf8(Some(key)), _) = &lookup.args[1] else {
+            panic!("second argument must be a Utf8 literal, got {:?}", lookup.args[1]);
+        };
+        (column.name(), key.as_str())
+    }
+
+    #[test]
+    fn attribute_lookup_coalesces_log_then_scope_then_resource() {
+        // An empty schema is a valid stand-in for "the three per-level
+        // columns have not been merged yet": schema_has_merged_attributes
+        // only checks for the presence of MERGED_ATTRIBUTES_COLUMN by name,
+        // so its absence is all this shape test needs, regardless of what
+        // else the schema does or doesn't contain.
+        let expr = super::attribute_lookup("k8s_pod_name", &DFSchema::empty());
+
+        let Expr::ScalarFunction(coalesce) = &expr else {
+            panic!("attribute_lookup must produce a coalesce, got {expr:?}");
+        };
+        assert_eq!(coalesce.func.name(), "coalesce");
+
+        // `coalesce` returns its first non-NULL argument, so argument order IS
+        // the precedence: most specific level first.
+        let targets: Vec<(&str, &str)> = coalesce.args.iter().map(map_lookup_target).collect();
+        assert_eq!(
+            targets,
+            vec![
+                (COL_LOG_ATTRIBUTES, "k8s_pod_name"),
+                (COL_SCOPE_ATTRIBUTES, "k8s_pod_name"),
+                (COL_RESOURCE_ATTRIBUTES, "k8s_pod_name"),
+            ]
+        );
+    }
+
+    /// One-row fixture carrying ONLY the already-merged `attributes` column
+    /// (no `log_attributes`/`scope_attributes`/`resource_attributes` at
+    /// all), keyed in already-underscored wire form as a real merge output
+    /// would be. Used by the schema-aware branch test below: since this
+    /// schema never had the three per-level columns, planning against it
+    /// would fail outright (`No field named log_attributes`) if
+    /// `attribute_lookup` fell back to an unconditional coalesce — this is
+    /// the C1 regression, reproduced at the unit level.
+    fn build_merged_only_fixture_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![build_attribute_map_field(
+            super::MERGED_ATTRIBUTES_COLUMN,
+        )]));
+        let attrs = build_attribute_map(&[("http_method", "GET")]);
+        RecordBatch::try_new(schema, vec![attrs]).expect("record batch")
+    }
+
+    #[tokio::test]
+    async fn attribute_lookup_reads_the_merged_column_directly_when_schema_already_has_it() {
+        // Guards the exact branch schema_has_merged_attributes exists for —
+        // see build_merged_only_fixture_batch's doc for why a "simplified"
+        // unconditional coalesce would fail this test at plan construction,
+        // not merely produce a wrong value.
+        let batch = build_merged_only_fixture_batch();
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("memtable");
+        let ctx = SessionContext::new();
+        ctx.register_table("merged_only_fixture", Arc::new(table))
+            .expect("register table");
+
+        let df = ctx.table("merged_only_fixture").await.expect("table");
+        let lookup_expr = super::attribute_lookup("http_method", df.schema()).alias("resolved");
+        let df = df.select(vec![lookup_expr]).expect("select");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(batches.len(), 1, "single-partition fixture yields one batch");
+
+        let column = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("resolved column is Utf8");
+        assert_eq!(column.len(), 1, "fixture has exactly one row");
+        assert_eq!(column.value(0), "GET");
+    }
+
+    /// `MAP<Utf8, Utf8>` field shape produced by [`MapBuilder`]'s default
+    /// element names (`entries`/`keys`/`values`), mirroring the fixture
+    /// convention already used by the `traceql` planner's `MemTable` tests.
+    fn build_attribute_map_field(name: &str) -> Field {
+        Field::new(
+            name,
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("keys", DataType::Utf8, false)),
+                            Arc::new(Field::new("values", DataType::Utf8, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        )
+    }
+
+    /// Build a one-row `MAP<Utf8, Utf8>` array from stored (dotted) key/value
+    /// pairs, in the given order — mirrors how ingest builds each row.
+    fn build_attribute_map(pairs: &[(&str, &str)]) -> ArrayRef {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for (key, value) in pairs {
+            builder.keys().append_value(key);
+            builder.values().append_value(value);
+        }
+        builder.append(true).expect("map row");
+        Arc::new(builder.finish())
+    }
+
+    /// Single-row fixture exercising every case the tests below need, keyed
+    /// in `OTel` dotted form throughout so a passing lookup also proves the
+    /// dotted -> underscored normalization is live end to end:
+    ///
+    /// - `k8s.pod.name`: present at all three levels (precedence case).
+    /// - `k8s.namespace.name`: present at scope + resource, absent at log
+    ///   (fall-through case).
+    /// - `http.method`: present at all three levels, but *empty string* at
+    ///   log (the present-but-empty case that must not fall through).
+    fn build_fixture_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            build_attribute_map_field(COL_LOG_ATTRIBUTES),
+            build_attribute_map_field(COL_SCOPE_ATTRIBUTES),
+            build_attribute_map_field(COL_RESOURCE_ATTRIBUTES),
+        ]));
+
+        let log = build_attribute_map(&[("k8s.pod.name", "log-value"), ("http.method", "")]);
+        let scope = build_attribute_map(&[
+            ("k8s.pod.name", "scope-value"),
+            ("k8s.namespace.name", "scope-namespace"),
+            ("http.method", "GET"),
+        ]);
+        let resource = build_attribute_map(&[
+            ("k8s.pod.name", "resource-value"),
+            ("k8s.namespace.name", "resource-namespace"),
+            ("http.method", "POST"),
+        ]);
+
+        RecordBatch::try_new(schema, vec![log, scope, resource]).expect("record batch")
+    }
+
+    /// Evaluate `attribute_lookup(label)` against [`build_fixture_batch`]
+    /// through a real `SessionContext` and return the resulting single
+    /// cell, or `None` for SQL NULL.
+    async fn evaluate_attribute_lookup(label: &str) -> Option<String> {
+        let batch = build_fixture_batch();
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("memtable");
+        let ctx = SessionContext::new();
+        ctx.register_table("attribute_fixture", Arc::new(table))
+            .expect("register table");
+
+        let df = ctx.table("attribute_fixture").await.expect("table");
+        let lookup_expr = super::attribute_lookup(label, df.schema()).alias("resolved");
+        let df = df.select(vec![lookup_expr]).expect("select");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(batches.len(), 1, "single-partition fixture yields one batch");
+
+        let column = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("resolved column is Utf8");
+        assert_eq!(column.len(), 1, "fixture has exactly one row");
+        if column.is_null(0) {
+            None
+        } else {
+            Some(column.value(0).to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn attribute_lookup_prefers_log_value_when_key_present_in_all_three_maps() {
+        // Precedence contract: log wins even though scope and resource also
+        // carry `k8s.pod.name` (queried here in its Loki-legal underscored
+        // form), proving the dotted -> underscored mapping is live too.
+        assert_eq!(
+            evaluate_attribute_lookup("k8s_pod_name").await,
+            Some("log-value".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn attribute_lookup_falls_through_to_scope_when_log_lacks_the_key() {
+        // `k8s.namespace.name` is absent from log_attributes, so coalesce
+        // must skip it and take the scope value, not the resource value.
+        assert_eq!(
+            evaluate_attribute_lookup("k8s_namespace_name").await,
+            Some("scope-namespace".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn attribute_lookup_resolves_present_but_empty_log_value_without_falling_through() {
+        // The contract this helper exists for: `http.method` is present at
+        // log with an EMPTY STRING value, which is non-NULL and must stop
+        // the coalesce chain — not fall through to scope's "GET" or
+        // resource's "POST". A regression here would silently return a
+        // less specific level's value, and no other test would catch it.
+        assert_eq!(evaluate_attribute_lookup("http_method").await, Some(String::new()));
+    }
+}
+
+#[cfg(test)]
+mod merged_attributes_tests {
+    //! Behavioral tests for the private [`super::merged_attributes`] helper.
+    //!
+    //! [`super::udf::MergeAttributeLevels`] already carries execution-based
+    //! coverage of the merge/normalize/precedence rules themselves (see
+    //! `udf::merge_attribute_levels::tests`); these tests prove the planner
+    //! wires that UDF to the three correct columns, in the correct
+    //! precedence order, including through a real `SessionContext`.
+
+    use std::sync::Arc;
+
+    use datafusion::{
+        arrow::{
+            array::{Array, ArrayRef, MapArray, MapBuilder, StringArray, StringBuilder},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        },
+        common::DFSchema,
+        datasource::MemTable,
+        logical_expr::Expr,
+        prelude::SessionContext,
+    };
+    use icegate_common::schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES};
+
+    #[test]
+    fn calls_the_merge_udf_over_resource_scope_and_log_in_precedence_order() {
+        // See attribute_lookup_tests's identical use of an empty schema: it
+        // only needs to lack MERGED_ATTRIBUTES_COLUMN by name to exercise
+        // the not-yet-merged branch this shape test targets.
+        let expr = super::merged_attributes(&DFSchema::empty());
+        let Expr::ScalarFunction(merge) = &expr else {
+            panic!("merged_attributes must produce a scalar function, got {expr:?}");
+        };
+        assert_eq!(merge.func.name(), "merge_attribute_levels");
+
+        // Argument order IS precedence order for MergeAttributeLevels (resource
+        // first, log last — see its doc comment).
+        let columns: Vec<&str> = merge
+            .args
+            .iter()
+            .map(|arg| match arg {
+                Expr::Column(column) => column.name(),
+                other => panic!("every merge argument must be a column, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            vec![COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_LOG_ATTRIBUTES]
+        );
+    }
+
+    /// `MAP<Utf8, Utf8>` field shape produced by [`MapBuilder`]'s default
+    /// element names, mirroring [`super::attribute_lookup_tests`]'s fixture
+    /// convention (duplicated here rather than shared: the two modules are
+    /// siblings under `planner`, so a private helper in one is not visible
+    /// from the other).
+    fn build_attribute_map_field(name: &str) -> Field {
+        Field::new(
+            name,
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("keys", DataType::Utf8, false)),
+                            Arc::new(Field::new("values", DataType::Utf8, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        )
+    }
+
+    fn build_attribute_map(pairs: &[(&str, &str)]) -> ArrayRef {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for (key, value) in pairs {
+            builder.keys().append_value(key);
+            builder.values().append_value(value);
+        }
+        builder.append(true).expect("map row");
+        Arc::new(builder.finish())
+    }
+
+    #[tokio::test]
+    async fn merges_and_normalizes_three_levels_through_a_real_session_context() {
+        let schema = Arc::new(Schema::new(vec![
+            build_attribute_map_field(COL_RESOURCE_ATTRIBUTES),
+            build_attribute_map_field(COL_SCOPE_ATTRIBUTES),
+            build_attribute_map_field(COL_LOG_ATTRIBUTES),
+        ]));
+        let resource = build_attribute_map(&[("k8s.pod.name", "resource-value"), ("shared.key", "resource")]);
+        let scope = build_attribute_map(&[("shared.key", "scope")]);
+        let log = build_attribute_map(&[("http.method", "GET")]);
+        let batch = RecordBatch::try_new(schema, vec![resource, scope, log]).expect("record batch");
+
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("memtable");
+        let ctx = SessionContext::new();
+        ctx.register_table("merge_fixture", Arc::new(table)).expect("register table");
+
+        let df = ctx.table("merge_fixture").await.expect("table");
+        let merged_expr = super::merged_attributes(df.schema()).alias("merged");
+        let df = df.select(vec![merged_expr]).expect("select");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(batches.len(), 1, "single-partition fixture yields one batch");
+
+        let map = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("merged column is MAP");
+        let entries = map.value(0);
+        let keys = entries.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+        let values = entries.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+        let merged: std::collections::BTreeMap<&str, &str> =
+            (0..keys.len()).map(|i| (keys.value(i), values.value(i))).collect();
+
+        assert_eq!(
+            merged.get("k8s_pod_name"),
+            Some(&"resource-value"),
+            "dotted keys normalize to wire names"
+        );
+        assert_eq!(
+            merged.get("shared_key"),
+            Some(&"scope"),
+            "scope wins over resource when log is absent (log-wins precedence)"
+        );
+        assert_eq!(merged.get("http_method"), Some(&"GET"));
+        assert_eq!(merged.len(), 3, "keys from all three levels are unioned");
+    }
+
+    #[tokio::test]
+    async fn returns_the_existing_column_directly_when_schema_already_has_it() {
+        // Guards the branch schema_has_merged_attributes exists for, mirroring
+        // attribute_lookup_tests's identical-purpose test: a schema carrying
+        // ONLY the already-merged `attributes` column, with none of
+        // resource/scope/log_attributes present at all. If merged_attributes
+        // "simplified" back to an unconditional merge-UDF call over the three
+        // per-level columns, this would fail to plan at all (`No field named
+        // resource_attributes`) rather than merely return a wrong value — the
+        // C1 regression, reproduced at the unit level.
+        let schema = Arc::new(Schema::new(vec![build_attribute_map_field(
+            super::MERGED_ATTRIBUTES_COLUMN,
+        )]));
+        let attrs = build_attribute_map(&[("already_merged_key", "already_merged_value")]);
+        let batch = RecordBatch::try_new(schema, vec![attrs]).expect("record batch");
+
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("memtable");
+        let ctx = SessionContext::new();
+        ctx.register_table("already_merged_fixture", Arc::new(table))
+            .expect("register table");
+
+        let df = ctx.table("already_merged_fixture").await.expect("table");
+        let merged_expr = super::merged_attributes(df.schema()).alias("merged");
+        let df = df.select(vec![merged_expr]).expect("select");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(batches.len(), 1, "single-partition fixture yields one batch");
+
+        let map = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("merged column is MAP");
+        let entries = map.value(0);
+        let keys = entries.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+        let values = entries.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+        assert_eq!(keys.len(), 1, "the existing column passes through untouched");
+        assert_eq!(keys.value(0), "already_merged_key");
+        assert_eq!(values.value(0), "already_merged_value");
+    }
+}
+
+#[cfg(test)]
+mod drop_keep_attributes_tests {
+    //! Behavioral tests for [`super::DataFusionPlanner::apply_drop`],
+    //! [`super::DataFusionPlanner::apply_keep`], and the shared
+    //! [`super::DataFusionPlanner::apply_attributes_filter`] /
+    //! [`super::DataFusionPlanner::resolve_current_attributes`] machinery
+    //! they route through.
+    //!
+    //! The three per-level columns must collapse into exactly one
+    //! `attributes` output column — not zero (the filtered map silently
+    //! disappearing from the output) and not three (stale per-level columns
+    //! left behind) — and a second `drop`/`keep` stage in the same pipeline
+    //! must operate on that already-merged column rather than recompute a
+    //! fresh, unfiltered merge that would silently undo the first stage's
+    //! filtering (or error, once the per-level columns are gone).
+
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use datafusion::{
+        arrow::{
+            array::{Array, ArrayRef, MapArray, MapBuilder, StringArray, StringBuilder},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        },
+        dataframe::DataFrame,
+        datasource::MemTable,
+        prelude::SessionContext,
+    };
+    use icegate_common::schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES};
+
+    use super::{DataFusionPlanner, MERGED_ATTRIBUTES_COLUMN};
+    use crate::logql::{
+        common::{ComparisonOp, MatchOp},
+        log::{DropKeepLabel, LabelFilterExpr, LabelMatcher},
+    };
+
+    /// See [`super::merged_attributes_tests`]'s identical helper — not
+    /// shared for the same sibling-module-privacy reason.
+    fn build_attribute_map_field(name: &str) -> Field {
+        Field::new(
+            name,
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("keys", DataType::Utf8, false)),
+                            Arc::new(Field::new("values", DataType::Utf8, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        )
+    }
+
+    fn build_attribute_map(pairs: &[(&str, &str)]) -> ArrayRef {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for (key, value) in pairs {
+            builder.keys().append_value(key);
+            builder.values().append_value(value);
+        }
+        builder.append(true).expect("map row");
+        Arc::new(builder.finish())
+    }
+
+    /// One-row `DataFrame` with the three (as yet unmerged) per-level
+    /// columns, matching the shape `apply_drop`/`apply_keep` see as the
+    /// first pipeline stage: `resource_attributes` carries `pairs`, `scope`
+    /// and `log` are empty.
+    async fn register_fixture(pairs: &[(&str, &str)]) -> DataFrame {
+        let schema = Arc::new(Schema::new(vec![
+            build_attribute_map_field(COL_RESOURCE_ATTRIBUTES),
+            build_attribute_map_field(COL_SCOPE_ATTRIBUTES),
+            build_attribute_map_field(COL_LOG_ATTRIBUTES),
+        ]));
+        let resource = build_attribute_map(pairs);
+        let scope = build_attribute_map(&[]);
+        let log = build_attribute_map(&[]);
+        let batch = RecordBatch::try_new(schema, vec![resource, scope, log]).expect("record batch");
+
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("memtable");
+        let ctx = SessionContext::new();
+        ctx.register_table("drop_keep_fixture", Arc::new(table))
+            .expect("register table");
+        ctx.table("drop_keep_fixture").await.expect("table")
+    }
+
+    /// Assert `df` has exactly one `attributes` column (the collapse
+    /// contract), then collect it as a (key, value) map.
+    async fn collect_single_attributes_map(df: DataFrame) -> BTreeMap<String, String> {
+        let attribute_field_count = df
+            .schema()
+            .inner()
+            .fields()
+            .iter()
+            .filter(|f| f.name() == MERGED_ATTRIBUTES_COLUMN)
+            .count();
+        assert_eq!(
+            attribute_field_count, 1,
+            "expected exactly one merged `attributes` column in the output"
+        );
+
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(batches.len(), 1, "single-partition fixture yields one batch");
+
+        let map = batches[0]
+            .column_by_name(MERGED_ATTRIBUTES_COLUMN)
+            .expect("attributes column")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("attributes column is MAP");
+        let entries = map.value(0);
+        let keys = entries.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+        let values = entries.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+        (0..keys.len())
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn drop_collapses_the_three_level_columns_into_one_attributes_column() {
+        let df = register_fixture(&[("keep_me", "r1"), ("drop_me", "r2")]).await;
+        let df = DataFusionPlanner::apply_drop(df, &[DropKeepLabel::new("drop_me")]).expect("apply_drop");
+
+        let attrs = collect_single_attributes_map(df).await;
+        assert_eq!(attrs.get("keep_me").map(String::as_str), Some("r1"));
+        assert!(!attrs.contains_key("drop_me"));
+    }
+
+    #[tokio::test]
+    async fn keep_collapses_the_three_level_columns_into_one_attributes_column() {
+        let df = register_fixture(&[("keep_me", "r1"), ("drop_me", "r2")]).await;
+        let df = DataFusionPlanner::apply_keep(df, &[DropKeepLabel::new("keep_me")]).expect("apply_keep");
+
+        let attrs = collect_single_attributes_map(df).await;
+        assert_eq!(attrs.len(), 1, "only the kept key should survive");
+        assert_eq!(attrs.get("keep_me").map(String::as_str), Some("r1"));
+    }
+
+    #[tokio::test]
+    async fn chained_drop_then_keep_operates_on_the_already_merged_column() {
+        let df = register_fixture(&[("a", "1"), ("b", "2"), ("c", "3")]).await;
+
+        // First stage: drop "a". This collapses the three raw columns into
+        // one `attributes` column (see the collapse tests above).
+        let df = DataFusionPlanner::apply_drop(df, &[DropKeepLabel::new("a")]).expect("apply_drop");
+
+        // Second stage: keep "b". If this recomputed a fresh merge instead
+        // of reading the already-merged `attributes` column back, it would
+        // either error (the raw columns are gone) or silently resurrect "a"
+        // by re-merging the untouched raw data — resolve_current_attributes
+        // exists specifically to prevent both.
+        let df = DataFusionPlanner::apply_keep(df, &[DropKeepLabel::new("b")]).expect("apply_keep");
+
+        let attrs = collect_single_attributes_map(df).await;
+        assert_eq!(attrs.len(), 1, "only 'b' should survive both stages");
+        assert_eq!(attrs.get("b").map(String::as_str), Some("2"));
+    }
+
+    // ========================================================================
+    // C1 regression: LabelFilter after Drop/Keep
+    //
+    // apply_attributes_filter (above) collapses the three per-level columns
+    // into one `attributes` column. A `LabelFilter` pipeline stage reading
+    // attributes AFTER that collapse used to still route through the
+    // pre-merge coalesce (attribute_lookup ignored the DataFrame it was
+    // about to run against), producing `No field named ...log_attributes` at
+    // plan construction — a 500 for any `| drop`/`| keep` followed by
+    // another attribute-reading stage. These tests execute that exact
+    // two-stage pipeline and assert on the resulting rows, not on the plan.
+    // ========================================================================
+
+    /// Multi-row sibling of [`build_attribute_map`]: one row per entry of
+    /// `rows`, needed below because a single-row fixture cannot distinguish
+    /// "the filter matched" from "the filter was never applied".
+    fn build_attribute_map_rows(rows: &[&[(&str, &str)]]) -> ArrayRef {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for pairs in rows {
+            for (key, value) in *pairs {
+                builder.keys().append_value(key);
+                builder.values().append_value(value);
+            }
+            builder.append(true).expect("map row");
+        }
+        Arc::new(builder.finish())
+    }
+
+    /// Multi-row sibling of [`register_fixture`]: `resource_attributes`
+    /// carries one row per entry of `rows`, `scope`/`log` empty on every row.
+    async fn register_multi_row_fixture(rows: &[&[(&str, &str)]]) -> DataFrame {
+        let schema = Arc::new(Schema::new(vec![
+            build_attribute_map_field(COL_RESOURCE_ATTRIBUTES),
+            build_attribute_map_field(COL_SCOPE_ATTRIBUTES),
+            build_attribute_map_field(COL_LOG_ATTRIBUTES),
+        ]));
+        let resource = build_attribute_map_rows(rows);
+        let empty_rows: Vec<&[(&str, &str)]> = vec![&[]; rows.len()];
+        let scope = build_attribute_map_rows(&empty_rows);
+        let log = build_attribute_map_rows(&empty_rows);
+        let batch = RecordBatch::try_new(schema, vec![resource, scope, log]).expect("record batch");
+
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("memtable");
+        let ctx = SessionContext::new();
+        ctx.register_table("drop_keep_multi_row_fixture", Arc::new(table))
+            .expect("register table");
+        ctx.table("drop_keep_multi_row_fixture").await.expect("table")
+    }
+
+    /// Collect `df`'s `attributes` column as one `BTreeMap` per surviving
+    /// row, in row order — the multi-row sibling of
+    /// [`collect_single_attributes_map`], for tests where the row *count*
+    /// (filter selectivity) is itself part of what's under test.
+    async fn collect_attributes_per_row(df: DataFrame) -> Vec<BTreeMap<String, String>> {
+        let batches = df.collect().await.expect("collect");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let map = batch
+                .column_by_name(MERGED_ATTRIBUTES_COLUMN)
+                .expect("attributes column")
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .expect("attributes column is MAP");
+            for row in 0..map.len() {
+                let entries = map.value(row);
+                let keys = entries.column(0).as_any().downcast_ref::<StringArray>().expect("keys");
+                let values = entries.column(1).as_any().downcast_ref::<StringArray>().expect("values");
+                rows.push(
+                    (0..keys.len())
+                        .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+                        .collect(),
+                );
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn label_filter_after_drop_matches_a_surviving_label_and_excludes_the_dropped_one() {
+        // `{...} | drop user_id | request_id="req-456"` — C1's first repro.
+        let df = register_multi_row_fixture(&[
+            &[("user_id", "user-123"), ("request_id", "req-456")],
+            &[("user_id", "user-999"), ("request_id", "req-000")],
+        ])
+        .await;
+
+        let df = DataFusionPlanner::apply_drop(df, &[DropKeepLabel::new("user_id")]).expect("apply_drop");
+        let filter = LabelFilterExpr::Matcher(LabelMatcher::new("request_id", MatchOp::Eq, "req-456"));
+        let df = DataFusionPlanner::apply_label_filter(df, filter).expect("apply_label_filter");
+
+        let rows = collect_attributes_per_row(df).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the request_id=\"req-456\" row should survive the filter"
+        );
+        assert_eq!(
+            rows[0].get("request_id").map(String::as_str),
+            Some("req-456"),
+            "a surviving label must still match after drop"
+        );
+        assert!(
+            !rows[0].contains_key("user_id"),
+            "the dropped label must be absent from the output"
+        );
+    }
+
+    #[tokio::test]
+    async fn label_filter_after_keep_matches_a_surviving_label_and_excludes_the_dropped_one() {
+        // `{...} | keep user_id | user_id="user-123"` — C1's second repro.
+        let df = register_multi_row_fixture(&[
+            &[("user_id", "user-123"), ("request_id", "req-456")],
+            &[("user_id", "user-999"), ("request_id", "req-456")],
+        ])
+        .await;
+
+        let df = DataFusionPlanner::apply_keep(df, &[DropKeepLabel::new("user_id")]).expect("apply_keep");
+        let filter = LabelFilterExpr::Matcher(LabelMatcher::new("user_id", MatchOp::Eq, "user-123"));
+        let df = DataFusionPlanner::apply_label_filter(df, filter).expect("apply_label_filter");
+
+        let rows = collect_attributes_per_row(df).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the user_id=\"user-123\" row should survive the filter"
+        );
+        assert_eq!(
+            rows[0].get("user_id").map(String::as_str),
+            Some("user-123"),
+            "a surviving label must still match after keep"
+        );
+        assert_eq!(
+            rows[0].len(),
+            1,
+            "keep user_id must have already dropped every other label, including request_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_label_filter_after_drop_compares_the_surviving_label_correctly() {
+        // `{...} | drop user_id | http_duration_ms > 100` — C1's third repro.
+        let df = register_multi_row_fixture(&[
+            &[("user_id", "u1"), ("http_duration_ms", "150")],
+            &[("user_id", "u2"), ("http_duration_ms", "50")],
+        ])
+        .await;
+
+        let df = DataFusionPlanner::apply_drop(df, &[DropKeepLabel::new("user_id")]).expect("apply_drop");
+        let filter = LabelFilterExpr::Number {
+            label: "http_duration_ms".to_string(),
+            op: ComparisonOp::Gt,
+            value: 100.0,
+        };
+        let df = DataFusionPlanner::apply_label_filter(df, filter).expect("apply_label_filter");
+
+        let rows = collect_attributes_per_row(df).await;
+        assert_eq!(rows.len(), 1, "only the 150 > 100 row should survive the filter");
+        assert_eq!(
+            rows[0].get("http_duration_ms").map(String::as_str),
+            Some("150"),
+            "a surviving label must still compare correctly after drop"
+        );
+        assert!(
+            !rows[0].contains_key("user_id"),
+            "the dropped label must be absent from the output"
+        );
     }
 }

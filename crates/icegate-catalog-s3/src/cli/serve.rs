@@ -67,8 +67,6 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
-
     use std::time::Duration;
 
     use super::*;

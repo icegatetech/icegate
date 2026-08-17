@@ -21,8 +21,8 @@ use super::{handlers, server::TempoState, validation::MAX_BODY_BYTES};
 /// Build the Tempo HTTP router.
 ///
 /// Endpoint mapping:
-/// - `GET  /api/traces/{trace_id}`          — trace lookup by id.
-/// - `GET  /api/v2/traces/{trace_id}`       — v2 alias of trace lookup.
+/// - `GET  /api/traces/{trace_id}`          — trace lookup by id (bare OTLP).
+/// - `GET  /api/v2/traces/{trace_id}`       — same lookup in the `TraceByIDResponse` envelope.
 /// - `GET  / POST /api/search`              — `TraceQL` search.
 /// - `GET  /api/search/tags`                — v1 flat tag list.
 /// - `GET  /api/v2/search/tags`             — v2 scoped tag list (Grafana).
@@ -51,7 +51,7 @@ pub fn routes(state: TempoState, pressure: MemoryPressure) -> Router {
     let query_timeout = Duration::from_secs(state.engine.config().max_query_duration_secs);
     Router::new()
         .route("/api/traces/{trace_id}", get(handlers::get_trace))
-        .route("/api/v2/traces/{trace_id}", get(handlers::get_trace))
+        .route("/api/v2/traces/{trace_id}", get(handlers::get_trace_v2))
         .route(
             "/api/search",
             get(handlers::search_traces).post(handlers::search_traces),
@@ -113,7 +113,10 @@ mod tests {
         guard
     }
 
-    async fn build_state() -> TempoState {
+    /// Builds the router state over a fresh temp-dir warehouse, returning the
+    /// directory guard alongside it. The caller MUST hold the guard for as long
+    /// as it uses the state: dropping it removes the directory the catalog reads.
+    async fn build_state() -> (TempoState, tempfile::TempDir) {
         let warehouse = tempfile::tempdir().expect("tempdir");
         let catalog_config = CatalogConfig {
             backend: CatalogBackend::Memory,
@@ -133,8 +136,7 @@ mod tests {
             wal_store,
             wal_reader,
         ));
-        Box::leak(Box::new(warehouse));
-        TempoState { engine }
+        (TempoState { engine }, warehouse)
     }
 
     fn get_request(uri: &str) -> Request<Body> {
@@ -143,28 +145,32 @@ mod tests {
 
     #[tokio::test]
     async fn inert_guard_allows_requests() {
-        let app = routes(build_state().await, MemoryPressure::inert());
+        let (state, _warehouse) = build_state().await;
+        let app = routes(state, MemoryPressure::inert());
         let response = app.oneshot(get_request("/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn pressured_guard_sheds_work_path() {
-        let app = routes(build_state().await, pressured_guard());
+        let (state, _warehouse) = build_state().await;
+        let app = routes(state, pressured_guard());
         let response = app.oneshot(get_request("/api/search")).await.expect("response");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn pressured_guard_bypasses_ready() {
-        let app = routes(build_state().await, pressured_guard());
+        let (state, _warehouse) = build_state().await;
+        let app = routes(state, pressured_guard());
         let response = app.oneshot(get_request("/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn pressured_guard_bypasses_echo() {
-        let app = routes(build_state().await, pressured_guard());
+        let (state, _warehouse) = build_state().await;
+        let app = routes(state, pressured_guard());
         let response = app.oneshot(get_request("/api/echo")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }

@@ -64,6 +64,13 @@ SCOPE_EVENT    : 'event' ;
 SCOPE_LINK     : 'link' ;
 SCOPE_PARENT   : 'parent' ;
 SCOPE_TRACE    : 'trace' ;
+// `TraceQL`/Tempo has no instrumentation-scope query scope — there is
+// deliberately no `SCOPE_INSTRUMENTATION : 'scope' ;` token here. OTLP
+// `InstrumentationScope.attributes` (physically the `scope_attributes`
+// column) are reachable only through `span.<name>` / the unscoped
+// `.<name>` form, exactly like any other span-scope attribute — see
+// `crate::tempo::metadata` and `traceql::datafusion::selectors`. The bare
+// word `scope` therefore lexes as an ordinary `IDENT`.
 
 // =====================================================================
 // Intrinsic field keywords

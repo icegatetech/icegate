@@ -216,22 +216,22 @@ fn visit_matchers(ctx: &MatchersContextAll) -> Result<Vec<LabelMatcher>> {
 fn visit_matcher(ctx: &MatcherContextAll) -> Result<LabelMatcher> {
     match ctx {
         MatcherContextAll::MatcherEqContext(c) => {
-            let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
+            let label = c.labelName().ok_or_else(|| parse_error("Missing label name"))?.get_text();
             let value = c.STRING().ok_or_else(|| parse_error("Missing value"))?.get_text();
             Ok(LabelMatcher::new(label, MatchOp::Eq, clean_string(&value)))
         }
         MatcherContextAll::MatcherNeqContext(c) => {
-            let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
+            let label = c.labelName().ok_or_else(|| parse_error("Missing label name"))?.get_text();
             let value = c.STRING().ok_or_else(|| parse_error("Missing value"))?.get_text();
             Ok(LabelMatcher::new(label, MatchOp::Neq, clean_string(&value)))
         }
         MatcherContextAll::MatcherReContext(c) => {
-            let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
+            let label = c.labelName().ok_or_else(|| parse_error("Missing label name"))?.get_text();
             let value = c.STRING().ok_or_else(|| parse_error("Missing value"))?.get_text();
             Ok(LabelMatcher::new(label, MatchOp::Re, clean_string(&value)))
         }
         MatcherContextAll::MatcherNreContext(c) => {
-            let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
+            let label = c.labelName().ok_or_else(|| parse_error("Missing label name"))?.get_text();
             let value = c.STRING().ok_or_else(|| parse_error("Missing value"))?.get_text();
             Ok(LabelMatcher::new(label, MatchOp::Nre, clean_string(&value)))
         }
@@ -246,11 +246,11 @@ fn visit_label_extractions(ctx: &LabelExtractionsContextAll) -> Result<Vec<Label
     for extraction_ctx in ctx.labelExtractionExpr_all() {
         match extraction_ctx.as_ref() {
             LabelExtractionExprContextAll::LabelExtractionSimpleContext(c) => {
-                let name = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
+                let name = c.labelName().ok_or_else(|| parse_error("Missing label name"))?.get_text();
                 extractions.push(LabelExtraction::new(name));
             }
             LabelExtractionExprContextAll::LabelExtractionWithPathContext(c) => {
-                let name = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label name"))?.get_text();
+                let name = c.labelName().ok_or_else(|| parse_error("Missing label name"))?.get_text();
                 let path = c.STRING().ok_or_else(|| parse_error("Missing path"))?.get_text();
                 extractions.push(LabelExtraction::with_path(name, clean_string(&path)));
             }
@@ -272,7 +272,7 @@ fn visit_drop_keep_list(ctx: &DropKeepListContextAll) -> Result<Vec<DropKeepLabe
             DropKeepItemContextAll::DropKeepSimpleContext(c) => {
                 // Simple name: drop level
                 let name = c
-                    .ATTRIBUTE()
+                    .labelName()
                     .ok_or_else(|| parse_error("Missing attribute in drop/keep"))?
                     .get_text();
                 labels.push(DropKeepLabel::new(name));
@@ -322,10 +322,7 @@ fn collect_grouping_labels(ctx: &GroupingLabelsContextAll) -> Vec<GroupingLabel>
     // groupingLabels: groupingLabel (COMMA groupingLabel)*
     for label_ctx in ctx.groupingLabel_all() {
         let mut label = String::new();
-        if let Some(prefix) = label_ctx.PREFIX() {
-            label.push_str(&prefix.get_text());
-        }
-        if let Some(attr) = label_ctx.ATTRIBUTE() {
+        if let Some(attr) = label_ctx.labelName() {
             label.push_str(&attr.get_text());
         }
         if !label.is_empty() {
@@ -383,10 +380,7 @@ fn collect_labels_from_list(ctx: &GroupingLabelListContextAll, labels: &mut Vec<
 
     if let Some(label_ctx) = ctx.groupingLabel() {
         let mut label = String::new();
-        if let Some(prefix) = label_ctx.PREFIX() {
-            label.push_str(&prefix.get_text());
-        }
-        if let Some(attr) = label_ctx.ATTRIBUTE() {
+        if let Some(attr) = label_ctx.labelName() {
             label.push_str(&attr.get_text());
         }
         if !label.is_empty() {
@@ -586,7 +580,7 @@ impl LogQLExprVisitor {
             MetricExprContextAll::MetricExprVariableContext(c) => {
                 let var_ctx = c.variableExpr().ok_or_else(|| parse_error("Missing variable expression"))?;
                 let name = var_ctx
-                    .ATTRIBUTE()
+                    .labelName()
                     .ok_or_else(|| parse_error("Missing variable name"))?
                     .get_text();
                 Ok(MetricExpr::Variable(name))
@@ -920,11 +914,11 @@ impl LogQLExprVisitor {
     fn visit_unwrap_expr(&self, ctx: &UnwrapExprContextAll) -> Result<UnwrapExpr> {
         match ctx {
             UnwrapExprContextAll::UnwrapBasicContext(c) => {
-                let label = c.ATTRIBUTE().ok_or_else(|| parse_error("Missing label in unwrap"))?.get_text();
+                let label = c.labelName().ok_or_else(|| parse_error("Missing label in unwrap"))?.get_text();
                 Ok(UnwrapExpr::new(label))
             }
             UnwrapExprContextAll::UnwrapWithConversionContext(c) => {
-                let attrs: Vec<_> = c.ATTRIBUTE_all();
+                let attrs: Vec<_> = c.labelName_all();
                 if attrs.len() < 2 {
                     return Err(parse_error("Unwrap with conversion requires function and label"));
                 }
@@ -1149,7 +1143,7 @@ impl LogQLExprVisitor {
         for op_ctx in ops_ctx.labelFormatOp_all() {
             match op_ctx.as_ref() {
                 LabelFormatOpContextAll::LabelFormatRenameContext(c) => {
-                    let attrs: Vec<_> = c.ATTRIBUTE_all().iter().map(|a| a.get_text()).collect();
+                    let attrs: Vec<_> = c.labelName_all().iter().map(|a| a.get_text()).collect();
                     if attrs.len() >= 2 {
                         ops.push(LabelFormatOp::Rename {
                             dst: attrs[0].clone(),
@@ -1159,7 +1153,7 @@ impl LogQLExprVisitor {
                 }
                 LabelFormatOpContextAll::LabelFormatTemplateContext(c) => {
                     let dst = c
-                        .ATTRIBUTE()
+                        .labelName()
                         .ok_or_else(|| parse_error("Missing destination label"))?
                         .get_text();
                     let template = c.STRING().ok_or_else(|| parse_error("Missing template"))?.get_text();
@@ -1232,7 +1226,7 @@ impl LogQLExprVisitor {
     #[allow(clippy::unused_self)]
     fn visit_number_filter(&self, ctx: &NumberFilterContextAll) -> Result<LabelFilterExpr> {
         let label = ctx
-            .ATTRIBUTE()
+            .labelName()
             .ok_or_else(|| parse_error("Missing label in number filter"))?
             .get_text();
 
@@ -1253,7 +1247,7 @@ impl LogQLExprVisitor {
     #[allow(clippy::unused_self)]
     fn visit_duration_filter(&self, ctx: &DurationFilterContextAll) -> Result<LabelFilterExpr> {
         let label = ctx
-            .ATTRIBUTE()
+            .labelName()
             .ok_or_else(|| parse_error("Missing label in duration filter"))?
             .get_text();
 
@@ -1274,7 +1268,7 @@ impl LogQLExprVisitor {
     #[allow(clippy::unused_self)]
     fn visit_bytes_filter(&self, ctx: &BytesFilterContextAll) -> Result<LabelFilterExpr> {
         let label = ctx
-            .ATTRIBUTE()
+            .labelName()
             .ok_or_else(|| parse_error("Missing label in bytes filter"))?
             .get_text();
 
@@ -1295,7 +1289,7 @@ impl LogQLExprVisitor {
     #[allow(clippy::unused_self)]
     fn visit_ip_label_filter(&self, ctx: &IpLabelFilterContextAll) -> Result<LabelFilterExpr> {
         let label = ctx
-            .ATTRIBUTE()
+            .labelName()
             .ok_or_else(|| parse_error("Missing label in IP filter"))?
             .get_text();
 

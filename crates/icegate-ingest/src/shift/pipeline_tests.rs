@@ -8,6 +8,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS};
 use icegate_queue::QueueReader;
 use jobmanager::{JobCode, JobsManager, TaskDefinition, TaskExecutor, TaskOutcome, task_fn};
@@ -29,8 +30,8 @@ use super::{
     test_utils::{
         IcebergStorageWithHistory, LogOutputRow, RecordingStorage, StorageCall, StorageFault, WalQueueReader,
         WalSegment, assert_parquet_row_group_bounds_match_sorted_rows, expected_row_bodies, generous_timeouts,
-        log_sort_key_cmp, logs_ingest_batch, read_parquet_output_rows, row_bodies_from_batches,
-        tenant_ids_from_batches, two_tenant_ingest_batches,
+        log_sort_key_cmp, logs_ingest_batch_with_schema, read_parquet_output_rows, row_bodies_from_batches,
+        tenant_ids_from_batches, two_tenant_ingest_batches_with_schema,
     },
 };
 use crate::{
@@ -190,8 +191,18 @@ async fn run_single_task_job(definition: TaskDefinition, executor: Arc<dyn TaskE
 }
 
 /// Two WAL segments holding two tenants, which the planner splits into one shift task per tenant.
+///
+/// Built against a freshly derived schema; see [`logs_ingest_batch_with_schema`] for when that is
+/// (and is not) safe. A test that writes through the real catalog must use
+/// [`two_tenant_wal_segments_with_schema`] instead.
 fn two_tenant_wal_segments() -> Vec<WalSegment> {
-    let [ingest_segment_100, ingest_segment_101] = two_tenant_ingest_batches();
+    two_tenant_wal_segments_with_schema(&crate::transform::logs_arrow_schema().expect("logs arrow schema"))
+}
+
+/// As [`two_tenant_wal_segments`], but built against an explicit Arrow schema — see
+/// [`logs_ingest_batch_with_schema`].
+fn two_tenant_wal_segments_with_schema(schema: &arrow::datatypes::Schema) -> Vec<WalSegment> {
+    let [ingest_segment_100, ingest_segment_101] = two_tenant_ingest_batches_with_schema(schema);
     let prepared_100 = sort_logs(&ingest_segment_100, 2, None)
         .expect("prepare WAL segment 100")
         .expect("segment 100 row groups");
@@ -726,11 +737,18 @@ async fn each_shift_task_writes_one_tenant_in_sort_key_order() {
 /// sorted, tenant-isolated, and reachable through a snapshot carrying the committed WAL offset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_pipeline_commits_sorted_parquet_and_records_the_wal_offset() {
-    let wal_segments = two_tenant_wal_segments();
-    let queue_reader = Arc::new(WalQueueReader::new(&wal_segments));
-
+    // The table is created before the WAL fixture: `create_logs_table` uses the `Memory`
+    // catalog backend, which reassigns nested field ids (map children) on `create_table` —
+    // unlike the production `S3Catalog`, which preserves them verbatim (see
+    // `IcebergTableMetadata::create` in `icegate-catalog-s3/src/domain/root.rs`). So the
+    // fixture batches must be built against the table's own committed schema, not a freshly
+    // derived one — see `two_tenant_wal_segments_with_schema`.
     let table_name = format!("logs_e2e_{}", Uuid::new_v4().simple());
     let (catalog, table) = super::test_utils::create_logs_table(&table_name).await;
+    let table_arrow_schema = schema_to_arrow_schema(table.metadata().current_schema()).expect("table arrow schema");
+    let wal_segments = two_tenant_wal_segments_with_schema(&table_arrow_schema);
+    let queue_reader = Arc::new(WalQueueReader::new(&wal_segments));
+
     let mut shift_config = ShiftConfig::default();
     shift_config.write.row_group_size = 2;
     let shift_config = Arc::new(shift_config);
@@ -838,14 +856,24 @@ async fn the_pipeline_commits_sorted_parquet_and_records_the_wal_offset() {
 /// tenant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pathologically_small_writer_budget_rolls_the_shift_task_over_several_data_files() {
-    let ingest_segment = logs_ingest_batch(vec![
-        ("tenant-a", Some("svc-1"), 100, 101),
-        ("tenant-a", Some("svc-1"), 100, 102),
-        ("tenant-a", Some("svc-0"), 110, 103),
-        ("tenant-a", Some("svc-2"), 120, 104),
-        ("tenant-a", Some("svc-3"), 130, 105),
-        ("tenant-a", Some("svc-4"), 140, 106),
-    ]);
+    // The table is created before the WAL fixture — see the comment in
+    // `the_pipeline_commits_sorted_parquet_and_records_the_wal_offset` for why the batch must
+    // carry the table's own committed field ids rather than a freshly derived schema's.
+    let table_name = format!("logs_failover_{}", Uuid::new_v4().simple());
+    let (catalog, table) = super::test_utils::create_logs_table(&table_name).await;
+    let table_arrow_schema = schema_to_arrow_schema(table.metadata().current_schema()).expect("table arrow schema");
+
+    let ingest_segment = logs_ingest_batch_with_schema(
+        &table_arrow_schema,
+        vec![
+            ("tenant-a", Some("svc-1"), 100, 101),
+            ("tenant-a", Some("svc-1"), 100, 102),
+            ("tenant-a", Some("svc-0"), 110, 103),
+            ("tenant-a", Some("svc-2"), 120, 104),
+            ("tenant-a", Some("svc-3"), 130, 105),
+            ("tenant-a", Some("svc-4"), 140, 106),
+        ],
+    );
     let prepared = sort_logs(&ingest_segment, 2, None)
         .expect("prepare WAL segment")
         .expect("segment row groups");
@@ -855,8 +883,6 @@ async fn a_pathologically_small_writer_budget_rolls_the_shift_task_over_several_
     }];
     let queue_reader = Arc::new(WalQueueReader::new(&wal_segments));
 
-    let table_name = format!("logs_failover_{}", Uuid::new_v4().simple());
-    let (catalog, _table) = super::test_utils::create_logs_table(&table_name).await;
     let mut shift_config = ShiftConfig::default();
     shift_config.write.row_group_size = 2;
     let shift_config = Arc::new(shift_config);

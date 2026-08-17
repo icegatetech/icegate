@@ -224,8 +224,6 @@ fn decode_batch(batch: &RecordBatch) -> Result<Vec<RateObservation>> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use chrono::DateTime;
 
     use super::LiveRates;

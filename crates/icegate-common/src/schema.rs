@@ -27,8 +27,9 @@ pub const PRICE_DECIMAL_SCALE: u32 = 10;
 ///
 /// Based on the `LogRecord` message from
 /// opentelemetry/proto/logs/v1/logs.proto. Body is simplified from `AnyValue`
-/// variant to String type. Attributes are merged from resource, scope, and
-/// log-level attributes into a single Map<String, String>.
+/// variant to String type. Attributes are stored one Map<String, String> per
+/// OTLP level — `Resource.attributes`, `InstrumentationScope.attributes`, and
+/// `LogRecord.attributes` — with keys in their dotted OTel-native form.
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
@@ -40,18 +41,38 @@ pub const PRICE_DECIMAL_SCALE: u32 = 10;
 ///
 /// # Field IDs
 /// Field IDs are assigned sequentially to match Iceberg catalog behavior.
-/// Map nested fields (key=11, value=12) come after attributes (10).
+/// Each map's key/value ids follow its parent: 13/14/15, 16/17/18, 19/20/21.
+///
+/// Ids 10-12 are **retired**: they belonged to the pre-split merged
+/// `attributes` map. A field id is what Iceberg matches on, so reusing 10 for
+/// `resource_attributes` would make every old data file's merged, underscored
+/// map read back as this column — silently, since the name is only a label.
+/// Old data survives the mandated drop-and-recreate inside queued WAL segments,
+/// which are shifted against the current schema, so the ids must stay distinct.
+/// Same reasoning as the appended ids on `spans` and `metrics`.
 pub fn logs_schema() -> Result<Schema> {
-    // Create Map<String, String> for attributes
-    // Nested field IDs must be sequential after parent (10 -> 11, 12)
-    let attributes_map = Type::Map(MapType::new(
+    // One MAP<String, String> per OTLP level. Parent/key/value ids are
+    // consecutive per map, which is what the Iceberg catalog expects.
+    let resource_attributes_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(14, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
-            11, // Sequential after attributes field (10)
-            "key",
+            15,
+            "value",
             Type::Primitive(PrimitiveType::String),
         )),
+    ));
+    let scope_attributes_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(17, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
-            12, // Sequential after key (11)
+            18,
+            "value",
+            Type::Primitive(PrimitiveType::String),
+        )),
+    ));
+    let log_attributes_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(20, "key", Type::Primitive(PrimitiveType::String))),
+        Arc::new(NestedField::required(
+            21,
             "value",
             Type::Primitive(PrimitiveType::String),
         )),
@@ -109,9 +130,17 @@ pub fn logs_schema() -> Result<Schema> {
             )),
             // Body (simplified from AnyValue variant to String)
             Arc::new(NestedField::optional(9, "body", Type::Primitive(PrimitiveType::String))),
-            // Attributes (merged from resource, scope, and log attributes)
-            // Map nested fields use IDs 11, 12
-            Arc::new(NestedField::required(10, "attributes", attributes_map)),
+            // Attributes, one column per OTLP level. Keys keep their dotted
+            // OTel-native form; nothing normalises them on the write path.
+            // Ids start at 13, past the retired 10-12 of the merged map they
+            // replaced — see this function's doc.
+            Arc::new(NestedField::required(
+                13,
+                "resource_attributes",
+                resource_attributes_map,
+            )),
+            Arc::new(NestedField::required(16, "scope_attributes", scope_attributes_map)),
+            Arc::new(NestedField::required(19, "log_attributes", log_attributes_map)),
         ])
         .build()?;
 
@@ -170,10 +199,10 @@ pub fn logs_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// Based on the Span message from opentelemetry/proto/trace/v1/trace.proto.
 /// Includes nested events and links as List<Struct> types.
-/// Attributes are split into two top-level maps:
-/// - `resource_attributes` (Map<string, string>): OTLP resource attributes.
-/// - `span_attributes` (Map<string, string>): OTLP span attributes plus
-///   folded `InstrumentationScope.attributes`.
+/// Attributes are stored one Map<String, String> per OTLP level:
+/// - `resource_attributes` (Map<string, string>): OTLP `Resource.attributes`.
+/// - `scope_attributes` (Map<string, string>): OTLP `InstrumentationScope.attributes`.
+/// - `span_attributes` (Map<string, string>): OTLP `Span.attributes`.
 ///
 /// # Nested Structures
 /// - events: `List<Struct>` - Span events (NO `trace_id`/`span_id`, inherits from parent)
@@ -280,10 +309,14 @@ pub fn spans_schema() -> Result<Schema> {
                 )),
             )),
             // Flags and monitoring
-            Arc::new(NestedField::optional(18, "flags", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(
+                18,
+                COL_FLAGS,
+                Type::Primitive(PrimitiveType::Int),
+            )),
             Arc::new(NestedField::optional(
                 19,
-                "dropped_attributes_count",
+                COL_DROPPED_ATTRIBUTES_COUNT,
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
@@ -317,7 +350,7 @@ pub fn spans_schema() -> Result<Schema> {
                         )),
                         Arc::new(NestedField::required(
                             26,
-                            "attributes",
+                            COL_ATTRIBUTES,
                             Type::Map(MapType::new(
                                 Arc::new(NestedField::required(27, "key", Type::Primitive(PrimitiveType::String))),
                                 Arc::new(NestedField::required(
@@ -329,7 +362,7 @@ pub fn spans_schema() -> Result<Schema> {
                         )),
                         Arc::new(NestedField::required(
                             29,
-                            "dropped_attributes_count",
+                            COL_DROPPED_ATTRIBUTES_COUNT,
                             Type::Primitive(PrimitiveType::Int),
                         )),
                     ])),
@@ -362,7 +395,7 @@ pub fn spans_schema() -> Result<Schema> {
                         )),
                         Arc::new(NestedField::required(
                             35,
-                            "attributes",
+                            COL_ATTRIBUTES,
                             Type::Map(MapType::new(
                                 Arc::new(NestedField::required(36, "key", Type::Primitive(PrimitiveType::String))),
                                 Arc::new(NestedField::required(
@@ -374,17 +407,20 @@ pub fn spans_schema() -> Result<Schema> {
                         )),
                         Arc::new(NestedField::required(
                             38,
-                            "dropped_attributes_count",
+                            COL_DROPPED_ATTRIBUTES_COUNT,
                             Type::Primitive(PrimitiveType::Int),
                         )),
-                        Arc::new(NestedField::optional(39, "flags", Type::Primitive(PrimitiveType::Int))),
+                        Arc::new(NestedField::optional(
+                            39,
+                            COL_FLAGS,
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
                     ])),
                     true,
                 )))),
             )),
-            // Span-level attributes (OTLP `Span.attributes` plus folded
-            // `ScopeSpans.scope.attributes`). Parent + key + value consume
-            // IDs 40, 41, 42.
+            // Span-level attributes (OTLP `Span.attributes`). Parent + key +
+            // value consume IDs 40, 41, 42.
             Arc::new(NestedField::required(
                 40,
                 "span_attributes",
@@ -392,6 +428,22 @@ pub fn spans_schema() -> Result<Schema> {
                     Arc::new(NestedField::required(41, "key", Type::Primitive(PrimitiveType::String))),
                     Arc::new(NestedField::required(
                         42,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
+            )),
+            // Scope-level attributes (OTLP `InstrumentationScope.attributes`).
+            // Appended rather than placed beside `resource_attributes` so every
+            // pre-existing field id stays put. Parent + key + value consume
+            // 43, 44, 45.
+            Arc::new(NestedField::required(
+                43,
+                "scope_attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(44, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        45,
                         "value",
                         Type::Primitive(PrimitiveType::String),
                     )),
@@ -1081,6 +1133,10 @@ pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// Events are extracted from the logs stream based on the `event_name` field.
 /// See: <https://opentelemetry.io/docs/specs/semconv/general/events/>
 ///
+/// Attributes are stored one Map<String, String> per OTLP level —
+/// `Resource.attributes`, `InstrumentationScope.attributes`, and
+/// `LogRecord.attributes` — with keys in their dotted OTel-native form.
+///
 /// # Partitioning
 /// - `tenant_id` (identity)
 /// - day(`timestamp`)
@@ -1088,12 +1144,38 @@ pub fn spans_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// # Sorting
 /// - `service_name` (ascending)
 /// - `timestamp` (descending) - recent-first ordering
+///
+/// # Field IDs
+/// Field IDs are assigned sequentially to match Iceberg catalog behavior.
+/// Each map's key/value ids follow its parent: 13/14/15, 16/17/18, 19/20/21.
+///
+/// Ids 10-12 are **retired** for the same reason as on `logs`: they belonged
+/// to the pre-split merged `attributes` map, and Iceberg matches on the id, so
+/// reusing them would make an old data file's merged map read back as
+/// `resource_attributes`.
 pub fn events_schema() -> Result<Schema> {
-    // Create Map<String, String> for attributes (field IDs: 11, 12)
-    let attributes_map = Type::Map(MapType::new(
-        Arc::new(NestedField::required(11, "key", Type::Primitive(PrimitiveType::String))),
+    // One MAP<String, String> per OTLP level. Parent/key/value ids are
+    // consecutive per map, which is what the Iceberg catalog expects.
+    let resource_attributes_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(14, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
-            12,
+            15,
+            "value",
+            Type::Primitive(PrimitiveType::String),
+        )),
+    ));
+    let scope_attributes_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(17, "key", Type::Primitive(PrimitiveType::String))),
+        Arc::new(NestedField::required(
+            18,
+            "value",
+            Type::Primitive(PrimitiveType::String),
+        )),
+    ));
+    let log_attributes_map = Type::Map(MapType::new(
+        Arc::new(NestedField::required(20, "key", Type::Primitive(PrimitiveType::String))),
+        Arc::new(NestedField::required(
+            21,
             "value",
             Type::Primitive(PrimitiveType::String),
         )),
@@ -1151,8 +1233,17 @@ pub fn events_schema() -> Result<Schema> {
                 "span_id",
                 Type::Primitive(PrimitiveType::Fixed(8)),
             )),
-            // Event attributes
-            Arc::new(NestedField::required(10, "attributes", attributes_map)),
+            // Attributes, one column per OTLP level. Keys keep their dotted
+            // OTel-native form; nothing normalises them on the write path.
+            // Ids start at 13, past the retired 10-12 of the merged map they
+            // replaced — see this function's doc.
+            Arc::new(NestedField::required(
+                13,
+                "resource_attributes",
+                resource_attributes_map,
+            )),
+            Arc::new(NestedField::required(16, "scope_attributes", scope_attributes_map)),
+            Arc::new(NestedField::required(19, "log_attributes", log_attributes_map)),
         ])
         .build()?;
 
@@ -1217,6 +1308,16 @@ pub fn events_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// metric types (gauge, sum, histogram, `exponential_histogram`, summary)
 /// into a single table with optional fields for type-specific data.
 ///
+/// Attributes are stored one Map<String, String> per OTLP level:
+/// - `resource_attributes` (Map<string, string>): OTLP `Resource.attributes`.
+/// - `scope_attributes` (Map<string, string>): OTLP `InstrumentationScope.attributes`.
+/// - `data_point_attributes` (Map<string, string>): OTLP `<X>DataPoint.attributes`.
+///   Named after the data point, not the metric: `Metric` itself has no
+///   `attributes` field, and a row in this table IS a data point.
+///
+/// `metadata` (OTLP `Metric.metadata`) is a separate, explicitly
+/// non-identifying level and keeps its own column — it is not an attribute map.
+///
 /// # Partitioning
 /// - `tenant_id` (identity)
 /// - day(`timestamp`)
@@ -1228,8 +1329,8 @@ pub fn events_sort_order(schema: &Schema) -> Result<SortOrder> {
 /// - `timestamp` (descending) - recent-first ordering
 #[allow(clippy::too_many_lines)]
 pub fn metrics_schema() -> Result<Schema> {
-    // Create Map<String, String> for main attributes (field IDs: 32, 33)
-    let attributes_map = Type::Map(MapType::new(
+    // Create Map<String, String> for data-point attributes (field IDs: 32, 33)
+    let data_point_attributes_map = Type::Map(MapType::new(
         Arc::new(NestedField::required(32, "key", Type::Primitive(PrimitiveType::String))),
         Arc::new(NestedField::required(
             33,
@@ -1299,7 +1400,7 @@ pub fn metrics_schema() -> Result<Schema> {
             "trace_id",
             Type::Primitive(PrimitiveType::Fixed(16)),
         )),
-        Arc::new(NestedField::required(43, "attributes", exemplar_attributes_map)),
+        Arc::new(NestedField::required(43, COL_ATTRIBUTES, exemplar_attributes_map)),
     ]));
 
     let schema = Schema::builder()
@@ -1369,8 +1470,14 @@ pub fn metrics_schema() -> Result<Schema> {
                 "is_monotonic",
                 Type::Primitive(PrimitiveType::Boolean),
             )),
-            // Attributes (merged from resource, scope, and metric/data point attributes)
-            Arc::new(NestedField::required(13, "attributes", attributes_map)),
+            // Data-point attributes (OTLP `<X>DataPoint.attributes`). Renamed
+            // from `attributes`: after the per-level split it holds only the
+            // data point's own attributes.
+            Arc::new(NestedField::required(
+                13,
+                "data_point_attributes",
+                data_point_attributes_map,
+            )),
             // Value fields (for gauge and sum metrics)
             Arc::new(NestedField::optional(
                 14,
@@ -1457,7 +1564,11 @@ pub fn metrics_schema() -> Result<Schema> {
                 )))),
             )),
             // Flags and exemplars
-            Arc::new(NestedField::optional(30, "flags", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(
+                30,
+                COL_FLAGS,
+                Type::Primitive(PrimitiveType::Int),
+            )),
             Arc::new(NestedField::optional(
                 31,
                 "exemplars",
@@ -1469,6 +1580,32 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             // OTLP Metric.metadata: additional KeyValue metadata describing the metric.
             Arc::new(NestedField::optional(50, "metadata", metadata_map)),
+            // Resource and scope attributes. Appended after the previous
+            // maximum field id (52) so every existing id stays put.
+            Arc::new(NestedField::required(
+                53,
+                "resource_attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(54, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        55,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
+            )),
+            Arc::new(NestedField::required(
+                56,
+                "scope_attributes",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(57, "key", Type::Primitive(PrimitiveType::String))),
+                    Arc::new(NestedField::required(
+                        58,
+                        "value",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )),
+            )),
         ])
         .build()?;
 
@@ -1562,18 +1699,39 @@ pub const COL_TENANT_ID: &str = "tenant_id";
 pub const COL_TIMESTAMP: &str = "timestamp";
 /// Log message body.
 pub const COL_BODY: &str = "body";
-/// Merged `MAP<String, String>` of resource/scope/log attributes.
-pub const COL_ATTRIBUTES: &str = "attributes";
-/// Spans table — resource-attribute MAP column.
+/// Resource-attribute MAP column — OTLP `Resource.attributes`.
 ///
-/// Holds OTLP `Resource.attributes` after the 2026-04-19 split.
-/// Logs still use [`COL_ATTRIBUTES`] which is a single merged map.
+/// Present on `logs`, `spans`, `events`, and `metrics`.
 pub const COL_RESOURCE_ATTRIBUTES: &str = "resource_attributes";
+
+/// Scope-attribute MAP column — OTLP `InstrumentationScope.attributes`.
+///
+/// Present on `logs`, `spans`, `events`, and `metrics`.
+pub const COL_SCOPE_ATTRIBUTES: &str = "scope_attributes";
+
+/// Logs record-attribute MAP column — OTLP `LogRecord.attributes`.
+///
+/// Present on `logs` and `events` (events rows are extracted from OTLP
+/// `LogRecord`s, so they carry this column rather than a dedicated
+/// `event_attributes` one).
+pub const COL_LOG_ATTRIBUTES: &str = "log_attributes";
+
+/// Metrics record-attribute MAP column — OTLP `<X>DataPoint.attributes`.
+///
+/// Not to be confused with [`COL_METADATA`]: `Metric` has no `attributes`
+/// field, and `Metric.metadata` is explicitly non-identifying.
+pub const COL_DATA_POINT_ATTRIBUTES: &str = "data_point_attributes";
+
+/// Metrics — OTLP `Metric.metadata` MAP column.
+///
+/// Non-identifying by the OTLP spec: it exists for lossless round-trip
+/// translation and takes no part in series identity.
+pub const COL_METADATA: &str = "metadata";
 
 /// Spans table — span-attribute MAP column.
 ///
-/// Holds OTLP `Span.attributes` plus folded `InstrumentationScope.attributes`
-/// after the 2026-04-19 split.
+/// Holds OTLP `Span.attributes` only; scope-level attributes live in
+/// [`COL_SCOPE_ATTRIBUTES`] instead of being folded in here.
 pub const COL_SPAN_ATTRIBUTES: &str = "span_attributes";
 /// `OpenTelemetry` severity text (e.g. `"ERROR"`, `"INFO"`).
 pub const COL_SEVERITY_TEXT: &str = "severity_text";
@@ -1601,6 +1759,22 @@ pub const COL_STATUS_MESSAGE: &str = "status_message";
 pub const COL_EVENTS: &str = "events";
 /// Spans table — `links` column (ARRAY of struct).
 pub const COL_LINKS: &str = "links";
+/// Nested `attributes` map inside the `events`, `links`, and `exemplars` structs.
+///
+/// Distinct from the top-level per-OTLP-level attribute columns
+/// ([`COL_RESOURCE_ATTRIBUTES`] and friends): this one is a struct field, not a
+/// table column.
+pub const COL_ATTRIBUTES: &str = "attributes";
+/// Spans — OTLP-reported count of attributes dropped before export (`INT`).
+/// Present on the span itself and inside the `events` / `links` structs.
+pub const COL_DROPPED_ATTRIBUTES_COUNT: &str = "dropped_attributes_count";
+/// Spans/metrics — OTLP `flags` bitmask (`INT`).
+///
+/// The bits differ per table: on spans (the span itself and the `links`
+/// struct) they are `SpanFlags`, carrying the W3C trace flags plus the
+/// remote-parent bit; on a metrics data point they are `DataPointFlags`,
+/// which are unrelated to W3C trace flags.
+pub const COL_FLAGS: &str = "flags";
 /// Logs/events/spans — observed-by-collector timestamp (`TIMESTAMP`).
 pub const COL_OBSERVED_TIMESTAMP: &str = "observed_timestamp";
 /// Logs/events/spans/metrics — write-side timestamp captured by ingest (`TIMESTAMP`).
@@ -1774,12 +1948,11 @@ mod tests {
     #[test]
     fn test_logs_schema() {
         let schema = logs_schema().expect("Failed to create logs schema");
-        // highest_field_id includes nested field IDs from Map
-        assert_eq!(schema.highest_field_id(), 12);
+        // highest_field_id includes nested field IDs from the three attribute maps
+        assert_eq!(schema.highest_field_id(), 21);
         assert!(schema.field_by_name("tenant_id").is_some());
         assert!(schema.field_by_name("timestamp").is_some());
         assert!(schema.field_by_name("body").is_some());
-        assert!(schema.field_by_name("attributes").is_some());
         assert!(
             schema.field_by_name("cloud_account_id").is_none(),
             "cloud_account_id must be gone"
@@ -1787,10 +1960,59 @@ mod tests {
     }
 
     #[test]
+    fn logs_schema_splits_attributes_by_otlp_level() {
+        let schema = logs_schema().expect("logs schema");
+
+        assert!(
+            schema.field_by_name("attributes").is_none(),
+            "merged `attributes` map must be gone from logs"
+        );
+
+        for (name, parent, key, value) in [
+            ("resource_attributes", 13, 14, 15),
+            ("scope_attributes", 16, 17, 18),
+            ("log_attributes", 19, 20, 21),
+        ] {
+            let field = schema.field_by_name(name).unwrap_or_else(|| panic!("{name} field"));
+            assert_eq!(field.id, parent, "{name} parent id");
+            let Type::Map(map) = &*field.field_type else {
+                panic!("{name} must be Map");
+            };
+            assert_eq!(map.key_field.id, key, "{name} key id");
+            assert_eq!(map.value_field.id, value, "{name} value id");
+        }
+    }
+
+    #[test]
+    fn retired_merged_attributes_ids_are_not_reused_on_logs_or_events() {
+        // Iceberg identifies a column by field id, not by name, so reusing an
+        // id changes what old data means rather than what it is called. Ids
+        // 10-12 belonged to the pre-split merged `attributes` map on both
+        // tables; a data file still carrying them — a WAL segment queued
+        // across the upgrade, say — must not read back as one of the new
+        // per-level maps. `spans` and `metrics` avoid this by appending, and
+        // these two must not quietly diverge from that.
+        for (table, schema) in [
+            ("logs", logs_schema().expect("logs schema")),
+            ("events", events_schema().expect("events schema")),
+        ] {
+            for field in schema.as_struct().fields() {
+                assert!(
+                    field.id > 12 || !matches!(&*field.field_type, Type::Map(_)),
+                    "{table}: attribute map `{}` reuses retired id {}",
+                    field.name,
+                    field.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_spans_schema() {
         let schema = spans_schema().expect("Failed to create spans schema");
-        // Field IDs 1-21 + events(22-29) + links(30-39) + span_attributes(40-42).
-        assert_eq!(schema.highest_field_id(), 42);
+        // Field IDs 1-21 + events(22-29) + links(30-39) + span_attributes(40-42)
+        // + scope_attributes(43-45).
+        assert_eq!(schema.highest_field_id(), 45);
         assert!(schema.field_by_name("trace_id").is_some());
         assert!(schema.field_by_name("span_id").is_some());
         assert!(schema.field_by_name("events").is_some());
@@ -2004,9 +2226,26 @@ mod tests {
     }
 
     #[test]
+    fn spans_schema_has_a_dedicated_scope_attributes_map() {
+        let schema = spans_schema().expect("spans schema");
+        let field = schema.field_by_name("scope_attributes").expect("scope_attributes field");
+        assert_eq!(field.id, 43);
+        let Type::Map(map) = &*field.field_type else {
+            panic!("scope_attributes must be Map");
+        };
+        assert_eq!(map.key_field.id, 44);
+        assert_eq!(map.value_field.id, 45);
+
+        // The pre-existing maps keep their ids so the rest of the schema is stable.
+        assert_eq!(schema.field_by_name("resource_attributes").expect("resource").id, 15);
+        assert_eq!(schema.field_by_name("span_attributes").expect("span").id, 40);
+    }
+
+    #[test]
     fn test_events_schema() {
         let schema = events_schema().expect("Failed to create events schema");
-        assert_eq!(schema.highest_field_id(), 12);
+        // highest_field_id includes nested field IDs from the three attribute maps
+        assert_eq!(schema.highest_field_id(), 21);
         assert!(schema.field_by_name("event_domain").is_some());
         assert!(schema.field_by_name("event_name").is_some());
         assert!(
@@ -2016,12 +2255,38 @@ mod tests {
     }
 
     #[test]
+    fn events_schema_splits_attributes_by_otlp_level() {
+        let schema = events_schema().expect("events schema");
+
+        assert!(
+            schema.field_by_name("attributes").is_none(),
+            "merged `attributes` map must be gone from events"
+        );
+
+        for (name, parent, key, value) in [
+            ("resource_attributes", 13, 14, 15),
+            ("scope_attributes", 16, 17, 18),
+            ("log_attributes", 19, 20, 21),
+        ] {
+            let field = schema.field_by_name(name).unwrap_or_else(|| panic!("{name} field"));
+            assert_eq!(field.id, parent, "{name} parent id");
+            let Type::Map(map) = &*field.field_type else {
+                panic!("{name} must be Map");
+            };
+            assert_eq!(map.key_field.id, key, "{name} key id");
+            assert_eq!(map.value_field.id, value, "{name} value id");
+        }
+    }
+
+    #[test]
     fn test_metrics_schema() {
         let schema = metrics_schema().expect("Failed to create metrics schema");
         // highest_field_id includes nested field IDs from Maps, Lists, and Structs.
         // Top-level fields occupy 1..=31; nested IDs run 32..=49; the appended
-        // `metadata` map adds field 50 (key 51, value 52).
-        assert_eq!(schema.highest_field_id(), 52);
+        // `metadata` map adds field 50 (key 51, value 52); the appended
+        // `resource_attributes`/`scope_attributes` maps add fields 53 (54, 55)
+        // and 56 (57, 58).
+        assert_eq!(schema.highest_field_id(), 58);
         assert!(schema.field_by_name("metric_name").is_some());
         assert!(schema.field_by_name("metric_type").is_some());
         assert!(schema.field_by_name("value_double").is_some());
@@ -2035,17 +2300,53 @@ mod tests {
     }
 
     #[test]
+    fn metrics_schema_splits_attributes_by_otlp_level() {
+        let schema = metrics_schema().expect("metrics schema");
+
+        assert!(
+            schema.field_by_name("attributes").is_none(),
+            "renamed to data_point_attributes"
+        );
+
+        // Renamed in place: ids are unchanged.
+        let dp = schema.field_by_name("data_point_attributes").expect("data_point_attributes");
+        assert_eq!(dp.id, 13);
+        let Type::Map(dp_map) = &*dp.field_type else {
+            panic!("data_point_attributes must be Map");
+        };
+        assert_eq!(dp_map.key_field.id, 32);
+        assert_eq!(dp_map.value_field.id, 33);
+
+        // Appended after the previous maximum id (52).
+        for (name, parent, key, value) in [("resource_attributes", 53, 54, 55), ("scope_attributes", 56, 57, 58)] {
+            let field = schema.field_by_name(name).unwrap_or_else(|| panic!("{name} field"));
+            assert_eq!(field.id, parent, "{name} parent id");
+            let Type::Map(map) = &*field.field_type else {
+                panic!("{name} must be Map");
+            };
+            assert_eq!(map.key_field.id, key);
+            assert_eq!(map.value_field.id, value);
+        }
+
+        // Metric.metadata is a different level and keeps its own column.
+        assert_eq!(schema.field_by_name("metadata").expect("metadata").id, 50);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn test_metrics_schema_nested_ids_sequential() {
         use iceberg::spec::Type;
 
         let schema = metrics_schema().expect("Failed to create metrics schema");
 
-        // attributes Map: parent=13, key=32, value=33.
-        let attributes = schema.field_by_name("attributes").expect("attributes field");
+        // data_point_attributes Map (renamed in place from `attributes`):
+        // parent=13, key=32, value=33.
+        let attributes = schema
+            .field_by_name("data_point_attributes")
+            .expect("data_point_attributes field");
         assert_eq!(attributes.id, 13);
         let Type::Map(attr_map) = &*attributes.field_type else {
-            panic!("attributes must be Map");
+            panic!("data_point_attributes must be Map");
         };
         assert_eq!(attr_map.key_field.id, 32);
         assert_eq!(attr_map.value_field.id, 33);
@@ -2239,5 +2540,25 @@ mod tests {
         .map(|n| schema.field_by_name(n).expect("field present").id)
         .collect();
         assert_eq!(ids, expected);
+    }
+
+    /// Durable guard for the OTel-native attributes migration: every
+    /// per-table test above already checks this incidentally, but a future
+    /// edit to any one of them could drop the assertion without anyone
+    /// noticing. This test exists solely to keep failing if a merged
+    /// `attributes` column ever comes back on any of the four OTLP tables.
+    #[test]
+    fn no_table_has_a_merged_attributes_column() {
+        for (table, schema) in [
+            ("logs", logs_schema().expect("logs")),
+            ("spans", spans_schema().expect("spans")),
+            ("events", events_schema().expect("events")),
+            ("metrics", metrics_schema().expect("metrics")),
+        ] {
+            assert!(
+                schema.field_by_name("attributes").is_none(),
+                "{table} must not carry a merged `attributes` column"
+            );
+        }
     }
 }

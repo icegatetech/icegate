@@ -34,16 +34,24 @@ use iceberg::{
         },
     },
 };
+use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE, catalog::CatalogBuilder, schema,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE,
+    catalog::CatalogBuilder,
+    schema::{self, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES},
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
     tempo::TempoConfig,
 };
 use reqwest::Client;
-use tokio::time::Duration;
+use tokio::{sync::oneshot, time::Duration};
 use tokio_util::sync::CancellationToken;
+
+/// Readiness poll budget for a freshly bound Tempo server. Generous because the
+/// sanitizer builds run this same harness at a fraction of normal speed.
+const READY_ATTEMPTS: u32 = 50;
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Test server running a Tempo HTTP API on an ephemeral port.
 pub struct TestServer {
@@ -51,6 +59,10 @@ pub struct TestServer {
     pub base_url: String,
     pub cancel_token: CancellationToken,
     server_handle: tokio::task::JoinHandle<()>,
+    /// Owns the temporary warehouse directory; held purely for its
+    /// `Drop`, which removes the directory when the server is dropped.
+    #[allow(dead_code)]
+    temp_dir: tempfile::TempDir,
 }
 
 impl TestServer {
@@ -68,17 +80,14 @@ impl TestServer {
             cache: None,
         };
 
-        // Pick a random-but-free ephemeral port. We bind via TempoConfig
-        // on 0.0.0.0:0 effectively by using the OS assigned port. TempoConfig
-        // has no port_tx plumbing, so instead we probe a free port first.
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let actual_port = probe.local_addr()?.port();
-        drop(probe);
-
+        // Port 0: the OS assigns a free port and the server reports it back over
+        // `port_tx`. Probing for a port here and handing the number to the server
+        // instead would reopen a race — the probe listener has to close before the
+        // server can bind, and anything on the host can take the port in between.
         let tempo_config = TempoConfig {
             enabled: true,
             host: "127.0.0.1".to_string(),
-            port: actual_port,
+            port: 0,
         };
 
         let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new()).await?;
@@ -111,28 +120,57 @@ impl TestServer {
         let cancel_token_clone = cancel_token.clone();
         let server_engine = Arc::clone(&query_engine);
 
-        let server_handle = tokio::spawn(async move {
-            icegate_query::tempo::run(
+        let (port_tx, port_rx) = oneshot::channel::<u16>();
+
+        let mut server_handle = tokio::spawn(async move {
+            icegate_query::tempo::run_with_port_tx(
                 server_engine,
                 tempo_config,
                 cancel_token_clone,
+                Some(port_tx),
                 icegate_common::MemoryPressure::inert(),
             )
             .await
             .unwrap();
         });
 
-        // Wait for the server to be reachable.
+        // Drain the task on either failure before unwinding: `warehouse_path` drops
+        // with this frame, so a detached server would go on serving from a deleted
+        // directory. `drain_server_task` resumes the task's own panic when it has
+        // one, which is the only place the real startup error survives.
+        let actual_port = match tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx).await {
+            Ok(Ok(port)) => port,
+            Ok(Err(_recv_err)) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Tempo").await;
+                panic!("Tempo server dropped the port channel before reporting a bound port");
+            }
+            Err(_elapsed) => {
+                cancel_token.cancel();
+                drain_server_task(&mut server_handle, "Tempo").await;
+                panic!("Timed out waiting for Tempo server to bind");
+            }
+        };
+
+        // A bound port is not a serving router, so confirm readiness before
+        // handing the harness back. Failing here rather than pressing on turns a
+        // dead server into a clear message instead of an opaque connection error
+        // from whichever request the test happens to send first.
         let client = Client::new();
         let base_url = format!("http://127.0.0.1:{actual_port}");
-        for _ in 0..50 {
+        let mut is_ready = false;
+        for _ in 0..READY_ATTEMPTS {
             if client.get(format!("{base_url}/ready")).send().await.is_ok() {
+                is_ready = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
-
-        Box::leak(Box::new(warehouse_path));
+        if !is_ready {
+            cancel_token.cancel();
+            drain_server_task(&mut server_handle, "Tempo").await;
+            return Err(format!("Tempo server at {base_url} never became ready").into());
+        }
 
         Ok((
             Self {
@@ -140,15 +178,23 @@ impl TestServer {
                 base_url,
                 cancel_token,
                 server_handle,
+                temp_dir: warehouse_path,
             },
             catalog,
         ))
     }
 
-    /// Shut the server down and wait briefly for the task to exit.
-    pub async fn shutdown(self) {
+    /// Shut the server down, draining the spawn task.
+    ///
+    /// Surfaces a panic from the server task and fails on timeout rather
+    /// than swallowing both, so a crashing or hung server can't silently
+    /// pass the test (and leak the background task).
+    pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.server_handle).await;
+        match drain_server_task(&mut self.server_handle, "Tempo").await {
+            DrainOutcome::Finished => {}
+            DrainOutcome::Aborted => panic!("Tempo server did not shut down within {}s", SHUTDOWN_TIMEOUT.as_secs()),
+        }
     }
 }
 
@@ -181,7 +227,94 @@ pub async fn write_test_spans_with_properties(
     tenant_id: &str,
     writer_properties: WriterProperties,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let span_attribute_rows = default_span_attribute_rows();
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        writer_properties,
+        &span_attribute_rows,
+        &[&[], &[], &[]],
+    )
+    .await
+}
+
+/// Like [`write_test_spans`] but sets each row's `scope_attributes` (`OTel`
+/// `InstrumentationScope.attributes`) to the given per-row key/value pairs
+/// instead of leaving them empty. `scope_attribute_rows` must have exactly
+/// three entries, one per row of the fixed fixture — see
+/// [`write_spans_fixture`]. Every other column matches [`write_test_spans`].
+pub async fn write_test_spans_with_scope_attributes(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let span_attribute_rows = default_span_attribute_rows();
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        WriterProperties::builder().build(),
+        &span_attribute_rows,
+        scope_attribute_rows,
+    )
+    .await
+}
+
+/// Like [`write_test_spans`] but sets both span- and scope-level attribute
+/// maps from caller-supplied rows. Each slice must contain exactly three rows.
+pub async fn write_test_spans_with_span_and_scope_attributes(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    span_attribute_rows: &[&[(&str, &str)]],
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        WriterProperties::builder().build(),
+        span_attribute_rows,
+        scope_attribute_rows,
+    )
+    .await
+}
+
+const fn default_span_attribute_rows() -> [&'static [(&'static str, &'static str)]; 3] {
+    [
+        &[("http.method", "GET"), ("http.url", "/api/health")],
+        &[("http.method", "GET"), ("http.url", "/api/users")],
+        &[("db.statement", "SELECT * FROM users")],
+    ]
+}
+
+/// Shared row-assembly core for [`write_test_spans_with_properties`] and
+/// [`write_test_spans_with_scope_attributes`] — writes the fixed
+/// three-span fixture (frontend/frontend/backend) every Tempo test in this
+/// crate builds on. The writer properties and per-row span/scope attributes
+/// vary between callers; everything else is fixed.
+async fn write_spans_fixture(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    writer_properties: WriterProperties,
+    span_attribute_rows: &[&[(&str, &str)]],
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    assert_eq!(
+        span_attribute_rows.len(),
+        3,
+        "span_attribute_rows must contain exactly three rows"
+    );
+    assert_eq!(
+        scope_attribute_rows.len(),
+        3,
+        "scope_attribute_rows must contain exactly three rows"
+    );
 
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
@@ -272,15 +405,12 @@ pub async fn write_test_spans_with_properties(
         ],
     )?;
     // Build span_attributes map (OTel Span attrs — e.g. http.method, db.statement).
-    let span_attributes = build_attribute_map(
-        &arrow_schema,
-        col_idx("span_attributes"),
-        &[
-            &[("http.method", "GET"), ("http.url", "/api/health")],
-            &[("http.method", "GET"), ("http.url", "/api/users")],
-            &[("db.statement", "SELECT * FROM users")],
-        ],
-    )?;
+    let span_attributes = build_attribute_map(&arrow_schema, col_idx(COL_SPAN_ATTRIBUTES), span_attribute_rows)?;
+    // Build scope_attributes map (OTel InstrumentationScope.attributes).
+    // Content is caller-supplied — empty by default via
+    // `write_test_spans`/`write_test_spans_with_properties`, populated by
+    // `write_test_spans_with_scope_attributes`.
+    let scope_attributes = build_attribute_map(&arrow_schema, col_idx(COL_SCOPE_ATTRIBUTES), scope_attribute_rows)?;
 
     let flags: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(0)]));
     let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(0)]));
@@ -310,6 +440,7 @@ pub async fn write_test_spans_with_properties(
     by_name.insert("status_message", status_message);
     by_name.insert("resource_attributes", resource_attributes);
     by_name.insert("span_attributes", span_attributes);
+    by_name.insert(COL_SCOPE_ATTRIBUTES, scope_attributes);
     by_name.insert("flags", flags);
     by_name.insert("dropped_attributes_count", dropped_attributes_count);
     by_name.insert("dropped_events_count", dropped_events_count);
@@ -365,8 +496,8 @@ fn empty_list_array_for_field(field: &Field, length: usize) -> ArrayRef {
 }
 
 /// Build a `MapArray` for an iceberg `MAP<STRING,STRING>` column given
-/// per-row key/value pairs. Used for the post-split `resource_attributes`
-/// and `span_attributes` columns.
+/// per-row key/value pairs. Used for the per-OTLP-level `resource_attributes`,
+/// `scope_attributes`, and `span_attributes` columns.
 fn build_attribute_map(
     arrow_schema: &datafusion::arrow::datatypes::Schema,
     col_index: usize,

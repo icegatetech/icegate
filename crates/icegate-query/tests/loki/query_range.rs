@@ -1,7 +1,5 @@
 //! Tests for basic `query_range` and explain endpoints
 #![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
     clippy::print_stdout,
     clippy::uninlined_format_args,
     clippy::cast_possible_truncation
