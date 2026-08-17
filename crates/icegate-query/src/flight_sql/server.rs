@@ -107,11 +107,12 @@ pub async fn run_with_port_tx(
     let query_deadline = Duration::from_secs(query_deadline_secs);
 
     tonic::transport::Server::builder()
-        // The pair covers both halves of a Flight SQL call: `timeout` bounds the
-        // response future (planning, and every unary RPC), the layer bounds the
-        // body that `DoGet` streams afterwards. Either alone leaves the other
-        // half unbounded.
-        .timeout(query_deadline)
+        // The layer covers both halves of a call — the response phase (planning,
+        // and every unary RPC) and the stream — out of ONE budget, and answers
+        // both with the same gRPC status. Deliberately no `Server::timeout`
+        // alongside it: a second bound on the response phase would answer that
+        // half with a status of its own, so the setting behind the deadline
+        // would report differently depending on which half was running.
         .layer(ResponseDeadlineLayer::new(query_deadline))
         .add_service(intercepted)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
@@ -122,4 +123,104 @@ pub async fn run_with_port_tx(
 
     tracing::info!("Flight SQL server stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_flight::error::FlightError;
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
+    use tonic::transport::Endpoint;
+
+    use super::*;
+    use crate::test_support::build_stalling_engine;
+
+    /// Query deadline the test server runs with: the narrowest the engine config
+    /// accepts, so the call ends in a second rather than in the default 30.
+    const DEADLINE_SECS: u64 = 1;
+
+    /// Outer bound on the RPC, an order of magnitude above the server's own
+    /// deadline. It exists so a layer that stops answering fails the test
+    /// instead of hanging the suite until CI kills the job.
+    const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// The query deadline over the RESPONSE phase, at the real gRPC boundary.
+    /// The catalog behind the engine never answers, so `GetFlightInfo` can only
+    /// end at the deadline — and it has to end with the status the layer
+    /// defines, the same one a cut stream carries, rather than whatever a
+    /// transport-level bound would report.
+    #[tokio::test]
+    async fn a_planning_phase_outliving_the_deadline_fails_with_deadline_exceeded() {
+        let cancel_token = CancellationToken::new();
+        let (port_tx, port_rx) = oneshot::channel();
+        let server_token = cancel_token.clone();
+        let mut server = tokio::spawn(async move {
+            run_with_port_tx(
+                build_stalling_engine(DEADLINE_SECS),
+                FlightSqlConfig {
+                    enabled: true,
+                    host: "127.0.0.1".to_string(),
+                    port: 0,
+                    max_message_size: 16 * 1024 * 1024,
+                },
+                server_token,
+                Some(port_tx),
+                MemoryPressure::inert(),
+            )
+            .await
+            .expect("the Flight SQL server runs until it is cancelled");
+        });
+
+        // Carried out as a value rather than asserted here: an unwind before the
+        // drain below would leave the server task and its listener running for
+        // the rest of the test binary.
+        let outcome = plan_one_query(port_rx).await;
+
+        cancel_token.cancel();
+        assert_eq!(
+            drain_server_task(&mut server, "Flight SQL").await,
+            DrainOutcome::Finished,
+            "the server must stop within {}s of the cancel",
+            SHUTDOWN_TIMEOUT.as_secs()
+        );
+
+        let status = outcome.unwrap_or_else(|failure| panic!("{failure}"));
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    }
+
+    /// Plan one query against the server that reports its port on `port_rx`, and
+    /// return the gRPC status the call fails with.
+    ///
+    /// Every failure is returned rather than asserted, so the caller can drain
+    /// the server before failing the test. Both waits are bounded: the bind by
+    /// [`PORT_BIND_TIMEOUT`], the call by [`RPC_TIMEOUT`].
+    async fn plan_one_query(port_rx: oneshot::Receiver<u16>) -> Result<tonic::Status, String> {
+        let port = tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx)
+            .await
+            .map_err(|_elapsed| format!("the server did not bind within {}s", PORT_BIND_TIMEOUT.as_secs()))?
+            .map_err(|_recv_error| "the server dropped the port channel before reporting a bound port".to_string())?;
+        let channel = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .map_err(|error| format!("the bound port must form a valid endpoint URI: {error}"))?
+            .connect()
+            .await
+            .map_err(|error| format!("the server must accept connections: {error}"))?;
+
+        let planned = tokio::time::timeout(
+            RPC_TIMEOUT,
+            FlightSqlServiceClient::new(channel).execute("SELECT * FROM iceberg.icegate.logs".to_string(), None),
+        )
+        .await
+        .map_err(|_elapsed| {
+            format!(
+                "the deadline must end planning well before the test's own {}s bound",
+                RPC_TIMEOUT.as_secs()
+            )
+        })?;
+
+        match planned {
+            Ok(_info) => Err("planning past the deadline must not return flight info".to_string()),
+            Err(FlightError::Tonic(status)) => Ok(*status),
+            Err(other) => Err(format!("the deadline must arrive as a gRPC status, got: {other}")),
+        }
+    }
 }

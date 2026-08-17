@@ -159,74 +159,13 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // Distinct from `metrics_cancel`, which must outlive the worker drain so
     // `/metrics` keeps serving until the very end.
     let cancel_token = CancellationToken::new();
-    // Maintenance reads table data through the catalog and never through the
-    // foyer cache, so the handle carries no cache — only the storage backend
-    // the GC sweep addresses, and the operator registries built from it.
-    let io = IoHandle::from_config(None, Some(&config.storage.backend)).await?;
-    let catalog = CatalogBuilder::from_config(&config.catalog, &io, cancel_token.clone()).await?;
-    let compactor = Compactor::new(Arc::clone(&catalog), &config.compaction).await?;
-    let mut services = MaintenanceServices {
-        compactor: Some(compactor.start()?),
-        ..MaintenanceServices::default()
+    let mut services = MaintenanceServices::default();
+    let io = match start_services(&mut services, &config, &cancel_token).await {
+        Ok(io) => io,
+        Err(error) => {
+            return Err(abort_startup(error, &cancel_token, services, &metrics_cancel, metrics_server).await);
+        }
     };
-    tracing::info!("compaction maintenance service started");
-
-    // Start the orphan-file sweep when enabled. Each runner is dropped after
-    // `start()`; the returned handle owns the workers.
-    if config.gc.enabled {
-        let spec = GcRunnerSpec {
-            operator_registry: io.object_store_operator_registry(),
-            config: config.gc.clone(),
-        };
-        match GcRunner::new(Arc::clone(&catalog), spec)
-            .await
-            .and_then(|runner| runner.start())
-        {
-            Ok(handle) => {
-                services.gc = Some(handle);
-                tracing::info!("orphan-file gc service started");
-            }
-            Err(error) => {
-                return Err(abort_startup(error, &cancel_token, services, &metrics_cancel, metrics_server).await);
-            }
-        }
-    }
-
-    // WAL cleanup runs on a pool of its own, so a sweep holding a worker cannot
-    // stand between two cleanup cycles.
-    if config.wal_cleanup.enabled {
-        let started = match build_wal_cleaner(&io, &config) {
-            Ok(cleaner) => WalCleanupRunner::new(Arc::clone(&catalog), cleaner, config.wal_cleanup.clone())
-                .await
-                .and_then(|runner| runner.start()),
-            Err(error) => Err(error),
-        };
-        match started {
-            Ok(handle) => {
-                services.wal_cleanup = Some(handle);
-                tracing::info!("wal cleanup service started");
-            }
-            Err(error) => {
-                return Err(abort_startup(error, &cancel_token, services, &metrics_cancel, metrics_server).await);
-            }
-        }
-    }
-
-    // Start the pricing crawler alongside the others when enabled.
-    if config.pricing.enabled {
-        match PricingRunner::new(Arc::clone(&catalog), &config.pricing)
-            .await
-            .and_then(|runner| runner.start())
-        {
-            Ok(handle) => {
-                services.pricing = Some(handle);
-                tracing::info!("pricing crawler service started");
-            }
-            Err(error) => {
-                return Err(abort_startup(error, &cancel_token, services, &metrics_cancel, metrics_server).await);
-            }
-        }
-    }
 
     // Wait for shutdown, but watch the metrics server task at the same time: it
     // only resolves before a shutdown signal if it failed to start (e.g. its port
@@ -253,6 +192,12 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
             Err(join_err) => tracing::error!("metrics server task failed to join: {join_err}"),
         }
     }
+    // Closed once nothing reads through it any more — the pools have drained and
+    // the metrics server has unbound — as [`IoHandle::close`] requires. This is
+    // the ordinary stop; a startup failure never reaches here and drops the
+    // handle instead, which is safe only while maintain configures no cache (see
+    // [`start_services`]).
+    io.close().await;
     drop(metrics_runtime);
 
     // Surface a worker-drain failure first, then any deferred metrics startup
@@ -263,6 +208,72 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
         return Err(err);
     }
     Ok(())
+}
+
+/// Bring up the IO handle, the catalog, and every enabled worker pool, in start
+/// order.
+///
+/// Each pool that starts is recorded in `services` before the next one is built,
+/// so a failure part-way through leaves the caller holding exactly what is
+/// running. Every step leaves through one `?`: that is what makes
+/// [`abort_startup`] the single unwind path it claims to be — a step wired past
+/// it would leak the pools already started and the metrics task.
+///
+/// Returns the [`IoHandle`] the catalog and the sweeps were built from; the
+/// caller owns it for the lifetime of the service and closes it after the drain.
+/// A failure part-way through returns no handle: the one built here is dropped
+/// unclosed, which stays safe only because the handle carries no cache — give
+/// maintain one, and it has to be created by the caller so both exits can close
+/// it.
+///
+/// # Errors
+///
+/// Returns [`MaintainError`] if the storage backend or the catalog cannot be
+/// built, or if any of the four services fails to start.
+async fn start_services(
+    services: &mut MaintenanceServices,
+    config: &MaintainConfig,
+    cancel_token: &CancellationToken,
+) -> Result<IoHandle, MaintainError> {
+    // Maintenance reads table data through the catalog and never through the
+    // foyer cache, so the handle carries no cache — only the storage backend
+    // the GC sweep addresses, and the operator registries built from it.
+    let io = IoHandle::from_config(None, Some(&config.storage.backend)).await?;
+    let catalog = CatalogBuilder::from_config(&config.catalog, &io, cancel_token.clone()).await?;
+    let compactor = Compactor::new(Arc::clone(&catalog), &config.compaction).await?;
+    services.compactor = Some(compactor.start()?);
+    tracing::info!("compaction maintenance service started");
+
+    // Start the orphan-file sweep when enabled. Each runner is dropped after
+    // `start()`; the returned handle owns the workers.
+    if config.gc.enabled {
+        let spec = GcRunnerSpec {
+            operator_registry: io.object_store_operator_registry(),
+            config: config.gc.clone(),
+        };
+        services.gc = Some(GcRunner::new(Arc::clone(&catalog), spec).await?.start()?);
+        tracing::info!("orphan-file gc service started");
+    }
+
+    // WAL cleanup runs on a pool of its own, so a sweep holding a worker cannot
+    // stand between two cleanup cycles.
+    if config.wal_cleanup.enabled {
+        let cleaner = build_wal_cleaner(&io, config)?;
+        services.wal_cleanup = Some(
+            WalCleanupRunner::new(Arc::clone(&catalog), cleaner, config.wal_cleanup.clone())
+                .await?
+                .start()?,
+        );
+        tracing::info!("wal cleanup service started");
+    }
+
+    // Start the pricing crawler alongside the others when enabled.
+    if config.pricing.enabled {
+        services.pricing = Some(PricingRunner::new(Arc::clone(&catalog), &config.pricing).await?.start()?);
+        tracing::info!("pricing crawler service started");
+    }
+
+    Ok(io)
 }
 
 /// Build the cleaner addressing the WAL queue.

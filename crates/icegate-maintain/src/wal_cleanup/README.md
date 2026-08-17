@@ -76,8 +76,10 @@ committed offset, so only a stale query can ever read across it.
 ## What cleanup is not
 
 - **Not part of the snapshot/orphan retention ordering.** That ordering ties three windows in
-  time together (see the crate [README](../../README.md)); this bound is in segments and depends
-  on no other component's window.
+  time together and the chart checks it at render time (see the crate
+  [README](../../README.md)); this bound is a count of segments, so there is nothing there to
+  order it against. It is NOT independent of the query window all the same — sizing the count
+  against that window is [above](#sizing-keep_segments_count).
 - **Not a defence for an arbitrarily old reader.** The count buys a bounded window, not history.
   A reader older than it gets an error, not partial rows.
 - **Not a job for every table.** `events` is an Iceberg table with no WAL topic of its own, so it

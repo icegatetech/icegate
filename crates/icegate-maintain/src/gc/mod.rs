@@ -42,7 +42,7 @@ use crate::gc::sweep::run_sweep;
 pub const GC_TASK_CODE: &str = "gc";
 
 /// Static identity of one table's GC job.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct GcTableSpec {
     /// Stable job name used in the registry and logs (e.g. `gc_logs`).
     job_name: &'static str,
@@ -50,11 +50,8 @@ struct GcTableSpec {
     table: &'static str,
 }
 
-/// Build the per-table specs for the enabled tables.
+/// Build the per-table specs for the tables GC is enabled for.
 fn enabled_gc_tables(config: &GcConfig) -> Vec<GcTableSpec> {
-    if !config.enabled {
-        return Vec::new();
-    }
     let mut specs = Vec::new();
     if config.logs_enabled {
         specs.push(GcTableSpec {
@@ -87,6 +84,33 @@ fn enabled_gc_tables(config: &GcConfig) -> Vec<GcTableSpec> {
         });
     }
     specs
+}
+
+/// Resolve the jobs to register, naming the switch that left the set empty.
+///
+/// Two different settings produce no job — the master switch and the per-table
+/// flags — and an operator can only act on the one that is actually theirs, so
+/// the refusals are kept apart and each names its own config key.
+///
+/// # Errors
+///
+/// Returns [`MaintainError::Config`] when `gc.enabled` is off, and when it is on
+/// with no table enabled.
+fn resolve_gc_jobs(config: &GcConfig) -> Result<Vec<GcTableSpec>> {
+    if !config.enabled {
+        return Err(MaintainError::Config(
+            "gc is disabled: set gc.enabled to run the orphan sweep".to_string(),
+        ));
+    }
+    let specs = enabled_gc_tables(config);
+    if specs.is_empty() {
+        return Err(MaintainError::Config(
+            "gc is enabled but no table is: enable at least one of \
+             gc.{logs,spans,events,metrics,operations}_enabled"
+                .to_string(),
+        ));
+    }
+    Ok(specs)
 }
 
 /// Per-table GC task executor.
@@ -169,8 +193,9 @@ impl GcRunner {
     ///
     /// # Errors
     ///
-    /// Returns [`MaintainError`] if the config block is invalid, no table is
-    /// enabled, or the jobmanager storage cannot be constructed.
+    /// Returns [`MaintainError`] if the config block is invalid, `gc.enabled` is
+    /// off, no table is enabled, or the jobmanager storage cannot be
+    /// constructed.
     pub async fn new(catalog: Arc<dyn Catalog>, spec: GcRunnerSpec) -> Result<Self> {
         Self::new_with_max_iterations(catalog, spec, None).await
     }
@@ -192,14 +217,7 @@ impl GcRunner {
             config,
         } = spec;
         config.validate()?;
-        let specs = enabled_gc_tables(&config);
-        if specs.is_empty() {
-            return Err(MaintainError::Config(
-                "no gc jobs enabled: enable gc for at least one of \
-                 logs/spans/events/metrics/operations"
-                    .to_string(),
-            ));
-        }
+        let specs = resolve_gc_jobs(&config)?;
 
         let interval = Duration::from_secs(config.jobsmanager.scan_interval_secs);
         let timeout = Duration::from_secs(config.orphans.sweep_timeout_secs);
@@ -269,14 +287,46 @@ fn map_job_error<E: std::fmt::Display>(error: E) -> MaintainError {
 
 #[cfg(test)]
 mod tests {
-    use super::enabled_gc_tables;
+    use super::{enabled_gc_tables, resolve_gc_jobs};
     use crate::gc::config::GcConfig;
 
     /// The master switch is honoured where the jobs are built, so a disabled
-    /// block registers no sweep at all rather than five no-op tasks.
+    /// block registers no sweep at all rather than five no-op tasks — and the
+    /// refusal has to name `gc.enabled`, because that key is what the operator
+    /// sets in the chart and in Compose, and a message pointing at the per-table
+    /// flags sends them to a setting that is already on.
     #[test]
-    fn a_disabled_block_registers_no_sweep_job() {
-        assert!(enabled_gc_tables(&GcConfig::default()).is_empty());
+    fn a_disabled_block_is_refused_by_the_name_of_the_master_switch() {
+        let error = resolve_gc_jobs(&GcConfig::default()).expect_err("a disabled block registers no sweep");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("gc.enabled"),
+            "the master switch is not named: {message}"
+        );
+    }
+
+    /// The other empty set, which the same message used to cover: the block is
+    /// on and every table is off, so the per-table keys are the ones to name.
+    #[test]
+    fn an_enabled_block_without_tables_is_refused_by_the_per_table_keys() {
+        let config = GcConfig {
+            enabled: true,
+            logs_enabled: false,
+            spans_enabled: false,
+            events_enabled: false,
+            metrics_enabled: false,
+            operations_enabled: false,
+            ..GcConfig::default()
+        };
+
+        let error = resolve_gc_jobs(&config).expect_err("an empty table set registers no sweep");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("gc.{logs,spans,events,metrics,operations}_enabled"),
+            "the per-table keys are not named: {message}"
+        );
     }
 
     /// All five tables, and only the enabled ones.

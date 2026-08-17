@@ -6,8 +6,9 @@
 //! is real — tonic transport, Flight SQL client, an actual long-running plan.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::uninlined_format_args)]
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use arrow_flight::error::FlightError;
 use icegate_query::engine::QueryEngineConfig;
 
 use super::harness::{TestServer, execute_sql};
@@ -30,7 +31,6 @@ async fn a_query_outliving_the_deadline_fails_the_stream() -> Result<(), Box<dyn
     let (server, _catalog) = TestServer::start_with_engine_config(engine_config).await?;
     let mut client = server.client(Some("default"));
 
-    let started = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         execute_sql(
@@ -42,10 +42,18 @@ async fn a_query_outliving_the_deadline_fails_the_stream() -> Result<(), Box<dyn
     .expect("the deadline must end the query well before the test's own timeout");
 
     let error = result.expect_err("a query past its deadline must not return rows");
-    assert!(
-        started.elapsed() < Duration::from_secs(30),
-        "the stream ended at the deadline, not by exhausting the plan: {error}"
-    );
+    // The deadline is the ONLY outcome this test accepts: a dropped connection,
+    // a planning failure, or a shed request all end the stream with an error
+    // too, and any of them would pass a check that merely says "it failed".
+    // Which half of the call the deadline lands in does not matter — both answer
+    // with this status (`icegate_query::infra::deadline`).
+    let Some(flight_error) = error.downcast_ref::<FlightError>() else {
+        panic!("the stream must fail with a Flight error, got: {error}");
+    };
+    let FlightError::Tonic(status) = flight_error else {
+        panic!("the deadline must arrive as a gRPC status, got: {flight_error}");
+    };
+    assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
 
     server.shutdown().await;
     Ok(())

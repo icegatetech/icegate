@@ -86,6 +86,23 @@ pub(crate) fn topic_prefix(base_path: &str, topic: &Topic) -> Path {
 /// digits precede letters — so a `.parquet` suffix check alone would let one
 /// answer for the segments. Every listing-driven path (recovery, cleanup,
 /// reading) therefore parses the key and skips what does not parse.
+///
+/// Only the SHAPE of the name is checked: a key nested deeper under the topic
+/// prefix still parses, because the topic the key carries is not compared with
+/// the one being listed — see the `TODO` below for what that costs each caller.
+// TODO(med): check the topic, not only the shape of the name. The parse accepts
+// any key whose last component is a zero-padded `.parquet` file and reports its
+// offset, while [`SegmentId::from_relative_path`] takes everything before that
+// component as the topic and nobody compares it with the topic that was asked
+// for. So `<base>/logs/archive/00000000000000000009.parquet` is read as offset 9
+// of topic `logs` on every path that lists a topic prefix: `exists_above` and
+// `find_existing_segment_offset` in [`crate::writer`] (recovery resumes above a
+// key that is not a segment of this topic), `collect_deletable_segments` in
+// [`crate::cleaner`] (a foreign nested object is DELETED as a segment), and
+// `list_segments` in [`crate::reader`], which parses the key inline instead of
+// coming through here. The fix is to take the expected topic as an argument and
+// drop a key whose parsed topic differs, moving the reader onto this helper in
+// the same pass so the rule holds in one place.
 pub(crate) fn parse_segment_offset(base_path: &str, location: &Path) -> Option<u64> {
     let location_str = location.as_ref();
     if !location_str.ends_with(".parquet") {

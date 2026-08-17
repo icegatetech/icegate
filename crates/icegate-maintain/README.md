@@ -57,11 +57,12 @@ provider can be cached before the sweep may take it. Violate either and a query
 plans against a file the sweep has already deleted: a scan error, not wrong
 results.
 
-WAL cleanup is deliberately not part of this ordering. Its bound is
-`committed - maintain.wal_cleanup.keep_segments_count`, in segments, so it depends on no
-other component's window — see [`wal_cleanup/README.md`](src/wal_cleanup/README.md) for the
-reader it has to stay behind and why the count, not a clock, is what holds it
-there.
+WAL cleanup is deliberately not part of this ordering: its bound is
+`committed - maintain.wal_cleanup.keep_segments_count`, a count of segments rather than a
+window in time, so there is nothing for the chart to order it against. How that count is
+sized, what it has to cover, and the floor enforced while cleanup is enabled are in
+[`wal_cleanup/README.md`](src/wal_cleanup/README.md), which also says which reader cleanup
+has to stay behind and why the count, not a clock, is what holds it there.
 
 Who enforces what:
 

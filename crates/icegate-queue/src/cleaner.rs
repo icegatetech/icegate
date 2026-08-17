@@ -104,6 +104,10 @@ pub struct DeleteLimits {
     /// further candidate past it ends with [`DeleteSummary::truncated`] set and
     /// leaves the rest for the next one; a call whose candidates merely fill it
     /// exactly is complete, not truncated.
+    ///
+    /// Zero is rejected rather than honoured: it is a budget under which no
+    /// schedule ever reclaims a segment, and every cycle would report the topic
+    /// as truncated — see [`QueueCleaner::delete_segments_upto`].
     pub max_deletes: usize,
     /// Maximum number of deletions in flight at once.
     pub concurrency: usize,
@@ -205,7 +209,8 @@ impl QueueCleaner {
     ///
     /// # Errors
     ///
-    /// Returns [`QueueError::ObjectStore`] if the listing fails and
+    /// Returns [`QueueError::Config`] if [`DeleteLimits::max_deletes`] is zero,
+    /// [`QueueError::ObjectStore`] if the listing fails and
     /// [`QueueError::Cancelled`] if `cancel` fires. Individual delete failures
     /// are reported in [`DeleteSummary::failed`], not propagated.
     pub async fn delete_segments_upto(
@@ -215,6 +220,17 @@ impl QueueCleaner {
         limits: &DeleteLimits,
         cancel: &CancellationToken,
     ) -> Result<DeleteSummary> {
+        // A zero budget is not a cycle that reclaims nothing: the scan stops on
+        // the first candidate, so the call reports the topic as truncated while
+        // deleting nothing, and a schedule repeating it never makes progress.
+        // Refused before the listing, so it costs no request either.
+        if limits.max_deletes == 0 {
+            return Err(QueueError::Config(
+                "max_deletes must be greater than zero: a zero budget deletes no segment and reports \
+                 every cycle as truncated"
+                    .to_string(),
+            ));
+        }
         let mut summary = DeleteSummary::default();
         let SegmentScan {
             mut candidates,
@@ -1012,6 +1028,31 @@ mod tests {
                 "concurrency {concurrency}"
             );
         }
+    }
+
+    /// A budget of zero deletes nothing however often the cycle repeats, so it
+    /// is refused instead of reported as a truncated cycle — and refused before
+    /// the listing, which is what the request count here pins down.
+    #[tokio::test]
+    async fn a_zero_delete_budget_is_refused_before_the_listing() {
+        let inner = Arc::new(InMemory::new());
+        seed_segments(&inner, TOPIC, 0..3).await;
+        let counts = Arc::new(RequestCounts::default());
+        let store = Arc::new(RequestCountingStore {
+            inner: Arc::clone(&inner),
+            counts: Arc::clone(&counts),
+        });
+        let cleaner = QueueCleaner::new(BASE_PATH, Arc::clone(&store) as _);
+
+        let error = cleaner
+            .delete_segments_upto(&TOPIC.to_string(), 2, &limits(0, 4, false), &CancellationToken::new())
+            .await
+            .expect_err("a zero budget must not report a cycle");
+
+        assert!(matches!(error, QueueError::Config(_)));
+        assert_eq!(counts.lists.load(Ordering::Relaxed), 0, "the prefix is never listed");
+        assert_eq!(counts.deletes.load(Ordering::Relaxed), 0);
+        assert_eq!(surviving_offsets(&inner, TOPIC).await, vec![0, 1, 2]);
     }
 
     /// A segment that vanished between the listing and the delete — a manual
