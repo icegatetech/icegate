@@ -169,8 +169,6 @@ STRING
     | '"' (~('"' | '\\') | '\\' .)* '"'
     | '`' (~('`'  | '\\') | '\\' .)* '`';
 
-PREFIX: ('resource:'|'log:'|'scope:');
-
 // Functions - must come before ATTRIBUTE to have precedence
 IP : 'ip' ;
 

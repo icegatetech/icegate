@@ -59,7 +59,7 @@ icegate-queue = { path = "crates/icegate-queue" }
 # `metrics-otel` is the crate's `MetricsSink` implementation over OpenTelemetry. A cargo
 # feature is workspace-wide, so it is enabled once here; which pool actually records is
 # decided per pool by whether it is given a sink (`JobsManagerBuilder::metrics`).
-jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "e280a2c937c4a6850608f587adb7f10aa8923258", features = ["metrics-otel"] }
+jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "474beecc44931b2a487883df7bdaf0bf9831c395", features = ["metrics-otel"] }
 
 # Arrow ecosystem (must match iceberg's version)
 arrow = { version = "58.4", default-features = false, features = ["prettyprint"] }

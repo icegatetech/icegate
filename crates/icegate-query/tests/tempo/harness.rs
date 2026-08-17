@@ -34,9 +34,11 @@ use iceberg::{
         },
     },
 };
-use icegate_common::testing::server_task::{DrainOutcome, SHUTDOWN_TIMEOUT, drain_server_task};
+use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE, catalog::CatalogBuilder, schema,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE,
+    catalog::CatalogBuilder,
+    schema::{self, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES},
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
@@ -50,9 +52,6 @@ use tokio_util::sync::CancellationToken;
 /// sanitizer builds run this same harness at a fraction of normal speed.
 const READY_ATTEMPTS: u32 = 50;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// How long to wait for the server to report the port it bound.
-const PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Test server running a Tempo HTTP API on an ephemeral port.
 pub struct TestServer {
@@ -139,7 +138,7 @@ impl TestServer {
         // with this frame, so a detached server would go on serving from a deleted
         // directory. `drain_server_task` resumes the task's own panic when it has
         // one, which is the only place the real startup error survives.
-        let actual_port = match tokio::time::timeout(PORT_TIMEOUT, port_rx).await {
+        let actual_port = match tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx).await {
             Ok(Ok(port)) => port,
             Ok(Err(_recv_err)) => {
                 cancel_token.cancel();
@@ -228,7 +227,94 @@ pub async fn write_test_spans_with_properties(
     tenant_id: &str,
     writer_properties: WriterProperties,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let span_attribute_rows = default_span_attribute_rows();
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        writer_properties,
+        &span_attribute_rows,
+        &[&[], &[], &[]],
+    )
+    .await
+}
+
+/// Like [`write_test_spans`] but sets each row's `scope_attributes` (`OTel`
+/// `InstrumentationScope.attributes`) to the given per-row key/value pairs
+/// instead of leaving them empty. `scope_attribute_rows` must have exactly
+/// three entries, one per row of the fixed fixture — see
+/// [`write_spans_fixture`]. Every other column matches [`write_test_spans`].
+pub async fn write_test_spans_with_scope_attributes(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let span_attribute_rows = default_span_attribute_rows();
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        WriterProperties::builder().build(),
+        &span_attribute_rows,
+        scope_attribute_rows,
+    )
+    .await
+}
+
+/// Like [`write_test_spans`] but sets both span- and scope-level attribute
+/// maps from caller-supplied rows. Each slice must contain exactly three rows.
+pub async fn write_test_spans_with_span_and_scope_attributes(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    span_attribute_rows: &[&[(&str, &str)]],
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_spans_fixture(
+        table,
+        catalog,
+        tenant_id,
+        WriterProperties::builder().build(),
+        span_attribute_rows,
+        scope_attribute_rows,
+    )
+    .await
+}
+
+const fn default_span_attribute_rows() -> [&'static [(&'static str, &'static str)]; 3] {
+    [
+        &[("http.method", "GET"), ("http.url", "/api/health")],
+        &[("http.method", "GET"), ("http.url", "/api/users")],
+        &[("db.statement", "SELECT * FROM users")],
+    ]
+}
+
+/// Shared row-assembly core for [`write_test_spans_with_properties`] and
+/// [`write_test_spans_with_scope_attributes`] — writes the fixed
+/// three-span fixture (frontend/frontend/backend) every Tempo test in this
+/// crate builds on. The writer properties and per-row span/scope attributes
+/// vary between callers; everything else is fixed.
+async fn write_spans_fixture(
+    table: &Table,
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+    writer_properties: WriterProperties,
+    span_attribute_rows: &[&[(&str, &str)]],
+    scope_attribute_rows: &[&[(&str, &str)]],
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    assert_eq!(
+        span_attribute_rows.len(),
+        3,
+        "span_attribute_rows must contain exactly three rows"
+    );
+    assert_eq!(
+        scope_attribute_rows.len(),
+        3,
+        "scope_attribute_rows must contain exactly three rows"
+    );
 
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
@@ -319,15 +405,12 @@ pub async fn write_test_spans_with_properties(
         ],
     )?;
     // Build span_attributes map (OTel Span attrs — e.g. http.method, db.statement).
-    let span_attributes = build_attribute_map(
-        &arrow_schema,
-        col_idx("span_attributes"),
-        &[
-            &[("http.method", "GET"), ("http.url", "/api/health")],
-            &[("http.method", "GET"), ("http.url", "/api/users")],
-            &[("db.statement", "SELECT * FROM users")],
-        ],
-    )?;
+    let span_attributes = build_attribute_map(&arrow_schema, col_idx(COL_SPAN_ATTRIBUTES), span_attribute_rows)?;
+    // Build scope_attributes map (OTel InstrumentationScope.attributes).
+    // Content is caller-supplied — empty by default via
+    // `write_test_spans`/`write_test_spans_with_properties`, populated by
+    // `write_test_spans_with_scope_attributes`.
+    let scope_attributes = build_attribute_map(&arrow_schema, col_idx(COL_SCOPE_ATTRIBUTES), scope_attribute_rows)?;
 
     let flags: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(0)]));
     let dropped_attributes_count: ArrayRef = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(0)]));
@@ -357,6 +440,7 @@ pub async fn write_test_spans_with_properties(
     by_name.insert("status_message", status_message);
     by_name.insert("resource_attributes", resource_attributes);
     by_name.insert("span_attributes", span_attributes);
+    by_name.insert(COL_SCOPE_ATTRIBUTES, scope_attributes);
     by_name.insert("flags", flags);
     by_name.insert("dropped_attributes_count", dropped_attributes_count);
     by_name.insert("dropped_events_count", dropped_events_count);
@@ -412,8 +496,8 @@ fn empty_list_array_for_field(field: &Field, length: usize) -> ArrayRef {
 }
 
 /// Build a `MapArray` for an iceberg `MAP<STRING,STRING>` column given
-/// per-row key/value pairs. Used for the post-split `resource_attributes`
-/// and `span_attributes` columns.
+/// per-row key/value pairs. Used for the per-OTLP-level `resource_attributes`,
+/// `scope_attributes`, and `span_attributes` columns.
 fn build_attribute_map(
     arrow_schema: &datafusion::arrow::datatypes::Schema,
     col_index: usize,

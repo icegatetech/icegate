@@ -184,10 +184,13 @@ fn test_selector_operators() {
 }
 
 #[test]
-fn test_selector_with_prefix() {
-    assert_parses(r#"{resource:job="mysql"}"#);
-    assert_parses(r#"{log:level="error"}"#);
-    assert_parses(r#"{scope:name="api"}"#);
+fn test_selector_with_prefix_is_rejected() {
+    // Colons are not legal in Loki label names -- upstream returns HTTP 400 for
+    // a label like `bad:label`. The scoping prefix is gone with them; scope is
+    // reachable through Flight SQL and TraceQL instead.
+    assert_fails(r#"{resource:job="mysql"}"#);
+    assert_fails(r#"{log:level="error"}"#);
+    assert_fails(r#"{scope:name="api"}"#);
 }
 
 // ==================== Line Filter Tests ====================
@@ -520,9 +523,26 @@ fn test_grouping_without() {
 }
 
 #[test]
-fn test_grouping_with_prefix() {
-    assert_parses(r#"sum by (resource:namespace) (rate({job="mysql"}[5m]))"#);
-    assert_parses(r#"avg by (log:level, scope:name) (count_over_time({job="app"}[1m]))"#);
+fn test_grouping_with_prefix_is_rejected() {
+    // Same restriction as label matchers: `groupingLabel` no longer accepts a
+    // scoping prefix, so a colon here is a syntax error, not a literal label.
+    assert_fails(r#"sum by (resource:namespace) (rate({job="mysql"}[5m]))"#);
+    assert_fails(r#"avg by (log:level, scope:name) (count_over_time({job="app"}[1m]))"#);
+}
+
+#[test]
+fn test_underscored_label_names_still_parse() {
+    // Guards against over-deletion: removing PREFIX must not touch the plain
+    // ATTRIBUTE path shared by matchers and grouping labels.
+    assert_parses(r#"{k8s_pod_name="web-1", service_name="api"}"#);
+    assert_parses(r#"sum by (k8s_pod_name) (rate({service_name="api"}[5m]))"#);
+}
+
+#[test]
+fn test_ip_token_is_accepted_as_a_label_name() {
+    assert_parses(r#"{ip="value"}"#);
+    assert_parses(r#"sum by (ip) (rate({ip!="loopback"}[5m]))"#);
+    assert_parses(r#"{job="app"} | ip = ip("192.0.2.0/24")"#);
 }
 
 #[test]

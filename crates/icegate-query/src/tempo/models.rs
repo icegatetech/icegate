@@ -213,7 +213,15 @@ pub struct TagsV1Response {
 /// Grafana's query builder).
 #[derive(Debug, Serialize)]
 pub struct TagsV2Response {
-    /// One group per `TraceQL` scope: `resource`, `span`, `intrinsic`, …
+    /// One group per `TraceQL` scope: `resource`, `span`, `intrinsic`,
+    /// `event`, `link`.
+    ///
+    /// There is deliberately no `scope` group: `TraceQL`/Tempo has no
+    /// instrumentation-scope query scope, so OTLP
+    /// `InstrumentationScope.attributes` are unioned into the `span` group
+    /// (the only prefix that can select them). Advertising a group whose
+    /// prefix cannot select anything would hand clients a guaranteed-empty
+    /// query.
     pub scopes: Vec<ScopeGroup>,
 }
 
@@ -286,6 +294,14 @@ pub enum Scope {
     /// Resource-level attributes (`OTel` `Resource`).
     Resource,
     /// Span-level attributes.
+    ///
+    /// `OTel` `InstrumentationScope.attributes` (physically the
+    /// `scope_attributes` column) fold into this scope too — `TraceQL` /
+    /// Tempo have no instrumentation-scope query scope, so a client can only
+    /// ever address those attributes through `span.` or the unscoped `.`
+    /// form, exactly as if they had been physically written into
+    /// `span_attributes` (which is what ingest did before the OTel-native
+    /// storage split). See the `tempo::metadata` module docs.
     Span,
     /// `TraceQL` intrinsic attributes (name, kind, duration, …).
     Intrinsic,
@@ -331,8 +347,10 @@ impl Scope {
 ///
 /// Grafana sends tag names in `.`-prefixed dotted form:
 /// - `resource.service.name` — resource-scope key `service.name`
-/// - `span.http.method`      — span-scope key `http.method`
-/// - `.service.name`         — span- or resource-scope key `service.name`
+/// - `span.http.method`      — span-scope key `http.method` (also the
+///   address for a key that physically lives in `scope_attributes` — see
+///   [`Scope::Span`])
+/// - `.service.name`         — resource- or span-scope key `service.name`
 ///   (underspecified scope)
 /// - `name`, `duration`, …   — bare `TraceQL` intrinsic
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,8 +358,8 @@ pub enum TagRef<'a> {
     /// Bare `TraceQL` intrinsic (no leading dot, no `resource.`/`span.`
     /// prefix).
     Intrinsic(&'a str),
-    /// Scoped attribute reference: `resource.foo` / `span.foo` / `event.foo`
-    /// / `link.foo`.
+    /// Scoped attribute reference: `resource.foo` / `span.foo` /
+    /// `event.foo` / `link.foo`.
     Scoped {
         /// Scope prefix preceding the dot.
         scope: Scope,
@@ -349,7 +367,9 @@ pub enum TagRef<'a> {
         key: &'a str,
     },
     /// `.foo` form — attribute lookup without an explicit scope. Callers
-    /// usually enumerate both `resource` and `span` maps.
+    /// enumerate the `resource` and `span` maps (`span` already folds in
+    /// `scope_attributes` — see [`Scope::Span`]) — the only simple
+    /// `MAP<String,String>` attribute columns on `spans`.
     UnscopedAttribute(&'a str),
 }
 
@@ -405,6 +425,28 @@ mod tests {
     fn scope_parse_unknown_is_none() {
         assert_eq!(Scope::parse(""), None);
         assert_eq!(Scope::parse("other"), None);
+        // `TraceQL`/Tempo have no instrumentation-scope query scope (the
+        // owner's correction that removed `Scope::Instrumentation`): the
+        // former wire value "scope" is now just another unrecognised
+        // string, so a `?scope=scope` request falls back to "all scopes"
+        // rather than filtering to a group that no longer exists.
+        assert_eq!(Scope::parse("scope"), None);
+    }
+
+    // Pins the exact wire spelling of every remaining scope against
+    // `Scope::parse`. A typo in either `as_str` or `parse` breaks the round
+    // trip.
+    #[test]
+    fn scope_as_str_round_trips_through_parse() {
+        for scope in [
+            Scope::Resource,
+            Scope::Span,
+            Scope::Intrinsic,
+            Scope::Event,
+            Scope::Link,
+        ] {
+            assert_eq!(Scope::parse(scope.as_str()), Some(scope));
+        }
     }
 
     #[test]
@@ -415,6 +457,20 @@ mod tests {
                 scope: Scope::Resource,
                 key: "service.name",
             }
+        );
+    }
+
+    // The owner's correction removed the `scope.` prefix entirely — it is
+    // no longer special-cased in `TagRef::parse`, so a name spelled with
+    // that old prefix now falls through to the catch-all `Intrinsic` arm
+    // (the same outcome as any other unrecognised dotted prefix, e.g.
+    // `bogus.foo`) instead of being misrouted to a scope that no longer
+    // exists.
+    #[test]
+    fn tagref_parse_scope_prefix_is_no_longer_special_cased() {
+        assert_eq!(
+            TagRef::parse("scope.instrumentation.name"),
+            TagRef::Intrinsic("scope.instrumentation.name")
         );
     }
 

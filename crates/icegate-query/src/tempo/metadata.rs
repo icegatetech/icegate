@@ -9,13 +9,29 @@
 //! footers / dictionary pages rather than materializing rows — the same
 //! code path used by Loki's `/labels` and `/label_values`.
 //!
-//! Post the 2026-04-19 spans-attributes split, the spans table carries two
-//! separate `MAP<String,String>` columns:
+//! The spans table carries three separate `MAP<String,String>` columns, one
+//! per OTLP level:
 //! - `resource_attributes` — keys from OTLP `Resource`.
-//! - `span_attributes`     — keys from OTLP `Span` + folded scope attrs.
+//! - `scope_attributes`    — keys from OTLP `InstrumentationScope.attributes`.
+//! - `span_attributes`     — keys from OTLP `Span` only.
 //!
-//! Scope separation in `/api/v2/search/tags` therefore becomes
-//! schema-enforced rather than heuristic: each map drives its own scope.
+//! `TraceQL`/Tempo has no query scope for instrumentation-scope attributes —
+//! the owner's correction that replaced an earlier, incorrect dedicated
+//! `scope` group/selector. They surface through the `span` scope instead,
+//! exactly as they did when ingest physically folded them into
+//! `span_attributes` before the OTel-native storage split. So only two
+//! `TraceQL` scope groups are driven by attribute maps — `resource` and
+//! `span` — and `span`'s group listing ([`list_tags_v2`]) and tag-values
+//! lookup ([`list_tag_values`]) coalesces `span_attributes` with
+//! `scope_attributes` per row, with `span_attributes` winning on key collision
+//! (the same precedence the pre-migration physical fold had). Each map's
+//! dotted-prefix address on `/api/search/tag/{name}/values` is `resource.`
+//! or `span.` — plus the unscoped `.` form, which searches both. A tag is
+//! never advertised under a group whose prefix cannot actually select it:
+//! doing so would let a client build a query — a `resource.foo = "x"`
+//! selector, or a `resource.foo` values lookup — that is guaranteed to
+//! return nothing, because the underlying selector for that group reads a
+//! different column than the one the tag actually lives in.
 
 use std::collections::BTreeSet;
 
@@ -23,8 +39,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use iceberg::expr::{Predicate, Reference};
 use icegate_common::schema::{COL_KIND, COL_STATUS_CODE};
 use icegate_common::schema::{
-    COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES, COL_SPAN_ID,
-    COL_TRACE_ID, SPAN_INDEXED_ATTRIBUTE_COLUMNS, TRACEQL_INTRINSIC_TAGS,
+    COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES,
+    COL_SPAN_ID, COL_TRACE_ID, SPAN_INDEXED_ATTRIBUTE_COLUMNS, TRACEQL_INTRINSIC_TAGS,
 };
 use icegate_common::{ICEGATE_NAMESPACE, SPANS_TABLE};
 
@@ -65,6 +81,24 @@ const SPANS_RESOURCE_CONFIG: MetadataScanConfig = MetadataScanConfig {
     label_aliases: &[],
     excluded_map_keys: &[],
     map_column: COL_RESOURCE_ATTRIBUTES,
+    normalize_keys: false,
+};
+
+/// Metadata-scan config for the `scope_attributes` map (`OTel`
+/// `InstrumentationScope.attributes`).
+///
+/// `indexed_columns` is empty for the same reason as
+/// [`SPANS_RESOURCE_CONFIG`]: no top-level column is promoted from this
+/// map. `TraceQL`/Tempo has no instrumentation-scope query scope, so this
+/// config never backs its own `ScopeGroup` — [`list_tags_v2`] unions its
+/// output into the `span` group, with `span_attributes` winning on key
+/// collision (the precedence the pre-migration physical fold had).
+const SPANS_SCOPE_CONFIG: MetadataScanConfig = MetadataScanConfig {
+    indexed_columns: &[],
+    label_aliases: &[],
+    excluded_map_keys: &[],
+    map_column: COL_SCOPE_ATTRIBUTES,
+    normalize_keys: false,
 };
 
 /// Metadata-scan config for the `span_attributes` map.
@@ -78,6 +112,7 @@ const SPANS_SPAN_CONFIG: MetadataScanConfig = MetadataScanConfig {
     label_aliases: &[],
     excluded_map_keys: &[],
     map_column: COL_SPAN_ATTRIBUTES,
+    normalize_keys: false,
 };
 
 /// Metadata-scan config for span tag-value lookup (`/tag/<name>/values`)
@@ -87,6 +122,26 @@ const SPANS_VALUES_RESOURCE_CONFIG: MetadataScanConfig = MetadataScanConfig {
     label_aliases: &[],
     excluded_map_keys: &[],
     map_column: COL_RESOURCE_ATTRIBUTES,
+    normalize_keys: false,
+};
+
+/// Metadata-scan config for span tag-value lookup (`/tag/<name>/values`)
+/// against scope-scoped keys (`OTel` `InstrumentationScope.attributes`).
+/// Used as the per-row fallback for the `span.<key>` lookup in
+/// [`list_tag_values`] — see
+/// [`SPANS_SCOPE_CONFIG`].
+///
+/// `indexed_columns` is empty for the same reason as [`SPANS_SCOPE_CONFIG`]:
+/// no top-level column is promoted from this map. Because this config is only
+/// ever scanned *alongside* [`SPANS_VALUES_SPAN_CONFIG`], which already covers
+/// the indexed columns, repeating them here would decode the same dictionary
+/// page a second time for a result that cannot differ.
+const SPANS_VALUES_SCOPE_CONFIG: MetadataScanConfig = MetadataScanConfig {
+    indexed_columns: &[],
+    label_aliases: &[],
+    excluded_map_keys: &[],
+    map_column: COL_SCOPE_ATTRIBUTES,
+    normalize_keys: false,
 };
 
 /// Metadata-scan config for span tag-value lookup (`/tag/<name>/values`)
@@ -96,6 +151,7 @@ const SPANS_VALUES_SPAN_CONFIG: MetadataScanConfig = MetadataScanConfig {
     label_aliases: &[],
     excluded_map_keys: &[],
     map_column: COL_SPAN_ATTRIBUTES,
+    normalize_keys: false,
 };
 
 /// Default lookback when a client omits `start` / `end`.
@@ -168,7 +224,7 @@ pub async fn list_tags_v2(
             tenant_id,
             start_dt,
             end_dt,
-            &SPANS_RESOURCE_CONFIG,
+            &[SPANS_RESOURCE_CONFIG],
             extra_predicate.clone(),
         )
         .await
@@ -184,15 +240,21 @@ pub async fn list_tags_v2(
         });
     }
 
-    // Span scope: span_attributes map keys + span-specific indexed columns
-    // (name).
+    // Span scope: span_attributes map keys, UNIONED with scope_attributes
+    // map keys (`OTel` `InstrumentationScope.attributes` — `TraceQL`/Tempo
+    // has no dedicated query scope for these, so they surface through
+    // `span`; see the module docs) + span-specific indexed columns (name).
+    // A tag present in both maps is still only one key in the resulting
+    // `BTreeSet`, so no collision handling is needed here — that only
+    // matters for the tag-VALUES path ([`list_tag_values`]), where the two
+    // maps can hold different values for the same row.
     if scope_filter.is_none_or(|s| s == Scope::Span) {
         let tags: BTreeSet<String> = metadata_scan::scan_labels(
             &table,
             tenant_id,
             start_dt,
             end_dt,
-            &SPANS_SPAN_CONFIG,
+            &[SPANS_SPAN_CONFIG, SPANS_SCOPE_CONFIG],
             extra_predicate.clone(),
         )
         .await
@@ -297,14 +359,14 @@ pub async fn list_tag_values(
             scope: Scope::Resource,
             key,
         } => {
-            let mapped = map_attribute_to_column(key);
+            let mapped = map_attribute_to_column(key).unwrap_or(key);
             values = metadata_scan::scan_label_values(
                 &table,
                 tenant_id,
                 start_dt,
                 end_dt,
-                &SPANS_VALUES_RESOURCE_CONFIG,
-                mapped.unwrap_or(key),
+                &[SPANS_VALUES_RESOURCE_CONFIG],
+                mapped,
                 extra_predicate,
             )
             .await
@@ -314,29 +376,38 @@ pub async fn list_tag_values(
             scope: Scope::Span,
             key,
         } => {
-            let mapped = map_attribute_to_column(key);
-            values = metadata_scan::scan_label_values(
+            // `span.<key>` also reaches `scope_attributes` — `TraceQL`/
+            // Tempo has no dedicated instrumentation-scope query scope, so
+            // a key that physically lives only in `scope_attributes` must
+            // still resolve here (see the module docs). The two maps are
+            // coalesced per row so a span value shadows a scope value for
+            // the same key, matching `span_attribute_lhs`.
+            values = metadata_scan::scan_coalesced_map_label_values(
                 &table,
                 tenant_id,
                 start_dt,
                 end_dt,
                 &SPANS_VALUES_SPAN_CONFIG,
-                mapped.unwrap_or(key),
+                &SPANS_VALUES_SCOPE_CONFIG,
+                key,
                 extra_predicate,
             )
             .await
             .map_err(|e| TempoError(QueryError::from(e)))?;
         }
         TagRef::UnscopedAttribute(key) => {
-            // `.foo` — scope underspecified. Union values from both maps.
+            // `.foo` — scope underspecified by the caller. Unlike the
+            // resource arm above (reads exactly one scope), this unions
+            // resource values with the per-row coalesced span/scope value.
             let mapped = map_attribute_to_column(key).unwrap_or(key);
-            let span_values = metadata_scan::scan_label_values(
+            let span_values = metadata_scan::scan_coalesced_map_label_values(
                 &table,
                 tenant_id,
                 start_dt,
                 end_dt,
                 &SPANS_VALUES_SPAN_CONFIG,
-                mapped,
+                &SPANS_VALUES_SCOPE_CONFIG,
+                key,
                 extra_predicate.clone(),
             )
             .await
@@ -346,9 +417,9 @@ pub async fn list_tag_values(
                 tenant_id,
                 start_dt,
                 end_dt,
-                &SPANS_VALUES_RESOURCE_CONFIG,
+                &[SPANS_VALUES_RESOURCE_CONFIG],
                 mapped,
-                extra_predicate,
+                extra_predicate.clone(),
             )
             .await
             .map_err(|e| TempoError(QueryError::from(e)))?;
@@ -485,7 +556,7 @@ async fn scan_values_either(
         tenant_id,
         start,
         end,
-        &SPANS_VALUES_SPAN_CONFIG,
+        &[SPANS_VALUES_SPAN_CONFIG],
         column,
         extra_predicate,
     )
@@ -639,8 +710,28 @@ async fn load_spans_table(state: &TempoState) -> TempoResult<iceberg::table::Tab
 
 #[cfg(test)]
 mod tests {
-    use super::{kind_code_to_str, map_attribute_to_column, resolve_window, status_code_to_str};
+    use icegate_common::schema::{COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES};
+
+    use super::{
+        SPANS_RESOURCE_CONFIG, SPANS_SCOPE_CONFIG, SPANS_SPAN_CONFIG, kind_code_to_str, map_attribute_to_column,
+        resolve_window, status_code_to_str,
+    };
     use crate::traceql::common::{KindValue, StatusValue};
+
+    // Pins the OTLP-nesting order (Resource -> Scope -> Span) across the
+    // three physical attribute-map columns. A config with the wrong
+    // `map_column` silently scans the wrong data with no other signal.
+    #[test]
+    fn spans_metadata_configs_cover_every_stored_attribute_column() {
+        let covered: Vec<&str> = [SPANS_RESOURCE_CONFIG, SPANS_SCOPE_CONFIG, SPANS_SPAN_CONFIG]
+            .iter()
+            .map(|c| c.map_column)
+            .collect();
+        assert_eq!(
+            covered,
+            vec![COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES]
+        );
+    }
 
     #[test]
     fn map_attribute_maps_service_name() {

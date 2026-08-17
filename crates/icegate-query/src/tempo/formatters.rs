@@ -18,6 +18,7 @@ use datafusion::arrow::array::{
     Array, AsArray, FixedSizeBinaryArray, Int32Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
     TimestampMicrosecondArray,
 };
+use icegate_common::schema::{COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES};
 use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value::Value as AnyVal},
     resource::v1::Resource,
@@ -37,8 +38,12 @@ use crate::tempo::models::{
 /// Convert spans into OTLP `resourceSpans` JSON.
 ///
 /// Groups spans by their resource attributes and a synthetic scope (currently
-/// always the same since the spans schema flattens scope into the attributes
-/// map). Output matches what Grafana's Tempo data source expects.
+/// always the same literal name — the spans schema stores `OTel`
+/// `InstrumentationScope.attributes` in their own `scope_attributes` column,
+/// merged into each span's emitted `attributes` here (`span_attributes`
+/// wins on key collision — see [`merge_span_and_scope_attributes`]), but
+/// does not persist the scope's `name`/`version` themselves). Output
+/// matches what Grafana's Tempo data source expects.
 ///
 /// # Errors
 ///
@@ -60,8 +65,9 @@ pub fn spans_to_otlp_json(batches: &[RecordBatch]) -> crate::error::Result<Value
         let statuses = i32_col_opt(batch, "status_code");
         let starts = ts_col(batch, "timestamp")?;
         let ends = ts_col_opt(batch, "end_timestamp");
-        let resource_attrs = map_col(batch, "resource_attributes")?;
-        let span_attrs = map_col(batch, "span_attributes")?;
+        let resource_attrs = map_col(batch, COL_RESOURCE_ATTRIBUTES)?;
+        let span_attrs = map_col(batch, COL_SPAN_ATTRIBUTES)?;
+        let scope_attrs = map_col(batch, COL_SCOPE_ATTRIBUTES)?;
         let svc_names = string_col_opt(batch, "service_name");
         let events_col = list_col_opt(batch, "events");
         let links_col = list_col_opt(batch, "links");
@@ -104,7 +110,7 @@ pub fn spans_to_otlp_json(batches: &[RecordBatch]) -> crate::error::Result<Value
                 statuses.as_ref().map(|c| c.value(row)),
                 starts.value(row),
                 ends.as_ref().map(|c| c.value(row)),
-                row_attributes(span_attrs, row),
+                attribute_pairs_to_json(&merge_span_and_scope_attributes(scope_attrs, span_attrs, row)),
                 events,
                 dropped_events_count,
                 links,
@@ -223,6 +229,47 @@ fn row_attributes(map_arr: &MapArray, row: usize) -> Vec<Value> {
         }
     }
     out
+}
+
+/// Merge `scope_attributes` into `span_attributes` for one row.
+///
+/// `span_attributes` wins on key collision — the precedence the
+/// pre-migration physical fold had: ingest used to write `OTel`
+/// `InstrumentationScope.attributes` into the same map as `Span.attributes`,
+/// and a same-named span-level key silently overwrote the scope-level one.
+/// Keeping that precedence here means a client reading
+/// `GET /api/traces/{traceID}` sees exactly the value `TraceQL` would match
+/// (`traceql::datafusion::selectors::span_attribute_lhs` resolves the same
+/// way). Do NOT "simplify" this to reading only `span_attributes` — a span
+/// whose only carrier for an attribute is `scope_attributes` would then
+/// silently drop that attribute from the response body, even though search
+/// and tag enumeration both see it. This is the exact C3 regression the
+/// merge fixes; see the scope-attribute tests in this module.
+fn merge_span_and_scope_attributes(scope_attrs: &MapArray, span_attrs: &MapArray, row: usize) -> Vec<(String, String)> {
+    let mut merged: BTreeMap<String, String> = map_row_pairs(scope_attrs, row).into_iter().collect();
+    merged.extend(map_row_pairs(span_attrs, row));
+    merged.into_iter().collect()
+}
+
+/// Non-null `(key, value)` pairs of one row of a `MAP<Utf8,Utf8>` column,
+/// as owned strings.
+fn map_row_pairs(map_arr: &MapArray, row: usize) -> Vec<(String, String)> {
+    let entries = map_arr.value(row);
+    let keys = entries.column(0).as_string::<i32>();
+    let values = entries.column(1).as_string::<i32>();
+    (0..keys.len())
+        .filter(|&i| !values.is_null(i))
+        .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+        .collect()
+}
+
+/// Render `(key, value)` pairs as the OTLP JSON attribute-list shape
+/// (`[{key, value: {stringValue}}]`).
+fn attribute_pairs_to_json(pairs: &[(String, String)]) -> Vec<Value> {
+    pairs
+        .iter()
+        .map(|(k, v)| json!({"key": k, "value": {"stringValue": v}}))
+        .collect()
 }
 
 // =========================================================================
@@ -755,8 +802,9 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
         let status_msgs = string_col_opt(batch, "status_message");
         let starts = ts_col(batch, "timestamp")?;
         let ends = ts_col_opt(batch, "end_timestamp");
-        let resource_attrs_col = map_col(batch, "resource_attributes")?;
-        let span_attrs_col = map_col(batch, "span_attributes")?;
+        let resource_attrs_col = map_col(batch, COL_RESOURCE_ATTRIBUTES)?;
+        let span_attrs_col = map_col(batch, COL_SPAN_ATTRIBUTES)?;
+        let scope_attrs_col = map_col(batch, COL_SCOPE_ATTRIBUTES)?;
         let svcs = string_col_opt(batch, "service_name");
         let events_col = list_col_opt(batch, "events");
         let links_col = list_col_opt(batch, "links");
@@ -797,7 +845,7 @@ fn spans_to_traces_data(batches: &[RecordBatch]) -> crate::error::Result<TracesD
                     .and_then(|c| (!c.is_null(row)).then(|| c.value(row).to_string())),
                 starts.value(row),
                 ends.as_ref().map(|c| c.value(row)),
-                proto_attributes(span_attrs_col, row),
+                attribute_pairs_to_proto(&merge_span_and_scope_attributes(scope_attrs_col, span_attrs_col, row)),
                 events,
                 dropped_events_count,
                 links,
@@ -905,6 +953,21 @@ fn proto_attributes(map_arr: &MapArray, row: usize) -> Vec<KeyValue> {
         });
     }
     out
+}
+
+/// Render `(key, value)` pairs as OTLP proto [`KeyValue`]s. Proto sibling
+/// of [`attribute_pairs_to_json`].
+fn attribute_pairs_to_proto(pairs: &[(String, String)]) -> Vec<KeyValue> {
+    pairs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key_strindex: 0,
+            key: k.clone(),
+            value: Some(AnyValue {
+                value: Some(AnyVal::StringValue(v.clone())),
+            }),
+        })
+        .collect()
 }
 
 #[allow(clippy::cast_sign_loss)]
@@ -1198,6 +1261,20 @@ mod proto_tests {
         b.finish()
     }
 
+    /// Build a 1-row `Map<Utf8,Utf8>` array with the given key/value pairs
+    /// (possibly zero). Generalizes [`single_attr_map`] to more than one
+    /// entry — used for the `scope_attributes` fixtures, which need both a
+    /// scope-only key and one that collides with `span_attributes`.
+    fn attr_map(pairs: &[(&str, &str)]) -> datafusion::arrow::array::MapArray {
+        let mut b = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for (k, v) in pairs {
+            b.keys().append_value(k);
+            b.values().append_value(v);
+        }
+        b.append(true).expect("map row");
+        b.finish()
+    }
+
     fn map_field(name: &str) -> Field {
         Field::new(
             name,
@@ -1308,6 +1385,7 @@ mod proto_tests {
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
             map_field("resource_attributes"),
             map_field("span_attributes"),
+            map_field("scope_attributes"),
             Field::new("events", DataType::List(event_item_field), true),
             Field::new("links", DataType::List(link_item_field), true),
             Field::new("dropped_events_count", DataType::Int32, true),
@@ -1316,6 +1394,10 @@ mod proto_tests {
 
         let res_attrs = single_attr_map("k8s.namespace.name", "icegate");
         let span_attrs = single_attr_map("http.method", "GET");
+        // Empty: this fixture is shared by the events/links tests below,
+        // none of which inspect top-level span attributes. The merge
+        // behaviour itself is covered by `single_span_batch_with_scope_attributes`.
+        let scope_attrs = attr_map(&[]);
 
         let trace_bytes = hex::decode("0102030405060708090a0b0c0d0e0f10").expect("trace_id hex");
         let span_bytes = hex::decode("aabbccddeeff0011").expect("span_id hex");
@@ -1333,6 +1415,7 @@ mod proto_tests {
                 Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_000_000_000])),
                 Arc::new(res_attrs),
                 Arc::new(span_attrs),
+                Arc::new(scope_attrs),
                 Arc::new(events_array),
                 Arc::new(links_array),
                 Arc::new(Int32Array::from(vec![Some(2)])),
@@ -1375,6 +1458,7 @@ mod proto_tests {
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
             map_field("resource_attributes"),
             map_field("span_attributes"),
+            map_field("scope_attributes"),
         ]));
 
         let mut res_b = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
@@ -1388,6 +1472,12 @@ mod proto_tests {
         span_b.values().append_value("GET");
         span_b.append(true).expect("map row");
         let span_attrs = span_b.finish();
+
+        // Empty: `encodes_to_valid_protobuf` below asserts the exact
+        // (unmerged) span-attribute list, so this fixture must not carry
+        // any scope-only or colliding keys. The merge itself is covered by
+        // `single_span_batch_with_scope_attributes`.
+        let scope_attrs = attr_map(&[]);
 
         let trace_bytes = hex::decode("0102030405060708090a0b0c0d0e0f10").expect("trace_id hex");
         let span_bytes = hex::decode("aabbccddeeff0011").expect("span_id hex");
@@ -1406,6 +1496,55 @@ mod proto_tests {
                 Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_000_000_000])),
                 Arc::new(res_attrs),
                 Arc::new(span_attrs),
+                Arc::new(scope_attrs),
+            ],
+        )
+        .expect("record batch")
+    }
+
+    /// Build a single-row batch whose `scope_attributes` map carries a
+    /// scope-only key (`otel.scope.name`, absent from `span_attributes`)
+    /// and a key that collides with `span_attributes` under a DIFFERENT
+    /// value (`http.method`: `"POST"` in scope vs. `"GET"` in span). Proves
+    /// both halves of the C3 fix: a span whose only carrier for an
+    /// attribute is `scope_attributes` must still surface it in the
+    /// emitted span attributes, and `span_attributes` must win on
+    /// collision — the precedence the pre-migration physical fold had.
+    fn single_span_batch_with_scope_attributes() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+            Field::new("span_id", DataType::FixedSizeBinary(8), false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("kind", DataType::Int32, true),
+            Field::new("status_code", DataType::Int32, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            map_field("resource_attributes"),
+            map_field("span_attributes"),
+            map_field("scope_attributes"),
+        ]));
+
+        let res_attrs = single_attr_map("k8s.namespace.name", "icegate");
+        let span_attrs = single_attr_map("http.method", "GET");
+        let scope_attrs = attr_map(&[("otel.scope.name", "checkout-worker"), ("http.method", "POST")]);
+
+        let trace_bytes = hex::decode("0102030405060708090a0b0c0d0e0f10").expect("trace_id hex");
+        let span_bytes = hex::decode("aabbccddeeff0011").expect("span_id hex");
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(trace_bytes.as_slice())).expect("trace_id"),
+                ),
+                Arc::new(FixedSizeBinaryArray::try_from_iter(std::iter::once(span_bytes.as_slice())).expect("span_id")),
+                Arc::new(StringArray::from(vec!["GET /api"])),
+                Arc::new(Int32Array::from(vec![Some(2)])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec![Some("frontend")])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_000_000_000])),
+                Arc::new(res_attrs),
+                Arc::new(span_attrs),
+                Arc::new(scope_attrs),
             ],
         )
         .expect("record batch")
@@ -1573,6 +1712,60 @@ mod proto_tests {
         assert_eq!(span["droppedLinksCount"], 3);
     }
 
+    /// C3 regression (protobuf path): `GET /api/traces/{traceID}` must
+    /// include an attribute whose only carrier is `scope_attributes`, and a
+    /// key present in both maps must resolve to the `span_attributes`
+    /// value — see [`merge_span_and_scope_attributes`]. Before the fix,
+    /// `spans_to_traces_data` read only `resource_attributes` and
+    /// `span_attributes` (as string literals), so `otel.scope.name` was
+    /// silently absent from the response body even though search and tag
+    /// enumeration both saw it.
+    #[test]
+    fn proto_span_attributes_include_scope_only_key_with_span_precedence_on_collision() {
+        let batches = vec![single_span_batch_with_scope_attributes()];
+        let bytes = spans_to_otlp_proto(&batches).expect("proto encode");
+        let decoded = TracesData::decode(&*bytes).expect("proto decode");
+        let span_attrs: Vec<(&str, &str)> = decoded.resource_spans[0].scope_spans[0].spans[0]
+            .attributes
+            .iter()
+            .filter_map(|kv| {
+                let v = kv.value.as_ref()?;
+                match &v.value {
+                    Some(AnyVal::StringValue(s)) => Some((kv.key.as_str(), s.as_str())),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(
+            span_attrs,
+            vec![("http.method", "GET"), ("otel.scope.name", "checkout-worker")],
+            "expected span_attributes to win the http.method collision and the scope-only \
+             otel.scope.name key to surface: {span_attrs:?}"
+        );
+    }
+
+    /// C3 regression (JSON path): same proof as
+    /// `proto_span_attributes_include_scope_only_key_with_span_precedence_on_collision`,
+    /// against [`spans_to_otlp_json`] instead of the protobuf encoder.
+    #[test]
+    fn json_span_attributes_include_scope_only_key_with_span_precedence_on_collision() {
+        let batches = vec![single_span_batch_with_scope_attributes()];
+        let value = spans_to_otlp_json(&batches).expect("json build");
+        let attrs = value["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .expect("attributes array");
+        let pairs: Vec<(&str, &str)> = attrs
+            .iter()
+            .filter_map(|a| Some((a["key"].as_str()?, a["value"]["stringValue"].as_str()?)))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("http.method", "GET"), ("otel.scope.name", "checkout-worker")],
+            "expected span_attributes to win the http.method collision and the scope-only \
+             otel.scope.name key to surface: {pairs:?}"
+        );
+    }
+
     /// The v2 body is a `TraceByIDResponse`, so a decoder following that
     /// contract reads field 1 as an embedded message; a bare `TracesData`
     /// there would be read as garbage. The envelope must carry the v1
@@ -1591,8 +1784,9 @@ mod proto_tests {
         let len = prost::encoding::decode_varint(&mut buf).expect("trace length");
         assert_eq!(len, u64::try_from(bare.len()).expect("length fits u64"));
         assert_eq!(buf, bare.as_slice(), "embedded payload must equal the v1 body");
-        assert!(
-            TracesData::decode(buf).expect("embedded trace decode").resource_spans.len() == 1,
+        assert_eq!(
+            TracesData::decode(buf).expect("embedded trace decode").resource_spans.len(),
+            1,
             "tempopb.Trace and TracesData share the resourceSpans = 1 layout"
         );
     }

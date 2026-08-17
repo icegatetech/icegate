@@ -275,8 +275,6 @@ pub(super) fn insert_etag(headers: &mut HeaderMap, etag: &str) -> Result<(), Api
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
-
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 

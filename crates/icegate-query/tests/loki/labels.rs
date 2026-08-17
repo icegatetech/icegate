@@ -1,7 +1,5 @@
 //! Tests for label metadata endpoints (labels, label values, series)
 #![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
     clippy::print_stdout,
     clippy::uninlined_format_args,
     clippy::cast_possible_truncation
@@ -63,11 +61,22 @@ async fn test_labels_endpoint() -> Result<(), Box<dyn std::error::Error>> {
         label_strs
     );
 
-    // Should include attribute keys from test data
+    // Should include attribute keys from test data, under their wire names —
+    // the fixture stores these dotted (`user.id`, `http.target`,
+    // `server.address`), so this also pins the '.' -> '_' rendering.
+    for expected in ["user_id", "request_id", "http_target", "server_address"] {
+        assert!(
+            label_strs.contains(&expected),
+            "labels should include log-level attribute `{expected}`, got: {label_strs:?}"
+        );
+    }
+
+    // The scope level must be enumerated too: it is a separate stored MAP
+    // column, so a regression that dropped it would leave every other
+    // assertion here passing.
     assert!(
-        label_strs.contains(&"user_id") || label_strs.contains(&"page") || label_strs.contains(&"db_host"),
-        "labels should include attribute keys from test data, got: {:?}",
-        label_strs
+        label_strs.contains(&"otel_scope_name"),
+        "labels should include the scope-level attribute `otel_scope_name`, got: {label_strs:?}"
     );
 
     server.shutdown().await;
@@ -139,7 +148,12 @@ async fn test_label_values_endpoint() -> Result<(), Box<dyn std::error::Error>> 
         value_strs
     );
 
-    // Test label values for an attribute (not indexed column)
+    // Test label values for an attribute (not indexed column). `write_test_logs`
+    // stores this key dotted (`user.id`, only on row 0 — see harness.rs), so this
+    // only comes back non-empty if the '.' -> '_' wire-name normalization is
+    // applied when matching the stored key against the requested label. An empty
+    // result here is a regression, not a legitimate "no data" case, so the
+    // assertion must not be guarded by `if !values.is_empty()`.
     let resp = server
         .client
         .get(format!("{}/loki/api/v1/label/user_id/values", server.base_url))
@@ -154,14 +168,100 @@ async fn test_label_values_endpoint() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(body["status"], "success");
 
     let values = body["data"].as_array().expect("data should be an array");
-    if !values.is_empty() {
-        let value_strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
-        assert!(
-            value_strs.contains(&"user-123"),
-            "user_id values should include 'user-123', got: {:?}",
-            value_strs
-        );
-    }
+    let value_strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        value_strs,
+        vec!["user-123"],
+        "user_id values should be exactly ['user-123'] (dotted 'user.id' resolved via its wire name), got: {:?}",
+        value_strs
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Dedicated regression coverage for the dotted-key -> wire-name mapping in
+/// `/label_values`: `write_test_logs` stores `request.id` (dotted, OTel-native)
+/// on row 0's `log_attributes`; Loki label names cannot contain dots, so the
+/// only way a real client can ever request this value is via the underscored
+/// wire name `request_id`. Kept independent of `test_label_values_endpoint`'s
+/// `user_id` case so the dotted -> underscored mapping is proven on a second,
+/// distinct attribute rather than resting on a single example.
+#[tokio::test]
+async fn test_label_values_endpoint_resolves_dotted_key_by_wire_name() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/label/request_id/values", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let values = body["data"].as_array().expect("data should be an array");
+    let value_strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        value_strs,
+        vec!["req-456"],
+        "underscored wire name 'request_id' must resolve the dotted stored key 'request.id', got: {:?}",
+        value_strs
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// `/label_values` must reach EVERY stored attribute map, not just
+/// `log_attributes`.
+///
+/// The three levels are enumerated by one scan over one projection of the data
+/// file (see `engine::metadata_scan::scan_label_values`), so a level dropped
+/// from that projection returns an empty list rather than an error — and every
+/// other value assertion in this file reads `log_attributes` or an indexed
+/// column, so none of them would fail. `write_test_logs` stores
+/// `otel.scope.name` in `scope_attributes` on all three rows, which is
+/// reachable only through the scope level.
+#[tokio::test]
+async fn test_label_values_endpoint_reads_the_scope_attribute_map() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+
+    let table = catalog
+        .load_table(&iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?)
+        .await?;
+    write_test_logs(&table, &catalog).await?;
+
+    let resp = server
+        .client
+        .get(format!("{}/loki/api/v1/label/otel_scope_name/values", server.base_url))
+        .header("X-Scope-OrgID", "test-tenant")
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+
+    assert_eq!(status, 200, "Response body: {}", body);
+    assert_eq!(body["status"], "success");
+
+    let values = body["data"].as_array().expect("data should be an array");
+    let value_strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        value_strs,
+        vec!["test-instrumentation"],
+        "scope-level attribute values must be enumerated alongside the log level, got: {:?}",
+        value_strs
+    );
 
     server.shutdown().await;
     Ok(())

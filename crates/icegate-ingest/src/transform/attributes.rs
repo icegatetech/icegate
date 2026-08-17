@@ -5,7 +5,22 @@ use arrow::{
     array::{MapBuilder, MapFieldNames, StringBuilder},
     datatypes::{DataType, Fields, Schema},
 };
+use icegate_common::attribute_key::{matches_wire_name, normalize_attribute_key};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
+
+/// OTLP semantic-convention resource-attribute keys, in the dotted form they
+/// arrive on the wire, that the transforms read by name.
+///
+/// Spelled once here rather than per signal because every transform matches the
+/// same keys — to fill a promoted top-level column, and to suppress the now
+/// redundant map copy through [`merge_dotted_levels`]. They belong to this
+/// module and not to `icegate_common::schema`, which describes table columns:
+/// the dotted key is what OTLP puts in an attribute map, and the column it is
+/// promoted into is spelled differently and lives at a different layer
+/// (`service.name` -> `icegate_common::schema::COL_SERVICE_NAME`).
+pub(crate) const SERVICE_NAME_KEY: &str = "service.name";
+/// See [`SERVICE_NAME_KEY`]. Promoted to its own column on metrics only.
+pub(crate) const SERVICE_INSTANCE_ID_KEY: &str = "service.instance.id";
 
 /// Extracts a string value from an OTLP `AnyValue` reference.
 ///
@@ -370,6 +385,19 @@ pub(crate) fn map_field_names() -> MapFieldNames {
     }
 }
 
+/// Build a `MAP<Utf8,Utf8>` builder wired to schema-derived key/value fields.
+///
+/// The field names match the canonical Iceberg-to-Arrow map layout used by
+/// every ingest transform.
+pub(crate) fn attribute_map_builder(
+    key_field: arrow::datatypes::FieldRef,
+    value_field: arrow::datatypes::FieldRef,
+) -> MapBuilder<StringBuilder, StringBuilder> {
+    MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field)
+        .with_values_field(value_field)
+}
+
 /// Current wall-clock time in microseconds since the Unix epoch.
 ///
 /// # Errors
@@ -393,27 +421,19 @@ pub(crate) const fn nanos_to_micros(nanos: u64) -> i64 {
     (nanos / 1000) as i64
 }
 
-/// Extracts map field metadata from the Arrow schema for attributes field.
+/// Extracts map field metadata from the Arrow schema by field name.
 ///
-/// Returns a tuple of (`key_field`, `value_field`) from the schema's map type definition.
+/// Returns a tuple of (`key_field`, `value_field`) from the schema's map type
+/// definition. Used by every per-level attribute MAP column (`logs`, `spans`,
+/// and others as they migrate) to wire a builder to the Iceberg field metadata.
 ///
 /// # Errors
 ///
 /// Returns `IngestError::Validation` if:
-/// - Schema does not contain an 'attributes' field
-/// - The 'attributes' field is not of Map type
+/// - Schema does not contain a field named `name`
+/// - The field is not of Map type
 /// - The map entries are not of Struct type
 /// - The struct does not contain at least 2 fields (key and value)
-pub(crate) fn extract_map_fields_from_schema(
-    schema: &Schema,
-) -> crate::error::Result<(arrow::datatypes::FieldRef, arrow::datatypes::FieldRef)> {
-    extract_map_fields_from_schema_named(schema, "attributes")
-}
-
-/// Extracts map field metadata from the Arrow schema by field name.
-///
-/// Used by both `logs_to_record_batch` (via `extract_map_fields_from_schema`)
-/// and `spans_to_record_batch` (directly).
 pub(crate) fn extract_map_fields_from_schema_named(
     schema: &Schema,
     name: &str,
@@ -474,46 +494,30 @@ pub(crate) fn extract_map_fields_from_nested_struct(
     }
 }
 
-/// Adds flattened attributes to the map builder with key normalization.
-///
-/// Flattens nested structures and normalises attribute keys by replacing
-/// dots with underscores. Any normalised key present in `skip_keys` is
-/// dropped (used to suppress already-promoted top-level columns from the
-/// resource flattening pass).
-pub(crate) fn add_flattened_attributes(
-    attributes: &[KeyValue],
-    attributes_builder: &mut MapBuilder<StringBuilder, StringBuilder>,
-    skip_keys: &[&str],
-) {
-    for kv in attributes {
-        let flattened = flatten_any_value(&kv.key, kv.value.as_ref());
-        for (key, value) in flattened {
-            let normalized = normalize_attribute_key(&key);
-            if skip_keys.contains(&normalized.as_str()) {
-                continue;
-            }
-            attributes_builder.keys().append_value(normalized);
-            attributes_builder.values().append_value(value);
-        }
-    }
-}
-
 /// Merge dotted-flattened attributes from several precedence levels into one
 /// sorted, deduplicated map. Levels apply in order, so a later (more specific)
-/// level overwrites an earlier one on key collision. Any dotted key in
+/// level overwrites an earlier one on key collision. Any key in
 /// `skip_in_first` is dropped **only** from the first (most-general) level —
 /// used to suppress keys already promoted to a dedicated top-level column while
 /// still letting a more-specific level re-supply an override (mirrors the logs
 /// `LOG_PROMOTED_RESOURCE_KEYS` rule).
+///
+/// Suppression matches by **wire name**, not by the raw dotted string: a
+/// promoted `service.name` also drops a resource attribute spelled
+/// `service_name`. Both reach the query layer as the label `service_name`, and
+/// the attribute maps are applied after the promoted columns when labels are
+/// built — so letting the second spelling through would put the map's value on
+/// the wire in place of the promoted column's.
 pub(crate) fn merge_dotted_levels(
     levels: &[&[KeyValue]],
     skip_in_first: &[&str],
 ) -> std::collections::BTreeMap<String, String> {
+    let skip_wire_names: Vec<_> = skip_in_first.iter().map(|promoted| normalize_attribute_key(promoted)).collect();
     let mut merged = std::collections::BTreeMap::new();
     for (level_idx, attrs) in levels.iter().enumerate() {
         for kv in *attrs {
             for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-                if level_idx == 0 && skip_in_first.contains(&key.as_str()) {
+                if level_idx == 0 && skip_wire_names.iter().any(|wire_name| matches_wire_name(&key, wire_name)) {
                     continue;
                 }
                 merged.insert(key, value);
@@ -526,9 +530,13 @@ pub(crate) fn merge_dotted_levels(
 /// Flatten a single attribute list and deduplicate keys into a sorted
 /// [`std::collections::BTreeMap`].
 ///
-/// Mirrors the deduplication semantics of [`merge_dotted_attributes`] for
-/// the single-input case so resource attributes get the same guarantee
-/// (one entry per key, deterministic order) as scope+span attributes.
+/// Callers build each per-OTLP-level attribute column (resource, scope,
+/// span, ...) with one independent call per level — there is no cross-level
+/// merge, so a key present at two levels is stored twice, once per level.
+/// Returning a [`std::collections::BTreeMap`] guarantees a single entry per
+/// key within that level (so downstream `MAP<K,V>` readers can't disagree on
+/// which duplicate to surface) and gives a deterministic on-disk attribute
+/// order for reproducible parquet output.
 pub(crate) fn dedupe_dotted_attributes(attributes: &[KeyValue]) -> std::collections::BTreeMap<String, String> {
     let mut merged: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for kv in attributes {
@@ -539,101 +547,10 @@ pub(crate) fn dedupe_dotted_attributes(attributes: &[KeyValue]) -> std::collecti
     merged
 }
 
-/// Merge scope and span attributes into a single deduplicated, sorted
-/// key→value map.
-///
-/// Scope attributes are inserted first; span attributes overwrite on
-/// collision so span-level metadata always wins over the (broader)
-/// scope-level metadata — matching the `OTel` data model where span
-/// attributes describe the operation and scope attributes describe the
-/// instrumentation library that produced it.
-///
-/// Returning a [`std::collections::BTreeMap`] guarantees a single entry
-/// per key (so downstream `MAP<K,V>` readers can't disagree on which
-/// duplicate to surface) and gives a deterministic on-disk attribute
-/// order for reproducible parquet output.
-pub(crate) fn merge_dotted_attributes(
-    scope_attrs: &[KeyValue],
-    span_attrs: &[KeyValue],
-) -> std::collections::BTreeMap<String, String> {
-    let mut merged: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for kv in scope_attrs {
-        for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-            merged.insert(key, value);
-        }
-    }
-    // Span attributes overwrite any scope-level entry with the same key.
-    for kv in span_attrs {
-        for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-            merged.insert(key, value);
-        }
-    }
-    merged
-}
-
-/// Recursively flattens an OTLP `AnyValue` into key-value pairs.
-///
-/// Nested `KvlistValue` structures are flattened using underscore separator,
-/// matching Loki's behavior with JSON parser.
-///
-/// # Arguments
-///
-/// * `prefix` - Key prefix for nested values (use empty string for root)
-/// * `value` - OTLP `AnyValue` to flatten
-///
-/// # Returns
-///
-/// Vector of (key, value) string pairs representing flattened structure
-///
-/// # Examples
-///
-/// ```
-/// // Input: prefix="http", value=KvlistValue({method: "GET", details: {code: 200}})
-/// // Output: [("http_method", "GET"), ("http_details_code", "200")]
-/// ```
-fn flatten_any_value(prefix: &str, value: Option<&AnyValue>) -> Vec<(String, String)> {
-    let mut result = Vec::new();
-
-    if let Some(v) = value {
-        if let Some(val) = &v.value {
-            match val {
-                Value::KvlistValue(kvs) => {
-                    // Recursively flatten nested key-value lists
-                    for kv in &kvs.values {
-                        let nested_prefix = if prefix.is_empty() {
-                            kv.key.clone()
-                        } else {
-                            format!("{}_{}", prefix, kv.key)
-                        };
-                        let nested_pairs = flatten_any_value(&nested_prefix, kv.value.as_ref());
-                        result.extend(nested_pairs);
-                    }
-                }
-                Value::ArrayValue(arr) => {
-                    // Arrays are stringified, not flattened (no indexable keys)
-                    let items: Vec<String> =
-                        arr.values.iter().filter_map(|v| extract_any_value_string(Some(v))).collect();
-                    let stringified = format!("[{}]", items.join(", "));
-                    result.push((prefix.to_string(), stringified));
-                }
-                _ => {
-                    // Primitive types: stringify and return
-                    if let Some(s) = extract_any_value_string(Some(v)) {
-                        result.push((prefix.to_string(), s));
-                    }
-                }
-            }
-        }
-    }
-
-    result
-}
-
 /// Flattens an OTLP `AnyValue` into dotted key-value pairs.
 ///
-/// Mirrors [`flatten_any_value`] but joins nested `KvlistValue` keys with a
-/// dot (`.`) separator instead of underscore. Use this for spans and other
-/// signals where OTel-native dotted attribute names must be preserved.
+/// Nested `KvlistValue` structures are flattened by joining keys with a dot
+/// (`.`) separator, preserving the OTel-native dotted attribute name.
 ///
 /// # Arguments
 ///
@@ -681,14 +598,6 @@ pub(crate) fn flatten_any_value_dotted(prefix: &str, value: Option<&AnyValue>) -
     result
 }
 
-/// Normalizes an attribute key by replacing dots with underscores.
-///
-/// `OpenTelemetry` uses dots in attribute names (e.g., "service.name"),
-/// but some systems prefer underscores for compatibility.
-fn normalize_attribute_key(key: &str) -> String {
-    key.replace('.', "_")
-}
-
 /// Extracts the `element` field of a `List` column from the Arrow schema.
 ///
 /// The returned field carries the element name/nullability Arrow's
@@ -728,14 +637,6 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::AnyValue;
 
     use super::*;
-
-    #[test]
-    fn test_normalize_attribute_key() {
-        assert_eq!(normalize_attribute_key("service.name"), "service_name");
-        assert_eq!(normalize_attribute_key("cloud.account.id"), "cloud_account_id");
-        assert_eq!(normalize_attribute_key("no_dots"), "no_dots");
-        assert_eq!(normalize_attribute_key(""), "");
-    }
 
     #[test]
     fn test_extract_string_value_types() {
@@ -849,105 +750,6 @@ mod tests {
         assert!(parsed.is_object());
         assert_eq!(parsed["status"], 200);
         assert_eq!(parsed["message"], "OK");
-    }
-
-    #[test]
-    fn test_flatten_nested_attributes() {
-        use std::collections::HashMap;
-
-        use opentelemetry_proto::tonic::common::v1::{KeyValueList, any_value::Value};
-
-        // Test nested KvlistValue flattening
-        let nested_kv = AnyValue {
-            value: Some(Value::KvlistValue(KeyValueList {
-                values: vec![
-                    KeyValue {
-                        key_strindex: 0,
-                        key: "method".to_string(),
-                        value: Some(AnyValue {
-                            value: Some(Value::StringValue("POST".to_string())),
-                        }),
-                    },
-                    KeyValue {
-                        key_strindex: 0,
-                        key: "details".to_string(),
-                        value: Some(AnyValue {
-                            value: Some(Value::KvlistValue(KeyValueList {
-                                values: vec![
-                                    KeyValue {
-                                        key_strindex: 0,
-                                        key: "status".to_string(),
-                                        value: Some(AnyValue {
-                                            value: Some(Value::IntValue(200)),
-                                        }),
-                                    },
-                                    KeyValue {
-                                        key_strindex: 0,
-                                        key: "path".to_string(),
-                                        value: Some(AnyValue {
-                                            value: Some(Value::StringValue("/api/v1".to_string())),
-                                        }),
-                                    },
-                                ],
-                            })),
-                        }),
-                    },
-                ],
-            })),
-        };
-
-        let flattened = flatten_any_value("http", Some(&nested_kv));
-
-        // Should produce 3 flattened entries
-        assert_eq!(flattened.len(), 3);
-
-        // Check flattened keys and values
-        let map: HashMap<String, String> = flattened.into_iter().collect();
-        assert_eq!(map.get("http_method"), Some(&"POST".to_string()));
-        assert_eq!(map.get("http_details_status"), Some(&"200".to_string()));
-        assert_eq!(map.get("http_details_path"), Some(&"/api/v1".to_string()));
-    }
-
-    #[test]
-    fn test_flatten_array_attribute() {
-        use opentelemetry_proto::tonic::common::v1::{ArrayValue, any_value::Value};
-
-        // Arrays should be stringified, not flattened (no meaningful keys)
-        let array_value = AnyValue {
-            value: Some(Value::ArrayValue(ArrayValue {
-                values: vec![
-                    AnyValue {
-                        value: Some(Value::StringValue("tag1".to_string())),
-                    },
-                    AnyValue {
-                        value: Some(Value::StringValue("tag2".to_string())),
-                    },
-                ],
-            })),
-        };
-
-        let flattened = flatten_any_value("tags", Some(&array_value));
-
-        // Should produce single stringified entry
-        assert_eq!(flattened.len(), 1);
-        assert_eq!(flattened[0].0, "tags");
-        assert_eq!(flattened[0].1, "[tag1, tag2]");
-    }
-
-    #[test]
-    fn test_flatten_primitive_attribute() {
-        use opentelemetry_proto::tonic::common::v1::any_value::Value;
-
-        // Primitive values should work as before
-        let string_value = AnyValue {
-            value: Some(Value::StringValue("simple".to_string())),
-        };
-
-        let flattened = flatten_any_value("key", Some(&string_value));
-
-        assert_eq!(flattened.len(), 1);
-        assert_eq!(flattened[0].0, "key");
-        assert_eq!(flattened[0].1, "simple");
     }
 
     #[test]

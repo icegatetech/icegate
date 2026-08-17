@@ -109,6 +109,8 @@ pub const OPERATIONS_TOPIC: &str = "operations";
 /// query engine to determine the WAL/Iceberg boundary.
 pub const WAL_OFFSET_PROPERTY: &str = "icegate.queue.offset";
 
+/// Stored-attribute-key to wire (Loki label) name mapping.
+pub mod attribute_key;
 /// Catalog management for Iceberg catalogs.
 pub mod catalog;
 /// Common configuration utilities.
@@ -149,6 +151,7 @@ pub mod wal_offset;
 pub mod testing;
 
 // Re-export commonly used types
+pub use attribute_key::{matches_wire_name, normalize_attribute_key};
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle};
 pub use config::{ServerConfig, check_port_conflicts, load_config_file};
 pub use error::{CommonError as Error, Result};

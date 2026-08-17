@@ -1338,6 +1338,16 @@ fn enter_variableExpr(&mut self, _ctx: &VariableExprContext<'input>) { }
  */
 fn exit_variableExpr(&mut self, _ctx: &VariableExprContext<'input>) { }
 /**
+ * Enter a parse tree produced by {@link LogQLParser#labelName}.
+ * @param ctx the parse tree
+ */
+fn enter_labelName(&mut self, _ctx: &LabelNameContext<'input>) { }
+/**
+ * Exit a parse tree produced by {@link LogQLParser#labelName}.
+ * @param ctx the parse tree
+ */
+fn exit_labelName(&mut self, _ctx: &LabelNameContext<'input>) { }
+/**
  * Enter a parse tree produced by {@link LogQLParser#duration}.
  * @param ctx the parse tree
  */

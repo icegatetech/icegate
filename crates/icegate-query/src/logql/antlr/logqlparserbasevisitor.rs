@@ -599,6 +599,11 @@ pub trait LogQLParserBaseVisitor<'input>:
             self.visit_children(ctx)
         }
 
+	// Visit a parse tree produced by LogQLParser#labelName.
+	fn visit_labelname(&mut self, ctx: &LabelNameContext<'input>) {
+            self.visit_children(ctx)
+        }
+
 	// Visit a parse tree produced by LogQLParser#duration.
 	fn visit_duration(&mut self, ctx: &DurationContext<'input>) {
             self.visit_children(ctx)

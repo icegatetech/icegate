@@ -27,7 +27,6 @@ use crate::storage::cached::CachedCatalogStorage;
 use crate::storage::s3::S3CatalogStorage;
 use crate::storage::{CatalogStorage, LoadOutcome, Version};
 
-#[allow(clippy::expect_used)]
 fn test_catalog(storage: Arc<dyn CatalogStorage>, file_io: FileIO, tables_uri_prefix: String) -> S3Catalog {
     S3Catalog::with_storage(
         storage,
@@ -136,7 +135,6 @@ pub(crate) struct TestEnv {
 /// backend over it. Shared by the raw ([`make_catalog`]) and cached
 /// ([`make_cached_catalog`]) harnesses so the bucket bootstrap lives in one
 /// place.
-#[allow(clippy::expect_used)]
 async fn bootstrap_object_store() -> (S3TestContainer, S3CatalogConfig, Arc<S3CatalogStorage>, String) {
     let store = S3TestContainer::start().await.expect("start object storage");
     let endpoint = store.endpoint().to_string();
@@ -186,7 +184,6 @@ pub(crate) async fn make_catalog() -> TestEnv {
 /// catalog root and table metadata alike — is all that is shared with the
 /// catalog that wrote the state; no in-memory `CatalogRoot`, cache, or storage
 /// instance crosses the boundary.
-#[allow(clippy::expect_used)]
 pub(crate) fn restart_catalog(env: &TestEnv) -> S3Catalog {
     let storage = Arc::new(
         S3CatalogStorage::new(&env.s3_config, tokio_util::sync::CancellationToken::new()).expect("restarted storage"),
@@ -334,7 +331,6 @@ pub(crate) fn make_in_memory_catalog_cached_with_storage() -> (S3Catalog, Arc<In
     (catalog, inner)
 }
 
-#[allow(clippy::expect_used)]
 pub(crate) fn test_schema() -> Schema {
     Schema::builder()
         .with_schema_id(0)
@@ -346,7 +342,6 @@ pub(crate) fn test_schema() -> Schema {
         .expect("schema")
 }
 
-#[allow(clippy::expect_used)]
 pub(crate) async fn create_table(catalog: &S3Catalog, namespace: &NamespaceIdent, name: &str) -> Table {
     if !catalog.namespace_exists(namespace).await.expect("check namespace") {
         catalog
@@ -377,7 +372,6 @@ impl CapturingCatalog {
         }
     }
 
-    #[allow(clippy::expect_used)]
     fn take_commit(self) -> TableCommit {
         self.captured_commit
             .into_inner()
@@ -452,14 +446,12 @@ impl Catalog for CapturingCatalog {
         unreachable!("not used in commit capture")
     }
 
-    #[allow(clippy::expect_used)]
     async fn update_table(&self, commit: TableCommit) -> IcebergResult<Table> {
         *self.captured_commit.lock().expect("captured commit lock") = Some(commit);
         Ok(self.table.clone())
     }
 }
 
-#[allow(clippy::expect_used)]
 pub(crate) async fn update_request(table: &Table, key: &str, value: &str) -> TableCommit {
     let tx = Transaction::new(table);
     let tx = tx

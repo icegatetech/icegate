@@ -16,7 +16,10 @@ use arrow::{
     datatypes::Schema,
 };
 use iceberg::arrow::schema_to_arrow_schema;
-use icegate_common::DEFAULT_TENANT_ID;
+use icegate_common::{
+    DEFAULT_TENANT_ID,
+    schema::{COL_DATA_POINT_ATTRIBUTES, COL_METADATA, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES},
+};
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     common::v1::KeyValue,
@@ -27,9 +30,10 @@ use opentelemetry_proto::tonic::{
 };
 
 use super::attributes::{
-    dedupe_dotted_attributes, extract_map_fields_from_nested_struct, extract_map_fields_from_schema_named,
-    extract_string_value, flatten_any_value_dotted, is_zero_bytes, list_element_field, list_struct_fields,
-    map_field_names, merge_dotted_levels, nanos_to_micros, now_micros, u32_count_to_i32, u64_to_i64,
+    SERVICE_INSTANCE_ID_KEY, SERVICE_NAME_KEY, attribute_map_builder, dedupe_dotted_attributes,
+    extract_map_fields_from_nested_struct, extract_map_fields_from_schema_named, extract_string_value,
+    flatten_any_value_dotted, is_zero_bytes, list_element_field, list_struct_fields, merge_dotted_levels,
+    nanos_to_micros, now_micros, u32_count_to_i32, u64_to_i64,
 };
 
 /// Process-wide cache of the derived metrics Arrow schema.
@@ -72,10 +76,6 @@ const METRIC_TYPE_SUMMARY: &str = "summary";
 /// `aggregation_temporality` string values stored in the table (per `SCHEMA.md`).
 const AGG_TEMPORALITY_DELTA: &str = "DELTA";
 const AGG_TEMPORALITY_CUMULATIVE: &str = "CUMULATIVE";
-
-/// Resource-attribute keys (dotted form) promoted to dedicated top-level columns.
-const SERVICE_NAME_KEY: &str = "service.name";
-const SERVICE_INSTANCE_ID_KEY: &str = "service.instance.id";
 
 /// Promoted keys suppressed from the merged `attributes` MAP at the resource
 /// level so they are not stored twice (once in the column, once in the map) —
@@ -166,35 +166,13 @@ fn data_point_count(data: &metric::Data) -> usize {
     }
 }
 
-/// Overlay a data point's own attributes onto the pre-flattened resource+scope
-/// `base` map. The base (computed once per scope via [`merge_dotted_levels`])
-/// already has the promoted `service.name`/`service.instance.id` keys
-/// suppressed; a data-point attribute of the same name still overrides. Cloning
-/// the base and overlaying only the data point avoids re-flattening the
-/// resource/scope attributes for every single data point.
-///
-/// Attribute keys are kept in OTel-native **dotted** form (e.g. `http.method`),
-/// matching the spans tables. This intentionally differs from the logs table,
-/// which stores underscore-normalised keys; any metrics query layer must look
-/// attributes up by their dotted key.
-fn merge_point_attributes(base: &BTreeMap<String, String>, data_point: &[KeyValue]) -> BTreeMap<String, String> {
-    // TODO(low): `data_point` is frequently empty (all dimensions live at resource/scope
-    // level), making this clone redundant; returning `Cow::Borrowed(base)` would avoid it.
-    let mut merged = base.clone();
-    for kv in data_point {
-        for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-            merged.insert(key, value);
-        }
-    }
-    merged
-}
-
 /// Flatten `Metric.metadata` (OTLP `KeyValue`s) into a deduped, dotted-key map.
 ///
 /// Metric-level metadata is shared by every data point of the metric, so it is
-/// flattened once per metric (mirroring [`merge_point_attributes`] for the
-/// data-point attributes). A `BTreeMap` yields sorted, de-duplicated keys, which
-/// a `MAP<String,String>` column requires.
+/// flattened once per metric — mirroring how resource/scope attributes are
+/// flattened once per `ResourceMetrics`/`ScopeMetrics` rather than per data
+/// point. A `BTreeMap` yields sorted, de-duplicated keys, which a
+/// `MAP<String,String>` column requires.
 fn flatten_metric_metadata(metadata: &[KeyValue]) -> BTreeMap<String, String> {
     let mut flattened = BTreeMap::new();
     for kv in metadata {
@@ -213,9 +191,10 @@ struct RowContext<'a> {
     metric_name: &'a str,
     description: &'a str,
     unit: &'a str,
-    /// Pre-flattened resource+scope attributes shared by every data point under
-    /// this resource/scope (see [`merge_point_attributes`]).
-    base_attributes: &'a BTreeMap<String, String>,
+    /// Resource attributes for this `ResourceMetrics`, flattened once.
+    resource_attributes: &'a BTreeMap<String, String>,
+    /// Scope attributes for this `ScopeMetrics`, flattened once.
+    scope_attributes: &'a BTreeMap<String, String>,
     /// Flattened `Metric.metadata`, shared by every data point of this metric.
     metadata: &'a BTreeMap<String, String>,
     ingested: i64,
@@ -224,7 +203,7 @@ struct RowContext<'a> {
 /// Column builders for the metrics table, one entry per data point.
 ///
 /// Every method appends to a disjoint set of columns so that, per row, each of
-/// the 31 columns receives exactly one append (value or null).
+/// the 34 columns receives exactly one append (value or null).
 struct MetricColumns {
     tenant_id: StringBuilder,
     service_name: StringBuilder,
@@ -238,7 +217,7 @@ struct MetricColumns {
     unit: StringBuilder,
     aggregation_temporality: StringBuilder,
     is_monotonic: BooleanBuilder,
-    attributes: MapBuilder<StringBuilder, StringBuilder>,
+    data_point_attributes: MapBuilder<StringBuilder, StringBuilder>,
     value_double: Float64Builder,
     value_int: Int64Builder,
     count: Int64Builder,
@@ -258,6 +237,8 @@ struct MetricColumns {
     flags: Int32Builder,
     exemplars: ListBuilder<StructBuilder>,
     metadata: MapBuilder<StringBuilder, StringBuilder>,
+    resource_attributes: MapBuilder<StringBuilder, StringBuilder>,
+    scope_attributes: MapBuilder<StringBuilder, StringBuilder>,
     schema: Arc<Schema>,
 }
 
@@ -267,7 +248,9 @@ impl MetricColumns {
     /// bound) to avoid repeated buffer reallocations during a large export.
     #[allow(clippy::too_many_lines)]
     fn new(schema: Arc<Schema>, capacity: usize) -> crate::error::Result<Self> {
-        let (attr_key, attr_val) = extract_map_fields_from_schema_named(&schema, "attributes")?;
+        let (dp_key, dp_val) = extract_map_fields_from_schema_named(&schema, COL_DATA_POINT_ATTRIBUTES)?;
+        let (resource_key, resource_val) = extract_map_fields_from_schema_named(&schema, COL_RESOURCE_ATTRIBUTES)?;
+        let (scope_key, scope_val) = extract_map_fields_from_schema_named(&schema, COL_SCOPE_ATTRIBUTES)?;
         let bucket_counts_el = list_element_field(&schema, "bucket_counts")?;
         let explicit_bounds_el = list_element_field(&schema, "explicit_bounds")?;
         let positive_bucket_counts_el = list_element_field(&schema, "positive_bucket_counts")?;
@@ -276,14 +259,12 @@ impl MetricColumns {
         let (exemplar_el, exemplar_fields) = list_struct_fields(&schema, "exemplars")?;
         let (exemplar_attr_key, exemplar_attr_val) =
             extract_map_fields_from_nested_struct(&exemplar_fields, "attributes")?;
-        let (metadata_key, metadata_val) = extract_map_fields_from_schema_named(&schema, "metadata")?;
+        let (metadata_key, metadata_val) = extract_map_fields_from_schema_named(&schema, COL_METADATA)?;
 
-        let attributes = MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
-            .with_keys_field(attr_key)
-            .with_values_field(attr_val);
-        let metadata = MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
-            .with_keys_field(metadata_key)
-            .with_values_field(metadata_val);
+        let data_point_attributes = attribute_map_builder(dp_key, dp_val);
+        let resource_attributes = attribute_map_builder(resource_key, resource_val);
+        let scope_attributes = attribute_map_builder(scope_key, scope_val);
+        let metadata = attribute_map_builder(metadata_key, metadata_val);
 
         // quantile struct: (quantile: Double, value: Double) in schema order.
         let quantile_values = ListBuilder::new(StructBuilder::new(
@@ -304,11 +285,7 @@ impl MetricColumns {
                 Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
                 Box::new(FixedSizeBinaryBuilder::new(8)) as Box<dyn ArrayBuilder>,
                 Box::new(FixedSizeBinaryBuilder::new(16)) as Box<dyn ArrayBuilder>,
-                Box::new(
-                    MapBuilder::new(Some(map_field_names()), StringBuilder::new(), StringBuilder::new())
-                        .with_keys_field(exemplar_attr_key)
-                        .with_values_field(exemplar_attr_val),
-                ) as Box<dyn ArrayBuilder>,
+                Box::new(attribute_map_builder(exemplar_attr_key, exemplar_attr_val)) as Box<dyn ArrayBuilder>,
             ],
         ))
         .with_field(exemplar_el);
@@ -329,7 +306,7 @@ impl MetricColumns {
             unit: StringBuilder::with_capacity(capacity, string_bytes),
             aggregation_temporality: StringBuilder::with_capacity(capacity, string_bytes),
             is_monotonic: BooleanBuilder::with_capacity(capacity),
-            attributes,
+            data_point_attributes,
             value_double: Float64Builder::with_capacity(capacity),
             value_int: Int64Builder::with_capacity(capacity),
             count: Int64Builder::with_capacity(capacity),
@@ -349,6 +326,8 @@ impl MetricColumns {
             flags: Int32Builder::with_capacity(capacity),
             exemplars,
             metadata,
+            resource_attributes,
+            scope_attributes,
             schema,
         })
     }
@@ -373,7 +352,7 @@ impl MetricColumns {
             Arc::new(self.unit.finish()),
             Arc::new(self.aggregation_temporality.finish()),
             Arc::new(self.is_monotonic.finish()),
-            Arc::new(self.attributes.finish()),
+            Arc::new(self.data_point_attributes.finish()),
             Arc::new(self.value_double.finish()),
             Arc::new(self.value_int.finish()),
             Arc::new(self.count.finish()),
@@ -393,6 +372,8 @@ impl MetricColumns {
             Arc::new(self.flags.finish()),
             Arc::new(self.exemplars.finish()),
             Arc::new(self.metadata.finish()),
+            Arc::new(self.resource_attributes.finish()),
+            Arc::new(self.scope_attributes.finish()),
         ];
         RecordBatch::try_new(self.schema, columns).map_err(|e| {
             tracing::error!("Failed to create metrics RecordBatch: {e}");
@@ -402,8 +383,9 @@ impl MetricColumns {
 }
 
 impl MetricColumns {
-    /// Columns common to every data point: identity, timestamps, metadata,
-    /// attributes, flags. `description`/`unit` empty strings store as null.
+    /// Columns common to every data point: identity, timestamps, the three
+    /// attribute maps (data-point/resource/scope), `Metric.metadata`, flags.
+    /// `description`/`unit` empty strings store as null.
     fn append_common(
         &mut self,
         ctx: &RowContext,
@@ -441,10 +423,20 @@ impl MetricColumns {
             self.unit.append_value(ctx.unit);
         }
         for (key, value) in attributes {
-            self.attributes.keys().append_value(key);
-            self.attributes.values().append_value(value);
+            self.data_point_attributes.keys().append_value(key);
+            self.data_point_attributes.values().append_value(value);
         }
-        self.attributes.append(true)?;
+        self.data_point_attributes.append(true)?;
+        for (key, value) in ctx.resource_attributes {
+            self.resource_attributes.keys().append_value(key);
+            self.resource_attributes.values().append_value(value);
+        }
+        self.resource_attributes.append(true)?;
+        for (key, value) in ctx.scope_attributes {
+            self.scope_attributes.keys().append_value(key);
+            self.scope_attributes.values().append_value(value);
+        }
+        self.scope_attributes.append(true)?;
         for (key, value) in ctx.metadata {
             self.metadata.keys().append_value(key);
             self.metadata.values().append_value(value);
@@ -681,7 +673,7 @@ impl MetricColumns {
                 drops += 1;
                 continue;
             };
-            let attributes = merge_point_attributes(ctx.base_attributes, &dp.attributes);
+            let attributes = dedupe_dotted_attributes(&dp.attributes);
             let timestamp = timestamp_or_default(dp.time_unix_nano, ctx.ingested);
             let start = optional_micros(dp.start_time_unix_nano);
             self.append_common(ctx, METRIC_TYPE_GAUGE, timestamp, start, &attributes, flags)?;
@@ -724,7 +716,7 @@ impl MetricColumns {
                 drops += 1;
                 continue;
             };
-            let attributes = merge_point_attributes(ctx.base_attributes, &dp.attributes);
+            let attributes = dedupe_dotted_attributes(&dp.attributes);
             let timestamp = timestamp_or_default(dp.time_unix_nano, ctx.ingested);
             let start = optional_micros(dp.start_time_unix_nano);
             self.append_common(ctx, METRIC_TYPE_SUM, timestamp, start, &attributes, flags)?;
@@ -772,7 +764,7 @@ impl MetricColumns {
                 drops += 1;
                 continue;
             }
-            let attributes = merge_point_attributes(ctx.base_attributes, &dp.attributes);
+            let attributes = dedupe_dotted_attributes(&dp.attributes);
             let timestamp = timestamp_or_default(dp.time_unix_nano, ctx.ingested);
             let start = optional_micros(dp.start_time_unix_nano);
             self.append_common(ctx, METRIC_TYPE_HISTOGRAM, timestamp, start, &attributes, flags)?;
@@ -822,7 +814,7 @@ impl MetricColumns {
                 drops += 1;
                 continue;
             }
-            let attributes = merge_point_attributes(ctx.base_attributes, &dp.attributes);
+            let attributes = dedupe_dotted_attributes(&dp.attributes);
             let timestamp = timestamp_or_default(dp.time_unix_nano, ctx.ingested);
             let start = optional_micros(dp.start_time_unix_nano);
             self.append_common(
@@ -873,7 +865,7 @@ impl MetricColumns {
                 drops += 1;
                 continue;
             }
-            let attributes = merge_point_attributes(ctx.base_attributes, &dp.attributes);
+            let attributes = dedupe_dotted_attributes(&dp.attributes);
             let timestamp = timestamp_or_default(dp.time_unix_nano, ctx.ingested);
             let start = optional_micros(dp.start_time_unix_nano);
             let quantiles: Vec<(f64, f64)> = dp.quantile_values.iter().map(|q| (q.quantile, q.value)).collect();
@@ -893,8 +885,11 @@ impl MetricColumns {
 /// Transforms an OTLP metrics export request to an Arrow `RecordBatch`.
 ///
 /// Emits one row per data point across all resource/scope/metric levels.
-/// Strict OTLP-conformance violations are dropped and counted in the second
-/// return value so the caller can report `rejectedDataPoints`.
+/// Resource, scope, and data-point attributes are written to their own
+/// `MAP<String, String>` column, keyed by their dotted OTLP name — see
+/// [`metrics_arrow_schema`]. Strict OTLP-conformance violations are dropped
+/// and counted in the second return value so the caller can report
+/// `rejectedDataPoints`.
 ///
 /// # Returns
 ///
@@ -943,12 +938,13 @@ pub fn metrics_to_record_batch(
             .find(|kv| kv.key == SERVICE_INSTANCE_ID_KEY)
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
+        // Flattened once per ResourceMetrics / ScopeMetrics and reused by every
+        // data point beneath: with the levels in their own columns there is no
+        // merged set to clone per point.
+        let resource_attributes = merge_dotted_levels(&[resource_attrs], METRICS_PROMOTED_RESOURCE_KEYS);
         for sm in &rm.scope_metrics {
             let scope_attrs = sm.scope.as_ref().map_or(&empty, |s| &s.attributes);
-            // Flatten resource + scope attributes once per scope; each data
-            // point clones this base and overlays only its own attributes
-            // instead of re-flattening resource/scope for every point.
-            let base_attributes = merge_dotted_levels(&[resource_attrs, scope_attrs], METRICS_PROMOTED_RESOURCE_KEYS);
+            let scope_attributes = dedupe_dotted_attributes(scope_attrs);
             for metric in &sm.metrics {
                 let Some(data) = metric.data.as_ref() else {
                     // No data oneof => no data points; nothing to reject.
@@ -962,7 +958,8 @@ pub fn metrics_to_record_batch(
                     metric_name: &metric.name,
                     description: &metric.description,
                     unit: &metric.unit,
-                    base_attributes: &base_attributes,
+                    resource_attributes: &resource_attributes,
+                    scope_attributes: &scope_attributes,
                     metadata: &metadata,
                     ingested,
                 };
@@ -990,8 +987,9 @@ mod tests {
     #[test]
     fn metrics_arrow_schema_has_expected_columns() {
         let schema = metrics_arrow_schema().expect("metrics arrow schema");
-        // 32 top-level fields per metrics_schema() (field ids 1..=31 plus `metadata` at id 50).
-        assert_eq!(schema.fields().len(), 32);
+        // 34 top-level fields per metrics_schema(): field ids 1..=31, `metadata`
+        // at id 50, and the appended `resource_attributes` (53) / `scope_attributes` (56).
+        assert_eq!(schema.fields().len(), 34);
         for name in [
             "tenant_id",
             "service_name",
@@ -1005,7 +1003,7 @@ mod tests {
             "unit",
             "aggregation_temporality",
             "is_monotonic",
-            "attributes",
+            "data_point_attributes",
             "value_double",
             "value_int",
             "count",
@@ -1025,6 +1023,8 @@ mod tests {
             "flags",
             "exemplars",
             "metadata",
+            "resource_attributes",
+            "scope_attributes",
         ] {
             assert!(schema.field_with_name(name).is_ok(), "missing column {name}");
         }
@@ -1075,6 +1075,41 @@ mod tests {
         }
     }
 
+    /// Build a single-Gauge-datapoint batch with independently controlled
+    /// resource / scope / data-point attribute sets, for exercising the
+    /// per-OTLP-level attribute split.
+    fn metrics_batch_with(
+        resource_attrs: &[KeyValue],
+        scope_attrs: &[KeyValue],
+        point_attrs: &[KeyValue],
+    ) -> RecordBatch {
+        let mut dp = gauge_double_dp(1.0);
+        dp.attributes = point_attrs.to_vec();
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: resource_attrs.to_vec(),
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(opentelemetry_proto::tonic::common::v1::InstrumentationScope {
+                        attributes: scope_attrs.to_vec(),
+                        ..Default::default()
+                    }),
+                    metrics: vec![Metric {
+                        name: "m".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge { data_points: vec![dp] })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        batch.expect("batch")
+    }
+
     /// Pull row 0 of a `MapArray` column into a `BTreeMap`.
     fn map_pairs(batch: &RecordBatch, column: &str) -> BTreeMap<String, String> {
         let map = batch
@@ -1115,7 +1150,7 @@ mod tests {
         let batch = batch.expect("batch");
         assert_eq!(drops, 0);
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 32);
+        assert_eq!(batch.num_columns(), 34);
 
         let metric_type = batch
             .column_by_name("metric_type")
@@ -1240,40 +1275,54 @@ mod tests {
     }
 
     #[test]
-    fn attributes_merge_resource_scope_datapoint_with_datapoint_winning() {
-        let mut dp = gauge_double_dp(1.0);
-        dp.attributes = vec![kv("host", "h-dp"), kv("dp.only", "v")];
-        let request = ExportMetricsServiceRequest {
-            resource_metrics: vec![ResourceMetrics {
-                resource: Some(Resource {
-                    attributes: vec![kv("service.name", "svc"), kv("host", "h-res"), kv("res.only", "v")],
-                    ..Default::default()
-                }),
-                scope_metrics: vec![ScopeMetrics {
-                    scope: Some(opentelemetry_proto::tonic::common::v1::InstrumentationScope {
-                        attributes: vec![kv("scope.only", "v")],
-                        ..Default::default()
-                    }),
-                    metrics: vec![Metric {
-                        name: "m".to_string(),
-                        data: Some(metric::Data::Gauge(Gauge { data_points: vec![dp] })),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
-        let batch = batch.expect("batch");
-        let attrs = map_pairs(&batch, "attributes");
-        assert_eq!(attrs.get("host"), Some(&"h-dp".to_string())); // data point wins
-        assert_eq!(attrs.get("res.only"), Some(&"v".to_string()));
-        assert_eq!(attrs.get("scope.only"), Some(&"v".to_string()));
-        assert_eq!(attrs.get("dp.only"), Some(&"v".to_string()));
-        // service.name is promoted to its own column and suppressed from the merged
-        // map at the resource level (mirrors logs), so it is not stored twice.
-        assert!(!attrs.contains_key("service.name"));
+    fn metrics_route_attributes_to_their_own_maps() {
+        let batch = metrics_batch_with(
+            &[kv("service.name", "api"), kv("k8s.pod.name", "web-1")],
+            &[kv("otel.scope.name", "lib")],
+            &[kv("http.method", "GET")],
+        );
+
+        let resource = map_pairs(&batch, "resource_attributes");
+        let scope = map_pairs(&batch, "scope_attributes");
+        let data_point = map_pairs(&batch, "data_point_attributes");
+
+        assert_eq!(resource.get("k8s.pod.name").map(String::as_str), Some("web-1"));
+        assert!(!resource.contains_key("service.name"), "promoted to its own column");
+        assert_eq!(scope.get("otel.scope.name").map(String::as_str), Some("lib"));
+        assert_eq!(data_point.get("http.method").map(String::as_str), Some("GET"));
+
+        // Resource and scope no longer bleed into the data-point map.
+        assert!(!data_point.contains_key("k8s.pod.name"));
+        assert!(!data_point.contains_key("otel.scope.name"));
+    }
+
+    #[test]
+    fn attributes_at_each_level_keep_their_own_value_independently() {
+        // `host` is set at both the resource and data-point level.
+        let batch = metrics_batch_with(
+            &[kv("service.name", "svc"), kv("host", "h-res"), kv("res.only", "v")],
+            &[kv("scope.only", "v")],
+            &[kv("host", "h-dp"), kv("dp.only", "v")],
+        );
+
+        let resource = map_pairs(&batch, "resource_attributes");
+        let scope = map_pairs(&batch, "scope_attributes");
+        let data_point = map_pairs(&batch, "data_point_attributes");
+
+        // With the levels split into their own columns there is no cross-level
+        // merge any more (unlike the pre-split `merge_point_attributes`
+        // behavior, where a data-point attribute overwrote the same key
+        // flattened from resource/scope): each map keeps its own value.
+        assert_eq!(resource.get("host"), Some(&"h-res".to_string()));
+        assert_eq!(data_point.get("host"), Some(&"h-dp".to_string()));
+
+        assert_eq!(resource.get("res.only"), Some(&"v".to_string()));
+        assert_eq!(scope.get("scope.only"), Some(&"v".to_string()));
+        assert_eq!(data_point.get("dp.only"), Some(&"v".to_string()));
+
+        // service.name is promoted to its own column and suppressed from the
+        // resource level only.
+        assert!(!resource.contains_key("service.name"));
     }
 
     #[test]

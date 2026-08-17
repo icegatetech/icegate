@@ -9,10 +9,12 @@
 //!    the `attributes.*.key` sub-column for every row group via
 //!    [`crate::engine::metadata_scan::parquet_reader::read_column_dictionaries`].
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use iceberg::arrow::ArrowFileReader;
 use iceberg::expr::Predicate;
+use icegate_common::attribute_key::normalize_attribute_key;
 use icegate_common::schema::COL_TENANT_ID;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -131,6 +133,28 @@ pub async fn collect_map_keys_via_dict(
     };
 
     parquet_reader::read_column_dictionaries(reader, metadata, predicate, key_leaf_idx, out).await?;
+    retain_discoverable_keys(out, config);
+    Ok(())
+}
+
+/// Reduce raw stored map keys to the label names `/labels` may advertise.
+///
+/// Under a normalizing policy the keys are rendered as wire names BEFORE the
+/// exclusions apply, because both exclusion lists are written in wire form: a
+/// stored `trace.id` would otherwise slip past a `trace_id` exclusion and then
+/// be normalized into exactly that name by the caller, re-exposing the label
+/// the exclusion exists to hide. Normalization is idempotent, so hoisting it
+/// here does not change what the caller emits.
+fn retain_discoverable_keys(out: &mut BTreeSet<String>, config: &MetadataScanConfig) {
+    if config.normalize_keys {
+        *out = std::mem::take(out)
+            .into_iter()
+            .map(|key| match normalize_attribute_key(&key) {
+                Cow::Borrowed(_) => key,
+                Cow::Owned(wire_name) => wire_name,
+            })
+            .collect();
+    }
 
     // Hard exclusion: system-reserved keys (tenant_id) are stripped
     // unconditionally regardless of caller config. The tenant column
@@ -141,12 +165,15 @@ pub async fn collect_map_keys_via_dict(
     for &key in config.excluded_map_keys {
         out.remove(key);
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_system_reserved;
+    use std::collections::BTreeSet;
+
+    use icegate_common::schema::{COL_LOG_ATTRIBUTES, COL_SPAN_ATTRIBUTES};
+
+    use super::{MetadataScanConfig, is_system_reserved, retain_discoverable_keys};
 
     #[test]
     fn tenant_id_is_system_reserved() {
@@ -171,5 +198,60 @@ mod tests {
         ] {
             assert!(!is_system_reserved(ok), "{ok} should not be reserved");
         }
+    }
+
+    /// Loki-shaped config: wire-form exclusions, normalizing policy.
+    const NORMALIZING_CFG: MetadataScanConfig = MetadataScanConfig {
+        indexed_columns: &[],
+        label_aliases: &[],
+        excluded_map_keys: &["trace_id", "span_id"],
+        map_column: COL_LOG_ATTRIBUTES,
+        normalize_keys: true,
+    };
+
+    /// Tempo-shaped config: keys are matched as stored, nothing normalizes.
+    const EXACT_CFG: MetadataScanConfig = MetadataScanConfig {
+        indexed_columns: &[],
+        label_aliases: &[],
+        excluded_map_keys: &["trace_id", "span_id"],
+        map_column: COL_SPAN_ATTRIBUTES,
+        normalize_keys: false,
+    };
+
+    fn discoverable(stored: &[&str], config: &MetadataScanConfig) -> Vec<String> {
+        let mut out: BTreeSet<String> = stored.iter().map(|k| (*k).to_string()).collect();
+        retain_discoverable_keys(&mut out, config);
+        out.into_iter().collect()
+    }
+
+    #[test]
+    fn dotted_key_is_excluded_under_its_wire_name() {
+        // The regression: a stored `trace.id` used to survive the wire-form
+        // exclusion and then be normalized into `trace_id` by the caller,
+        // re-exposing the high-cardinality label the list exists to hide.
+        assert_eq!(discoverable(&["trace.id", "pod"], &NORMALIZING_CFG), vec!["pod"]);
+    }
+
+    #[test]
+    fn dotted_system_reserved_key_is_excluded_under_its_wire_name() {
+        assert_eq!(discoverable(&["tenant.id", "pod"], &NORMALIZING_CFG), vec!["pod"]);
+    }
+
+    #[test]
+    fn surviving_keys_come_back_as_wire_names_when_normalizing() {
+        assert_eq!(
+            discoverable(&["k8s.pod.name"], &NORMALIZING_CFG),
+            vec!["k8s_pod_name".to_string()]
+        );
+    }
+
+    #[test]
+    fn dotted_key_is_kept_as_stored_when_not_normalizing() {
+        // Tempo addresses attributes by their dotted name, so neither the
+        // rendering nor the wire-form exclusion may apply there.
+        assert_eq!(
+            discoverable(&["trace.id", "http.method"], &EXACT_CFG),
+            vec!["http.method".to_string(), "trace.id".to_string()]
+        );
     }
 }

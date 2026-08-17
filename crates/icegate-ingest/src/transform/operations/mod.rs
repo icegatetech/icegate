@@ -23,30 +23,34 @@ use arrow::datatypes::Schema;
 use iceberg::arrow::schema_to_arrow_schema;
 
 use self::projection::{OperationRow, project_operation_row};
-use super::attributes::{extract_string_value, list_element_field, now_micros};
+use super::attributes::{SERVICE_NAME_KEY, extract_string_value, list_element_field, now_micros};
 
-/// Returns the Arrow schema for `operations`, derived from the Iceberg schema.
+/// Process-wide cache of the derived operations Arrow schema.
+static OPERATIONS_ARROW_SCHEMA: OnceLock<std::result::Result<Arc<Schema>, String>> = OnceLock::new();
+
+/// Returns the Arrow schema for `operations`, derived once from the Iceberg
+/// schema and cached for the lifetime of the process.
 ///
-/// Uses `icegate_common::schema::operations_schema()` as the source of truth
-/// and converts it via `iceberg::arrow::schema_to_arrow_schema()`.
+/// Uses `icegate_common::schema::operations_schema()` as the source of truth and
+/// converts it via `iceberg::arrow::schema_to_arrow_schema()`. The conversion is
+/// memoised because rebuilding 60+ Iceberg fields on every request is wasted
+/// work; cloning the cached `Arc` is cheap.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics only if the statically-defined Iceberg schema cannot be created or
-/// converted to Arrow, which cannot happen in practice.
-#[allow(clippy::expect_used)]
-pub fn operations_arrow_schema() -> Schema {
-    // Cached: the schema is static, but rebuilding 60+ Iceberg fields and
-    // converting to Arrow on every request is wasted work. Cloning the cached
-    // `Schema` is cheap because Arrow `Fields` are `Arc`-backed.
-    static SCHEMA: OnceLock<Schema> = OnceLock::new();
-    SCHEMA
-        .get_or_init(|| {
-            let iceberg_schema =
-                icegate_common::schema::operations_schema().expect("operations_schema should always be valid");
-            schema_to_arrow_schema(&iceberg_schema).expect("operations schema conversion should succeed")
-        })
-        .clone()
+/// Returns `IngestError::Validation` if the Iceberg operations schema cannot be
+/// built or converted to Arrow. The schema is statically defined, so this does
+/// not happen in practice.
+pub fn operations_arrow_schema() -> crate::error::Result<Arc<Schema>> {
+    match OPERATIONS_ARROW_SCHEMA.get_or_init(|| {
+        let iceberg_schema = icegate_common::schema::operations_schema().map_err(|e| e.to_string())?;
+        schema_to_arrow_schema(&iceberg_schema).map(Arc::new).map_err(|e| e.to_string())
+    }) {
+        Ok(schema) => Ok(Arc::clone(schema)),
+        Err(message) => Err(crate::error::IngestError::Validation(format!(
+            "failed to build operations Arrow schema: {message}"
+        ))),
+    }
 }
 
 /// Append one optional `Vec<String>` as a NULL-or-populated list entry.
@@ -107,7 +111,7 @@ pub fn operations_to_record_batch(
 
     let tenant = tenant_id.unwrap_or(icegate_common::DEFAULT_TENANT_ID);
     let ingested_at = now_micros()?;
-    let schema = operations_arrow_schema();
+    let schema = operations_arrow_schema()?;
 
     let mut rows: Vec<OperationRow> = Vec::with_capacity(total_spans);
     let mut drops: usize = 0;
@@ -123,7 +127,7 @@ pub fn operations_to_record_batch(
         let resource_attrs = resource_spans.resource.as_ref().map_or(&empty_attrs, |r| &r.attributes);
         let service_name = resource_attrs
             .iter()
-            .find(|kv| kv.key == "service.name")
+            .find(|kv| kv.key == SERVICE_NAME_KEY)
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
         for scope_spans in &resource_spans.scope_spans {
@@ -362,7 +366,7 @@ pub fn operations_to_record_batch(
         Arc::new(encoding_formats_b.finish()),
     ];
 
-    let batch = RecordBatch::try_new(Arc::new(schema), columns).map_err(|e| {
+    let batch = RecordBatch::try_new(schema, columns).map_err(|e| {
         tracing::error!("Failed to create operations RecordBatch: {e}");
         crate::error::IngestError::Validation(format!("Failed to create operations RecordBatch: {e}"))
     })?;

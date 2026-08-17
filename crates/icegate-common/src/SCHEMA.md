@@ -91,8 +91,11 @@ CREATE TABLE iceberg.triplecloud.logs (
     -- Log body (simplified from AnyValue variant to String)
     body VARCHAR,                    -- Optional - may be empty for some log records
 
-    -- Attributes (merged from resource, scope, and log-level attributes)
-    attributes MAP(VARCHAR, VARCHAR) NOT NULL
+    -- Attributes, one map per OTLP level. Keys keep their dotted OTel-native
+    -- form; nothing on the write path rewrites them.
+    resource_attributes MAP(VARCHAR, VARCHAR) NOT NULL,  -- OTLP Resource.attributes
+    scope_attributes MAP(VARCHAR, VARCHAR) NOT NULL,     -- OTLP InstrumentationScope.attributes
+    log_attributes MAP(VARCHAR, VARCHAR) NOT NULL        -- OTLP LogRecord.attributes
 )
 WITH (
     format = 'PARQUET',
@@ -112,7 +115,7 @@ ALTER TABLE iceberg.triplecloud.logs SET PROPERTIES
 
 -- Create table comment
 COMMENT ON TABLE iceberg.triplecloud.logs IS
-    'OpenTelemetry log records with severity, body, and merged attributes from resource/scope/log levels';
+    'OpenTelemetry log records with severity, body, and per-OTLP-level attribute maps (resource/scope/log)';
 ```
 
 ---
@@ -147,8 +150,8 @@ CREATE TABLE iceberg.triplecloud.spans (
     status_code INTEGER,               -- StatusCode enum value
     status_message VARCHAR,
 
-    -- Attributes (merged from resource, scope, and span attributes)
-    attributes MAP(VARCHAR, VARCHAR) NOT NULL,
+    -- Resource attributes (OTLP Resource.attributes only)
+    resource_attributes MAP(VARCHAR, VARCHAR) NOT NULL,
 
     -- Flags and monitoring
     flags INTEGER,
@@ -172,7 +175,16 @@ CREATE TABLE iceberg.triplecloud.spans (
         attributes MAP(VARCHAR, VARCHAR),
         dropped_attributes_count INTEGER,
         flags INTEGER
-    ))
+    )),
+
+    -- Span attributes: OTLP Span.attributes only.
+    -- Placed after links (as in schema.rs) for contiguous Iceberg field IDs.
+    span_attributes MAP(VARCHAR, VARCHAR) NOT NULL,
+
+    -- Scope attributes (OTLP InstrumentationScope.attributes). Appended
+    -- after span_attributes rather than declared beside resource_attributes,
+    -- so every pre-existing field id stays put.
+    scope_attributes MAP(VARCHAR, VARCHAR) NOT NULL
 )
 WITH (
     format = 'PARQUET',
@@ -192,7 +204,7 @@ ALTER TABLE iceberg.triplecloud.spans SET PROPERTIES
 
 -- Create table comment
 COMMENT ON TABLE iceberg.triplecloud.spans IS
-    'OpenTelemetry distributed trace spans with nested events and links, merged attributes from resource/scope/span levels';
+    'OpenTelemetry distributed trace spans with nested events and links, and resource/scope/span attributes in separate maps';
 ```
 
 ---
@@ -222,8 +234,12 @@ CREATE TABLE iceberg.triplecloud.events (
     trace_id VARBINARY,               -- 16-byte W3C trace ID (FIXED_LEN_BYTE_ARRAY(16))
     span_id VARBINARY,                -- 8-byte W3C span ID (FIXED_LEN_BYTE_ARRAY(8))
 
-    -- Event attributes
-    attributes MAP(VARCHAR, VARCHAR) NOT NULL
+    -- Attributes, one map per OTLP level. Events are extracted from OTLP
+    -- LogRecords, so they carry log_attributes rather than a dedicated
+    -- event_attributes column.
+    resource_attributes MAP(VARCHAR, VARCHAR) NOT NULL,  -- OTLP Resource.attributes
+    scope_attributes MAP(VARCHAR, VARCHAR) NOT NULL,     -- OTLP InstrumentationScope.attributes
+    log_attributes MAP(VARCHAR, VARCHAR) NOT NULL        -- OTLP LogRecord.attributes
 )
 WITH (
     format = 'PARQUET',
@@ -280,8 +296,10 @@ CREATE TABLE iceberg.triplecloud.metrics (
     aggregation_temporality VARCHAR,      -- DELTA or CUMULATIVE
     is_monotonic BOOLEAN,
 
-    -- Attributes (merged from resource, scope, and metric/data point attributes)
-    attributes MAP(VARCHAR, VARCHAR) NOT NULL,
+    -- Data-point attributes (OTLP <X>DataPoint.attributes). Renamed from
+    -- `attributes`: after the per-level split it holds only the data
+    -- point's own attributes (ids unchanged).
+    data_point_attributes MAP(VARCHAR, VARCHAR) NOT NULL,
 
     -- Value fields (for gauge and sum metrics)
     value_double DOUBLE,
@@ -323,8 +341,15 @@ CREATE TABLE iceberg.triplecloud.metrics (
         attributes MAP(VARCHAR, VARCHAR)
     )),
 
-    -- OTLP Metric.metadata (additional KeyValue metadata describing the metric)
-    metadata MAP(VARCHAR, VARCHAR)
+    -- OTLP Metric.metadata (additional KeyValue metadata describing the
+    -- metric). Non-identifying by the OTLP spec, so it is not an attribute
+    -- level: it exists for lossless round-trip translation only.
+    metadata MAP(VARCHAR, VARCHAR),
+
+    -- Resource and scope attributes. Appended after the previous maximum
+    -- field id (52) so every pre-existing id stays put.
+    resource_attributes MAP(VARCHAR, VARCHAR) NOT NULL,  -- OTLP Resource.attributes
+    scope_attributes MAP(VARCHAR, VARCHAR) NOT NULL      -- OTLP InstrumentationScope.attributes
 )
 WITH (
     format = 'PARQUET',
@@ -344,7 +369,7 @@ ALTER TABLE iceberg.triplecloud.metrics SET PROPERTIES
 
 -- Create table comment
 COMMENT ON TABLE iceberg.triplecloud.metrics IS
-    'OpenTelemetry metrics (gauge, sum, histogram, exponential histogram, summary) with merged attributes from resource/scope/metric levels';
+    'OpenTelemetry metrics (gauge, sum, histogram, exponential histogram, summary) with per-OTLP-level attribute maps (resource/scope/data point)';
 ```
 
 ---
@@ -501,7 +526,9 @@ SELECT
     timestamp,
     severity_text,
     body,
-    attributes
+    resource_attributes,
+    scope_attributes,
+    log_attributes
 FROM iceberg.triplecloud.logs
 WHERE service_name = 'api-service'
   AND timestamp >= TIMESTAMP '2025-01-01 00:00:00 UTC'
@@ -612,9 +639,20 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 
 ---
 
-**Version:** 1.4
-**Last Updated:** 2026-06-25
+**Version:** 1.6
+**Last Updated:** 2026-08-13
 **Schema Source:** `crates/icegate-common/src/schema.rs`
+
+**Notable Changes in v1.6:**
+- Attribute keys are stored in OTel-native dotted form on every table (e.g. `k8s.pod.name`, not `k8s_pod_name`). Ingest no longer rewrites `.` to `_`.
+- `logs`, `spans`, `events`, and `metrics` each store one `MAP(VARCHAR, VARCHAR)` per OTLP level instead of one merged `attributes` map, named after the OTLP message that owns the `attributes` field: `resource_attributes`, `scope_attributes`, and `log_attributes` / `span_attributes` / `data_point_attributes`.
+- `spans` splits into three maps rather than two: `resource_attributes` (OTLP `Resource.attributes`, field id 15), `span_attributes` (OTLP `Span.attributes` only, id 40), and `scope_attributes` (OTLP `InstrumentationScope.attributes`, appended at id 43). `span_attributes` no longer folds scope attributes in — both maps are declared after `links`, in that order, so every pre-existing field id stays put.
+- `metrics` renames `attributes` to `data_point_attributes` (ids unchanged: 13/32/33) and appends `resource_attributes` (53) and `scope_attributes` (56) after the previous maximum id (52). `metadata` still holds OTLP `Metric.metadata` at its own id (50); it is non-identifying and is not an attribute level.
+- `logs` and `events` each split their single `attributes` map into `resource_attributes` (13), `scope_attributes` (16), and `log_attributes` (19) (events rows are extracted from OTLP `LogRecord`s, so they carry `log_attributes` rather than a dedicated `event_attributes`). Ids 10-12, which held the merged map, are **retired and never reused**: Iceberg matches on the field id, so reusing 10 would make an old data file's merged, underscored map read back as `resource_attributes`.
+- No table has a merged `attributes` column any more. The nested `attributes` maps inside the `spans.events`/`spans.links` structs and the `metrics.exemplars` struct are unaffected — those are per-event/per-link/per-exemplar OTLP fields, not one of the four per-message levels this split addresses.
+- The Loki wire format is unchanged: label names remain `[a-zA-Z_][a-zA-Z0-9_]*`. Dot-to-underscore normalization moved from ingest to query time, so a stored `user.id` key is still exposed to Loki clients as `user_id`.
+- Breaking. `migrate upgrade` does not rewrite in place: **drain the WAL queue first**, then drop `logs`, `spans`, `events`, and `metrics` through the catalog and re-run `migrate create`. Data in those four tables is lost. `operations` and `prices` are untouched.
+  Draining first is not optional: the queue lives on object storage independently of the Iceberg tables, so segments written by the previous ingest binary survive the drop and are shifted against the new schema. They carry the old column layout, and the shifter resolves parquet leaves against the *current* schema, so their attribute statistics are silently dropped.
 
 **Notable Changes in v1.4:**
 - Added the `operations` table (5th physical table): a typed columnar projection over the LLM/GenAI subset of `spans` (1:1 by `span_id`), partitioned `tenant_id` + `day(timestamp)`, sorted `trace_id` + `timestamp DESC` (no `service_name` leg; D10).
