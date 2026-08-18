@@ -101,22 +101,21 @@ async fn build_catalog() -> (Arc<dyn Catalog>, tempfile::TempDir) {
     (catalog, warehouse)
 }
 
-/// One log row per offset, in the canonical `logs` schema.
+/// An all-empty attribute map for `column`, one entry per row.
 ///
-/// Only `body` distinguishes the rows; the other required columns carry fixed
-/// values, and the optional ones are left null.
-fn logs_batch(arrow_schema: &ArrowSchemaRef, offsets: impl IntoIterator<Item = u64>) -> RecordBatch {
-    let bodies: Vec<String> = offsets.into_iter().map(body_of_segment).collect();
-    let row_count = bodies.len();
-
-    let attributes_field = arrow_schema.field_with_name(schema::COL_ATTRIBUTES).expect("attributes column");
-    let DataType::Map(entries_field, _) = attributes_field.data_type() else {
-        panic!("attributes must be a map in the canonical logs schema");
+/// The key and value fields are cloned from the target column: each OTLP level
+/// carries its own Iceberg field ids in that metadata, so an array built from
+/// another level's fields is a genuine `DataType` mismatch and
+/// `RecordBatch::try_new` rejects it.
+fn empty_attribute_map(arrow_schema: &ArrowSchemaRef, column: &str, row_count: usize) -> ArrayRef {
+    let field = arrow_schema.field_with_name(column).expect("attribute column");
+    let DataType::Map(entries_field, _) = field.data_type() else {
+        panic!("{column} must be a map in the canonical logs schema");
     };
     let DataType::Struct(entry_fields) = entries_field.data_type() else {
         panic!("map entries must be a struct");
     };
-    let mut attributes_builder = MapBuilder::new(
+    let mut builder = MapBuilder::new(
         Some(MapFieldNames {
             entry: entries_field.name().clone(),
             key: entry_fields[0].name().clone(),
@@ -125,16 +124,27 @@ fn logs_batch(arrow_schema: &ArrowSchemaRef, offsets: impl IntoIterator<Item = u
         StringBuilder::new(),
         StringBuilder::new(),
     )
-    .with_keys_field(entry_fields[0].clone())
-    .with_values_field(entry_fields[1].clone());
+    .with_keys_field(Arc::clone(&entry_fields[0]))
+    .with_values_field(Arc::clone(&entry_fields[1]));
     for _ in 0..row_count {
-        attributes_builder.append(true).expect("append empty attribute map");
+        builder.append(true).expect("append empty attribute map");
     }
+    Arc::new(builder.finish())
+}
+
+/// One log row per offset, in the canonical `logs` schema.
+///
+/// Only `body` distinguishes the rows; the other required columns carry fixed
+/// values — the three attribute maps an empty map per row, since the schema
+/// requires them — and the optional ones are left null.
+fn logs_batch(arrow_schema: &ArrowSchemaRef, offsets: impl IntoIterator<Item = u64>) -> RecordBatch {
+    let bodies: Vec<String> = offsets.into_iter().map(body_of_segment).collect();
+    let row_count = bodies.len();
 
     let timestamps: ArrayRef = Arc::new(datafusion::arrow::array::TimestampMicrosecondArray::from(
         vec![TIMESTAMP_MICROS; row_count],
     ));
-    let columns: HashMap<&str, ArrayRef> = HashMap::from([
+    let mut columns: HashMap<&str, ArrayRef> = HashMap::from([
         (
             schema::COL_TENANT_ID,
             Arc::new(StringArray::from(vec![TENANT_ID; row_count])) as ArrayRef,
@@ -143,11 +153,15 @@ fn logs_batch(arrow_schema: &ArrowSchemaRef, offsets: impl IntoIterator<Item = u
         (schema::COL_OBSERVED_TIMESTAMP, Arc::clone(&timestamps)),
         (schema::COL_INGESTED_TIMESTAMP, timestamps),
         (schema::COL_BODY, Arc::new(StringArray::from(bodies)) as ArrayRef),
-        (
-            schema::COL_ATTRIBUTES,
-            Arc::new(attributes_builder.finish()) as ArrayRef,
-        ),
     ]);
+    columns.extend(
+        [
+            schema::COL_RESOURCE_ATTRIBUTES,
+            schema::COL_SCOPE_ATTRIBUTES,
+            schema::COL_LOG_ATTRIBUTES,
+        ]
+        .map(|column| (column, empty_attribute_map(arrow_schema, column, row_count))),
+    );
 
     let arrays: Vec<ArrayRef> = arrow_schema
         .fields()
