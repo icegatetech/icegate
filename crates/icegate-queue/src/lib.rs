@@ -13,18 +13,25 @@
 //! - **Sequential ordering**: Monotonically increasing offsets per topic
 //! - **Row group partitioning**: Optional grouping by column for efficient reads
 //! - **Backpressure**: Bounded channels prevent memory overflow
-//! - **Recovery**: Automatic offset recovery on restart
+//! - **Recovery**: Offset recovery is part of starting the writer, and fails the
+//!   start when the queue's history cannot be resumed
+//! - **Retention**: [`QueueCleaner`] deletes a topic's tail below a bound the
+//!   caller derives
 //!
 //! ## Example
 //!
 //! ```ignore
-//! use icegate_queue::{PreparedWalRowGroup, QueueConfig, QueueWriter, WriteRequest, Topic};
+//! use icegate_queue::{PreparedWalRowGroup, QueueConfig, QueueWriter, WriteRequest, Topic, channel};
 //! use arrow::record_batch::RecordBatch;
 //! use tokio::sync::oneshot;
 //!
-//! // Create queue writer
+//! // Create queue writer and start it: `start` recovers the per-topic offset
+//! // counters first and fails instead of starting on a queue whose history
+//! // cannot be resumed.
 //! let config = QueueConfig::new("s3://bucket/queue");
-//! let (tx, writer) = QueueWriter::new(config, object_store)?;
+//! let (tx, rx) = channel(config.common.channel_capacity);
+//! let writer = QueueWriter::new(config, object_store);
+//! let handle = writer.start(rx).await?;
 //!
 //! // Send write request
 //! let (response_tx, response_rx) = oneshot::channel();
@@ -41,6 +48,7 @@
 
 mod accumulator;
 mod channel;
+mod cleaner;
 mod config;
 mod error;
 mod extract;
@@ -49,6 +57,7 @@ mod segment;
 mod writer;
 
 pub use channel::{PreparedWalRowGroup, Topic, WriteChannel, WriteReceiver, WriteRequest, WriteResult, channel};
+pub use cleaner::{DeleteLimits, DeleteSummary, QueueCleaner};
 pub use config::{CompressionCodec, QueueConfig};
 pub use error::{QueueError, Result};
 pub use extract::{ExtractField, ExtractedValue, FieldExtractor};
@@ -56,7 +65,7 @@ pub use reader::{
     ListedSegment, ParquetQueueReader, QueueReader, RecordBatchStream, RowGroupPlanEntry, SegmentFile, SegmentsPlan,
 };
 pub use segment::SegmentId;
-pub use writer::{NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome};
+pub use writer::{CommittedOffsetsByTopic, NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome};
 
 /// WAL footer key for per-row-group opaque payloads.
 ///

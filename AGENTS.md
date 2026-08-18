@@ -64,7 +64,7 @@ goes in `icegate-common`, never copied into a component.
 | `icegate-queue`      | Generic WAL data queue on object storage: durable-before-ack, exactly-once, per-topic offsets. | [README](crates/icegate-queue/README.md)                                                                 |
 | `icegate-ingest`     | OTLP receivers (gRPC/HTTP), transform, WAL write.                                              | per-tenant task model [README](crates/icegate-ingest/README.md)                                                   |
 | `icegate-query`      | Query APIs (Loki/Prometheus/Tempo), query engine, LogQL, query CLI.                            | [README](crates/icegate-query/README.md), LogQL [logql/README](crates/icegate-query/src/logql/README.md) |
-| `icegate-maintain`   | Background maintenance: compaction, GC, schema migration, maintain CLI.                        | [README](crates/icegate-maintain/README.md), compaction [compact/README](crates/icegate-maintain/src/compact/README.md), retention [migrate/README](crates/icegate-maintain/src/migrate/README.md) |
+| `icegate-maintain`   | Background maintenance: compaction, GC, WAL cleanup, schema migration, maintain CLI.           | [README](crates/icegate-maintain/README.md), compaction [compact/README](crates/icegate-maintain/src/compact/README.md), retention [migrate/README](crates/icegate-maintain/src/migrate/README.md), WAL cleanup [wal_cleanup/README](crates/icegate-maintain/src/wal_cleanup/README.md) |
 
 ### Dependency rules
 - `icegate-common` is the foundation and depends on no other workspace crate;

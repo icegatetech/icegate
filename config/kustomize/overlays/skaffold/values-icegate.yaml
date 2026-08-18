@@ -165,6 +165,20 @@ maintain:
         prefix: gc
         jobStateCodec: json
         requestTimeoutSecs: 5
+  ## WAL cleanup — enabled with a dev cadence: run every minute (the prod default
+  ## is 10 minutes). `keepSegmentsCount` inherits the chart default, which is
+  ## also the floor the pod enforces. Its own worker pool and job-state prefix,
+  ## as gc and compaction have.
+  walCleanup:
+    enabled: true
+    jobsmanager:
+      scanIntervalSecs: 60
+      storage:
+        endpoint: http://rustfs-svc.infra.svc.cluster.local:9000
+        bucket: jobs
+        prefix: wal_cleanup
+        jobStateCodec: json
+        requestTimeoutSecs: 5
   ## LLM pricing crawler — enabled in dev with a short 5-minute cadence so a
   ## real crawl runs shortly after startup and can be inspected. Fetches the
   ## live OpenRouter and LiteLLM feeds (chart defaults), so the dev cluster

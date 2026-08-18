@@ -47,7 +47,7 @@ use iceberg::Catalog;
 use iceberg::spec::DataFile;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use icegate_catalog_s3::S3Catalog;
-use icegate_common::{LOGS_TABLE, WAL_OFFSET_PROPERTY, icegate_table_ident, resolve_wal_offset};
+use icegate_common::{LOGS_TABLE, WAL_OFFSET_PROPERTY, icegate_table_ident, resolve_committed_offset};
 use icegate_maintain::gc::config::GcOrphansConfig;
 use icegate_maintain::gc::metrics::GcMetrics;
 use icegate_maintain::gc::sweep::run_sweep;
@@ -281,7 +281,7 @@ async fn read_history(catalog: &S3Catalog) -> (usize, Option<u64>) {
         .await
         .expect("load logs table");
     let metadata = table.metadata();
-    let offset = resolve_wal_offset(metadata).expect("the WAL offset must stay resolvable");
+    let offset = resolve_committed_offset(metadata).expect("the WAL offset must stay resolvable");
     (metadata.snapshots().len(), offset)
 }
 

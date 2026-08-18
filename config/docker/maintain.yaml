@@ -18,6 +18,47 @@ storage:
     region: us-east-1
     endpoint: http://s3:9000
 
+# WAL queue location. Must match the ingest service's `queue.common.base_path`
+# (config/docker/ingest.yaml) — the queue lives in its own bucket, reached with
+# the same storage credentials as the tables.
+queue:
+  common:
+    base_path: s3://queue/
+
+# WAL segment cleanup for the long-running `maintain run` service. Deletes the
+# queue tail already shifted into Iceberg, up to `committed - keep_segments_count`.
+# Runs on its own worker pool with its own "wal_cleanup" job-state prefix, as compaction,
+# gc and pricing do; the cadence is `jobsmanager.scan_interval_secs`. Demo
+# setting: cleanup every minute (prod default is 10 minutes).
+wal_cleanup:
+  enabled: true
+  dry_run: false
+  logs_enabled: true
+  spans_enabled: true
+  metrics_enabled: true
+  operations_enabled: true
+  # Segments kept below the committed offset. It is a margin in segments against
+  # a time window: a query planned on a cached catalog provider reads the WAL
+  # from that provider's boundary for up to
+  # `engine.max_age_secs + engine.max_query_duration_secs` (config/docker/query.yaml)
+  # and fails when cleanup has taken those segments. The value is that window
+  # times the segments per second one topic rolls, at the shipped defaults.
+  keep_segments_count: 1200
+  max_deletes_per_cycle: 5000
+  delete_concurrency: 8
+  cleanup_timeout_secs: 120
+  jobsmanager:
+    scan_interval_secs: 60
+    worker_count: 2
+    poll_interval_ms: 1000
+    storage:
+      endpoint: http://s3:9000
+      bucket: jobs
+      prefix: wal_cleanup
+      region: us-east-1
+      job_state_codec: json
+      request_timeout_secs: 5
+
 # Snapshot-retention policy stamped into the properties of every table
 # `migrate create` creates; the long-running services never read this block.
 # Expiration then rides along on every commit those services make, off the
@@ -62,7 +103,7 @@ compaction:
 # S3 objects no longer referenced by table metadata and older than the grace
 # period. Aggressive demo settings: sweep every 5 minutes, 10-minute grace
 # (prod defaults are daily / 7 days). Uses its own "gc" job-state prefix so it
-# never collides with compaction's.
+# never collides with compaction's, and its own worker pool.
 gc:
   enabled: true
   logs_enabled: true

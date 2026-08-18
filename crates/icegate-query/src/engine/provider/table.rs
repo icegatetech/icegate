@@ -23,8 +23,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::union::UnionExec;
 use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
-use icegate_common::resolve_wal_offset;
-use icegate_queue::ParquetQueueReader;
+use icegate_common::resolve_committed_offset;
+use icegate_queue::{ParquetQueueReader, QueueError, SegmentFile};
 use tokio_util::sync::CancellationToken;
 
 use super::WalQueryConfig;
@@ -202,9 +202,18 @@ impl TableProvider for IcegateTableProvider {
 impl IcegateTableProvider {
     /// Build a DataFusion execution plan for WAL Parquet segments.
     ///
-    /// Lists WAL segments after `start_offset`, converts logical filter
+    /// Lists WAL segments from `start_offset` upwards, converts logical filter
     /// expressions to physical predicates, and configures a `DataSourceExec`
     /// with Parquet row group pruning enabled.
+    ///
+    /// Returns `Ok(None)` when the topic holds no segment at or above
+    /// `start_offset` — a queue the Shifter has caught up with.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::list_wal_segments`] reports, plus
+    /// [`DataFusionError::Plan`] when a filter cannot be turned into a physical
+    /// predicate or the WAL store URL does not parse.
     #[tracing::instrument(level = "debug", skip(self, state, projection, filters), fields(start_offset))]
     async fn build_wal_plan(
         &self,
@@ -219,11 +228,15 @@ impl IcegateTableProvider {
         }
 
         // List WAL segments via the shared reader
-        let files = self.list_wal_files(start_offset).await?;
-        if files.is_empty() {
+        let segments = self.list_wal_segments(start_offset).await?;
+        if segments.is_empty() {
             return Ok(None);
         }
-        tracing::debug!(segment_count = files.len(), "Listed WAL segments");
+        tracing::debug!(segment_count = segments.len(), "Listed WAL segments");
+        let files: Vec<datafusion::datasource::listing::PartitionedFile> = segments
+            .into_iter()
+            .map(|segment| datafusion::datasource::listing::PartitionedFile::new(segment.path, segment.size))
+            .collect();
 
         // Convert logical filter expressions to physical predicates
         // for Parquet row group pruning
@@ -280,41 +293,54 @@ impl IcegateTableProvider {
         Ok(Some(DataSourceExec::from_data_source(config)))
     }
 
-    /// List WAL segment files after the given offset and return as
-    /// `PartitionedFile` entries.
+    /// List the WAL segments at or above `start_offset`, ordered by offset
+    /// ascending.
+    ///
+    /// The queue guarantees the listing either is empty or is an unbroken run
+    /// starting at exactly `start_offset`; a gap below it is
+    /// [`QueueError::SegmentsGone`] and one inside it is
+    /// [`QueueError::SegmentMissing`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataFusionError::Execution`] for both of those, carrying what
+    /// an operator can act on — that failure is not the queue's to explain,
+    /// because the retention that caused it is configured in the maintain
+    /// service. Every other listing failure stays
+    /// [`DataFusionError::External`].
     #[tracing::instrument(level = "debug", skip(self), fields(start_offset))]
-    async fn list_wal_files(
-        &self,
-        start_offset: u64,
-    ) -> DFResult<Vec<datafusion::datasource::listing::PartitionedFile>> {
+    async fn list_wal_segments(&self, start_offset: u64) -> DFResult<Vec<SegmentFile>> {
         // Intentionally uncancellable: WAL segment listing is a short metadata
         // operation during query planning that must run to completion.
         let uncancellable_token = CancellationToken::new();
-        let segment_files = self
+        let segments = self
             .wal_reader
             .list_segment_files(&self.topic, start_offset, &uncancellable_token)
             .await
-            .map_err(|e| DataFusionError::External(e.into()))?;
+            .map_err(|e| match e {
+                gone @ (QueueError::SegmentsGone { .. } | QueueError::SegmentMissing { .. }) => {
+                    DataFusionError::Execution(format!(
+                        "{gone}. This query was planned against a catalog provider that reads the WAL from \
+                         {start_offset}, and retention cleanup has since deleted segments it needs. Those \
+                         rows are committed to Iceberg — retry the query so it plans on a fresh provider, \
+                         and raise maintain's wal_cleanup.keep_segments_count if this repeats"
+                    ))
+                }
+                other => DataFusionError::External(other.into()),
+            })?;
 
         tracing::debug!(
-            segments_found = segment_files.len(),
+            segments_found = segments.len(),
             start_offset,
             "WAL segment listing complete"
         );
-
-        let files: Vec<datafusion::datasource::listing::PartitionedFile> = segment_files
-            .into_iter()
-            .map(|sf| datafusion::datasource::listing::PartitionedFile::new(sf.path, sf.size))
-            .collect();
-
-        tracing::debug!(segments_resolved = files.len(), start_offset, "WAL resolving complete");
-        Ok(files)
+        Ok(segments)
     }
 }
 
 /// Extract the WAL boundary offset from Iceberg snapshot history.
 ///
-/// Delegates to [`resolve_wal_offset`], which walks the snapshot parent chain
+/// Delegates to [`resolve_committed_offset`], which walks the snapshot parent chain
 /// looking for the `icegate.queue.offset` property. The property may be absent
 /// from the current snapshot because compaction creates `replace` snapshots
 /// without it, so the walk skips past them to the Shifter commit that recorded
@@ -338,5 +364,5 @@ impl IcegateTableProvider {
 /// query results, so the scan fails loudly instead.
 #[tracing::instrument(level = "debug", skip(table))]
 fn extract_wal_offset(table: &Table) -> DFResult<Option<u64>> {
-    resolve_wal_offset(table.metadata()).map_err(|e| DataFusionError::Execution(e.to_string()))
+    resolve_committed_offset(table.metadata()).map_err(|e| DataFusionError::Execution(e.to_string()))
 }

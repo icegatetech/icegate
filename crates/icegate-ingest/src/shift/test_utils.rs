@@ -630,7 +630,7 @@ pub(super) fn tenant_ids_from_batches(batches: &[RecordBatch]) -> Vec<String> {
 }
 
 /// Create a memory-backed logs table matching the fixture batches, and the catalog holding it.
-pub(super) async fn create_logs_table(table_name: &str) -> (Arc<dyn Catalog>, Table) {
+pub(crate) async fn create_logs_table(table_name: &str) -> (Arc<dyn Catalog>, Table) {
     let catalog_config = CatalogConfig {
         backend: CatalogBackend::Memory,
         warehouse: format!("memory://shift-pipeline-{}", Uuid::new_v4()),

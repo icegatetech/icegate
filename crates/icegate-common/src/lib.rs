@@ -166,7 +166,8 @@ pub use metrics::{MetricsConfig, MetricsRuntime, run_metrics_server};
 pub use retrier::{Retrier, RetrierConfig, RetryError};
 pub use storage::{
     IceGateStorage, IceGateStorageFactory, ObjectStoreWithPath, OperatorRegistry, PrefetchConfig, S3Config,
-    StorageBackend, StorageCache, StorageConfig, StorageLayersConfig, build_storage_cache, register_foyer_metrics,
+    StorageBackend, StorageCache, StorageConfig, StorageLayersConfig, build_storage_cache, is_persistent_base_path,
+    is_retryable_error_source, is_retryable_object_store_error, register_foyer_metrics,
 };
 // Re-exported so `CatalogBuilder::from_config` callers can name the shutdown
 // token type without a direct `tokio-util` dependency.
@@ -175,7 +176,7 @@ pub use tracing::{
     TracingConfig, TracingGuard, add_span_link, add_span_links, extract_current_trace_context, init_tracing,
     traceparent_to_context,
 };
-pub use wal_offset::resolve_wal_offset;
+pub use wal_offset::resolve_committed_offset;
 
 #[cfg(test)]
 mod operations_const_tests {

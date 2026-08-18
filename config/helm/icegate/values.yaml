@@ -164,6 +164,13 @@ query:
     ## this line to do it — so unlike the tunables around it, the value is set
     ## rather than commented out, and unsetting it fails the render.
     maxAgeSecs: 30
+    ## Hard ceiling (seconds) on one query's wall clock, enforced on Loki,
+    ## Prometheus, Tempo and Flight SQL. Together with maxAgeSecs it bounds how
+    ## long a query can hold a cached provider, and so how far behind the
+    ## committed WAL boundary a live reader can be — which is the window
+    ## maintain.walCleanup.keepSegmentsCount has to cover in segments. Raising
+    ## either of the two widens that window.
+    maxQueryDurationSecs: 30
     ## Include WAL (hot) segments in query results (default: false).
     ## When false, queries only read committed Iceberg data.
     ## Note: does not affect /labels, /label_values, or /series — those are Iceberg-only.
@@ -670,14 +677,15 @@ maintain:
       deleteConcurrency: 16
       ## Per-table sweep task deadline, in seconds.
       sweepTimeoutSecs: 3600
-    ## Jobs-manager settings. Reuses compaction's shape but with its own worker
-    ## pool and a distinct "gc" job-state prefix. Credentials come from the pod's
-    ## AWS env vars, not configured here.
+    ## Jobs-manager settings: the sweep's own worker pool and a distinct "gc"
+    ## job-state prefix. Credentials come from the pod's AWS env vars, not
+    ## configured here.
     jobsmanager:
       ## Period of the per-table GC discovery loop, in seconds (default: daily).
       scanIntervalSecs: 86400
-      ## Number of concurrent GC workers (GC is I/O-bound and runs infrequently).
-      workerCount: 2
+      ## Number of concurrent sweep workers. One is enough for a daily loop; WAL
+      ## cleanup no longer shares this pool.
+      workerCount: 1
       ## Jobmanager worker poll interval, in milliseconds.
       pollIntervalMs: 1000
       storage:
@@ -686,6 +694,62 @@ maintain:
         endpoint: ""
         bucket: jobs
         prefix: gc
+        region: ""  # defaults to aws.region
+        jobStateCodec: json
+        requestTimeoutSecs: 5
+
+  ## WAL segment cleanup (maps to the binary's WalCleanupConfig). Deletes the
+  ## queue tail already shifted into Iceberg; without it WAL segments are never
+  ## reclaimed. Runs as its own per-topic loop on its own worker pool, reading
+  ## the queue location from `queue.common.basePath` at the chart root.
+  walCleanup:
+    ## Master switch. Off by default so an upgrade never silently begins
+    ## deleting; an operator opts in explicitly.
+    enabled: false
+    ## Count what would be deleted and delete nothing (escape hatch).
+    dryRun: false
+    ## Per-topic cleanup toggles. There is no `events` topic — that table has no
+    ## WAL of its own.
+    topics:
+      logs: true
+      spans: true
+      metrics: true
+      operations: true
+    ## Segments below the committed offset that are never deleted: the delete
+    ## bound is `committed - keepSegmentsCount`. This is the whole retention
+    ## margin, and it is a margin in segments against a window in time — a query
+    ## planned against a cached provider reads the WAL from the boundary that
+    ## provider recorded, for up to
+    ## `query.engine.maxAgeSecs + query.engine.maxQueryDurationSecs`, and fails
+    ## if cleanup has taken those segments. Size it as that window times the
+    ## segments per second one topic rolls; the default is that product at the
+    ## defaults of both, and the pod rejects anything below it while cleanup is
+    ## enabled. Raise it with the ingest rate, not with the retention you want.
+    keepSegmentsCount: 1200
+    ## Ceiling on deletions per topic per cycle; a cycle that hits it logs a
+    ## warning and leaves the rest for the next one.
+    maxDeletesPerCycle: 50000
+    ## Max concurrent segment deletions.
+    deleteConcurrency: 16
+    ## Per-topic cleanup task deadline, in seconds.
+    cleanupTimeoutSecs: 600
+    ## Jobs-manager settings: cleanup's own worker pool and a distinct
+    ## "wal_cleanup" job-state prefix, so it never contends with gc or compaction.
+    ## Credentials come from the pod's AWS env vars, not configured here.
+    jobsmanager:
+      ## Period of the per-topic cleanup loop, in seconds.
+      scanIntervalSecs: 600
+      ## Number of concurrent cleanup workers. The enabled topics share them, so
+      ## a slow topic delays the others below this count.
+      workerCount: 2
+      ## Jobmanager worker poll interval, in milliseconds.
+      pollIntervalMs: 1000
+      storage:
+        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## an https:// endpoint connects over TLS, http:// does not.
+        endpoint: ""
+        bucket: jobs
+        prefix: wal_cleanup
         region: ""  # defaults to aws.region
         jobStateCodec: json
         requestTimeoutSecs: 5

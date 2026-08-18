@@ -15,7 +15,7 @@ use icegate_common::parquet_writer::ColumnEncoding;
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
 use jobmanager::{JobsManager, JobsManagerHandle, TaskCode, TaskDefinition};
 
-use crate::compact::config::CompactionConfig;
+use crate::compact::config::{COMPACTION_CONFIG_BLOCK, CompactionConfig};
 use crate::compact::data::planner::PlannerLimits;
 use crate::compact::data::rewrite::CompactFilesExecutor;
 use crate::compact::manifest::rewrite::ManifestCompactExecutor;
@@ -200,7 +200,7 @@ impl Compactor {
         // The pool records nothing: compaction's own instruments are `CompactMetrics`, and the
         // jobmanager's job/task/storage measurements are not collected for this component.
         let mut builder = JobsManager::builder()
-            .s3(config.jobsmanager.storage.to_s3_storage_config()?)
+            .s3(config.jobsmanager.storage.to_s3_storage_config(COMPACTION_CONFIG_BLOCK)?)
             .workers(config.jobsmanager.worker_count)
             .poll_interval(Duration::from_millis(config.jobsmanager.poll_interval_ms));
 

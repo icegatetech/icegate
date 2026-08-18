@@ -7,11 +7,14 @@
 //! - [`IceGateStorage`] / [`IceGateStorageFactory`] — Iceberg `Storage` impl
 //!   with foyer caching and OpenTelemetry layers
 //! - [`StorageCache`] / [`build_storage_cache`] — shared foyer cache utilities
+//! - [`is_retryable_object_store_error`] / [`is_retryable_error_source`] —
+//!   whether a storage failure is worth another attempt
 //!
 //! Both operator paths resolve through the registry, which wraps every
 //! operator it builds in the layer stack defined by the private `layers`
 //! module, whose docs carry the reason operators are built once and reused.
 
+mod base_path;
 mod builder;
 pub mod cache;
 mod config;
@@ -20,7 +23,9 @@ pub mod icegate_storage;
 mod layers;
 pub mod prefetch;
 mod registry;
+mod retryable;
 
+pub use base_path::is_persistent_base_path;
 pub use builder::ObjectStoreWithPath;
 pub use cache::{StorageCache, build_storage_cache, register_foyer_metrics};
 pub use config::{S3Config, StorageBackend, StorageConfig};
@@ -28,3 +33,4 @@ pub use icegate_storage::{IceGateStorage, IceGateStorageFactory};
 pub use layers::StorageLayersConfig;
 pub use prefetch::PrefetchConfig;
 pub use registry::OperatorRegistry;
+pub use retryable::{is_retryable_error_source, is_retryable_object_store_error};

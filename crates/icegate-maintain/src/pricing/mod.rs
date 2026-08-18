@@ -59,6 +59,7 @@ use reqwest::Client;
 use tracing::{Instrument, info_span};
 
 use crate::error::{MaintainError, Result};
+use crate::pricing::config::PRICING_CONFIG_BLOCK;
 
 /// Task code for the single pricing crawl task.
 pub const PRICING_TASK_CODE: &str = "pricing";
@@ -495,7 +496,7 @@ impl PricingRunner {
         // meter installed by `MetricsRuntime`; inert when metrics are disabled (no
         // provider set).
         let manager = JobsManager::builder()
-            .s3(config.jobsmanager.storage.to_s3_storage_config()?)
+            .s3(config.jobsmanager.storage.to_s3_storage_config(PRICING_CONFIG_BLOCK)?)
             .workers(config.jobsmanager.worker_count)
             .poll_interval(Duration::from_millis(config.jobsmanager.poll_interval_ms))
             .metrics(Arc::new(OtelMetrics::new(&opentelemetry::global::meter(

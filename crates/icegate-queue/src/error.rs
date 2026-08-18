@@ -1,6 +1,8 @@
 //! Error types for the queue crate.
 
-use std::{error::Error, io};
+use std::io;
+
+use icegate_common::{is_retryable_error_source, is_retryable_object_store_error};
 
 /// Result type for queue operations.
 pub type Result<T> = std::result::Result<T, QueueError>;
@@ -55,6 +57,48 @@ pub enum QueueError {
     InvalidPath {
         /// The invalid path.
         path: String,
+    },
+
+    /// Segments the caller asked to read from are gone from the topic.
+    ///
+    /// Contiguity below the requested offset is this crate's invariant, so the
+    /// gap is reported here rather than left for a caller to discover by
+    /// comparing offsets. Reported as facts only: what was asked for and what
+    /// survives. Whoever configured the retention that removed them is the one
+    /// who can say what to do about it.
+    #[error(
+        "WAL segments {requested_offset}..={} of topic '{topic}' are gone: the lowest surviving \
+         segment is {lowest_offset}",
+        lowest_offset.saturating_sub(1)
+    )]
+    SegmentsGone {
+        /// Topic the listing was asked for.
+        topic: String,
+        /// Offset the caller asked to read from.
+        requested_offset: u64,
+        /// Lowest offset the topic still holds.
+        lowest_offset: u64,
+    },
+
+    /// A segment inside the listed range is gone, so the run starts where the
+    /// caller asked but breaks further up.
+    ///
+    /// The other shape of the same loss, and the one retention cleanup leaves
+    /// behind when it skips a segment the store refuses to delete and reclaims
+    /// its neighbours. A caller handed the shorter list would read the segments
+    /// above the break as if they followed the ones below it, and the rows in
+    /// between would vanish without a trace.
+    #[error(
+        "WAL segment {missing_offset} of topic '{topic}' is gone: the listing from \
+         {requested_offset} is not contiguous"
+    )]
+    SegmentMissing {
+        /// Topic the listing was asked for.
+        topic: String,
+        /// Offset the caller asked to read from.
+        requested_offset: u64,
+        /// Lowest offset the topic no longer holds inside the listed range.
+        missing_offset: u64,
     },
 
     /// Parquet encoding/decoding error.
@@ -118,17 +162,27 @@ impl icegate_common::RetryError for QueueError {
 
 impl QueueError {
     /// Returns true when the error can be retried safely.
+    ///
+    /// Classification of a storage fault lives in `icegate-common`
+    /// ([`is_retryable_object_store_error`]): this crate does not depend on
+    /// opendal, and opendal is where the transient/permanent status of an S3
+    /// answer is actually recorded.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Write { source, .. } | Self::Read { source, .. } => is_retryable_error_chain(source.as_ref()),
-            Self::ObjectStore(err) => is_retryable_object_store(err),
-            Self::Io(err) => is_retryable_io(err),
+            Self::Write { source, .. } | Self::Read { source, .. } => is_retryable_error_source(source.as_ref()),
+            Self::ObjectStore(err) => is_retryable_object_store_error(err),
+            // The chain walk starts at the error itself, so an already typed
+            // `io::Error` is classified by the same list.
+            Self::Io(err) => is_retryable_error_source(err),
             Self::Multiple(errors) => errors.iter().all(Self::is_retryable),
             Self::Cancelled
             | Self::MaxAttemptsReached
             | Self::AlreadyExists { .. }
             | Self::Recovery { .. }
             | Self::InvalidPath { .. }
+            // Listing again cannot bring back a deleted file.
+            | Self::SegmentsGone { .. }
+            | Self::SegmentMissing { .. }
             | Self::Parquet(_)
             | Self::Arrow(_)
             | Self::Json(_)
@@ -138,40 +192,4 @@ impl QueueError {
             | Self::Join(_) => false,
         }
     }
-}
-
-fn is_retryable_object_store(err: &object_store::Error) -> bool {
-    match err {
-        object_store::Error::Generic { source, .. } => is_retryable_error_chain(source.as_ref()),
-        _ => false,
-    }
-}
-
-fn is_retryable_error_chain(err: &(dyn Error + 'static)) -> bool {
-    let mut current: Option<&(dyn Error + 'static)> = Some(err);
-    while let Some(error) = current {
-        if let Some(io_err) = error.downcast_ref::<io::Error>() {
-            if is_retryable_io(io_err) {
-                return true;
-            }
-        }
-        current = error.source();
-    }
-    false
-}
-
-fn is_retryable_io(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::TimedOut
-            | io::ErrorKind::Interrupted
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::HostUnreachable
-    )
 }

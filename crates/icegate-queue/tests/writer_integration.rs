@@ -18,7 +18,7 @@ async fn test_write_single_batch_to_s3() -> Result<(), Box<dyn std::error::Error
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     // Write batch
     let batch = common::test_batch(100, 5)?;
@@ -57,7 +57,7 @@ async fn test_sequential_writes_monotonic_offsets() -> Result<(), Box<dyn std::e
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let batch = common::test_batch(10, 1)?;
 
@@ -101,7 +101,7 @@ async fn test_write_empty_batch() -> Result<(), Box<dyn std::error::Error>> {
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     // Create empty batch
     let batch = common::test_batch(0, 1)?;
@@ -140,7 +140,7 @@ async fn test_write_with_base_path() -> Result<(), Box<dyn std::error::Error>> {
     let config = QueueConfig::new("my-custom-path");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let batch = common::test_batch(10, 1)?;
     let (response_tx, response_rx) = oneshot::channel();
@@ -175,7 +175,7 @@ async fn test_channel_write_response() -> Result<(), Box<dyn std::error::Error>>
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store);
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let batch = common::test_batch(42, 1)?;
     let (response_tx, response_rx) = oneshot::channel();
@@ -209,7 +209,7 @@ async fn test_multi_batch_request_gets_single_ack_and_multiple_row_groups() -> R
     let config = QueueConfig::new("queue").with_flush_interval_ms(50);
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let batch_a = common::test_batch(3, 1)?;
     let batch_b = common::test_batch(2, 1)?;
@@ -258,7 +258,7 @@ async fn test_logs_row_group_boundary_metadata_roundtrips_through_wal_footer() -
     let config = QueueConfig::new("queue").with_flush_interval_ms(50);
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let batch_a = common::logs_batch(&[(Some("svc-2"), Some(40), 1), (Some("svc-2"), Some(30), 2)]);
     let batch_b = common::logs_batch(&[(Some("svc-1"), Some(20), 3), (Some("svc-1"), Some(10), 4)]);
@@ -329,7 +329,7 @@ async fn test_requests_in_same_flush_share_offset_but_keep_own_record_counts() -
         .with_flush_interval_ms(50);
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store);
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let (first_response_tx, first_response_rx) = oneshot::channel();
     tx.send(WriteRequest {
@@ -377,7 +377,7 @@ async fn test_write_then_read_roundtrip() -> Result<(), Box<dyn std::error::Erro
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let original_batch = common::test_batch(100, 5)?;
     let (response_tx, response_rx) = oneshot::channel();
@@ -431,7 +431,7 @@ async fn test_write_read_schema_preservation() -> Result<(), Box<dyn std::error:
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let original_batch = common::test_batch(50, 2)?;
     let original_schema = original_batch.schema();
@@ -487,7 +487,7 @@ async fn test_write_read_with_compression() -> Result<(), Box<dyn std::error::Er
     let config = QueueConfig::new("queue");
     let (tx, rx) = channel(config.common.channel_capacity);
     let writer = QueueWriter::new(config, store.clone());
-    let handle = writer.start(rx);
+    let handle = writer.start(rx).await.unwrap();
 
     let original_batch = common::test_batch(1000, 10)?;
     let (response_tx, response_rx) = oneshot::channel();

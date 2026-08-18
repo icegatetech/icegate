@@ -42,6 +42,11 @@ arrow-flight = { workspace = true }
 # gRPC server
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
+# Middleware of our own: the Flight SQL response-body deadline layer
+# (`infra::deadline`) implements tower's `Layer`/`Service` over `http` bodies.
+tower = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
 
 # Object storage
 object_store = { workspace = true }
@@ -100,4 +105,9 @@ reqwest = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true, features = ["util"] }
+# Body combinators (`BodyExt`) used to drive the deadline layer's bodies in tests.
+http-body-util = "0.1"
+# `test-util` enables the paused-clock (`start_paused`) test runtime the response
+# deadline tests run on, so a 30 s deadline costs no wall-clock time.
+tokio = { workspace = true, features = ["test-util"] }

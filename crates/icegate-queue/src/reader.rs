@@ -229,6 +229,15 @@ impl ParquetQueueReader {
     /// Lists segments for a topic starting from a given offset.
     ///
     /// Returns listed segments (with file sizes) sorted by offset.
+    ///
+    /// Reports the segments that exist AS THEY ARE: it does NOT verify that the
+    /// listing reaches down to `start_offset`, nor that it holds every offset in
+    /// between. A caller that needs the contiguous run — an empty listing or an
+    /// unbroken one starting exactly at `start_offset` — must use
+    /// [`Self::list_segment_files`], which checks for the segments retention
+    /// cleanup deleted and reports them
+    /// ([`QueueError::SegmentsGone`], [`QueueError::SegmentMissing`]). This
+    /// method silently returns the shorter list instead.
     pub async fn list_segments(
         &self,
         topic: &Topic,
@@ -327,14 +336,23 @@ impl ParquetQueueReader {
         Ok(segments)
     }
 
-    /// Lists segment files for a topic with their sizes.
+    /// Lists segment files for a topic with their sizes, from `start_offset`
+    /// upwards and ordered by offset ascending.
     ///
     /// File sizes are obtained directly from the object store listing,
     /// avoiding extra HEAD requests.
     ///
+    /// The result is either EMPTY — the topic holds nothing at or above
+    /// `start_offset`, which is a queue its consumer has caught up with — or it
+    /// is an UNBROKEN run of offsets starting at exactly `start_offset`.
+    /// Segments retention cleanup has taken are a gap, not a shorter answer; see
+    /// [`Self::verify_listing_continuity`].
+    ///
     /// # Errors
     ///
-    /// Returns an error if the segment listing fails.
+    /// Returns [`QueueError::SegmentsGone`] when the lowest surviving segment is
+    /// above `start_offset`, [`QueueError::SegmentMissing`] when a segment
+    /// inside the range is gone, or an error if the segment listing fails.
     pub async fn list_segment_files(
         &self,
         topic: &Topic,
@@ -342,6 +360,7 @@ impl ParquetQueueReader {
         cancel_token: &CancellationToken,
     ) -> Result<Vec<SegmentFile>> {
         let segments = self.list_segments(topic, start_offset, cancel_token).await?;
+        Self::verify_listing_continuity(topic, start_offset, &segments)?;
         let files = segments
             .into_iter()
             .map(|seg| {
@@ -355,10 +374,89 @@ impl ParquetQueueReader {
         Ok(files)
     }
 
+    /// Whether a listing covers everything the caller asked for.
+    ///
+    /// An empty listing is fine: nothing at or above `start_offset` exists yet,
+    /// which is the steady state of a queue its consumer has caught up with. A
+    /// NON-empty listing must be an unbroken run of offsets from `start_offset`
+    /// upwards, and both ways it can fall short cost the caller the same rows:
+    /// handed a listing that starts higher, or one that skips an offset in the
+    /// middle, they read it as "this is all there ever was" and lose in silence
+    /// what was deleted. The writer never skips an offset (a failed write leaves
+    /// the counter where it was, so the next one reclaims the same offset), so a
+    /// break here is always something that removed a segment after the fact —
+    /// retention cleanup stepping over a segment the store refused to delete, or
+    /// a hand reaching into the bucket.
+    ///
+    /// [`Self::list_segments`] sorts by offset, so the first entry is the lowest
+    /// and the last is the highest. An unbroken run therefore holds exactly as
+    /// many steps between neighbours as there are offsets between those two, and
+    /// a listing that holds fewer has lost some — which is the whole check, at a
+    /// cost that does not grow with the listing. The offsets are only walked to
+    /// NAME the first one lost, on the path that is already failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::SegmentsGone`] when the run starts above
+    /// `start_offset` and [`QueueError::SegmentMissing`] when it breaks above
+    /// its start, both with the offsets involved.
+    fn verify_listing_continuity(topic: &Topic, start_offset: u64, segments: &[ListedSegment]) -> Result<()> {
+        let (Some(lowest), Some(highest)) = (segments.first(), segments.last()) else {
+            return Ok(());
+        };
+        if lowest.id.offset > start_offset {
+            return Err(QueueError::SegmentsGone {
+                topic: topic.clone(),
+                requested_offset: start_offset,
+                lowest_offset: lowest.id.offset,
+            });
+        }
+        // Both subtractions are safe by construction: the listing is sorted, so
+        // the highest offset is at or above the lowest, and it is non-empty, so
+        // it holds at least one segment. Comparing the two spans rather than
+        // count against offset-span-plus-one also keeps `u64::MAX` out of an
+        // overflow.
+        let offset_span = highest.id.offset - lowest.id.offset;
+        let listed_span = segments.len() as u64 - 1;
+        if listed_span < offset_span {
+            let Some(missing_offset) = find_missing_offset(segments) else {
+                // Unreachable while the listing is sorted, and stated as an
+                // error rather than assumed away: with ascending offsets the
+                // steps between neighbours add up to the span, so fewer steps
+                // than span means one of them is longer than one. Falling
+                // through to `Ok` here would hand back the very listing the
+                // count just proved incomplete.
+                return Err(QueueError::Metadata(format!(
+                    "listing of topic '{topic}' covers offsets {}..={} in {} segments yet holds no gap: \
+                     the listing is not sorted by offset",
+                    lowest.id.offset,
+                    highest.id.offset,
+                    segments.len()
+                )));
+            };
+            return Err(QueueError::SegmentMissing {
+                topic: topic.clone(),
+                requested_offset: start_offset,
+                missing_offset,
+            });
+        }
+        Ok(())
+    }
+
     /// Lists segments and returns a flat plan of row-group entries.
     ///
     /// Entries are ordered deterministically by `(segment_idx, row_group_idx)`
     /// where `segment_idx` matches the listing order (sorted by WAL offset).
+    ///
+    /// The listing obeys the same contract as [`Self::list_segment_files`]:
+    /// either empty, or an unbroken run starting at exactly `start_offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::Config`] on a duplicate [`ExtractField::name`],
+    /// [`QueueError::SegmentsGone`] when the lowest surviving segment is above
+    /// `start_offset`, [`QueueError::SegmentMissing`] when a segment inside the
+    /// range is gone, and the listing or metadata error otherwise.
     pub async fn plan_segments(
         &self,
         topic: &Topic,
@@ -377,6 +475,7 @@ impl ParquetQueueReader {
         }
 
         let listed = self.list_segments(topic, start_offset, cancel_token).await?;
+        Self::verify_listing_continuity(topic, start_offset, &listed)?;
         if listed.is_empty() {
             return Ok(SegmentsPlan {
                 entries: Vec::new(),
@@ -709,6 +808,22 @@ impl ParquetQueueReader {
     }
 }
 
+/// The lowest offset absent from an ascending listing, or `None` when the
+/// listing holds every offset between its ends.
+///
+/// Runs only once a cheaper check has already established that something is
+/// missing (see [`ParquetQueueReader::verify_listing_continuity`]), so the walk
+/// costs a query that is failing anyway and buys it the offset to report.
+fn find_missing_offset(segments: &[ListedSegment]) -> Option<u64> {
+    segments
+        .windows(2)
+        // Saturating because the successor of `u64::MAX` is not an offset a
+        // segment could hold: no key sorts above it, so the pair cannot exist
+        // and the arithmetic must not decide the answer.
+        .map(|pair| (pair[0].id.offset.saturating_add(1), pair[1].id.offset))
+        .find_map(|(expected, found)| (found != expected).then_some(expected))
+}
+
 #[async_trait]
 impl QueueReader for ParquetQueueReader {
     async fn plan_segments(
@@ -729,5 +844,108 @@ impl QueueReader for ParquetQueueReader {
         cancel_token: &CancellationToken,
     ) -> Result<RecordBatchStream> {
         Self::read_segment(self, topic, offset, record_batch_idxs, cancel_token).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Topic every case below asks about; the value never reaches a store.
+    const TOPIC: &str = "logs";
+
+    /// Size every listed segment carries: continuity is decided by offsets
+    /// alone, so the number only has to be a valid one.
+    const SEGMENT_SIZE: u64 = 1;
+
+    /// What [`ParquetQueueReader::verify_listing_continuity`] must answer for
+    /// one listing, in the terms of the contract rather than of the error type.
+    #[derive(Debug)]
+    enum Continuity {
+        /// The listing covers everything the caller asked for.
+        Unbroken,
+        /// The run starts above the requested offset, with this lowest offset.
+        Gone { lowest_offset: u64 },
+        /// The run breaks above its start, at this offset.
+        Missing { missing_offset: u64 },
+    }
+
+    /// A listing of `offsets`, in the ascending order `list_segments` produces.
+    fn listing(offsets: &[u64]) -> Vec<ListedSegment> {
+        offsets
+            .iter()
+            .map(|&offset| ListedSegment {
+                id: SegmentId::new(TOPIC, offset),
+                size: SEGMENT_SIZE,
+            })
+            .collect()
+    }
+
+    /// The rule every listing-driven read depends on, over the shapes retention
+    /// cleanup and a hand in the bucket actually leave. The offsets reported are
+    /// what an operator acts on, and the FIRST lost offset is the one that
+    /// names the segment the reader would have read next — a check that named
+    /// any other gap would send them after the wrong one.
+    #[test]
+    fn verify_listing_continuity_names_the_first_offset_a_listing_lost() {
+        let cases: [(&str, u64, &[u64], Continuity); 6] = [
+            (
+                "a topic with nothing at or above the offset",
+                4,
+                &[],
+                Continuity::Unbroken,
+            ),
+            ("a single surviving segment", 4, &[4], Continuity::Unbroken),
+            ("two adjacent segments", 4, &[4, 5], Continuity::Unbroken),
+            (
+                "one segment missing from the middle",
+                4,
+                &[4, 6],
+                Continuity::Missing { missing_offset: 5 },
+            ),
+            (
+                "two gaps: the lower one is what the caller reads next",
+                4,
+                &[4, 6, 9],
+                Continuity::Missing { missing_offset: 5 },
+            ),
+            (
+                "the run starts above the requested offset",
+                3,
+                &[4, 5],
+                Continuity::Gone { lowest_offset: 4 },
+            ),
+        ];
+
+        for (case, start_offset, offsets, expected) in cases {
+            let result =
+                ParquetQueueReader::verify_listing_continuity(&TOPIC.to_string(), start_offset, &listing(offsets));
+            match (&expected, result) {
+                (Continuity::Unbroken, Ok(())) => {}
+                (
+                    Continuity::Gone { lowest_offset },
+                    Err(QueueError::SegmentsGone {
+                        requested_offset,
+                        lowest_offset: reported,
+                        ..
+                    }),
+                ) => {
+                    assert_eq!(requested_offset, start_offset, "{case}");
+                    assert_eq!(reported, *lowest_offset, "{case}");
+                }
+                (
+                    Continuity::Missing { missing_offset },
+                    Err(QueueError::SegmentMissing {
+                        requested_offset,
+                        missing_offset: reported,
+                        ..
+                    }),
+                ) => {
+                    assert_eq!(requested_offset, start_offset, "{case}");
+                    assert_eq!(reported, *missing_offset, "{case}");
+                }
+                (expected, actual) => panic!("{case}: expected {expected:?}, got {actual:?}"),
+            }
+        }
     }
 }

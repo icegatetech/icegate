@@ -424,9 +424,9 @@ async fn gc_fails_closed_and_deletes_nothing_when_a_manifest_is_unreadable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gc_runner_reclaims_in_the_background() {
-    use icegate_maintain::compact::config::{CompactionJobsManagerConfig, JobStateCodec, JobsStorageConfig};
     use icegate_maintain::gc::GcRunner;
     use icegate_maintain::gc::config::GcConfig;
+    use icegate_maintain::jobs::{JobStateCodec, JobsManagerConfig, JobsStorageConfig};
 
     let (_store, conn) = setup_object_store().await;
     let catalog = Arc::new(build_s3_catalog(&conn).await);
@@ -451,7 +451,7 @@ async fn gc_runner_reclaims_in_the_background() {
             min_age_secs: 0,
             ..GcOrphansConfig::default()
         },
-        jobsmanager: CompactionJobsManagerConfig {
+        jobsmanager: JobsManagerConfig {
             worker_count: 1,
             poll_interval_ms: 100,
             scan_interval_secs: 1,
@@ -470,7 +470,11 @@ async fn gc_runner_reclaims_in_the_background() {
     };
 
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
-    let runner = GcRunner::new_with_max_iterations(dyn_catalog, build_operator_registry(&conn).await, &gc, Some(1))
+    let spec = icegate_maintain::gc::GcRunnerSpec {
+        operator_registry: build_operator_registry(&conn).await,
+        config: gc,
+    };
+    let runner = GcRunner::new_with_max_iterations(dyn_catalog, spec, Some(1))
         .await
         .expect("build runner");
     let data_before = count_under_segment(&list_all_object_keys(&conn).await, "data");

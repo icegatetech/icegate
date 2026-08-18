@@ -71,6 +71,15 @@ impl TestServer {
     /// channel + the underlying Iceberg catalog (so tests can write
     /// fixture rows).
     pub async fn start() -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
+        Self::start_with_engine_config(QueryEngineConfig::default()).await
+    }
+
+    /// Variant of [`Self::start`] running the server on a specific engine
+    /// config — the query deadline is read from it, so a test that must see the
+    /// deadline fire cannot use the 30 s default.
+    pub async fn start_with_engine_config(
+        engine_config: QueryEngineConfig,
+    ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
         let warehouse_path = tempfile::tempdir()?;
         let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
         let catalog_config = CatalogConfig {
@@ -85,7 +94,6 @@ impl TestServer {
 
         let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let wal_reader = Arc::new(icegate_queue::ParquetQueueReader::new("", Arc::clone(&wal_store), 8192).unwrap());
-        let engine_config = QueryEngineConfig::default();
         let query_engine = Arc::new(QueryEngine::new(
             Arc::clone(&catalog),
             engine_config,
