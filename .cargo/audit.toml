@@ -19,4 +19,14 @@ ignore = [
     # object_store/datafusion/parquet stack to match.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # h2 unbounded empty DATA frames, patched only in >=0.4.16. The 0.4.x copy is
+    # updated; the remaining hit is h2 0.3.27, which no version bump can reach:
+    # aws-sdk-s3's default `rustls` feature turns on aws-smithy-runtime's
+    # `connector-hyper-0-14-x`, and that pins hyper 0.14 + h2 0.3. Dropping
+    # default features on our side would not remove it either — `jobmanager` and
+    # the iceberg AWS catalogs pull the same crates with defaults, and Cargo
+    # unions features across the graph. Nothing configures the legacy hyper-0.14
+    # connector, so the default HTTPS client stays on hyper 1.x + h2 0.4.
+    # Remove once the AWS SDK drops the hyper-0.14 connector.
+    "RUSTSEC-2026-0258",
 ]
