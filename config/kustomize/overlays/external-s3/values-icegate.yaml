@@ -6,12 +6,15 @@ namespace:
 
 ## Iceberg catalog (shared by all components)
 catalog:
-  backend: rest
-  rest:
-    uri: http://nessie.infra.svc.cluster.local.:19120/iceberg
+  backend: s3
+  s3:
+    warehouse: catalog
   warehouse: "s3://<S3_BUCKET>/warehouse/"
-  properties:
-    prefix: main
+
+## Read-only Iceberg REST endpoint for external engines (Trino, Spark).
+## Requires catalog.backend=s3; the chart fails the render otherwise.
+catalogServer:
+  enabled: true
 
 ## Storage configuration
 storage:
@@ -47,8 +50,8 @@ query:
       enabled: false
   waitForDependencies:
     enabled: true
-    endpoints:
-      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
+    buckets:
+      - <S3_BUCKET>
   loki:
     enabled: true
     port: 3100
@@ -77,8 +80,8 @@ ingest:
   replicaCount: 1
   waitForDependencies:
     enabled: true
-    endpoints:
-      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
+    buckets:
+      - <S3_BUCKET>
   otlpHttp:
     enabled: true
     port: 4318
@@ -119,5 +122,5 @@ migrate:
   activeDeadlineSeconds: 300
   waitForDependencies:
     enabled: true
-    endpoints:
-      - http://nessie.infra.svc.cluster.local.:19120/api/v2/config
+    buckets:
+      - <S3_BUCKET>

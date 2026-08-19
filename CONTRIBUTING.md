@@ -50,7 +50,7 @@ make dev     # Run full stack with hot-reload
 make debug   # Run without query service for debugging
 ```
 
-This starts RustFS (S3), Grafana, and other services via Docker Compose. The Iceberg catalog is IceGate's own S3-backed catalog (no external catalog service by default); Nessie starts only under the optional `analytics` profile.
+This starts RustFS (S3), Grafana, and other services via Docker Compose. The Iceberg catalog is IceGate's own S3-backed catalog (no external catalog service); its read-only Iceberg REST endpoint starts only under the optional `analytics` profile.
 
 ## Development Workflow
 

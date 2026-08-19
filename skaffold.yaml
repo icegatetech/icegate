@@ -34,6 +34,13 @@ build:
         buildArgs:
           BINARY: maintain
         target: runtime
+    - image: ghcr.io/icegatetech/icegate-catalog
+      context: .
+      docker:
+        dockerfile: config/docker/release.Dockerfile
+        buildArgs:
+          BINARY: catalog
+        target: runtime
 
 manifests:
   kustomize:

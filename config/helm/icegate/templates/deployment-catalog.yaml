@@ -44,8 +44,9 @@ spec:
             {{- include "icegate.awsEnv" . | nindent 12 }}
             - name: RUST_LOG
               value: {{ .Values.catalogServer.rustLog | quote }}
-            - name: OTEL_SERVICE_NAME
-              value: icegate-catalog
+            # No OTEL_* here, unlike the other components: this binary installs a
+            # bare `tracing_subscriber::fmt` (`icegate-catalog-s3/src/main.rs`)
+            # and exports no OTLP.
             {{- with .Values.catalogServer.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -102,7 +102,7 @@ Callers must use `nindent N` to place at the correct indentation level.
 {{- define "icegate.catalogYaml" -}}
 {{- if eq .Values.catalog.backend "rest" -}}
 backend: !rest
-  uri: {{ .Values.catalog.rest.uri }}
+  uri: {{ required "catalog.rest.uri is required when catalog.backend=rest" .Values.catalog.rest.uri }}
 warehouse: {{ .Values.catalog.warehouse }}
 {{- if .Values.catalog.properties }}
 properties:

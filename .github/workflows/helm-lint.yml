@@ -36,3 +36,6 @@ jobs:
 
       - name: Template catalog server
         run: make helm-catalog-test
+
+      - name: Template REST backend guard
+        run: make helm-rest-uri-test

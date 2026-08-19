@@ -55,57 +55,45 @@ services:
         aws --endpoint-url http://rustfs:9000 s3api put-bucket-lifecycle-configuration --bucket queue --lifecycle-configuration '{"Rules":[{"ID":"expire-1d","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":1}}]}'
     logging: *fluentd-logging
 
-  # Nessie + Trino form the legacy `analytics` path (opt-in via `--profile analytics`).
-  # The default stack writes to the s3-catalog, which Trino (Iceberg REST only) cannot
-  # read — so Trino sees no data from the default stack without switching icegate to `rest`.
-  nessie-init:
-    image: busybox
-    volumes:
-      - nessie-data:/data
-    command: ["sh", "-c", "chown -R 10000:10001 /data"]
-    profiles:
-      - analytics
-    logging: *fluentd-logging
-
-  nessie:
-    image: quay.io/projectnessie/nessie:0.105.7
+  # Iceberg REST endpoint over the same catalog root the default stack writes
+  # (`s3.bucket` + `s3.warehouse` in catalog.yaml), for engines that reach a
+  # catalog only over REST. Read-only by construction (GET/HEAD only): writes
+  # go through ingest, never through this endpoint.
+  catalog:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile
+      args:
+        BINARY: catalog
+        PROFILE: ${PROFILE:-release}
+    command: ["/usr/local/bin/catalog", "serve", "--config", "/etc/icegate/catalog.yaml"]
     profiles:
       - analytics
     ports:
-      - "19120:19120"
-    environment:
-      # Disable authentication
-      nessie.server.authentication.enabled: "false"
-      # Configure default warehouse
-      nessie.catalog.default-warehouse: warehouse
-      nessie.catalog.warehouses.warehouse.location: s3://warehouse/
-      # S3 configuration for RustFS
-      nessie.catalog.service.s3.default-options.endpoint: http://rustfs:9000/
-      nessie.catalog.service.s3.default-options.path-style-access: "true"
-      nessie.catalog.service.s3.default-options.region: us-east-1
-      # S3 credentials via secret reference
-      nessie.catalog.service.s3.default-options.access-key: "urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key"
-      nessie.catalog.secrets.access-key.name: rustfsadmin
-      nessie.catalog.secrets.access-key.secret: rustfsadmin
-      # RustFS / AWS SDK v2 compatibility
-      AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
-      AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
-      # RocksDB version store
-      nessie.version.store.type: ROCKSDB
-      nessie.version.store.persist.rocks.database-path: /data/rocksdb
+      - "8181:8181"
     volumes:
-      - nessie-data:/data
+      - ./catalog.yaml:/etc/icegate/catalog.yaml:ro
     depends_on:
-      rustfs:
-        condition: service_healthy
-      nessie-init:
+      migrate:
         condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_REGION: us-east-1
+      # No OTEL_* here: this binary installs a bare `tracing_subscriber::fmt`
+      # (`icegate-catalog-s3/src/main.rs`) and exports no OTLP, unlike the
+      # services that build their telemetry through `icegate-common`.
+      RUST_LOG: "info,icegate_catalog_s3=debug,tower_http=info,aws_sdk_s3=warn,aws_smithy_runtime=warn"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8181' || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 5
       start_period: 10s
+    develop:
+      watch:
+        - action: rebuild
+          path: ../../crates
     logging: *fluentd-logging
 
   migrate:
@@ -376,7 +364,7 @@ services:
     depends_on:
       rustfs:
         condition: service_healthy
-      nessie:
+      catalog:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/usr/lib/trino/bin/health-check"]
@@ -392,4 +380,3 @@ volumes:
   rustfs-data:
   prometheus-data:
   grafana-data:
-  nessie-data:
