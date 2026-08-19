@@ -36,9 +36,11 @@ catalog:
     ## table data alike, and so overrides AWS_VIRTUAL_HOSTED_STYLE_REQUEST:
     ## honouring that variable would address the two differently.
     # pathStyleAccess: true
-  ## REST catalog settings (used when backend=rest)
+  ## REST catalog settings (used when backend=rest). No default: the URI names
+  ## an external catalog service this chart does not deploy, so it must be set
+  ## by whoever runs one.
   rest:
-    uri: http://nessie:19120/iceberg
+    uri: ""
   ## S3 Tables settings (used when backend=s3tables)
   s3tables:
     tableBucketArn: ""
@@ -49,7 +51,7 @@ catalog:
   ## Iceberg warehouse location
   warehouse: "s3://warehouse/"
   ## Additional catalog properties, merged into the rendered catalog config for
-  ## every backend. Backend-specific: e.g. REST/Nessie reads `prefix: main` here,
+  ## every backend. Backend-specific: e.g. a REST catalog reads `prefix` here,
   ## the s3 backend forwards extra keys to FileIO. Structural s3 keys
   ## (bucket/region/endpoint/codec) come from the dedicated fields above.
   properties: {}

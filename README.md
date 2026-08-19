@@ -131,7 +131,7 @@ Once running, the following services are available:
 - **RustFS Console**: `http://localhost:9001` - Object storage web interface (login: rustfsadmin/rustfsadmin)
 - **RustFS API**: `http://localhost:9000` - S3-compatible object storage API
 
-The default stack uses IceGate's own S3-backed catalog (see [Catalog](#catalog)); no external catalog service is required. A Nessie catalog is started only under the optional `analytics` profile for Trino (see [Additional Profiles](#additional-profiles)).
+The default stack uses IceGate's own S3-backed catalog (see [Catalog](#catalog)); no external catalog service is required. The optional `analytics` profile additionally exposes that same catalog over a read-only Iceberg REST endpoint (see [Additional Profiles](#additional-profiles)).
 
 ### Additional Profiles
 
@@ -148,7 +148,7 @@ make run-docker-core-release
 make run-docker-analytics-release
 ```
 
-The `analytics` profile starts Nessie and Trino. This is a legacy path: Trino reads only through Nessie (Iceberg REST), so it does **not** see tables of the default stack, which live in the S3-backed catalog (see [Catalog](#catalog)). For SQL over the default stack's data, use Arrow Flight SQL at `grpc://localhost:8815`.
+The `analytics` profile starts Trino together with an Iceberg REST endpoint (`http://localhost:8181`) over the default stack's own catalog, so no separate catalog service and no separate copy of the data is involved. The endpoint serves reads only — writes go through ingest. For SQL without a separate engine, use Arrow Flight SQL at `grpc://localhost:8815`.
 
 ### Next Steps
 

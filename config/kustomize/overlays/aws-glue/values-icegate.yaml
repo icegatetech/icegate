@@ -10,8 +10,6 @@ catalog:
   glue:
     catalogId: "<AWS_ACCOUNT_ID>"
   warehouse: "s3://<S3_BUCKET>/warehouse/"
-  properties:
-    prefix: main
 
 ## Storage configuration
 storage:

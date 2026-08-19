@@ -1,5 +1,5 @@
 .PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench down \
-       helm-lint helm-template helm-catalog-test catalog-rest-check catalog-rest-test catalog-rest-clippy \
+       helm-lint helm-template helm-catalog-test helm-rest-uri-test catalog-rest-check catalog-rest-test catalog-rest-clippy \
        sanitize sanitize-address sanitize-leak sanitize-memory
 
 run-docker-core-release:
@@ -73,12 +73,16 @@ helm-lint:
 helm-template:
 	helm template icegate config/helm/icegate > /dev/null
 
-ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test catalog-rest-check catalog-rest-test catalog-rest-clippy
+ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test helm-rest-uri-test catalog-rest-check catalog-rest-test catalog-rest-clippy
 
 # The catalog server is off by default, so the default render above never covers
 # its templates. Enabling it must produce a complete deployable unit, and pairing
 # it with any backend other than s3 must fail the render rather than ship a
 # server wired to a catalog it cannot read.
+#
+# The REST case carries a `catalog.rest.uri`: without one the render stops on
+# that requirement (see `helm-rest-uri-test`) and this block would pass on an
+# unrelated failure instead of on the catalog-server guard it exists to check.
 #
 # S3 addressing is rendered only when set, because an absent key is what makes
 # the catalog derive the policy from the endpoint instead of forcing path-style
@@ -93,7 +97,7 @@ helm-catalog-test:
 			exit 1; \
 		}; \
 	done
-	@if error=$$(helm template icegate config/helm/icegate --set catalogServer.enabled=true --set catalog.backend=rest 2>&1 > /dev/null); then \
+	@if error=$$(helm template icegate config/helm/icegate --set catalogServer.enabled=true --set catalog.backend=rest --set catalog.rest.uri=http://catalog.example:19120/iceberg 2>&1 > /dev/null); then \
 		echo "expected catalog server with REST backend to fail rendering"; \
 		exit 1; \
 	fi; \
@@ -112,6 +116,17 @@ helm-catalog-test:
 		echo "an explicit pathStyleAccess must reach the catalog server config"; \
 		exit 1; \
 	}
+
+# A REST backend names an external catalog service this chart does not deploy.
+# Without a default there is nothing to inherit, so the render must fail loudly
+# rather than emit an empty `uri` that only surfaces as a runtime connection
+# error inside the pod.
+helm-rest-uri-test:
+	@if error=$$(helm template icegate config/helm/icegate --set catalog.backend=rest 2>&1 > /dev/null); then \
+		echo "expected backend=rest without catalog.rest.uri to fail rendering"; \
+		exit 1; \
+	fi; \
+	printf '%s\n' "$$error" | grep -F "catalog.rest.uri is required" > /dev/null
 
 # Run the test suite under LLVM sanitizers. Linux-only (leak and memory do not
 # exist on Darwin); scripts/sanitize.sh re-execs itself in a container on macOS.

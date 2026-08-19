@@ -1,0 +1,20 @@
+# Read-only Iceberg REST catalog over the same `root.json` the default stack
+# writes: `s3.bucket` + `s3.warehouse` repeat the catalog coordinates of
+# query.yaml (`catalog.properties.bucket`, `catalog.backend !s3 warehouse`),
+# because a REST reader pointed at a different root would serve an empty
+# catalog rather than fail. Credentials are inline for the same reason they are
+# inline in query.yaml: the catalog's S3 client is a separate path from storage.
+http:
+  host: 0.0.0.0
+  port: 8181
+  default_page_size: 100
+  max_page_size: 1000
+s3:
+  bucket: warehouse
+  region: us-east-1
+  endpoint: http://s3:9000
+  path_style_access: true
+  access_key_id: rustfsadmin
+  secret_access_key: rustfsadmin
+  warehouse: catalog
+  codec: json
