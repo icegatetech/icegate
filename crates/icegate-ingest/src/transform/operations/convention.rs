@@ -52,6 +52,37 @@ pub(crate) trait OperationConvention: Send + Sync {
         &[]
     }
 
+    /// `(attribute_key, json_field)` sources this convention reads a scalar
+    /// `field` out of, where the attribute holds an opaque JSON object rather
+    /// than the value itself.
+    ///
+    /// `OpenInference` declares no individual sampling attributes at all: an SDK
+    /// puts the whole request payload in `llm.invocation_parameters`, so
+    /// `temperature`, `top_p`, `max_tokens` and the rest are only reachable
+    /// through it. Candidates are ordered, because the JSON field name is the
+    /// provider's, not the convention's — `OpenAI` writes `max_tokens` on one API
+    /// and `max_completion_tokens` on another.
+    ///
+    /// Resolved only after every declared attribute key for the field is absent,
+    /// so a real typed attribute always wins over a value dug out of a blob.
+    /// Default: none.
+    fn json_blob_field_keys(&self, _field: OperationField) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// Attribute keys holding a single string that this convention contributes
+    /// as the sole element of a *list* `field`.
+    ///
+    /// Needed because the conventions disagree on cardinality for the same
+    /// concept: OTEL's `gen_ai.response.finish_reasons` is an array, while
+    /// `OpenInference`'s `llm.finish_reason` is one string. The list resolver
+    /// rejects a non-array outright — and a rejected value drops the whole row —
+    /// so a singular source has to be declared here rather than alongside the
+    /// array keys. Default: none.
+    fn singular_list_field_keys(&self, _field: OperationField) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Attribute-key prefixes under which this convention flattens a JSON array
     /// into indexed keys (`<prefix>.<index>.<singular>.<field>`), to be rebuilt
     /// into the array `field` expects. Used by SDKs that do not emit a
