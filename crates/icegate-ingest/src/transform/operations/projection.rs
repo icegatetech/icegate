@@ -333,7 +333,46 @@ fn resolve_str(view: &AttributeView, field: OperationField) -> Result<Option<Str
     Ok(None)
 }
 
+/// Resolve `field` out of a convention-declared JSON blob attribute.
+///
+/// Returns the raw JSON value so each typed resolver can apply its own
+/// conversion. A blob that is absent, unparseable, or missing the named field
+/// yields `None`.
+///
+/// Deliberately non-fatal, unlike the typed attribute resolvers: a blob is an
+/// opaque vendor request payload that the convention makes no type promise
+/// about, so a surprise inside it is a value this projection cannot use, not
+/// evidence that the span is malformed. Dropping the whole operations row over
+/// an unexpected `temperature` in a passthrough payload would lose the span's
+/// tokens, model, and messages along with it.
+///
+/// The blob is re-parsed per field rather than parsed once per span. Nine
+/// sampling fields consult it, so a span pays up to nine parses of a small
+/// object — measurably cheaper than threading a cache through `AttributeView`,
+/// and exactly zero for the conventions that declare no blob sources at all.
+fn resolve_blob_value(view: &AttributeView, field: OperationField) -> Option<serde_json::Value> {
+    for convention in CONVENTIONS {
+        for &(blob_key, json_field) in convention.json_blob_field_keys(field) {
+            let Some(text) = extract_string_value(view.get(blob_key)) else {
+                continue;
+            };
+            let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if let Some(value) = fields.get(json_field) {
+                if !value.is_null() {
+                    return Some(value.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the first present `i64` for `field`; strict parse (D6).
+///
+/// Falls back to a JSON blob source ([`resolve_blob_value`]) only when no
+/// declared attribute key is present.
 ///
 /// # Errors
 ///
@@ -344,7 +383,7 @@ fn resolve_i64(view: &AttributeView, field: OperationField, context: &'static st
             return extract_i64(Some(value), context);
         }
     }
-    Ok(None)
+    Ok(resolve_blob_value(view, field).and_then(|value| value.as_i64()))
 }
 
 /// Resolve the first present `f64` for `field`; strict parse (D6).
@@ -358,7 +397,11 @@ fn resolve_f64(view: &AttributeView, field: OperationField, context: &'static st
             return extract_f64(Some(value), context);
         }
     }
-    Ok(None)
+    // A blob number arrives as JSON, where `1` and `1.0` are the same literal,
+    // so an integral value is accepted here rather than demanded as a float.
+    Ok(resolve_blob_value(view, field)
+        .and_then(|value| value.as_f64())
+        .filter(|number| number.is_finite()))
 }
 
 /// Resolve the first present `bool` for `field`; strict parse (D6).
@@ -372,7 +415,7 @@ fn resolve_bool(view: &AttributeView, field: OperationField, context: &'static s
             return extract_bool(Some(value), context);
         }
     }
-    Ok(None)
+    Ok(resolve_blob_value(view, field).and_then(|value| value.as_bool()))
 }
 
 /// Resolve the first present `Vec<String>` for `field`; strict parse (D6).
@@ -386,7 +429,26 @@ fn resolve_str_list(view: &AttributeView, field: OperationField, context: &'stat
             return extract_string_list(Some(value), context);
         }
     }
-    Ok(None)
+    Ok(resolve_singular_list(view, field))
+}
+
+/// Resolve a list `field` from a convention that states it as a single string,
+/// yielding a one-element list.
+///
+/// Kept out of [`resolve_str_list`]'s main loop because the two cardinalities
+/// cannot share a key list: `extract_string_list` rejects a non-array value,
+/// and that rejection drops the entire operations row. A singular key listed
+/// beside the array keys would therefore not merely fail to resolve — it would
+/// discard the span's whole projection.
+fn resolve_singular_list(view: &AttributeView, field: OperationField) -> Option<Vec<String>> {
+    for convention in CONVENTIONS {
+        for &key in convention.singular_list_field_keys(field) {
+            if let Some(value) = extract_string_value(view.get(key)) {
+                return Some(vec![value]);
+            }
+        }
+    }
+    None
 }
 
 /// Resolve the first present JSON-serialized content for `field`.
@@ -1391,6 +1453,221 @@ mod tests {
         let input: serde_json::Value =
             serde_json::from_str(row.input_messages.as_deref().expect("present")).expect("json");
         assert_eq!(input[0]["content"], "whole");
+    }
+
+    #[test]
+    fn openinference_sampling_params_come_out_of_the_invocation_parameters_blob() {
+        // OpenInference declares no individual sampling attributes; an SDK puts
+        // the whole request payload in one JSON attribute, so these nine typed
+        // columns are reachable only through it.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str(
+                "llm.invocation_parameters",
+                r#"{"temperature":0.7,"top_p":0.95,"top_k":40,"max_tokens":512,
+                    "frequency_penalty":0.1,"presence_penalty":-0.2,"seed":7,"stream":true,"n":3}"#,
+            ),
+        ]);
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("row");
+
+        assert!((row.temperature.expect("temperature") - 0.7).abs() < f64::EPSILON);
+        assert!((row.top_p.expect("top_p") - 0.95).abs() < f64::EPSILON);
+        assert_eq!(row.top_k, Some(40));
+        assert_eq!(row.max_tokens, Some(512));
+        assert!((row.frequency_penalty.expect("frequency") - 0.1).abs() < f64::EPSILON);
+        assert!((row.presence_penalty.expect("presence") + 0.2).abs() < f64::EPSILON);
+        assert_eq!(row.seed, Some(7));
+        assert_eq!(row.stream, Some(true));
+        assert_eq!(row.choice_count, Some(3), "OpenAI spells choice count `n`");
+    }
+
+    #[test]
+    fn max_completion_tokens_is_accepted_as_max_tokens() {
+        // The Responses API and the reasoning models spell it this way; the
+        // published TRAIL dataset uses it on 1,508 spans.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.invocation_parameters", r#"{"max_completion_tokens":8192}"#),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        assert_eq!(row.max_tokens, Some(8192));
+    }
+
+    #[test]
+    fn a_typed_attribute_wins_over_the_same_field_inside_a_blob() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_dbl("gen_ai.request.temperature", 0.1),
+            kv_str("llm.invocation_parameters", r#"{"temperature":0.9}"#),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        assert!((row.temperature.expect("temperature") - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_malformed_blob_leaves_the_column_null_without_dropping_the_row() {
+        // A blob is an opaque vendor payload, not a typed attribute the
+        // convention promises, so a surprise inside it must not cost the span
+        // its tokens, model, and messages.
+        for blob in [
+            "not json at all",
+            r#"{"temperature":"hot"}"#,
+            r#"["temperature", 0.7]"#,
+            r#"{"temperature":null}"#,
+        ] {
+            let span = span_with(vec![
+                kv_str("openinference.span.kind", "LLM"),
+                kv_int("llm.token_count.total", 42),
+                kv_str("llm.invocation_parameters", blob),
+            ]);
+            let row = project_operation_row(&span, None, "t", None, 1)
+                .expect("a bad blob must not fail the projection")
+                .expect("row survives");
+            assert_eq!(row.temperature, None, "blob {blob} must not populate temperature");
+            assert_eq!(row.total_tokens, Some(42), "the rest of the row survives blob {blob}");
+        }
+    }
+
+    #[test]
+    fn openinference_tool_attributes_project_onto_the_tool_columns() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "TOOL"),
+            kv_str("tool.name", "web_search"),
+            kv_str("tool.description", "Search the web"),
+            kv_str("tool.id", "call_62136355"),
+            kv_str("tool.parameters", r#"{"q":"string"}"#),
+        ]);
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("row");
+
+        assert_eq!(row.operation_name, "execute_tool");
+        assert_eq!(row.tool_name.as_deref(), Some("web_search"));
+        assert_eq!(row.tool_description.as_deref(), Some("Search the web"));
+        assert_eq!(row.tool_call_id.as_deref(), Some("call_62136355"));
+        assert_eq!(row.tool_definitions.as_deref(), Some(r#"{"q":"string"}"#));
+    }
+
+    #[test]
+    fn a_tool_json_schema_is_preferred_over_bare_parameters() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "TOOL"),
+            kv_str("tool.parameters", r#"{"q":"string"}"#),
+            kv_str("tool.json_schema", r#"{"type":"function"}"#),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        assert_eq!(
+            row.tool_definitions.as_deref(),
+            Some(r#"{"type":"function"}"#),
+            "the complete definition wins over the argument shape alone"
+        );
+    }
+
+    #[test]
+    fn a_singular_finish_reason_becomes_a_one_element_list() {
+        // OTEL's equivalent is an array and OpenInference's is one string. The
+        // array resolver rejects a non-array and a rejection drops the row, so
+        // this guards that the singular source is handled separately.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.finish_reason", "stop"),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("a singular finish reason must not drop the row")
+            .expect("row");
+        assert_eq!(row.finish_reasons, Some(vec!["stop".to_string()]));
+    }
+
+    #[test]
+    fn an_array_finish_reason_still_wins_over_the_singular_one() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.finish_reason", "stop"),
+            KeyValue {
+                key_strindex: 0,
+                key: "gen_ai.response.finish_reasons".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::ArrayValue(ArrayValue {
+                        values: vec![AnyValue {
+                            value: Some(Value::StringValue("length".to_string())),
+                        }],
+                    })),
+                }),
+            },
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        assert_eq!(row.finish_reasons, Some(vec!["length".to_string()]));
+    }
+
+    #[test]
+    fn llm_provider_fills_provider_name_when_no_system_is_stated() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.provider", "azure"),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        assert_eq!(row.provider_name.as_deref(), Some("azure"));
+    }
+
+    #[test]
+    fn llm_system_outranks_llm_provider_for_provider_name() {
+        // `llm.system` names the AI product, which is what this column means
+        // elsewhere; `llm.provider` names the host it runs on.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.provider", "azure"),
+            kv_str("llm.system", "openai"),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        assert_eq!(row.provider_name.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn embedding_and_reranker_model_names_fill_request_model() {
+        for key in ["embedding.model_name", "reranker.model_name"] {
+            let span = span_with(vec![kv_str("openinference.span.kind", "LLM"), kv_str(key, "model-x")]);
+            let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+            assert_eq!(
+                row.request_model.as_deref(),
+                Some("model-x"),
+                "{key} must fill the column"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_prompts_and_choices_project_into_the_message_columns() {
+        // A completions API has no roles, so these rebuild to [{"text": ...}].
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.prompts.0.prompt.text", "def fib(n):"),
+            kv_str("llm.choices.0.completion.text", " return n"),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let input: serde_json::Value =
+            serde_json::from_str(row.input_messages.as_deref().expect("present")).expect("json");
+        assert_eq!(input[0]["text"], "def fib(n):");
+        let output: serde_json::Value =
+            serde_json::from_str(row.output_messages.as_deref().expect("present")).expect("json");
+        assert_eq!(output[0]["text"], " return n");
+    }
+
+    #[test]
+    fn chat_messages_outrank_completions_prompts() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.prompts.0.prompt.text", "completions"),
+            kv_str("llm.input_messages.0.message.role", "user"),
+            kv_str("llm.input_messages.0.message.content", "chat"),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let input: serde_json::Value =
+            serde_json::from_str(row.input_messages.as_deref().expect("present")).expect("json");
+        assert_eq!(input[0]["content"], "chat");
     }
 
     #[test]
