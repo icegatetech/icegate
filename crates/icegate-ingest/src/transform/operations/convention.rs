@@ -52,6 +52,19 @@ pub(crate) trait OperationConvention: Send + Sync {
         &[]
     }
 
+    /// Attribute-key prefixes under which this convention flattens a JSON array
+    /// into indexed keys (`<prefix>.<index>.<singular>.<field>`), to be rebuilt
+    /// into the array `field` expects. Used by SDKs that do not emit a
+    /// structured array attribute at all — `OpenInference` spreads a prompt
+    /// across one attribute per message field. Resolved after the scalar
+    /// [`Self::field_keys`] and before the object, message, and event modes,
+    /// since a convention that offers both a whole array and its flattened
+    /// pieces means the same thing by each and the whole array is cheaper.
+    /// Default: none.
+    fn indexed_field_prefixes(&self, _field: OperationField) -> &'static [&'static str] {
+        &[]
+    }
+
     /// `(attribute_key, role)` sources this convention wraps into a single-message
     /// JSON array `[{"role": role, "content": <value>}]` for a message content
     /// `field` — used when an SDK emits a bare prompt/response string rather than

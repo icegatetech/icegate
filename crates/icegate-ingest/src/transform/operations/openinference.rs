@@ -29,6 +29,15 @@ impl OperationConvention for OpenInference {
         }
     }
 
+    fn indexed_field_prefixes(&self, field: OperationField) -> &'static [&'static str] {
+        match field {
+            OperationField::InputMessages => &["llm.input_messages"],
+            OperationField::OutputMessages => &["llm.output_messages"],
+            OperationField::ToolDefinitions => &["llm.tools"],
+            _ => &[],
+        }
+    }
+
     fn classify_operation(&self, _span_name: &str, attrs: &AttributeView) -> Option<String> {
         let kind = extract_string_value(attrs.get("openinference.span.kind"))?;
         // Normalization map per spec section 4. PROMPT and any unrecognized kind
@@ -101,6 +110,40 @@ mod tests {
     fn conversation_id_sources_session_id() {
         let keys = OpenInference.field_keys(OperationField::ConversationId);
         assert_eq!(keys, &["session.id"]);
+    }
+
+    #[test]
+    fn message_columns_source_the_indexed_prefixes() {
+        // OpenInference has no whole-array attribute for these; it flattens the
+        // array across `<prefix>.<index>.message.<field>` keys.
+        assert_eq!(
+            OpenInference.indexed_field_prefixes(OperationField::InputMessages),
+            &["llm.input_messages"]
+        );
+        assert_eq!(
+            OpenInference.indexed_field_prefixes(OperationField::OutputMessages),
+            &["llm.output_messages"]
+        );
+        assert_eq!(
+            OpenInference.indexed_field_prefixes(OperationField::ToolDefinitions),
+            &["llm.tools"]
+        );
+    }
+
+    #[test]
+    fn message_columns_have_no_scalar_source() {
+        // The indexed prefixes are the only source; declaring a scalar key as
+        // well would claim an attribute this convention never emits.
+        assert_eq!(OpenInference.field_keys(OperationField::InputMessages), &[] as &[&str]);
+        assert_eq!(OpenInference.field_keys(OperationField::OutputMessages), &[] as &[&str]);
+    }
+
+    #[test]
+    fn fields_without_an_indexed_source_declare_none() {
+        assert_eq!(
+            OpenInference.indexed_field_prefixes(OperationField::RequestModel),
+            &[] as &[&str]
+        );
     }
 
     #[test]
