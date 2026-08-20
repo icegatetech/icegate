@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::transform::attributes::{
     extract_bool, extract_f64, extract_i64, extract_string_list, extract_string_value, is_zero_bytes, nanos_to_micros,
     serialize_all_attrs_to_json_object, serialize_any_value_to_json, serialize_attrs_to_json_object,
-    serialize_message_to_json_array, u32_count_to_i32,
+    serialize_indexed_attrs_to_json_array, serialize_message_to_json_array, u32_count_to_i32,
 };
 
 /// Borrowing view over a span's attribute list. Built once per span and shared
@@ -443,6 +443,20 @@ fn resolve_json_object_from_attrs(attrs: &[KeyValue], field: OperationField) -> 
     None
 }
 
+/// Resolve a content field by rebuilding the JSON array a convention flattened
+/// into indexed attribute keys. Returns `None` when no convention declares an
+/// indexed prefix for `field`, or no attribute carries one.
+fn resolve_indexed_array_from_attrs(attrs: &[KeyValue], field: OperationField) -> Option<String> {
+    for convention in CONVENTIONS {
+        for &prefix in convention.indexed_field_prefixes(field) {
+            if let Some(json) = serialize_indexed_attrs_to_json_array(attrs, prefix) {
+                return Some(json);
+            }
+        }
+    }
+    None
+}
+
 /// Resolve a message content field as a single-message JSON array
 /// `[{"role": role, "content": <value>}]` from the first present
 /// convention-declared `(attribute_key, role)` source. Returns `None` when no
@@ -465,7 +479,8 @@ fn resolve_message_array_from_attrs(attrs: &[KeyValue], field: OperationField) -
 }
 
 /// Resolve a content field through the modes in precedence order: a scalar
-/// attribute value ([`resolve_json`]), a JSON object of flat attributes
+/// attribute value ([`resolve_json`]), an array rebuilt from indexed attribute
+/// keys ([`resolve_indexed_array_from_attrs`]), a JSON object of flat attributes
 /// ([`resolve_json_object_from_attrs`]), a single-message JSON array
 /// ([`resolve_message_array_from_attrs`]), then a JSON object from a span event
 /// ([`resolve_json_from_events`]). The first mode to produce a value wins.
@@ -481,6 +496,9 @@ fn resolve_json_incl_events(
     field: OperationField,
 ) -> Result<Option<String>> {
     if let Some(json) = resolve_json(view, field)? {
+        return Ok(Some(json));
+    }
+    if let Some(json) = resolve_indexed_array_from_attrs(attrs, field) {
         return Ok(Some(json));
     }
     if let Some(json) = resolve_json_object_from_attrs(attrs, field) {
@@ -1303,6 +1321,90 @@ mod tests {
         assert!(messages.is_array(), "input_messages must be a JSON array");
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "/code-review");
+    }
+
+    #[test]
+    fn openinference_indexed_messages_project_into_the_content_columns() {
+        // OpenInference SDKs (smolagents, LlamaIndex, LangChain) do not emit a
+        // messages array; they flatten one across indexed attributes. Before the
+        // indexed mode existed these spans projected an operations row with both
+        // message columns NULL, silently losing the whole conversation.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.model_name", "o3-mini"),
+            kv_str("llm.input_messages.0.message.role", "system"),
+            kv_str("llm.input_messages.0.message.content", "You are helpful"),
+            kv_str("llm.input_messages.1.message.role", "user"),
+            kv_str("llm.input_messages.1.message.content", "What is 2+2?"),
+            kv_str("llm.output_messages.0.message.role", "assistant"),
+            kv_str("llm.output_messages.0.message.content", "4"),
+        ]);
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("an OpenInference LLM span -> row");
+
+        assert_eq!(row.operation_name, "chat");
+        let input: serde_json::Value =
+            serde_json::from_str(row.input_messages.as_deref().expect("input_messages present")).expect("json");
+        assert_eq!(input.as_array().expect("array").len(), 2);
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[1]["content"], "What is 2+2?");
+
+        let output: serde_json::Value =
+            serde_json::from_str(row.output_messages.as_deref().expect("output_messages present")).expect("json");
+        assert_eq!(output[0]["role"], "assistant");
+        assert_eq!(output[0]["content"], "4");
+    }
+
+    #[test]
+    fn openinference_tool_schemas_project_into_tool_definitions() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("llm.tools.0.tool.json_schema", r#"{"name":"web_search"}"#),
+        ]);
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("row");
+
+        let tools: serde_json::Value =
+            serde_json::from_str(row.tool_definitions.as_deref().expect("tool_definitions present")).expect("json");
+        assert_eq!(tools[0]["json_schema"], r#"{"name":"web_search"}"#);
+    }
+
+    #[test]
+    fn a_whole_messages_array_wins_over_the_flattened_form() {
+        // A span carrying both means the same thing by each, so the scalar
+        // OTEL attribute is taken and the indexed rebuild is not run.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("gen_ai.input.messages", r#"[{"role":"user","content":"whole"}]"#),
+            kv_str("llm.input_messages.0.message.role", "user"),
+            kv_str("llm.input_messages.0.message.content", "flattened"),
+        ]);
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("row");
+
+        let input: serde_json::Value =
+            serde_json::from_str(row.input_messages.as_deref().expect("present")).expect("json");
+        assert_eq!(input[0]["content"], "whole");
+    }
+
+    #[test]
+    fn openinference_session_id_projects_as_the_conversation_id() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("session.id", "conv-42"),
+        ]);
+
+        let row = project_operation_row(&span, None, "t", None, 1)
+            .expect("projection ok")
+            .expect("row");
+
+        assert_eq!(row.conversation_id.as_deref(), Some("conv-42"));
     }
 
     #[test]
