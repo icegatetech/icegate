@@ -12,7 +12,12 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.95.0"
+# The same version `rust-toolchain.toml` pins, and it moves in the same commit.
+# Nothing here is built or linted with anything else: rustup obeys that pin on a
+# workstation, CI hands it to dtolnay/rust-toolchain, and `pedantic = "deny"`
+# below makes each release's new lints part of the contract. A lower number here
+# would be a second, untested claim about which compiler this workspace needs.
+rust-version = "1.98.0"
 authors = ["IceGate Tech"]
 license = "Apache-2.0"
 repository = "https://github.com/icegatetech/icegate"

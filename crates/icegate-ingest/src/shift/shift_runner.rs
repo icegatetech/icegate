@@ -448,9 +448,13 @@ impl std::fmt::Display for ShiftWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.reason {
             // `IngestError::Cancelled` renders as a bare "operation cancelled",
-            // which loses the one thing worth knowing at 03:00: cancellation was
-            // observed by the write retry, not by the reads ahead of it.
-            ShiftTaskFailureReason::Cancelled => f.write_str("shift task cancelled during write retry"),
+            // which names no subject at all. Name the shift task and stop there:
+            // three stages reach this arm — the WAL prefetch through
+            // [`ShiftWriteError::queue_read`], the storage write through `From`,
+            // and the retry loop through [`RetryError::cancelled`] — and `reason`
+            // collapses to `Cancelled` for all of them, so any stage this text
+            // named would be wrong for the other two.
+            ShiftTaskFailureReason::Cancelled => f.write_str("shift task cancelled"),
             _ => self.source.fmt(f),
         }
     }
@@ -1697,6 +1701,24 @@ mod tests {
             "failed to open WAL segment 7 row group 0: but this is plain Shift variant".to_string(),
         ));
         assert_eq!(plain_shift_with_same_words.reason, ShiftTaskFailureReason::Write);
+    }
+
+    /// Cancellation reaches the `Cancelled` reason from the WAL prefetch as well as from the
+    /// storage write, and the reason keeps no record of which one it was. The rendered text must
+    /// therefore name no stage, or it would misreport two of the three call sites.
+    #[test]
+    fn shift_write_error_renders_cancellation_without_naming_a_stage() {
+        let from_prefetch = ShiftWriteError::queue_read(IngestError::Cancelled);
+        assert_eq!(from_prefetch.reason, ShiftTaskFailureReason::Cancelled);
+        assert_eq!(from_prefetch.to_string(), "shift task cancelled");
+
+        let from_storage_write = ShiftWriteError::from(IngestError::Cancelled);
+        assert_eq!(from_storage_write.reason, ShiftTaskFailureReason::Cancelled);
+        assert_eq!(from_storage_write.to_string(), "shift task cancelled");
+
+        let from_retry_loop = <ShiftWriteError as icegate_common::RetryError>::cancelled();
+        assert_eq!(from_retry_loop.reason, ShiftTaskFailureReason::Cancelled);
+        assert_eq!(from_retry_loop.to_string(), "shift task cancelled");
     }
 
     /// A shutdown that lands while the reads are in flight must stop the task with the cancelled

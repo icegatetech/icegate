@@ -7,7 +7,9 @@
 # picks up the newest release — and `pedantic = "deny"` in Cargo.toml turns every
 # lint added by that release into a build failure on code nobody touched. Pinning
 # moves the toolchain bump into its own commit, where the new lints are the point
-# of the change. Bump roughly every six weeks, in step with the Rust release train.
+# of the change. Bump roughly every six weeks, in step with the Rust release train,
+# and carry `rust-version` in Cargo.toml along in the same commit — cargo cannot
+# read this file, so that field restates the number and would otherwise go stale.
 #
 # Always spell out MAJOR.MINOR.PATCH. rustup reads a two-component `1.NN` as a
 # version channel and installs the newest patch of that branch, so `1.99` would
