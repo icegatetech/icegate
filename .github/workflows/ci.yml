@@ -32,11 +32,10 @@ env:
 
 jobs:
   test:
-    name: Test ${{ matrix.rust }} on ${{ matrix.os }}
+    name: Test on ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest]
-        rust: [stable, beta]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Free Disk Space (Ubuntu)
@@ -57,10 +56,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # `dtolnay/rust-toolchain` requires an explicit `toolchain:` and never reads
+      # rust-toolchain.toml, so the pin has to be handed to it. Same shape as
+      # sanitizers.yml, which reads its own pin from config/sanitizers/toolchain.
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "version=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: ${{ steps.toolchain.outputs.version }}
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
@@ -85,9 +91,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pinned-cargo-build-target-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-
+            ${{ runner.os }}-pinned-cargo-build-target-
 
       - name: Check compilation
         run: cargo check --workspace --all-targets
@@ -123,9 +129,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "version=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      # `components:` is not optional here even though rust-toolchain.toml lists
+      # clippy: the action installs with `--profile minimal` and adds only the
+      # components named in this input.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
           components: clippy
 
       - name: Install protoc
@@ -151,9 +165,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-stable-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pinned-cargo-build-target-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-stable-cargo-build-target-
+            ${{ runner.os }}-pinned-cargo-build-target-
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -168,8 +182,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "version=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
@@ -194,9 +214,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-stable-cargo-build-target-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pinned-cargo-build-target-release-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-stable-cargo-build-target-release-
+            ${{ runner.os }}-pinned-cargo-build-target-release-
 
       - name: Build release binaries
         run: cargo build --workspace --release --verbose --features icegate-catalog-s3/rest
@@ -211,8 +231,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "version=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
@@ -237,9 +263,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-stable-cargo-build-target-bench-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pinned-cargo-build-target-bench-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-stable-cargo-build-target-bench-
+            ${{ runner.os }}-pinned-cargo-build-target-bench-
 
       - name: Restore benchmark baseline cache
         uses: actions/cache@v4

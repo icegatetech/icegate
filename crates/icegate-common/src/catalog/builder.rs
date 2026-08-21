@@ -243,9 +243,7 @@ impl CatalogBuilder {
             CatalogBackend::Glue { catalog_id } => {
                 Self::create_glue_catalog(config, catalog_id.as_deref(), io_cache).await
             }
-            CatalogBackend::S3 { warehouse } => {
-                Self::create_s3_catalog(config, warehouse, io_cache, cancel_token).await
-            }
+            CatalogBackend::S3 { warehouse } => Self::create_s3_catalog(config, warehouse, io_cache, cancel_token),
         }
     }
 
@@ -363,7 +361,10 @@ impl CatalogBuilder {
     }
 
     /// Create an S3-backed catalog.
-    async fn create_s3_catalog(
+    ///
+    /// Not `async`, unlike its siblings: `S3Catalog` builds synchronously, and the
+    /// `unused_async` lint is denied.
+    fn create_s3_catalog(
         config: &CatalogConfig,
         warehouse: &str,
         io_cache: &IoHandle,
@@ -428,8 +429,7 @@ impl CatalogBuilder {
             .with_props(build_file_io_props(&config.properties, &s3_config))
             .build();
 
-        let catalog = S3Catalog::new(s3_config, file_io, cancel_token)
-            .await
+        let catalog = S3Catalog::new(&s3_config, file_io, cancel_token)
             .map_err(|e| CommonError::Config(format!("failed to create s3 catalog: {e}")))?;
 
         if let Some(endpoint) = endpoint.as_deref() {

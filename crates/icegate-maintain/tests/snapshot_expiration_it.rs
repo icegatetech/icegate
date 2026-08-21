@@ -292,7 +292,7 @@ async fn read_history(catalog: &S3Catalog) -> (usize, Option<u64>) {
 #[ignore = "GH-165: commit-path expiration is gone; see the module docs"]
 async fn expiration_holds_the_history_at_the_configured_window() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     create_logs_table(&catalog, &narrow_window()).await;
 
     for offset in 1..=6_u64 {
@@ -314,7 +314,7 @@ async fn expiration_holds_the_history_at_the_configured_window() {
 #[tokio::test]
 async fn expiration_keeps_a_wal_offset_carrier_outside_the_window() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     create_logs_table(&catalog, &narrow_window()).await;
 
     commit_snapshot(&catalog, Some(42)).await;
@@ -341,7 +341,7 @@ async fn expiration_keeps_a_wal_offset_carrier_outside_the_window() {
 #[tokio::test]
 async fn a_table_created_with_expiration_disabled_keeps_every_snapshot() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let disabled = SnapshotExpirationConfig {
         enabled: false,
         ..narrow_window()
@@ -367,7 +367,7 @@ async fn a_table_created_with_expiration_disabled_keeps_every_snapshot() {
 #[ignore = "GH-165: commit-path expiration is gone; see the module docs"]
 async fn the_sweep_reclaims_the_data_and_manifests_of_expired_snapshots() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     create_logs_table(&catalog, &narrow_window()).await;
 
     let history = seed_rewritten_history(&catalog).await;
@@ -444,7 +444,7 @@ async fn the_sweep_reclaims_the_data_and_manifests_of_expired_snapshots() {
 #[tokio::test]
 async fn the_sweep_keeps_rewritten_files_while_expiration_is_disabled() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let disabled = SnapshotExpirationConfig {
         enabled: false,
         ..narrow_window()

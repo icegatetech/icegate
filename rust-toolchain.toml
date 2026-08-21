@@ -2,8 +2,20 @@
 # This file pins the Rust toolchain version for consistent builds
 
 [toolchain]
-# Use stable channel
-channel = "stable"
+# An exact version, not the `stable` channel. `stable` resolves at install time,
+# so a workstation keeps whatever it installed months ago while a fresh CI runner
+# picks up the newest release — and `pedantic = "deny"` in Cargo.toml turns every
+# lint added by that release into a build failure on code nobody touched. Pinning
+# moves the toolchain bump into its own commit, where the new lints are the point
+# of the change. Bump roughly every six weeks, in step with the Rust release train.
+#
+# Always spell out MAJOR.MINOR.PATCH. rustup reads a two-component `1.NN` as a
+# version channel and installs the newest patch of that branch, so `1.99` would
+# resolve to 1.99.0 here and to 1.99.2 on a runner provisioned a month later —
+# the same drift this pin exists to stop. The CI workflows also pass this value
+# to dtolnay/rust-toolchain, which rewrites shorthand (`1.9` becomes `1.90`)
+# before handing it to rustup; a full triple is passed through untouched.
+channel = "1.98.0"
 
 # Specify components to install
 components = [

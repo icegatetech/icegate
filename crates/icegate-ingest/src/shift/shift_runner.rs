@@ -231,7 +231,7 @@ where
         let write_result = self
             .write_row_groups_with_retry(input.segments.as_slice(), cancel_token)
             .await
-            .map_err(|err| ShiftTaskFailure::new(err.reason, err.error))?;
+            .map_err(ShiftTaskFailure::from)?;
 
         if write_result.rows_written == 0 {
             return Err(ShiftTaskFailure::new(
@@ -384,10 +384,15 @@ fn bridge_merge_error(err: icegate_common::Error, cancel_token: &CancellationTok
     err.into()
 }
 
+/// A write-path failure: the typed reason plus the error that produced it.
+///
+/// The reason is not derivable from the error alone — the same
+/// `IngestError` reaches this type both from a WAL read and from the storage
+/// write, and only the call site knows which. The error text is rendered on
+/// demand rather than stored, so the two can never disagree.
 struct ShiftWriteError {
     reason: ShiftTaskFailureReason,
-    error: Error,
-    source: Option<crate::error::IngestError>,
+    source: crate::error::IngestError,
 }
 
 impl ShiftWriteError {
@@ -397,13 +402,12 @@ impl ShiftWriteError {
         }
         Self {
             reason: ShiftTaskFailureReason::QueueRead,
-            error: Error::Other(err.to_string()),
-            source: Some(err),
+            source: err,
         }
     }
 
     fn is_retryable(&self) -> bool {
-        self.source.as_ref().is_some_and(crate::error::IngestError::is_retryable)
+        self.source.is_retryable()
     }
 }
 
@@ -411,16 +415,14 @@ impl icegate_common::RetryError for ShiftWriteError {
     fn cancelled() -> Self {
         Self {
             reason: ShiftTaskFailureReason::Cancelled,
-            error: Error::Other("shift task cancelled during write retry".to_string()),
-            source: Some(crate::error::IngestError::Cancelled),
+            source: crate::error::IngestError::Cancelled,
         }
     }
 
     fn max_attempts() -> Self {
         Self {
             reason: ShiftTaskFailureReason::Write,
-            error: Error::Other("max retry attempts reached".to_string()),
-            source: Some(crate::error::IngestError::MaxAttemptsReached),
+            source: crate::error::IngestError::MaxAttemptsReached,
         }
     }
 }
@@ -432,17 +434,25 @@ impl From<crate::error::IngestError> for ShiftWriteError {
             crate::error::IngestError::Cancelled => ShiftTaskFailureReason::Cancelled,
             _ => ShiftTaskFailureReason::Write,
         };
-        Self {
-            reason,
-            error: Error::Other(err.to_string()),
-            source: Some(err),
-        }
+        Self { reason, source: err }
+    }
+}
+
+impl From<ShiftWriteError> for ShiftTaskFailure {
+    fn from(err: ShiftWriteError) -> Self {
+        Self::new(err.reason, Error::Other(err.to_string()))
     }
 }
 
 impl std::fmt::Display for ShiftWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
+        match self.reason {
+            // `IngestError::Cancelled` renders as a bare "operation cancelled",
+            // which loses the one thing worth knowing at 03:00: cancellation was
+            // observed by the write retry, not by the reads ahead of it.
+            ShiftTaskFailureReason::Cancelled => f.write_str("shift task cancelled during write retry"),
+            _ => self.source.fmt(f),
+        }
     }
 }
 

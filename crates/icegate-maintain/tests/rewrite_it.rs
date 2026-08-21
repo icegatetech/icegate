@@ -278,7 +278,7 @@ async fn data_file_count(table: &Table, descriptor: &SortColumnsDescriptor) -> u
 #[tokio::test]
 async fn rewrite_executor_compacts_partition_preserving_rows_and_order() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
     let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
 
@@ -424,7 +424,7 @@ async fn rewrite_carries_wal_offset_property_forward() {
     const SEED_OFFSET: u64 = 4242;
 
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
     let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
 

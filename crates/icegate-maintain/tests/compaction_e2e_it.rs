@@ -361,7 +361,7 @@ async fn wait_for_file_count_drop(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compactor_compacts_partition_end_to_end() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
     let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
 
@@ -613,7 +613,7 @@ fn manifest_compaction_config(conn: &StorageConn) -> CompactionConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compactor_repacks_manifests_without_touching_data() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
     let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
 
@@ -792,7 +792,7 @@ async fn manifest_compaction_carries_wal_offset_forward() {
     const WAL_OFFSET: u64 = 4242;
 
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
 
     // Seed four files; the LAST fast_append stamps the WAL offset on its snapshot,
@@ -851,7 +851,7 @@ async fn manifest_compaction_reports_actual_output_count() {
     // observable, then cross-check it against the table's real post-commit
     // DATA-manifest count.
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
 
     // Four tiny single-partition files, one manifest each, all well below the

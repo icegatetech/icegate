@@ -215,7 +215,7 @@ fn service_and_timestamp_rows(batches: &[RecordBatch]) -> Vec<(String, i64)> {
 #[tokio::test]
 async fn iceberg_merge_source_interleaves_two_overlapping_sorted_files() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = build_s3_catalog(&conn).await;
+    let catalog = build_s3_catalog(&conn);
     let ident = create_logs_table(&catalog).await;
 
     // Two files in one partition, each internally sorted by

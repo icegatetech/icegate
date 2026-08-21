@@ -66,7 +66,7 @@ pub async fn setup_object_store() -> (S3TestContainer, StorageConn) {
 }
 
 /// Build a concrete [`S3Catalog`] against the object store.
-pub async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
+pub fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
     let io = IoHandle::noop();
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("warehouse".to_string(), format!("s3://{BUCKET_NAME}"));
@@ -78,7 +78,7 @@ pub async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
     let file_io = FileIOBuilder::new(io.storage_factory()).with_props(props).build();
 
     S3Catalog::new(
-        S3CatalogConfig {
+        &S3CatalogConfig {
             bucket: BUCKET_NAME.to_string(),
             region: "us-east-1".to_string(),
             endpoint: Some(conn.endpoint.clone()),
@@ -91,7 +91,6 @@ pub async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
         file_io,
         tokio_util::sync::CancellationToken::new(),
     )
-    .await
     .expect("build S3 catalog")
 }
 
