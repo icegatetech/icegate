@@ -163,7 +163,7 @@ async fn first_crawl_appends_and_second_identical_crawl_commits_nothing() {
     // Steady state is an empty commit — the property that keeps a sixth table
     // from generating small-file churn.
     let (_store, conn) = common::setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
     create_tables(&dyn_catalog, &SnapshotExpirationConfig::default(), false)
         .await
@@ -204,7 +204,7 @@ async fn first_crawl_appends_and_second_identical_crawl_commits_nothing() {
 #[tokio::test]
 async fn a_changed_rate_appends_exactly_one_revision() {
     let (_store, conn) = common::setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
     create_tables(&dyn_catalog, &SnapshotExpirationConfig::default(), false)
         .await
@@ -267,7 +267,7 @@ async fn pricing_runner_builds_starts_and_drains() {
     // design contributes no rows and does not fail the crawl. What it does
     // assert is that neither outcome commits a snapshot.
     let (_store, conn) = common::setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
     create_tables(&dyn_catalog, &SnapshotExpirationConfig::default(), false)
         .await

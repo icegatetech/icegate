@@ -12,7 +12,12 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.95.0"
+# The same version `rust-toolchain.toml` pins, and it moves in the same commit.
+# Nothing here is built or linted with anything else: rustup obeys that pin on a
+# workstation, CI hands it to dtolnay/rust-toolchain, and `pedantic = "deny"`
+# below makes each release's new lints part of the contract. A lower number here
+# would be a second, untested claim about which compiler this workspace needs.
+rust-version = "1.98.0"
 authors = ["IceGate Tech"]
 license = "Apache-2.0"
 repository = "https://github.com/icegatetech/icegate"
@@ -59,7 +64,7 @@ icegate-queue = { path = "crates/icegate-queue" }
 # `metrics-otel` is the crate's `MetricsSink` implementation over OpenTelemetry. A cargo
 # feature is workspace-wide, so it is enabled once here; which pool actually records is
 # decided per pool by whether it is given a sink (`JobsManagerBuilder::metrics`).
-jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "820bbe524170c8dbbe07463b4e0538e353b8de60", features = ["metrics-otel"] }
+jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "db738dd87443f3d30d85cbba0bd604f98df4ef97", features = ["metrics-otel"] }
 
 # Arrow ecosystem (must match iceberg's version)
 arrow = { version = "58.4", default-features = false, features = ["prettyprint"] }

@@ -76,7 +76,7 @@ async fn setup_object_store() -> (S3TestContainer, StorageConn) {
 
 /// Build a concrete [`S3Catalog`] against the object store with a `FileIO` over the same
 /// OpenDAL S3 backend the production builder uses.
-async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
+fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
     let io = IoHandle::noop();
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("warehouse".to_string(), format!("s3://{BUCKET_NAME}"));
@@ -88,7 +88,7 @@ async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
     let file_io = FileIOBuilder::new(io.storage_factory()).with_props(props).build();
 
     S3Catalog::new(
-        S3CatalogConfig {
+        &S3CatalogConfig {
             bucket: BUCKET_NAME.to_string(),
             region: "us-east-1".to_string(),
             endpoint: Some(conn.endpoint.clone()),
@@ -101,7 +101,6 @@ async fn build_s3_catalog(conn: &StorageConn) -> S3Catalog {
         file_io,
         tokio_util::sync::CancellationToken::new(),
     )
-    .await
     .expect("build S3 catalog")
 }
 
@@ -227,7 +226,7 @@ async fn commit_fast_append(catalog: &S3Catalog, ident: &TableIdent, data_files:
 #[tokio::test]
 async fn list_data_files_with_stats_enumerates_two_seeded_files() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = build_s3_catalog(&conn).await;
+    let catalog = build_s3_catalog(&conn);
 
     // --- create namespace + logs table -------------------------------------
     catalog

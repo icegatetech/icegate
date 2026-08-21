@@ -82,19 +82,17 @@ impl S3Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error if S3 configuration is invalid or storage cannot be created.
-    // Async is intentional: the constructor follows the async initialization pattern used by callers.
-    #[allow(clippy::unused_async)]
-    pub async fn new(config: S3CatalogConfig, file_io: FileIO, cancel_token: CancellationToken) -> Result<Self> {
-        let tables_uri_prefix = Self::compute_tables_uri_prefix(&config);
+    /// Returns an error if S3 configuration is invalid, if storage cannot be
+    /// created, or if called outside a tokio context: the runtime handed to every
+    /// [`Table`] is borrowed from the ambient one.
+    pub fn new(config: &S3CatalogConfig, file_io: FileIO, cancel_token: CancellationToken) -> Result<Self> {
+        let tables_uri_prefix = Self::compute_tables_uri_prefix(config);
         // Catalog layer drives optimistic CAS loops; storage keeps the I/O
         // curve. Two distinct backoff shapes for two distinct retry semantics.
         let retrier = Retrier::new(config.cas_retrier_config.clone());
-        let enable_cache = config.enable_cache;
-        let metadata_cache_cap = config.metadata_cache_cap;
-        let raw_storage: Arc<dyn CatalogStorage> = Arc::new(S3CatalogStorage::new(&config, cancel_token.clone())?);
-        let storage: Arc<dyn CatalogStorage> = if enable_cache {
-            Arc::new(CachedCatalogStorage::new(raw_storage, metadata_cache_cap))
+        let raw_storage: Arc<dyn CatalogStorage> = Arc::new(S3CatalogStorage::new(config, cancel_token.clone())?);
+        let storage: Arc<dyn CatalogStorage> = if config.enable_cache {
+            Arc::new(CachedCatalogStorage::new(raw_storage, config.metadata_cache_cap))
         } else {
             raw_storage
         };

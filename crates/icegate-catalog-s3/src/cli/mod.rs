@@ -76,7 +76,7 @@ impl CatalogCli {
         let cancellation = CancellationToken::new();
         let s3_config = config.to_s3_catalog_config()?;
         let file_io = config.build_file_io()?;
-        let catalog = Arc::new(S3Catalog::new(s3_config, file_io, cancellation.clone()).await?);
+        let catalog = Arc::new(S3Catalog::new(&s3_config, file_io, cancellation.clone())?);
         serve::run(config, catalog, cancellation).await
     }
 

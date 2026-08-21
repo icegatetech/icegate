@@ -197,7 +197,7 @@ async fn put_leaked_metadata(conn: &StorageConn, catalog: &S3Catalog, ident: &Ta
 #[tokio::test]
 async fn gc_reclaims_unreferenced_files_and_keeps_live_ones() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
 
     // One committed (referenced) data file.
@@ -247,7 +247,7 @@ async fn gc_reclaims_unreferenced_files_and_keeps_live_ones() {
 #[tokio::test]
 async fn gc_preserves_everything_inside_the_grace_period() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
 
     let live = write_one_file(
@@ -285,7 +285,7 @@ async fn gc_preserves_everything_inside_the_grace_period() {
 #[tokio::test]
 async fn gc_dry_run_finds_orphans_but_deletes_nothing() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
 
     let live = write_one_file(
@@ -323,7 +323,7 @@ async fn gc_dry_run_finds_orphans_but_deletes_nothing() {
 #[tokio::test]
 async fn gc_leaves_metadata_when_metadata_sweeping_is_disabled() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
 
     let live = write_one_file(
@@ -368,7 +368,7 @@ async fn gc_leaves_metadata_when_metadata_sweeping_is_disabled() {
 #[tokio::test]
 async fn gc_fails_closed_and_deletes_nothing_when_a_manifest_is_unreadable() {
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
     let live = write_one_file(
         &catalog.load_table(&ident).await.unwrap(),
@@ -429,7 +429,7 @@ async fn gc_runner_reclaims_in_the_background() {
     use icegate_maintain::jobs::{JobStateCodec, JobsManagerConfig, JobsStorageConfig};
 
     let (_store, conn) = setup_object_store().await;
-    let catalog = Arc::new(build_s3_catalog(&conn).await);
+    let catalog = Arc::new(build_s3_catalog(&conn));
     let ident = create_logs_table(&catalog).await;
 
     let live = write_one_file(
