@@ -195,6 +195,136 @@ pub(crate) fn serialize_message_to_json_array(role: &str, content: &str) -> Opti
     serde_json::to_string(&serde_json::json!([{ "role": role, "content": content }])).ok()
 }
 
+/// One node of a rebuilt structure, before it is turned back into JSON.
+///
+/// Arrays are held index-keyed rather than as a `Vec` because the flattened
+/// attributes arrive in whatever order the map iterated: `...10.` sorts before
+/// `...2.` lexicographically, and an index may be missing entirely if the
+/// producer dropped an attribute. A `BTreeMap<usize, _>` restores numeric order
+/// and tolerates gaps, both of which a positional `Vec` would get wrong.
+enum RebuiltNode {
+    /// A terminal attribute value.
+    Leaf(serde_json::Value),
+    /// A nested object, keyed by field name.
+    Object(std::collections::BTreeMap<String, Self>),
+    /// A nested array, keyed by the index parsed out of the attribute key.
+    Array(std::collections::BTreeMap<usize, Self>),
+}
+
+impl RebuiltNode {
+    /// Convert the tree into JSON, collapsing index-keyed maps into arrays in
+    /// ascending index order.
+    fn into_json(self) -> serde_json::Value {
+        match self {
+            Self::Leaf(value) => value,
+            Self::Object(fields) => {
+                serde_json::Value::Object(fields.into_iter().map(|(key, node)| (key, node.into_json())).collect())
+            }
+            Self::Array(items) => serde_json::Value::Array(items.into_values().map(Self::into_json).collect()),
+        }
+    }
+
+    /// Insert `value` at `path`, creating intermediate nodes as needed.
+    ///
+    /// A numeric segment addresses an array element and, per the `OpenInference`
+    /// flattening rule, is always followed by a singular wrapper segment naming
+    /// the element's type (`message`, `tool_call`, `tool`, `document`). That
+    /// wrapper carries no information the position does not already give, so it
+    /// is skipped, which is what turns `...messages.0.message.role` back into
+    /// `[{"role": ...}]` rather than `[{"message": {"role": ...}}]`.
+    ///
+    /// A segment that collides with an already-built node of the other kind is
+    /// dropped rather than overwriting it: a producer that emits both
+    /// `x.0.a.b` and `x.0.a` has contradicted itself, and keeping the first
+    /// value is preferable to letting the later one silently win.
+    fn insert(&mut self, path: &[&str], value: serde_json::Value) {
+        let Some((head, rest)) = path.split_first() else {
+            return;
+        };
+        if let Ok(index) = head.parse::<usize>() {
+            let Self::Array(items) = self else { return };
+            // Skip the singular wrapper that always follows an index. A path
+            // ending on the index itself has no wrapper to skip.
+            let rest = rest.split_first().map_or(rest, |(_wrapper, tail)| tail);
+            if rest.is_empty() {
+                items.entry(index).or_insert(Self::Leaf(value));
+                return;
+            }
+            items.entry(index).or_insert_with(|| Self::child_for(rest)).insert(rest, value);
+            return;
+        }
+        let Self::Object(fields) = self else { return };
+        if rest.is_empty() {
+            fields.entry((*head).to_string()).or_insert(Self::Leaf(value));
+            return;
+        }
+        fields
+            .entry((*head).to_string())
+            .or_insert_with(|| Self::child_for(rest))
+            .insert(rest, value);
+    }
+
+    /// The empty container a path should descend into: an array when the next
+    /// segment is an index, an object otherwise.
+    fn child_for(path: &[&str]) -> Self {
+        if path.first().is_some_and(|segment| segment.parse::<usize>().is_ok()) {
+            Self::Array(std::collections::BTreeMap::new())
+        } else {
+            Self::Object(std::collections::BTreeMap::new())
+        }
+    }
+}
+
+/// Rebuild the JSON array that `OpenInference` flattened into indexed attribute
+/// keys under `prefix`, and serialize it.
+///
+/// `OpenInference` does not emit a structured messages array the way the OTEL
+/// `GenAI` convention does. It flattens one instead, as
+/// `<prefix>.<index>.<singular>.<field...>` — so a two-message prompt arrives as
+/// four separate span attributes:
+///
+/// ```text
+/// llm.input_messages.0.message.role     = "system"
+/// llm.input_messages.0.message.content  = "You are..."
+/// llm.input_messages.1.message.role     = "user"
+/// llm.input_messages.1.message.content  = "What is..."
+/// ```
+///
+/// This is the inverse of that flattening, so the pieces land in
+/// `input_messages` / `output_messages` as the same
+/// `[{"role": ..., "content": ...}]` array every other convention projects,
+/// rather than not landing at all. The rule is applied recursively, so a nested
+/// group such as `...0.message.tool_calls.0.tool_call.function.name` rebuilds
+/// into a `tool_calls` array inside its message.
+///
+/// Returns `None` when no attribute carries the prefix.
+pub(crate) fn serialize_indexed_attrs_to_json_array(attrs: &[KeyValue], prefix: &str) -> Option<String> {
+    let mut root = RebuiltNode::Array(std::collections::BTreeMap::new());
+    let mut found = false;
+    for kv in attrs {
+        // The trailing dot matters: without it, `llm.tools_count` would be read
+        // as a member of the `llm.tools` array.
+        let Some(remainder) = kv.key.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('.')) else {
+            continue;
+        };
+        let Some(value) = kv.value.as_ref().and_then(any_value_to_json) else {
+            continue;
+        };
+        let path: Vec<&str> = remainder.split('.').collect();
+        // The first segment must be an index; anything else is a sibling
+        // attribute that merely shares the prefix, not an array element.
+        if path.first().is_none_or(|segment| segment.parse::<usize>().is_err()) {
+            continue;
+        }
+        root.insert(&path, value);
+        found = true;
+    }
+    if !found {
+        return None;
+    }
+    serde_json::to_string(&root.into_json()).ok()
+}
+
 /// Checks if a byte slice is all zeros.
 pub(crate) fn is_zero_bytes(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == 0)
@@ -994,5 +1124,141 @@ mod tests {
         assert!(parsed.is_array());
         assert_eq!(parsed[0]["role"], "user");
         assert_eq!(parsed[0]["content"], "hello \"world\"");
+    }
+
+    /// Build a string attribute, for the indexed-rebuild tests below.
+    fn indexed_kv(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key_strindex: 0,
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue(value.to_string())),
+            }),
+        }
+    }
+
+    /// Parse a rebuilt array back out, so assertions read against structure
+    /// rather than against an exact serialization.
+    fn rebuild(attrs: &[KeyValue], prefix: &str) -> serde_json::Value {
+        let json = serialize_indexed_attrs_to_json_array(attrs, prefix).expect("prefix is present");
+        serde_json::from_str(&json).expect("valid json")
+    }
+
+    #[test]
+    fn rebuilds_indexed_messages_into_the_role_content_array_shape() {
+        let attrs = vec![
+            indexed_kv("llm.input_messages.0.message.role", "system"),
+            indexed_kv("llm.input_messages.0.message.content", "You are helpful"),
+            indexed_kv("llm.input_messages.1.message.role", "user"),
+            indexed_kv("llm.input_messages.1.message.content", "What is 2+2?"),
+        ];
+        let parsed = rebuild(&attrs, "llm.input_messages");
+        assert_eq!(parsed.as_array().expect("array").len(), 2);
+        assert_eq!(parsed[0]["role"], "system");
+        assert_eq!(parsed[0]["content"], "You are helpful");
+        assert_eq!(parsed[1]["role"], "user");
+        assert_eq!(parsed[1]["content"], "What is 2+2?");
+    }
+
+    #[test]
+    fn rebuilt_messages_drop_the_singular_wrapper_segment() {
+        let attrs = vec![indexed_kv("llm.input_messages.0.message.role", "user")];
+        let parsed = rebuild(&attrs, "llm.input_messages");
+        assert!(
+            parsed[0].get("message").is_none(),
+            "the `message` wrapper carries nothing the position does not, and would break the shared array shape"
+        );
+    }
+
+    #[test]
+    fn rebuilds_indices_in_numeric_not_lexicographic_order() {
+        // "10" sorts before "2" as text; a positional rebuild that trusted map
+        // order would emit this conversation scrambled.
+        let attrs = vec![
+            indexed_kv("llm.input_messages.10.message.content", "eleventh"),
+            indexed_kv("llm.input_messages.2.message.content", "third"),
+            indexed_kv("llm.input_messages.0.message.content", "first"),
+        ];
+        let parsed = rebuild(&attrs, "llm.input_messages");
+        let contents: Vec<&str> = parsed
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|item| item["content"].as_str().expect("string"))
+            .collect();
+        assert_eq!(contents, vec!["first", "third", "eleventh"]);
+    }
+
+    #[test]
+    fn rebuilds_nested_tool_calls_inside_a_message() {
+        let attrs = vec![
+            indexed_kv("llm.output_messages.0.message.role", "assistant"),
+            indexed_kv("llm.output_messages.0.message.tool_calls.0.tool_call.id", "call_abc"),
+            indexed_kv(
+                "llm.output_messages.0.message.tool_calls.0.tool_call.function.name",
+                "final_answer",
+            ),
+            indexed_kv(
+                "llm.output_messages.0.message.tool_calls.0.tool_call.function.arguments",
+                r#"{"answer": 42}"#,
+            ),
+        ];
+        let parsed = rebuild(&attrs, "llm.output_messages");
+        assert_eq!(parsed[0]["role"], "assistant");
+        let calls = parsed[0]["tool_calls"].as_array().expect("tool_calls is an array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call_abc");
+        assert_eq!(calls[0]["function"]["name"], "final_answer");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"answer": 42}"#);
+    }
+
+    #[test]
+    fn rebuilds_a_gap_in_the_indices_without_inventing_an_element() {
+        // Index 1 is missing entirely; the result must be two elements, not
+        // three with a null in the middle.
+        let attrs = vec![
+            indexed_kv("llm.input_messages.0.message.content", "first"),
+            indexed_kv("llm.input_messages.2.message.content", "third"),
+        ];
+        let parsed = rebuild(&attrs, "llm.input_messages");
+        assert_eq!(parsed.as_array().expect("array").len(), 2);
+        assert_eq!(parsed[0]["content"], "first");
+        assert_eq!(parsed[1]["content"], "third");
+    }
+
+    #[test]
+    fn rebuild_ignores_a_sibling_attribute_sharing_the_prefix() {
+        let attrs = vec![
+            indexed_kv("llm.input_messages.0.message.content", "hello"),
+            indexed_kv("llm.input_messages_count", "1"),
+        ];
+        let parsed = rebuild(&attrs, "llm.input_messages");
+        assert_eq!(parsed.as_array().expect("array").len(), 1);
+        assert_eq!(parsed[0]["content"], "hello");
+    }
+
+    #[test]
+    fn rebuild_ignores_a_prefixed_attribute_that_is_not_indexed() {
+        // `llm.input_messages.summary` shares the prefix but names no element.
+        let attrs = vec![indexed_kv("llm.input_messages.summary", "two messages")];
+        assert!(serialize_indexed_attrs_to_json_array(&attrs, "llm.input_messages").is_none());
+    }
+
+    #[test]
+    fn rebuild_returns_none_when_the_prefix_is_absent() {
+        let attrs = vec![indexed_kv("gen_ai.input.messages", "[]")];
+        assert!(serialize_indexed_attrs_to_json_array(&attrs, "llm.input_messages").is_none());
+    }
+
+    #[test]
+    fn rebuilds_a_single_valued_element_such_as_a_tool_schema() {
+        let attrs = vec![
+            indexed_kv("llm.tools.0.tool.json_schema", r#"{"name":"web_search"}"#),
+            indexed_kv("llm.tools.1.tool.json_schema", r#"{"name":"final_answer"}"#),
+        ];
+        let parsed = rebuild(&attrs, "llm.tools");
+        assert_eq!(parsed.as_array().expect("array").len(), 2);
+        assert_eq!(parsed[0]["json_schema"], r#"{"name":"web_search"}"#);
+        assert_eq!(parsed[1]["json_schema"], r#"{"name":"final_answer"}"#);
     }
 }
