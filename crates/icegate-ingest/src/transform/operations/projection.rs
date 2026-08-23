@@ -5,6 +5,7 @@
 //! a span's attributes, and the `project_operation_row` driver with its strict
 //! typed resolvers.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
@@ -28,6 +29,14 @@ use crate::transform::attributes::{
 /// skipped, so `has`/`get` only report attributes that carry an actual value.
 pub(crate) struct AttributeView<'a> {
     by_key: HashMap<&'a str, &'a AnyValue>,
+    /// Memoized parse of each convention-declared JSON blob attribute read so
+    /// far, keyed by attribute name. `None` records a blob that is absent or
+    /// not a JSON object, so a failed parse is not retried either.
+    ///
+    /// Interior mutability because the resolvers hold the view by shared
+    /// reference; the view is built and dropped inside one span's projection,
+    /// so the cell is never shared across threads.
+    parsed_blobs: RefCell<HashMap<&'static str, Option<serde_json::Map<String, serde_json::Value>>>>,
 }
 
 impl<'a> AttributeView<'a> {
@@ -40,7 +49,10 @@ impl<'a> AttributeView<'a> {
                 by_key.insert(kv.key.as_str(), value);
             }
         }
-        Self { by_key }
+        Self {
+            by_key,
+            parsed_blobs: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Returns the borrowed [`AnyValue`] for `key`, or `None` when the key is
@@ -54,6 +66,31 @@ impl<'a> AttributeView<'a> {
     /// key is present).
     pub(crate) fn has(&self, key: &str) -> bool {
         self.by_key.contains_key(key)
+    }
+
+    /// Returns `json_field` out of the JSON object held in the `blob_key`
+    /// attribute, parsing that attribute at most once per span.
+    ///
+    /// A blob that is absent, unparseable, or not a JSON object yields `None`,
+    /// as does a field that is missing or JSON `null`. The parse is memoized
+    /// because one blob backs many columns — every `OpenInference` sampling
+    /// parameter is read out of `llm.invocation_parameters` — and the blob is a
+    /// whole vendor request payload, so its parse cost scales with the payload,
+    /// not with the one number being read.
+    fn blob_field(&self, blob_key: &'static str, json_field: &str) -> Option<serde_json::Value> {
+        let mut parsed_blobs = self.parsed_blobs.borrow_mut();
+        let fields = parsed_blobs.entry(blob_key).or_insert_with(|| {
+            let text = extract_string_value(self.get(blob_key))?;
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(serde_json::Value::Object(fields)) => Some(fields),
+                _ => None,
+            }
+        });
+        fields
+            .as_ref()
+            .and_then(|fields| fields.get(json_field))
+            .filter(|value| !value.is_null())
+            .cloned()
     }
 }
 
@@ -346,27 +383,16 @@ fn resolve_str(view: &AttributeView, field: OperationField) -> Result<Option<Str
 /// an unexpected `temperature` in a passthrough payload would lose the span's
 /// tokens, model, and messages along with it.
 ///
-/// The blob is re-parsed per field rather than parsed once per span. Nine
-/// sampling fields consult it, so a span pays up to nine parses of a small
-/// object — measurably cheaper than threading a cache through `AttributeView`,
-/// and exactly zero for the conventions that declare no blob sources at all.
+/// Each declared blob is parsed at most once per span by
+/// [`AttributeView::blob_field`], however many columns read out of it, and not
+/// at all for the conventions that declare no blob sources.
 fn resolve_blob_value(view: &AttributeView, field: OperationField) -> Option<serde_json::Value> {
-    for convention in CONVENTIONS {
-        for &(blob_key, json_field) in convention.json_blob_field_keys(field) {
-            let Some(text) = extract_string_value(view.get(blob_key)) else {
-                continue;
-            };
-            let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(&text) else {
-                continue;
-            };
-            if let Some(value) = fields.get(json_field) {
-                if !value.is_null() {
-                    return Some(value.clone());
-                }
-            }
-        }
-    }
-    None
+    CONVENTIONS.iter().find_map(|convention| {
+        convention
+            .json_blob_field_keys(field)
+            .iter()
+            .find_map(|&(blob_key, json_field)| view.blob_field(blob_key, json_field))
+    })
 }
 
 /// Resolve the first present `i64` for `field`; strict parse (D6).
@@ -383,7 +409,27 @@ fn resolve_i64(view: &AttributeView, field: OperationField, context: &'static st
             return extract_i64(Some(value), context);
         }
     }
-    Ok(resolve_blob_value(view, field).and_then(|value| value.as_i64()))
+    // JSON has a single number type, so an SDK that holds `max_tokens` as a
+    // float serializes it as `40.0`, which `as_i64` rejects. Accept an integral
+    // number in range rather than leaving the column NULL; a real fraction is
+    // still not an integer and stays NULL. This mirrors `resolve_f64`, which
+    // accepts an integral number for the same reason.
+    Ok(resolve_blob_value(view, field).and_then(|value| value.as_i64().or_else(|| blob_number_as_i64(&value))))
+}
+
+/// Convert an integral JSON float to `i64`, or `None` when it has a fractional
+/// part or falls outside the range `i64` can hold exactly.
+fn blob_number_as_i64(value: &serde_json::Value) -> Option<i64> {
+    // 2^63 as f64. The upper bound is exclusive because `i64::MAX` is not
+    // representable as an `f64`, so anything at or above this bound would
+    // saturate rather than convert.
+    const UPPER_BOUND: f64 = 9_223_372_036_854_775_808.0;
+    let number = value.as_f64()?;
+    if number.fract() != 0.0 || number < -UPPER_BOUND || number >= UPPER_BOUND {
+        return None;
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "checked integral and in range above")]
+    Some(number as i64)
 }
 
 /// Resolve the first present `f64` for `field`; strict parse (D6).
@@ -1494,6 +1540,45 @@ mod tests {
         ]);
         let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
         assert_eq!(row.max_tokens, Some(8192));
+    }
+
+    #[test]
+    fn an_integral_float_in_the_blob_fills_the_integer_column() {
+        // An SDK that keeps these as floats serializes `40.0`, which is the
+        // same JSON number as `40`. Reading it as NULL would lose the value.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str(
+                "llm.invocation_parameters",
+                r#"{"top_k":40.0,"max_tokens":512.0,"seed":7.0,"n":3.0}"#,
+            ),
+        ]);
+        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        assert_eq!(row.top_k, Some(40));
+        assert_eq!(row.max_tokens, Some(512));
+        assert_eq!(row.seed, Some(7));
+        assert_eq!(row.choice_count, Some(3));
+    }
+
+    #[test]
+    fn a_fractional_or_out_of_range_number_leaves_the_integer_column_null() {
+        // A fraction is not the integer the column holds, and a magnitude past
+        // i64 would saturate into a value the payload never stated. Both stay
+        // NULL rather than storing something invented.
+        for blob in [
+            r#"{"max_tokens":512.5}"#,
+            r#"{"max_tokens":1e30}"#,
+            r#"{"max_tokens":-1e30}"#,
+        ] {
+            let span = span_with(vec![
+                kv_str("openinference.span.kind", "LLM"),
+                kv_int("llm.token_count.total", 42),
+                kv_str("llm.invocation_parameters", blob),
+            ]);
+            let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+            assert_eq!(row.max_tokens, None, "blob {blob} must not populate max_tokens");
+            assert_eq!(row.total_tokens, Some(42), "the rest of the row survives blob {blob}");
+        }
     }
 
     #[test]

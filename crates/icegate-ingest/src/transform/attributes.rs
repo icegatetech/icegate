@@ -275,6 +275,20 @@ impl RebuiltNode {
     }
 }
 
+/// Longest dotted path, in segments after the prefix, that the indexed rebuild
+/// will follow.
+///
+/// [`RebuiltNode::insert`] recurses once per segment and
+/// [`RebuiltNode::into_json`] once per nesting level, while the segment count
+/// comes from an OTLP attribute key, which the client controls. Without a cap, a
+/// single key carrying enough dots would recurse the ingest thread into a stack
+/// overflow, which aborts the process rather than failing the request. The
+/// deepest path the convention defines is a multimodal image
+/// (`<index>.message.contents.<index>.message_content.image.image.url`, eight
+/// segments), so this leaves room for a longer variant while still bounding the
+/// recursion.
+const MAX_INDEXED_KEY_SEGMENTS: usize = 16;
+
 /// Rebuild the JSON array that `OpenInference` flattened into indexed attribute
 /// keys under `prefix`, and serialize it.
 ///
@@ -297,6 +311,9 @@ impl RebuiltNode {
 /// group such as `...0.message.tool_calls.0.tool_call.function.name` rebuilds
 /// into a `tool_calls` array inside its message.
 ///
+/// An over-deep key is skipped rather than rebuilt: see
+/// [`MAX_INDEXED_KEY_SEGMENTS`].
+///
 /// Returns `None` when no attribute carries the prefix.
 pub(crate) fn serialize_indexed_attrs_to_json_array(attrs: &[KeyValue], prefix: &str) -> Option<String> {
     let mut root = RebuiltNode::Array(std::collections::BTreeMap::new());
@@ -314,6 +331,9 @@ pub(crate) fn serialize_indexed_attrs_to_json_array(attrs: &[KeyValue], prefix: 
         // The first segment must be an index; anything else is a sibling
         // attribute that merely shares the prefix, not an array element.
         if path.first().is_none_or(|segment| segment.parse::<usize>().is_err()) {
+            continue;
+        }
+        if path.len() > MAX_INDEXED_KEY_SEGMENTS {
             continue;
         }
         root.insert(&path, value);
@@ -1260,5 +1280,90 @@ mod tests {
         assert_eq!(parsed.as_array().expect("array").len(), 2);
         assert_eq!(parsed[0]["json_schema"], r#"{"name":"web_search"}"#);
         assert_eq!(parsed[1]["json_schema"], r#"{"name":"final_answer"}"#);
+    }
+    #[test]
+    fn rebuilds_multimodal_message_contents_without_their_wrapper() {
+        // The wrapper skipped after an index is positional, not a known name:
+        // the multimodal list nests `message_content` under `contents`, and the
+        // content columns expect the same unwrapped shape there as anywhere
+        // else. Recognizing only a fixed set of wrapper names would rebuild
+        // this as `[{"message_content": {...}}]`.
+        let attrs = vec![
+            indexed_kv("llm.input_messages.0.message.role", "user"),
+            indexed_kv("llm.input_messages.0.message.contents.0.message_content.type", "text"),
+            indexed_kv(
+                "llm.input_messages.0.message.contents.0.message_content.text",
+                "what is this",
+            ),
+            indexed_kv("llm.input_messages.0.message.contents.1.message_content.type", "image"),
+            indexed_kv(
+                "llm.input_messages.0.message.contents.1.message_content.image.image.url",
+                "https://example.test/photo.jpg",
+            ),
+        ];
+        let parsed = rebuild(&attrs, "llm.input_messages");
+        assert_eq!(parsed[0]["role"], "user");
+        let contents = parsed[0]["contents"].as_array().expect("contents is an array");
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["type"], "text");
+        assert_eq!(contents[0]["text"], "what is this");
+        assert_eq!(contents[1]["type"], "image");
+        assert_eq!(contents[1]["image"]["image"]["url"], "https://example.test/photo.jpg");
+    }
+
+    #[test]
+    fn rebuild_keeps_the_first_value_when_a_segment_collides_with_the_other_shape() {
+        // The producer contradicts itself: `...tool.a` is a leaf in one
+        // attribute and an object in the next. The first value stands and the
+        // colliding segment is dropped, rather than the later key silently
+        // replacing what is already built.
+        let attrs = vec![
+            indexed_kv("llm.tools.0.tool.a", "scalar"),
+            indexed_kv("llm.tools.0.tool.a.b", "nested"),
+        ];
+        let parsed = rebuild(&attrs, "llm.tools");
+        assert_eq!(parsed[0]["a"], "scalar");
+
+        // ... and in the other order: the object is built first, so the later
+        // leaf cannot overwrite it.
+        let attrs = vec![
+            indexed_kv("llm.tools.0.tool.a.b", "nested"),
+            indexed_kv("llm.tools.0.tool.a", "scalar"),
+        ];
+        let parsed = rebuild(&attrs, "llm.tools");
+        assert_eq!(parsed[0]["a"]["b"], "nested");
+    }
+
+    #[test]
+    fn rebuild_skips_a_key_deeper_than_the_recursion_cap() {
+        // A client-supplied key with one segment too many is dropped whole,
+        // rather than recursed into. The well-formed sibling still rebuilds.
+        // `0` + the repeated segments + `leaf` is one segment over the cap.
+        let deep = format!("llm.tools.0.{}leaf", "a.".repeat(MAX_INDEXED_KEY_SEGMENTS - 1));
+        let attrs = vec![
+            indexed_kv(&deep, "dropped"),
+            indexed_kv("llm.tools.1.tool.json_schema", "kept"),
+        ];
+        let parsed = rebuild(&attrs, "llm.tools");
+        assert_eq!(parsed.as_array().expect("array").len(), 1);
+        assert_eq!(parsed[0]["json_schema"], "kept");
+    }
+
+    #[test]
+    fn rebuild_accepts_a_key_at_the_recursion_cap() {
+        // One segment shallower than the case above, so the cap is a boundary
+        // and not a blanket rejection of nested keys.
+        // `0` + `tool` + the repeated segments + `leaf` is exactly the cap.
+        const NESTING: usize = MAX_INDEXED_KEY_SEGMENTS - 3;
+        let attrs = vec![indexed_kv(
+            &format!("llm.tools.0.tool.{}leaf", "a.".repeat(NESTING)),
+            "kept",
+        )];
+        let parsed = rebuild(&attrs, "llm.tools");
+        let mut node = &parsed[0];
+        for _ in 0..NESTING {
+            node = &node["a"];
+        }
+        assert_eq!(node["leaf"], "kept");
     }
 }
