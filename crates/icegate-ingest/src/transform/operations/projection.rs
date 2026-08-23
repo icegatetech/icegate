@@ -418,17 +418,28 @@ fn resolve_i64(view: &AttributeView, field: OperationField, context: &'static st
 }
 
 /// Convert an integral JSON float to `i64`, or `None` when it has a fractional
-/// part or falls outside the range `i64` can hold exactly.
+/// part or a magnitude no longer pinned to a single integer by `f64`.
 fn blob_number_as_i64(value: &serde_json::Value) -> Option<i64> {
-    // 2^63 as f64. The upper bound is exclusive because `i64::MAX` is not
-    // representable as an `f64`, so anything at or above this bound would
-    // saturate rather than convert.
-    const UPPER_BOUND: f64 = 9_223_372_036_854_775_808.0;
+    // 2^53, the first magnitude at which the representable integers stop being
+    // consecutive: from here up, a whole `f64` no longer names one integer, so
+    // casting it would store a number nothing necessarily sent. The bound is
+    // exclusive because 2^53 is itself where its unrepresentable neighbour
+    // lands. It sits far under `i64::MAX`, so nothing reaching the cast can
+    // saturate.
+    //
+    // This bounds only the cast. serde_json is built without
+    // `arbitrary_precision`, and its parser is already off by an ulp for some
+    // literals just under the bound, which no check here can undo: the text is
+    // gone by the time a `Value` arrives.
+    const EXACT_INTEGER_BOUND: f64 = 9_007_199_254_740_992.0;
     let number = value.as_f64()?;
-    if number.fract() != 0.0 || number < -UPPER_BOUND || number >= UPPER_BOUND {
+    if number.fract() != 0.0 || number.abs() >= EXACT_INTEGER_BOUND {
         return None;
     }
-    #[expect(clippy::cast_possible_truncation, reason = "checked integral and in range above")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "checked integral and exactly representable above"
+    )]
     Some(number as i64)
 }
 
@@ -1561,14 +1572,37 @@ mod tests {
     }
 
     #[test]
+    fn the_integral_float_cast_is_bounded_at_the_last_exact_integer() {
+        // Driven through the values rather than through JSON text: serde_json's
+        // own parser is off by an ulp for some literals immediately under the
+        // bound, which would hide where this rule actually cuts.
+        for (number, expected) in [
+            (9_007_199_254_740_991.0_f64, Some(9_007_199_254_740_991)),
+            (-9_007_199_254_740_991.0_f64, Some(-9_007_199_254_740_991)),
+            (9_007_199_254_740_992.0_f64, None),
+            (-9_007_199_254_740_992.0_f64, None),
+        ] {
+            let value = serde_json::Value::from(number);
+            assert_eq!(
+                blob_number_as_i64(&value),
+                expected,
+                "{number} at the exact-integer bound"
+            );
+        }
+    }
+
+    #[test]
     fn a_fractional_or_out_of_range_number_leaves_the_integer_column_null() {
-        // A fraction is not the integer the column holds, and a magnitude past
-        // i64 would saturate into a value the payload never stated. Both stay
-        // NULL rather than storing something invented.
+        // A fraction is not the integer the column holds, and past 2^53 a whole
+        // float no longer names one integer: `9007199254740993.0` reaches this
+        // code already rounded onto a neighbour. Both stay NULL rather than
+        // storing a number the payload never stated.
         for blob in [
             r#"{"max_tokens":512.5}"#,
             r#"{"max_tokens":1e30}"#,
             r#"{"max_tokens":-1e30}"#,
+            r#"{"max_tokens":9007199254740993.0}"#,
+            r#"{"max_tokens":-9007199254740993.0}"#,
         ] {
             let span = span_with(vec![
                 kv_str("openinference.span.kind", "LLM"),
