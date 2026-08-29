@@ -77,7 +77,7 @@ Chart releases are signed with cosign using the release workflow's identity, so 
 is no public key to distribute:
 
 ```bash
-cosign verify oci://ghcr.io/icegatetech/charts/icegate:0.2.0 \
+cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
   --certificate-identity-regexp 'https://github.com/icegatetech/icegate/.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

@@ -191,6 +191,20 @@ jobs:
           echo "--- stamped ---"
           grep -E '^(version|appVersion):|prerelease:|image: ghcr' "$CHART"
 
+      - name: Install helm-docs
+        run: scripts/install-helm-docs.sh
+
+      # The README is what Artifact Hub renders as the package page, and helm-docs
+      # bakes the chart version into it — the badges and the `--version` and
+      # `cosign verify` snippets. Regenerating it from the freshly stamped
+      # Chart.yaml is what keeps those commands naming the version this run
+      # publishes; the copy committed in the repo carries the placeholder version
+      # and would tell every reader to install a release that does not exist.
+      - name: Regenerate chart README
+        run: |
+          helm-docs --chart-search-root config/helm/icegate --template-files README.md.gotmpl
+          grep -E '^!\[Version|--version |cosign verify ' config/helm/icegate/README.md
+
       - name: Lint chart
         run: helm lint config/helm/icegate
 

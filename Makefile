@@ -135,7 +135,7 @@ helm-rest-uri-test:
 # name simply means Artifact Hub scans nothing and the security badge disappears.
 #
 # Needs helm-docs on PATH to regenerate the README and diff it:
-#   go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2
+#   scripts/install-helm-docs.sh
 helm-metadata-test:
 	python3 scripts/helm-metadata-check.py
 
