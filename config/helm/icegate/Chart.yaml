@@ -68,6 +68,14 @@ annotations:
   # notes already carry the full commit list, so this lists only what changes the
   # chart's own behaviour or values.
   artifacthub.io/changes: |
+    - kind: changed
+      description: Default catalog backend is now s3, the catalog this project ships itself
+    - kind: changed
+      description: catalog.rest.uri has no default and is required when catalog.backend=rest
+    - kind: added
+      description: Maintain component running compaction, snapshot expiry, orphan-file GC and WAL cleanup
+    - kind: added
+      description: Optional read-only Iceberg REST catalog server, off by default
     - kind: added
       description: Values schema, so chart values are browsable and validated on install
     - kind: added
