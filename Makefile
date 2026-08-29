@@ -73,7 +73,7 @@ helm-lint:
 helm-template:
 	helm template icegate config/helm/icegate > /dev/null
 
-ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test helm-rest-uri-test catalog-rest-check catalog-rest-test catalog-rest-clippy
+ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test helm-rest-uri-test helm-metadata-test catalog-rest-check catalog-rest-test catalog-rest-clippy
 
 # The catalog server is off by default, so the default render above never covers
 # its templates. Enabling it must produce a complete deployable unit, and pairing
@@ -127,6 +127,17 @@ helm-rest-uri-test:
 		exit 1; \
 	fi; \
 	printf '%s\n' "$$error" | grep -F "catalog.rest.uri is required" > /dev/null
+
+# Every Artifact Hub artifact is a copy of something else in the repo: the image
+# annotations copy the bake targets, the values schema copies the shape of
+# values.yaml, the README copies the install command. A copy goes stale silently,
+# and these particular failures are invisible from inside the repo — a wrong image
+# name simply means Artifact Hub scans nothing and the security badge disappears.
+#
+# Needs helm-docs on PATH to regenerate the README and diff it:
+#   go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2
+helm-metadata-test:
+	python3 scripts/helm-metadata-check.py
 
 # Run the test suite under LLVM sanitizers. Linux-only (leak and memory do not
 # exist on Darwin); scripts/sanitize.sh re-execs itself in a container on macOS.

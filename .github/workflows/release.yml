@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -176,8 +177,19 @@ jobs:
       - name: Stamp chart version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          sed -i "s/^version:.*/version: ${VERSION}/" config/helm/icegate/Chart.yaml
-          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" config/helm/icegate/Chart.yaml
+          CHART=config/helm/icegate/Chart.yaml
+          sed -i "s/^version:.*/version: ${VERSION}/" "$CHART"
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$CHART"
+          # The artifacthub.io/images tags must match the images this run publishes,
+          # or Artifact Hub scans a version that does not exist and the security
+          # report silently comes back empty.
+          sed -i -E "s|(image: ghcr.io/icegatetech/icegate-[a-z]+):.*|\\1:${VERSION}|" "$CHART"
+          # A tag with a hyphen after the v is a prerelease, matching the rule the
+          # Validate SemVer tag step already applies.
+          if [[ "$VERSION" == *-* ]]; then PRE=true; else PRE=false; fi
+          sed -i -E "s|(artifacthub.io/prerelease: ).*|\\1\"${PRE}\"|" "$CHART"
+          echo "--- stamped ---"
+          grep -E '^(version|appVersion):|prerelease:|image: ghcr' "$CHART"
 
       - name: Lint chart
         run: helm lint config/helm/icegate
@@ -187,6 +199,33 @@ jobs:
 
       - name: Push chart to GHCR
         run: helm push "icegate-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/icegatetech/charts
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Push Artifact Hub repository metadata
+        run: |
+          oras push \
+            ghcr.io/icegatetech/charts/icegate:artifacthub.io \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            config/helm/icegate/artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
+
+      - name: Sign the chart
+        env:
+          COSIGN_YES: "true"
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cosign sign "ghcr.io/icegatetech/charts/icegate:${VERSION}"
+
+      - name: Verify the signature
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cosign verify "ghcr.io/icegatetech/charts/icegate:${VERSION}" \
+            --certificate-identity-regexp 'https://github.com/icegatetech/icegate/.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
   # ── GitHub Release ────────────────────────────────────────────────────────
   github-release:

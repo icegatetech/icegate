@@ -707,9 +707,10 @@ operators must perform a destructive migration.
 
 #### Procedure
 
-1. **Back up** the affected tables. With Nessie this is a `CREATE BRANCH`
-   off the live ref before you drop anything; with a hosted REST catalog,
-   snapshot the underlying object-store prefix.
+1. **Back up** the affected tables before dropping anything. Under the
+   default s3 catalog this means copying the catalog prefix and the table
+   data prefixes in object storage; a catalog that offers branching can
+   branch off the live ref instead.
 2. **Stop ingest writers** so no new files land in the old schema during
    the cutover.
 3. **Drop and recreate** each affected table from the canonical Rust

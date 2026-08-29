@@ -28,6 +28,17 @@ jobs:
         with:
           version: v4.1.0
 
+      - name: Install helm-docs
+        run: |
+          VERSION=1.14.2
+          curl -fsSL -o /tmp/helm-docs.tar.gz \
+            "https://github.com/norwoodj/helm-docs/releases/download/v${VERSION}/helm-docs_${VERSION}_Linux_x86_64.tar.gz"
+          tar -xzf /tmp/helm-docs.tar.gz -C /tmp helm-docs
+          sudo install -m 0755 /tmp/helm-docs /usr/local/bin/helm-docs
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
       - name: Lint chart
         run: helm lint config/helm/icegate
 
@@ -39,3 +50,6 @@ jobs:
 
       - name: Template REST backend guard
         run: make helm-rest-uri-test
+
+      - name: Check Artifact Hub metadata
+        run: make helm-metadata-test

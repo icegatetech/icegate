@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "IceGate Helm chart values",
+  "description": "Structural schema for the IceGate chart. Sections and their immediate members are typed; deeper trees are left open so that adding a value does not break installs. See values.yaml for the authoritative defaults and comments.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "namespace": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Namespace creation.",
+      "properties": {
+        "create": { "type": ["boolean", "null"], "description": "Create the namespace as part of this chart release." }
+      }
+    },
+    "global": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Global settings shared by every component.",
+      "properties": {
+        "nameOverride": { "type": ["string", "null"], "description": "Override the chart name used in resource names." },
+        "fullnameOverride": { "type": ["string", "null"], "description": "Override the fully qualified resource name prefix." },
+        "imagePullSecrets": { "type": ["array", "null"], "description": "Image pull secrets applied to every component." }
+      }
+    },
+    "serviceAccount": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "ServiceAccount used by every component.",
+      "properties": {
+        "create": { "type": ["boolean", "null"], "description": "Create the ServiceAccount." },
+        "annotations": { "type": ["object", "null"], "description": "Annotations for the ServiceAccount, for example an AWS IRSA role ARN." },
+        "name": { "type": ["string", "null"], "description": "Name of an existing ServiceAccount to use instead of creating one." }
+      }
+    },
+    "catalog": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Iceberg catalog configuration, shared by all components.",
+      "properties": {
+        "backend": { "type": ["string", "null"], "enum": ["s3", "rest", "s3tables", "glue", null], "description": "Catalog backend. The s3 backend is the project's own root.json catalog and requires no external service." },
+        "s3": { "type": ["object", "null"], "additionalProperties": true, "description": "S3 catalog settings, used when backend=s3." },
+        "rest": { "type": ["object", "null"], "additionalProperties": true, "description": "REST catalog settings, used when backend=rest. The URI names an external catalog service this chart does not deploy, so it has no default." },
+        "s3tables": { "type": ["object", "null"], "additionalProperties": true, "description": "S3 Tables settings, used when backend=s3tables." },
+        "glue": { "type": ["object", "null"], "additionalProperties": true, "description": "AWS Glue settings, used when backend=glue." },
+        "warehouse": { "type": ["string", "null"], "description": "Iceberg warehouse location." },
+        "properties": { "type": ["object", "null"], "description": "Additional catalog properties merged into the rendered catalog config for every backend." }
+      }
+    },
+    "storage": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Object storage configuration, shared by all components.",
+      "properties": {
+        "s3": { "type": ["object", "null"], "additionalProperties": true, "description": "S3 or S3-compatible storage settings." }
+      }
+    },
+    "queue": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "WAL queue configuration, shared by query and ingest.",
+      "properties": {
+        "common": { "type": ["object", "null"], "additionalProperties": true, "description": "Settings applied to both the read and write sides." },
+        "read": { "type": ["object", "null"], "additionalProperties": true, "description": "Read-side queue settings, used by query." },
+        "write": { "type": ["object", "null"], "additionalProperties": true, "description": "Write-side queue settings, used by ingest." }
+      }
+    },
+    "aws": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "AWS credentials.",
+      "properties": {
+        "existingSecret": { "type": ["string", "null"], "description": "Name of an existing Secret holding AWS credentials." },
+        "region": { "type": ["string", "null"], "description": "AWS region." }
+      }
+    },
+    "catalogServer": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Read-only Iceberg REST catalog server component. Requires catalog.backend=s3.",
+      "properties": {
+        "enabled": { "type": ["boolean", "null"], "description": "Deploy the catalog server." },
+        "replicaCount": { "type": ["integer", "null"], "description": "Number of replicas." },
+        "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Container image settings." },
+        "http": { "type": ["object", "null"], "additionalProperties": true, "description": "HTTP listener settings." },
+        "pagination": { "type": ["object", "null"], "additionalProperties": true, "description": "Response pagination settings." },
+        "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
+        "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },
+        "resources": { "type": ["object", "null"], "description": "Pod resource requests and limits." },
+        "nodeSelector": { "type": ["object", "null"], "description": "Node selector." },
+        "tolerations": { "type": ["array", "null"], "description": "Tolerations." },
+        "affinity": { "type": ["object", "null"], "description": "Affinity rules." },
+        "service": { "type": ["object", "null"], "additionalProperties": true, "description": "Service settings." }
+      }
+    },
+    "query": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Query component: Loki-, Prometheus- and Tempo-compatible APIs plus Arrow Flight SQL.",
+      "properties": {
+        "enabled": { "type": ["boolean", "null"], "description": "Deploy the query component." },
+        "replicaCount": { "type": ["integer", "null"], "description": "Number of replicas." },
+        "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Container image settings." },
+        "engine": { "type": ["object", "null"], "additionalProperties": true, "description": "Query engine settings." },
+        "cache": { "type": ["object", "null"], "additionalProperties": true, "description": "IO and metadata cache settings." },
+        "loki": { "type": ["object", "null"], "additionalProperties": true, "description": "Loki-compatible API listener." },
+        "prometheus": { "type": ["object", "null"], "additionalProperties": true, "description": "Prometheus-compatible API listener." },
+        "tempo": { "type": ["object", "null"], "additionalProperties": true, "description": "Tempo-compatible API listener." },
+        "flightSql": { "type": ["object", "null"], "additionalProperties": true, "description": "Arrow Flight SQL listener." },
+        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Metrics endpoint settings." },
+        "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings." },
+        "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
+        "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },
+        "resources": { "type": ["object", "null"], "description": "Pod resource requests and limits." },
+        "nodeSelector": { "type": ["object", "null"], "description": "Node selector." },
+        "tolerations": { "type": ["array", "null"], "description": "Tolerations." },
+        "affinity": { "type": ["object", "null"], "description": "Affinity rules." },
+        "topologySpreadConstraints": { "type": ["array", "null"], "description": "Topology spread constraints." },
+        "service": { "type": ["object", "null"], "additionalProperties": true, "description": "Service settings." },
+        "ingress": { "type": ["object", "null"], "additionalProperties": true, "description": "Ingress settings." },
+        "pdb": { "type": ["object", "null"], "additionalProperties": true, "description": "PodDisruptionBudget settings." },
+        "waitForDependencies": { "type": ["object", "null"], "additionalProperties": true, "description": "Init-container dependency gate." },
+        "livenessProbe": { "type": ["object", "null"], "description": "Liveness probe." },
+        "readinessProbe": { "type": ["object", "null"], "description": "Readiness probe." }
+      }
+    },
+    "ingest": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Ingest component: OTLP gRPC and HTTP receivers writing to the WAL.",
+      "properties": {
+        "enabled": { "type": ["boolean", "null"], "description": "Deploy the ingest component." },
+        "replicaCount": { "type": ["integer", "null"], "description": "Number of replicas." },
+        "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Container image settings." },
+        "shift": { "type": ["object", "null"], "additionalProperties": true, "description": "WAL-to-Iceberg shift settings." },
+        "cache": { "type": ["object", "null"], "additionalProperties": true, "description": "IO and metadata cache settings." },
+        "otlpHttp": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP HTTP receiver." },
+        "otlpGrpc": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP gRPC receiver." },
+        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Metrics endpoint settings." },
+        "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings." },
+        "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
+        "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },
+        "resources": { "type": ["object", "null"], "description": "Pod resource requests and limits." },
+        "nodeSelector": { "type": ["object", "null"], "description": "Node selector." },
+        "tolerations": { "type": ["array", "null"], "description": "Tolerations." },
+        "affinity": { "type": ["object", "null"], "description": "Affinity rules." },
+        "topologySpreadConstraints": { "type": ["array", "null"], "description": "Topology spread constraints." },
+        "service": { "type": ["object", "null"], "additionalProperties": true, "description": "Service settings." },
+        "ingress": { "type": ["object", "null"], "additionalProperties": true, "description": "Ingress settings." },
+        "pdb": { "type": ["object", "null"], "additionalProperties": true, "description": "PodDisruptionBudget settings." },
+        "waitForDependencies": { "type": ["object", "null"], "additionalProperties": true, "description": "Init-container dependency gate." },
+        "livenessProbe": { "type": ["object", "null"], "description": "Liveness probe." },
+        "readinessProbe": { "type": ["object", "null"], "description": "Readiness probe." }
+      }
+    },
+    "migrate": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Schema migration Job, run as a Helm hook.",
+      "properties": {
+        "enabled": { "type": ["boolean", "null"], "description": "Run the migrate hook." },
+        "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Container image settings." },
+        "resources": { "type": ["object", "null"], "description": "Job resource requests and limits." },
+        "backoffLimit": { "type": ["integer", "null"], "description": "Job backoff limit." },
+        "activeDeadlineSeconds": { "type": ["integer", "null"], "description": "Job active deadline in seconds." },
+        "hookDeletePolicy": { "type": ["string", "null"], "description": "Helm hook delete policy." },
+        "snapshotExpiration": { "type": ["object", "null"], "additionalProperties": true, "description": "Iceberg snapshot expiry settings." },
+        "waitForDependencies": { "type": ["object", "null"], "additionalProperties": true, "description": "Init-container dependency gate." }
+      }
+    },
+    "maintain": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Maintain component: compaction, garbage collection and WAL cleanup.",
+      "properties": {
+        "enabled": { "type": ["boolean", "null"], "description": "Deploy the maintain component." },
+        "replicaCount": { "type": ["integer", "null"], "description": "Number of replicas." },
+        "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Container image settings." },
+        "compaction": { "type": ["object", "null"], "additionalProperties": true, "description": "Parquet and manifest compaction settings." },
+        "gc": { "type": ["object", "null"], "additionalProperties": true, "description": "Garbage collection settings." },
+        "walCleanup": { "type": ["object", "null"], "additionalProperties": true, "description": "WAL segment reclamation settings." },
+        "pricing": { "type": ["object", "null"], "additionalProperties": true, "description": "LLM pricing table settings." },
+        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Metrics endpoint settings." },
+        "service": { "type": ["object", "null"], "additionalProperties": true, "description": "Service settings." },
+        "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings. Enabling this requires maintain.tracing.otlpEndpoint; a Helm required guard enforces it." },
+        "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
+        "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },
+        "resources": { "type": ["object", "null"], "description": "Pod resource requests and limits." },
+        "nodeSelector": { "type": ["object", "null"], "description": "Node selector." },
+        "tolerations": { "type": ["array", "null"], "description": "Tolerations." },
+        "affinity": { "type": ["object", "null"], "description": "Affinity rules." },
+        "livenessProbe": { "type": ["object", "null"], "description": "Liveness probe." },
+        "waitForDependencies": { "type": ["object", "null"], "additionalProperties": true, "description": "Init-container dependency gate." }
+      }
+    },
+    "serviceMonitor": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Prometheus Operator ServiceMonitor resources.",
+      "properties": {
+        "enabled": { "type": ["boolean", "null"], "description": "Create ServiceMonitor resources." },
+        "interval": { "type": ["string", "null"], "description": "Scrape interval." },
+        "scrapeTimeout": { "type": ["string", "null"], "description": "Scrape timeout." },
+        "labels": { "type": ["object", "null"], "description": "Extra labels for ServiceMonitor discovery." }
+      }
+    }
+  }
+}

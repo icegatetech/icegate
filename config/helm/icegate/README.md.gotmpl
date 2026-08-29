@@ -1,0 +1,94 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.versionBadge" . }}{{ template "chart.typeBadge" . }}{{ template "chart.appVersionBadge" . }}
+
+IceGate is an observability data lake engine. This chart deploys it on Kubernetes:
+OpenTelemetry data arrives over OTLP, is written to a write-ahead log on object
+storage, and lands in Apache Iceberg tables stored as Parquet. Queries run on Apache
+DataFusion and are served through Loki- and Tempo-compatible HTTP APIs and Arrow
+Flight SQL. There is no OLTP database in the deployment: the Iceberg catalog is backed
+by object storage, and compute scales separately from the data it reads.
+
+## Status and stability
+
+IceGate is a prototype. The released chart versions are `0.1.1` and a series of
+`0.2.0` release candidates. Interfaces, values and the Iceberg schema may change
+between releases, and there is no upgrade compatibility guarantee yet. Read the
+release notes before upgrading.
+
+## Install
+
+```bash
+helm install icegate oci://ghcr.io/icegatetech/charts/icegate
+```
+
+To pin a version:
+
+```bash
+helm install icegate oci://ghcr.io/icegatetech/charts/icegate --version {{ .Version }}
+```
+
+## What this chart deploys
+
+Four components, each independently enabled and scaled:
+
+| Component | Responsibility |
+|---|---|
+| `ingest` | Receives OTLP over gRPC and HTTP, writes to the WAL on object storage |
+| `query` | Serves the Loki-, Tempo- and Prometheus-shaped HTTP APIs and Arrow Flight SQL, reading both Iceberg tables and the live WAL |
+| `maintain` | Background compaction, garbage collection and WAL reclamation |
+| `catalog` | Read-only Iceberg REST catalog API over the object-storage catalog. Off by default |
+
+A `migrate` Job runs as a Helm hook to create or update the Iceberg tables.
+
+## Requirements
+
+- Kubernetes with a working `StorageClass` if you run object storage in-cluster.
+- S3 or an S3-compatible object store, reachable from every enabled component.
+- Credentials supplied through `aws.existingSecret`, or an IRSA role on the
+  ServiceAccount via `serviceAccount.annotations`.
+
+## Running against S3-compatible storage
+
+The default catalog backend is `s3`: IceGate keeps its own Iceberg catalog state in
+object storage, so no external catalog service is needed. Point `storage.s3` at your
+endpoint and set credentials. S3 addressing is derived from the endpoint by default —
+path-style for S3-compatible endpoints, virtual-hosted on AWS S3 — so leave
+`catalog.s3.pathStyleAccess` unset unless you need to overrule that.
+
+## Using an external Iceberg REST catalog
+
+Set `catalog.backend` to `rest` and give `catalog.rest.uri` the catalog's address. The
+chart does not deploy a REST catalog, so the URI has no default and the render fails
+without one. `s3tables` and `glue` backends are also available; see the values table.
+
+## Querying with Loki- and Tempo-compatible APIs
+
+The `query` component exposes HTTP APIs that speak the Loki and Tempo query protocols,
+so existing clients for those protocols can read IceGate directly. Arrow Flight SQL is
+available for SQL access. Each listener is enabled and given a port independently under
+`query`; the values table below lists the keys.
+
+## Verifying the chart signature
+
+Chart releases are signed with cosign using the release workflow's identity, so there
+is no public key to distribute:
+
+```bash
+cosign verify oci://ghcr.io/icegatetech/charts/icegate:{{ .Version }} \
+  --certificate-identity-regexp 'https://github.com/icegatetech/icegate/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+{{ template "chart.valuesSection" . }}
+
+## Links
+
+{{ template "chart.sourcesSection" . }}
+
+- [Documentation](https://docs.icegate.tech)
+- [Issue tracker](https://github.com/icegatetech/icegate/issues)
+
+{{ template "chart.maintainersSection" . }}

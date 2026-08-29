@@ -1,0 +1,11 @@
+# Artifact Hub repository metadata. For an OCI-based Helm repository this file is not
+# served over HTTP: .github/workflows/release.yml pushes it to GHCR as an OCI artifact
+# tagged `artifacthub.io`, which is where Artifact Hub looks for it.
+#
+# `repositoryID` is issued by Artifact Hub when the repository is first registered and
+# is added afterwards — see PUBLISHING.md. `owners` is what earns the Verified
+# Publisher badge, and the email must be one the listed owner can receive mail at.
+repositoryID: d41d5a6d-4fd0-4796-9f33-a3e597705e7c
+owners:
+  - name: icegatetech
+    email: contact@icegate.team

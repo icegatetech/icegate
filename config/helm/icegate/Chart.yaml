@@ -37,6 +37,57 @@ annotations:
       url: https://github.com/icegatetech/icegate
     - name: support
       url: https://github.com/icegatetech/icegate/issues
+  # Drives Artifact Hub's Trivy scan and the security rating badge — without it no
+  # security report is produced at all. The four entries must stay in step with the
+  # bake targets in config/docker/docker-bake.hcl; `make helm-metadata-test` asserts
+  # this. The tags match appVersion and are rewritten by .github/workflows/release.yml
+  # at tag time, like `version` and `appVersion` above.
+  artifacthub.io/images: |
+    - name: query
+      image: ghcr.io/icegatetech/icegate-query:0.2.0
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    - name: ingest
+      image: ghcr.io/icegatetech/icegate-ingest:0.2.0
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    - name: maintain
+      image: ghcr.io/icegatetech/icegate-maintain:0.2.0
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    - name: catalog
+      image: ghcr.io/icegatetech/icegate-catalog:0.2.0
+      platforms:
+        - linux/amd64
+        - linux/arm64
+  # A curated changelog for chart consumers, maintained by hand and covering only the
+  # version being released. Deliberately not generated from git log: the GitHub release
+  # notes already carry the full commit list, so this lists only what changes the
+  # chart's own behaviour or values.
+  artifacthub.io/changes: |
+    - kind: added
+      description: Values schema, so chart values are browsable and validated on install
+    - kind: added
+      description: Chart README with install, configuration and catalog-backend guidance
+  # Rewritten by .github/workflows/release.yml from the tag: a tag containing a hyphen
+  # is a prerelease. Editing it here changes nothing at release time.
+  artifacthub.io/prerelease: "false"
+  # Shown when the INSTALL button on the package page is clicked.
+  artifacthub.io/install: |
+    ```bash
+    helm install icegate oci://ghcr.io/icegatetech/charts/icegate
+    ```
+  # Packages a user of this chart also needs, and that this repo already deploys
+  # alongside IceGate (see config/kustomize/base/otel-collector and the grafana
+  # service in config/docker/docker-compose.yml). Both URLs were verified to return
+  # 200 from the Artifact Hub API: an unresolvable one renders as a broken
+  # recommendation on the package page.
+  artifacthub.io/recommendations: |
+    - url: https://artifacthub.io/packages/helm/opentelemetry-helm/opentelemetry-collector
+    - url: https://artifacthub.io/packages/helm/grafana/grafana
 # Discovery terms on Artifact Hub. `prometheus` is deliberately absent: the routes are mounted
 # but every handler returns 501, so listing it here would surface this chart for a query it
 # cannot answer. Add it back with the implementation, not before.

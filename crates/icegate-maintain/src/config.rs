@@ -226,7 +226,7 @@ mod tests {
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
   properties:
     prefix: main
@@ -259,7 +259,7 @@ storage:
         let yaml = r#"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -289,7 +289,7 @@ tracing:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -319,7 +319,7 @@ tracing:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -347,7 +347,7 @@ tracing:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -377,7 +377,7 @@ snapshot_expiration:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -398,7 +398,7 @@ snapshot_expiration:
     const ZERO_ORPHAN_GRACE_PERIOD: &str = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -473,7 +473,7 @@ gc:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -537,7 +537,7 @@ wal_cleanup:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -562,7 +562,7 @@ storage:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -591,7 +591,7 @@ wal_cleanup:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3
@@ -621,7 +621,7 @@ wal_cleanup:
         let yaml = r"
 catalog:
   backend: !rest
-    uri: http://nessie:19120/iceberg
+    uri: http://catalog.example:19120/iceberg
   warehouse: s3://warehouse/
 storage:
   backend: !s3

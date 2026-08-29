@@ -15,3 +15,9 @@
 .idea
 *.tmproj
 .vscode
+
+# Maintainer-facing, not chart content. release.yml pushes artifacthub-repo.yml to
+# GHCR as its own OCI artifact tagged `artifacthub.io`, and PUBLISHING.md documents
+# the manual registration steps; neither is any use to someone installing the chart.
+artifacthub-repo.yml
+PUBLISHING.md
