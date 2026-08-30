@@ -80,6 +80,10 @@ annotations:
       description: Values schema, so chart values are browsable and validated on install
     - kind: added
       description: Chart README with install, configuration and catalog-backend guidance
+    - kind: security
+      description: Component images rebuilt on a distroless base, clearing all critical and high CVEs
+    - kind: changed
+      description: waitForDependencies images bumped to busybox 1.38.0 and aws-cli 2.36.34
   # Rewritten by .github/workflows/release.yml from the tag: a tag containing a hyphen
   # is a prerelease. Editing it here changes nothing at release time.
   artifacthub.io/prerelease: "false"

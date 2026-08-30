@@ -68,12 +68,38 @@ cp /app/target/${RUST_TARGET}/release/maintain /app/output/
 cp /app/target/${RUST_TARGET}/release/catalog  /app/output/
 EOF
 
+# ── Binary staging ──────────────────────────────────────────────────────────
+# The runtime base has no shell, so everything that needs one happens here:
+# validating BINARY, and building the `entrypoint` symlink the Helm chart
+# invokes (`config/helm/icegate/templates/deployment-*.yaml`) alongside the
+# per-binary name Docker Compose invokes (`config/docker/docker-compose.yml`).
+# COPY of a directory preserves the symlink, so the binary is stored once.
+FROM --platform=$BUILDPLATFORM builder AS stager
+ARG BINARY
+RUN <<EOF
+set -eu
+test -n "${BINARY}" || { echo "ERROR: BINARY build-arg is required" >&2; exit 1; }
+mkdir -p /stage
+cp "/app/output/${BINARY}" "/stage/${BINARY}"
+ln -s "/usr/local/bin/${BINARY}" /stage/entrypoint
+EOF
+
 # ── Runtime (one binary per image) ──────────────────────────────────────────
 # No platform pin — inherits the target platform from Buildx.
-FROM debian:bookworm-slim AS runtime
+#
+# Distroless rather than debian:bookworm-slim: the binaries link only
+# libgcc_s/libm/libc, so every other package a Debian base ships is unused
+# attack surface that Trivy reports against this image. Bookworm carried 4
+# CRITICAL and 26 HIGH findings, none of them with a fixed version available
+# (perl-base, util-linux, ncurses, gzip, zlib1g — all `affected`,
+# `fix_deferred` or `will_not_fix`, and all still unfixed in trixie), so no
+# base-version bump clears them; dropping the packages does. `cc` is the
+# smallest variant that carries libgcc-s1, which the binaries need; the
+# `-debian12` suffix keeps glibc in step with the `rust:bookworm` builder.
+# ca-certificates ships in the base, so no apt layer is needed for TLS.
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 ARG BINARY
-RUN test -n "$BINARY" || { echo "ERROR: BINARY build-arg is required"; exit 1; }
 ARG VERSION
 ARG REVISION
 ARG BUILD_DATE
@@ -87,11 +113,10 @@ LABEL org.opencontainers.image.title="icegate-${BINARY}" \
       org.opencontainers.image.source="https://github.com/icegatetech/icegate" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=stager /stage/ /usr/local/bin/
 
-COPY --from=builder /app/output/${BINARY} /usr/local/bin/${BINARY}
-RUN ln -s /usr/local/bin/${BINARY} /usr/local/bin/entrypoint
-
-USER nobody
+# Numeric, because the image has no user database to resolve a name against.
+# 65532 is the distroless `nonroot` uid; the chart pins its own uid through
+# `securityContext` (`config/helm/icegate/templates/_helpers.tpl`).
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/entrypoint"]

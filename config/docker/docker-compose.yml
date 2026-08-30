@@ -36,7 +36,7 @@ services:
     logging: *fluentd-logging
 
   rustfs-init:
-    image: amazon/aws-cli:2.35.15
+    image: amazon/aws-cli:2.36.34
     depends_on:
       rustfs:
         condition: service_healthy
@@ -84,17 +84,40 @@ services:
       # (`icegate-catalog-s3/src/main.rs`) and exports no OTLP, unlike the
       # services that build their telemetry through `icegate-common`.
       RUST_LOG: "info,icegate_catalog_s3=debug,tower_http=info,aws_sdk_s3=warn,aws_smithy_runtime=warn"
-    healthcheck:
-      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8181' || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    # No healthcheck of its own: see the `catalog-probe` service.
     develop:
       watch:
         - action: rebuild
           path: ../../crates
     logging: *fluentd-logging
+
+  # A Compose healthcheck runs inside the container it checks, and the release
+  # image (`config/docker/release.Dockerfile`) is distroless — it ships the
+  # binary and nothing else, so there is no shell or probe tool to run one with.
+  # This sidecar joins the target's network namespace, which puts the target's
+  # ports on its own localhost, and reports health by connecting to one. Anything
+  # that must wait for a port therefore depends on the probe, not on the target.
+  # Kubernetes needs none of this: its probes are httpGet, evaluated by the
+  # kubelet (`config/helm/icegate/templates/deployment-*.yaml`).
+  catalog-probe:
+    image: busybox:1.38.0
+    # `network_mode: service:` forbids ports and networks of its own.
+    network_mode: "service:catalog"
+    command: ["sleep", "infinity"]
+    # Without an init, busybox sleep ignores SIGTERM and `compose down` waits out
+    # the kill timeout on every probe.
+    init: true
+    depends_on:
+      catalog:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "8181"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    profiles:
+      - analytics
 
   migrate:
     build:
@@ -141,12 +164,7 @@ services:
       # second, silently-ignored source of truth. `OTEL_SERVICE_NAME` stays: it is
       # read by the SDK's resource detector, not by the config file.
       OTEL_SERVICE_NAME: icegate-maintain
-    healthcheck:
-      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/9091' || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+    # No healthcheck of its own: see the `maintain-probe` service.
     develop:
       watch:
         - action: rebuild
@@ -157,6 +175,22 @@ services:
           memory: 2g
           cpus: 2
     logging: *fluentd-logging
+
+  # A TCP probe sidecar; see `catalog-probe` for what these are for.
+  maintain-probe:
+    image: busybox:1.38.0
+    network_mode: "service:maintain"
+    command: ["sleep", "infinity"]
+    init: true
+    depends_on:
+      maintain:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9091"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   query:
     build:
@@ -217,12 +251,7 @@ services:
       RUST_LOG: "info,icegate_ingest=debug,jobmanager=debug,icegate_queue=debug,icegate_common=debug,otel::tracing=debug,tonic_tracing_opentelemetry=debug,aws_sdk_s3=warn,aws_smithy_http=warn,aws_smithy_client=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: ingest
-    healthcheck:
-      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/4317' || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    # No healthcheck of its own: see the `ingest-probe` service.
     develop:
       watch:
         - action: rebuild
@@ -233,6 +262,22 @@ services:
           memory: 2g
           cpus: 2
     logging: *fluentd-logging
+
+  # A TCP probe sidecar; see `catalog-probe` for what these are for.
+  ingest-probe:
+    image: busybox:1.38.0
+    network_mode: "service:ingest"
+    command: ["sleep", "infinity"]
+    init: true
+    depends_on:
+      ingest:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "4317"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.149.0
@@ -271,7 +316,7 @@ services:
     image: ghcr.io/krzko/otelgen:v0.5.2
     command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]
     depends_on:
-      ingest:
+      ingest-probe:
         condition: service_healthy
     restart: unless-stopped
     profiles:
@@ -364,7 +409,7 @@ services:
     depends_on:
       rustfs:
         condition: service_healthy
-      catalog:
+      catalog-probe:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/usr/lib/trino/bin/health-check"]

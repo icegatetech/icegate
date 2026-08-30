@@ -281,7 +281,7 @@ query:
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
     enabled: false
-    image: busybox:1.37
+    image: busybox:1.38.0
     ## Endpoints to poll (HTTP GET). Query starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
@@ -293,7 +293,7 @@ query:
     buckets: []
     #  - warehouse
     ## Image for the bucket check (must contain the AWS CLI).
-    awsCliImage: amazon/aws-cli:2.35.15
+    awsCliImage: amazon/aws-cli:2.36.34
 
   ## Liveness and readiness probe overrides
   livenessProbe:
@@ -453,7 +453,7 @@ ingest:
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
     enabled: false
-    image: busybox:1.37
+    image: busybox:1.38.0
     ## Endpoints to poll (HTTP GET). Ingest starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
@@ -465,7 +465,7 @@ ingest:
     buckets: []
     #  - warehouse
     ## Image for the bucket check (must contain the AWS CLI).
-    awsCliImage: amazon/aws-cli:2.35.15
+    awsCliImage: amazon/aws-cli:2.36.34
 
   ## Liveness and readiness probe overrides
   livenessProbe:
@@ -532,7 +532,7 @@ migrate:
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
     enabled: true
-    image: busybox:1.37
+    image: busybox:1.38.0
     ## Endpoints to poll (HTTP GET). Migrate starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
@@ -544,7 +544,7 @@ migrate:
     buckets: []
     #  - warehouse
     ## Image for the bucket check (must contain the AWS CLI).
-    awsCliImage: amazon/aws-cli:2.35.15
+    awsCliImage: amazon/aws-cli:2.36.34
 
 ## ---------------------------------------------------------------------------
 ## Maintain component (long-running `maintain run` service)
@@ -864,7 +864,7 @@ maintain:
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
     enabled: false
-    image: busybox:1.37
+    image: busybox:1.38.0
     ## Endpoints to poll (HTTP GET). Compaction starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
@@ -876,7 +876,7 @@ maintain:
     buckets: []
     #  - warehouse
     ## Image for the bucket check (must contain the AWS CLI).
-    awsCliImage: amazon/aws-cli:2.35.15
+    awsCliImage: amazon/aws-cli:2.36.34
 
 ## ---------------------------------------------------------------------------
 ## ServiceMonitor (Prometheus Operator)

@@ -10,7 +10,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: rustfs-init
-          image: amazon/aws-cli:2.35.15
+          image: amazon/aws-cli:2.36.34
           env:
             - name: AWS_ACCESS_KEY_ID
               value: rustfsadmin

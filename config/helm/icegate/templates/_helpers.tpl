@@ -328,7 +328,7 @@ initContainers:
   {{- end }}
   {{- if .config.buckets }}
   - name: wait-for-buckets
-    image: {{ .config.awsCliImage | default "amazon/aws-cli:2.35.15" }}
+    image: {{ .config.awsCliImage | default "amazon/aws-cli:2.36.34" }}
     securityContext:
       # readOnlyRootFilesystem is relaxed (unlike the strict container context)
       # so the AWS CLI can use its writable scratch space; still non-root, no
