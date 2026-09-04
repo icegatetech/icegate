@@ -70,10 +70,22 @@ pub const TENANT_ID_HEADER: &str = "x-scope-orgid";
 
 /// Validate a tenant ID value.
 ///
-/// Returns `true` if `value` is non-empty and contains only ASCII
-/// alphanumeric characters, hyphens, or underscores.
+/// Returns `true` if `value` is non-empty and contains only ASCII alphanumeric
+/// characters, hyphens, underscores, or colons.
+///
+/// The colon is admitted because the control plane's tenant id is
+/// `{org_id}:{workspace_id}` — the separator is part of the format, not a
+/// character that happens to appear in one. Refusing it does not reject a
+/// request: ingest and `resolve_tenant_id` both fall back to
+/// [`DEFAULT_TENANT_ID`], so a refused id merges every workspace into one
+/// tenant instead of failing. The class stays otherwise closed — no `/`, no
+/// `.`, no quote, no whitespace — so an id can neither traverse a storage path
+/// nor break out of a SQL literal.
 pub fn is_valid_tenant_id(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':')
 }
 
 /// Resolve a tenant identifier from an optional raw header value.
@@ -223,5 +235,27 @@ mod tests {
         assert_eq!(resolve_tenant_id(None), DEFAULT_TENANT_ID);
         assert_eq!(resolve_tenant_id(Some("has space")), DEFAULT_TENANT_ID);
         assert_eq!(resolve_tenant_id(Some("")), DEFAULT_TENANT_ID);
+    }
+
+    /// The control plane's tenant id is `{org_id}:{workspace_id}`, so the colon is
+    /// part of the format rather than an edge case. Refusing it does not reject the
+    /// request: ingest and query both fall back to the default tenant, which
+    /// silently merges every workspace into one.
+    #[test]
+    fn a_tenant_id_may_carry_the_colon_that_separates_org_from_workspace() {
+        assert!(is_valid_tenant_id("2q4mHrPd9kL:7xZa1vB3nQe"));
+        assert_eq!(
+            resolve_tenant_id(Some("2q4mHrPd9kL:7xZa1vB3nQe")),
+            "2q4mHrPd9kL:7xZa1vB3nQe"
+        );
+    }
+
+    /// Widening to `:` must not widen to anything else: path traversal, quotes and
+    /// whitespace stay refused, and an empty id is still not an id.
+    #[test]
+    fn widening_to_the_colon_admits_nothing_else() {
+        for refused in ["", "../etc", "a/b", "a'b", "a b", "a.b", "a\\b", "a\"b"] {
+            assert!(!is_valid_tenant_id(refused), "must refuse {refused:?}");
+        }
     }
 }

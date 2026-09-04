@@ -40,7 +40,7 @@ const STATUS_OK: &str = "ok";
 /// Extract tenant ID from gRPC request metadata.
 ///
 /// Returns `Some(tenant_id)` if the `x-scope-orgid` metadata key is present and
-/// contains a valid value (non-empty, ASCII alphanumeric/hyphens/underscores).
+/// contains a valid value (non-empty, ASCII alphanumeric/hyphens/underscores/colons).
 /// Returns `None` otherwise, which falls back to `DEFAULT_TENANT_ID` downstream.
 fn extract_tenant_id<T>(request: &Request<T>) -> Option<String> {
     request
