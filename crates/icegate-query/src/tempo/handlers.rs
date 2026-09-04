@@ -39,8 +39,8 @@ use crate::{error::QueryError, traceql::iceberg_predicate::translate_query_to_pr
 
 /// Extract tenant ID from HTTP headers.
 ///
-/// Returns the header value if present and valid (ASCII alphanumeric, hyphens,
-/// underscores). Falls back to `DEFAULT_TENANT_ID` otherwise — matching the
+/// Returns the header value if present and valid (non-empty, ASCII alphanumeric/hyphens/underscores/colons).
+/// Falls back to `DEFAULT_TENANT_ID` otherwise — matching the
 /// ingest-path behaviour so that data is always queryable under the same
 /// tenant that was used during ingestion.
 fn extract_tenant_id(headers: &HeaderMap) -> String {
