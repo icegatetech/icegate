@@ -29,8 +29,6 @@ annotations:
   artifacthub.io/category: monitoring-logging
   artifacthub.io/license: Apache-2.0
   artifacthub.io/links: |
-    - name: homepage
-      url: https://icegate.tech
     - name: documentation
       url: https://docs.icegate.tech
     - name: source
