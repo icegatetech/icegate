@@ -1,7 +1,5 @@
 # icegate
 
-IceGate is an observability data lake engine that stores logs, traces, metrics, and events in Apache Iceberg tables with DataFusion as the query engine. Data is ingested via OpenTelemetry protocol and queried via Loki- and Tempo-compatible APIs plus Arrow Flight SQL.
-
 ![Version: 0.2.0](https://img.shields.io/badge/Version-0.2.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.2.0](https://img.shields.io/badge/AppVersion-0.2.0-informational?style=flat-square)
 
 IceGate is an observability data lake engine. This chart deploys it on Kubernetes:
