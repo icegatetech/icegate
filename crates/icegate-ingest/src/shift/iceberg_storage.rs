@@ -367,10 +367,10 @@ impl TableLoader {
     }
 
     async fn load_cached(&self) -> Result<Table> {
-        if let Some(cached) = self.cache.read().await.as_ref() {
-            if cached.loaded_at.elapsed() <= self.ttl {
-                return Ok(cached.table.clone());
-            }
+        if let Some(cached) = self.cache.read().await.as_ref()
+            && cached.loaded_at.elapsed() <= self.ttl
+        {
+            return Ok(cached.table.clone());
         }
 
         self.load_fresh().await

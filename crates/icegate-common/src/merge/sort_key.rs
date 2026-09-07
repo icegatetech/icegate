@@ -154,7 +154,7 @@ impl SortColumnsDescriptor {
 
     /// All sort fields in Iceberg sort-order order.
     #[must_use]
-    pub fn columns(&self) -> &[SortColumnDescriptor] {
+    pub const fn columns(&self) -> &[SortColumnDescriptor] {
         self.columns.as_slice()
     }
 

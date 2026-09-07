@@ -398,10 +398,10 @@ impl Accumulator for CountGridAccumulator {
             }
             let other_counts = extract_i64_list(counts_list, row)?;
             for (i, c) in other_counts.into_iter().enumerate() {
-                if let Some(c) = c {
-                    if i < self.counts.len() {
-                        self.counts[i] += c;
-                    }
+                if let Some(c) = c
+                    && i < self.counts.len()
+                {
+                    self.counts[i] += c;
                 }
             }
         }
@@ -506,11 +506,11 @@ impl Accumulator for SumGridAccumulator {
             let other_sums = extract_f64_list(sums_list, row)?;
             let other_counts = extract_i64_list(counts_list, row)?;
             for (i, (s, c)) in other_sums.into_iter().zip(other_counts).enumerate() {
-                if let (Some(s), Some(c)) = (s, c) {
-                    if i < self.sums.len() {
-                        self.sums[i] += s;
-                        self.counts[i] += c;
-                    }
+                if let (Some(s), Some(c)) = (s, c)
+                    && i < self.sums.len()
+                {
+                    self.sums[i] += s;
+                    self.counts[i] += c;
                 }
             }
         }
@@ -622,11 +622,11 @@ impl Accumulator for AvgGridAccumulator {
             let other_sums = extract_f64_list(sums_list, row)?;
             let other_counts = extract_i64_list(counts_list, row)?;
             for (i, (s, c)) in other_sums.into_iter().zip(other_counts).enumerate() {
-                if let (Some(s), Some(c)) = (s, c) {
-                    if i < self.sums.len() {
-                        self.sums[i] += s;
-                        self.counts[i] += c;
-                    }
+                if let (Some(s), Some(c)) = (s, c)
+                    && i < self.sums.len()
+                {
+                    self.sums[i] += s;
+                    self.counts[i] += c;
                 }
             }
         }
@@ -1016,29 +1016,30 @@ impl Accumulator for WelfordGridAccumulator {
             let other_m2s = extract_f64_list(m2s_list, row)?;
 
             for (i, ((m, c), m2)) in other_means.into_iter().zip(other_counts).zip(other_m2s).enumerate() {
-                if let (Some(other_mean), Some(other_count), Some(other_m2)) = (m, c, m2) {
-                    if i < self.counts.len() && other_count > 0 {
-                        // Chan et al. parallel combination formula
-                        let n_a = self.counts[i];
-                        let n_b = other_count;
-                        if n_a == 0 {
-                            self.counts[i] = n_b;
-                            self.means[i] = other_mean;
-                            self.m2s[i] = other_m2;
-                        } else {
-                            let n_ab = n_a + n_b;
-                            let delta = other_mean - self.means[i];
-                            #[allow(clippy::cast_precision_loss)]
-                            let new_mean = self.means[i].mul_add(n_a as f64, other_mean * n_b as f64) / n_ab as f64;
-                            #[allow(clippy::cast_precision_loss)]
-                            // Fuse the final multiply-add (single rounding), matching the
-                            // streaming `update` path's `mul_add` and the `new_mean` line above.
-                            let new_m2 =
-                                (delta * delta).mul_add(n_a as f64 * n_b as f64 / n_ab as f64, self.m2s[i] + other_m2);
-                            self.counts[i] = n_ab;
-                            self.means[i] = new_mean;
-                            self.m2s[i] = new_m2;
-                        }
+                if let (Some(other_mean), Some(other_count), Some(other_m2)) = (m, c, m2)
+                    && i < self.counts.len()
+                    && other_count > 0
+                {
+                    // Chan et al. parallel combination formula
+                    let n_a = self.counts[i];
+                    let n_b = other_count;
+                    if n_a == 0 {
+                        self.counts[i] = n_b;
+                        self.means[i] = other_mean;
+                        self.m2s[i] = other_m2;
+                    } else {
+                        let n_ab = n_a + n_b;
+                        let delta = other_mean - self.means[i];
+                        #[allow(clippy::cast_precision_loss)]
+                        let new_mean = self.means[i].mul_add(n_a as f64, other_mean * n_b as f64) / n_ab as f64;
+                        #[allow(clippy::cast_precision_loss)]
+                        // Fuse the final multiply-add (single rounding), matching the
+                        // streaming `update` path's `mul_add` and the `new_mean` line above.
+                        let new_m2 =
+                            (delta * delta).mul_add(n_a as f64 * n_b as f64 / n_ab as f64, self.m2s[i] + other_m2);
+                        self.counts[i] = n_ab;
+                        self.means[i] = new_mean;
+                        self.m2s[i] = new_m2;
                     }
                 }
             }
@@ -1164,12 +1165,13 @@ impl Accumulator for FirstGridAccumulator {
             let other_vals = extract_f64_list(vals_list, row)?;
             let other_ts = extract_i64_list(ts_list, row)?;
             for (i, (v, t)) in other_vals.into_iter().zip(other_ts).enumerate() {
-                if let (Some(v), Some(t)) = (v, t) {
-                    if i < self.timestamps.len() && (t < self.timestamps[i] || !self.has_value[i]) {
-                        self.timestamps[i] = t;
-                        self.values[i] = v;
-                        self.has_value[i] = true;
-                    }
+                if let (Some(v), Some(t)) = (v, t)
+                    && i < self.timestamps.len()
+                    && (t < self.timestamps[i] || !self.has_value[i])
+                {
+                    self.timestamps[i] = t;
+                    self.values[i] = v;
+                    self.has_value[i] = true;
                 }
             }
         }

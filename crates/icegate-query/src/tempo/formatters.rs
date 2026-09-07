@@ -167,10 +167,10 @@ fn build_span_value(
     let mut span = Map::new();
     span.insert("traceId".into(), json!(trace_id));
     span.insert("spanId".into(), json!(span_id));
-    if let Some(p) = parent {
-        if !p.is_empty() {
-            span.insert("parentSpanId".into(), json!(p));
-        }
+    if let Some(p) = parent
+        && !p.is_empty()
+    {
+        span.insert("parentSpanId".into(), json!(p));
     }
     span.insert("name".into(), json!(name));
     if let Some(k) = kind {

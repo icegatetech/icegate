@@ -300,7 +300,7 @@ impl CatalogTableLink {
         self.status == TableStatus::Active
     }
 
-    pub(crate) fn mark_tombstoned(&mut self) {
+    pub(crate) const fn mark_tombstoned(&mut self) {
         self.status = TableStatus::Tombstoned;
     }
 

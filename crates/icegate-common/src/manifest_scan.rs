@@ -247,10 +247,10 @@ async fn process_manifest(
             continue;
         }
         let partition_key = partition_key_string(data_file.partition());
-        if let Some(target) = partition_filter {
-            if partition_key != target {
-                continue;
-            }
+        if let Some(target) = partition_filter
+            && partition_key != target
+        {
+            continue;
         }
         let (min_key, max_key) = decode_boundary_keys(resolved, data_file.lower_bounds(), data_file.upper_bounds())?;
         stats.push(DataFileStats {

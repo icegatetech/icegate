@@ -134,16 +134,16 @@ impl IngestError {
 fn is_retryable_error_chain(err: &(dyn Error + 'static)) -> bool {
     let mut current: Option<&(dyn Error + 'static)> = Some(err);
     while let Some(error) = current {
-        if let Some(io_err) = error.downcast_ref::<io::Error>() {
-            if is_retryable_io(io_err) {
-                return true;
-            }
+        if let Some(io_err) = error.downcast_ref::<io::Error>()
+            && is_retryable_io(io_err)
+        {
+            return true;
         }
 
-        if let Some(iceberg_err) = error.downcast_ref::<iceberg::Error>() {
-            if iceberg_err.retryable() {
-                return true;
-            }
+        if let Some(iceberg_err) = error.downcast_ref::<iceberg::Error>()
+            && iceberg_err.retryable()
+        {
+            return true;
         }
 
         current = error.source();

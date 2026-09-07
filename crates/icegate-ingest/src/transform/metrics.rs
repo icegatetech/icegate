@@ -156,7 +156,7 @@ const fn temporality_str(value: i32) -> Option<&'static str> {
 /// Number of data points carried by a `metric::Data` variant. Summed across a
 /// request to bound the emitted row count (one row per data point), used both
 /// as the empty-request short-circuit and as the column-builder capacity hint.
-fn data_point_count(data: &metric::Data) -> usize {
+const fn data_point_count(data: &metric::Data) -> usize {
     match data {
         metric::Data::Gauge(gauge) => gauge.data_points.len(),
         metric::Data::Sum(sum) => sum.data_points.len(),

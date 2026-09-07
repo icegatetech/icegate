@@ -214,10 +214,10 @@ fn validate_duration_param(name: &str, value: Option<&str>) -> TempoResult<()> {
 fn parse_time(s: &str) -> Result<DateTime<Utc>, QueryError> {
     // Fractional seconds (e.g. "1776611234.567") — handled first so we don't
     // truncate the sub-second component when the integer path succeeds.
-    if s.contains('.') {
-        if let Ok(secs) = s.parse::<f64>() {
-            return from_fractional_seconds(secs);
-        }
+    if s.contains('.')
+        && let Ok(secs) = s.parse::<f64>()
+    {
+        return from_fractional_seconds(secs);
     }
 
     if let Ok(n) = s.parse::<i64>() {

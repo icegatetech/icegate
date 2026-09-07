@@ -172,10 +172,10 @@ pub(crate) fn serialize_attrs_to_json_object(attrs: &[KeyValue], keys: &[&str]) 
         if object.contains_key(key) {
             continue;
         }
-        if let Some(kv) = attrs.iter().find(|kv| kv.key == key) {
-            if let Some(value) = kv.value.as_ref().and_then(any_value_to_json) {
-                object.insert(key.to_string(), value);
-            }
+        if let Some(kv) = attrs.iter().find(|kv| kv.key == key)
+            && let Some(value) = kv.value.as_ref().and_then(any_value_to_json)
+        {
+            object.insert(key.to_string(), value);
         }
     }
     if object.is_empty() {

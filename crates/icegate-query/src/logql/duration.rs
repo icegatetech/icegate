@@ -167,12 +167,12 @@ pub fn parse_duration(text: &str) -> Result<TimeDelta> {
         // Validate unit ordering (strict: must be descending)
         let priority = unit_priority(unit).ok_or_else(|| parse_error(format!("Unknown duration unit: {unit}")))?;
 
-        if let Some(last) = last_priority {
-            if priority >= last {
-                return Err(parse_error(format!(
-                    "Duration units must be in descending order, got '{unit}' after a smaller or equal unit"
-                )));
-            }
+        if let Some(last) = last_priority
+            && priority >= last
+        {
+            return Err(parse_error(format!(
+                "Duration units must be in descending order, got '{unit}' after a smaller or equal unit"
+            )));
         }
         last_priority = Some(priority);
 

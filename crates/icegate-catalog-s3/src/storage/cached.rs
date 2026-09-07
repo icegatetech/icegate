@@ -218,11 +218,11 @@ mod tests {
             let guard = self.root.lock().await;
             match guard.as_ref() {
                 Some((root, etag)) => {
-                    if let Some(Version::Etag(provided)) = known {
-                        if provided == etag {
-                            self.load_root_304.fetch_add(1, Ordering::SeqCst);
-                            return Ok(LoadOutcome::NotModified);
-                        }
+                    if let Some(Version::Etag(provided)) = known
+                        && provided == etag
+                    {
+                        self.load_root_304.fetch_add(1, Ordering::SeqCst);
+                        return Ok(LoadOutcome::NotModified);
                     }
                     Ok(LoadOutcome::Loaded {
                         root: Arc::clone(root),

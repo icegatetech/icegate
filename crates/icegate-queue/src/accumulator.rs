@@ -37,13 +37,13 @@ pub struct PendingFlush {
 impl PendingFlush {
     /// Returns true when there are no requests to flush.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.requests.is_empty()
     }
 
     /// Returns the number of logical requests in this flush.
     #[must_use]
-    pub fn request_count(&self) -> usize {
+    pub const fn request_count(&self) -> usize {
         self.requests.len()
     }
 

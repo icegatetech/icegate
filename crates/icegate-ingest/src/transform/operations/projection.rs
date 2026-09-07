@@ -361,10 +361,10 @@ fn validate_span_id(bytes: &[u8]) -> Result<[u8; 8]> {
 /// unavailable (an internal registry invariant; see [`field_precedence`]).
 fn resolve_str(view: &AttributeView, field: OperationField) -> Result<Option<String>> {
     for &key in field_precedence(field)? {
-        if let Some(value) = view.get(key) {
-            if let Some(s) = extract_string_value(Some(value)) {
-                return Ok(Some(s));
-            }
+        if let Some(value) = view.get(key)
+            && let Some(s) = extract_string_value(Some(value))
+        {
+            return Ok(Some(s));
         }
     }
     Ok(None)
@@ -516,10 +516,10 @@ fn resolve_singular_list(view: &AttributeView, field: OperationField) -> Option<
 /// unavailable (an internal registry invariant; see [`field_precedence`]).
 fn resolve_json(view: &AttributeView, field: OperationField) -> Result<Option<String>> {
     for &key in field_precedence(field)? {
-        if let Some(value) = view.get(key) {
-            if let Some(json) = serialize_any_value_to_json(Some(value)) {
-                return Ok(Some(json));
-            }
+        if let Some(value) = view.get(key)
+            && let Some(json) = serialize_any_value_to_json(Some(value))
+        {
+            return Ok(Some(json));
         }
     }
     Ok(None)
@@ -536,10 +536,10 @@ fn resolve_json_from_events(events: &[Event], field: OperationField) -> Option<S
             continue;
         }
         for event in events {
-            if event_names.contains(&event.name.as_str()) {
-                if let Some(json) = serialize_all_attrs_to_json_object(&event.attributes) {
-                    return Some(json);
-                }
+            if event_names.contains(&event.name.as_str())
+                && let Some(json) = serialize_all_attrs_to_json_object(&event.attributes)
+            {
+                return Some(json);
             }
         }
     }
@@ -587,10 +587,10 @@ fn resolve_message_array_from_attrs(attrs: &[KeyValue], field: OperationField) -
                 .iter()
                 .find(|kv| kv.key == key)
                 .and_then(|kv| extract_string_value(kv.value.as_ref()));
-            if let Some(content) = content {
-                if let Some(json) = serialize_message_to_json_array(role, &content) {
-                    return Some(json);
-                }
+            if let Some(content) = content
+                && let Some(json) = serialize_message_to_json_array(role, &content)
+            {
+                return Some(json);
             }
         }
     }

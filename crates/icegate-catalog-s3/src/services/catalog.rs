@@ -778,12 +778,11 @@ impl Catalog for S3Catalog {
                 // our own prior register (success). Anything else falls through
                 // to `link_table`, which rejects a foreign occupant as
                 // `TableAlreadyExists`.
-                if let Some(existing) = root.get_active(&key_for_op) {
-                    if existing.table_id() == &table_id_for_op
-                        && existing.metadata_location() == &metadata_location_for_op
-                    {
-                        return Ok(());
-                    }
+                if let Some(existing) = root.get_active(&key_for_op)
+                    && existing.table_id() == &table_id_for_op
+                    && existing.metadata_location() == &metadata_location_for_op
+                {
+                    return Ok(());
                 }
                 root.link_table(key_for_op.clone(), entry_for_op.clone())?;
                 Ok(())

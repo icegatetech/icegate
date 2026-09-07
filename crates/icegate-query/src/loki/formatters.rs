@@ -235,47 +235,47 @@ fn extract_labels(
             .and_then(|arr| if arr.is_null(row) { None } else { Some(arr.value(row)) })
     };
 
-    if let Some(idx) = cols.service_name {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern(COL_SERVICE_NAME), interner.intern(val));
-        }
+    if let Some(idx) = cols.service_name
+        && let Some(val) = extract_string(idx)
+    {
+        labels.insert(interner.intern(COL_SERVICE_NAME), interner.intern(val));
     }
 
-    if let Some(idx) = cols.severity_text {
-        if let Some(val) = extract_string(idx) {
-            // `severity_text` is the canonical OTLP field; mirror it as
-            // `level` so Grafana's log panel — which colours and filters
-            // by the `level` label — works without the LogQL series
-            // planner having to alias the column. The series planner
-            // does alias `severity_text` → `level` for its DataFrame
-            // output, so the second insert below is idempotent on that
-            // path; for `plan_log` (raw entries) it's the only place
-            // `level` is emitted.
-            let severity_value = interner.intern(val);
-            labels.insert(interner.intern(COL_SEVERITY_TEXT), Arc::clone(&severity_value));
-            labels.insert(interner.intern(LEVEL_ALIAS), severity_value);
-        }
+    if let Some(idx) = cols.severity_text
+        && let Some(val) = extract_string(idx)
+    {
+        // `severity_text` is the canonical OTLP field; mirror it as
+        // `level` so Grafana's log panel — which colours and filters
+        // by the `level` label — works without the LogQL series
+        // planner having to alias the column. The series planner
+        // does alias `severity_text` → `level` for its DataFrame
+        // output, so the second insert below is idempotent on that
+        // path; for `plan_log` (raw entries) it's the only place
+        // `level` is emitted.
+        let severity_value = interner.intern(val);
+        labels.insert(interner.intern(COL_SEVERITY_TEXT), Arc::clone(&severity_value));
+        labels.insert(interner.intern(LEVEL_ALIAS), severity_value);
     }
 
-    if let Some(idx) = cols.level {
-        if let Some(val) = extract_string(idx) {
-            labels.insert(interner.intern(LEVEL_ALIAS), interner.intern(val));
-        }
+    if let Some(idx) = cols.level
+        && let Some(val) = extract_string(idx)
+    {
+        labels.insert(interner.intern(LEVEL_ALIAS), interner.intern(val));
     }
 
     // trace_id / span_id are stored as raw FIXED_LEN_BYTE_ARRAY (16 / 8 bytes).
     // Hex-encode at materialisation time so Loki's wire format keeps emitting
     // the canonical lowercase-hex W3C representation.
-    if let Some(idx) = cols.trace_id {
-        if let Some(val) = extract_fixed_bytes(batch, idx, row) {
-            labels.insert(interner.intern(COL_TRACE_ID), interner.intern(&hex::encode(val)));
-        }
+    if let Some(idx) = cols.trace_id
+        && let Some(val) = extract_fixed_bytes(batch, idx, row)
+    {
+        labels.insert(interner.intern(COL_TRACE_ID), interner.intern(&hex::encode(val)));
     }
 
-    if let Some(idx) = cols.span_id {
-        if let Some(val) = extract_fixed_bytes(batch, idx, row) {
-            labels.insert(interner.intern(COL_SPAN_ID), interner.intern(&hex::encode(val)));
-        }
+    if let Some(idx) = cols.span_id
+        && let Some(val) = extract_fixed_bytes(batch, idx, row)
+    {
+        labels.insert(interner.intern(COL_SPAN_ID), interner.intern(&hex::encode(val)));
     }
 
     for &idx in &cols.attribute_maps {
@@ -313,32 +313,32 @@ fn extract_attributes_map(
     labels: &mut HashMap<Arc<str>, Arc<str>>,
     interner: &mut StringInterner,
 ) {
-    if let Some(map_arr) = batch.column(attr_idx).as_any().downcast_ref::<MapArray>() {
-        if !map_arr.is_null(row) {
-            let offsets = map_arr.offsets();
-            #[allow(clippy::cast_sign_loss)]
-            let start = offsets[row] as usize;
-            #[allow(clippy::cast_sign_loss)]
-            let end = offsets[row + 1] as usize;
+    if let Some(map_arr) = batch.column(attr_idx).as_any().downcast_ref::<MapArray>()
+        && !map_arr.is_null(row)
+    {
+        let offsets = map_arr.offsets();
+        #[allow(clippy::cast_sign_loss)]
+        let start = offsets[row] as usize;
+        #[allow(clippy::cast_sign_loss)]
+        let end = offsets[row + 1] as usize;
 
-            let keys = map_arr.keys().as_any().downcast_ref::<StringArray>();
-            let values = map_arr.values().as_any().downcast_ref::<StringArray>();
+        let keys = map_arr.keys().as_any().downcast_ref::<StringArray>();
+        let values = map_arr.values().as_any().downcast_ref::<StringArray>();
 
-            if let (Some(keys), Some(values)) = (keys, values) {
-                // Wire names already written by THIS level; scoped to this call
-                // so it resets at every level boundary (see doc comment above).
-                let mut seen_in_level: HashSet<Arc<str>> = HashSet::with_capacity(end - start);
-                for i in start..end {
-                    // A NULL key or value makes the entry invisible rather than
-                    // valueless, so it does not claim the wire name — the same
-                    // rule the two UDFs apply (see `icegate_common::attribute_key`).
-                    if !keys.is_null(i) && !values.is_null(i) {
-                        // The series path arrives pre-normalized, and
-                        // normalizing again is a no-op.
-                        let name = interner.intern(&normalize_attribute_key(keys.value(i)));
-                        if seen_in_level.insert(Arc::clone(&name)) {
-                            labels.insert(name, interner.intern(values.value(i)));
-                        }
+        if let (Some(keys), Some(values)) = (keys, values) {
+            // Wire names already written by THIS level; scoped to this call
+            // so it resets at every level boundary (see doc comment above).
+            let mut seen_in_level: HashSet<Arc<str>> = HashSet::with_capacity(end - start);
+            for i in start..end {
+                // A NULL key or value makes the entry invisible rather than
+                // valueless, so it does not claim the wire name — the same
+                // rule the two UDFs apply (see `icegate_common::attribute_key`).
+                if !keys.is_null(i) && !values.is_null(i) {
+                    // The series path arrives pre-normalized, and
+                    // normalizing again is a no-op.
+                    let name = interner.intern(&normalize_attribute_key(keys.value(i)));
+                    if seen_in_level.insert(Arc::clone(&name)) {
+                        labels.insert(name, interner.intern(values.value(i)));
                     }
                 }
             }
@@ -449,15 +449,15 @@ fn extract_metric_value(batch: &RecordBatch, cols: &MetricBatchColumns, row: usi
         || "0".to_string(),
         |idx| {
             let col = batch.column(idx);
-            if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-                if !arr.is_null(row) {
-                    return arr.value(row).to_string();
-                }
+            if let Some(arr) = col.as_any().downcast_ref::<Float64Array>()
+                && !arr.is_null(row)
+            {
+                return arr.value(row).to_string();
             }
-            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                if !arr.is_null(row) {
-                    return arr.value(row).to_string();
-                }
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>()
+                && !arr.is_null(row)
+            {
+                return arr.value(row).to_string();
             }
             "0".to_string()
         },
@@ -492,14 +492,14 @@ fn extract_metric_labels(
                 let label_name = map_column_to_label(col_name);
                 labels.insert(interner.intern(label_name), interner.intern(arr.value(row)));
             }
-        } else if let Some(arr) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-            if !arr.is_null(row) {
-                let label_name = map_column_to_label(col_name);
-                labels.insert(
-                    interner.intern(label_name),
-                    interner.intern(&hex::encode(arr.value(row))),
-                );
-            }
+        } else if let Some(arr) = column.as_any().downcast_ref::<FixedSizeBinaryArray>()
+            && !arr.is_null(row)
+        {
+            let label_name = map_column_to_label(col_name);
+            labels.insert(
+                interner.intern(label_name),
+                interner.intern(&hex::encode(arr.value(row))),
+            );
         }
     }
 
@@ -591,12 +591,12 @@ pub fn batches_to_series_list(batches: &[RecordBatch]) -> Vec<HashMap<String, St
 
             // Extract indexed columns
             for &(name, idx) in &indexed_indices {
-                if let Some(arr) = batch.column(idx).as_any().downcast_ref::<StringArray>() {
-                    if !arr.is_null(row) {
-                        let val = arr.value(row);
-                        if !val.is_empty() {
-                            label_map.insert(name.to_string(), val.to_string());
-                        }
+                if let Some(arr) = batch.column(idx).as_any().downcast_ref::<StringArray>()
+                    && !arr.is_null(row)
+                {
+                    let val = arr.value(row);
+                    if !val.is_empty() {
+                        label_map.insert(name.to_string(), val.to_string());
                     }
                 }
             }
@@ -622,29 +622,29 @@ fn extract_series_attributes(
     labels: &mut HashMap<String, String>,
     interner: &mut StringInterner,
 ) {
-    if let Some(map_arr) = batch.column(attr_idx).as_any().downcast_ref::<MapArray>() {
-        if !map_arr.is_null(row) {
-            let offsets = map_arr.offsets();
-            #[allow(clippy::cast_sign_loss)]
-            let start = offsets[row] as usize;
-            #[allow(clippy::cast_sign_loss)]
-            let end = offsets[row + 1] as usize;
+    if let Some(map_arr) = batch.column(attr_idx).as_any().downcast_ref::<MapArray>()
+        && !map_arr.is_null(row)
+    {
+        let offsets = map_arr.offsets();
+        #[allow(clippy::cast_sign_loss)]
+        let start = offsets[row] as usize;
+        #[allow(clippy::cast_sign_loss)]
+        let end = offsets[row + 1] as usize;
 
-            let keys = map_arr.keys().as_any().downcast_ref::<StringArray>();
-            let values = map_arr.values().as_any().downcast_ref::<StringArray>();
+        let keys = map_arr.keys().as_any().downcast_ref::<StringArray>();
+        let values = map_arr.values().as_any().downcast_ref::<StringArray>();
 
-            if let (Some(keys), Some(values)) = (keys, values) {
-                for i in start..end {
-                    if !keys.is_null(i) && !values.is_null(i) {
-                        let k = keys.value(i);
-                        if SERIES_EXCLUDED_ATTR_KEYS.contains(&k) {
-                            continue;
-                        }
-                        // Use interner for deduplication, then convert to owned
-                        // String for the output HashMap.
-                        let _ = interner.intern(k);
-                        labels.insert(k.to_string(), values.value(i).to_string());
+        if let (Some(keys), Some(values)) = (keys, values) {
+            for i in start..end {
+                if !keys.is_null(i) && !values.is_null(i) {
+                    let k = keys.value(i);
+                    if SERIES_EXCLUDED_ATTR_KEYS.contains(&k) {
+                        continue;
                     }
+                    // Use interner for deduplication, then convert to owned
+                    // String for the output HashMap.
+                    let _ = interner.intern(k);
+                    labels.insert(k.to_string(), values.value(i).to_string());
                 }
             }
         }
