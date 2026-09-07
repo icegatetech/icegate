@@ -12,4 +12,4 @@ pub mod http;
 #[cfg(feature = "shed-tonic")]
 pub use grpc::MemoryShedInterceptor;
 pub use guard::{MemoryPressure, MemoryPressureConfig, MemoryPressureSampler, UsageReader};
-pub use http::{SHED_RETRY_AFTER_SECS, ShedPolicy, default_shed_response, shed_when_pressured};
+pub use http::{SHED_RETRY_AFTER_SECS, ShedPolicy, default_shed_response, drain_request_body, shed_when_pressured};

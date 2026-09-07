@@ -378,7 +378,23 @@ ingest:
       ## maxPrefetchBytes: 4194304  # 4 MiB (metadata is small)
       ## prefetchColumns: []        # empty = all columns
 
-  ## OTLP HTTP receiver
+  ## Which tenant an incoming OTLP request writes to.
+  ##   single — the deployment serves one tenant; `id` is used and the
+  ##            x-scope-orgid header must either be absent or name that same id.
+  ##   multi  — the tenant comes from x-scope-orgid only; a request without a
+  ##            valid header is rejected with 400 / INVALID_ARGUMENT.
+  ## Behind authProxy.enabled the mode is decided by how many tenant_id values
+  ## the token issuer emits: one id for the whole deployment means single with
+  ## that id, more than one means multi. The default pair below is refused with
+  ## the proxy on — see icegate.validateAuthProxy.
+  tenant:
+    mode: single
+    id: "default"
+
+  ## The published OTLP ports. Without an auth proxy icegate binds them itself;
+  ## with authProxy.enabled the proxy binds them and icegate moves to the pod
+  ## loopback (see authProxy.upstream). There is deliberately no `host` key:
+  ## the bind address is decided by authProxy.enabled and nothing else.
   otlpHttp:
     enabled: true
     port: 4318
@@ -394,11 +410,75 @@ ingest:
     enabled: true
     port: 4317
 
-  ## Prometheus metrics endpoint
+  ## Operational listener: always serves /health, and /metrics when enabled.
+  ## Unlike the OTLP listeners this one keeps a `host` key — it must stay
+  ## reachable from the pod IP for the ServiceMonitor scrape.
   metrics:
     enabled: true
+    host: "0.0.0.0"
     port: 9091
     path: /metrics
+
+  ## Envoy sidecar terminating TLS and checking the ingest token in front of the
+  ## OTLP receivers. Off by default: the OSS deployment publishes the receivers
+  ## directly.
+  authProxy:
+    enabled: false
+    image:
+      repository: envoyproxy/envoy
+      ## Empty means the pinned default in templates/deployment-ingest.yaml.
+      ## Pinned rather than floating: the filter chain this chart renders is
+      ## accepted by a specific Envoy release, and a moving tag changes that
+      ## contract without a change here.
+      tag: ""
+      pullPolicy: IfNotPresent
+    ## Token issuer, audience and JWKS endpoint. No defaults: icegate must not
+    ## carry the control plane's addresses.
+    jwt:
+      issuer: ""
+      audience: ""
+      jwksUri: ""
+      jwksCacheDurationSecs: 300
+      clockSkewSeconds: 60
+      ## The JOSE `typ` of the token header, which says the bearer is an access
+      ## token rather than another JOSE object the same signing key produces.
+      ## RFC 9068 names `at+jwt` for it, and the proxy compares the header
+      ## exactly, so an issuer that stamps another spelling is configured here
+      ## rather than admitted silently.
+      headerType: "at+jwt"
+      ## The payload `typ` the issuer stamps on an ingest token. It is what
+      ## separates an ingest token from every other token the same issuer signs
+      ## for the same audience, so the proxy admits a request only when the claim
+      ## carries this value. A value rather than a literal because the issuer
+      ## owns it: renaming it there must be a values change here, not a release.
+      ## Checked alongside headerType above: a request needs both.
+      tokenType: "ingest"
+      ## CA bundle the proxy validates the JWKS host's certificate against.
+      ## Path inside the proxy image, so it moves with authProxy.image: these
+      ## keys decide who may write into a tenant, and an unauthenticated fetch
+      ## would let whoever can answer for the JWKS host issue tokens of its own.
+      trustedCaFile: /etc/ssl/certs/ca-certificates.crt
+    ## Secret holding the server certificate the proxy presents (keys tls.crt
+    ## and tls.key).
+    tls:
+      secretName: ""
+    ## Loopback ports icegate listens on while the proxy owns the published
+    ## ones. Tunable only because a pod may already use these numbers for
+    ## something else; the values are never reachable from outside the pod.
+    upstream:
+      otlpHttpPort: 14318
+      otlpGrpcPort: 14317
+    ## How long the proxy waits for icegate to answer one OTLP request, in whole
+    ## seconds with the s suffix — values.schema.json refuses any other form,
+    ## because that is the form the render checks read back out of the rendered
+    ## configuration. Named here because the proxy is a second ceiling on the
+    ## response time: an OTLP request is answered only once the batch is durable
+    ## in the WAL, and a request the proxy gives up on is reported to the sender
+    ## as a failure while icegate may still commit it — the retry that follows
+    ## then writes the batch twice. Without this key the ceiling would be
+    ## whatever the proxy image defaults to, which no values file states.
+    upstreamTimeout: "30s"
+    resources: {}
 
   ## OpenTelemetry tracing
   tracing:
@@ -467,17 +547,30 @@ ingest:
     ## Image for the bucket check (must contain the AWS CLI).
     awsCliImage: amazon/aws-cli:2.36.34
 
-  ## Liveness and readiness probe overrides
+  ## Liveness and readiness probe overrides for the icegate container.
+  ## Both hit /health on the operational listener, addressed by the port name the
+  ## Deployment declares unconditionally, so the probe follows ingest.metrics.port
+  ## instead of holding a second copy of it. With authProxy.enabled the OTLP ports
+  ## belong to the proxy, so probing them would report the proxy's health instead
+  ## of icegate's.
+  ##
+  ## The probe addresses icegate directly rather than through the proxy, because
+  ## routing it through Envoy would make the probe port depend on
+  ## authProxy.enabled, which these free-form blocks cannot express. A dead proxy
+  ## still takes the pod out of the endpoints: the auth-proxy container carries a
+  ## tcpSocket probe of its own (see templates/deployment-ingest.yaml).
   livenessProbe:
-    tcpSocket:
-      port: 4317
+    httpGet:
+      path: /health
+      port: metrics
     initialDelaySeconds: 15
     periodSeconds: 20
     timeoutSeconds: 5
     failureThreshold: 3
   readinessProbe:
-    tcpSocket:
-      port: 4317
+    httpGet:
+      path: /health
+      port: metrics
     initialDelaySeconds: 5
     periodSeconds: 10
     timeoutSeconds: 5

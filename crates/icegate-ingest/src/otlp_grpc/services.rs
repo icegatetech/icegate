@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use icegate_common::{TENANT_ID_HEADER, is_valid_tenant_id};
+use icegate_common::TenantId;
 use icegate_queue::WriteChannel;
 use opentelemetry_proto::tonic::collector::{
     logs::v1::{
@@ -29,26 +29,28 @@ use crate::{
     otlp_grpc::error::GrpcError,
 };
 
-const SIGNAL_LOGS: &str = "logs";
-const SIGNAL_TRACES: &str = "traces";
-const SIGNAL_METRICS: &str = "metrics";
+pub(super) const SIGNAL_LOGS: &str = "logs";
+pub(super) const SIGNAL_TRACES: &str = "traces";
+pub(super) const SIGNAL_METRICS: &str = "metrics";
 const SIGNAL_OPERATIONS: &str = "operations";
-const PROTOCOL_GRPC: &str = "grpc";
+pub(super) const PROTOCOL_GRPC: &str = "grpc";
 const ENCODING_PROTOBUF: &str = "protobuf";
 const STATUS_OK: &str = "ok";
 
-/// Extract tenant ID from gRPC request metadata.
+/// Read the tenant the interceptor resolved from the request extensions.
 ///
-/// Returns `Some(tenant_id)` if the `x-scope-orgid` metadata key is present and
-/// contains a valid value (non-empty, ASCII alphanumeric/hyphens/underscores).
-/// Returns `None` otherwise, which falls back to `DEFAULT_TENANT_ID` downstream.
-fn extract_tenant_id<T>(request: &Request<T>) -> Option<String> {
+/// # Errors
+///
+/// Returns `Status::internal` when the extension is absent. That means the
+/// server was assembled without [`TenantPolicyInterceptor`](super::tenant::TenantPolicyInterceptor)
+/// — a defect in the server wiring, not a client error — so the branch is
+/// unreachable on a correctly built server.
+fn read_request_tenant<T>(request: &Request<T>) -> Result<TenantId, Status> {
     request
-        .metadata()
-        .get(TENANT_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| is_valid_tenant_id(s))
-        .map(String::from)
+        .extensions()
+        .get::<TenantId>()
+        .cloned()
+        .ok_or_else(|| Status::internal("tenant policy interceptor is not installed on this server"))
 }
 
 /// OTLP gRPC service implementation.
@@ -82,6 +84,12 @@ impl OtlpGrpcService {
             metrics,
         }
     }
+
+    /// The recorder this service reports through, for the interceptors wrapped
+    /// around it: they label their rejections with the same instruments.
+    pub(super) fn metrics(&self) -> OtlpMetrics {
+        self.metrics.clone()
+    }
 }
 
 #[tonic::async_trait]
@@ -101,7 +109,7 @@ impl LogsService for OtlpGrpcService {
         let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_LOGS, ENCODING_PROTOBUF);
         request_metrics.record_request_size(request_size);
 
-        let tenant_id = extract_tenant_id(&request);
+        let tenant = read_request_tenant(&request)?;
 
         // TODO(med): instrument gRPC decoding time by wrapping tonic/prost codec; handler receives decoded payload.
         let export_request = request.into_inner();
@@ -111,7 +119,7 @@ impl LogsService for OtlpGrpcService {
         let transform_start = Instant::now();
         let batch = tokio::task::spawn_blocking(move || {
             // TODO(med): Add a check - if the request size is not large, then we do not go into a separate thread. With small volumes, the overhead on the stream will not cover the costs.
-            span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
+            span.in_scope(|| transform::logs_to_record_batch(&export_request, &tenant))
         })
         .await
         .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
@@ -150,7 +158,7 @@ impl TraceService for OtlpGrpcService {
         let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_TRACES, ENCODING_PROTOBUF);
         request_metrics.record_request_size(request_size);
 
-        let tenant_id = extract_tenant_id(&request);
+        let tenant = read_request_tenant(&request)?;
         // Shared across the two parallel transform tasks; `ExportTraceServiceRequest`
         // is owned plain data (`Send + Sync`), so the `Arc` clone is cheap and no
         // deep copy of the request is made.
@@ -165,7 +173,7 @@ impl TraceService for OtlpGrpcService {
         let span = tracing::Span::current();
         let spans_task = tokio::task::spawn_blocking({
             let export_request = Arc::clone(&export_request);
-            let tenant_id = tenant_id.clone();
+            let tenant = tenant.clone();
             let span = span.clone();
             move || {
                 // Time the spans transform inside its own blocking task so the
@@ -173,7 +181,7 @@ impl TraceService for OtlpGrpcService {
                 // Recording `elapsed()` after the `join!` below would inflate it
                 // with the parallel operations transform (and join scheduling).
                 let transform_start = Instant::now();
-                let result = span.in_scope(|| transform::spans_to_record_batch(&export_request, tenant_id.as_deref()));
+                let result = span.in_scope(|| transform::spans_to_record_batch(&export_request, &tenant));
                 (result, transform_start.elapsed())
             }
         });
@@ -184,7 +192,7 @@ impl TraceService for OtlpGrpcService {
             let operations_task = tokio::task::spawn_blocking({
                 let export_request = Arc::clone(&export_request);
                 let span = span.clone();
-                move || span.in_scope(|| transform::operations_to_record_batch(&export_request, tenant_id.as_deref()))
+                move || span.in_scope(|| transform::operations_to_record_batch(&export_request, &tenant))
             });
             let (spans_join, operations_join) = tokio::join!(spans_task, operations_task);
             // Operations transform is best-effort: a panic degrades to a logged
@@ -246,13 +254,13 @@ impl MetricsService for OtlpGrpcService {
         let request_metrics = OtlpRequestRecorder::new(&self.metrics, PROTOCOL_GRPC, SIGNAL_METRICS, ENCODING_PROTOBUF);
         request_metrics.record_request_size(request_size);
 
-        let tenant_id = extract_tenant_id(&request);
+        let tenant = read_request_tenant(&request)?;
         let export_request = request.into_inner();
 
         let span = tracing::Span::current();
         let transform_start = Instant::now();
         let (batch_opt, drops) = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| transform::metrics_to_record_batch(&export_request, tenant_id.as_deref()))
+            span.in_scope(|| transform::metrics_to_record_batch(&export_request, &tenant))
         })
         .await
         .map_err(|e| Status::internal(format!("Transform task panicked: {e}")))?
@@ -331,6 +339,18 @@ mod tests {
         OtlpGrpcService::new(write_channel, 4, true, OtlpMetrics::new_disabled())
     }
 
+    /// A request carrying the tenant extension the interceptor would have set.
+    ///
+    /// These tests call the handlers directly, bypassing the interceptor; the
+    /// interceptor's own behaviour is covered in `tenant.rs`.
+    fn request_with_tenant<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request
+            .extensions_mut()
+            .insert(TenantId::new("test-tenant").expect("a valid tenant identifier"));
+        request
+    }
+
     #[tokio::test]
     async fn export_logs_returns_success_on_full_wal_ack() {
         let (tx, mut rx) = channel(1);
@@ -348,7 +368,7 @@ mod tests {
         });
 
         let service = test_service(tx);
-        let response = LogsService::export(&service, Request::new(create_test_request()))
+        let response = LogsService::export(&service, request_with_tenant(create_test_request()))
             .await
             .expect("grpc response")
             .into_inner();
@@ -369,7 +389,7 @@ mod tests {
         });
 
         let service = test_service(tx);
-        let response = LogsService::export(&service, Request::new(create_test_request()))
+        let response = LogsService::export(&service, request_with_tenant(create_test_request()))
             .await
             .expect("grpc response")
             .into_inner();
@@ -386,7 +406,7 @@ mod tests {
         drop(rx);
 
         let service = test_service(tx);
-        let status = LogsService::export(&service, Request::new(create_test_request()))
+        let status = LogsService::export(&service, request_with_tenant(create_test_request()))
             .await
             .expect_err("grpc status");
         assert_eq!(status.code(), tonic::Code::Internal);
@@ -397,7 +417,7 @@ mod tests {
         let (tx, mut rx) = channel(1);
         let service = OtlpGrpcService::new(tx, 0, true, OtlpMetrics::new_disabled());
 
-        let status = LogsService::export(&service, Request::new(create_test_request()))
+        let status = LogsService::export(&service, request_with_tenant(create_test_request()))
             .await
             .expect_err("grpc status");
 
@@ -454,7 +474,7 @@ mod tests {
         });
 
         let service = test_service(tx);
-        let response = TraceService::export(&service, Request::new(request))
+        let response = TraceService::export(&service, request_with_tenant(request))
             .await
             .expect("grpc ok")
             .into_inner();
@@ -556,7 +576,7 @@ mod tests {
         });
 
         let service = test_service(tx);
-        let response = TraceService::export(&service, Request::new(traces_request_one_llm_one_plain()))
+        let response = TraceService::export(&service, request_with_tenant(traces_request_one_llm_one_plain()))
             .await
             .expect("traces response must be OK even when operations write fails")
             .into_inner();
@@ -593,7 +613,7 @@ mod tests {
         });
 
         let service = test_service(tx);
-        let response = TraceService::export(&service, Request::new(traces_request_one_llm_one_plain()))
+        let response = TraceService::export(&service, request_with_tenant(traces_request_one_llm_one_plain()))
             .await
             .expect("grpc ok")
             .into_inner();
@@ -629,7 +649,7 @@ mod tests {
         });
 
         let service = OtlpGrpcService::new(tx, 4, false, OtlpMetrics::new_disabled());
-        let response = TraceService::export(&service, Request::new(traces_request_one_llm_one_plain()))
+        let response = TraceService::export(&service, request_with_tenant(traces_request_one_llm_one_plain()))
             .await
             .expect("grpc ok")
             .into_inner();
@@ -680,7 +700,7 @@ mod tests {
         });
 
         let service = test_service(tx);
-        let response = MetricsService::export(&service, Request::new(request))
+        let response = MetricsService::export(&service, request_with_tenant(request))
             .await
             .expect("grpc ok")
             .into_inner();

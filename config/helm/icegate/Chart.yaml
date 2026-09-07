@@ -82,6 +82,14 @@ annotations:
       description: Component images rebuilt on a distroless base, clearing all critical and high CVEs
     - kind: changed
       description: waitForDependencies images bumped to busybox 1.38.0 and aws-cli 2.36.34
+    - kind: changed
+      description: ingest.tenant decides the tenant of every write, and a x-scope-orgid naming another tenant is rejected instead of defaulted
+    - kind: changed
+      description: ingest probes moved to /health on the operational listener (ingest.metrics.port) from the OTLP port
+    - kind: added
+      description: Optional Envoy auth proxy in front of the ingest receivers (ingest.authProxy), terminating TLS and writing x-scope-orgid from the ingest token
+    - kind: added
+      description: ingest.metrics.host, the bind address of the operational listener
   # Rewritten by .github/workflows/release.yml from the tag: a tag containing a hyphen
   # is a prerelease. Editing it here changes nothing at release time.
   artifacthub.io/prerelease: "false"

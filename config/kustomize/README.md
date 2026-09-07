@@ -86,7 +86,7 @@ kustomize build --enable-helm config/kustomize/overlays/aws-glue | kubectl apply
 
 ## Render checks
 
-Overlay rendering is checked by hand only. CI covers the Helm chart alone (`.github/workflows/helm-lint.yml`). Chart sources differ per overlay: the base pulls `kube-prometheus-stack` and `grafana` from `prometheus-community` and `grafana`, `skaffold` and `orbstack` pull RustFS from `charts.rustfs.com` and take the IceGate chart locally (`helmGlobals.chartHome`), `external-s3` and `aws-glue` pull it from `oci://ghcr.io/icegatetech/charts`. What holds for all four is the base, so rendering any overlay needs those registries reachable and a CI step would report their availability alongside a defect in this repository.
+Overlay rendering is checked by hand only. CI covers the Helm chart alone (`.github/workflows/deploy-config.yml`). Chart sources differ per overlay: the base pulls `kube-prometheus-stack` and `grafana` from `prometheus-community` and `grafana`, `skaffold` and `orbstack` pull RustFS from `charts.rustfs.com` and take the IceGate chart locally (`helmGlobals.chartHome`), `external-s3` and `aws-glue` pull it from `oci://ghcr.io/icegatetech/charts`. What holds for all four is the base, so rendering any overlay needs those registries reachable and a CI step would report their availability alongside a defect in this repository.
 
 After changing an overlay, its values, or the chart version it pins, render it:
 

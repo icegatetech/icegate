@@ -1,0 +1,172 @@
+{{- if and .Values.ingest.enabled .Values.ingest.authProxy.enabled -}}
+{{- include "icegate.validateAuthProxy" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "icegate.componentName" (dict "context" . "component" "ingest-authproxy") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 4 }}
+data:
+  envoy.yaml: |
+    static_resources:
+      listeners:
+        {{- /* Each listener is gated on its receiver: with the receiver off
+               nothing listens on the upstream port, and an ungated listener
+               would publish a port whose only answer is a connection refused. */}}
+        {{- if .Values.ingest.otlpHttp.enabled }}
+        # OTLP/HTTP. Terminates TLS, checks the ingest token, and rewrites
+        # x-scope-orgid from the token's tenant_id claim before proxying to
+        # icegate on the pod loopback.
+        - name: otlp_http
+          address:
+            socket_address: { address: 0.0.0.0, port_value: {{ .Values.ingest.otlpHttp.port }} }
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                      - certificate_chain: { filename: /etc/icegate/tls/tls.crt }
+                        private_key: { filename: /etc/icegate/tls/tls.key }
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: otlp_http
+                    codec_type: AUTO
+                    route_config:
+                      name: otlp_http
+                      virtual_hosts:
+                        - name: otlp_http
+                          domains: ["*"]
+                          routes:
+                            # Every path. The upstream is icegate's OTLP receiver
+                            # and serves nothing else — its own router answers an
+                            # unknown path 404, and the operational listener that
+                            # carries /health and /metrics is on another port this
+                            # proxy does not front. Listing the OTLP paths here only
+                            # added a copy of
+                            # crates/icegate-ingest/src/otlp_http/routes.rs that
+                            # nothing compares against it.
+                            - match: { prefix: / }
+                              route:
+                                cluster: icegate_otlp_http
+                                timeout: {{ .Values.ingest.authProxy.upstreamTimeout | quote }}
+                    http_filters:
+                      {{- include "icegate.authProxyHttpFilters" . | nindent 22 }}
+        {{- end }}
+
+        {{- if .Values.ingest.otlpGrpc.enabled }}
+        # OTLP/gRPC. Same filter chain; a refused RPC surfaces to the exporter
+        # as UNAUTHENTICATED.
+        - name: otlp_grpc
+          address:
+            socket_address: { address: 0.0.0.0, port_value: {{ .Values.ingest.otlpGrpc.port }} }
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                      - certificate_chain: { filename: /etc/icegate/tls/tls.crt }
+                        private_key: { filename: /etc/icegate/tls/tls.key }
+                    alpn_protocols: ["h2"]
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: otlp_grpc
+                    codec_type: HTTP2
+                    route_config:
+                      name: otlp_grpc
+                      virtual_hosts:
+                        - name: otlp_grpc
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: /opentelemetry.proto.collector. }
+                              route:
+                                cluster: icegate_otlp_grpc
+                                timeout: {{ .Values.ingest.authProxy.upstreamTimeout | quote }}
+                    http_filters:
+                      {{- include "icegate.authProxyHttpFilters" . | nindent 22 }}
+        {{- end }}
+
+      clusters:
+        {{- if .Values.ingest.otlpHttp.enabled }}
+        - name: icegate_otlp_http
+          connect_timeout: 1s
+          type: STATIC
+          load_assignment:
+            cluster_name: icegate_otlp_http
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: {{ .Values.ingest.authProxy.upstream.otlpHttpPort }}
+        {{- end }}
+        {{- if .Values.ingest.otlpGrpc.enabled }}
+        - name: icegate_otlp_grpc
+          connect_timeout: 1s
+          type: STATIC
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: icegate_otlp_grpc
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: {{ .Values.ingest.authProxy.upstream.otlpGrpcPort }}
+        {{- end }}
+        # The JWKS endpoint the jwt_authn filter fetches signing keys from.
+        - name: token_issuer_jwks
+          connect_timeout: 2s
+          type: LOGICAL_DNS
+          dns_lookup_family: V4_ONLY
+          {{- $jwks := urlParse .Values.ingest.authProxy.jwt.jwksUri }}
+          {{- $jwksHost := regexReplaceAll ":[0-9]+$" $jwks.host "" }}
+          {{- $jwksPort := ternary 443 80 (eq $jwks.scheme "https") }}
+          {{- if contains ":" $jwks.host }}
+          {{- $jwksPort = atoi (last (splitList ":" $jwks.host)) }}
+          {{- end }}
+          load_assignment:
+            cluster_name: token_issuer_jwks
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: {{ $jwksHost | quote }}
+                          port_value: {{ $jwksPort }}
+          {{- if eq $jwks.scheme "https" }}
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              sni: {{ $jwksHost | quote }}
+              # These keys decide who may write into a tenant, so the peer that
+              # serves them is authenticated: without a validation_context Envoy
+              # encrypts the fetch but accepts any certificate, and whoever can
+              # answer for this host serves its own JWKS once cache_duration
+              # lapses. trustedCaFile names a path inside the proxy image, which
+              # is why it is a value rather than a literal.
+              common_tls_context:
+                validation_context:
+                  trusted_ca:
+                    filename: {{ .Values.ingest.authProxy.jwt.trustedCaFile | quote }}
+                  match_typed_subject_alt_names:
+                    - san_type: DNS
+                      matcher:
+                        exact: {{ $jwksHost | quote }}
+          {{- end }}
+{{- end }}

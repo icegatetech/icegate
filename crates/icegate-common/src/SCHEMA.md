@@ -469,7 +469,7 @@ CREATE TABLE iceberg.triplecloud.operations (
     agent_description VARCHAR,
     workflow_name VARCHAR,
 
-    -- Content (opt-in; JSON-encoded String; icegate stores raw, trust redacts at app layer)
+    -- Content (opt-in; JSON-encoded String; icegate stores what it is sent, redaction is the sender's)
     input_messages VARCHAR,
     output_messages VARCHAR,
     system_instructions VARCHAR,

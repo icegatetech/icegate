@@ -8,6 +8,8 @@ metadata:
     {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 4 }}
 data:
   ingest.yaml: |
+    {{- include "icegate.validateAuthProxy" . }}
+    {{- include "icegate.tenantYaml" . | nindent 4 }}
     catalog:
       {{- include "icegate.catalogYaml" . | nindent 6 }}
       {{- if .Values.ingest.cache.enabled }}
@@ -76,18 +78,31 @@ data:
           region: {{ .Values.ingest.shift.jobsmanager.storage.region | default .Values.aws.region | quote }}
           job_state_codec: {{ .Values.ingest.shift.jobsmanager.storage.jobStateCodec }}
           request_timeout_secs: {{ .Values.ingest.shift.jobsmanager.storage.requestTimeoutSecs }}
+    {{- /* The OTLP bind address follows authProxy.enabled and nothing else:
+           with the proxy, it owns the published ports and icegate retreats to
+           the pod loopback; without it, icegate is the published listener. */}}
     otlp_http:
       enabled: {{ .Values.ingest.otlpHttp.enabled }}
+      {{- if .Values.ingest.authProxy.enabled }}
+      host: "127.0.0.1"
+      port: {{ .Values.ingest.authProxy.upstream.otlpHttpPort }}
+      {{- else }}
       host: "0.0.0.0"
       port: {{ .Values.ingest.otlpHttp.port }}
+      {{- end }}
       max_body_bytes: {{ .Values.ingest.otlpHttp.maxBodyBytes | default 16777216 | int64 }}
     otlp_grpc:
       enabled: {{ .Values.ingest.otlpGrpc.enabled }}
+      {{- if .Values.ingest.authProxy.enabled }}
+      host: "127.0.0.1"
+      port: {{ .Values.ingest.authProxy.upstream.otlpGrpcPort }}
+      {{- else }}
       host: "0.0.0.0"
       port: {{ .Values.ingest.otlpGrpc.port }}
+      {{- end }}
     metrics:
       enabled: {{ .Values.ingest.metrics.enabled }}
-      host: "0.0.0.0"
+      host: {{ .Values.ingest.metrics.host | quote }}
       port: {{ .Values.ingest.metrics.port }}
       path: {{ .Values.ingest.metrics.path | quote }}
     tracing:

@@ -21,6 +21,7 @@ use arrow::array::{
 };
 use arrow::datatypes::Schema;
 use iceberg::arrow::schema_to_arrow_schema;
+use icegate_common::TenantId;
 
 use self::projection::{OperationRow, project_operation_row};
 use super::attributes::{SERVICE_NAME_KEY, extract_string_value, list_element_field, now_micros};
@@ -96,7 +97,7 @@ fn append_str_list(builder: &mut ListBuilder<StringBuilder>, value: Option<&Vec<
 #[tracing::instrument(skip(request))]
 pub fn operations_to_record_batch(
     request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
-    tenant_id: Option<&str>,
+    tenant_id: &TenantId,
 ) -> crate::error::Result<(Option<RecordBatch>, usize)> {
     let total_spans: usize = request
         .resource_spans
@@ -109,7 +110,6 @@ pub fn operations_to_record_batch(
         return Ok((None, 0));
     }
 
-    let tenant = tenant_id.unwrap_or(icegate_common::DEFAULT_TENANT_ID);
     let ingested_at = now_micros()?;
     let schema = operations_arrow_schema()?;
 
@@ -133,7 +133,7 @@ pub fn operations_to_record_batch(
         for scope_spans in &resource_spans.scope_spans {
             let scope = scope_spans.scope.as_ref();
             for span in &scope_spans.spans {
-                match project_operation_row(span, scope, tenant, service_name.as_deref(), ingested_at) {
+                match project_operation_row(span, scope, tenant_id, service_name.as_deref(), ingested_at) {
                     Ok(Some(row)) => rows.push(row),
                     Ok(None) => non_llm_skipped += 1,
                     Err(error) => {
@@ -390,6 +390,7 @@ mod tests {
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
     use super::operations_to_record_batch;
+    use crate::transform::test_support::test_tenant;
 
     fn kv_str(key: &str, value: &str) -> KeyValue {
         KeyValue {
@@ -472,7 +473,7 @@ mod tests {
             }],
         };
 
-        let (batch_opt, drops) = operations_to_record_batch(&request, Some("tenant-a")).expect("batch ok");
+        let (batch_opt, drops) = operations_to_record_batch(&request, &test_tenant("tenant-a")).expect("batch ok");
         let batch = batch_opt.expect("one llm span -> batch");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(drops, 0);
@@ -491,7 +492,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let (batch_opt, drops) = operations_to_record_batch(&request, Some("t")).expect("ok");
+        let (batch_opt, drops) = operations_to_record_batch(&request, &test_tenant("t")).expect("ok");
         assert!(batch_opt.is_none());
         assert_eq!(drops, 0);
     }
@@ -541,7 +542,7 @@ mod tests {
             }],
         };
 
-        let (batch_opt, drops) = operations_to_record_batch(&request, Some("tenant-a")).expect("batch ok");
+        let (batch_opt, drops) = operations_to_record_batch(&request, &test_tenant("tenant-a")).expect("batch ok");
         let batch = batch_opt.expect("one llm span -> batch");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(drops, 0);

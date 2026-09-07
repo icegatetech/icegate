@@ -839,6 +839,7 @@ pub struct OtlpMetrics {
     wal_enqueue_duration: Histogram<f64>,
     wal_ack_duration: Histogram<f64>,
     wal_queue_unavailable_total: Counter<u64>,
+    tenant_rejections_total: Counter<u64>,
 }
 
 impl OtlpMetrics {
@@ -860,6 +861,7 @@ impl OtlpMetrics {
             wal_enqueue_duration: meter.f64_histogram("icegate_ingest_wal_enqueue_duration").build(),
             wal_ack_duration: meter.f64_histogram("icegate_ingest_wal_ack_duration").build(),
             wal_queue_unavailable_total: meter.u64_counter("icegate_ingest_wal_queue_unavailable").build(),
+            tenant_rejections_total: meter.u64_counter("icegate_ingest_otlp_tenant_rejections").build(),
         }
     }
 
@@ -916,6 +918,10 @@ impl OtlpMetrics {
             .u64_counter("icegate_ingest_wal_queue_unavailable")
             .with_description("Failed WAL enqueue attempts")
             .build();
+        let tenant_rejections_total = meter
+            .u64_counter("icegate_ingest_otlp_tenant_rejections")
+            .with_description("OTLP requests rejected for carrying no usable tenant")
+            .build();
 
         Self {
             enabled: true,
@@ -930,6 +936,7 @@ impl OtlpMetrics {
             wal_enqueue_duration,
             wal_ack_duration,
             wal_queue_unavailable_total,
+            tenant_rejections_total,
         }
     }
 
@@ -1001,6 +1008,26 @@ impl OtlpMetrics {
             return;
         }
         self.decode_errors_total.add(
+            1,
+            &[
+                KeyValue::new("protocol", protocol.to_string()),
+                KeyValue::new("signal", signal.to_string()),
+                KeyValue::new("reason", reason.to_string()),
+            ],
+        );
+    }
+
+    /// Record a rejected request that carried no usable tenant.
+    ///
+    /// `reason` comes from
+    /// [`TenantRejection::reason`](icegate_common::TenantRejection::reason) and
+    /// from nowhere else; a hand-written string here would drift from the
+    /// variants the resolver returns.
+    pub fn add_tenant_rejection(&self, protocol: &str, signal: &str, reason: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.tenant_rejections_total.add(
             1,
             &[
                 KeyValue::new("protocol", protocol.to_string()),
@@ -1562,6 +1589,7 @@ mod tests {
 
     use bytes::Bytes;
     use futures::StreamExt;
+    use icegate_common::TenantRejection;
     use icegate_queue::{ParquetQueueReader, Topic};
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
@@ -1570,7 +1598,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        test_support::{build_meter_provider, find_histogram_count},
+        test_support::{build_meter_provider, find_counter_total, find_histogram_count},
         *,
     };
 
@@ -1955,6 +1983,41 @@ mod tests {
                 &exporter,
                 "icegate_ingest_shift_queue_writer_s3_request_duration",
                 list_ok_labels,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn tenant_rejections_are_counted_per_protocol_signal_and_reason() {
+        let (provider, exporter) = build_meter_provider();
+        let metrics = OtlpMetrics::new(&provider.meter("test_tenant_rejections"));
+
+        // Reason strings come from the resolver's own enum, never from a literal
+        // written at the call site.
+        metrics.add_tenant_rejection("http", "logs", TenantRejection::Missing.reason());
+        metrics.add_tenant_rejection("http", "logs", TenantRejection::Missing.reason());
+        metrics.add_tenant_rejection("grpc", "traces", TenantRejection::DuplicateHeader.reason());
+
+        provider.force_flush().expect("failed to flush metrics");
+
+        assert_eq!(
+            find_counter_total(
+                &exporter,
+                "icegate_ingest_otlp_tenant_rejections",
+                &[("protocol", "http"), ("signal", "logs"), ("reason", "missing")],
+            ),
+            2
+        );
+        assert_eq!(
+            find_counter_total(
+                &exporter,
+                "icegate_ingest_otlp_tenant_rejections",
+                &[
+                    ("protocol", "grpc"),
+                    ("signal", "traces"),
+                    ("reason", "duplicate_header"),
+                ],
             ),
             1
         );

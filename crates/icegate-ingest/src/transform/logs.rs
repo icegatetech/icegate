@@ -8,7 +8,7 @@ use arrow::{
 };
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::{
-    DEFAULT_TENANT_ID,
+    TenantId,
     schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES},
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -55,7 +55,7 @@ pub fn logs_arrow_schema() -> crate::error::Result<Arc<Schema>> {
 /// # Arguments
 ///
 /// * `request` - The OTLP export logs request
-/// * `tenant_id` - Tenant identifier (from request metadata or default)
+/// * `tenant_id` - Tenant the rows are written to, decided by the tenant policy
 ///
 /// # Returns
 ///
@@ -72,8 +72,9 @@ pub fn logs_arrow_schema() -> crate::error::Result<Arc<Schema>> {
 #[tracing::instrument(skip(request))]
 pub fn logs_to_record_batch(
     request: &ExportLogsServiceRequest,
-    tenant_id: Option<&str>,
+    tenant_id: &TenantId,
 ) -> crate::error::Result<Option<RecordBatch>> {
+    let tenant_id = tenant_id.as_ref();
     let ingested_timestamp = now_micros()?;
 
     // Count total log records for capacity hints
@@ -110,8 +111,6 @@ pub fn logs_to_record_batch(
     let mut scope_attrs_builder = attribute_map_builder(scope_key_field, scope_value_field);
     let mut log_attrs_builder = attribute_map_builder(log_key_field, log_value_field);
 
-    let tenant = tenant_id.unwrap_or(DEFAULT_TENANT_ID);
-
     // Empty slice for default attributes
     let empty_attrs: Vec<opentelemetry_proto::tonic::common::v1::KeyValue> = Vec::new();
 
@@ -137,7 +136,7 @@ pub fn logs_to_record_batch(
 
             for log_record in &scope_logs.log_records {
                 // tenant_id
-                tenant_id_builder.append_value(tenant);
+                tenant_id_builder.append_value(tenant_id);
 
                 // service_name
                 if let Some(ref svc) = service_name {
@@ -296,12 +295,13 @@ mod tests {
     };
 
     use super::*;
+    use crate::transform::test_support::test_tenant;
 
     #[test]
     fn test_logs_to_record_batch_empty() {
         let request = ExportLogsServiceRequest { resource_logs: vec![] };
 
-        let batch = logs_to_record_batch(&request, None).expect("should not error");
+        let batch = logs_to_record_batch(&request, &test_tenant("test-tenant")).expect("should not error");
         assert!(batch.is_none());
     }
 
@@ -349,7 +349,7 @@ mod tests {
             }],
         };
 
-        let batch = logs_to_record_batch(&request, Some("test-tenant")).expect("should not error");
+        let batch = logs_to_record_batch(&request, &test_tenant("test-tenant")).expect("should not error");
         assert!(batch.is_some());
 
         let batch = batch.expect("batch should exist");
@@ -417,7 +417,9 @@ mod tests {
             }],
         };
 
-        let batch = logs_to_record_batch(&request, Some("tenant-1")).expect("ok").expect("batch");
+        let batch = logs_to_record_batch(&request, &test_tenant("tenant-1"))
+            .expect("ok")
+            .expect("batch");
 
         // Indexed top-level columns must hold the values directly. trace_id /
         // span_id are stored as raw `FIXED_LEN_BYTE_ARRAY` bytes, not hex.
@@ -510,7 +512,9 @@ mod tests {
             }],
         };
 
-        let batch = logs_to_record_batch(&request, Some("t1")).expect("transform").expect("batch");
+        let batch = logs_to_record_batch(&request, &test_tenant("t1"))
+            .expect("transform")
+            .expect("batch");
 
         let resource = map_pairs(&batch, "resource_attributes");
         let scope = map_pairs(&batch, "scope_attributes");
@@ -554,7 +558,9 @@ mod tests {
             }],
         };
 
-        let batch = logs_to_record_batch(&request, Some("t1")).expect("transform").expect("batch");
+        let batch = logs_to_record_batch(&request, &test_tenant("t1"))
+            .expect("transform")
+            .expect("batch");
         let resource = map_pairs(&batch, "resource_attributes");
 
         assert!(

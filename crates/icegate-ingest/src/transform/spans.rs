@@ -11,7 +11,7 @@ use arrow::{
 };
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::{
-    DEFAULT_TENANT_ID,
+    TenantId,
     schema::{
         COL_ATTRIBUTES, COL_DROPPED_ATTRIBUTES_COUNT, COL_EVENTS, COL_FLAGS, COL_LINKS, COL_NAME,
         COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID,
@@ -132,7 +132,7 @@ fn nested_field_index(
 /// # Arguments
 ///
 /// * `request` - The OTLP export traces request
-/// * `tenant_id` - Tenant identifier (from request metadata or default)
+/// * `tenant_id` - Tenant the rows are written to, decided by the tenant policy
 ///
 /// # Returns
 ///
@@ -149,10 +149,11 @@ fn nested_field_index(
 #[tracing::instrument(skip(request))]
 pub fn spans_to_record_batch(
     request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
-    tenant_id: Option<&str>,
+    tenant_id: &TenantId,
 ) -> crate::error::Result<(Option<RecordBatch>, usize)> {
     use arrow::array::{Int64Array, ListBuilder, StructBuilder};
 
+    let tenant_id = tenant_id.as_ref();
     let ingested_timestamp = now_micros()?;
 
     let total_spans: usize = request
@@ -262,7 +263,6 @@ pub fn spans_to_record_batch(
     let link_dropped_slot = nested_field_index(&link_struct_fields, COL_LINKS, COL_DROPPED_ATTRIBUTES_COUNT)?;
     let link_flags_slot = nested_field_index(&link_struct_fields, COL_LINKS, COL_FLAGS)?;
 
-    let tenant = tenant_id.unwrap_or(DEFAULT_TENANT_ID);
     let empty_attrs: Vec<opentelemetry_proto::tonic::common::v1::KeyValue> = Vec::new();
     let mut drops: usize = 0;
 
@@ -339,7 +339,7 @@ pub fn spans_to_record_batch(
                     None => parent_span_id_builder.append_null(),
                 }
 
-                tenant_id_builder.append_value(tenant);
+                tenant_id_builder.append_value(tenant_id);
                 match service_name.as_deref() {
                     Some(svc) => service_name_builder.append_value(svc),
                     None => service_name_builder.append_null(),
@@ -627,6 +627,7 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
 
     use super::*;
+    use crate::transform::test_support::test_tenant;
 
     #[test]
     fn spans_arrow_schema_has_nested_events_and_links() {
@@ -640,7 +641,7 @@ mod tests {
     fn spans_to_record_batch_empty_request_returns_none() {
         use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
         let request = ExportTraceServiceRequest { resource_spans: vec![] };
-        let (batch, drops) = spans_to_record_batch(&request, None).expect("should not error");
+        let (batch, drops) = spans_to_record_batch(&request, &test_tenant("test-tenant")).expect("should not error");
         assert!(batch.is_none());
         assert_eq!(drops, 0);
     }
@@ -695,7 +696,7 @@ mod tests {
             }],
         };
 
-        let (batch_opt, drops) = spans_to_record_batch(&request, Some("tenant-1")).expect("ok");
+        let (batch_opt, drops) = spans_to_record_batch(&request, &test_tenant("tenant-1")).expect("ok");
         let batch = batch_opt.expect("batch");
         assert_eq!(drops, 0);
         assert_eq!(batch.num_rows(), 1);
@@ -766,7 +767,7 @@ mod tests {
             }],
         };
 
-        let (batch_opt, drops) = spans_to_record_batch(&request, None).expect("ok");
+        let (batch_opt, drops) = spans_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch_opt.is_none());
         assert_eq!(drops, 1);
     }
@@ -845,7 +846,7 @@ mod tests {
             }],
         };
 
-        let (batch, _) = spans_to_record_batch(&request, Some("tenant-1")).expect("ok");
+        let (batch, _) = spans_to_record_batch(&request, &test_tenant("tenant-1")).expect("ok");
         let batch = batch.expect("batch");
 
         let resource_attrs = batch
@@ -939,7 +940,7 @@ mod tests {
             }],
         };
 
-        let (batch, _) = spans_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = spans_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         let events = batch
             .column_by_name("events")
@@ -1027,7 +1028,7 @@ mod tests {
             }],
         };
 
-        let (batch, _) = spans_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = spans_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
 
         let links = batch
@@ -1121,7 +1122,8 @@ mod tests {
             }],
         };
 
-        let (maybe_batch, drops) = super::spans_to_record_batch(&request, None).expect("spans transform");
+        let (maybe_batch, drops) =
+            super::spans_to_record_batch(&request, &test_tenant("test-tenant")).expect("spans transform");
         assert_eq!(drops, 0);
         let batch = maybe_batch.expect("batch produced");
         assert_eq!(batch.num_rows(), 1);
@@ -1294,7 +1296,7 @@ mod tests {
             }],
         };
 
-        let (batch, _drops) = spans_to_record_batch(&request, Some("t1")).expect("spans transform");
+        let (batch, _drops) = spans_to_record_batch(&request, &test_tenant("t1")).expect("spans transform");
         batch.expect("batch produced")
     }
 
@@ -1441,7 +1443,7 @@ mod tests {
             }],
         };
 
-        let (batch, _) = spans_to_record_batch(&request, None).expect("spans transform");
+        let (batch, _) = spans_to_record_batch(&request, &test_tenant("test-tenant")).expect("spans transform");
         let batch = batch.expect("batch produced");
 
         for column in [COL_EVENTS, COL_LINKS] {

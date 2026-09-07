@@ -175,6 +175,167 @@ backend: !s3
 {{- end }}
 
 {{/*
+Render the ingest tenant policy (zero-indented).
+Produces the YAML tagged union: `!single { id }` or `!multi`.
+Callers must use `nindent N` to place at the correct indentation level.
+
+`fail` rather than a default: a `single` policy with no id would deserialize into
+an empty tenant that no request can name, and the pod would reject every batch.
+*/}}
+{{- define "icegate.tenantYaml" -}}
+{{- if eq .Values.ingest.tenant.mode "single" -}}
+{{- if not .Values.ingest.tenant.id }}{{ fail "ingest.tenant.id is required when ingest.tenant.mode is single" }}{{ end -}}
+tenant: !single
+  id: {{ .Values.ingest.tenant.id | quote }}
+{{- else if eq .Values.ingest.tenant.mode "multi" -}}
+tenant: !multi
+{{- else -}}
+{{ fail (printf "ingest.tenant.mode must be single or multi, got %q" .Values.ingest.tenant.mode) }}
+{{- end -}}
+{{- end }}
+
+{{/*
+Render the auth proxy's HTTP filter chain (zero-indented). Both listeners use the
+same one, so it is defined once here.
+
+Four filters, and the order is the contract:
+  1. header_mutation drops whatever the client sent as x-scope-orgid. It has to
+     be a filter, and it has to be this one: route-level `request_headers_to_remove`
+     is applied by the router filter, which runs last, so it would delete the value
+     jwt_authn wrote rather than the one the client sent, and every request would
+     reach icegate with no tenant at all.
+  2. jwt_authn verifies the ingest token and copies its `tenant_id` claim into
+     the now-empty x-scope-orgid header the ingest handlers read. `forward: false`
+     keeps the token itself from reaching icegate.
+  3. rbac checks both halves of the token profile, and a request needs both.
+     The JOSE `typ` of the header says the object is an access token rather
+     than any other JOSE object the same key signs; the payload `typ` is the
+     issuer's own discriminator, which says *which* application token this is.
+     The audience replaces neither: it separates the ingest token from the API
+     token, not an ingest token from any other token the same issuer signs for
+     the same audience. Both markers are pinned by scripts/authproxy-test.sh.
+  4. router proxies what survived.
+
+Usage: include "icegate.authProxyHttpFilters" .
+*/}}
+{{- define "icegate.authProxyHttpFilters" -}}
+- name: envoy.filters.http.header_mutation
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+    mutations:
+      request_mutations:
+        - remove: x-scope-orgid
+- name: envoy.filters.http.jwt_authn
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+    providers:
+      ingest_token:
+        issuer: {{ .Values.ingest.authProxy.jwt.issuer | quote }}
+        audiences:
+          - {{ .Values.ingest.authProxy.jwt.audience | quote }}
+        forward: false
+        # Both halves of the token reach rbac below, which is the only filter
+        # that reads either: without these keys the metadata carries nothing and
+        # a principal stated over it admits every token jwt_authn verified.
+        header_in_metadata: jwt_header
+        payload_in_metadata: jwt_payload
+        clock_skew_seconds: {{ .Values.ingest.authProxy.jwt.clockSkewSeconds }}
+        # The only place a token is taken from. With no extractor named,
+        # jwt_authn also accepts an `access_token` query parameter, and a URL is
+        # written to access logs and traces by everything it passes through.
+        from_headers:
+          - name: Authorization
+            value_prefix: "Bearer "
+        claim_to_headers:
+          - header_name: x-scope-orgid
+            claim_name: tenant_id
+        remote_jwks:
+          http_uri:
+            uri: {{ .Values.ingest.authProxy.jwt.jwksUri | quote }}
+            cluster: token_issuer_jwks
+            timeout: 5s
+          cache_duration: {{ printf "%ds" (int .Values.ingest.authProxy.jwt.jwksCacheDurationSecs) | quote }}
+          # Fetched in the background so the proxy starts even while the issuer
+          # is unreachable.
+          async_fetch: {}
+    rules:
+      - match: { prefix: / }
+        requires: { provider_name: ingest_token }
+- name: envoy.filters.http.rbac
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+    rules:
+      action: ALLOW
+      policies:
+        # `principals.metadata` is marked deprecated by Envoy 1.36 (it still
+        # loads, with a warning). The replacement is a CEL `condition` over the
+        # same jwt_authn metadata; swap it when this image stops accepting the
+        # field, not before — the CEL form is longer and harder to read.
+        ingest_tokens_only:
+          permissions:
+            - any: true
+          principals:
+            - and_ids:
+                ids:
+                  - metadata:
+                      filter: envoy.filters.http.jwt_authn
+                      path:
+                        - key: jwt_header
+                        - key: typ
+                      value:
+                        string_match: { exact: {{ .Values.ingest.authProxy.jwt.headerType | quote }} }
+                  - metadata:
+                      filter: envoy.filters.http.jwt_authn
+                      path:
+                        - key: jwt_payload
+                        - key: typ
+                      value:
+                        string_match: { exact: {{ .Values.ingest.authProxy.jwt.tokenType | quote }} }
+- name: envoy.filters.http.router
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+{{- end }}
+
+{{/*
+Fail the render when the auth proxy is enabled without the settings it cannot
+work around. Every one of them names something outside this chart — the token
+issuer, its JWKS endpoint, the audience, and the Secret holding the server
+certificate — so there is nothing to default to, and a proxy started without them
+either rejects every request or, worse, accepts tokens it should not.
+
+The tenant policy is checked alongside them. The proxy writes x-scope-orgid from
+the token's `tenant_id` claim, and a `single` policy accepts that header only
+when it names the configured id, so a deployment left on the chart's default id
+refuses every batch the issuer signs for anything else — with nothing in the
+render to say so. `single` behind the proxy is not forbidden outright: a
+single-customer deployment whose issuer puts exactly that id in the token is
+legitimate, and it passes as soon as the id is the operator's own rather than the
+value shipped in values.yaml.
+
+`ingest.ingress` is refused outright, and for the same reason the list above
+exists: the pairing renders cleanly and then fails every request. The Ingress
+addresses the Service ports, those ports reach the proxy's listeners, and the
+listeners speak TLS — while what makes a controller reach a TLS backend lives in
+the controller's own configuration, outside this chart's reach.
+
+Usage: include "icegate.validateAuthProxy" .
+*/}}
+{{- define "icegate.validateAuthProxy" -}}
+{{- if and .Values.ingest.enabled .Values.ingest.authProxy.enabled }}
+{{- if not .Values.ingest.authProxy.jwt.issuer }}{{ fail "ingest.authProxy.jwt.issuer is required when ingest.authProxy.enabled" }}{{ end }}
+{{- if not .Values.ingest.authProxy.jwt.audience }}{{ fail "ingest.authProxy.jwt.audience is required when ingest.authProxy.enabled" }}{{ end }}
+{{- if not .Values.ingest.authProxy.jwt.jwksUri }}{{ fail "ingest.authProxy.jwt.jwksUri is required when ingest.authProxy.enabled" }}{{ end }}
+{{- if not .Values.ingest.authProxy.tls.secretName }}{{ fail "ingest.authProxy.tls.secretName is required when ingest.authProxy.enabled" }}{{ end }}
+{{- if .Values.ingest.ingress.enabled }}
+{{- fail "ingest.ingress.enabled together with ingest.authProxy.enabled: the Service ports the Ingress addresses are the proxy's, and the proxy terminates TLS on them (the OTLP/gRPC one negotiates h2 through ALPN). What an Ingress controller has to be told to reach a TLS backend is the controller's own setting, which this chart neither renders nor can check, so the pairing is refused here instead of creating an Ingress whose every request fails the handshake. Publish the proxy through the Service (its ports already carry TLS), or turn ingest.authProxy.enabled off" }}
+{{- end }}
+{{- if and (eq .Values.ingest.tenant.mode "single") (eq .Values.ingest.tenant.id "default") }}
+{{- fail "ingest.tenant is still the chart default (mode single, id \"default\") while ingest.authProxy.enabled: the proxy writes x-scope-orgid from the token's tenant_id claim, and a single policy on the default id refuses every batch the issuer signs for any other tenant. Set ingest.tenant.mode=multi, or ingest.tenant.id to the one id this deployment's issuer emits" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Fail the render when the retention window, the query provider cache, and the GC
 grace period are not ordered so that a query can never plan against files that
 are already gone:

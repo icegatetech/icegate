@@ -1,11 +1,13 @@
-# One tenant for the whole stand, named `demo`, because that is what the
-# collector sends: `X-Scope-OrgID: demo` in otel-collector/config.yaml, on the
-# logs of every service that uses the fluentd driver. In single mode a header
-# naming any other tenant is rejected, so `default` here would 400 every batch.
-# `otelgen` (profile `load`) sends no header at all and therefore also lands in
-# `demo`; view its data through the "Loki (demo)" / "Tempo (demo)" datasources.
-tenant: !single
-  id: demo
+# Ingest behind the Envoy auth proxy (docker-compose.proxy.yml overlay).
+#
+# Differs from ingest.yaml in exactly two ways, both consequences of the proxy
+# standing in front:
+#   - `!multi`: the tenant comes from x-scope-orgid, which the proxy writes from
+#     the ingest token's tenant_id claim after dropping whatever the client sent;
+#   - the OTLP listeners move to the pod loopback, because the proxy owns the
+#     published 4317/4318. Same split the chart renders under
+#     ingest.authProxy.enabled.
+tenant: !multi
 
 catalog:
   backend: !s3
@@ -45,13 +47,13 @@ shift:
 
 otlp_http:
   enabled: true
-  host: 0.0.0.0
-  port: 4318
+  host: 127.0.0.1
+  port: 14318
 
 otlp_grpc:
   enabled: true
-  host: 0.0.0.0
-  port: 4317
+  host: 127.0.0.1
+  port: 14317
 
 metrics:
   enabled: true

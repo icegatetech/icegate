@@ -1,9 +1,21 @@
-//! Prometheus metrics utilities.
+//! Prometheus metrics, and the operational HTTP listener that serves them.
+//!
+//! The listener does two things that are not both about metrics: it always
+//! answers [`HEALTH_PATH`], and it answers [`OperationalConfig::path`] only when
+//! the component built a [`MetricsRuntime`]. It lives here, and its
+//! configuration is named after the metrics endpoint, because that is the name
+//! of the section every deployment configures it through — `metrics` in each
+//! component's configuration file and in the chart's values. Renaming the module
+//! would leave the key and the code that reads it named differently.
+//!
+//! So [`OperationalConfig::enabled`] governs the Prometheus endpoint alone: the
+//! listener binds either way, and a liveness probe never depends on whether the
+//! deployment scrapes metrics.
 
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Json, Router,
     extract::Extension,
     http::{StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
@@ -20,16 +32,32 @@ use crate::{
     error::{CommonError, Result},
 };
 
-/// Metrics server configuration.
+/// Operational listener configuration.
+///
+/// The listener itself is unconditional: [`run_operational_server`] always binds
+/// `host:port` and always serves `/health`, so a liveness probe does not depend
+/// on whether the deployment scrapes metrics.
+// TODO(high): one type, two responsibilities — `host`/`port` bind the listener that
+// always serves HEALTH_PATH, `enabled`/`path` register the Prometheus endpoint. Split
+// them and move the configuration key from `metrics` to `operational` (serde alias for
+// the old one), in a single change across crates/icegate-{ingest,query,maintain}/src/config.rs,
+// config/docker/{ingest,ingest-proxy,query,maintain}.yaml, config/helm/icegate
+// (values.yaml, values.schema.json, templates/configmap-*.yaml) and the kustomize
+// overlays. `ServerConfig::name` reports "Operational" while the operator edits a
+// `metrics` section. Drop the `MetricsConfig` alias in `lib.rs` in the same change:
+// it exists only for icegate-ee, which still imports the pre-rename name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricsConfig {
-    /// Whether metrics are enabled.
+pub struct OperationalConfig {
+    /// Whether the `path` endpoint is registered.
+    ///
+    /// This flag governs metrics only. With it off the listener still runs and
+    /// still answers `/health`; only the Prometheus endpoint is absent.
     #[serde(default)]
     pub enabled: bool,
-    /// Bind host for the standalone metrics server.
+    /// Bind host for the operational server.
     #[serde(default = "default_metrics_host")]
     pub host: String,
-    /// Bind port for the standalone metrics server.
+    /// Bind port for the operational server.
     #[serde(default = "default_metrics_port")]
     pub port: u16,
     /// HTTP path for the metrics endpoint.
@@ -37,7 +65,7 @@ pub struct MetricsConfig {
     pub path: String,
 }
 
-impl Default for MetricsConfig {
+impl Default for OperationalConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -48,18 +76,21 @@ impl Default for MetricsConfig {
     }
 }
 
-impl MetricsConfig {
+impl OperationalConfig {
     /// Validate metrics configuration.
     ///
     /// # Errors
     ///
     /// Returns an error if any configuration value is invalid.
     pub fn validate(&self) -> Result<()> {
-        if self.enabled {
-            if self.host.trim().is_empty() {
-                return Err(CommonError::Config("metrics host cannot be empty".to_string()));
-            }
+        // The host is checked whatever `enabled` says: the listener binds in
+        // both cases, so an empty host is a configuration error here rather than
+        // a bind failure minutes into startup.
+        if self.host.trim().is_empty() {
+            return Err(CommonError::Config("metrics host cannot be empty".to_string()));
+        }
 
+        if self.enabled {
             if self.path.trim().is_empty() {
                 return Err(CommonError::Config("metrics path cannot be empty".to_string()));
             }
@@ -67,19 +98,32 @@ impl MetricsConfig {
             if !self.path.starts_with('/') {
                 return Err(CommonError::Config("metrics path must start with '/'".to_string()));
             }
+
+            // The listener serves `HEALTH_PATH` unconditionally, so the same path
+            // asked for here is a second `GET` route on it, and `Router::route`
+            // answers that with a panic rather than an error. Refused here, where
+            // the field that has to move is named.
+            if self.path.trim() == HEALTH_PATH {
+                return Err(CommonError::Config(format!(
+                    "metrics path cannot be {HEALTH_PATH}: the operational listener always serves it"
+                )));
+            }
         }
 
         Ok(())
     }
 }
 
-impl ServerConfig for MetricsConfig {
+impl ServerConfig for OperationalConfig {
     fn name(&self) -> &'static str {
-        "Metrics"
+        "Operational"
     }
 
+    /// Always `true`: the operational listener occupies its port whatever
+    /// `enabled` says, so [`check_port_conflicts`](crate::config::check_port_conflicts)
+    /// has to see it.
     fn enabled(&self) -> bool {
-        self.enabled
+        true
     }
 
     fn port(&self) -> u16 {
@@ -226,37 +270,68 @@ fn histogram_view(inst: &Instrument) -> Option<Stream> {
         .ok()
 }
 
-/// Build a router serving Prometheus metrics.
-fn metrics_router(registry: Arc<Registry>, path: &str) -> Router {
-    Router::new().route(path, get(metrics_handler)).layer(Extension(registry))
+/// Path of the health endpoint served by every component's operational listener.
+///
+/// Named here because the Helm probes and the Compose health checks address it
+/// by this literal; the deployment configs are the second copy, and they cite
+/// this constant.
+pub const HEALTH_PATH: &str = "/health";
+
+/// Build the operational router: `/health` always, the Prometheus endpoint only
+/// when a registry is given.
+///
+/// A `None` registry is what `metrics.enabled: false` means at this layer — the
+/// component built no meter provider, so there is nothing to encode and the
+/// `path` route is not registered at all.
+fn build_operational_router(registry: Option<Arc<Registry>>, path: &str) -> Router {
+    let mut router = Router::new().route(HEALTH_PATH, get(health_handler));
+    if let Some(registry) = registry {
+        router = router.route(path, get(metrics_handler)).layer(Extension(registry));
+    }
+    router
 }
 
-/// Run a standalone metrics server.
-pub async fn run_metrics_server(
-    config: MetricsConfig,
-    registry: Arc<Registry>,
+/// Run the operational server.
+///
+/// Binds `config.host:config.port` unconditionally and serves [`HEALTH_PATH`];
+/// `registry` decides whether `config.path` is served alongside it. Returns when
+/// `cancel_token` is cancelled and the listener has unbound.
+///
+/// # Errors
+///
+/// Returns an error if the address cannot be bound or the server stops with a
+/// fatal error.
+pub async fn run_operational_server(
+    config: OperationalConfig,
+    registry: Option<Arc<Registry>>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    if !config.enabled {
-        return Ok(());
-    }
-
     let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let app = metrics_router(registry, &config.path);
+    let app = build_operational_router(registry, &config.path);
 
-    tracing::info!("Metrics server listening on {}", addr);
+    tracing::info!("Operational server listening on {}", addr);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             cancel_token.cancelled().await;
-            tracing::info!("Metrics server shutting down gracefully");
+            tracing::info!("Operational server shutting down gracefully");
         })
         .await?;
 
-    tracing::info!("Metrics server stopped");
+    tracing::info!("Operational server stopped");
 
     Ok(())
+}
+
+/// Report that the process is up.
+///
+/// Liveness only: it answers as soon as the listener is bound, and says nothing
+/// about the catalog, the WAL, or any worker pool. A probe that failed while a
+/// component was recovering would have the kubelet kill it mid-recovery.
+async fn health_handler() -> Response {
+    // TODO(high): need to refactor the probes - now there is no understanding that ingest works
+    Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
 async fn metrics_handler(Extension(registry): Extension<Arc<Registry>>) -> Response {
@@ -283,4 +358,127 @@ const fn default_metrics_port() -> u16 {
 
 fn default_metrics_path() -> String {
     "/metrics".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// Issue a `GET` against the operational router and return status and body.
+    async fn get_path(router: Router, path: &str) -> (StatusCode, String) {
+        let response = router
+            .oneshot(Request::builder().uri(path).body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = response.into_body().collect().await.expect("body").to_bytes();
+        (status, String::from_utf8(body.to_vec()).expect("utf-8 body"))
+    }
+
+    /// `HEALTH_PATH` as the metrics path would register a second `GET` route on
+    /// the path the listener always serves, which `Router::route` reports by
+    /// panicking. The configuration is refused instead.
+    #[test]
+    fn a_metrics_path_equal_to_the_health_path_is_refused() {
+        let mut config = OperationalConfig {
+            enabled: true,
+            ..OperationalConfig::default()
+        };
+
+        // Baseline validates: any error after replacing only `path` therefore
+        // comes from the health-path check rather than from the host or the
+        // leading-slash rule.
+        config.validate().expect("baseline operational config is valid");
+
+        config.path = HEALTH_PATH.to_string();
+
+        assert!(matches!(config.validate(), Err(CommonError::Config(_))));
+    }
+
+    #[tokio::test]
+    async fn operational_server_serves_health_without_a_registry() {
+        // `metrics.enabled: false` reaches this layer as a `None` registry: the
+        // probe must still be answered, and `/metrics` must not exist.
+        let router = build_operational_router(None, "/metrics");
+
+        let (status, body) = get_path(router.clone(), HEALTH_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"status":"ok"}"#);
+
+        let (status, _) = get_path(router, "/metrics").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn operational_server_serves_metrics_when_a_registry_is_given() {
+        let registry = Registry::new();
+        let counter = prometheus::IntCounter::new("icegate_test_total", "test counter").expect("counter");
+        registry.register(Box::new(counter.clone())).expect("register counter");
+        counter.inc();
+
+        let router = build_operational_router(Some(Arc::new(registry)), "/metrics");
+
+        let (status, body) = get_path(router.clone(), "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("icegate_test_total 1"),
+            "the encoded exposition must carry the registered counter, got: {body}"
+        );
+
+        let (status, _) = get_path(router, HEALTH_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// `enabled: false` governs the Prometheus endpoint alone, so the listener
+    /// still takes its port. A port already held by the test is what makes the
+    /// bind observable: a `run_operational_server` that returned early on the
+    /// flag would report success and leave the probes without `/health`.
+    #[tokio::test]
+    async fn the_operational_server_binds_its_port_with_metrics_disabled() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the test holds the port the server must fail to take");
+        let port = occupied.local_addr().expect("the bound address is known").port();
+
+        let config = OperationalConfig {
+            enabled: false,
+            host: "127.0.0.1".to_string(),
+            port,
+            ..OperationalConfig::default()
+        };
+
+        // Bounded: a server that did take the port would serve until cancelled.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_operational_server(config, None, CancellationToken::new()),
+        )
+        .await
+        .expect("the server must return rather than serve on a port it cannot bind");
+
+        assert!(matches!(outcome, Err(CommonError::Io(_))));
+    }
+
+    /// The host is validated outside the `enabled` branch, because the listener
+    /// binds in both cases: an empty host is a configuration error rather than a
+    /// failure to parse `":9091"` at startup.
+    #[test]
+    fn an_empty_host_is_refused_while_the_metrics_endpoint_is_disabled() {
+        let mut config = OperationalConfig::default();
+        assert!(!config.enabled, "the default leaves the metrics endpoint off");
+
+        // Baseline validates: the error below therefore comes from the host rule
+        // rather than from one of the rules the `enabled` branch holds.
+        config.validate().expect("the default operational config is valid");
+
+        config.host = String::new();
+
+        assert!(matches!(config.validate(), Err(CommonError::Config(_))));
+    }
 }
