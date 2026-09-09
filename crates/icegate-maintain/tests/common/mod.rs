@@ -138,11 +138,20 @@ pub async fn list_all_object_keys(conn: &StorageConn) -> Vec<String> {
 /// laid out in the caller's order. The `body` column is `msg-<unique>` so every
 /// row is globally distinguishable.
 pub fn logs_batch(rows: &[(&str, i64)], unique_offset: usize) -> RecordBatch {
+    logs_batch_for_tenant(TENANT, rows, unique_offset)
+}
+
+/// [`logs_batch`] for a caller-chosen tenant.
+///
+/// `tenant_id` is an identity partition column, so it decides the partition
+/// directory Iceberg writes the file under — which is what a caller testing
+/// path escaping needs to vary.
+pub fn logs_batch_for_tenant(tenant_id: &str, rows: &[(&str, i64)], unique_offset: usize) -> RecordBatch {
     let iceberg_schema = logs_schema().unwrap();
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).unwrap());
     let n = rows.len();
 
-    let tenant = StringArray::from(vec![TENANT; n]);
+    let tenant = StringArray::from(vec![tenant_id; n]);
     let service_name = StringArray::from(rows.iter().map(|(s, _)| Some(*s)).collect::<Vec<_>>());
     let ts: Vec<i64> = rows.iter().map(|(_, t)| *t).collect();
     let trace_vals: Vec<[u8; 16]> = (0..n).map(|i| [u8::try_from((unique_offset + i) % 256).unwrap(); 16]).collect();

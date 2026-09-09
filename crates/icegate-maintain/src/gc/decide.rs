@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use object_store::path::Path as ObjectPath;
-use url::Url;
 
 use crate::error::MaintainError;
 
@@ -12,23 +11,34 @@ use crate::error::MaintainError;
 ///
 /// Iceberg metadata records absolute URIs (`s3://bucket/icegate/logs/data/f.parquet`),
 /// while an object-store `list` yields bucket-relative keys
-/// (`icegate/logs/data/f.parquet`). Parsing the URI and taking its path component
-/// places both in the same key space, so the sweep can compare them directly
-/// (both as [`ObjectPath`], the type `list` already returns).
+/// (`icegate/logs/data/f.parquet`). Dropping the scheme and authority places both
+/// in the same key space, so the sweep can compare them directly (both as
+/// [`ObjectPath`], the type `list` already returns).
+///
+/// The strip is textual, and the remainder is keyed through [`ObjectPath::from`]
+/// — the same constructor a listed key arrives through — because the two must
+/// normalise one object identically or the sweep deletes a live file. What
+/// forbids percent-decoding here is that the escapes are not transport encoding:
+/// Iceberg escapes a partition value into the path it then writes to, so a
+/// `tenant_id` of `a:b` becomes the literal key `tenant_id=a%3Ab` and `%3A` is
+/// three characters of the object's name. Decoding it invents a key that no
+/// object has, and the miss reads as "unreferenced".
 ///
 /// # Errors
 ///
-/// Returns [`MaintainError::Storage`] if `uri` is not a valid absolute URL or its
-/// path is not a valid object key. Callers MUST treat this as fail-closed (delete
+/// Returns [`MaintainError::Storage`] if `uri` carries no `scheme://` or names no
+/// object under its authority. Callers MUST treat this as fail-closed (delete
 /// nothing): an unparseable referenced path could otherwise drop a live file.
 pub(crate) fn parse_object_key(uri: &str) -> Result<ObjectPath, MaintainError> {
-    let url =
-        Url::parse(uri).map_err(|e| MaintainError::Storage(format!("gc: malformed referenced URI '{uri}': {e}")))?;
-    // `url.path()` is the bucket-relative path with the scheme and authority
-    // (`s3://bucket`) already removed; `from_url_path` percent-decodes and
-    // validates it into an object key.
-    ObjectPath::from_url_path(url.path())
-        .map_err(|e| MaintainError::Storage(format!("gc: malformed referenced key '{uri}': {e}")))
+    let authority_and_key = uri
+        .split_once("://")
+        .map(|(_scheme, rest)| rest)
+        .ok_or_else(|| MaintainError::Storage(format!("gc: malformed referenced URI '{uri}': no scheme")))?;
+    let key = authority_and_key
+        .split_once('/')
+        .map(|(_authority, key)| key)
+        .ok_or_else(|| MaintainError::Storage(format!("gc: referenced URI '{uri}' names no object")))?;
+    Ok(ObjectPath::from(key))
 }
 
 /// Whether a swept object is a data file or an Iceberg metadata file.
@@ -117,6 +127,44 @@ mod tests {
             parse_object_key("s3://warehouse/icegate/logs/data/f.parquet").unwrap().as_ref(),
             "icegate/logs/data/f.parquet"
         );
+    }
+
+    /// The referenced set and the object listing MUST agree on the key of one
+    /// object. Iceberg percent-escapes partition values into the data-file path
+    /// (`form_urlencoded`, so a tenant id's `:` becomes `%3A`), while a listed
+    /// key reaches the sweep through `object_store`'s `Path`, whose encode set
+    /// contains `%`. The two therefore normalise the same object differently
+    /// unless the sweep keys both sides the same way -- and a disagreement here
+    /// deletes a live file, because the delete path decodes back to the real key.
+    #[test]
+    fn an_escaped_partition_value_keys_the_same_on_both_sides() {
+        // What Iceberg records in the manifest for a tenant id holding a colon.
+        let uri = "s3://warehouse/icegate/logs/data/tenant_id=a%3Ab/timestamp_day=2026-09-09/f.parquet";
+        // What `list` yields for that same object: the raw key, keyed through
+        // `Path::from` exactly as `object_store_opendal` does.
+        let listed = ObjectPath::from("icegate/logs/data/tenant_id=a%3Ab/timestamp_day=2026-09-09/f.parquet");
+
+        assert_eq!(
+            parse_object_key(uri).unwrap(),
+            listed,
+            "the referenced key and the listed key name the same object"
+        );
+    }
+
+    /// The consequence of the disagreement above, at the boundary that acts on
+    /// it: a live file of a colon-carrying tenant, old enough to be past the
+    /// grace period, must be kept.
+    #[test]
+    fn a_referenced_file_under_an_escaped_partition_is_kept() {
+        let uri = "s3://warehouse/icegate/logs/data/tenant_id=a%3Ab/timestamp_day=2026-09-09/f.parquet";
+        let set: HashSet<ObjectPath> = std::iter::once(parse_object_key(uri).unwrap()).collect();
+        let listed = ObjectPath::from("icegate/logs/data/tenant_id=a%3Ab/timestamp_day=2026-09-09/f.parquet");
+        let modified = Utc.timestamp_opt(1_000, 0).unwrap();
+        let cutoff = Utc.timestamp_opt(2_000, 0).unwrap();
+
+        let decision = Decision::classify(&listed, "icegate/logs", &set, modified, cutoff, true);
+
+        assert_eq!(decision, Decision::Referenced);
     }
 
     #[test]
