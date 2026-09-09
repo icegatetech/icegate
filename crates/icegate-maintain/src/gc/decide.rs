@@ -24,21 +24,47 @@ use crate::error::MaintainError;
 /// three characters of the object's name. Decoding it invents a key that no
 /// object has, and the miss reads as "unreferenced".
 ///
+/// Every component is required and must be non-empty: a URI missing one is a
+/// URI whose object key cannot be derived, and guessing one is what drops a live
+/// file. Rejecting an empty authority also refuses `file://` URIs, which is the
+/// wanted answer — a local store is rooted at the table directory, so its listed
+/// keys are relative to that root and could not be compared against these
+/// bucket-relative ones anyway.
+///
 /// # Errors
 ///
-/// Returns [`MaintainError::Storage`] if `uri` carries no `scheme://` or names no
-/// object under its authority. Callers MUST treat this as fail-closed (delete
-/// nothing): an unparseable referenced path could otherwise drop a live file.
+/// Returns [`MaintainError::Storage`] if `uri` carries no `scheme://`, or if its
+/// scheme, authority, or object key is empty. Callers MUST treat this as
+/// fail-closed (delete nothing): an unparseable referenced path could otherwise
+/// drop a live file.
 pub(crate) fn parse_object_key(uri: &str) -> Result<ObjectPath, MaintainError> {
-    let authority_and_key = uri
-        .split_once("://")
-        .map(|(_scheme, rest)| rest)
-        .ok_or_else(|| MaintainError::Storage(format!("gc: malformed referenced URI '{uri}': no scheme")))?;
-    let key = authority_and_key
+    let (scheme, authority_and_key) = uri.split_once("://").ok_or_else(|| refuse_uri(uri, "no scheme"))?;
+    if scheme.is_empty() {
+        return Err(refuse_uri(uri, "empty scheme"));
+    }
+    let (authority, key) = authority_and_key
         .split_once('/')
-        .map(|(_authority, key)| key)
-        .ok_or_else(|| MaintainError::Storage(format!("gc: referenced URI '{uri}' names no object")))?;
-    Ok(ObjectPath::from(key))
+        .ok_or_else(|| refuse_uri(uri, "names no object"))?;
+    if authority.is_empty() {
+        return Err(refuse_uri(uri, "empty authority"));
+    }
+    let key = ObjectPath::from(key);
+    // Emptiness of the RESULT is the invariant, not of the input: `ObjectPath::from`
+    // drops empty segments, so `/` and `//` survive a non-empty string check and
+    // still normalise away to a key that names nothing.
+    if key.as_ref().is_empty() {
+        return Err(refuse_uri(uri, "empty object key"));
+    }
+    Ok(key)
+}
+
+/// Refuse `uri` as unusable, naming the component at fault.
+///
+/// The component is named because the sweep stops on this error, and an operator
+/// reading the log has to tell a malformed manifest from a URI shape the parser
+/// does not yet admit.
+fn refuse_uri(uri: &str, reason: &str) -> MaintainError {
+    MaintainError::Storage(format!("gc: malformed referenced URI '{uri}': {reason}"))
 }
 
 /// Whether a swept object is a data file or an Iceberg metadata file.
@@ -167,14 +193,41 @@ mod tests {
         assert_eq!(decision, Decision::Referenced);
     }
 
+    /// Every shape whose object key cannot be derived, one rule: refuse it.
+    ///
+    /// The sweep must fail closed rather than silently mis-key a referenced file
+    /// — a key guessed from an incomplete URI names an object that may not be the
+    /// referenced one, and a referenced file missing from the set is a deleted
+    /// file. The last two cases are why the check is on the parsed key rather
+    /// than the input string: both are non-empty strings that normalise to no key.
     #[test]
-    fn parse_object_key_rejects_a_scheme_less_path() {
-        // A bare, scheme-less path is not a valid absolute URI; the sweep must
-        // fail closed rather than silently mis-key a referenced file.
-        assert!(matches!(
-            parse_object_key("icegate/logs/data/f.parquet"),
-            Err(MaintainError::Storage(_))
-        ));
+    fn a_uri_missing_any_component_is_refused() {
+        for uri in [
+            "icegate/logs/data/f.parquet", // no scheme at all
+            "://warehouse/key",            // empty scheme
+            "s3://warehouse",              // no object under the authority
+            "s3:///key",                   // empty authority (a `file://` URI lands here too)
+            "s3://warehouse/",             // empty object key
+            "s3://warehouse//",            // object key of separators only
+        ] {
+            assert!(
+                matches!(parse_object_key(uri), Err(MaintainError::Storage(_))),
+                "must refuse {uri:?}"
+            );
+        }
+    }
+
+    /// The refusal names the component at fault, not just the URI: the sweep
+    /// stops here, and "malformed" alone does not tell an operator whether the
+    /// manifest is corrupt or the parser is too narrow.
+    #[test]
+    fn a_refusal_names_the_component_at_fault() {
+        let error = parse_object_key("s3://warehouse/").expect_err("an empty object key is refused");
+
+        assert!(
+            error.to_string().contains("empty object key"),
+            "the faulting component is not named: {error}"
+        );
     }
 
     fn referenced(keys: &[&str]) -> HashSet<ObjectPath> {
