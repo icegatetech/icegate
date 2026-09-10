@@ -32,7 +32,7 @@ use super::parquet_reader;
 /// validation. Mirrors the discovery-side guard in
 /// [`super::labels::is_system_reserved`] — see that module for the
 /// rationale.
-fn is_system_reserved_value_column(name: &str) -> bool {
+const fn is_system_reserved_value_column(name: &str) -> bool {
     name.eq_ignore_ascii_case(COL_TENANT_ID)
 }
 
@@ -417,10 +417,8 @@ fn collect_coalesced_map_values_from_batch(
             Some(values) => collect_map_values_for_row(values, row, label_name, primary_config.normalize_keys, out)?,
             None => false,
         };
-        if !has_primary {
-            if let Some(values) = &fallback {
-                collect_map_values_for_row(values, row, label_name, fallback_config.normalize_keys, out)?;
-            }
+        if !has_primary && let Some(values) = &fallback {
+            collect_map_values_for_row(values, row, label_name, fallback_config.normalize_keys, out)?;
         }
     }
     Ok(())

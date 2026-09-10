@@ -540,29 +540,29 @@ impl<A: Access> LayeredAccess for PrefetchAccessor<A> {
             //    so the data is served from cache instead of a duplicate S3 hit.
             let range = args.range();
             let req_offset = range.offset();
-            if let Some(req_size) = range.size() {
-                if let Some(mut rx) = inner.tracker.find_overlap(&path, req_offset, req_size) {
-                    tracing::debug!(offset = req_offset, length = req_size, "Waiting for in-flight prefetch");
-                    let wait_start = Instant::now();
-                    // `watch` preserves state: if the prefetch already
-                    // completed, `wait_for` returns immediately.
-                    // Timeout guards against a prefetch task that panics or
-                    // is cancelled without sending completion.
-                    match tokio::time::timeout(INFLIGHT_WAIT_TIMEOUT, rx.wait_for(|&done| done)).await {
-                        Ok(Ok(_)) => {
-                            inner.metrics.record_inflight_wait(wait_start);
-                            tracing::debug!("In-flight prefetch complete, reading from cache");
-                        }
-                        Ok(Err(_)) | Err(_) => {
-                            // Sender dropped (task cancelled) or timeout.
-                            inner.metrics.record_inflight_wait(wait_start);
-                            tracing::warn!(
-                                offset = req_offset,
-                                length = req_size,
-                                elapsed_s = wait_start.elapsed().as_secs_f64(),
-                                "In-flight prefetch wait failed or timed out, proceeding with read"
-                            );
-                        }
+            if let Some(req_size) = range.size()
+                && let Some(mut rx) = inner.tracker.find_overlap(&path, req_offset, req_size)
+            {
+                tracing::debug!(offset = req_offset, length = req_size, "Waiting for in-flight prefetch");
+                let wait_start = Instant::now();
+                // `watch` preserves state: if the prefetch already
+                // completed, `wait_for` returns immediately.
+                // Timeout guards against a prefetch task that panics or
+                // is cancelled without sending completion.
+                match tokio::time::timeout(INFLIGHT_WAIT_TIMEOUT, rx.wait_for(|&done| done)).await {
+                    Ok(Ok(_)) => {
+                        inner.metrics.record_inflight_wait(wait_start);
+                        tracing::debug!("In-flight prefetch complete, reading from cache");
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // Sender dropped (task cancelled) or timeout.
+                        inner.metrics.record_inflight_wait(wait_start);
+                        tracing::warn!(
+                            offset = req_offset,
+                            length = req_size,
+                            elapsed_s = wait_start.elapsed().as_secs_f64(),
+                            "In-flight prefetch wait failed or timed out, proceeding with read"
+                        );
                     }
                 }
             }
@@ -967,22 +967,22 @@ fn compute_prefetch_ranges(
             }
 
             // Dictionary page: offset is optional, length = data_page_offset - dict_offset.
-            if config.prefetch_dictionary_pages {
-                if let Some(dict_off) = col.dictionary_page_offset() {
-                    let data_off = col.data_page_offset();
-                    if dict_off > 0 && dict_off < data_off {
-                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                        let len = (data_off - dict_off) as usize;
-                        if total_bytes + len > config.max_prefetch_bytes {
-                            return (ranges, summary);
-                        }
-                        #[allow(clippy::cast_sign_loss)]
-                        {
-                            ranges.push((dict_off as u64, len as u64));
-                        }
-                        total_bytes += len;
-                        summary.dictionary_pages += 1;
+            if config.prefetch_dictionary_pages
+                && let Some(dict_off) = col.dictionary_page_offset()
+            {
+                let data_off = col.data_page_offset();
+                if dict_off > 0 && dict_off < data_off {
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let len = (data_off - dict_off) as usize;
+                    if total_bytes + len > config.max_prefetch_bytes {
+                        return (ranges, summary);
                     }
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        ranges.push((dict_off as u64, len as u64));
+                    }
+                    total_bytes += len;
+                    summary.dictionary_pages += 1;
                 }
             }
 

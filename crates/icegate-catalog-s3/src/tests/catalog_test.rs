@@ -157,10 +157,10 @@ impl CatalogStorage for ConflictOnSaveStorage {
         match guard.as_ref() {
             Some((root, version)) => {
                 let etag = version.to_string();
-                if let Some(Version::Etag(provided)) = known {
-                    if provided == &etag {
-                        return Ok(LoadOutcome::NotModified);
-                    }
+                if let Some(Version::Etag(provided)) = known
+                    && provided == &etag
+                {
+                    return Ok(LoadOutcome::NotModified);
                 }
                 Ok(LoadOutcome::Loaded {
                     root: Arc::clone(root),

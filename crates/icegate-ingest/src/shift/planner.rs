@@ -540,10 +540,8 @@ fn bin_pack(clusters: Vec<Cluster>, limits: &PlannerConfig) -> Result<(Vec<Plann
                 || chunk.total_bytes.saturating_add(cluster.total_bytes) > limits.upper_bound_bytes
                 || chunk.row_groups.len().saturating_add(cluster_count) > limits.max_row_groups
         });
-        if must_flush {
-            if let Some(chunk) = current.take() {
-                chunks.push(chunk);
-            }
+        if must_flush && let Some(chunk) = current.take() {
+            chunks.push(chunk);
         }
 
         let chunk = current.get_or_insert_with(|| PlannedChunk {

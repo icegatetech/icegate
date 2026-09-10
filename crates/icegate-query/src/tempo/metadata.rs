@@ -466,12 +466,11 @@ pub async fn list_tag_values_v2(
     // actually present in the window — empty result is intentional
     // (e.g. no `error` rows in the window means no `error` in the
     // dropdown).
-    if let TagRef::Intrinsic(name) = TagRef::parse(tag_name) {
-        if let Some(values) =
+    if let TagRef::Intrinsic(name) = TagRef::parse(tag_name)
+        && let Some(values) =
             enum_intrinsic_values_dynamic(state, tenant_id, name, start, end, extra_predicate.clone()).await?
-        {
-            return Ok(values.into_iter().take(limit).collect());
-        }
+    {
+        return Ok(values.into_iter().take(limit).collect());
     }
 
     let strings = list_tag_values(state, tenant_id, tag_name, start, end, limit, extra_predicate).await?;

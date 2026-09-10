@@ -121,10 +121,10 @@ pub struct TracingGuard {
 
 impl Drop for TracingGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.provider.take() {
-            if let Err(e) = provider.shutdown() {
-                tracing::error!("Failed to shutdown tracer provider: {e}");
-            }
+        if let Some(provider) = self.provider.take()
+            && let Err(e) = provider.shutdown()
+        {
+            tracing::error!("Failed to shutdown tracer provider: {e}");
         }
     }
 }

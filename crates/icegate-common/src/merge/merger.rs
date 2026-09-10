@@ -54,7 +54,7 @@ impl MergeHeap {
         Self { cursors: Vec::new() }
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.cursors.is_empty()
     }
 
@@ -386,10 +386,10 @@ where
     ///
     /// Returns an error if opening or reading the first cluster fails.
     pub async fn prefetch_first_group(&mut self) -> Result<()> {
-        if self.prefetched_batches.is_empty() {
-            if let Some(batch) = self.next_group_inner().await? {
-                self.prefetched_batches.push_back(batch);
-            }
+        if self.prefetched_batches.is_empty()
+            && let Some(batch) = self.next_group_inner().await?
+        {
+            self.prefetched_batches.push_back(batch);
         }
         Ok(())
     }
@@ -448,7 +448,11 @@ where
 
             // Repeatedly take the smallest next row across active streams.
             while self.merge_interleave_indices.len() < self.config.row_group_size {
-                if self.merge_interleave_indices.len() % MERGE_CANCEL_CHECK_INTERVAL_ROWS == 0 {
+                if self
+                    .merge_interleave_indices
+                    .len()
+                    .is_multiple_of(MERGE_CANCEL_CHECK_INTERVAL_ROWS)
+                {
                     self.check_cancelled()?;
                 }
                 let Some(cursor) = ({

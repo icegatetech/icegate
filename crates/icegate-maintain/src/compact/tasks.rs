@@ -347,10 +347,10 @@ impl TaskExecutor for CompactManifestRunner {
 /// no context (tracing disabled) or the traceparent is unparseable, since a task
 /// must never fail over telemetry.
 fn link_planning_span(trace_context: Option<&str>) {
-    if let Some(traceparent) = trace_context {
-        if !icegate_common::add_span_link(traceparent) {
-            tracing::debug!(traceparent, "compaction task carries an invalid plan traceparent");
-        }
+    if let Some(traceparent) = trace_context
+        && !icegate_common::add_span_link(traceparent)
+    {
+        tracing::debug!(traceparent, "compaction task carries an invalid plan traceparent");
     }
 }
 
