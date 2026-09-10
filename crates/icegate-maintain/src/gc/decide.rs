@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use object_store::path::Path as ObjectPath;
-use url::Url;
 
 use crate::error::MaintainError;
 
@@ -12,23 +11,60 @@ use crate::error::MaintainError;
 ///
 /// Iceberg metadata records absolute URIs (`s3://bucket/icegate/logs/data/f.parquet`),
 /// while an object-store `list` yields bucket-relative keys
-/// (`icegate/logs/data/f.parquet`). Parsing the URI and taking its path component
-/// places both in the same key space, so the sweep can compare them directly
-/// (both as [`ObjectPath`], the type `list` already returns).
+/// (`icegate/logs/data/f.parquet`). Dropping the scheme and authority places both
+/// in the same key space, so the sweep can compare them directly (both as
+/// [`ObjectPath`], the type `list` already returns).
+///
+/// The strip is textual, and the remainder is keyed through [`ObjectPath::from`]
+/// — the same constructor a listed key arrives through — because the two must
+/// normalise one object identically or the sweep deletes a live file. What
+/// forbids percent-decoding here is that the escapes are not transport encoding:
+/// Iceberg escapes a partition value into the path it then writes to, so a
+/// `tenant_id` of `a:b` becomes the literal key `tenant_id=a%3Ab` and `%3A` is
+/// three characters of the object's name. Decoding it invents a key that no
+/// object has, and the miss reads as "unreferenced".
+///
+/// Every component is required and must be non-empty: a URI missing one is a
+/// URI whose object key cannot be derived, and guessing one is what drops a live
+/// file. Rejecting an empty authority also refuses `file://` URIs, which is the
+/// wanted answer — a local store is rooted at the table directory, so its listed
+/// keys are relative to that root and could not be compared against these
+/// bucket-relative ones anyway.
 ///
 /// # Errors
 ///
-/// Returns [`MaintainError::Storage`] if `uri` is not a valid absolute URL or its
-/// path is not a valid object key. Callers MUST treat this as fail-closed (delete
-/// nothing): an unparseable referenced path could otherwise drop a live file.
+/// Returns [`MaintainError::Storage`] if `uri` carries no `scheme://`, or if its
+/// scheme, authority, or object key is empty. Callers MUST treat this as
+/// fail-closed (delete nothing): an unparseable referenced path could otherwise
+/// drop a live file.
 pub(crate) fn parse_object_key(uri: &str) -> Result<ObjectPath, MaintainError> {
-    let url =
-        Url::parse(uri).map_err(|e| MaintainError::Storage(format!("gc: malformed referenced URI '{uri}': {e}")))?;
-    // `url.path()` is the bucket-relative path with the scheme and authority
-    // (`s3://bucket`) already removed; `from_url_path` percent-decodes and
-    // validates it into an object key.
-    ObjectPath::from_url_path(url.path())
-        .map_err(|e| MaintainError::Storage(format!("gc: malformed referenced key '{uri}': {e}")))
+    let (scheme, authority_and_key) = uri.split_once("://").ok_or_else(|| refuse_uri(uri, "no scheme"))?;
+    if scheme.is_empty() {
+        return Err(refuse_uri(uri, "empty scheme"));
+    }
+    let (authority, key) = authority_and_key
+        .split_once('/')
+        .ok_or_else(|| refuse_uri(uri, "names no object"))?;
+    if authority.is_empty() {
+        return Err(refuse_uri(uri, "empty authority"));
+    }
+    let key = ObjectPath::from(key);
+    // Emptiness of the RESULT is the invariant, not of the input: `ObjectPath::from`
+    // drops empty segments, so `/` and `//` survive a non-empty string check and
+    // still normalise away to a key that names nothing.
+    if key.as_ref().is_empty() {
+        return Err(refuse_uri(uri, "empty object key"));
+    }
+    Ok(key)
+}
+
+/// Refuse `uri` as unusable, naming the component at fault.
+///
+/// The component is named because the sweep stops on this error, and an operator
+/// reading the log has to tell a malformed manifest from a URI shape the parser
+/// does not yet admit.
+fn refuse_uri(uri: &str, reason: &str) -> MaintainError {
+    MaintainError::Storage(format!("gc: malformed referenced URI '{uri}': {reason}"))
 }
 
 /// Whether a swept object is a data file or an Iceberg metadata file.
@@ -119,14 +155,79 @@ mod tests {
         );
     }
 
+    /// The referenced set and the object listing MUST agree on the key of one
+    /// object. Iceberg percent-escapes partition values into the data-file path
+    /// (`form_urlencoded`, so a tenant id's `:` becomes `%3A`), while a listed
+    /// key reaches the sweep through `object_store`'s `Path`, whose encode set
+    /// contains `%`. The two therefore normalise the same object differently
+    /// unless the sweep keys both sides the same way -- and a disagreement here
+    /// deletes a live file, because the delete path decodes back to the real key.
     #[test]
-    fn parse_object_key_rejects_a_scheme_less_path() {
-        // A bare, scheme-less path is not a valid absolute URI; the sweep must
-        // fail closed rather than silently mis-key a referenced file.
-        assert!(matches!(
-            parse_object_key("icegate/logs/data/f.parquet"),
-            Err(MaintainError::Storage(_))
-        ));
+    fn an_escaped_partition_value_keys_the_same_on_both_sides() {
+        // What Iceberg records in the manifest for a tenant id holding a colon.
+        let uri = "s3://warehouse/icegate/logs/data/tenant_id=a%3Ab/timestamp_day=2026-09-09/f.parquet";
+        // What `list` yields for that same object: the raw key, keyed through
+        // `Path::from` exactly as `object_store_opendal` does.
+        let listed = ObjectPath::from("icegate/logs/data/tenant_id=a%3Ab/timestamp_day=2026-09-09/f.parquet");
+
+        assert_eq!(
+            parse_object_key(uri).unwrap(),
+            listed,
+            "the referenced key and the listed key name the same object"
+        );
+    }
+
+    /// The consequence of the disagreement above, at the boundary that acts on
+    /// it: a live file of a colon-carrying tenant, old enough to be past the
+    /// grace period, must be kept.
+    #[test]
+    fn a_referenced_file_under_an_escaped_partition_is_kept() {
+        let uri = "s3://warehouse/icegate/logs/data/tenant_id=a%3Ab/timestamp_day=2026-09-09/f.parquet";
+        let set: HashSet<ObjectPath> = std::iter::once(parse_object_key(uri).unwrap()).collect();
+        let listed = ObjectPath::from("icegate/logs/data/tenant_id=a%3Ab/timestamp_day=2026-09-09/f.parquet");
+        let modified = Utc.timestamp_opt(1_000, 0).unwrap();
+        let cutoff = Utc.timestamp_opt(2_000, 0).unwrap();
+
+        let decision = Decision::classify(&listed, "icegate/logs", &set, modified, cutoff, true);
+
+        assert_eq!(decision, Decision::Referenced);
+    }
+
+    /// Every shape whose object key cannot be derived, one rule: refuse it.
+    ///
+    /// The sweep must fail closed rather than silently mis-key a referenced file
+    /// — a key guessed from an incomplete URI names an object that may not be the
+    /// referenced one, and a referenced file missing from the set is a deleted
+    /// file. The last two cases are why the check is on the parsed key rather
+    /// than the input string: both are non-empty strings that normalise to no key.
+    #[test]
+    fn a_uri_missing_any_component_is_refused() {
+        for uri in [
+            "icegate/logs/data/f.parquet", // no scheme at all
+            "://warehouse/key",            // empty scheme
+            "s3://warehouse",              // no object under the authority
+            "s3:///key",                   // empty authority (a `file://` URI lands here too)
+            "s3://warehouse/",             // empty object key
+            "s3://warehouse//",            // object key of separators only
+        ] {
+            assert!(
+                matches!(parse_object_key(uri), Err(MaintainError::Storage(_))),
+                "must refuse {uri:?}"
+            );
+        }
+    }
+
+    /// The refusal names the component at fault, not just the URI: the sweep
+    /// stops here, and "malformed" alone does not tell an operator whether the
+    /// manifest is corrupt or the parser is too narrow.
+    #[test]
+    fn a_refusal_names_the_component_at_fault() {
+        let error = parse_object_key("s3://warehouse/").expect_err("an empty object key is refused");
+
+        assert!(
+            error.to_string().contains("empty object key"),
+            "the faulting component is not named: {error}"
+        );
     }
 
     fn referenced(keys: &[&str]) -> HashSet<ObjectPath> {
