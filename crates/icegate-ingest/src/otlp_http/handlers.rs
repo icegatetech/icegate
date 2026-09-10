@@ -46,7 +46,7 @@ const STATUS_OK: &str = "ok";
 /// Extract tenant ID from HTTP headers.
 ///
 /// Returns `Some(tenant_id)` if the `x-scope-orgid` header is present and
-/// contains a valid value (non-empty, ASCII alphanumeric/hyphens/underscores).
+/// contains a valid value (non-empty, ASCII alphanumeric/hyphens/underscores/colons).
 /// Returns `None` otherwise, which falls back to `DEFAULT_TENANT_ID` downstream.
 fn extract_tenant_id(headers: &HeaderMap) -> Option<String> {
     headers
