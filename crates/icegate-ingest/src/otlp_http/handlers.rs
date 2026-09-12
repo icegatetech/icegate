@@ -6,18 +6,17 @@ use std::time::Instant;
 use axum::{
     Json,
     body::Bytes,
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, header::CONTENT_TYPE},
-    response::IntoResponse,
 };
-use icegate_common::{TENANT_ID_HEADER, is_valid_tenant_id};
+use icegate_common::TenantId;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use super::{
     error::{OtlpError, OtlpResult},
     models::{
-        ExportLogsResponse, ExportMetricsResponse, ExportTracesResponse, HealthResponse, HealthStatus,
-        LogsPartialSuccess, MetricsPartialSuccess, TracesPartialSuccess,
+        ExportLogsResponse, ExportMetricsResponse, ExportTracesResponse, LogsPartialSuccess, MetricsPartialSuccess,
+        TracesPartialSuccess,
     },
     server::OtlpHttpState,
 };
@@ -37,24 +36,11 @@ const CONTENT_TYPE_JSON: &str = "application/json";
 /// `spawn_blocking` hand-off would cost more than the decode itself (GH-158).
 const DECODE_OFFLOAD_THRESHOLD_BYTES: usize = 64 * 1024;
 
-const SIGNAL_LOGS: &str = "logs";
-const SIGNAL_TRACES: &str = "traces";
+pub(super) const SIGNAL_LOGS: &str = "logs";
+pub(super) const SIGNAL_TRACES: &str = "traces";
 const SIGNAL_OPERATIONS: &str = "operations";
-const PROTOCOL_HTTP: &str = "http";
+pub(super) const PROTOCOL_HTTP: &str = "http";
 const STATUS_OK: &str = "ok";
-
-/// Extract tenant ID from HTTP headers.
-///
-/// Returns `Some(tenant_id)` if the `x-scope-orgid` header is present and
-/// contains a valid value (non-empty, ASCII alphanumeric/hyphens/underscores/colons).
-/// Returns `None` otherwise, which falls back to `DEFAULT_TENANT_ID` downstream.
-fn extract_tenant_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(TENANT_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| is_valid_tenant_id(s))
-        .map(String::from)
-}
 
 /// Handle OTLP logs ingestion.
 ///
@@ -64,9 +50,13 @@ fn extract_tenant_id(headers: &HeaderMap) -> Option<String> {
 ///
 /// Transforms OTLP log records to Arrow `RecordBatch` and writes to the WAL
 /// queue.
-#[tracing::instrument(skip(state, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_LOGS))]
+///
+/// The tenant comes from the request extensions, where the tenant layer put it;
+/// a request that reaches a handler has already been resolved.
+#[tracing::instrument(skip(state, tenant, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_LOGS))]
 pub async fn ingest_logs(
     State(state): State<OtlpHttpState>,
+    Extension(tenant): Extension<TenantId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> OtlpResult<Json<ExportLogsResponse>> {
@@ -85,14 +75,12 @@ pub async fn ingest_logs(
         .await
         .map_err(OtlpError::from)?;
 
-    let tenant_id = extract_tenant_id(&headers);
-
     // Transform OTLP logs to Arrow RecordBatch (offload to blocking thread)
     let span = tracing::Span::current();
     let transform_start = Instant::now();
     let batch = tokio::task::spawn_blocking(move || {
         // TODO(med): Add a check - if the request size is not large, then we do not go into a separate thread. With small volumes, the overhead on the stream will not cover the costs.
-        span.in_scope(|| transform::logs_to_record_batch(&export_request, tenant_id.as_deref()))
+        span.in_scope(|| transform::logs_to_record_batch(&export_request, &tenant))
     })
     .await??;
     request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_LOGS, STATUS_OK);
@@ -169,9 +157,10 @@ where
 /// Transforms OTLP spans to Arrow `RecordBatch` and writes to the WAL queue.
 /// Transform-time drops (invalid `trace_id`/`span_id`) surface as
 /// `partial_success.rejected_spans`.
-#[tracing::instrument(skip(state, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_TRACES))]
+#[tracing::instrument(skip(state, tenant, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_TRACES))]
 pub async fn ingest_traces(
     State(state): State<OtlpHttpState>,
+    Extension(tenant): Extension<TenantId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> OtlpResult<Json<ExportTracesResponse>> {
@@ -192,7 +181,6 @@ pub async fn ingest_traces(
         .await
         .map_err(OtlpError::from)?;
 
-    let tenant_id = extract_tenant_id(&headers);
     // Shared across the two parallel transform tasks; the decoded request is owned
     // plain data (`Send + Sync`), so the `Arc` clone is cheap (no deep copy).
     let export_request = Arc::new(export_request);
@@ -206,7 +194,7 @@ pub async fn ingest_traces(
     let span = tracing::Span::current();
     let spans_task = tokio::task::spawn_blocking({
         let export_request = Arc::clone(&export_request);
-        let tenant_id = tenant_id.clone();
+        let tenant = tenant.clone();
         let span = span.clone();
         move || {
             // Time the spans transform inside its own blocking task so the traces
@@ -214,7 +202,7 @@ pub async fn ingest_traces(
             // `elapsed()` after the `join!` below would inflate it with the
             // parallel operations transform (and join scheduling).
             let transform_start = Instant::now();
-            let result = span.in_scope(|| transform::spans_to_record_batch(&export_request, tenant_id.as_deref()));
+            let result = span.in_scope(|| transform::spans_to_record_batch(&export_request, &tenant));
             (result, transform_start.elapsed())
         }
     });
@@ -225,7 +213,7 @@ pub async fn ingest_traces(
         let operations_task = tokio::task::spawn_blocking({
             let export_request = Arc::clone(&export_request);
             let span = span.clone();
-            move || span.in_scope(|| transform::operations_to_record_batch(&export_request, tenant_id.as_deref()))
+            move || span.in_scope(|| transform::operations_to_record_batch(&export_request, &tenant))
         });
         let (spans_join, operations_join) = tokio::join!(spans_task, operations_task);
         // Operations transform is best-effort: a panic degrades to a logged
@@ -267,7 +255,7 @@ pub async fn ingest_traces(
     }))
 }
 
-const SIGNAL_METRICS: &str = "metrics";
+pub(super) const SIGNAL_METRICS: &str = "metrics";
 
 /// Handle OTLP metrics ingestion.
 ///
@@ -275,9 +263,10 @@ const SIGNAL_METRICS: &str = "metrics";
 /// metric data points to an Arrow `RecordBatch` and writes to the WAL queue.
 /// Strict-conformance transform drops surface as
 /// `partial_success.rejected_data_points`.
-#[tracing::instrument(skip(state, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_METRICS))]
+#[tracing::instrument(skip(state, tenant, headers, body), fields(protocol = PROTOCOL_HTTP, signal = SIGNAL_METRICS))]
 pub async fn ingest_metrics(
     State(state): State<OtlpHttpState>,
+    Extension(tenant): Extension<TenantId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> OtlpResult<Json<ExportMetricsResponse>> {
@@ -297,12 +286,10 @@ pub async fn ingest_metrics(
         .await
         .map_err(OtlpError::from)?;
 
-    let tenant_id = extract_tenant_id(&headers);
-
     let span = tracing::Span::current();
     let transform_start = Instant::now();
     let (batch_opt, drops) = tokio::task::spawn_blocking(move || {
-        span.in_scope(|| transform::metrics_to_record_batch(&export_request, tenant_id.as_deref()))
+        span.in_scope(|| transform::metrics_to_record_batch(&export_request, &tenant))
     })
     .await??;
     request_metrics.record_transform_duration(transform_start.elapsed(), SIGNAL_METRICS, STATUS_OK);
@@ -323,13 +310,6 @@ pub async fn ingest_metrics(
             error_message: Some(message),
         }),
     }))
-}
-
-/// Health check endpoint.
-pub async fn health() -> impl IntoResponse {
-    Json(HealthResponse {
-        status: HealthStatus::Healthy,
-    })
 }
 
 /// Resolve OTLP encoding from Content-Type.
@@ -401,6 +381,13 @@ mod tests {
         Bytes::from(create_test_request().encode_to_vec())
     }
 
+    /// The tenant extension the layer would have installed. Handlers are called
+    /// directly here, so the extension is supplied by hand; the layer's own
+    /// behaviour is covered in `routes.rs`.
+    fn test_tenant() -> Extension<TenantId> {
+        Extension(TenantId::new("test-tenant").expect("a valid tenant identifier"))
+    }
+
     fn test_state(write_channel: icegate_queue::WriteChannel) -> OtlpHttpState {
         OtlpHttpState {
             write_channel,
@@ -434,33 +421,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_extract_tenant_id_present() {
-        let mut headers = HeaderMap::new();
-        headers.insert(TENANT_ID_HEADER, "my-tenant".parse().unwrap());
-        assert_eq!(extract_tenant_id(&headers), Some("my-tenant".to_string()));
-    }
-
-    #[test]
-    fn test_extract_tenant_id_missing() {
-        let headers = HeaderMap::new();
-        assert_eq!(extract_tenant_id(&headers), None);
-    }
-
-    #[test]
-    fn test_extract_tenant_id_empty() {
-        let mut headers = HeaderMap::new();
-        headers.insert(TENANT_ID_HEADER, "".parse().unwrap());
-        assert_eq!(extract_tenant_id(&headers), None);
-    }
-
-    #[test]
-    fn test_extract_tenant_id_invalid_chars() {
-        let mut headers = HeaderMap::new();
-        headers.insert(TENANT_ID_HEADER, "bad/tenant".parse().unwrap());
-        assert_eq!(extract_tenant_id(&headers), None);
-    }
-
     #[tokio::test]
     async fn ingest_logs_returns_success_on_full_wal_ack() {
         let (tx, mut rx) = channel(1);
@@ -477,9 +437,14 @@ mod tests {
                 .expect("send wal ack");
         });
 
-        let response = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request())
-            .await
-            .expect("http response");
+        let response = ingest_logs(
+            State(test_state(tx)),
+            test_tenant(),
+            HeaderMap::new(),
+            encode_protobuf_request(),
+        )
+        .await
+        .expect("http response");
         writer.await.expect("writer task");
 
         assert!(response.0.partial_success.is_none());
@@ -496,9 +461,14 @@ mod tests {
                 .expect("send wal ack");
         });
 
-        let response = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request())
-            .await
-            .expect("http response");
+        let response = ingest_logs(
+            State(test_state(tx)),
+            test_tenant(),
+            HeaderMap::new(),
+            encode_protobuf_request(),
+        )
+        .await
+        .expect("http response");
         writer.await.expect("writer task");
 
         let partial = response.0.partial_success.expect("partial success");
@@ -512,7 +482,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "text/plain".parse().expect("content type"));
 
-        let result = ingest_logs(State(test_state(tx)), headers, Bytes::from_static(b"invalid")).await;
+        let result = ingest_logs(
+            State(test_state(tx)),
+            test_tenant(),
+            headers,
+            Bytes::from_static(b"invalid"),
+        )
+        .await;
         assert!(result.is_err());
         assert!(rx.try_recv().is_err());
     }
@@ -522,7 +498,13 @@ mod tests {
         let (tx, rx) = channel(1);
         drop(rx);
 
-        let result = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request()).await;
+        let result = ingest_logs(
+            State(test_state(tx)),
+            test_tenant(),
+            HeaderMap::new(),
+            encode_protobuf_request(),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -536,7 +518,7 @@ mod tests {
             metrics: OtlpMetrics::new_disabled(),
         };
 
-        let result = ingest_logs(State(state), HeaderMap::new(), encode_protobuf_request()).await;
+        let result = ingest_logs(State(state), test_tenant(), HeaderMap::new(), encode_protobuf_request()).await;
         assert!(result.is_err());
         assert!(rx.try_recv().is_err());
     }
@@ -585,7 +567,7 @@ mod tests {
         });
 
         let body = Bytes::from(request.encode_to_vec());
-        let response = ingest_traces(State(test_state(tx)), HeaderMap::new(), body)
+        let response = ingest_traces(State(test_state(tx)), test_tenant(), HeaderMap::new(), body)
             .await
             .expect("http ok");
         writer.await.expect("writer");
@@ -656,7 +638,7 @@ mod tests {
         });
 
         let body = Bytes::from(request.encode_to_vec());
-        let response = ingest_traces(State(test_state(tx)), HeaderMap::new(), body)
+        let response = ingest_traces(State(test_state(tx)), test_tenant(), HeaderMap::new(), body)
             .await
             .expect("http ok");
         writer.await.expect("writer");
@@ -739,7 +721,7 @@ mod tests {
         });
 
         let body = Bytes::from(metrics_gauge_request().encode_to_vec());
-        let response = ingest_metrics(State(test_state(tx)), HeaderMap::new(), body)
+        let response = ingest_metrics(State(test_state(tx)), test_tenant(), HeaderMap::new(), body)
             .await
             .expect("http response");
         writer.await.expect("writer task");
@@ -756,7 +738,7 @@ mod tests {
         });
 
         let body = Bytes::from(metrics_mixed_request().encode_to_vec());
-        let response = ingest_metrics(State(test_state(tx)), HeaderMap::new(), body)
+        let response = ingest_metrics(State(test_state(tx)), test_tenant(), HeaderMap::new(), body)
             .await
             .expect("http response");
         writer.await.expect("writer task");
@@ -769,7 +751,7 @@ mod tests {
         let (tx, rx) = channel(1);
         drop(rx);
         let body = Bytes::from(metrics_gauge_request().encode_to_vec());
-        let result = ingest_metrics(State(test_state(tx)), HeaderMap::new(), body).await;
+        let result = ingest_metrics(State(test_state(tx)), test_tenant(), HeaderMap::new(), body).await;
         assert!(result.is_err());
     }
 
@@ -864,7 +846,7 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF.parse().expect("content type"));
 
-        let response = ingest_traces(State(state), headers, axum::body::Bytes::from(body))
+        let response = ingest_traces(State(state), test_tenant(), headers, axum::body::Bytes::from(body))
             .await
             .expect("traces response must be OK even when operations write fails");
         writer.await.expect("writer task");
@@ -902,7 +884,7 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF.parse().expect("content type"));
 
-        let response = ingest_traces(State(state), headers, axum::body::Bytes::from(body))
+        let response = ingest_traces(State(state), test_tenant(), headers, axum::body::Bytes::from(body))
             .await
             .expect("traces response ok");
         let spans_rows = writer.await.expect("writer task");
@@ -928,7 +910,7 @@ mod tests {
             axum::http::HeaderValue::from_static("application/json"),
         );
         let body = Bytes::from(serde_json::to_vec(&metrics_gauge_request()).expect("encode json"));
-        let response = ingest_metrics(State(test_state(tx)), headers, body)
+        let response = ingest_metrics(State(test_state(tx)), test_tenant(), headers, body)
             .await
             .expect("http response");
         writer.await.expect("writer task");
@@ -989,7 +971,7 @@ mod tests {
             rows
         });
 
-        let response = ingest_logs(State(test_state(tx)), HeaderMap::new(), body)
+        let response = ingest_logs(State(test_state(tx)), test_tenant(), HeaderMap::new(), body)
             .await
             .expect("http ok");
         let rows = writer.await.expect("writer task");
@@ -1013,7 +995,13 @@ mod tests {
         })
         .expect("prefill channel slot");
 
-        let result = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request()).await;
+        let result = ingest_logs(
+            State(test_state(tx)),
+            test_tenant(),
+            HeaderMap::new(),
+            encode_protobuf_request(),
+        )
+        .await;
 
         assert!(matches!(result, Err(OtlpError(IngestError::QueueFull))));
     }
@@ -1027,7 +1015,13 @@ mod tests {
         // error rather than the timeout under test).
         let (tx, _rx) = channel(1);
 
-        let result = ingest_logs(State(test_state(tx)), HeaderMap::new(), encode_protobuf_request()).await;
+        let result = ingest_logs(
+            State(test_state(tx)),
+            test_tenant(),
+            HeaderMap::new(),
+            encode_protobuf_request(),
+        )
+        .await;
 
         assert!(matches!(result, Err(OtlpError(IngestError::AckTimeout))));
     }

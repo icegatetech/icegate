@@ -1,0 +1,75 @@
+name: Deploy Config
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'config/helm/**'
+      # all `config/docker` read by make helm-envoy-test; auth-proxy/** also by make authproxy-test
+      - 'config/docker/auth-proxy/**'
+      - 'config/docker/docker-compose.proxy.yml'
+      # the loopback ports helm-envoy-test compares against auth-proxy/envoy.yaml
+      - 'config/docker/ingest-proxy.yaml'
+      - 'scripts/authproxy-test.sh'
+      - 'Makefile'
+      - '.github/workflows/deploy-config.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'config/helm/**'
+      # all `config/docker` read by make helm-envoy-test; auth-proxy/** also by make authproxy-test
+      - 'config/docker/auth-proxy/**'
+      - 'config/docker/docker-compose.proxy.yml'
+      # the loopback ports helm-envoy-test compares against auth-proxy/envoy.yaml
+      - 'config/docker/ingest-proxy.yaml'
+      - 'scripts/authproxy-test.sh'
+      - 'Makefile'
+      - '.github/workflows/deploy-config.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-config:
+    name: Deploy Config
+    runs-on: ubuntu-latest
+    # The two auth-proxy steps pull the Envoy image and run containers, so this
+    # job can hang on a registry or a container that never becomes ready. Without
+    # a limit it would hold the runner for the 360-minute default.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v4.1.0
+
+      - name: Install helm-docs
+        run: scripts/install-helm-docs.sh
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Lint chart
+        run: helm lint config/helm/icegate
+
+      - name: Template chart
+        run: make helm-template
+
+      - name: Template catalog server
+        run: make helm-catalog-test
+
+      - name: Template REST backend guard
+        run: make helm-rest-uri-test
+
+      - name: Template tenant policy and auth proxy guards
+        run: make helm-tenant-test
+
+      - name: Validate the proxy configuration with Envoy
+        run: make helm-envoy-test
+
+      - name: Check the proxy rules end to end
+        run: make authproxy-test
+
+      - name: Check Artifact Hub metadata
+        run: make helm-metadata-test

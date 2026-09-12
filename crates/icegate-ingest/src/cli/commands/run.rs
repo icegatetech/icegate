@@ -19,7 +19,8 @@ use icegate_common::{
         LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, METRICS_BLOOM_COLUMNS, METRICS_COLUMN_ENCODINGS,
         OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS, SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
     },
-    run_metrics_server,
+    run_operational_server,
+    tenant::TenantResolver,
 };
 use icegate_queue::{
     CommittedOffsetsByTopic, NoopQueueWriterEvents, ParquetQueueReader, QueueConfig, QueueWriter, channel,
@@ -36,6 +37,8 @@ use crate::{
         ObjectStoreMetricsDecorator, OtlpMetrics, QueueReaderS3Metrics, QueueWriterS3Metrics, ShiftMetrics,
         WalWriterMetrics,
     },
+    otlp_grpc::OtlpGrpcService,
+    otlp_http::OtlpHttpState,
     runtime_threads::compute_runtime_threads,
     shift::{ShiftJobSpec, Shifter},
     wal::SortColumnsDescriptor,
@@ -409,6 +412,12 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
     tracing::info!("Loading configuration from {:?}", config_path);
     tracing::info!("Configuration loaded successfully");
 
+    // Built once, before any receiver starts: the single-tenant identifier is
+    // parsed here rather than on every request, and an unusable policy stops the
+    // process instead of reaching the first exporter.
+    let tenant_resolver = config.tenant.clone().into_resolver()?;
+    tracing::info!(mode = tenant_resolver.mode(), "Tenant policy resolved");
+
     // Initialize metrics early so that the global meter provider is available
     // for OpenDAL's OtelMetricsLayer and Iceberg's IceGateStorageFactory.
     let metrics_runtime = if config.metrics.enabled {
@@ -433,6 +442,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         queue_config,
         write_tx,
         write_rx,
+        tenant_resolver,
     )
     .await;
 
@@ -459,6 +469,7 @@ async fn run_services(
     queue_config: QueueConfig,
     write_tx: icegate_queue::WriteChannel,
     write_rx: icegate_queue::WriteReceiver,
+    tenant_resolver: TenantResolver,
 ) -> Result<()> {
     if let (Some(cache), Some(runtime)) = (io_cache.cache(), metrics_runtime.as_ref()) {
         icegate_common::register_foyer_metrics(cache, &runtime.meter());
@@ -630,12 +641,14 @@ async fn run_services(
     // Spawn server tasks
     let mut handles = Vec::new();
 
-    if let Some(metrics_runtime) = metrics_runtime.as_ref() {
+    // Spawned whatever `metrics.enabled` says: the listener owns `/health`, and
+    // the kubelet probes it even on a deployment that scrapes no metrics.
+    {
         let metrics_config = config.metrics.clone();
         let token = cancel_token.clone();
-        let registry = metrics_runtime.registry();
+        let registry = metrics_runtime.as_ref().map(|runtime| runtime.registry());
         let handle = tokio::spawn(async move {
-            run_metrics_server(metrics_config, registry, token)
+            run_operational_server(metrics_config, registry, token)
                 .await
                 .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
         });
@@ -644,49 +657,35 @@ async fn run_services(
 
     // OTLP HTTP server
     if config.otlp_http.enabled {
-        let write_channel = write_tx.clone();
-        let wal_row_group_size = queue_config.common.max_row_group_size;
-        let operations_enabled = config.operations.enabled;
+        let state = OtlpHttpState {
+            write_channel: write_tx.clone(),
+            wal_row_group_size: queue_config.common.max_row_group_size,
+            operations_enabled: config.operations.enabled,
+            metrics: otlp_metrics.clone(),
+        };
         let http_config = config.otlp_http.clone();
         let token = cancel_token.clone();
-        let metrics = otlp_metrics.clone();
         let guard = memory_pressure.clone();
-        let handle = tokio::spawn(async move {
-            crate::otlp_http::run(
-                write_channel,
-                wal_row_group_size,
-                operations_enabled,
-                metrics,
-                http_config,
-                token,
-                guard,
-            )
-            .await
-        });
+        let resolver = tenant_resolver.clone();
+        let handle =
+            tokio::spawn(async move { crate::otlp_http::run(state, http_config, token, guard, resolver).await });
         handles.push(handle);
     }
 
     // OTLP gRPC server
     if config.otlp_grpc.enabled {
-        let write_channel = write_tx.clone();
-        let wal_row_group_size = queue_config.common.max_row_group_size;
-        let operations_enabled = config.operations.enabled;
+        let service = OtlpGrpcService::new(
+            write_tx.clone(),
+            queue_config.common.max_row_group_size,
+            config.operations.enabled,
+            otlp_metrics.clone(),
+        );
         let grpc_config = config.otlp_grpc.clone();
         let token = cancel_token.clone();
-        let metrics = otlp_metrics.clone();
         let guard = memory_pressure.clone();
-        let handle = tokio::spawn(async move {
-            crate::otlp_grpc::run(
-                write_channel,
-                wal_row_group_size,
-                operations_enabled,
-                metrics,
-                grpc_config,
-                token,
-                guard,
-            )
-            .await
-        });
+        let resolver = tenant_resolver.clone();
+        let handle =
+            tokio::spawn(async move { crate::otlp_grpc::run(service, grpc_config, token, guard, resolver).await });
         handles.push(handle);
     }
 

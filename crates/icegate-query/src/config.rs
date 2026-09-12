@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use icegate_common::{
-    CatalogConfig, MemoryPressureConfig, MetricsConfig, StorageConfig, TracingConfig, check_port_conflicts,
+    CatalogConfig, MemoryPressureConfig, OperationalConfig, StorageConfig, TracingConfig, check_port_conflicts,
     load_config_file,
 };
 use icegate_queue::QueueConfig;
@@ -53,7 +53,7 @@ pub struct QueryConfig {
     pub tracing: TracingConfig,
     /// Prometheus metrics configuration
     #[serde(default)]
-    pub metrics: MetricsConfig,
+    pub metrics: OperationalConfig,
     /// Memory-pressure request-shedding guard configuration
     #[serde(default)]
     pub memory_pressure: MemoryPressureConfig,

@@ -134,9 +134,33 @@
         "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Container image settings." },
         "shift": { "type": ["object", "null"], "additionalProperties": true, "description": "WAL-to-Iceberg shift settings." },
         "cache": { "type": ["object", "null"], "additionalProperties": true, "description": "IO and metadata cache settings." },
+        "tenant": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Which tenant an incoming OTLP request writes to.",
+          "properties": {
+            "mode": { "type": ["string", "null"], "enum": ["single", "multi", null], "description": "single: one tenant for the deployment, named by id. multi: the tenant comes from the x-scope-orgid header only." },
+            "id": { "type": ["string", "null"], "description": "The tenant served in single mode. Required when mode is single." }
+          }
+        },
         "otlpHttp": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP HTTP receiver." },
         "otlpGrpc": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP gRPC receiver." },
-        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Metrics endpoint settings." },
+        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Operational listener: /health always, /metrics when enabled." },
+        "authProxy": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "description": "Envoy sidecar terminating TLS and checking the ingest token in front of the OTLP receivers.",
+          "required": ["upstreamTimeout"],
+          "properties": {
+            "enabled": { "type": ["boolean", "null"], "description": "Run the auth proxy alongside ingest." },
+            "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Proxy container image settings." },
+            "jwt": { "type": ["object", "null"], "additionalProperties": true, "description": "Ingest-token issuer, audience and JWKS endpoint." },
+            "tls": { "type": ["object", "null"], "additionalProperties": true, "description": "Secret holding the server certificate the proxy presents." },
+            "upstream": { "type": ["object", "null"], "additionalProperties": true, "description": "Loopback ports icegate listens on while the proxy owns the published ones." },
+            "upstreamTimeout": { "type": "string", "pattern": "^[0-9]+s$", "description": "How long the proxy waits for icegate to answer one OTLP request, as whole seconds with the s suffix, for example \"30s\". Narrower than the durations Envoy itself accepts: this is the form scripts/authproxy-test.sh reads back out of the rendered configuration. Null is refused too — it would render an empty timeout that the proxy rejects on startup, far from the values file that caused it." },
+            "resources": { "type": ["object", "null"], "description": "Proxy container resource requests and limits." }
+          }
+        },
         "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings." },
         "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
         "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },

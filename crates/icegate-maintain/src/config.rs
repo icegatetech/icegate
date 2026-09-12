@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use icegate_common::{CatalogConfig, MetricsConfig, StorageConfig, TracingConfig};
+use icegate_common::{CatalogConfig, OperationalConfig, StorageConfig, TracingConfig};
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +66,7 @@ pub struct MaintainConfig {
     /// commands; when enabled, `run` installs the global meter provider (so the
     /// compactor's `CompactMetrics` record) and serves `/metrics`.
     #[serde(default)]
-    pub metrics: MetricsConfig,
+    pub metrics: OperationalConfig,
     /// `OpenTelemetry` tracing for the long-running `run` service, which
     /// initialises the subscriber from this block once the config is loaded. The
     /// one-shot `migrate` commands never reach it: they install a plain JSON

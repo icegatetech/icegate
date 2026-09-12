@@ -8,6 +8,8 @@ x-logging: &fluentd-logging
     fluentd-retry-wait: "1s"
     tag: "docker.{{.Name}}"
 
+# TODO(med): make a base compose for basic components and an overlay compose for profile components
+
 services:
   rustfs:
     image: rustfs/rustfs:1.0.0-beta.8
@@ -263,7 +265,9 @@ services:
           cpus: 2
     logging: *fluentd-logging
 
-  # A TCP probe sidecar; see `catalog-probe` for what these are for.
+  # A probe sidecar; see `catalog-probe` for what these are for. It hits
+  # /health on the operational listener rather than the OTLP port, so it reports
+  # icegate's own health whether or not the auth proxy owns 4317/4318.
   ingest-probe:
     image: busybox:1.38.0
     network_mode: "service:ingest"
@@ -273,7 +277,7 @@ services:
       ingest:
         condition: service_started
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "4317"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9091/health"]
       interval: 5s
       timeout: 5s
       retries: 5

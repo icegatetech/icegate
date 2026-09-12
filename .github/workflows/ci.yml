@@ -5,6 +5,11 @@ on:
     branches: [ main ]
     paths:
       - 'crates/**'
+      # read by crates/icegate-ingest/tests/config_file.rs
+      - 'config/docker/ingest-proxy.yaml'
+      - 'config/docker/ingest.yaml'
+      - 'config/docker/otel-collector/config.yaml'
+      - 'config/docker/grafana/provisioning/datasources/datasources.yaml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'clippy.toml'
@@ -15,6 +20,11 @@ on:
     branches: [ main ]
     paths:
       - 'crates/**'
+      # read by crates/icegate-ingest/tests/config_file.rs
+      - 'config/docker/ingest-proxy.yaml'
+      - 'config/docker/ingest.yaml'
+      - 'config/docker/otel-collector/config.yaml'
+      - 'config/docker/grafana/provisioning/datasources/datasources.yaml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'clippy.toml'

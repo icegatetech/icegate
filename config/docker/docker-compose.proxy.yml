@@ -1,0 +1,31 @@
+# Overlay putting the Envoy auth proxy in front of ingest.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up --build
+#   (or: make run-docker-proxy-release)
+services:
+  ingest:
+    # `!multi` plus loopback OTLP listeners; the proxy owns 4317/4318.
+    volumes:
+      - ./ingest-proxy.yaml:/etc/icegate/ingest.yaml:ro
+
+  auth-proxy:
+    # Pinned: the filter chain in auth-proxy/envoy.yaml is accepted by a
+    # specific release, and a moving tag changes that without a change here.
+    image: envoyproxy/envoy:v1.36.10
+    # Shares ingest's network namespace, so it reaches icegate on
+    # 127.0.0.1:14317/14318 and the published 4317/4318 declared on the `ingest`
+    # service resolve to this container's listeners. Same technique as
+    # `ingest-probe`.
+    network_mode: "service:ingest"
+    command:
+      - /usr/local/bin/envoy
+      - --config-path
+      - /etc/envoy/envoy.yaml
+    volumes:
+      - ./auth-proxy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      ingest:
+        condition: service_started
+    restart: unless-stopped
+    logging:
+      driver: json-file

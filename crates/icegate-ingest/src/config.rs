@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use icegate_common::{
-    CatalogConfig, MemoryPressureConfig, MetricsConfig, StorageConfig, TracingConfig, check_port_conflicts,
-    load_config_file,
+    CatalogConfig, MemoryPressureConfig, OperationalConfig, StorageConfig, TenantPolicy, TracingConfig,
+    check_port_conflicts, load_config_file,
 };
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,9 @@ pub struct IngestConfig {
     /// Shift configuration for moving WAL to Iceberg
     #[serde(default)]
     pub shift: ShiftConfig,
+    /// How the tenant of an incoming request is decided.
+    #[serde(default)]
+    pub tenant: TenantPolicy,
     /// OTLP HTTP server
     pub otlp_http: OtlpHttpConfig,
     /// OTLP gRPC server
@@ -42,7 +45,7 @@ pub struct IngestConfig {
     pub operations: OperationsConfig,
     /// Metrics configuration
     #[serde(default)]
-    pub metrics: MetricsConfig,
+    pub metrics: OperationalConfig,
     /// Tracing configuration
     #[serde(default)]
     pub tracing: TracingConfig,
@@ -101,6 +104,7 @@ impl IngestConfig {
     pub fn validate(&self) -> Result<()> {
         self.catalog.validate()?;
         self.storage.validate()?;
+        self.tenant.validate()?;
         self.otlp_http.validate()?;
         self.otlp_grpc.validate()?;
         self.shift.validate()?;
@@ -120,22 +124,27 @@ impl IngestConfig {
 
 #[cfg(test)]
 mod tests {
+    use icegate_common::TenantPolicy;
+
     use super::IngestConfig;
     use crate::error::IngestError;
+
+    /// A default config with the two blocks that do not validate as-is filled
+    /// in: tracing (enabled with no OTLP endpoint) and the shift job storage.
+    fn valid_config() -> IngestConfig {
+        let mut config = IngestConfig::default();
+        config.tracing.enabled = false;
+        config.shift.jobsmanager.storage.endpoint = "http://localhost:9000".to_string();
+        config.shift.jobsmanager.storage.bucket = "warehouse".to_string();
+        config
+    }
 
     /// A `memory_pressure` validation failure must propagate out of
     /// `IngestConfig::validate`, proving the field is wired into the aggregate
     /// validator rather than merely deserialized.
     #[test]
     fn validate_rejects_invalid_memory_pressure() {
-        // Defaults are valid except tracing (enabled with no OTLP endpoint) and the
-        // shift job-storage endpoint/bucket; populate exactly those. Catalog
-        // (Memory + /tmp warehouse), storage (Memory), OTLP servers, and metrics
-        // (disabled) all validate as-is.
-        let mut config = IngestConfig::default();
-        config.tracing.enabled = false;
-        config.shift.jobsmanager.storage.endpoint = "http://localhost:9000".to_string();
-        config.shift.jobsmanager.storage.bucket = "warehouse".to_string();
+        let mut config = valid_config();
 
         // Baseline validates: any error after flipping only `memory_pressure`
         // therefore originates in its validator.
@@ -146,5 +155,49 @@ mod tests {
         config.memory_pressure.high_watermark = 0.90;
 
         assert!(matches!(config.validate(), Err(IngestError::Config(_))));
+    }
+
+    /// A `tenant` validation failure must propagate out of
+    /// `IngestConfig::validate`, proving the policy is wired into the aggregate
+    /// validator rather than merely deserialized.
+    #[test]
+    fn validate_rejects_an_invalid_single_tenant_id() {
+        let mut config = valid_config();
+        config.validate().expect("baseline ingest config is valid");
+
+        config.tenant = TenantPolicy::Single {
+            id: "bad/tenant".to_string(),
+        };
+
+        assert!(matches!(config.validate(), Err(IngestError::Config(_))));
+    }
+
+    /// The operational listener binds its port whatever `metrics.enabled` says,
+    /// so `check_port_conflicts` must see that port even with the Prometheus
+    /// endpoint off — otherwise the clash surfaces as a failed bind after the
+    /// receivers have already started.
+    #[test]
+    fn validate_rejects_a_disabled_metrics_port_taken_by_otlp_http() {
+        let mut config = valid_config();
+        config.validate().expect("baseline ingest config is valid");
+
+        config.metrics.enabled = false;
+        config.metrics.port = config.otlp_http.port;
+
+        assert!(matches!(config.validate(), Err(IngestError::Config(_))));
+    }
+
+    /// A config with no `tenant` section keeps writing to the tenant it wrote to
+    /// before the policy existed. The identifier is spelled out rather than read
+    /// from `DEFAULT_TENANT_ID`: it is the value already in the deployed tables,
+    /// so changing the constant must fail here.
+    #[test]
+    fn default_config_serves_the_default_tenant() {
+        assert_eq!(
+            IngestConfig::default().tenant,
+            TenantPolicy::Single {
+                id: "default".to_string()
+            }
+        );
     }
 }

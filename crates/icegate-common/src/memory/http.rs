@@ -7,6 +7,7 @@
 
 use axum::{
     Json,
+    body::Body,
     extract::Request,
     http::{HeaderValue, StatusCode, header},
     middleware::Next,
@@ -15,6 +16,31 @@ use axum::{
 use futures::StreamExt;
 
 use super::guard::MemoryPressure;
+
+/// Read and discard a request body a middleware layer has decided to refuse.
+///
+/// A layer that answers before the body is read leaves the client writing into a
+/// socket nobody reads, and the client sees a connection reset instead of the
+/// status; draining first is what lets it read the answer (GH-158). Memory stays
+/// bounded whatever the body's size, because each chunk is dropped as it
+/// arrives.
+///
+/// Reading stops at the first read error — the client hung up mid-upload, and
+/// there is nothing left to drain — and at `limit_bytes`, which is what bounds
+/// the work one refused request can extract: these layers run above the body
+/// limit of their surface, so nothing else caps them. A sender that exceeds
+/// `limit_bytes` gets the reset the drain exists to avoid, which is the correct
+/// trade: it is already sending more than the surface would ever accept.
+pub async fn drain_request_body(body: Body, limit_bytes: usize) {
+    let mut stream = body.into_data_stream();
+    let mut drained_bytes = 0_usize;
+    while drained_bytes < limit_bytes {
+        let Some(Ok(chunk)) = stream.next().await else {
+            break;
+        };
+        drained_bytes = drained_bytes.saturating_add(chunk.len());
+    }
+}
 
 /// Recommended `Retry-After` value (seconds) sent on a memory-pressure 503.
 ///
@@ -33,32 +59,34 @@ fn shed_retry_after() -> (header::HeaderName, HeaderValue) {
 ///
 /// `bypass_paths` MUST list every health/readiness probe path for the surface: a
 /// probe that received a 503 while shedding would make the kubelet kill the pod
-/// exactly when it is trying to recover. `drain_body` is `true` only for large-body
-/// surfaces (OTLP/HTTP) that must drain in constant memory so the client reads the
-/// 503 instead of a connection reset (GH-158).
+/// exactly when it is trying to recover. `drain_limit_bytes` is `Some` only for
+/// large-body surfaces (OTLP/HTTP), which must drain before answering so the
+/// client reads the 503 instead of a connection reset; the surfaces that carry
+/// query strings rather than payloads pass `None` and answer immediately.
 #[derive(Clone)]
 pub struct ShedPolicy {
     guard: MemoryPressure,
     surface: &'static str,
     bypass_paths: &'static [&'static str],
-    drain_body: bool,
+    drain_limit_bytes: Option<usize>,
 }
 
 impl ShedPolicy {
     /// Build a policy for one surface. `surface` is the metric attribute value
-    /// (`"loki" | "tempo" | "prometheus" | "otlp_http"`).
+    /// (`"loki" | "tempo" | "prometheus" | "otlp_http"`); `drain_limit_bytes` is
+    /// the bound handed to [`drain_request_body`] when the request is shed.
     #[must_use]
     pub const fn new(
         guard: MemoryPressure,
         surface: &'static str,
         bypass_paths: &'static [&'static str],
-        drain_body: bool,
+        drain_limit_bytes: Option<usize>,
     ) -> Self {
         Self {
             guard,
             surface,
             bypass_paths,
-            drain_body,
+            drain_limit_bytes,
         }
     }
 }
@@ -67,10 +95,10 @@ impl ShedPolicy {
 /// exact request path is a bypass path.
 ///
 /// `build_response` is a plain `fn` pointer so each surface returns a body matching its
-/// own error shape while the bypass/pressure/metric/drain logic stays shared. When
-/// `drain_body` is set, the request body is drained in constant memory before the 503
-/// is returned so the client reads the status rather than seeing a reset; the expensive
-/// decompress/decode/transform work is still skipped.
+/// own error shape while the bypass/pressure/metric/drain logic stays shared. With
+/// `drain_limit_bytes` set, the request body is drained through [`drain_request_body`]
+/// before the 503 is returned; the expensive decompress/decode/transform work is still
+/// skipped.
 pub async fn shed_when_pressured(
     policy: ShedPolicy,
     build_response: fn() -> Response,
@@ -81,15 +109,8 @@ pub async fn shed_when_pressured(
         return next.run(request).await;
     }
     policy.guard.record_shed(policy.surface);
-    if policy.drain_body {
-        // Discard each chunk so memory stays bounded regardless of body size; stop on
-        // the first read error (the client hung up mid-upload).
-        let mut body = request.into_body().into_data_stream();
-        while let Some(chunk) = body.next().await {
-            if chunk.is_err() {
-                break;
-            }
-        }
+    if let Some(limit_bytes) = policy.drain_limit_bytes {
+        drain_request_body(request.into_body(), limit_bytes).await;
     }
     build_response()
 }
@@ -169,7 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn pressured_work_path_sheds_503_with_retry_after() {
-        let policy = ShedPolicy::new(pressured_handle(), "loki", &["/ready"], false);
+        let policy = ShedPolicy::new(pressured_handle(), "loki", &["/ready"], None);
         let response = guarded_router(policy)
             .oneshot(Request::builder().uri("/work").body(Body::empty()).expect("request"))
             .await
@@ -181,7 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn pressured_bypass_path_passes_through() {
-        let policy = ShedPolicy::new(pressured_handle(), "loki", &["/ready"], false);
+        let policy = ShedPolicy::new(pressured_handle(), "loki", &["/ready"], None);
         let response = guarded_router(policy)
             .oneshot(Request::builder().uri("/ready").body(Body::empty()).expect("request"))
             .await
@@ -192,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn inert_guard_passes_through() {
-        let policy = ShedPolicy::new(MemoryPressure::inert(), "loki", &["/ready"], false);
+        let policy = ShedPolicy::new(MemoryPressure::inert(), "loki", &["/ready"], None);
         let response = guarded_router(policy)
             .oneshot(Request::builder().uri("/work").body(Body::empty()).expect("request"))
             .await
@@ -201,28 +222,103 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn pressured_drain_body_completes_with_503() {
-        // drain_body = true + an oversized body must complete cleanly with a 503
-        // (body drained in constant memory), never hang or reset the connection.
-        let policy = ShedPolicy::new(pressured_handle(), "otlp_http", &[], true);
-        let app = Router::new()
+    /// Router shedding every path, draining up to `drain_limit_bytes`.
+    fn draining_router(drain_limit_bytes: usize) -> Router {
+        let policy = ShedPolicy::new(pressured_handle(), "otlp_http", &[], Some(drain_limit_bytes));
+        Router::new()
             .route("/v1/logs", post(|| async { StatusCode::OK }))
             .layer(axum::middleware::from_fn(move |req, next| {
                 shed_when_pressured(policy.clone(), default_shed_response, req, next)
-            }));
+            }))
+    }
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/logs")
-                    .body(Body::from(vec![0_u8; 1024 * 1024]))
-                    .expect("request"),
-            )
+    /// A `POST /v1/logs` carrying `len` bytes of body.
+    fn logs_request(len: usize) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .body(Body::from(vec![0_u8; len]))
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_drain_limit_is_shed_with_503() {
+        const BODY_BYTES: usize = 1024 * 1024;
+
+        // The oversized body must complete cleanly with a 503 (drained in
+        // constant memory), never hang or reset the connection.
+        let response = draining_router(BODY_BYTES)
+            .oneshot(logs_request(BODY_BYTES))
             .await
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_drain_limit_is_still_shed_with_503() {
+        const DRAIN_LIMIT_BYTES: usize = 1024;
+
+        // The drain stops at the limit rather than following the sender for as
+        // long as it keeps writing; the status is still what the sender gets.
+        let response = draining_router(DRAIN_LIMIT_BYTES)
+            .oneshot(logs_request(DRAIN_LIMIT_BYTES * 16))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn draining_stops_at_the_limit() {
+        const DRAIN_LIMIT_BYTES: usize = 1024;
+        const CHUNK_BYTES: usize = 256;
+
+        // A stream that counts what was pulled out of it: the oracle is the
+        // number of chunks the drain consumed, which a limitless drain would
+        // push to the full 16.
+        let polled_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&polled_chunks);
+        let stream = futures::stream::iter(0..16).map(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(vec![0_u8; CHUNK_BYTES])
+        });
+
+        drain_request_body(Body::from_stream(stream), DRAIN_LIMIT_BYTES).await;
+
+        assert_eq!(
+            polled_chunks.load(std::sync::atomic::Ordering::SeqCst),
+            DRAIN_LIMIT_BYTES / CHUNK_BYTES,
+            "the drain must stop once it has read the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_stops_at_the_first_read_error() {
+        const CHUNK_BYTES: usize = 256;
+        const STREAM_ITEMS: usize = 16;
+        // Above everything the stream can yield, so stopping cannot be explained
+        // by the limit: the error is the only thing that ends the drain.
+        const DRAIN_LIMIT_BYTES: usize = CHUNK_BYTES * STREAM_ITEMS * 2;
+
+        let polled_items = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&polled_items);
+        let stream = futures::stream::iter(0..STREAM_ITEMS).map(move |index| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if index == 0 {
+                // The sender hung up mid-upload: there is nothing left to drain.
+                Err(std::io::Error::other("read failed"))
+            } else {
+                Ok(vec![0_u8; CHUNK_BYTES])
+            }
+        });
+
+        drain_request_body(Body::from_stream(stream), DRAIN_LIMIT_BYTES).await;
+
+        assert_eq!(
+            polled_items.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the drain must not read past the first error"
+        );
     }
 }

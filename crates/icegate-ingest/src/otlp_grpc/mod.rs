@@ -7,6 +7,7 @@ mod config;
 mod error;
 mod server;
 mod services;
+mod tenant;
 
 pub use config::OtlpGrpcConfig;
 pub use error::GrpcError;

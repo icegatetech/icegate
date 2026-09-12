@@ -67,27 +67,6 @@ pub struct MetricsPartialSuccess {
 }
 
 // ============================================================================
-// Health Check Models
-// ============================================================================
-
-/// Health check response.
-#[derive(Debug, Serialize)]
-pub struct HealthResponse {
-    /// Health status.
-    pub status: HealthStatus,
-}
-
-/// Health status enum.
-#[derive(Debug, Serialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum HealthStatus {
-    /// Service is healthy.
-    Healthy,
-    /// Service is unhealthy.
-    Unhealthy,
-}
-
-// ============================================================================
 // Error Response Models
 // ============================================================================
 

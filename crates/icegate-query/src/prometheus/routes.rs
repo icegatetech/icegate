@@ -39,7 +39,7 @@ pub fn routes(state: PrometheusState, pressure: MemoryPressure) -> Router {
         .layer(TimeoutLayer::with_status_code(TIMEOUT_STATUS, query_timeout))
         .layer(axum::middleware::from_fn(move |req, next| {
             shed_when_pressured(
-                ShedPolicy::new(pressure.clone(), "prometheus", PROMETHEUS_SHED_BYPASS, false),
+                ShedPolicy::new(pressure.clone(), "prometheus", PROMETHEUS_SHED_BYPASS, None),
                 default_shed_response,
                 req,
                 next,

@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use icegate_common::TenantId;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::{Span, span::Event};
 
@@ -712,7 +713,7 @@ fn resolve_time_to_first_chunk_ms(view: &AttributeView) -> Result<Option<i64>> {
 pub(crate) fn project_operation_row(
     span: &Span,
     scope: Option<&InstrumentationScope>,
-    tenant_id: &str,
+    tenant_id: &TenantId,
     service_name: Option<&str>,
     ingested_at: i64,
 ) -> Result<Option<OperationRow>> {
@@ -777,7 +778,7 @@ pub(crate) fn project_operation_row(
     let time_to_first_chunk_ms = resolve_time_to_first_chunk_ms(&view)?;
 
     Ok(Some(OperationRow {
-        tenant_id: tenant_id.to_string(),
+        tenant_id: tenant_id.as_ref().to_string(),
         trace_id,
         span_id,
         parent_span_id,
@@ -876,6 +877,7 @@ mod tests {
     use opentelemetry_proto::tonic::trace::v1::{Span, Status, span::Event};
 
     use super::*;
+    use crate::transform::test_support::test_tenant;
 
     /// Build a string-valued OTLP `KeyValue` for tests.
     fn kv_str(key: &str, value: &str) -> KeyValue {
@@ -1092,7 +1094,7 @@ mod tests {
             },
         ]);
 
-        let row = project_operation_row(&span, None, "tenant-a", Some("svc"), 999)
+        let row = project_operation_row(&span, None, &test_tenant("tenant-a"), Some("svc"), 999)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1118,7 +1120,7 @@ mod tests {
             kv_str("session.id", "sess-1"),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1145,7 +1147,7 @@ mod tests {
             kv_str("traceloop.workflow.name", "wf-1"),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1166,7 +1168,7 @@ mod tests {
             kv_str("llm.system", "oi-provider"),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1178,7 +1180,7 @@ mod tests {
     fn minimal_matching_span_leaves_optionals_null() {
         let span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1193,14 +1195,18 @@ mod tests {
     #[test]
     fn non_llm_span_yields_none() {
         let span = span_with(vec![kv_str("http.method", "GET")]);
-        assert!(project_operation_row(&span, None, "t", None, 1).expect("ok").is_none());
+        assert!(
+            project_operation_row(&span, None, &test_tenant("t"), None, 1)
+                .expect("ok")
+                .is_none()
+        );
     }
 
     #[test]
     fn bad_trace_id_on_matching_span_is_err() {
         let mut span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
         span.trace_id = vec![0u8; 16];
-        assert!(project_operation_row(&span, None, "t", None, 1).is_err());
+        assert!(project_operation_row(&span, None, &test_tenant("t"), None, 1).is_err());
     }
 
     #[test]
@@ -1209,7 +1215,7 @@ mod tests {
             kv_str("gen_ai.operation.name", "chat"),
             kv_str("gen_ai.request.temperature", "hot"),
         ]);
-        assert!(project_operation_row(&span, None, "t", None, 1).is_err());
+        assert!(project_operation_row(&span, None, &test_tenant("t"), None, 1).is_err());
     }
 
     #[test]
@@ -1217,7 +1223,9 @@ mod tests {
         let mut span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
         span.start_time_unix_nano = 3_000_000_000;
         span.end_time_unix_nano = 1_000_000_000;
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         assert_eq!(row.duration_micros, 0);
     }
 
@@ -1270,7 +1278,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, "tenant-a", Some("claude-code"), 1)
+        let row = project_operation_row(&span, None, &test_tenant("tenant-a"), Some("claude-code"), 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1307,7 +1315,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("interaction span -> row");
 
@@ -1328,7 +1336,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1352,7 +1360,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1368,7 +1376,7 @@ mod tests {
             vec![kv_str("tool_name", "Bash"), kv_str("span.type", "tool")],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1387,7 +1395,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1409,7 +1417,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1428,7 +1436,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("interaction span -> row");
 
@@ -1459,7 +1467,7 @@ mod tests {
             kv_str("llm.output_messages.0.message.content", "4"),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("an OpenInference LLM span -> row");
 
@@ -1483,7 +1491,7 @@ mod tests {
             kv_str("llm.tools.0.tool.json_schema", r#"{"name":"web_search"}"#),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1503,7 +1511,7 @@ mod tests {
             kv_str("llm.input_messages.0.message.content", "flattened"),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1526,7 +1534,7 @@ mod tests {
             ),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1549,7 +1557,9 @@ mod tests {
             kv_str("openinference.span.kind", "LLM"),
             kv_str("llm.invocation_parameters", r#"{"max_completion_tokens":8192}"#),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         assert_eq!(row.max_tokens, Some(8192));
     }
 
@@ -1564,7 +1574,9 @@ mod tests {
                 r#"{"top_k":40.0,"max_tokens":512.0,"seed":7.0,"n":3.0}"#,
             ),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         assert_eq!(row.top_k, Some(40));
         assert_eq!(row.max_tokens, Some(512));
         assert_eq!(row.seed, Some(7));
@@ -1609,7 +1621,9 @@ mod tests {
                 kv_int("llm.token_count.total", 42),
                 kv_str("llm.invocation_parameters", blob),
             ]);
-            let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+            let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+                .expect("ok")
+                .expect("row");
             assert_eq!(row.max_tokens, None, "blob {blob} must not populate max_tokens");
             assert_eq!(row.total_tokens, Some(42), "the rest of the row survives blob {blob}");
         }
@@ -1622,7 +1636,9 @@ mod tests {
             kv_dbl("gen_ai.request.temperature", 0.1),
             kv_str("llm.invocation_parameters", r#"{"temperature":0.9}"#),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         assert!((row.temperature.expect("temperature") - 0.1).abs() < f64::EPSILON);
     }
 
@@ -1642,7 +1658,7 @@ mod tests {
                 kv_int("llm.token_count.total", 42),
                 kv_str("llm.invocation_parameters", blob),
             ]);
-            let row = project_operation_row(&span, None, "t", None, 1)
+            let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
                 .expect("a bad blob must not fail the projection")
                 .expect("row survives");
             assert_eq!(row.temperature, None, "blob {blob} must not populate temperature");
@@ -1660,7 +1676,7 @@ mod tests {
             kv_str("tool.parameters", r#"{"q":"string"}"#),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1678,7 +1694,9 @@ mod tests {
             kv_str("tool.parameters", r#"{"q":"string"}"#),
             kv_str("tool.json_schema", r#"{"type":"function"}"#),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         assert_eq!(
             row.tool_definitions.as_deref(),
             Some(r#"{"type":"function"}"#),
@@ -1695,7 +1713,7 @@ mod tests {
             kv_str("openinference.span.kind", "LLM"),
             kv_str("llm.finish_reason", "stop"),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("a singular finish reason must not drop the row")
             .expect("row");
         assert_eq!(row.finish_reasons, Some(vec!["stop".to_string()]));
@@ -1718,7 +1736,9 @@ mod tests {
                 }),
             },
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         assert_eq!(row.finish_reasons, Some(vec!["length".to_string()]));
     }
 
@@ -1728,7 +1748,9 @@ mod tests {
             kv_str("openinference.span.kind", "LLM"),
             kv_str("llm.provider", "azure"),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         assert_eq!(row.provider_name.as_deref(), Some("azure"));
     }
 
@@ -1741,7 +1763,9 @@ mod tests {
             kv_str("llm.provider", "azure"),
             kv_str("llm.system", "openai"),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         assert_eq!(row.provider_name.as_deref(), Some("openai"));
     }
 
@@ -1749,7 +1773,9 @@ mod tests {
     fn embedding_and_reranker_model_names_fill_request_model() {
         for key in ["embedding.model_name", "reranker.model_name"] {
             let span = span_with(vec![kv_str("openinference.span.kind", "LLM"), kv_str(key, "model-x")]);
-            let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+            let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+                .expect("ok")
+                .expect("row");
             assert_eq!(
                 row.request_model.as_deref(),
                 Some("model-x"),
@@ -1766,7 +1792,9 @@ mod tests {
             kv_str("llm.prompts.0.prompt.text", "def fib(n):"),
             kv_str("llm.choices.0.completion.text", " return n"),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         let input: serde_json::Value =
             serde_json::from_str(row.input_messages.as_deref().expect("present")).expect("json");
         assert_eq!(input[0]["text"], "def fib(n):");
@@ -1783,7 +1811,9 @@ mod tests {
             kv_str("llm.input_messages.0.message.role", "user"),
             kv_str("llm.input_messages.0.message.content", "chat"),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1).expect("ok").expect("row");
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
         let input: serde_json::Value =
             serde_json::from_str(row.input_messages.as_deref().expect("present")).expect("json");
         assert_eq!(input[0]["content"], "chat");
@@ -1796,7 +1826,7 @@ mod tests {
             kv_str("session.id", "conv-42"),
         ]);
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1811,7 +1841,7 @@ mod tests {
             kv_str("gen_ai.operation.name", "chat"),
             kv_dbl("gen_ai.response.time_to_first_chunk", 1.3),
         ]);
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
         assert_eq!(row.time_to_first_chunk_ms, Some(1300));
@@ -1822,14 +1852,14 @@ mod tests {
         // Claude Code's flat token keys inherit the same strict non-negative
         // contract as every other adapter: a negative count drops the row (D6).
         let span = claude_span("claude_code.llm_request", vec![kv_str("input_tokens", "-5")]);
-        assert!(project_operation_row(&span, None, "t", None, 1).is_err());
+        assert!(project_operation_row(&span, None, &test_tenant("t"), None, 1).is_err());
     }
 
     #[test]
     fn claude_code_negative_ttft_ms_drops_row() {
         // Exercises the unit-aware resolver's negative guard on the `_ms` path.
         let span = claude_span("claude_code.llm_request", vec![kv_str("ttft_ms", "-1")]);
-        assert!(project_operation_row(&span, None, "t", None, 1).is_err());
+        assert!(project_operation_row(&span, None, &test_tenant("t"), None, 1).is_err());
     }
 
     #[test]
@@ -1843,7 +1873,7 @@ mod tests {
                 kv_str("span.type", "tool.execution"),
             ],
         );
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool.execution span -> row");
         assert_eq!(row.operation_name, "execute_tool");
@@ -1863,7 +1893,7 @@ mod tests {
             ])],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1888,7 +1918,7 @@ mod tests {
             ])],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1917,7 +1947,7 @@ mod tests {
             ])],
         );
 
-        let row = project_operation_row(&span, None, "t", None, 1)
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
