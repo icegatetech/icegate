@@ -145,10 +145,10 @@ fn translate_filter(f: &SpanFilter, exclude_column: Option<&str>) -> Predicate {
 /// `Not(Compare)` form.
 fn translate_negation(inner: &SpanFilter, exclude_column: Option<&str>) -> Predicate {
     let leaf = peel_parens(inner);
-    if let SpanFilter::Compare { field, op, value } = leaf {
-        if let Some(flipped) = flip_op(*op) {
-            return translate_compare(field, flipped, value, exclude_column);
-        }
+    if let SpanFilter::Compare { field, op, value } = leaf
+        && let Some(flipped) = flip_op(*op)
+    {
+        return translate_compare(field, flipped, value, exclude_column);
     }
     Predicate::AlwaysTrue
 }

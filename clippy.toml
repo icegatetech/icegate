@@ -39,7 +39,7 @@ single-char-binding-names-threshold = 4
 # `Duration` units) that are a workspace-wide pass of their own, not a rider on
 # an unrelated change. Lagging is the safe direction: Clippy only ever suggests
 # less than the toolchain allows, never code the declared MSRV cannot build.
-msrv = "1.82.0"
+msrv = "1.98.0"
 
 # Literal representation
 literal-representation-threshold = 65536

@@ -21,7 +21,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use common::{
     BUCKET_NAME, DAY_MICROS, StorageConn, build_operator_registry, build_s3_catalog, list_all_object_keys, logs_batch,
-    setup_object_store, write_one_file,
+    logs_batch_for_tenant, setup_object_store, write_one_file,
 };
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
@@ -242,6 +242,74 @@ async fn gc_reclaims_unreferenced_files_and_keeps_live_ones() {
     let descriptor = icegate_common::merge::sort_key::SortColumnsDescriptor::logs().expect("logs descriptor");
     let rows = read_all_rows(&live_table, descriptor).await;
     assert!(!rows.is_empty(), "live rows must be intact");
+}
+
+/// The production incident this pins: a tenant id may hold a colon
+/// (`icegate_common::is_valid_tenant_id` admits one), and `tenant_id` is an
+/// identity partition value, so Iceberg escapes it into the data file's path and
+/// the object's real key holds `%3A`. The sweep must still recognise
+/// that file as referenced — it reaches the referenced set as a manifest URI and
+/// the listing as a raw key, and the two normalise identically only if neither
+/// side percent-decodes. When they disagreed, the sweep read a live file as an
+/// orphan and the delete path decoded back to the real key, so the file went.
+///
+/// The grace period is zero here on purpose: a live file must be kept because it
+/// is referenced, never because it is young.
+#[tokio::test]
+async fn gc_keeps_a_referenced_file_whose_partition_value_is_escaped() {
+    const COLON_TENANT: &str = "2q4mHrPd9kL:7xZa1vB3nQe";
+
+    let (_store, conn) = setup_object_store().await;
+    let catalog = Arc::new(build_s3_catalog(&conn));
+    let ident = create_logs_table(&catalog).await;
+
+    let live = write_one_file(
+        &catalog.load_table(&ident).await.unwrap(),
+        logs_batch_for_tenant(COLON_TENANT, &[("svc", DAY_MICROS)], 0),
+    )
+    .await;
+    fast_append_one(&catalog, &ident, live.clone()).await;
+
+    // Assert the premise rather than trusting it: the escape has to be in the
+    // key, or the test would pass without exercising the defect at all.
+    let keys = list_all_object_keys(&conn).await;
+    assert!(
+        keys.iter().any(|k| k.contains("tenant_id=2q4mHrPd9kL%3A7xZa1vB3nQe")),
+        "Iceberg must escape the colon into the object key: {keys:?}"
+    );
+    assert_eq!(count_under_segment(&keys, "data"), 1, "one live data file before sweep");
+
+    let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
+    let operator_registry = build_operator_registry(&conn).await;
+    let summary = run_sweep(
+        &dyn_catalog,
+        &operator_registry,
+        TABLE,
+        &orphans_config(0, false, true),
+        Utc::now(),
+        &GcMetrics::new(),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("sweep succeeds");
+
+    assert_eq!(
+        summary.found_data, 0,
+        "the referenced file must not be classified as an orphan: {summary:?}"
+    );
+    assert_eq!(
+        count_under_segment(&list_all_object_keys(&conn).await, "data"),
+        1,
+        "the referenced data file must survive the sweep"
+    );
+
+    // And it is still readable through the table, not merely present.
+    let live_table = catalog.load_table(&ident).await.unwrap();
+    let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
+    assert!(
+        !read_all_rows(&live_table, descriptor).await.is_empty(),
+        "live rows must be intact"
+    );
 }
 
 #[tokio::test]

@@ -151,12 +151,12 @@ impl QueryEngineConfig {
                 "max_query_duration_secs must be greater than 0".into(),
             ));
         }
-        if let Some(hint) = self.wal_metadata_size_hint {
-            if hint == 0 {
-                return Err(QueryError::Config(
-                    "wal_metadata_size_hint must be greater than 0 when set".into(),
-                ));
-            }
+        if let Some(hint) = self.wal_metadata_size_hint
+            && hint == 0
+        {
+            return Err(QueryError::Config(
+                "wal_metadata_size_hint must be greater than 0 when set".into(),
+            ));
         }
         Ok(())
     }

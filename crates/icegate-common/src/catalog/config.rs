@@ -136,12 +136,12 @@ impl CatalogConfig {
                 }
             }
             CatalogBackend::Glue { catalog_id } => {
-                if let Some(id) = catalog_id {
-                    if id.len() != 12 || !id.bytes().all(|b| b.is_ascii_digit()) {
-                        return Err(CommonError::Config(
-                            "Glue catalog_id must be a 12-digit AWS account ID".into(),
-                        ));
-                    }
+                if let Some(id) = catalog_id
+                    && (id.len() != 12 || !id.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    return Err(CommonError::Config(
+                        "Glue catalog_id must be a 12-digit AWS account ID".into(),
+                    ));
                 }
             }
             CatalogBackend::S3 { warehouse } => {
@@ -179,12 +179,12 @@ impl CatalogConfig {
                     "Cache max_write_cache_size_mb must be greater than 0 when set".into(),
                 ));
             }
-            if let Some(ref prefetch) = cache.prefetch {
-                if prefetch.max_prefetch_bytes == 0 {
-                    return Err(CommonError::Config(
-                        "Prefetch max_prefetch_bytes must be greater than 0".into(),
-                    ));
-                }
+            if let Some(ref prefetch) = cache.prefetch
+                && prefetch.max_prefetch_bytes == 0
+            {
+                return Err(CommonError::Config(
+                    "Prefetch max_prefetch_bytes must be greater than 0".into(),
+                ));
             }
         }
 

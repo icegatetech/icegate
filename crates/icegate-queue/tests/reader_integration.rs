@@ -271,10 +271,10 @@ impl ObjectStore for FailingMetadataObjectStore {
                 ))),
             });
         }
-        if let Some(delay) = self.delay_for_location(location) {
-            if options.head || options.range.is_some() {
-                sleep(delay).await;
-            }
+        if let Some(delay) = self.delay_for_location(location)
+            && (options.head || options.range.is_some())
+        {
+            sleep(delay).await;
         }
         self.inner.get_opts(location, options).await
     }
@@ -335,15 +335,13 @@ impl ObjectStore for DelayedObjectStore {
         } else {
             ActiveMetadataReadGuard::new(None)
         };
-        if is_metadata_read {
-            if let Some(gate) = &self.metadata_concurrency_gate {
-                gate.wait_until_open().await?;
-            }
+        if is_metadata_read && let Some(gate) = &self.metadata_concurrency_gate {
+            gate.wait_until_open().await?;
         }
-        if let Some(delay) = self.delay_for_location(location) {
-            if options.head || options.range.is_some() {
-                sleep(delay).await;
-            }
+        if let Some(delay) = self.delay_for_location(location)
+            && (options.head || options.range.is_some())
+        {
+            sleep(delay).await;
         }
         self.inner.get_opts(location, options).await
     }

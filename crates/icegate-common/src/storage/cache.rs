@@ -795,27 +795,26 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                 let range_end = range_start
                     .checked_add(size)
                     .ok_or_else(|| Error::new(ErrorKind::Unexpected, "range offset + size overflows u64"))?;
-                if range_start < range_end {
-                    if let Some(entry) = inner
+                if range_start < range_end
+                    && let Some(entry) = inner
                         .cache
                         .get(&key)
                         .await
                         .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
-                    {
-                        let cached = entry.value();
-                        if cached.covers(range_start, range_end) {
-                            tracing::debug!(
-                                offset = range_start,
-                                length = range_end - range_start,
-                                "Cache hit (fast path)"
-                            );
-                            let data = cached
-                                .read_range(range_start, range_end)
-                                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
-                            inner.metrics.record_hit("fast_path", range_end - range_start);
-                            inner.metrics.record_read_duration(start);
-                            return Ok(make_read_response(data, None));
-                        }
+                {
+                    let cached = entry.value();
+                    if cached.covers(range_start, range_end) {
+                        tracing::debug!(
+                            offset = range_start,
+                            length = range_end - range_start,
+                            "Cache hit (fast path)"
+                        );
+                        let data = cached
+                            .read_range(range_start, range_end)
+                            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
+                        inner.metrics.record_hit("fast_path", range_end - range_start);
+                        inner.metrics.record_read_duration(start);
+                        return Ok(make_read_response(data, None));
                     }
                 }
             }
@@ -866,20 +865,20 @@ impl<A: Access> LayeredAccess for CacheAccessor<A> {
                     .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?
                     .map(|entry| entry.value().clone());
 
-                if let Some(ref cached) = existing {
-                    if cached.covers(range_start, range_end) {
-                        tracing::debug!(
-                            offset = range_start,
-                            length = range_end - range_start,
-                            "Cache hit (after lock)"
-                        );
-                        let data = cached
-                            .read_range(range_start, range_end)
-                            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
-                        inner.metrics.record_hit("lock_path", range_end - range_start);
-                        inner.metrics.record_read_duration(start);
-                        return Ok(make_read_response(data, total_size));
-                    }
+                if let Some(ref cached) = existing
+                    && cached.covers(range_start, range_end)
+                {
+                    tracing::debug!(
+                        offset = range_start,
+                        length = range_end - range_start,
+                        "Cache hit (after lock)"
+                    );
+                    let data = cached
+                        .read_range(range_start, range_end)
+                        .ok_or_else(|| Error::new(ErrorKind::Unexpected, "cache hit but read_range failed"))?;
+                    inner.metrics.record_hit("lock_path", range_end - range_start);
+                    inner.metrics.record_read_duration(start);
+                    return Ok(make_read_response(data, total_size));
                 }
 
                 // Find uncached gaps using the already-fetched entry.

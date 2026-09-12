@@ -34,9 +34,6 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 object_store = { workspace = true }
 
-# URL parsing: reduce Iceberg's absolute file URIs to bucket-relative object keys
-url = { workspace = true }
-
 # HTTP: the pricing crawler fetches rate cards from upstream JSON endpoints.
 # `stream` enables `bytes_stream()`, used to enforce the response size cap
 # before buffering rather than after.

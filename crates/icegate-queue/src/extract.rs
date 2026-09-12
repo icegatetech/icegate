@@ -77,7 +77,7 @@ impl ExtractedValue {
     /// Borrow the string payload if this is a [`Self::Utf8`] value, otherwise
     /// return `None`.
     #[must_use]
-    pub fn as_utf8(&self) -> Option<&str> {
+    pub const fn as_utf8(&self) -> Option<&str> {
         match self {
             Self::Utf8(s) => Some(s.as_str()),
             Self::TimestampMicrosRange(_, _) => None,

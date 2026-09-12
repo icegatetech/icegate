@@ -295,10 +295,10 @@ impl QueryEngine {
 
         // Re-check after acquiring lock — another task may have rebuilt.
         let rechecked = self.provider_rx.borrow().clone();
-        if let Some(cached) = rechecked {
-            if cached.created_at.elapsed() < self.max_age {
-                return Ok(cached.provider);
-            }
+        if let Some(cached) = rechecked
+            && cached.created_at.elapsed() < self.max_age
+        {
+            return Ok(cached.provider);
         }
 
         // Cold cache or stale provider — synchronous rebuild.
