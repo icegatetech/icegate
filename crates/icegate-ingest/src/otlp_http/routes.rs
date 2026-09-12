@@ -514,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_rejects_an_invalid_tenant_header() {
-        let response = multi_router().oneshot(logs_request(&["org:ws"])).await.expect("response");
+        let response = multi_router().oneshot(logs_request(&["org|ws"])).await.expect("response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(error_type_of(response).await, "bad_data");

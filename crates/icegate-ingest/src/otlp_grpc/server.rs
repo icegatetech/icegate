@@ -43,7 +43,8 @@ pub async fn run(
 
     // One tenant interceptor per server: the signal it labels its rejections with
     // is the service's own, known statically, so no request path is parsed.
-    let make_tenant_interceptor = |signal| TenantPolicyInterceptor::new(tenant_resolver.clone(), metrics.clone(), signal);
+    let make_tenant_interceptor =
+        |signal| TenantPolicyInterceptor::new(tenant_resolver.clone(), metrics.clone(), signal);
 
     tracing::info!("Starting OTLP gRPC server on {}", addr);
 
@@ -52,7 +53,10 @@ pub async fn run(
     // `NamedService` passes through both layers, so routing is unaffected.
     Server::builder()
         .add_service(InterceptedService::new(
-            InterceptedService::new(LogsServiceServer::new(service.clone()), make_tenant_interceptor(SIGNAL_LOGS)),
+            InterceptedService::new(
+                LogsServiceServer::new(service.clone()),
+                make_tenant_interceptor(SIGNAL_LOGS),
+            ),
             shed.clone(),
         ))
         .add_service(InterceptedService::new(
@@ -63,7 +67,10 @@ pub async fn run(
             shed.clone(),
         ))
         .add_service(InterceptedService::new(
-            InterceptedService::new(MetricsServiceServer::new(service), make_tenant_interceptor(SIGNAL_METRICS)),
+            InterceptedService::new(
+                MetricsServiceServer::new(service),
+                make_tenant_interceptor(SIGNAL_METRICS),
+            ),
             shed,
         ))
         .serve_with_shutdown(addr, async move {

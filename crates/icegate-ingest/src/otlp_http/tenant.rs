@@ -48,7 +48,11 @@ pub(super) async fn resolve_request_tenant(
         Err(rejection) => rejection,
     };
 
-    metrics.add_tenant_rejection(PROTOCOL_HTTP, signal_kind_from_path(request.uri().path()), rejection.reason());
+    metrics.add_tenant_rejection(
+        PROTOCOL_HTTP,
+        signal_kind_from_path(request.uri().path()),
+        rejection.reason(),
+    );
     drain_request_body(request.into_body(), drain_limit_bytes).await;
 
     reject_request(rejection)

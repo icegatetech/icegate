@@ -97,7 +97,10 @@ impl TenantId {
     /// question about the bytes it was given.
     #[must_use]
     pub fn is_valid(value: &str) -> bool {
-        !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':')
     }
 }
 
@@ -333,6 +336,24 @@ mod tests {
     }
 
     #[test]
+    fn a_tenant_id_may_carry_the_colon_that_separates_org_from_workspace() {
+        assert!(is_valid_tenant_id("2q4mHrPd9kL:7xZa1vB3nQe"));
+        assert_eq!(
+            resolve_tenant_id(Some("2q4mHrPd9kL:7xZa1vB3nQe")),
+            "2q4mHrPd9kL:7xZa1vB3nQe"
+        );
+    }
+
+    /// Widening to `:` must not widen to anything else: path traversal, quotes and
+    /// whitespace stay refused, and an empty id is still not an id.
+    #[test]
+    fn widening_to_the_colon_admits_nothing_else() {
+        for refused in ["", "../etc", "a/b", "a'b", "a b", "a.b", "a\\b", "a\"b"] {
+            assert!(!is_valid_tenant_id(refused), "must refuse {refused:?}");
+        }
+    }
+
+    #[test]
     fn test_valid_tenant_ids() {
         assert!(TenantId::is_valid("default"));
         assert!(TenantId::is_valid("my-tenant"));
@@ -419,7 +440,7 @@ mod tests {
     fn both_modes_reject_an_invalid_value() {
         // `org:ws` is the colon-separated form named by the parent task; the
         // rest are the classes `TenantId::is_valid` excludes.
-        for value in ["", "has space", "org:ws", "has/slash"] {
+        for value in ["", "has space", "has/slash"] {
             for resolver in [single_resolver("acme"), TenantResolver::Multi] {
                 assert_eq!(
                     resolver.resolve_tenant(TenantHeader::Once(value)),
