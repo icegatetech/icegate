@@ -130,12 +130,6 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         &pressure,
     );
 
-    if handles.is_empty() {
-        tracing::warn!("No query servers are enabled in configuration");
-        io_cache.close().await;
-        return Ok(());
-    }
-
     tracing::info!("All enabled query servers started");
     tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
     let failure = await_shutdown(handles, &cancel_token).await;
@@ -168,8 +162,10 @@ type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error
 /// Spawn one async task per enabled server, returning their join handles.
 ///
 /// The metrics server's error is boxed to match the query servers' return
-/// type so the caller can treat every handle uniformly. Returns an empty
-/// vector when no server is enabled.
+/// type so the caller can treat every handle uniformly. Never returns an empty
+/// vector: the operational listener is spawned whatever the configuration says,
+/// and [`QueryConfig::validate`] has already refused a document enabling no
+/// query protocol.
 fn spawn_servers(
     config: &QueryConfig,
     query_engine: &Arc<QueryEngine>,

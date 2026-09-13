@@ -81,11 +81,14 @@ helm-template:
 
 ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test helm-rest-uri-test helm-tenant-test helm-metadata-test catalog-rest-check catalog-rest-test catalog-rest-clippy
 
-# The tenant policy and the auth proxy are the two places where a rendering
-# mistake fails open rather than loudly: a `single` policy with no id rejects
-# every batch, and a proxy that does not move icegate onto the pod loopback
-# leaves the receivers published for any neighbour in the namespace to write to.
-# Neither is visible in the default render, so each is rendered here on purpose.
+# The tenant policy, the auth proxy and the ingest operational listener are the
+# three places where a rendering mistake fails open rather than loudly: a
+# `single` policy with no id rejects every batch, a proxy that does not move
+# icegate onto the pod loopback leaves the receivers published for any neighbour
+# in the namespace to write to, and a loopback `ingest.metrics.host` answers the
+# container alone, so both probes fail with nothing to say beyond that.
+# None of the three is visible in the default render, so each is rendered here
+# on purpose.
 helm-tenant-test:
 	@if error=$$(helm template icegate config/helm/icegate --set ingest.tenant.mode=single --set ingest.tenant.id="" 2>&1 > /dev/null); then \
 		echo "expected tenant.mode=single without tenant.id to fail rendering"; \
@@ -129,11 +132,80 @@ helm-tenant-test:
 		echo "both probes must still address the metrics port by name"; \
 		exit 1; \
 	}
+	@# Every spelling the guard names, the bracketed IPv6 loopback included: that
+	@# is the form run_operational_server parses out of `{host}:{port}`, so a
+	@# guard blind to it would refuse the roundabout spellings alone.
+	@for host in 127.0.0.1 localhost "::1" "[::1]"; do \
+		if error=$$(helm template icegate config/helm/icegate --set "ingest.metrics.host=$$host" 2>&1 > /dev/null); then \
+			echo "expected the loopback ingest.metrics.host $$host to fail rendering: the probes address that listener on the Pod IP"; \
+			exit 1; \
+		fi; \
+		printf '%s\n' "$$error" | grep -F "is a loopback address" > /dev/null || { \
+			echo "ingest.metrics.host $$host failed the render for another reason: $$error"; \
+			exit 1; \
+		}; \
+	done
+	@# A `null` in an overlay removes the key rather than setting one, and an
+	@# empty string renders a listener the ingest pod refuses on load. Both are
+	@# refused by a message that names the key: read straight, the guard would
+	@# abort on a type error addressing a line of _helpers.tpl instead.
+	@for host in null ""; do \
+		if error=$$(helm template icegate config/helm/icegate --set "ingest.metrics.host=$$host" 2>&1 > /dev/null); then \
+			echo "expected ingest.metrics.host=\"$$host\" to fail rendering"; \
+			exit 1; \
+		fi; \
+		printf '%s\n' "$$error" | grep -F "ingest.metrics.host is required" > /dev/null || { \
+			echo "ingest.metrics.host=\"$$host\" failed the render for another reason: $$error"; \
+			exit 1; \
+		}; \
+	done
 	@if error=$$(helm template icegate config/helm/icegate --set ingest.authProxy.enabled=true 2>&1 > /dev/null); then \
 		echo "expected authProxy.enabled without jwt settings to fail rendering"; \
 		exit 1; \
 	fi; \
 	printf '%s\n' "$$error" | grep -F "ingest.authProxy.jwt.issuer is required" > /dev/null
+	@if error=$$(helm template icegate config/helm/icegate --set ingest.authProxy.enabled=true \
+		--set ingest.tenant.mode=multi \
+		--set ingest.authProxy.upstreamTimeout=2s \
+		--set ingest.authProxy.jwt.issuer=https://api.example \
+		--set ingest.authProxy.jwt.audience=icegate-ingest \
+		--set ingest.authProxy.jwt.jwksUri=https://api.example/.well-known/jwks.json \
+		--set ingest.authProxy.tls.secretName=ingest-tls 2>&1 > /dev/null); then \
+		echo "expected an upstreamTimeout below the WAL acknowledgement deadline to fail rendering"; \
+		exit 1; \
+	fi; \
+	printf '%s\n' "$$error" | grep -F "below the WAL acknowledgement deadline" > /dev/null
+	@# The deadline itself, which the message above now names as the accepted
+	@# minimum. Without this case `lt` and `le` render alike on every value the
+	@# repository covers, and the operator could change either way unnoticed.
+	@rendered=$$(helm template icegate config/helm/icegate --set ingest.authProxy.enabled=true \
+		--set ingest.tenant.mode=multi \
+		--set ingest.authProxy.upstreamTimeout=3s \
+		--set ingest.authProxy.jwt.issuer=https://api.example \
+		--set ingest.authProxy.jwt.audience=icegate-ingest \
+		--set ingest.authProxy.jwt.jwksUri=https://api.example/.well-known/jwks.json \
+		--set ingest.authProxy.tls.secretName=ingest-tls) || { \
+		echo "an upstreamTimeout equal to the WAL acknowledgement deadline must render"; \
+		exit 1; \
+	}; \
+	[ "$$(printf '%s\n' "$$rendered" | grep -c -F 'timeout: "3s"')" = "2" ] || { \
+		echo "the accepted upstreamTimeout must reach the route of both proxy listeners"; \
+		exit 1; \
+	}
+	@# The tag is `required` in the template alone: values.schema.json puts no
+	@# constraint on ingest.authProxy.image, so nothing else refuses an empty one,
+	@# and a render without it pins no Envoy release at all.
+	@if error=$$(helm template icegate config/helm/icegate --set ingest.authProxy.enabled=true \
+		--set ingest.tenant.mode=multi \
+		--set ingest.authProxy.image.tag=null \
+		--set ingest.authProxy.jwt.issuer=https://api.example \
+		--set ingest.authProxy.jwt.audience=icegate-ingest \
+		--set ingest.authProxy.jwt.jwksUri=https://api.example/.well-known/jwks.json \
+		--set ingest.authProxy.tls.secretName=ingest-tls 2>&1 > /dev/null); then \
+		echo "expected an empty authProxy.image.tag to fail rendering"; \
+		exit 1; \
+	fi; \
+	printf '%s\n' "$$error" | grep -F "ingest.authProxy.image.tag is required" > /dev/null
 	@if error=$$(helm template icegate config/helm/icegate --set ingest.authProxy.enabled=true \
 		--set ingest.authProxy.jwt.issuer=https://api.example \
 		--set ingest.authProxy.jwt.audience=icegate-ingest \
@@ -219,6 +291,19 @@ helm-tenant-test:
 # throwaway certificate is generated for the validation: without a readable key
 # the load fails on the mount, not on the configuration under test.
 #
+# Both validations run as the invoking user, because the image's entrypoint drops
+# to its own `envoy` account (uid 101) and the generated directory, the private
+# key inside it and a checkout with a restrictive umask are all readable by their
+# owner alone. Under the image's account Envoy reports `Invalid path` for the
+# mounted document, which reads as a broken configuration and is a permission on
+# the host.
+#
+# `--user` alone does not settle it: the entrypoint drops the process when
+# ENVOY_UID is not 0 *and* the container started as uid 0, so a `make` run by
+# root keeps the starting uid at 0 and is dropped to 101 anyway. ENVOY_UID=0
+# falsifies the first half whatever uid the container starts as, and leaves a
+# non-root `--user` untouched.
+#
 # The stand's compose file names the same Envoy release as the chart. Both are
 # pinned by hand, and validating the stand's configuration with the chart's image
 # is what makes a drift between them invisible — so the two tags are compared
@@ -284,10 +369,12 @@ helm-envoy-test:
 	done; \
 	openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=validate \
 		-keyout "$$dir/tls.key" -out "$$dir/tls.crt" 2>/dev/null; \
-	docker run --rm -v "$$dir:/cfg:ro" -v "$$dir/tls.crt:/etc/icegate/tls/tls.crt:ro" \
+	docker run --rm --user "$$(id -u):$$(id -g)" -e ENVOY_UID=0 \
+		-v "$$dir:/cfg:ro" -v "$$dir/tls.crt:/etc/icegate/tls/tls.crt:ro" \
 		-v "$$dir/tls.key:/etc/icegate/tls/tls.key:ro" "$$image" \
 		/usr/local/bin/envoy --mode validate --config-path /cfg/envoy.yaml && \
-	docker run --rm -v "$$PWD/config/docker/auth-proxy:/cfg:ro" "$$image" \
+	docker run --rm --user "$$(id -u):$$(id -g)" -e ENVOY_UID=0 \
+		-v "$$PWD/config/docker/auth-proxy:/cfg:ro" "$$image" \
 		/usr/local/bin/envoy --mode validate --config-path /cfg/envoy.yaml
 
 # End-to-end check of the proxy's rules against a throwaway token issuer: the
@@ -351,11 +438,13 @@ helm-rest-uri-test:
 	fi; \
 	printf '%s\n' "$$error" | grep -F "catalog.rest.uri is required" > /dev/null
 
-# Every Artifact Hub artifact is a copy of something else in the repo: the image
+# Every artifact checked here is a copy of something else in the repo: the image
 # annotations copy the bake targets, the values schema copies the shape of
-# values.yaml, the README copies the install command. A copy goes stale silently,
-# and these particular failures are invisible from inside the repo — a wrong image
-# name simply means Artifact Hub scans nothing and the security badge disappears.
+# values.yaml, the README copies the install command, and _helpers.tpl copies the
+# WAL acknowledgement deadline it checks ingest.authProxy.upstreamTimeout against.
+# A copy goes stale silently, and these particular failures are invisible from
+# inside the repo — a wrong image name simply means Artifact Hub scans nothing and
+# the security badge disappears.
 #
 # Needs helm-docs on PATH to regenerate the README and diff it:
 #   scripts/install-helm-docs.sh

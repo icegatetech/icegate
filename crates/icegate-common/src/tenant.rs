@@ -63,7 +63,7 @@ pub fn resolve_tenant_id(header_value: Option<&str>) -> String {
 /// the same thing.
 fn invalid_tenant_id_error(id: &str) -> CommonError {
     CommonError::Config(format!(
-        "tenant id {id:?} must be non-empty ASCII alphanumeric, hyphens or underscores"
+        "tenant id {id:?} must be non-empty ASCII alphanumeric, hyphens, underscores or colons"
     ))
 }
 
@@ -90,7 +90,7 @@ impl TenantId {
     }
 
     /// Whether `value` may name a tenant: non-empty, and ASCII alphanumeric,
-    /// hyphens or underscores only.
+    /// hyphens, underscores or colons only.
     ///
     /// The rule itself, for a caller that holds a borrowed value and needs no
     /// [`TenantId`]: building one would allocate an `Arc<str>` to answer a

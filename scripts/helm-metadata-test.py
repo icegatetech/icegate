@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Assert the chart's Artifact Hub metadata still matches its sources.
+"""Assert every copy the chart carries still matches the source it came from.
 
-Each artifact checked here is a copy of something else in the repo, so each
-check names the source it must agree with. A failure means the copy drifted,
-not that the source is wrong.
+Each artifact checked here is a copy of something else in the repo — the Artifact
+Hub metadata, the values schema, the generated README, and the deadline the chart
+restates from Rust — so each check names the source it must agree with. A failure
+means the copy drifted, not that the source is wrong.
 """
 import re
 import subprocess
@@ -14,8 +15,10 @@ import yaml
 
 CHART_DIR = Path("config/helm/icegate")
 CHART = CHART_DIR / "Chart.yaml"
+HELPERS = CHART_DIR / "templates/_helpers.tpl"
 BAKE = Path("config/docker/docker-bake.hcl")
 RELEASE = Path(".github/workflows/release.yml")
+WAL_WRITER = Path("crates/icegate-ingest/src/wal/writer.rs")
 
 failures: list[str] = []
 
@@ -106,5 +109,25 @@ elif (CHART_DIR / "README.md").read_text() != before:
     fail("README.md is stale — run helm-docs and commit the result")
 else:
     ok("README.md is up to date")
+
+# 5. The WAL acknowledgement deadline the chart restates to check
+#    ingest.authProxy.upstreamTimeout against. Helm cannot read a Rust constant,
+#    so the copy is unavoidable — and nothing in the pod compares the two, since
+#    the proxy is handed a timeout icegate never sees. A drift would surface only
+#    as telemetry written twice after a retry, far from either value.
+writer_deadline = re.search(r"WAL_ACK_TIMEOUT: Duration = Duration::from_secs\((\d+)\)", WAL_WRITER.read_text())
+chart_deadline = re.search(r"\$walAckTimeoutSecs := (\d+)", HELPERS.read_text())
+if not writer_deadline or not chart_deadline:
+    fail(
+        f"the WAL acknowledgement deadline is no longer readable from "
+        f"{'writer.rs' if not writer_deadline else '_helpers.tpl'}; update this check or the definition"
+    )
+elif writer_deadline.group(1) != chart_deadline.group(1):
+    fail(
+        f"_helpers.tpl restates the WAL acknowledgement deadline as {chart_deadline.group(1)}s, "
+        f"writer.rs defines {writer_deadline.group(1)}s"
+    )
+else:
+    ok(f"chart restates the WAL acknowledgement deadline as {writer_deadline.group(1)}s")
 
 sys.exit(1 if failures else 0)

@@ -10,7 +10,18 @@ on:
       - 'config/docker/docker-compose.proxy.yml'
       # the loopback ports helm-envoy-test compares against auth-proxy/envoy.yaml
       - 'config/docker/ingest-proxy.yaml'
+      # read by make helm-metadata-test: the bake targets and the release job it
+      # compares the chart's metadata against, and the overlays it installs the
+      # values schema over
+      - 'config/docker/docker-bake.hcl'
+      - '.github/workflows/release.yml'
+      - 'config/kustomize/overlays/*/values-icegate.yaml'
+      # the WAL acknowledgement deadline _helpers.tpl restates, compared against
+      # its definition by the same target
+      - 'crates/icegate-ingest/src/wal/writer.rs'
       - 'scripts/authproxy-test.sh'
+      - 'scripts/helm-metadata-test.py'
+      - 'scripts/install-helm-docs.sh'
       - 'Makefile'
       - '.github/workflows/deploy-config.yml'
   pull_request:
@@ -22,10 +33,24 @@ on:
       - 'config/docker/docker-compose.proxy.yml'
       # the loopback ports helm-envoy-test compares against auth-proxy/envoy.yaml
       - 'config/docker/ingest-proxy.yaml'
+      # read by make helm-metadata-test: the bake targets and the release job it
+      # compares the chart's metadata against, and the overlays it installs the
+      # values schema over
+      - 'config/docker/docker-bake.hcl'
+      - '.github/workflows/release.yml'
+      - 'config/kustomize/overlays/*/values-icegate.yaml'
+      # the WAL acknowledgement deadline _helpers.tpl restates, compared against
+      # its definition by the same target
+      - 'crates/icegate-ingest/src/wal/writer.rs'
       - 'scripts/authproxy-test.sh'
+      - 'scripts/helm-metadata-test.py'
+      - 'scripts/install-helm-docs.sh'
       - 'Makefile'
       - '.github/workflows/deploy-config.yml'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   deploy-config:

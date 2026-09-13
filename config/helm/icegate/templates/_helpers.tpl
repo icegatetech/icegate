@@ -318,6 +318,16 @@ addresses the Service ports, those ports reach the proxy's listeners, and the
 listeners speak TLS — while what makes a controller reach a TLS backend lives in
 the controller's own configuration, outside this chart's reach.
 
+`upstreamTimeout` is checked against the WAL acknowledgement deadline, whose
+seconds are restated here as a literal. That restatement is the same trade
+`icegate.validateRetentionWindow` makes below and is taken for the same reason:
+the bound is not the chart's to invent, but the alternative is worse. icegate
+loads a timeout the proxy has already been given, so nothing in the pod compares
+the two, and the mismatch surfaces only as duplicated telemetry after a retry —
+far from the values that caused it. The deadline lives in
+`crates/icegate-ingest/src/wal/writer.rs`, and `make helm-metadata-test` compares
+the two, so a change there fails that target until it is a change here too.
+
 Usage: include "icegate.validateAuthProxy" .
 */}}
 {{- define "icegate.validateAuthProxy" -}}
@@ -329,9 +339,53 @@ Usage: include "icegate.validateAuthProxy" .
 {{- if .Values.ingest.ingress.enabled }}
 {{- fail "ingest.ingress.enabled together with ingest.authProxy.enabled: the Service ports the Ingress addresses are the proxy's, and the proxy terminates TLS on them (the OTLP/gRPC one negotiates h2 through ALPN). What an Ingress controller has to be told to reach a TLS backend is the controller's own setting, which this chart neither renders nor can check, so the pairing is refused here instead of creating an Ingress whose every request fails the handshake. Publish the proxy through the Service (its ports already carry TLS), or turn ingest.authProxy.enabled off" }}
 {{- end }}
+{{- $walAckTimeoutSecs := 3 }}
+{{- $upstreamTimeoutSecs := .Values.ingest.authProxy.upstreamTimeout | trimSuffix "s" | int }}
+{{- if lt $upstreamTimeoutSecs $walAckTimeoutSecs }}
+{{- fail (printf "ingest.authProxy.upstreamTimeout (%ds) is below the WAL acknowledgement deadline in crates/icegate-ingest/src/wal/writer.rs: icegate answers an OTLP request only once the batch is durable, so a proxy giving up first reports a failure for a write that still commits, and the sender's retry writes the batch twice. Raise it to %ds or more" $upstreamTimeoutSecs $walAckTimeoutSecs) }}
+{{- end }}
 {{- if and (eq .Values.ingest.tenant.mode "single") (eq .Values.ingest.tenant.id "default") }}
 {{- fail "ingest.tenant is still the chart default (mode single, id \"default\") while ingest.authProxy.enabled: the proxy writes x-scope-orgid from the token's tenant_id claim, and a single policy on the default id refuses every batch the issuer signs for any other tenant. Set ingest.tenant.mode=multi, or ingest.tenant.id to the one id this deployment's issuer emits" }}
 {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Fail the render when the ingest operational listener is bound where the kubelet
+cannot reach it.
+
+That listener carries `/health`, and both probes in `values.yaml` address it with
+an `httpGet` that names no `host`, which the kubelet resolves to the Pod IP. A
+loopback bind therefore answers the container itself and nobody else: readiness
+never passes, liveness restarts the container, and the deployment never reports a
+reason beyond a failing probe. The OTLP listeners have the opposite requirement
+and move to loopback under `ingest.authProxy.enabled` — hence two hosts rather
+than one, and hence this check naming only the operational one.
+
+The whole 127.0.0.0/8 range is refused, not just the address `values.yaml`
+ships: every one of them is local to the container.
+
+The IPv6 loopback is refused in both spellings. `run_operational_server` joins
+host and port as `{host}:{port}`, so the bracketed `[::1]` is the form that
+parses as a socket address there — and the form every tool prints — while the
+bare `::1` reaches the same bind only through the resolver. Refusing one of the
+two would close the roundabout path and leave the direct one open.
+
+The value is `required` rather than read straight, and through the parenthesised
+path, for the reason `icegate.validateRetentionWindow` uses the same pair below:
+Helm reads a `null` in an overlay as the removal of the key, so the check would
+otherwise abort on `invalid value; expected string`, naming a line of this file
+and none of the operator's own values. `required` rejects nil and the empty
+string alike, and the empty one is worth rejecting here too — it renders a
+listener config the ingest pod refuses on load, which is the same failure one
+deploy later.
+
+Usage: include "icegate.validateOperationalHost" .
+*/}}
+{{- define "icegate.validateOperationalHost" -}}
+{{- $host := required "ingest.metrics.host is required: the operational listener binds it whatever ingest.metrics.enabled says, and the probes address that listener on the Pod IP. Bind 0.0.0.0" (.Values.ingest.metrics).host }}
+{{- if or (hasPrefix "127." $host) (eq $host "localhost") (eq $host "::1") (eq $host "[::1]") }}
+{{- fail (printf "ingest.metrics.host (%s) is a loopback address: the operational listener carries /health, and both probes address it on the Pod IP, so this bind fails every readiness check and restarts the container on liveness. Bind 0.0.0.0" $host) }}
 {{- end }}
 {{- end }}
 

@@ -1,32 +1,25 @@
 # Tenancy mode
 
-The `tenant` key of the ingest configuration decides which tenant an OTLP
-request writes to, on the request's headers alone — before the body is
-decompressed or decoded. There is no fallback: a request the policy cannot
-resolve is refused, and nothing reaches the WAL.
+The `tenant` key of the ingest configuration decides which tenant an OTLP request
+writes to, on the request's headers alone — before the body is decompressed or
+decoded. There is no fallback: a request the policy cannot resolve is refused,
+and nothing reaches the WAL.
 
-| `tenant` | no `x-scope-orgid` | header names the configured tenant | header names another tenant | header appears twice |
-|---|---|---|---|---|
-| `!single` with `id` | writes to `id` | writes to `id` | refused | refused |
-| `!multi` | refused | — | writes to the header value | refused |
+The policy is `TenantPolicy` / `TenantResolver` in
+[`icegate-common`](../icegate-common/src/tenant.rs), whose doc comments carry the
+decision table of both modes, the identifiers a tenant may be named by, and what
+a configuration with no `tenant` section means. It is applied by
+[`otlp_http/tenant.rs`](src/otlp_http/tenant.rs) — a layer above decompression —
+and by [`otlp_grpc/tenant.rs`](src/otlp_grpc/tenant.rs) — an interceptor above
+the protobuf decode; each names the status its own protocol answers a refusal
+with, and both meter it through `OtlpMetrics::add_tenant_rejection`
+([`infra/metrics.rs`](src/infra/metrics.rs)).
 
-A header value is usable when it is non-empty and consists of ASCII
-alphanumerics, hyphens, and underscores; anything else is refused as well.
-`!single` consults the header rather than ignoring it, so a sender addressing
-another tenant is refused instead of silently written to `id`. Omitting the
-`tenant` key gives `!single` on `default`, which is what ingest wrote to before
-the policy existed.
-
-A refusal is `400` with `errorType: "bad_data"` on OTLP/HTTP and
-`INVALID_ARGUMENT` on OTLP/gRPC, and increments
-`icegate_ingest_otlp_tenant_rejections` with labels `protocol`, `signal`, and
-`reason` (`missing`, `invalid`, `duplicate_header`). On OTLP/HTTP the request
-body is drained before the status is written, so a client that has already begun
-uploading reads the status instead of a connection reset.
-
-`!multi` takes the tenant from whoever reaches the port, so it belongs behind an
-auth proxy that authenticates the sender and writes the header itself. Deployed
-without one, it lets any client on the network choose the tenant it writes to.
+What none of them can state, because it belongs to the deployment rather than to
+the resolver: `!multi` takes the tenant from whoever reaches the port, so it
+belongs behind an auth proxy that authenticates the sender and writes
+`x-scope-orgid` itself. Without one, any client on the network chooses the tenant
+it writes to.
 
 ## Checking the auth proxy on the dev stand
 

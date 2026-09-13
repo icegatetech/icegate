@@ -9,6 +9,7 @@ metadata:
 data:
   ingest.yaml: |
     {{- include "icegate.validateAuthProxy" . }}
+    {{- include "icegate.validateOperationalHost" . }}
     {{- include "icegate.tenantYaml" . | nindent 4 }}
     catalog:
       {{- include "icegate.catalogYaml" . | nindent 6 }}

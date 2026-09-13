@@ -98,7 +98,11 @@ spec:
         # and rewrites x-scope-orgid from its tenant_id claim. icegate itself
         # listens on the pod loopback while this container runs.
         - name: auth-proxy
-          image: {{ include "icegate.image" (dict "image" .Values.ingest.authProxy.image "tag" "v1.36.10") }}
+          {{- /* Written out rather than through `icegate.image`: that helper
+                 exists to fall back to a second source for the tag, and this
+                 image has none — its tag is required, so the fallback could
+                 only be the very field it stands in for. */}}
+          image: {{ .Values.ingest.authProxy.image.repository }}:{{ required "ingest.authProxy.image.tag is required: the filter chain this chart renders is accepted by a specific Envoy release, and there is no appVersion to fall back to for a third-party image" .Values.ingest.authProxy.image.tag }}
           imagePullPolicy: {{ .Values.ingest.authProxy.image.pullPolicy }}
           command:
             - /usr/local/bin/envoy

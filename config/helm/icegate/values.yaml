@@ -426,11 +426,14 @@ ingest:
     enabled: false
     image:
       repository: envoyproxy/envoy
-      ## Empty means the pinned default in templates/deployment-ingest.yaml.
       ## Pinned rather than floating: the filter chain this chart renders is
       ## accepted by a specific Envoy release, and a moving tag changes that
-      ## contract without a change here.
-      tag: ""
+      ## contract without a change here. Unlike the icegate images, whose tag
+      ## falls back to the chart's appVersion, this one names a third-party
+      ## release and has no such source — so it is stated here, where the
+      ## generated README reports it, rather than as a literal in the template.
+      ## make helm-envoy-test compares it against docker-compose.proxy.yml.
+      tag: "v1.36.10"
       pullPolicy: IfNotPresent
     ## Token issuer, audience and JWKS endpoint. No defaults: icegate must not
     ## carry the control plane's addresses.
@@ -476,7 +479,9 @@ ingest:
     ## in the WAL, and a request the proxy gives up on is reported to the sender
     ## as a failure while icegate may still commit it — the retry that follows
     ## then writes the batch twice. Without this key the ceiling would be
-    ## whatever the proxy image defaults to, which no values file states.
+    ## whatever the proxy image defaults to, which no values file states. The
+    ## render refuses a value below icegate's own WAL acknowledgement deadline
+    ## for that reason.
     upstreamTimeout: "30s"
     resources: {}
 
