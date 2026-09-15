@@ -5,8 +5,8 @@
 #   - `!multi`: the tenant comes from x-scope-orgid, which the proxy writes from
 #     the ingest token's tenant_id claim after dropping whatever the client sent;
 #   - the OTLP listeners move to the pod loopback, because the proxy owns the
-#     published 4317/4318. Same split the chart renders under
-#     ingest.authProxy.enabled.
+#     published 4317/4318. Same split the deployment example configures through
+#     ingest.otlpHttp.host / ingest.otlpGrpc.host.
 tenant: !multi
 
 catalog:

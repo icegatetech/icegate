@@ -87,7 +87,9 @@ annotations:
     - kind: changed
       description: ingest probes moved to /health on the operational listener (ingest.metrics.port) from the OTLP port
     - kind: added
-      description: Optional Envoy auth proxy in front of the ingest receivers (ingest.authProxy), terminating TLS and writing x-scope-orgid from the ingest token
+      description: ingest.otlpHttp.host and ingest.otlpGrpc.host, the bind addresses of the OTLP receivers
+    - kind: added
+      description: ingest.extraContainers and ingest.extraVolumes, for sidecars the chart does not ship
     - kind: added
       description: ingest.metrics.host, the bind address of the operational listener
   # Rewritten by .github/workflows/release.yml from the tag: a tag containing a hyphen

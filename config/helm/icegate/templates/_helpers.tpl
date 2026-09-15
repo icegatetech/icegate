@@ -195,159 +195,23 @@ tenant: !multi
 {{- end }}
 
 {{/*
-Render the auth proxy's HTTP filter chain (zero-indented). Both listeners use the
-same one, so it is defined once here.
+Answer whether a listener host is reachable only from inside the container.
 
-Four filters, and the order is the contract:
-  1. header_mutation drops whatever the client sent as x-scope-orgid. It has to
-     be a filter, and it has to be this one: route-level `request_headers_to_remove`
-     is applied by the router filter, which runs last, so it would delete the value
-     jwt_authn wrote rather than the one the client sent, and every request would
-     reach icegate with no tenant at all.
-  2. jwt_authn verifies the ingest token and copies its `tenant_id` claim into
-     the now-empty x-scope-orgid header the ingest handlers read. `forward: false`
-     keeps the token itself from reaching icegate.
-  3. rbac checks both halves of the token profile, and a request needs both.
-     The JOSE `typ` of the header says the object is an access token rather
-     than any other JOSE object the same key signs; the payload `typ` is the
-     issuer's own discriminator, which says *which* application token this is.
-     The audience replaces neither: it separates the ingest token from the API
-     token, not an ingest token from any other token the same issuer signs for
-     the same audience. Both markers are pinned by scripts/authproxy-test.sh.
-  4. router proxies what survived.
+Returns a non-empty string for a loopback address and the empty string otherwise,
+which is how Helm spells a boolean a caller can test with `if`.
 
-Usage: include "icegate.authProxyHttpFilters" .
+The whole 127.0.0.0/8 range counts, not just the address `values.yaml` ships, and
+the IPv6 loopback counts in both spellings: `run_operational_server` joins host
+and port as `{host}:{port}`, so the bracketed `[::1]` is the form that parses as a
+socket address there, while the bare `::1` reaches the same bind through the
+resolver.
+
+Usage: include "icegate.isLoopbackHost" .Values.ingest.otlpHttp.host
 */}}
-{{- define "icegate.authProxyHttpFilters" -}}
-- name: envoy.filters.http.header_mutation
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
-    mutations:
-      request_mutations:
-        - remove: x-scope-orgid
-- name: envoy.filters.http.jwt_authn
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
-    providers:
-      ingest_token:
-        issuer: {{ .Values.ingest.authProxy.jwt.issuer | quote }}
-        audiences:
-          - {{ .Values.ingest.authProxy.jwt.audience | quote }}
-        forward: false
-        # Both halves of the token reach rbac below, which is the only filter
-        # that reads either: without these keys the metadata carries nothing and
-        # a principal stated over it admits every token jwt_authn verified.
-        header_in_metadata: jwt_header
-        payload_in_metadata: jwt_payload
-        clock_skew_seconds: {{ .Values.ingest.authProxy.jwt.clockSkewSeconds }}
-        # The only place a token is taken from. With no extractor named,
-        # jwt_authn also accepts an `access_token` query parameter, and a URL is
-        # written to access logs and traces by everything it passes through.
-        from_headers:
-          - name: Authorization
-            value_prefix: "Bearer "
-        claim_to_headers:
-          - header_name: x-scope-orgid
-            claim_name: tenant_id
-        remote_jwks:
-          http_uri:
-            uri: {{ .Values.ingest.authProxy.jwt.jwksUri | quote }}
-            cluster: token_issuer_jwks
-            timeout: 5s
-          cache_duration: {{ printf "%ds" (int .Values.ingest.authProxy.jwt.jwksCacheDurationSecs) | quote }}
-          # Fetched in the background so the proxy starts even while the issuer
-          # is unreachable.
-          async_fetch: {}
-    rules:
-      - match: { prefix: / }
-        requires: { provider_name: ingest_token }
-- name: envoy.filters.http.rbac
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
-    rules:
-      action: ALLOW
-      policies:
-        # `principals.metadata` is marked deprecated by Envoy 1.36 (it still
-        # loads, with a warning). The replacement is a CEL `condition` over the
-        # same jwt_authn metadata; swap it when this image stops accepting the
-        # field, not before — the CEL form is longer and harder to read.
-        ingest_tokens_only:
-          permissions:
-            - any: true
-          principals:
-            - and_ids:
-                ids:
-                  - metadata:
-                      filter: envoy.filters.http.jwt_authn
-                      path:
-                        - key: jwt_header
-                        - key: typ
-                      value:
-                        string_match: { exact: {{ .Values.ingest.authProxy.jwt.headerType | quote }} }
-                  - metadata:
-                      filter: envoy.filters.http.jwt_authn
-                      path:
-                        - key: jwt_payload
-                        - key: typ
-                      value:
-                        string_match: { exact: {{ .Values.ingest.authProxy.jwt.tokenType | quote }} }
-- name: envoy.filters.http.router
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-{{- end }}
-
-{{/*
-Fail the render when the auth proxy is enabled without the settings it cannot
-work around. Every one of them names something outside this chart — the token
-issuer, its JWKS endpoint, the audience, and the Secret holding the server
-certificate — so there is nothing to default to, and a proxy started without them
-either rejects every request or, worse, accepts tokens it should not.
-
-The tenant policy is checked alongside them. The proxy writes x-scope-orgid from
-the token's `tenant_id` claim, and a `single` policy accepts that header only
-when it names the configured id, so a deployment left on the chart's default id
-refuses every batch the issuer signs for anything else — with nothing in the
-render to say so. `single` behind the proxy is not forbidden outright: a
-single-customer deployment whose issuer puts exactly that id in the token is
-legitimate, and it passes as soon as the id is the operator's own rather than the
-value shipped in values.yaml.
-
-`ingest.ingress` is refused outright, and for the same reason the list above
-exists: the pairing renders cleanly and then fails every request. The Ingress
-addresses the Service ports, those ports reach the proxy's listeners, and the
-listeners speak TLS — while what makes a controller reach a TLS backend lives in
-the controller's own configuration, outside this chart's reach.
-
-`upstreamTimeout` is checked against the WAL acknowledgement deadline, whose
-seconds are restated here as a literal. That restatement is the same trade
-`icegate.validateRetentionWindow` makes below and is taken for the same reason:
-the bound is not the chart's to invent, but the alternative is worse. icegate
-loads a timeout the proxy has already been given, so nothing in the pod compares
-the two, and the mismatch surfaces only as duplicated telemetry after a retry —
-far from the values that caused it. The deadline lives in
-`crates/icegate-ingest/src/wal/writer.rs`, and `make helm-metadata-test` compares
-the two, so a change there fails that target until it is a change here too.
-
-Usage: include "icegate.validateAuthProxy" .
-*/}}
-{{- define "icegate.validateAuthProxy" -}}
-{{- if and .Values.ingest.enabled .Values.ingest.authProxy.enabled }}
-{{- if not .Values.ingest.authProxy.jwt.issuer }}{{ fail "ingest.authProxy.jwt.issuer is required when ingest.authProxy.enabled" }}{{ end }}
-{{- if not .Values.ingest.authProxy.jwt.audience }}{{ fail "ingest.authProxy.jwt.audience is required when ingest.authProxy.enabled" }}{{ end }}
-{{- if not .Values.ingest.authProxy.jwt.jwksUri }}{{ fail "ingest.authProxy.jwt.jwksUri is required when ingest.authProxy.enabled" }}{{ end }}
-{{- if not .Values.ingest.authProxy.tls.secretName }}{{ fail "ingest.authProxy.tls.secretName is required when ingest.authProxy.enabled" }}{{ end }}
-{{- if .Values.ingest.ingress.enabled }}
-{{- fail "ingest.ingress.enabled together with ingest.authProxy.enabled: the Service ports the Ingress addresses are the proxy's, and the proxy terminates TLS on them (the OTLP/gRPC one negotiates h2 through ALPN). What an Ingress controller has to be told to reach a TLS backend is the controller's own setting, which this chart neither renders nor can check, so the pairing is refused here instead of creating an Ingress whose every request fails the handshake. Publish the proxy through the Service (its ports already carry TLS), or turn ingest.authProxy.enabled off" }}
-{{- end }}
-{{- $walAckTimeoutSecs := 3 }}
-{{- $upstreamTimeoutSecs := .Values.ingest.authProxy.upstreamTimeout | trimSuffix "s" | int }}
-{{- if lt $upstreamTimeoutSecs $walAckTimeoutSecs }}
-{{- fail (printf "ingest.authProxy.upstreamTimeout (%ds) is below the WAL acknowledgement deadline in crates/icegate-ingest/src/wal/writer.rs: icegate answers an OTLP request only once the batch is durable, so a proxy giving up first reports a failure for a write that still commits, and the sender's retry writes the batch twice. Raise it to %ds or more" $upstreamTimeoutSecs $walAckTimeoutSecs) }}
-{{- end }}
-{{- if and (eq .Values.ingest.tenant.mode "single") (eq .Values.ingest.tenant.id "default") }}
-{{- fail "ingest.tenant is still the chart default (mode single, id \"default\") while ingest.authProxy.enabled: the proxy writes x-scope-orgid from the token's tenant_id claim, and a single policy on the default id refuses every batch the issuer signs for any other tenant. Set ingest.tenant.mode=multi, or ingest.tenant.id to the one id this deployment's issuer emits" }}
-{{- end }}
-{{- end }}
+{{- define "icegate.isLoopbackHost" -}}
+{{- if or (hasPrefix "127." .) (eq . "localhost") (eq . "::1") (eq . "[::1]") -}}
+true
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -358,18 +222,15 @@ That listener carries `/health`, and both probes in `values.yaml` address it wit
 an `httpGet` that names no `host`, which the kubelet resolves to the Pod IP. A
 loopback bind therefore answers the container itself and nobody else: readiness
 never passes, liveness restarts the container, and the deployment never reports a
-reason beyond a failing probe. The OTLP listeners have the opposite requirement
-and move to loopback under `ingest.authProxy.enabled` — hence two hosts rather
-than one, and hence this check naming only the operational one.
+reason beyond a failing probe. The OTLP listeners have the opposite requirement:
+an operator moves them to loopback through `ingest.otlpHttp.host` /
+`ingest.otlpGrpc.host` when something else publishes their ports — hence separate
+hosts, and hence this check naming only the operational one, which has to stay on
+the Pod IP whatever the others do.
 
-The whole 127.0.0.0/8 range is refused, not just the address `values.yaml`
-ships: every one of them is local to the container.
-
-The IPv6 loopback is refused in both spellings. `run_operational_server` joins
-host and port as `{host}:{port}`, so the bracketed `[::1]` is the form that
-parses as a socket address there — and the form every tool prints — while the
-bare `::1` reaches the same bind only through the resolver. Refusing one of the
-two would close the roundabout path and leave the direct one open.
+Which addresses count as loopback is `icegate.isLoopbackHost` above, so this
+check and the port declarations of `deployment-ingest.yaml` cannot disagree on
+the answer.
 
 The value is `required` rather than read straight, and through the parenthesised
 path, for the reason `icegate.validateRetentionWindow` uses the same pair below:
@@ -384,8 +245,83 @@ Usage: include "icegate.validateOperationalHost" .
 */}}
 {{- define "icegate.validateOperationalHost" -}}
 {{- $host := required "ingest.metrics.host is required: the operational listener binds it whatever ingest.metrics.enabled says, and the probes address that listener on the Pod IP. Bind 0.0.0.0" (.Values.ingest.metrics).host }}
-{{- if or (hasPrefix "127." $host) (eq $host "localhost") (eq $host "::1") (eq $host "[::1]") }}
+{{- if include "icegate.isLoopbackHost" $host }}
 {{- fail (printf "ingest.metrics.host (%s) is a loopback address: the operational listener carries /health, and both probes address it on the Pod IP, so this bind fails every readiness check and restarts the container on liveness. Bind 0.0.0.0" $host) }}
+{{- end }}
+{{- end }}
+
+{{/*
+The OTLP port the Service publishes, which is the port a sender addresses.
+
+`ingest.service.otlpHttpPort` / `ingest.service.otlpGrpcPort` state it; left
+unset each follows the receiver port, the same number while icegate is the
+published listener itself and a different one as soon as a sidecar owns the
+published ports.
+
+Every template answering "where does a sender connect" reads it here rather than
+restating the expression: `service-ingest.yaml` publishes the port and `NOTES.txt`
+prints the `kubectl port-forward` command that addresses the Service by it. Built
+from the receiver port instead, that command names a port that exists only inside
+the pod, and it is the first text an operator of the sidecar example sees.
+
+Usage: include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpHttp")
+*/}}
+{{- define "icegate.ingestPublishedPort" -}}
+{{- $receiver := index .context.Values.ingest .signal -}}
+{{- index .context.Values.ingest.service (printf "%sPort" .signal) | default $receiver.port -}}
+{{- end }}
+
+{{/*
+Fail the render when an enabled OTLP receiver carries no bind address.
+
+Both reasons `icegate.validateOperationalHost` states for reading its host
+through `required` and the parenthesised path hold here unchanged: Helm reads a
+`null` in an overlay as the removal of the key, so the value reaches
+`icegate.isLoopbackHost` in `deployment-ingest.yaml` as nil and aborts the render
+on a line of this file, naming none of the operator's own values; and the empty
+string renders a listener config the ingest pod refuses on load, because
+`{host}:{port}` is what it parses as a socket address.
+
+Which address it is decides a second thing. The operational listener has to stay
+on the Pod IP; these two are the ones an operator deliberately moves to the
+loopback when a sidecar publishes their ports — and then `deployment-ingest.yaml`
+declares no port for that receiver, while `service-ingest.yaml` keeps addressing
+`targetPort` by the same name. So a loopback bind is accepted only alongside a
+container in `ingest.extraContainers` declaring that port name: without one the
+Service names a port no container in the pod declares, its EndpointSlice carries
+none, and a sender is refused the connection by a pod that is Ready and logs
+nothing. The check reads `ports[].name` and nothing else, so the chart still
+learns nothing about what that container runs.
+
+Each receiver is checked only while it is enabled: a disabled one binds nothing,
+and its host is then a key the operator has no reason to carry.
+
+Usage: include "icegate.validateOtlpHosts" .
+*/}}
+{{- define "icegate.validateOtlpHosts" -}}
+{{- $portNames := dict "otlpHttp" "otlp-http" "otlpGrpc" "otlp-grpc" }}
+{{- range $signal, $portName := $portNames }}
+{{/* `index` on a missing key yields nil rather than aborting, and the default
+     turns an explicitly null receiver map into one the field access below
+     reads as absent — the same reason the parenthesised path serves
+     `icegate.validateOperationalHost`. */}}
+{{- $receiver := default (dict) (index $.Values.ingest $signal) }}
+{{- if $receiver.enabled }}
+{{- $host := required (printf "ingest.%s.host is required: the receiver binds it, and neither an absent nor an empty value is an address — the ingest pod refuses the rendered listener on load. Bind 0.0.0.0, or a loopback address when a sidecar publishes the port" $signal) $receiver.host }}
+{{- if include "icegate.isLoopbackHost" $host }}
+{{- $isPortDeclared := false }}
+{{- range $container := default (list) $.Values.ingest.extraContainers }}
+{{- range $port := default (list) $container.ports }}
+{{- if eq (default "" $port.name) $portName }}
+{{- $isPortDeclared = true }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if not $isPortDeclared }}
+{{- fail (printf "ingest.%s.host (%s) is a loopback address, so this container declares no %s port, and the Service addresses that name as its targetPort: no container of ingest.extraContainers declares it either, so the pod publishes nothing and a sender is refused the connection. Add the container that listens on %s with a port named %s, or bind 0.0.0.0" $signal $host $portName $portName $portName) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 

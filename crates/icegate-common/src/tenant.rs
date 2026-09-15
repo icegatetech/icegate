@@ -359,6 +359,7 @@ mod tests {
         assert!(TenantId::is_valid("my-tenant"));
         assert!(TenantId::is_valid("tenant_123"));
         assert!(TenantId::is_valid("Org-42_prod"));
+        assert!(TenantId::is_valid("my_org:my-work"));
         assert!(TenantId::is_valid("a"));
     }
 

@@ -4,13 +4,16 @@
 #
 # What it pins, and why none of it is visible in a YAML diff:
 #   - the client's own x-scope-orgid never reaches icegate, and the value that
-#     does comes from the token's tenant_id claim (the filter order in
-#     icegate.authProxyHttpFilters is what makes this true; the route-level form
-#     of the same rule would delete the token's value instead);
+#     does comes from the token's tenant_id claim (the filter order of the
+#     configuration under test is what makes this true; the route-level form of
+#     the same rule would delete the token's value instead);
 #   - a token whose payload `typ` is not the discriminator the configuration
 #     under test admits is refused, and a token whose JOSE `typ` is not the one
 #     it admits is refused too; both values are read out of that configuration
 #     rather than named here;
+#   - a token carrying no tenant_id claim is refused by the proxy rather than
+#     forwarded: the header the claim is copied into is then absent, and icegate
+#     answers such a request 400 — the batch blamed for a fault of the token;
 #   - a token offered as an `access_token` query parameter is not a token: the
 #     Authorization header is the only place the configuration takes one from,
 #     so a bearer never reaches an access log through a URL;
@@ -37,28 +40,40 @@
 #     the token is what admits a request and the route table is not a second,
 #     silent allow-list of the paths icegate happens to serve today.
 #
-# Both copies of the filter chain are checked: the one the Helm chart renders and
-# the one the Compose stand ships. They are meant to agree, and nothing else
-# fails when they stop agreeing.
+# Both copies of the filter chain are checked: the one the deployment example
+# ships (config/helm/auth-proxy) and the one the Compose stand ships. They are
+# meant to agree, and nothing else fails when they stop agreeing. The example's
+# listeners terminate TLS, so its cases run over https and the stand's over http.
 #
 # The issuer here is a throwaway RSA key generated per run; no token issuer of
 # any deployment is contacted, and the keys never leave the temporary directory.
 #
-# Requires: docker (OrbStack), helm, openssl, curl. Not part of `make ci` —
-# see the `authproxy-test` target in the Makefile.
+# Requires: docker (OrbStack), openssl, curl. Not part of `make ci` — see the
+# `authproxy-test` target in the Makefile.
 set -euo pipefail
 
 # The issuer the stand's copy carries, read out of it rather than pinned here: a
 # token minted under any other name is refused by jwt_authn before a single case
-# runs, and the chart render below is given the same value so both configurations
+# runs. The example's copy is held to the same name below, so both configurations
 # check one issuer.
 readonly STAND_CONFIG="config/docker/auth-proxy/envoy.yaml"
+readonly EXAMPLE_CONFIGMAP="config/helm/auth-proxy/configmap-envoy.yaml"
+readonly EXAMPLE_VALUES="config/helm/auth-proxy/values-authproxy.yaml"
 ISSUER=$(awk '$1 == "issuer:" { print $2; exit }' "$STAND_CONFIG" | tr -d '"')
 readonly ISSUER
 [ -n "$ISSUER" ] || {
     echo "$STAND_CONFIG names no issuer" >&2
     exit 1
 }
+# One issuer for both copies: every token is minted under the name read above, so
+# a copy that names another one refuses every case of its own half of the run —
+# and says only that the proxy never became ready.
+example_issuer=$(awk '$1 == "issuer:" { print $2; exit }' "$EXAMPLE_CONFIGMAP" | tr -d '"')
+[ "$example_issuer" = "$ISSUER" ] || {
+    echo "$EXAMPLE_CONFIGMAP issues for $example_issuer, $STAND_CONFIG for $ISSUER" >&2
+    exit 1
+}
+unset example_issuer
 # The host the token_issuer_jwks cluster addresses. Derived from the issuer
 # rather than named again, so pointing the configuration at another issuer moves
 # the JWKS rewrite in prepare_stand_config with it instead of leaving the cluster
@@ -84,8 +99,8 @@ readonly GRPC_EXPORT_PATH="/opentelemetry.proto.collector.logs.v1.LogsService/Ex
 readonly GRPC_SLOW_EXPORT_PATH="/opentelemetry.proto.collector.logs.v1.LogsService/ExportSlow"
 readonly PYTHON_IMAGE="python:3.13-alpine"
 
-# Read out of the chart render rather than pinned here: the version the chart
-# deploys is the version the checks have to run against. The ports each
+# Read out of the example's values rather than pinned here: the version that
+# example deploys is the version the checks have to run against. The ports each
 # configuration binds are read the same way, out of the configuration under test
 # — hardcoding them here would turn a re-defaulted port into a readiness timeout
 # with no indication of what moved.
@@ -130,22 +145,6 @@ readonly UPSTREAM_CONTAINER="icegate-authproxy-upstream"
 readonly GRPC_UPSTREAM_CONTAINER="icegate-authproxy-upstream-grpc"
 readonly JWKS_CONTAINER="icegate-authproxy-jwks"
 readonly PROXY_CONTAINER="icegate-authproxy-envoy"
-
-# What the chart is rendered with, in one place: the same render carries both the
-# configuration under test and the image tag the containers run, and a value the
-# chart requires that reached only one of two lists would surface as "the chart
-# render named no proxy image" rather than as the value that is missing.
-# `tenant.mode=multi` belongs to it because the chart refuses the default tenant
-# behind the proxy (icegate.validateAuthProxy).
-CHART_SET_ARGS=(
-    --set ingest.tenant.mode=multi
-    --set ingest.authProxy.enabled=true
-    --set ingest.authProxy.jwt.issuer="$ISSUER"
-    --set ingest.authProxy.jwt.audience="$AUDIENCE"
-    --set ingest.authProxy.jwt.jwksUri="http://$JWKS_CONTAINER:$JWKS_PORT/jwks.json"
-    --set ingest.authProxy.tls.secretName=ingest-tls
-    --set ingest.authProxy.upstreamTimeout="${ROUTE_TIMEOUT_UNDER_TEST_SECONDS}s"
-)
 
 WORKDIR=""
 # The key the JWKS does not carry, named once because two cases address it: the
@@ -201,7 +200,7 @@ write_issuer_keys() {
 EOF
 }
 
-# Self-signed certificate for the chart's listeners, which terminate TLS.
+# Self-signed certificate for the example's listeners, which terminate TLS.
 write_server_cert() {
     openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
         -keyout "$WORKDIR/tls.key" -out "$WORKDIR/tls.crt" 2>/dev/null
@@ -212,17 +211,24 @@ write_server_cert() {
 # in seconds counted from now — negative for a token that has already expired.
 # $4 is the issuer, $5 the signing key and $6 the JOSE `typ` of the header; all
 # three default to the ones the proxy is configured to accept, and a case names
-# them only when refusing them is the point. The tenant_id claim is always
-# $TENANT.
+# them only when refusing them is the point. $7 is the tenant_id claim, $TENANT
+# unless given: the empty string mints a token carrying no tenant_id at all,
+# which is the issuing mistake the rbac policy has to refuse itself.
 mint_token() {
     local payload_typ="$1" audience="$2" lifetime="$3"
     local issuer="${4:-$ISSUER}" key="${5:-$WORKDIR/issuer.pem}" header_typ="${6:-$HEADER_TYPE}"
+    local tenant="${7-$TENANT}"
     local now exp header payload signing_input signature
     now=$(date +%s)
     exp=$((now + lifetime))
     header=$(printf '{"alg":"RS256","kid":"check","typ":"%s"}' "$header_typ" | base64url)
-    payload=$(printf '{"iss":"%s","aud":"%s","sub":"check","typ":"%s","tenant_id":"%s","iat":%s,"exp":%s}' \
-        "$issuer" "$audience" "$payload_typ" "$TENANT" "$now" "$exp" | base64url)
+    if [ -n "$tenant" ]; then
+        payload=$(printf '{"iss":"%s","aud":"%s","sub":"check","typ":"%s","tenant_id":"%s","iat":%s,"exp":%s}' \
+            "$issuer" "$audience" "$payload_typ" "$tenant" "$now" "$exp" | base64url)
+    else
+        payload=$(printf '{"iss":"%s","aud":"%s","sub":"check","typ":"%s","iat":%s,"exp":%s}' \
+            "$issuer" "$audience" "$payload_typ" "$now" "$exp" | base64url)
+    fi
     signing_input="$header.$payload"
     signature=$(printf '%s' "$signing_input" |
         openssl dgst -sha256 -sign "$key" -binary | base64url)
@@ -332,26 +338,22 @@ static_resources:
 EOF
 }
 
-# The chart's own render, with the issuer pointed at the throwaway JWKS server.
-# Rendered once and read twice: the configuration the containers load and the
-# image tag they run come out of the same document, so the two cannot describe
-# different releases of the chart.
-read_chart_render() {
-    local rendered
-    rendered=$(helm template icegate config/helm/icegate "${CHART_SET_ARGS[@]}")
-    printf '%s\n' "$rendered" |
-        awk '
-            /^  envoy\.yaml: \|/ { collecting = 1; next }
-            collecting && /^    / { sub(/^    /, ""); print; next }
-            collecting && NF { exit }
-        ' >"$WORKDIR/chart-envoy.yaml"
-    [ -s "$WORKDIR/chart-envoy.yaml" ] || {
-        echo "the chart render carried no envoy.yaml" >&2
+# The example's committed configuration, lifted out of its ConfigMap. The chart
+# renders no proxy, so this file and the stand's are the only two copies — both
+# are rewritten by prepare_config below before anything loads them.
+read_example_config() {
+    awk '
+        /^  envoy\.yaml: \|/ { collecting = 1; next }
+        collecting && /^    / { sub(/^    /, ""); print; next }
+        collecting && NF { exit }
+    ' "$EXAMPLE_CONFIGMAP" >"$WORKDIR/example-committed.yaml"
+    [ -s "$WORKDIR/example-committed.yaml" ] || {
+        echo "$EXAMPLE_CONFIGMAP carried no envoy.yaml" >&2
         exit 1
     }
-    ENVOY_IMAGE=$(printf '%s\n' "$rendered" | awk '/image: envoyproxy\/envoy/ { print $2; exit }')
+    ENVOY_IMAGE=$(awk '/image: envoyproxy\/envoy/ { print $2; exit }' "$EXAMPLE_VALUES")
     [ -n "$ENVOY_IMAGE" ] || {
-        echo "the chart render named no proxy image" >&2
+        echo "$EXAMPLE_VALUES names no proxy image" >&2
         exit 1
     }
 }
@@ -376,10 +378,12 @@ read_port() {
 }
 
 # Seconds of the route timeout on the route to cluster $2. Read beside the cluster
-# name and within the three lines that follow it, not as the first `timeout:` of
-# the document: the jwt_authn provider carries one of its own for the JWKS fetch,
-# and the two configurations write the route's on different lines — inline in the
-# stand's copy, under a `route:` block in the chart's.
+# name and within the three lines that follow it, rather than as the first
+# `timeout:` of the document: the jwt_authn provider carries one of its own for
+# the JWKS fetch. Both copies write the route's on the line that names the
+# cluster; the three-line reach covers a copy that spells it as a `route:` block
+# instead, which loads the same and is what the rewrite in prepare_config would
+# miss — assert_config_rewritten refuses that copy by name.
 read_route_timeout_seconds() {
     local config="$1" cluster="$2" seconds
     seconds=$(awk -v cluster="$cluster" '
@@ -397,10 +401,10 @@ read_route_timeout_seconds() {
 }
 
 # The value the rbac policy demands of the jwt_authn metadata key $2 — jwt_header
-# for the JOSE `typ`, jwt_payload for the claim. Read rather than pinned: the
-# chart carries the two as ingest.authProxy.jwt.headerType and .tokenType, so a
-# deployment that renamed either must still be checked against the value it
-# configured. Addressed by metadata key rather than by the first string_match of
+# for the JOSE `typ`, jwt_payload for the claim. Read rather than pinned: both
+# markers belong to the token issuer, so a deployment that renamed either must
+# still be checked against the value it configured. Addressed by metadata key
+# rather than by the first string_match of
 # the document: the policy states both principals in the same form, so position
 # alone would follow whichever is written first.
 read_metadata_match() {
@@ -475,15 +479,17 @@ read_config_values() {
     fi
 }
 
-# The stand's copy, with the issuer address rewritten and the route timeout put
-# on the value this check runs under (see ROUTE_TIMEOUT_UNDER_TEST_SECONDS); the
-# filter chain, which is the thing under test, is used exactly as committed. The
-# substitution matches only a route line, so a copy that carries no route timeout
-# reaches read_route_timeout_seconds unchanged and fails there by name.
-prepare_stand_config() {
+# A committed copy, with the issuer address pointed at the throwaway JWKS server
+# and the route timeout put on the value this check runs under (see
+# ROUTE_TIMEOUT_UNDER_TEST_SECONDS); the filter chain, which is the thing under
+# test, is used exactly as committed. Serves both copies: they write these three
+# places in the same form, which is what assert_config_rewritten checks before
+# either is loaded.
+prepare_config() {
+    local src="$1" dst="$2"
     sed -e "s#$ISSUER/.well-known/jwks.json#http://$JWKS_CONTAINER:$JWKS_PORT/jwks.json#" \
         -e "/cluster: icegate_otlp_/ s/timeout: \"[0-9]*s\"/timeout: \"${ROUTE_TIMEOUT_UNDER_TEST_SECONDS}s\"/" \
-        "$STAND_CONFIG" |
+        "$src" |
         awk -v host="$JWKS_CONTAINER" -v port="$JWKS_PORT" -v issuer_host="$ISSUER_HOST" '
             $0 ~ ("address: " issuer_host ", port_value: 443") {
                 sub(issuer_host, host); sub(/443/, port)
@@ -498,7 +504,61 @@ prepare_stand_config() {
             /name: token_issuer_jwks/ { seen_jwks = 1 }
             skip { next }
             { print }
-        ' >"$WORKDIR/stand-envoy.yaml"
+        ' >"$dst"
+}
+
+# A copy whose JWKS address or route timeout is written in another form passes
+# through the rewrite untouched and fails sixty seconds later as a proxy that
+# never became ready. Named here instead, against the document about to be loaded.
+#
+# Stated as three places the rewrite must have reached, not as the absence of
+# $ISSUER_HOST from the document: the `issuer` of the jwt_authn provider names
+# that host too and has to keep naming it. mint_token signs `iss` with $ISSUER
+# and the filter compares the claim against that string, so a rewrite there
+# answers every case 401.
+assert_config_rewritten() {
+    local config="$1" cluster seconds
+
+    grep -q "uri: \"http://$JWKS_CONTAINER:$JWKS_PORT/jwks.json\"" "$config" || {
+        echo "$config does not fetch the JWKS from the throwaway server:" >&2
+        grep -n "uri:" "$config" >&2
+        exit 1
+    }
+
+    # The token_issuer_jwks cluster alone: from its own `- name:` to the next one
+    # at that indent, or to the end of the document when it is the last cluster.
+    cluster=$(awk '
+        /^    - name: token_issuer_jwks$/ { collecting = 1; print; next }
+        collecting && /^    - name: / { exit }
+        collecting { print }
+    ' "$config")
+    [ -n "$cluster" ] || {
+        echo "$config carries no token_issuer_jwks cluster" >&2
+        exit 1
+    }
+    case "$cluster" in
+    *"$ISSUER_HOST"*)
+        echo "the token_issuer_jwks cluster of $config still addresses $ISSUER_HOST," \
+            "which resolves nowhere, so jwt_authn fetches no keys:" >&2
+        printf '%s\n' "$cluster" >&2
+        exit 1
+        ;;
+    esac
+    case "$cluster" in
+    *transport_socket*)
+        echo "the token_issuer_jwks cluster of $config still speaks TLS; the throwaway" \
+            "JWKS server serves plain HTTP" >&2
+        exit 1
+        ;;
+    esac
+
+    seconds=$(read_route_timeout_seconds "$config" icegate_otlp_http)
+    [ "$seconds" = "$ROUTE_TIMEOUT_UNDER_TEST_SECONDS" ] || {
+        echo "$config times the OTLP/HTTP route out after ${seconds}s, not the" \
+            "${ROUTE_TIMEOUT_UNDER_TEST_SECONDS}s this check runs under: the route timeout is" \
+            "written in a form the rewrite does not reach" >&2
+        exit 1
+    }
 }
 
 start_stand() {
@@ -519,7 +579,7 @@ start_stand() {
     # --base-id moves this Envoy's hot-restart domain socket off the default: the
     # socket lives in the network namespace, which this container shares with the
     # proxy, and the second Envoy to start would otherwise fail to bind it. The
-    # proxy keeps the default, so it runs exactly as the chart deploys it.
+    # proxy keeps the default, so it runs exactly as the example deploys it.
     docker run -d --name "$GRPC_UPSTREAM_CONTAINER" --network "container:$UPSTREAM_CONTAINER" \
         -v "$WORKDIR/grpc-upstream.yaml:/etc/envoy/envoy.yaml:ro" \
         "$ENVOY_IMAGE" /usr/local/bin/envoy --base-id 1 --config-path /etc/envoy/envoy.yaml >/dev/null
@@ -660,6 +720,14 @@ run_cases() {
         "$FOREIGN_HEADER_TYPE")" "")
     expect_status "$label: JOSE typ is not the configured one" 403 "$status"
 
+    # A token the issuer signed without the claim the tenant comes from. The
+    # refusal belongs to the proxy: claim_to_headers writes no header for an
+    # absent claim, so without this the request reaches icegate and is answered
+    # 400 — a status naming the batch for a fault that is the token's.
+    status=$(request "$(mint_token "$TOKEN_TYPE" "$AUDIENCE" 600 "$ISSUER" "$WORKDIR/issuer.pem" \
+        "$HEADER_TYPE" "")" "")
+    expect_status "$label: token without a tenant_id claim" 403 "$status"
+
     # A token in the URL is not a token: the query parameter jwt_authn would take
     # one from is closed, so a bearer cannot arrive by a route that writes it to
     # every access log between the sender and the proxy.
@@ -790,6 +858,16 @@ run_grpc_cases() {
         fail "$label: gRPC JOSE typ is not the configured one: expected grpc-status 7, got '$seen'"
     fi
 
+    status=$(request_grpc "$(mint_token "$TOKEN_TYPE" "$AUDIENCE" 600 "$ISSUER" "$WORKDIR/issuer.pem" \
+        "$HEADER_TYPE" "")" "")
+    expect_status "$label: gRPC with a token without a tenant_id claim" 200 "$status"
+    seen=$(read_response_header grpc-status)
+    if [ "$seen" = "7" ]; then
+        pass "$label: gRPC token without a tenant_id claim -> grpc-status 7"
+    else
+        fail "$label: gRPC token without a tenant_id claim: expected grpc-status 7, got '$seen'"
+    fi
+
     status=$(request_grpc "$(mint_token "$TOKEN_TYPE" "$AUDIENCE" 600)" "$FORGED_TENANT")
     expect_status "$label: gRPC with a valid token" 200 "$status"
     seen=$(read_response_header x-seen-orgid)
@@ -804,8 +882,8 @@ run_grpc_cases() {
     # grpc-status rather than the 504 the HTTP listener answers with. 14 is
     # UNAVAILABLE, which this release maps that 504 to — a code an exporter
     # retries, which is what makes the ceiling a choice about writing the batch
-    # twice rather than about latency alone (see ingest.authProxy.upstreamTimeout
-    # in the chart's values.yaml).
+    # twice rather than about latency alone (see the route timeout of
+    # config/helm/auth-proxy/configmap-envoy.yaml).
     status=$(request_grpc "$(mint_token "$TOKEN_TYPE" "$AUDIENCE" 600)" "" "$GRPC_SLOW_EXPORT_PATH")
     expect_status "$label: gRPC upstream slower than the route timeout" 200 "$status"
     seen=$(read_response_header grpc-status)
@@ -818,7 +896,6 @@ run_grpc_cases() {
 
 main() {
     require docker
-    require helm
     require openssl
     require curl
 
@@ -830,12 +907,15 @@ main() {
     write_upstream
     # An empty gRPC message: the five-byte length prefix and nothing after it.
     printf '\0\0\0\0\0' >"$WORKDIR/grpc-empty"
-    read_chart_render
-    prepare_stand_config
+    read_example_config
+    prepare_config "$WORKDIR/example-committed.yaml" "$WORKDIR/example-envoy.yaml"
+    assert_config_rewritten "$WORKDIR/example-envoy.yaml"
+    prepare_config "$STAND_CONFIG" "$WORKDIR/stand-envoy.yaml"
+    assert_config_rewritten "$WORKDIR/stand-envoy.yaml"
 
     SCHEME=https
-    start_stand "$WORKDIR/chart-envoy.yaml"
-    run_cases "chart"
+    start_stand "$WORKDIR/example-envoy.yaml"
+    run_cases "example"
     stop_stand
 
     # The stand's listeners do not terminate TLS; everything else is the same.

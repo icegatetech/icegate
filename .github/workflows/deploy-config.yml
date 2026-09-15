@@ -5,10 +5,10 @@ on:
     branches: [ main ]
     paths:
       - 'config/helm/**'
-      # all `config/docker` read by make helm-envoy-test; auth-proxy/** also by make authproxy-test
+      # all `config/docker` read by make envoy-config-test; auth-proxy/** also by make authproxy-test
       - 'config/docker/auth-proxy/**'
       - 'config/docker/docker-compose.proxy.yml'
-      # the loopback ports helm-envoy-test compares against auth-proxy/envoy.yaml
+      # the loopback ports envoy-config-test compares against auth-proxy/envoy.yaml
       - 'config/docker/ingest-proxy.yaml'
       # read by make helm-metadata-test: the bake targets and the release job it
       # compares the chart's metadata against, and the overlays it installs the
@@ -16,11 +16,14 @@ on:
       - 'config/docker/docker-bake.hcl'
       - '.github/workflows/release.yml'
       - 'config/kustomize/overlays/*/values-icegate.yaml'
-      # the WAL acknowledgement deadline _helpers.tpl restates, compared against
-      # its definition by the same target
+      # the WAL acknowledgement deadline the auth proxy example must not undercut,
+      # compared against its definition by the same target
       - 'crates/icegate-ingest/src/wal/writer.rs'
       - 'scripts/authproxy-test.sh'
+      - 'scripts/chartlib.py'
+      - 'scripts/envoy-config-test.py'
       - 'scripts/helm-metadata-test.py'
+      - 'scripts/helm-render-test.py'
       - 'scripts/install-helm-docs.sh'
       - 'Makefile'
       - '.github/workflows/deploy-config.yml'
@@ -28,10 +31,10 @@ on:
     branches: [ main ]
     paths:
       - 'config/helm/**'
-      # all `config/docker` read by make helm-envoy-test; auth-proxy/** also by make authproxy-test
+      # all `config/docker` read by make envoy-config-test; auth-proxy/** also by make authproxy-test
       - 'config/docker/auth-proxy/**'
       - 'config/docker/docker-compose.proxy.yml'
-      # the loopback ports helm-envoy-test compares against auth-proxy/envoy.yaml
+      # the loopback ports envoy-config-test compares against auth-proxy/envoy.yaml
       - 'config/docker/ingest-proxy.yaml'
       # read by make helm-metadata-test: the bake targets and the release job it
       # compares the chart's metadata against, and the overlays it installs the
@@ -39,11 +42,14 @@ on:
       - 'config/docker/docker-bake.hcl'
       - '.github/workflows/release.yml'
       - 'config/kustomize/overlays/*/values-icegate.yaml'
-      # the WAL acknowledgement deadline _helpers.tpl restates, compared against
-      # its definition by the same target
+      # the WAL acknowledgement deadline the auth proxy example must not undercut,
+      # compared against its definition by the same target
       - 'crates/icegate-ingest/src/wal/writer.rs'
       - 'scripts/authproxy-test.sh'
+      - 'scripts/chartlib.py'
+      - 'scripts/envoy-config-test.py'
       - 'scripts/helm-metadata-test.py'
+      - 'scripts/helm-render-test.py'
       - 'scripts/install-helm-docs.sh'
       - 'Makefile'
       - '.github/workflows/deploy-config.yml'
@@ -87,11 +93,11 @@ jobs:
       - name: Template REST backend guard
         run: make helm-rest-uri-test
 
-      - name: Template tenant policy and auth proxy guards
-        run: make helm-tenant-test
+      - name: Template tenant policy and pod extension guards
+        run: make helm-render-test
 
-      - name: Validate the proxy configuration with Envoy
-        run: make helm-envoy-test
+      - name: Validate the auth proxy example with Envoy
+        run: make envoy-config-test
 
       - name: Check the proxy rules end to end
         run: make authproxy-test
