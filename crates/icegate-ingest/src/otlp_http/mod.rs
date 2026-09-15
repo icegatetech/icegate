@@ -9,11 +9,9 @@ mod handlers;
 mod models;
 mod routes;
 mod server;
+mod tenant;
 
 pub use config::OtlpHttpConfig;
 pub use error::{OtlpError, OtlpResult};
-pub use models::{
-    ErrorResponse, ErrorType, ExportLogsResponse, ExportMetricsResponse, ExportTracesResponse, HealthResponse,
-    HealthStatus,
-};
-pub use server::run;
+pub use models::{ErrorResponse, ErrorType, ExportLogsResponse, ExportMetricsResponse, ExportTracesResponse};
+pub use server::{OtlpHttpState, run};

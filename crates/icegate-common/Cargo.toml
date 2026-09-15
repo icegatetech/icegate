@@ -95,3 +95,5 @@ testcontainers = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+# Collects an axum response body in the operational-router tests.
+http-body-util = "0.1"

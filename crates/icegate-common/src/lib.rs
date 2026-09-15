@@ -60,49 +60,6 @@ pub fn icegate_table_ident(table: &str) -> iceberg::TableIdent {
     )
 }
 
-/// Default tenant ID when not provided in request metadata.
-pub const DEFAULT_TENANT_ID: &str = "default";
-
-/// HTTP header / gRPC metadata key for tenant identification (`X-Scope-OrgID`,
-/// Grafana/Loki standard). Stored lowercase per HTTP/2 and gRPC conventions;
-/// header lookups are case-insensitive.
-pub const TENANT_ID_HEADER: &str = "x-scope-orgid";
-
-/// Validate a tenant ID value.
-///
-/// Returns `true` if `value` is non-empty and contains only ASCII alphanumeric
-/// characters, hyphens, underscores, or colons.
-///
-/// The colon is admitted because the control plane's tenant id is
-/// `{org_id}:{workspace_id}` — the separator is part of the format, not a
-/// character that happens to appear in one. Refusing it does not reject a
-/// request: ingest and `resolve_tenant_id` both fall back to
-/// [`DEFAULT_TENANT_ID`], so a refused id merges every workspace into one
-/// tenant instead of failing. The class stays otherwise closed — no `/`, no
-/// `.`, no quote, no whitespace — so an id can neither traverse a storage path
-/// nor break out of a SQL literal.
-pub fn is_valid_tenant_id(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':')
-}
-
-/// Resolve a tenant identifier from an optional raw header value.
-///
-/// Returns the value when present and valid per [`is_valid_tenant_id`],
-/// otherwise [`DEFAULT_TENANT_ID`]. This is the single fallback policy
-/// shared by every query protocol (Loki, Tempo, Flight SQL); callers only
-/// differ in how they pull the raw string out of their header/metadata
-/// map, so centralising the validate-or-default step here keeps tenant
-/// resolution defined in exactly one place.
-#[must_use]
-pub fn resolve_tenant_id(header_value: Option<&str>) -> String {
-    header_value
-        .filter(|value| is_valid_tenant_id(value))
-        .map_or_else(|| DEFAULT_TENANT_ID.to_string(), String::from)
-}
-
 /// Topic name for logs in the WAL queue.
 pub const LOGS_TOPIC: &str = "logs";
 
@@ -153,6 +110,8 @@ pub mod retrier;
 pub mod schema;
 /// Storage configuration.
 pub mod storage;
+/// Tenant identification and the ingest tenant policy.
+pub mod tenant;
 /// OpenTelemetry tracing configuration and utilities.
 pub mod tracing;
 /// Compaction-safe resolution of the last committed WAL offset from snapshots.
@@ -172,14 +131,25 @@ pub use manifest_scan::{DataFileStats, list_data_files_with_stats};
 pub use memory::MemoryShedInterceptor;
 pub use memory::{
     MemoryPressure, MemoryPressureConfig, MemoryPressureSampler, SHED_RETRY_AFTER_SECS, ShedPolicy, UsageReader,
-    default_shed_response, shed_when_pressured,
+    default_shed_response, drain_request_body, shed_when_pressured,
 };
-pub use metrics::{MetricsConfig, MetricsRuntime, run_metrics_server};
+/// The name [`OperationalConfig`] carried before the operational listener was
+/// separated from the metrics endpoint.
+///
+/// Kept for `icegate-ee`, which imports it from this crate's root; nothing
+/// inside this crate uses it. Removed together with the `metrics` configuration
+/// key — see the TODO in [`metrics`].
+pub use metrics::OperationalConfig as MetricsConfig;
+pub use metrics::{HEALTH_PATH, MetricsRuntime, OperationalConfig, run_operational_server};
 pub use retrier::{Retrier, RetrierConfig, RetryError};
 pub use storage::{
     IceGateStorage, IceGateStorageFactory, ObjectStoreWithPath, OperatorRegistry, PrefetchConfig, S3Config,
     StorageBackend, StorageCache, StorageConfig, StorageLayersConfig, build_storage_cache, is_persistent_base_path,
     is_retryable_error_source, is_retryable_object_store_error, register_foyer_metrics,
+};
+pub use tenant::{
+    DEFAULT_TENANT_ID, TENANT_ID_HEADER, TenantHeader, TenantId, TenantPolicy, TenantRejection, TenantResolver,
+    is_valid_tenant_id, resolve_tenant_id,
 };
 // Re-exported so `CatalogBuilder::from_config` callers can name the shutdown
 // token type without a direct `tokio-util` dependency.
@@ -199,63 +169,5 @@ mod operations_const_tests {
         assert_eq!(OPERATIONS_TABLE, "operations");
         assert_eq!(OPERATIONS_TABLE_FQN, "iceberg.icegate.operations");
         assert_eq!(OPERATIONS_TOPIC, "operations");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_valid_tenant_ids() {
-        assert!(is_valid_tenant_id("default"));
-        assert!(is_valid_tenant_id("my-tenant"));
-        assert!(is_valid_tenant_id("tenant_123"));
-        assert!(is_valid_tenant_id("Org-42_prod"));
-        assert!(is_valid_tenant_id("a"));
-    }
-
-    #[test]
-    fn test_invalid_tenant_ids() {
-        assert!(!is_valid_tenant_id(""));
-        assert!(!is_valid_tenant_id("has space"));
-        assert!(!is_valid_tenant_id("has/slash"));
-        assert!(!is_valid_tenant_id("has.dot"));
-        assert!(!is_valid_tenant_id("emoji\u{1F600}"));
-        assert!(!is_valid_tenant_id("tab\there"));
-    }
-
-    #[test]
-    fn resolve_tenant_id_honours_valid_value() {
-        assert_eq!(resolve_tenant_id(Some("tenant-a")), "tenant-a");
-    }
-
-    #[test]
-    fn resolve_tenant_id_falls_back_on_absent_or_invalid() {
-        assert_eq!(resolve_tenant_id(None), DEFAULT_TENANT_ID);
-        assert_eq!(resolve_tenant_id(Some("has space")), DEFAULT_TENANT_ID);
-        assert_eq!(resolve_tenant_id(Some("")), DEFAULT_TENANT_ID);
-    }
-
-    /// The control plane's tenant id is `{org_id}:{workspace_id}`, so the colon is
-    /// part of the format rather than an edge case. Refusing it does not reject the
-    /// request: ingest and query both fall back to the default tenant, which
-    /// silently merges every workspace into one.
-    #[test]
-    fn a_tenant_id_may_carry_the_colon_that_separates_org_from_workspace() {
-        assert!(is_valid_tenant_id("2q4mHrPd9kL:7xZa1vB3nQe"));
-        assert_eq!(
-            resolve_tenant_id(Some("2q4mHrPd9kL:7xZa1vB3nQe")),
-            "2q4mHrPd9kL:7xZa1vB3nQe"
-        );
-    }
-
-    /// Widening to `:` must not widen to anything else: path traversal, quotes and
-    /// whitespace stay refused, and an empty id is still not an id.
-    #[test]
-    fn widening_to_the_colon_admits_nothing_else() {
-        for refused in ["", "../etc", "a/b", "a'b", "a b", "a.b", "a\\b", "a\"b"] {
-            assert!(!is_valid_tenant_id(refused), "must refuse {refused:?}");
-        }
     }
 }

@@ -25,14 +25,21 @@ Tempo API (port {{ .Values.query.tempo.port }}):
 
 === Ingest Service ===
 
+{{- /* The port forwarded here is the one the Service publishes, not the one the
+       receiver binds: `port-forward` against a `svc/` names a port of that
+       Service, and the two are different numbers as soon as a sidecar owns the
+       published ports. `icegate.ingestPublishedPort` is what service-ingest.yaml
+       publishes, so this command addresses what that Service actually carries. */}}
 {{- if .Values.ingest.otlpGrpc.enabled }}
-OTLP gRPC (port {{ .Values.ingest.otlpGrpc.port }}):
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "ingest") }} {{ .Values.ingest.otlpGrpc.port }}:{{ .Values.ingest.otlpGrpc.port }}
+{{- $grpcPort := include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpGrpc") }}
+OTLP gRPC (port {{ $grpcPort }}):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "ingest") }} {{ $grpcPort }}:{{ $grpcPort }}
 {{- end }}
 
 {{- if .Values.ingest.otlpHttp.enabled }}
-OTLP HTTP (port {{ .Values.ingest.otlpHttp.port }}):
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "ingest") }} {{ .Values.ingest.otlpHttp.port }}:{{ .Values.ingest.otlpHttp.port }}
+{{- $httpPort := include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpHttp") }}
+OTLP HTTP (port {{ $httpPort }}):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "icegate.componentName" (dict "context" . "component" "ingest") }} {{ $httpPort }}:{{ $httpPort }}
 {{- end }}
 
 {{- end }}

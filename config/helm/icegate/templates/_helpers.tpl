@@ -175,6 +175,157 @@ backend: !s3
 {{- end }}
 
 {{/*
+Render the ingest tenant policy (zero-indented).
+Produces the YAML tagged union: `!single { id }` or `!multi`.
+Callers must use `nindent N` to place at the correct indentation level.
+
+`fail` rather than a default: a `single` policy with no id would deserialize into
+an empty tenant that no request can name, and the pod would reject every batch.
+*/}}
+{{- define "icegate.tenantYaml" -}}
+{{- if eq .Values.ingest.tenant.mode "single" -}}
+{{- if not .Values.ingest.tenant.id }}{{ fail "ingest.tenant.id is required when ingest.tenant.mode is single" }}{{ end -}}
+tenant: !single
+  id: {{ .Values.ingest.tenant.id | quote }}
+{{- else if eq .Values.ingest.tenant.mode "multi" -}}
+tenant: !multi
+{{- else -}}
+{{ fail (printf "ingest.tenant.mode must be single or multi, got %q" .Values.ingest.tenant.mode) }}
+{{- end -}}
+{{- end }}
+
+{{/*
+Answer whether a listener host is reachable only from inside the container.
+
+Returns a non-empty string for a loopback address and the empty string otherwise,
+which is how Helm spells a boolean a caller can test with `if`.
+
+The whole 127.0.0.0/8 range counts, not just the address `values.yaml` ships, and
+the IPv6 loopback counts in both spellings: `run_operational_server` joins host
+and port as `{host}:{port}`, so the bracketed `[::1]` is the form that parses as a
+socket address there, while the bare `::1` reaches the same bind through the
+resolver.
+
+Usage: include "icegate.isLoopbackHost" .Values.ingest.otlpHttp.host
+*/}}
+{{- define "icegate.isLoopbackHost" -}}
+{{- if or (hasPrefix "127." .) (eq . "localhost") (eq . "::1") (eq . "[::1]") -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail the render when the ingest operational listener is bound where the kubelet
+cannot reach it.
+
+That listener carries `/health`, and both probes in `values.yaml` address it with
+an `httpGet` that names no `host`, which the kubelet resolves to the Pod IP. A
+loopback bind therefore answers the container itself and nobody else: readiness
+never passes, liveness restarts the container, and the deployment never reports a
+reason beyond a failing probe. The OTLP listeners have the opposite requirement:
+an operator moves them to loopback through `ingest.otlpHttp.host` /
+`ingest.otlpGrpc.host` when something else publishes their ports — hence separate
+hosts, and hence this check naming only the operational one, which has to stay on
+the Pod IP whatever the others do.
+
+Which addresses count as loopback is `icegate.isLoopbackHost` above, so this
+check and the port declarations of `deployment-ingest.yaml` cannot disagree on
+the answer.
+
+The value is `required` rather than read straight, and through the parenthesised
+path, for the reason `icegate.validateRetentionWindow` uses the same pair below:
+Helm reads a `null` in an overlay as the removal of the key, so the check would
+otherwise abort on `invalid value; expected string`, naming a line of this file
+and none of the operator's own values. `required` rejects nil and the empty
+string alike, and the empty one is worth rejecting here too — it renders a
+listener config the ingest pod refuses on load, which is the same failure one
+deploy later.
+
+Usage: include "icegate.validateOperationalHost" .
+*/}}
+{{- define "icegate.validateOperationalHost" -}}
+{{- $host := required "ingest.metrics.host is required: the operational listener binds it whatever ingest.metrics.enabled says, and the probes address that listener on the Pod IP. Bind 0.0.0.0" (.Values.ingest.metrics).host }}
+{{- if include "icegate.isLoopbackHost" $host }}
+{{- fail (printf "ingest.metrics.host (%s) is a loopback address: the operational listener carries /health, and both probes address it on the Pod IP, so this bind fails every readiness check and restarts the container on liveness. Bind 0.0.0.0" $host) }}
+{{- end }}
+{{- end }}
+
+{{/*
+The OTLP port the Service publishes, which is the port a sender addresses.
+
+`ingest.service.otlpHttpPort` / `ingest.service.otlpGrpcPort` state it; left
+unset each follows the receiver port, the same number while icegate is the
+published listener itself and a different one as soon as a sidecar owns the
+published ports.
+
+Every template answering "where does a sender connect" reads it here rather than
+restating the expression: `service-ingest.yaml` publishes the port and `NOTES.txt`
+prints the `kubectl port-forward` command that addresses the Service by it. Built
+from the receiver port instead, that command names a port that exists only inside
+the pod, and it is the first text an operator of the sidecar example sees.
+
+Usage: include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpHttp")
+*/}}
+{{- define "icegate.ingestPublishedPort" -}}
+{{- $receiver := index .context.Values.ingest .signal -}}
+{{- index .context.Values.ingest.service (printf "%sPort" .signal) | default $receiver.port -}}
+{{- end }}
+
+{{/*
+Fail the render when an enabled OTLP receiver carries no bind address.
+
+Both reasons `icegate.validateOperationalHost` states for reading its host
+through `required` and the parenthesised path hold here unchanged: Helm reads a
+`null` in an overlay as the removal of the key, so the value reaches
+`icegate.isLoopbackHost` in `deployment-ingest.yaml` as nil and aborts the render
+on a line of this file, naming none of the operator's own values; and the empty
+string renders a listener config the ingest pod refuses on load, because
+`{host}:{port}` is what it parses as a socket address.
+
+Which address it is decides a second thing. The operational listener has to stay
+on the Pod IP; these two are the ones an operator deliberately moves to the
+loopback when a sidecar publishes their ports — and then `deployment-ingest.yaml`
+declares no port for that receiver, while `service-ingest.yaml` keeps addressing
+`targetPort` by the same name. So a loopback bind is accepted only alongside a
+container in `ingest.extraContainers` declaring that port name: without one the
+Service names a port no container in the pod declares, its EndpointSlice carries
+none, and a sender is refused the connection by a pod that is Ready and logs
+nothing. The check reads `ports[].name` and nothing else, so the chart still
+learns nothing about what that container runs.
+
+Each receiver is checked only while it is enabled: a disabled one binds nothing,
+and its host is then a key the operator has no reason to carry.
+
+Usage: include "icegate.validateOtlpHosts" .
+*/}}
+{{- define "icegate.validateOtlpHosts" -}}
+{{- $portNames := dict "otlpHttp" "otlp-http" "otlpGrpc" "otlp-grpc" }}
+{{- range $signal, $portName := $portNames }}
+{{/* `index` on a missing key yields nil rather than aborting, and the default
+     turns an explicitly null receiver map into one the field access below
+     reads as absent — the same reason the parenthesised path serves
+     `icegate.validateOperationalHost`. */}}
+{{- $receiver := default (dict) (index $.Values.ingest $signal) }}
+{{- if $receiver.enabled }}
+{{- $host := required (printf "ingest.%s.host is required: the receiver binds it, and neither an absent nor an empty value is an address — the ingest pod refuses the rendered listener on load. Bind 0.0.0.0, or a loopback address when a sidecar publishes the port" $signal) $receiver.host }}
+{{- if include "icegate.isLoopbackHost" $host }}
+{{- $isPortDeclared := false }}
+{{- range $container := default (list) $.Values.ingest.extraContainers }}
+{{- range $port := default (list) $container.ports }}
+{{- if eq (default "" $port.name) $portName }}
+{{- $isPortDeclared = true }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if not $isPortDeclared }}
+{{- fail (printf "ingest.%s.host (%s) is a loopback address, so this container declares no %s port, and the Service addresses that name as its targetPort: no container of ingest.extraContainers declares it either, so the pod publishes nothing and a sender is refused the connection. Add the container that listens on %s with a port named %s, or bind 0.0.0.0" $signal $host $portName $portName $portName) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Fail the render when the retention window, the query provider cache, and the GC
 grace period are not ordered so that a query can never plan against files that
 are already gone:

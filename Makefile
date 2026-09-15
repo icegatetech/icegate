@@ -1,6 +1,15 @@
-.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install ci bench down \
-       helm-lint helm-template helm-catalog-test helm-rest-uri-test catalog-rest-check catalog-rest-test catalog-rest-clippy \
+.PHONY: dev debug test check fmt fmt-fix clippy clippy-fix audit install install-deps ci bench down \
+       helm-lint helm-template helm-catalog-test helm-rest-uri-test helm-render-test catalog-rest-check catalog-rest-test catalog-rest-clippy \
+       envoy-config-test authproxy-test \
        sanitize sanitize-address sanitize-leak sanitize-memory
+
+# The chart checks in scripts/ are Python and need PyYAML. `install-deps` puts it
+# in a virtualenv here rather than in the interpreter, because a Homebrew or
+# Debian python3 refuses `pip install` into itself (PEP 668). CI installs the
+# package into its own runner instead, so this variable falls back to `python3`
+# when no virtualenv has been built.
+VENV := .venv
+PYTHON := $(if $(wildcard $(VENV)/bin/python),$(VENV)/bin/python,python3)
 
 run-docker-core-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml up --build
@@ -16,6 +25,11 @@ run-docker-monitoring-release:
 # Run core services with Trino
 run-docker-analytics-release:
 	PROFILE=release docker compose -f config/docker/docker-compose.yml --profile analytics up --build
+
+# Core services behind the Envoy auth proxy (TLS off; the proxy checks the
+# ingest token and rewrites x-scope-orgid). Not combinable with `load`.
+run-docker-proxy-release:
+	PROFILE=release docker compose -f config/docker/docker-compose.yml -f config/docker/docker-compose.proxy.yml up --build
 
 run-kubernetes-core-release:
 	kustomize  build --enable-helm config/kustomize/overlays/orbstack | kubectl apply --server-side --force-conflicts -f - || true
@@ -61,6 +75,10 @@ audit:
 install:
 	cargo install cargo-audit
 
+install-deps:
+	python3 -m venv $(VENV)
+	$(VENV)/bin/pip install --quiet --upgrade pip pyyaml
+
 bench:
 	cargo bench --bench queue_s3_bench --bench loki_queries -- --output-format bencher | tee output.txt
 
@@ -73,7 +91,30 @@ helm-lint:
 helm-template:
 	helm template icegate config/helm/icegate > /dev/null
 
-ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test helm-rest-uri-test helm-metadata-test catalog-rest-check catalog-rest-test catalog-rest-clippy
+ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test helm-rest-uri-test helm-render-test helm-metadata-test catalog-rest-check catalog-rest-test catalog-rest-clippy
+
+# Every render the default one does not cover: the tenant policy, the OTLP bind
+# addresses, the Service ports and the NOTES an operator reads first. Each is a
+# place where a rendering mistake fails open rather than loudly; the script names
+# which, and the message each guard must refuse with.
+helm-render-test:
+	$(PYTHON) scripts/helm-render-test.py
+
+# The two auth proxy copies against each other, then each loaded by Envoy itself,
+# which is the only reader that knows whether the document is valid. Outside `ci`
+# because it pulls the Envoy image and runs containers; run by
+# .github/workflows/deploy-config.yml. Run it after touching the filter chain or
+# either listener of the example or the stand.
+envoy-config-test:
+	$(PYTHON) scripts/envoy-config-test.py
+
+# End-to-end check of the proxy's rules against a throwaway token issuer: the
+# client's tenant header is dropped, the tenant comes from the token claim, the
+# payload type marker is required, and `exp` is honoured within the configured
+# skew. See the script's header for what each case pins. Outside `ci` and run by
+# deploy-config.yml for the same reason as envoy-config-test.
+authproxy-test:
+	scripts/authproxy-test.sh
 
 # The catalog server is off by default, so the default render above never covers
 # its templates. Enabling it must produce a complete deployable unit, and pairing
@@ -89,6 +130,7 @@ ci: check fmt clippy test audit helm-lint helm-template helm-catalog-test helm-r
 # onto AWS. Both halves are asserted: a chart that started emitting a default
 # would silently take that choice away, and a guard that stopped emitting an
 # explicit value would silently ignore the operator.
+# TODO(low): move to scripts
 helm-catalog-test:
 	@rendered=$$(helm template icegate config/helm/icegate --set catalogServer.enabled=true --set catalog.backend=s3) || exit 1; \
 	for resource in "kind: Deployment" "kind: Service" "kind: ConfigMap"; do \
@@ -128,16 +170,18 @@ helm-rest-uri-test:
 	fi; \
 	printf '%s\n' "$$error" | grep -F "catalog.rest.uri is required" > /dev/null
 
-# Every Artifact Hub artifact is a copy of something else in the repo: the image
+# Every artifact checked here is a copy of something else in the repo: the image
 # annotations copy the bake targets, the values schema copies the shape of
-# values.yaml, the README copies the install command. A copy goes stale silently,
-# and these particular failures are invisible from inside the repo — a wrong image
-# name simply means Artifact Hub scans nothing and the security badge disappears.
+# values.yaml, the README copies the install command, and the route timeout of
+# config/helm/auth-proxy/configmap-envoy.yaml is bounded by the WAL
+# acknowledgement deadline defined in Rust. A copy goes stale silently, and these
+# particular failures are invisible from inside the repo — a wrong image name
+# simply means Artifact Hub scans nothing and the security badge disappears.
 #
 # Needs helm-docs on PATH to regenerate the README and diff it:
 #   scripts/install-helm-docs.sh
 helm-metadata-test:
-	python3 scripts/helm-metadata-check.py
+	$(PYTHON) scripts/helm-metadata-test.py
 
 # Run the test suite under LLVM sanitizers. Linux-only (leak and memory do not
 # exist on Darwin); scripts/sanitize.sh re-execs itself in a container on macOS.

@@ -553,9 +553,9 @@ mod tests {
     /// Build the spans and operations transform outputs from one LLM-span request.
     fn spans_and_operations() -> ((Option<RecordBatch>, usize), (Option<RecordBatch>, usize)) {
         let request = one_llm_span_request();
-        let spans = crate::transform::spans_to_record_batch(&request, Some("tenant-a")).expect("spans transform");
-        let operations =
-            crate::transform::operations_to_record_batch(&request, Some("tenant-a")).expect("operations transform");
+        let tenant = crate::transform::test_support::test_tenant("tenant-a");
+        let spans = crate::transform::spans_to_record_batch(&request, &tenant).expect("spans transform");
+        let operations = crate::transform::operations_to_record_batch(&request, &tenant).expect("operations transform");
         (spans, operations)
     }
 

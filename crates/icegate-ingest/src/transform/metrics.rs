@@ -17,7 +17,7 @@ use arrow::{
 };
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::{
-    DEFAULT_TENANT_ID,
+    TenantId,
     schema::{COL_DATA_POINT_ATTRIBUTES, COL_METADATA, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES},
 };
 use opentelemetry_proto::tonic::{
@@ -902,8 +902,9 @@ impl MetricColumns {
 #[tracing::instrument(skip(request))]
 pub fn metrics_to_record_batch(
     request: &ExportMetricsServiceRequest,
-    tenant_id: Option<&str>,
+    tenant_id: &TenantId,
 ) -> crate::error::Result<(Option<RecordBatch>, usize)> {
+    let tenant_id = tenant_id.as_ref();
     let ingested = now_micros()?;
     // Upper bound on emitted rows (one per data point), used both as the
     // empty-request short-circuit and as the builder capacity hint.
@@ -921,7 +922,6 @@ pub fn metrics_to_record_batch(
 
     let schema = metrics_arrow_schema()?;
     let mut cols = MetricColumns::new(schema, estimated_rows)?;
-    let tenant = tenant_id.unwrap_or(DEFAULT_TENANT_ID);
     let empty: Vec<KeyValue> = Vec::new();
     let mut drops: usize = 0;
 
@@ -952,7 +952,7 @@ pub fn metrics_to_record_batch(
                 };
                 let metadata = flatten_metric_metadata(&metric.metadata);
                 let ctx = RowContext {
-                    tenant,
+                    tenant: tenant_id,
                     service_name: service_name.as_deref(),
                     service_instance_id: service_instance_id.as_deref(),
                     metric_name: &metric.name,
@@ -983,6 +983,7 @@ pub fn metrics_to_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transform::test_support::test_tenant;
 
     #[test]
     fn metrics_arrow_schema_has_expected_columns() {
@@ -1106,7 +1107,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         batch.expect("batch")
     }
 
@@ -1132,7 +1133,7 @@ mod tests {
         let request = ExportMetricsServiceRequest {
             resource_metrics: vec![],
         };
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 0);
     }
@@ -1146,7 +1147,7 @@ mod tests {
             "cpu.usage",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, Some("tenant-1")).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("tenant-1")).expect("ok");
         let batch = batch.expect("batch");
         assert_eq!(drops, 0);
         assert_eq!(batch.num_rows(), 1);
@@ -1199,7 +1200,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         let metadata = map_pairs(&batch, "metadata");
         assert_eq!(metadata.get("unit_family"), Some(&"time".to_string()));
@@ -1218,7 +1219,7 @@ mod tests {
             "queue.depth",
             vec![kv("service.name", "svc")],
         );
-        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         let value_int = batch
             .column_by_name("value_int")
@@ -1248,7 +1249,7 @@ mod tests {
             "broken",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1262,7 +1263,7 @@ mod tests {
             "m",
             vec![],
         );
-        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         let service_name = batch
             .column_by_name("service_name")
@@ -1343,7 +1344,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         let exemplars = batch
             .column_by_name("exemplars")
@@ -1389,7 +1390,7 @@ mod tests {
             "requests.total",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         assert_eq!(drops, 0);
 
@@ -1437,7 +1438,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         let temp = batch
             .column_by_name("aggregation_temporality")
@@ -1461,7 +1462,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1489,7 +1490,7 @@ mod tests {
             "latency",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         assert_eq!(drops, 0);
 
@@ -1552,7 +1553,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1587,7 +1588,7 @@ mod tests {
             "exp.latency",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         assert_eq!(drops, 0);
 
@@ -1656,7 +1657,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1687,7 +1688,7 @@ mod tests {
             "rpc.duration",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         assert_eq!(drops, 0);
 
@@ -1773,7 +1774,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(drops, 1);
@@ -1819,7 +1820,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(drops, 1);
@@ -1845,7 +1846,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1859,7 +1860,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1884,7 +1885,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1910,7 +1911,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1935,7 +1936,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, drops) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, drops) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         assert!(batch.is_none());
         assert_eq!(drops, 1);
     }
@@ -1957,7 +1958,7 @@ mod tests {
             "m",
             vec![kv("service.name", "svc")],
         );
-        let (batch, _) = metrics_to_record_batch(&request, None).expect("ok");
+        let (batch, _) = metrics_to_record_batch(&request, &test_tenant("test-tenant")).expect("ok");
         let batch = batch.expect("batch");
         let exemplars = batch
             .column_by_name("exemplars")

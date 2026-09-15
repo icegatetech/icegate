@@ -78,6 +78,14 @@ query:
 ingest:
   enabled: true
   replicaCount: 1
+  ## The only sender into ingest on these stands is the collector, and it sets
+  ## X-Scope-OrgID: demo (config/kustomize/base/otel-collector/configmap.yaml).
+  ## In single mode a header naming another tenant is rejected, so the id has to
+  ## be the one the collector sends. multi is not used here: with no auth proxy
+  ## in front, it would let any sender that reaches the port pick the tenant.
+  tenant:
+    mode: single
+    id: "demo"
   waitForDependencies:
     enabled: true
     buckets:

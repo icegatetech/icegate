@@ -8,6 +8,9 @@ metadata:
     {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 4 }}
 data:
   ingest.yaml: |
+    {{- include "icegate.validateOperationalHost" . }}
+    {{- include "icegate.validateOtlpHosts" . }}
+    {{- include "icegate.tenantYaml" . | nindent 4 }}
     catalog:
       {{- include "icegate.catalogYaml" . | nindent 6 }}
       {{- if .Values.ingest.cache.enabled }}
@@ -78,16 +81,16 @@ data:
           request_timeout_secs: {{ .Values.ingest.shift.jobsmanager.storage.requestTimeoutSecs }}
     otlp_http:
       enabled: {{ .Values.ingest.otlpHttp.enabled }}
-      host: "0.0.0.0"
+      host: {{ .Values.ingest.otlpHttp.host | quote }}
       port: {{ .Values.ingest.otlpHttp.port }}
       max_body_bytes: {{ .Values.ingest.otlpHttp.maxBodyBytes | default 16777216 | int64 }}
     otlp_grpc:
       enabled: {{ .Values.ingest.otlpGrpc.enabled }}
-      host: "0.0.0.0"
+      host: {{ .Values.ingest.otlpGrpc.host | quote }}
       port: {{ .Values.ingest.otlpGrpc.port }}
     metrics:
       enabled: {{ .Values.ingest.metrics.enabled }}
-      host: "0.0.0.0"
+      host: {{ .Values.ingest.metrics.host | quote }}
       port: {{ .Values.ingest.metrics.port }}
       path: {{ .Values.ingest.metrics.path | quote }}
     tracing:

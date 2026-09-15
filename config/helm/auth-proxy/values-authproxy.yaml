@@ -1,0 +1,113 @@
+## Ingest behind the Envoy auth proxy of configmap-envoy.yaml.
+##
+##   kubectl apply -f config/helm/auth-proxy/configmap-envoy.yaml
+##   helm install icegate oci://ghcr.io/icegatetech/charts/icegate \
+##     -f config/helm/auth-proxy/values-authproxy.yaml
+##
+## `tenant`, `otlpHttp`, `otlpGrpc`, `service`, `extraContainers` and
+## `extraVolumes` below are one decision rather than a set of independent ones:
+## the proxy owns the published ports, so icegate binds the loopback ones, so the
+## port names belong to the proxy container, so the Service publishes what a
+## sender addresses rather than what icegate binds. Leave any of them at its
+## chart default and the pod either refuses to start, publishes icegate
+## unguarded, or answers on a port no sender was told to use.
+ingest:
+  ## The proxy writes x-scope-orgid from the token's tenant_id claim, so the
+  ## tenant comes from the token. `single` is legitimate here only when the
+  ## issuer emits exactly that one id.
+  tenant:
+    mode: multi
+
+  ## icegate retreats to the pod loopback: nothing outside the pod can reach the
+  ## receivers, whatever the namespace's network policy says. The ports must
+  ## equal the upstream clusters of configmap-envoy.yaml.
+  otlpHttp:
+    host: "127.0.0.1"
+    port: 14318
+  otlpGrpc:
+    host: "127.0.0.1"
+    port: 14317
+
+  ## The Service keeps publishing the ports senders address, which the receiver
+  ## ports above no longer are. These two must equal the listeners of
+  ## configmap-envoy.yaml and the proxy container's ports below — the Service
+  ## addresses that container by port name, and the name carries no number.
+  service:
+    otlpHttpPort: 4318
+    otlpGrpcPort: 4317
+
+  extraContainers:
+    - name: auth-proxy
+      ## Pinned rather than floating: the filter chain of configmap-envoy.yaml is
+      ## accepted by a specific Envoy release, and a moving tag changes that
+      ## contract without a change here. `make envoy-config-test` compares this tag
+      ## against config/docker/docker-compose.proxy.yml.
+      image: envoyproxy/envoy:v1.36.10
+      imagePullPolicy: IfNotPresent
+      command:
+        - /usr/local/bin/envoy
+        - --config-path
+        - /etc/envoy/envoy.yaml
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      ## Example values, to be sized against your own traffic. Stated at all
+      ## because the icegate container states its own through ingest.resources,
+      ## and the QoS class a container without them is given belongs to the whole
+      ## pod rather than to that container.
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+      ## The published OTLP ports, by the names the Service addresses as its
+      ## targetPort. icegate declares neither while it is on the loopback.
+      ports:
+        - name: otlp-http
+          containerPort: 4318
+          protocol: TCP
+        - name: otlp-grpc
+          containerPort: 4317
+          protocol: TCP
+      ## icegate's own probes report icegate. Without these a proxy that died
+      ## while its container stayed up would leave the pod Ready with nothing
+      ## answering on the published ports. tcpSocket rather than httpGet: every
+      ## HTTP path of both listeners demands a token, and no admin interface is
+      ## rendered.
+      livenessProbe:
+        tcpSocket:
+          port: otlp-http
+        initialDelaySeconds: 5
+        periodSeconds: 20
+        timeoutSeconds: 5
+        failureThreshold: 3
+      readinessProbe:
+        tcpSocket:
+          port: otlp-http
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+      volumeMounts:
+        - name: authproxy-config
+          mountPath: /etc/envoy
+          readOnly: true
+        - name: authproxy-tls
+          mountPath: /etc/icegate/tls
+          readOnly: true
+
+  extraVolumes:
+    - name: authproxy-config
+      configMap:
+        name: ingest-authproxy
+    ## Server certificate the proxy presents, keys tls.crt and tls.key. Create it
+    ## yourself (cert-manager, or `kubectl create secret tls ingest-tls ...`):
+    ## this repository ships no certificate and no issuer.
+    - name: authproxy-tls
+      secret:
+        secretName: ingest-tls

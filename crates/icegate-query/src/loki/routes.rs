@@ -55,7 +55,7 @@ pub fn routes(state: LokiState, pressure: MemoryPressure) -> Router {
         // process is under memory pressure (health probes bypass).
         .layer(axum::middleware::from_fn(move |req, next| {
             shed_when_pressured(
-                ShedPolicy::new(pressure.clone(), "loki", LOKI_SHED_BYPASS, false),
+                ShedPolicy::new(pressure.clone(), "loki", LOKI_SHED_BYPASS, None),
                 default_shed_response,
                 req,
                 next,

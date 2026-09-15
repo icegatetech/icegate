@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use icegate_common::MemoryPressure;
+use icegate_common::{MemoryPressure, TenantResolver};
 use icegate_queue::WriteChannel;
 use tokio_util::sync::CancellationToken;
 
@@ -28,24 +28,15 @@ pub struct OtlpHttpState {
 ///
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
-    write_channel: WriteChannel,
-    wal_row_group_size: usize,
-    operations_enabled: bool,
-    metrics: OtlpMetrics,
+    state: OtlpHttpState,
     config: OtlpHttpConfig,
     cancel_token: CancellationToken,
     memory_pressure: MemoryPressure,
+    tenant_resolver: TenantResolver,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = OtlpHttpState {
-        write_channel,
-        wal_row_group_size,
-        operations_enabled,
-        metrics,
-    };
-
-    let app = super::routes::routes(state, config.max_body_bytes, memory_pressure);
+    let app = super::routes::routes(state, config.max_body_bytes, memory_pressure, tenant_resolver);
 
     tracing::info!("OTLP HTTP server listening on {}", addr);
 

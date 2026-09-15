@@ -109,6 +109,9 @@ The system consists of five core components for handling observability data (met
 
 This command builds and runs all core services in Kubernetes. The first run will take a few minutes to build the images and start all services.
 
+The chart publishes the OTLP receivers as they are. To put an authenticating
+proxy in front of them, see [config/helm/auth-proxy](config/helm/auth-proxy/README.md).
+
 ### Available Services
 
 Once running, the following services are available:
@@ -116,7 +119,9 @@ Once running, the following services are available:
 #### Data Ingestion
 - **OTLP gRPC**: `http://localhost:4317` - Ingest observability data using OpenTelemetry gRPC protocol
 - **OTLP HTTP**: `http://localhost:4318` - Ingest observability data using OpenTelemetry HTTP protocol
-- **Ingest Metrics**: `http://localhost:9091/metrics` - Prometheus metrics for ingest service
+- **Ingest operational listener**: port `9091`, serving `/health` (liveness of the ingest process) always, and `/metrics` while `metrics.enabled`. Neither stand publishes it to the host. In Docker Compose it is reachable inside the network, which is how the bundled Prometheus scrapes it (`config/docker/prometheus/prometheus.yml`) and how the `ingest-probe` service checks health. In Kubernetes the pod always listens, but the Service carries the port only while `ingest.metrics.enabled`; with metrics off, reach the listener with `kubectl port-forward` to the pod
+
+The tenant an OTLP request writes to is decided by the ingest `tenant` policy: a request whose `x-scope-orgid` header names a tenant the deployment does not serve is rejected rather than written elsewhere. The stand runs single-tenant on `demo`, which is what the bundled collector sends. See [crates/icegate-ingest/README.md](crates/icegate-ingest/README.md).
 
 #### Query APIs
 - **Loki API**: `http://localhost:3100` - Query logs using Loki-compatible API ✅ **Currently Supported** (`query`, `query_range`, `labels`, `label/{name}/values`, `series`)

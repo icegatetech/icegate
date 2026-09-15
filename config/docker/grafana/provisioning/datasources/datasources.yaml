@@ -1,12 +1,21 @@
 apiVersion: 1
 
 datasources:
+  # The stand writes into one tenant, `demo` (config/docker/ingest.yaml), and a
+  # query that carries no X-Scope-OrgID reads `default` — a tenant nothing here
+  # writes to. So every datasource that reads IceGate sends the header, and the
+  # demo pair below differs from these two only in the trace<->logs correlation
+  # it is wired for.
   - name: Loki
     type: loki
     access: proxy
     url: http://query:3100
     isDefault: true
     editable: false
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+    secureJsonData:
+      httpHeaderValue1: demo
   - name: Prometheus
     type: prometheus
     access: proxy
@@ -19,6 +28,10 @@ datasources:
     url: http://query:3200
     isDefault: false
     editable: false
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+    secureJsonData:
+      httpHeaderValue1: demo
   - name: Jaeger
     type: jaeger
     access: proxy
