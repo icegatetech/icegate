@@ -96,10 +96,11 @@ fn a_document_without_a_tenant_section_keeps_the_default_tenant() {
     );
 }
 
-/// The stand configuration is a second copy of the shape the chart renders under
-/// `ingest.authProxy.enabled`, and nothing else reads it in CI. Loading it here
-/// is what catches a stand config that stopped parsing or stopped being `!multi`
-/// while the auth proxy still expects to write the tenant header itself.
+/// The stand configuration is a second copy of the shape a deployment behind an
+/// auth proxy takes (`config/helm/auth-proxy/values-authproxy.yaml` is the other),
+/// and nothing else reads it in CI. Loading it here is what catches a stand config
+/// that stopped parsing or stopped being `!multi` while the auth proxy still
+/// expects to write the tenant header itself.
 #[test]
 fn the_proxy_stand_document_is_multi_tenant_on_the_loopback() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/docker/ingest-proxy.yaml");

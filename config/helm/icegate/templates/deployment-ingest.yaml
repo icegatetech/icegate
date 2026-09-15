@@ -15,9 +15,6 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap-ingest.yaml") . | sha256sum }}
-        {{- if .Values.ingest.authProxy.enabled }}
-        checksum/authproxy-config: {{ include (print $.Template.BasePath "/configmap-authproxy.yaml") . | sha256sum }}
-        {{- end }}
       labels:
         {{- include "icegate.componentLabels" (dict "context" . "component" "ingest") | nindent 8 }}
     spec:
@@ -41,22 +38,19 @@ spec:
           securityContext:
             {{- include "icegate.containerSecurityContext" . | nindent 12 }}
           ports:
-            {{- /* Port names are unique across the pod, so the published OTLP
-                   names belong to whichever container actually listens on them:
-                   the proxy when it is enabled, this container otherwise. The
-                   loopback ports icegate falls back to are not declared at all —
-                   nothing outside the pod can address them. */}}
-            {{- if not .Values.ingest.authProxy.enabled }}
-            {{- if .Values.ingest.otlpGrpc.enabled }}
+            {{- /* A loopback bind declares no port: nothing outside the pod can
+                   address it, and the name would be taken from the container
+                   that does listen there — port names are unique across a pod,
+                   and the Service addresses them by name. */}}
+            {{- if and .Values.ingest.otlpGrpc.enabled (not (include "icegate.isLoopbackHost" .Values.ingest.otlpGrpc.host)) }}
             - name: otlp-grpc
               containerPort: {{ .Values.ingest.otlpGrpc.port }}
               protocol: TCP
             {{- end }}
-            {{- if .Values.ingest.otlpHttp.enabled }}
+            {{- if and .Values.ingest.otlpHttp.enabled (not (include "icegate.isLoopbackHost" .Values.ingest.otlpHttp.host)) }}
             - name: otlp-http
               containerPort: {{ .Values.ingest.otlpHttp.port }}
               protocol: TCP
-            {{- end }}
             {{- end }}
             {{- /* Declared unconditionally: the operational listener runs
                    whatever ingest.metrics.enabled says, because the probes hit
@@ -93,65 +87,8 @@ spec:
             - name: cache
               mountPath: {{ .Values.ingest.cache.diskDir }}
             {{- end }}
-        {{- if .Values.ingest.authProxy.enabled }}
-        # Terminates TLS on the published OTLP ports, verifies the ingest token,
-        # and rewrites x-scope-orgid from its tenant_id claim. icegate itself
-        # listens on the pod loopback while this container runs.
-        - name: auth-proxy
-          {{- /* Written out rather than through `icegate.image`: that helper
-                 exists to fall back to a second source for the tag, and this
-                 image has none — its tag is required, so the fallback could
-                 only be the very field it stands in for. */}}
-          image: {{ .Values.ingest.authProxy.image.repository }}:{{ required "ingest.authProxy.image.tag is required: the filter chain this chart renders is accepted by a specific Envoy release, and there is no appVersion to fall back to for a third-party image" .Values.ingest.authProxy.image.tag }}
-          imagePullPolicy: {{ .Values.ingest.authProxy.image.pullPolicy }}
-          command:
-            - /usr/local/bin/envoy
-            - --config-path
-            - /etc/envoy/envoy.yaml
-          securityContext:
-            {{- include "icegate.containerSecurityContext" . | nindent 12 }}
-          ports:
-            {{- if .Values.ingest.otlpGrpc.enabled }}
-            - name: otlp-grpc
-              containerPort: {{ .Values.ingest.otlpGrpc.port }}
-              protocol: TCP
-            {{- end }}
-            {{- if .Values.ingest.otlpHttp.enabled }}
-            - name: otlp-http
-              containerPort: {{ .Values.ingest.otlpHttp.port }}
-              protocol: TCP
-            {{- end }}
-          {{- /* icegate's own probes report icegate, so a proxy that died while
-                 its container stayed up would leave the pod Ready with nothing
-                 answering on the published ports. tcpSocket rather than httpGet:
-                 jwt_authn covers `prefix: /` of both listeners, so every HTTP
-                 path here demands a token, and the proxy exposes no endpoint of
-                 its own — the configuration renders no admin interface. */}}
-          {{- if or .Values.ingest.otlpHttp.enabled .Values.ingest.otlpGrpc.enabled }}
-          livenessProbe:
-            tcpSocket:
-              port: {{ ternary "otlp-http" "otlp-grpc" .Values.ingest.otlpHttp.enabled }}
-            initialDelaySeconds: 5
-            periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
-          readinessProbe:
-            tcpSocket:
-              port: {{ ternary "otlp-http" "otlp-grpc" .Values.ingest.otlpHttp.enabled }}
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
-          {{- end }}
-          resources:
-            {{- toYaml .Values.ingest.authProxy.resources | nindent 12 }}
-          volumeMounts:
-            - name: authproxy-config
-              mountPath: /etc/envoy
-              readOnly: true
-            - name: authproxy-tls
-              mountPath: /etc/icegate/tls
-              readOnly: true
+        {{- with .Values.ingest.extraContainers }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       volumes:
         - name: config
@@ -164,13 +101,8 @@ spec:
           emptyDir:
             sizeLimit: {{ .Values.ingest.cache.volumeSizeLimit }}
         {{- end }}
-        {{- if .Values.ingest.authProxy.enabled }}
-        - name: authproxy-config
-          configMap:
-            name: {{ include "icegate.componentName" (dict "context" . "component" "ingest-authproxy") }}
-        - name: authproxy-tls
-          secret:
-            secretName: {{ .Values.ingest.authProxy.tls.secretName }}
+        {{- with .Values.ingest.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.ingest.nodeSelector }}
       nodeSelector:

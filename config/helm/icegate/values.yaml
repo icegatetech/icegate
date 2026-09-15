@@ -383,20 +383,27 @@ ingest:
   ##            x-scope-orgid header must either be absent or name that same id.
   ##   multi  — the tenant comes from x-scope-orgid only; a request without a
   ##            valid header is rejected with 400 / INVALID_ARGUMENT.
-  ## Behind authProxy.enabled the mode is decided by how many tenant_id values
-  ## the token issuer emits: one id for the whole deployment means single with
-  ## that id, more than one means multi. The default pair below is refused with
-  ## the proxy on — see icegate.validateAuthProxy.
+  ## `multi` takes the tenant from whoever reaches the port, so it belongs behind
+  ## something that authenticates the sender and writes x-scope-orgid itself.
+  ## Nothing in this chart checks that such a thing is there — see
+  ## config/helm/auth-proxy for a sidecar that does it, and
+  ## crates/icegate-ingest/README.md for what ingest expects of any proxy.
   tenant:
     mode: single
     id: "default"
 
-  ## The published OTLP ports. Without an auth proxy icegate binds them itself;
-  ## with authProxy.enabled the proxy binds them and icegate moves to the pod
-  ## loopback (see authProxy.upstream). There is deliberately no `host` key:
-  ## the bind address is decided by authProxy.enabled and nothing else.
+  ## The OTLP receivers. `host` is the bind address: 0.0.0.0 publishes the
+  ## receiver on the Pod IP, a loopback address keeps it inside the pod, where
+  ## only another container of the same pod reaches it — which is what a proxy
+  ## sidecar in extraContainers needs. A loopback bind also stops the container
+  ## declaring the port: the name then belongs to whichever container listens on
+  ## it, and the Service follows the name. Hence a loopback bind is accepted only
+  ## alongside an entry in extraContainers declaring that name — otlp-http or
+  ## otlp-grpc — since the Service addresses its targetPort by it; the render
+  ## refuses the pair and states the condition in full.
   otlpHttp:
     enabled: true
+    host: "0.0.0.0"
     port: 4318
     ## Max decompressed request body, in bytes (hard limit). A request exceeding
     ## this is rejected with a clean HTTP 413 — the body is drained first so the
@@ -408,82 +415,17 @@ ingest:
   ## OTLP gRPC receiver
   otlpGrpc:
     enabled: true
+    host: "0.0.0.0"
     port: 4317
 
   ## Operational listener: always serves /health, and /metrics when enabled.
-  ## Unlike the OTLP listeners this one keeps a `host` key — it must stay
-  ## reachable from the pod IP for the ServiceMonitor scrape.
+  ## Unlike the OTLP listeners this one must stay reachable from the pod IP — the
+  ## probes address it there, and so does the ServiceMonitor scrape.
   metrics:
     enabled: true
     host: "0.0.0.0"
     port: 9091
     path: /metrics
-
-  ## Envoy sidecar terminating TLS and checking the ingest token in front of the
-  ## OTLP receivers. Off by default: the OSS deployment publishes the receivers
-  ## directly.
-  authProxy:
-    enabled: false
-    image:
-      repository: envoyproxy/envoy
-      ## Pinned rather than floating: the filter chain this chart renders is
-      ## accepted by a specific Envoy release, and a moving tag changes that
-      ## contract without a change here. Unlike the icegate images, whose tag
-      ## falls back to the chart's appVersion, this one names a third-party
-      ## release and has no such source — so it is stated here, where the
-      ## generated README reports it, rather than as a literal in the template.
-      ## make helm-envoy-test compares it against docker-compose.proxy.yml.
-      tag: "v1.36.10"
-      pullPolicy: IfNotPresent
-    ## Token issuer, audience and JWKS endpoint. No defaults: icegate must not
-    ## carry the control plane's addresses.
-    jwt:
-      issuer: ""
-      audience: ""
-      jwksUri: ""
-      jwksCacheDurationSecs: 300
-      clockSkewSeconds: 60
-      ## The JOSE `typ` of the token header, which says the bearer is an access
-      ## token rather than another JOSE object the same signing key produces.
-      ## RFC 9068 names `at+jwt` for it, and the proxy compares the header
-      ## exactly, so an issuer that stamps another spelling is configured here
-      ## rather than admitted silently.
-      headerType: "at+jwt"
-      ## The payload `typ` the issuer stamps on an ingest token. It is what
-      ## separates an ingest token from every other token the same issuer signs
-      ## for the same audience, so the proxy admits a request only when the claim
-      ## carries this value. A value rather than a literal because the issuer
-      ## owns it: renaming it there must be a values change here, not a release.
-      ## Checked alongside headerType above: a request needs both.
-      tokenType: "ingest"
-      ## CA bundle the proxy validates the JWKS host's certificate against.
-      ## Path inside the proxy image, so it moves with authProxy.image: these
-      ## keys decide who may write into a tenant, and an unauthenticated fetch
-      ## would let whoever can answer for the JWKS host issue tokens of its own.
-      trustedCaFile: /etc/ssl/certs/ca-certificates.crt
-    ## Secret holding the server certificate the proxy presents (keys tls.crt
-    ## and tls.key).
-    tls:
-      secretName: ""
-    ## Loopback ports icegate listens on while the proxy owns the published
-    ## ones. Tunable only because a pod may already use these numbers for
-    ## something else; the values are never reachable from outside the pod.
-    upstream:
-      otlpHttpPort: 14318
-      otlpGrpcPort: 14317
-    ## How long the proxy waits for icegate to answer one OTLP request, in whole
-    ## seconds with the s suffix — values.schema.json refuses any other form,
-    ## because that is the form the render checks read back out of the rendered
-    ## configuration. Named here because the proxy is a second ceiling on the
-    ## response time: an OTLP request is answered only once the batch is durable
-    ## in the WAL, and a request the proxy gives up on is reported to the sender
-    ## as a failure while icegate may still commit it — the retry that follows
-    ## then writes the batch twice. Without this key the ceiling would be
-    ## whatever the proxy image defaults to, which no values file states. The
-    ## render refuses a value below icegate's own WAL acknowledgement deadline
-    ## for that reason.
-    upstreamTimeout: "30s"
-    resources: {}
 
   ## OpenTelemetry tracing
   tracing:
@@ -496,6 +438,17 @@ ingest:
 
   ## Extra environment variables
   extraEnv: []
+
+  ## Extra containers in the ingest pod, passed through as written. An auth proxy
+  ## sidecar goes here together with the loopback binds above; see
+  ## config/helm/auth-proxy/values-authproxy.yaml for a complete set. The one
+  ## thing the chart reads of an entry is `ports[].name`: a loopback OTLP bind
+  ## requires one declaring the port name that bind gave up, otlp-http or
+  ## otlp-grpc.
+  extraContainers: []
+
+  ## Extra volumes for the ingest pod, passed through as written.
+  extraVolumes: []
 
   resources:
     requests:
@@ -514,6 +467,15 @@ ingest:
   service:
     type: ClusterIP
     annotations: {}
+    ## The OTLP ports the Service publishes — what a sender addresses. Left
+    ## unset, each follows the receiver port above, which is the right answer
+    ## while icegate is itself the published listener. A sidecar that owns the
+    ## published ports takes those numbers for itself and moves the receivers to
+    ## the loopback; the two are different from then on, the receiver ports being
+    ## what the sidecar proxies to and these what senders keep addressing. See
+    ## config/helm/auth-proxy/values-authproxy.yaml.
+    otlpHttpPort: null
+    otlpGrpcPort: null
 
   ## Ingress
   ingress:
@@ -555,15 +517,13 @@ ingest:
   ## Liveness and readiness probe overrides for the icegate container.
   ## Both hit /health on the operational listener, addressed by the port name the
   ## Deployment declares unconditionally, so the probe follows ingest.metrics.port
-  ## instead of holding a second copy of it. With authProxy.enabled the OTLP ports
-  ## belong to the proxy, so probing them would report the proxy's health instead
-  ## of icegate's.
+  ## instead of holding a second copy of it. The OTLP ports are not probed: they
+  ## may belong to a container in extraContainers, and the answer would then be
+  ## that container's health rather than icegate's.
   ##
-  ## The probe addresses icegate directly rather than through the proxy, because
-  ## routing it through Envoy would make the probe port depend on
-  ## authProxy.enabled, which these free-form blocks cannot express. A dead proxy
-  ## still takes the pod out of the endpoints: the auth-proxy container carries a
-  ## tcpSocket probe of its own (see templates/deployment-ingest.yaml).
+  ## A sidecar that publishes those ports carries a probe of its own, stated
+  ## beside it in extraContainers — otherwise it can die with its container still
+  ## up, leaving the pod Ready with nothing answering on the published ports.
   livenessProbe:
     httpGet:
       path: /health

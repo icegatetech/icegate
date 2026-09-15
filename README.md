@@ -109,6 +109,9 @@ The system consists of five core components for handling observability data (met
 
 This command builds and runs all core services in Kubernetes. The first run will take a few minutes to build the images and start all services.
 
+The chart publishes the OTLP receivers as they are. To put an authenticating
+proxy in front of them, see [config/helm/auth-proxy](config/helm/auth-proxy/README.md).
+
 ### Available Services
 
 Once running, the following services are available:

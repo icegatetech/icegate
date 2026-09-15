@@ -1,0 +1,280 @@
+# Envoy in front of the icegate ingest receivers: terminates TLS on the published
+# OTLP ports, verifies the ingest token, and writes x-scope-orgid from its
+# tenant_id claim.
+#
+# Four values below name something outside this repository and MUST be replaced
+# before this is applied. Applied unchanged, the proxy refuses every request:
+#   - the `issuer` and `audiences` of the jwt_authn provider;
+#   - `remote_jwks.http_uri.uri`;
+#   - the `token_issuer_jwks` cluster: its endpoint `address`, its `sni`, and the
+#     `match_typed_subject_alt_names` matcher.
+#
+# A JWKS uri on `http://` takes one more change: the `transport_socket` of that
+# same cluster is deleted whole. The comment beside the block states why.
+#
+# The upstream ports (14317/14318) must equal ingest.otlpHttp.port and
+# ingest.otlpGrpc.port of values-authproxy.yaml — icegate binds those, this file
+# proxies to them, and a drift leaves a pod that starts clean and answers every
+# request with a connection refused upstream. `make envoy-config-test` compares them.
+#
+# The route timeout, the JWKS uri and the endpoint address of the
+# token_issuer_jwks cluster are written on one line each, the form
+# config/docker/auth-proxy/envoy.yaml uses: scripts/authproxy-test.sh rewrites all
+# three line by line before it loads this document, and a multi-line spelling
+# passes through that rewrite untouched.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingest-authproxy
+  labels:
+    app.kubernetes.io/name: icegate
+    app.kubernetes.io/component: ingest
+data:
+  envoy.yaml: |
+    static_resources:
+      listeners:
+        # OTLP/HTTP. Terminates TLS, checks the ingest token, and rewrites
+        # x-scope-orgid from the token's tenant_id claim before proxying to
+        # icegate on the pod loopback.
+        - name: otlp_http
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 4318 }
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                      - certificate_chain: { filename: /etc/icegate/tls/tls.crt }
+                        private_key: { filename: /etc/icegate/tls/tls.key }
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: otlp_http
+                    codec_type: AUTO
+                    route_config:
+                      name: otlp_http
+                      virtual_hosts:
+                        - name: otlp_http
+                          domains: ["*"]
+                          routes:
+                            # Every path. The upstream is icegate's OTLP receiver
+                            # and serves nothing else — its own router answers an
+                            # unknown path 404, and the operational listener that
+                            # carries /health and /metrics is on another port this
+                            # proxy does not front. Listing the OTLP paths here only
+                            # added a copy of
+                            # crates/icegate-ingest/src/otlp_http/routes.rs that
+                            # nothing compares against it.
+                            - match: { prefix: / }
+                              route: { cluster: icegate_otlp_http, timeout: "30s" }
+                    http_filters: &ingest_token_filters
+                      # Drops whatever the client sent as x-scope-orgid, before
+                      # jwt_authn writes the value from the token. A filter, and
+                      # this one first, because route-level
+                      # request_headers_to_remove is applied by the router filter
+                      # at the end of the chain and would delete the value the
+                      # token put there.
+                      - name: envoy.filters.http.header_mutation
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+                          mutations:
+                            request_mutations:
+                              - remove: x-scope-orgid
+                      - name: envoy.filters.http.jwt_authn
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+                          providers:
+                            ingest_token:
+                              issuer: "https://issuer.example"
+                              audiences:
+                                - "icegate-ingest"
+                              forward: false
+                              # Both halves of the token reach the rbac policy
+                              # below, which is the only filter that reads either:
+                              # without these keys the metadata carries nothing and
+                              # a principal stated over it admits every token
+                              # jwt_authn verified.
+                              header_in_metadata: jwt_header
+                              payload_in_metadata: jwt_payload
+                              clock_skew_seconds: 60
+                              # The only place a token is taken from, stated
+                              # explicitly so that a bearer cannot arrive in a
+                              # URL — which everything a URL passes through
+                              # writes to access logs and traces. The case
+                              # `token offered as a query parameter` in
+                              # scripts/authproxy-test.sh fails if one arriving
+                              # that way is accepted.
+                              from_headers:
+                                - name: Authorization
+                                  value_prefix: "Bearer "
+                              claim_to_headers:
+                                - header_name: x-scope-orgid
+                                  claim_name: tenant_id
+                              remote_jwks:
+                                http_uri:
+                                  uri: "https://issuer.example/.well-known/jwks.json"
+                                  cluster: token_issuer_jwks
+                                  timeout: 5s
+                                cache_duration: "300s"
+                                # Fetched in the background so the proxy starts
+                                # even while the issuer is unreachable.
+                                async_fetch: {}
+                          rules:
+                            - match: { prefix: / }
+                              requires: { provider_name: ingest_token }
+                      # The two markers of the token profile, neither of which
+                      # jwt_authn checks and neither of which the audience stands
+                      # in for: the JOSE `typ` of the header, which says the object
+                      # is an access token, and the payload `typ`, the issuer's own
+                      # discriminator of which application token this is. Beside
+                      # them the tenant_id claim, because it is this proxy that
+                      # owes a refused token a 403: claim_to_headers writes no
+                      # header for a claim that is absent, and icegate then
+                      # answers the batch 400 for a request whose fault is the
+                      # token.
+                      - name: envoy.filters.http.rbac
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                          rules:
+                            action: ALLOW
+                            policies:
+                              # `principals.metadata` is the form the pinned image
+                              # accepts: `make envoy-config-test` loads this
+                              # document with `envoy --mode validate` and fails
+                              # the day it stops being accepted. The other
+                              # spelling is a CEL `condition` over the same
+                              # jwt_authn metadata; swap to it then, not before —
+                              # it is longer and harder to read.
+                              ingest_tokens_only:
+                                permissions:
+                                  - any: true
+                                principals:
+                                  - and_ids:
+                                      ids:
+                                        - metadata:
+                                            filter: envoy.filters.http.jwt_authn
+                                            path:
+                                              - key: jwt_header
+                                              - key: typ
+                                            value:
+                                              string_match: { exact: "at+jwt" }
+                                        - metadata:
+                                            filter: envoy.filters.http.jwt_authn
+                                            path:
+                                              - key: jwt_payload
+                                              - key: typ
+                                            value:
+                                              string_match: { exact: "ingest" }
+                                        # Any non-empty value: which tenant the
+                                        # token names is the issuer's decision,
+                                        # an empty one names none.
+                                        - metadata:
+                                            filter: envoy.filters.http.jwt_authn
+                                            path:
+                                              - key: jwt_payload
+                                              - key: tenant_id
+                                            value:
+                                              string_match:
+                                                safe_regex: { regex: ".+" }
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+        # OTLP/gRPC. Same filter chain; a refused RPC surfaces to the exporter
+        # as UNAUTHENTICATED.
+        - name: otlp_grpc
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 4317 }
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                      - certificate_chain: { filename: /etc/icegate/tls/tls.crt }
+                        private_key: { filename: /etc/icegate/tls/tls.key }
+                    alpn_protocols: ["h2"]
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: otlp_grpc
+                    codec_type: HTTP2
+                    route_config:
+                      name: otlp_grpc
+                      virtual_hosts:
+                        - name: otlp_grpc
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: /opentelemetry.proto.collector. }
+                              route: { cluster: icegate_otlp_grpc, timeout: "30s" }
+                    http_filters: *ingest_token_filters
+
+      clusters:
+        - name: icegate_otlp_http
+          connect_timeout: 1s
+          type: STATIC
+          load_assignment:
+            cluster_name: icegate_otlp_http
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: 14318
+        - name: icegate_otlp_grpc
+          connect_timeout: 1s
+          type: STATIC
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: icegate_otlp_grpc
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: 14317
+        # The JWKS endpoint the jwt_authn filter fetches signing keys from.
+        - name: token_issuer_jwks
+          connect_timeout: 2s
+          type: LOGICAL_DNS
+          dns_lookup_family: V4_ONLY
+          load_assignment:
+            cluster_name: token_issuer_jwks
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: issuer.example, port_value: 443 }
+          # Delete this whole block for a JWKS uri on `http://`: kept, the fetch
+          # opens a TLS handshake against a plain-HTTP port and no key is ever
+          # loaded, while async_fetch above leaves the proxy started and Ready
+          # with every request answered 401.
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              sni: issuer.example
+              # These keys decide who may write into a tenant, so the peer that
+              # serves them is authenticated: without a validation_context Envoy
+              # encrypts the fetch but accepts any certificate, and whoever can
+              # answer for this host serves its own JWKS once cache_duration
+              # lapses. The CA path is the one in the envoyproxy/envoy image.
+              common_tls_context:
+                validation_context:
+                  trusted_ca:
+                    filename: "/etc/ssl/certs/ca-certificates.crt"
+                  match_typed_subject_alt_names:
+                    - san_type: DNS
+                      matcher:
+                        exact: issuer.example

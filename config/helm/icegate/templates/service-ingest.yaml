@@ -15,15 +15,19 @@ spec:
   selector:
     {{- include "icegate.selectorLabels" (dict "context" . "component" "ingest") | nindent 4 }}
   ports:
+    {{- /* The published port is `icegate.ingestPublishedPort`, which NOTES.txt
+           prints as the address of this Service — the two cannot disagree while
+           both read it there. targetPort stays a name, so it follows whichever
+           container listens on the port, icegate's or a sidecar's. */}}
     {{- if .Values.ingest.otlpGrpc.enabled }}
     - name: otlp-grpc
-      port: {{ .Values.ingest.otlpGrpc.port }}
+      port: {{ include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpGrpc") }}
       targetPort: otlp-grpc
       protocol: TCP
     {{- end }}
     {{- if .Values.ingest.otlpHttp.enabled }}
     - name: otlp-http
-      port: {{ .Values.ingest.otlpHttp.port }}
+      port: {{ include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpHttp") }}
       targetPort: otlp-http
       protocol: TCP
     {{- end }}

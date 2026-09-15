@@ -2,9 +2,15 @@
 """Assert every copy the chart carries still matches the source it came from.
 
 Each artifact checked here is a copy of something else in the repo — the Artifact
-Hub metadata, the values schema, the generated README, and the deadline the chart
-restates from Rust — so each check names the source it must agree with. A failure
-means the copy drifted, not that the source is wrong.
+Hub metadata, the values schema, the generated README, and the WAL acknowledgement
+deadline the auth proxy example must not undercut — so each check names the source
+it must agree with. A failure means the copy drifted, not that the source is wrong.
+
+The auth proxy example is also checked against itself, for the values no source in
+this repo holds: the chart refused an empty issuer, audience or JWKS uri while the
+proxy was a chart feature, and nothing refuses them now that it is deployed
+alongside. That check is here rather than in the chart because the example is the
+only file that carries them.
 """
 import re
 import subprocess
@@ -13,26 +19,26 @@ from pathlib import Path
 
 import yaml
 
-CHART_DIR = Path("config/helm/icegate")
+sys.path.insert(0, str(Path(__file__).parent))
+
+from chartlib import (  # noqa: E402  (path set above so this file runs from the repo root)
+    CHART_DIR,
+    fail,
+    load_document,
+    ok,
+    read_configmap_file,
+    read_envoy_route_timeouts,
+    report_failures,
+)
+
 CHART = CHART_DIR / "Chart.yaml"
-HELPERS = CHART_DIR / "templates/_helpers.tpl"
+EXAMPLE_CONFIGMAP = Path("config/helm/auth-proxy/configmap-envoy.yaml")
 BAKE = Path("config/docker/docker-bake.hcl")
 RELEASE = Path(".github/workflows/release.yml")
 WAL_WRITER = Path("crates/icegate-ingest/src/wal/writer.rs")
 
-failures: list[str] = []
-
-
-def fail(msg: str) -> None:
-    failures.append(msg)
-    print(f"FAIL: {msg}", file=sys.stderr)
-
-
-def ok(msg: str) -> None:
-    print(f"ok: {msg}")
-
-
-chart = yaml.safe_load(CHART.read_text())
+chart = load_document(CHART)
+envoy_document = read_configmap_file(EXAMPLE_CONFIGMAP, "envoy.yaml")
 annotations = chart.get("annotations", {})
 
 # 1. Images match the bake targets and carry appVersion's tag. A stale image name
@@ -110,24 +116,89 @@ elif (CHART_DIR / "README.md").read_text() != before:
 else:
     ok("README.md is up to date")
 
-# 5. The WAL acknowledgement deadline the chart restates to check
-#    ingest.authProxy.upstreamTimeout against. Helm cannot read a Rust constant,
-#    so the copy is unavoidable — and nothing in the pod compares the two, since
-#    the proxy is handed a timeout icegate never sees. A drift would surface only
-#    as telemetry written twice after a retry, far from either value.
+# 5. The route timeout of the auth proxy example against the WAL acknowledgement
+#    deadline it must not undercut. icegate answers an OTLP request only once the
+#    batch is durable, so a proxy that gives up first reports a failure for a
+#    write that still commits, and the sender's retry writes the batch twice.
+#    Nothing in a cluster compares the two: the proxy is handed a timeout icegate
+#    never sees.
 writer_deadline = re.search(r"WAL_ACK_TIMEOUT: Duration = Duration::from_secs\((\d+)\)", WAL_WRITER.read_text())
-chart_deadline = re.search(r"\$walAckTimeoutSecs := (\d+)", HELPERS.read_text())
-if not writer_deadline or not chart_deadline:
+# Read per route rather than by the key alone: `timeout` also ends
+# `connect_timeout`, and `remote_jwks.http_uri` carries a `timeout` of its own, so
+# a search for the key would report a neighbour. A duration Envoy accepts and this
+# pattern does not — `0.25s`, say — drops out of the list rather than ending the
+# run, and the count check below then names the file that carries it.
+example_timeouts = [
+    int(match.group(1))
+    for match in (re.fullmatch(r"(\d+)s", value) for value in read_envoy_route_timeouts(envoy_document).values())
+    if match
+]
+if not writer_deadline or not example_timeouts:
     fail(
         f"the WAL acknowledgement deadline is no longer readable from "
-        f"{'writer.rs' if not writer_deadline else '_helpers.tpl'}; update this check or the definition"
+        f"{'writer.rs' if not writer_deadline else EXAMPLE_CONFIGMAP}; update this check or the definition"
     )
-elif writer_deadline.group(1) != chart_deadline.group(1):
+elif len(example_timeouts) != 2:
+    fail(f"{EXAMPLE_CONFIGMAP} carries {len(example_timeouts)} route timeouts, expected one per listener")
+elif min(example_timeouts) < int(writer_deadline.group(1)):
     fail(
-        f"_helpers.tpl restates the WAL acknowledgement deadline as {chart_deadline.group(1)}s, "
-        f"writer.rs defines {writer_deadline.group(1)}s"
+        f"{EXAMPLE_CONFIGMAP} times a route out after {min(example_timeouts)}s, "
+        f"below the {writer_deadline.group(1)}s WAL acknowledgement deadline of writer.rs: "
+        f"the sender retries a write that still commits, and the batch lands twice"
     )
 else:
-    ok(f"chart restates the WAL acknowledgement deadline as {writer_deadline.group(1)}s")
+    ok(f"the auth proxy example outlasts the {writer_deadline.group(1)}s WAL acknowledgement deadline")
 
-sys.exit(1 if failures else 0)
+
+# 6. The three values of the example's jwt_authn provider that decide whether a
+#    token is checked at all. An empty `issuer` is not a configuration Envoy
+#    refuses — it is a provider that verifies no `iss`, so every token signed by a
+#    key of the same JWKS and carrying the same audience is admitted. The same
+#    holds for an empty audience list and for a JWKS uri fetching from nowhere.
+def read_jwt_authn_providers(document: dict) -> list[tuple[str, dict]]:
+    """Every `ingest_token` provider of the document, each with its listener name.
+
+    Every listener is walked rather than the first alone: the two share one filter
+    chain through a YAML anchor today, and a chain written out per listener is an
+    ordinary edit that would leave a second provider nothing reads. A shared chain
+    is reported once, under the listener that carries it first.
+    """
+    found: list[tuple[str, dict]] = []
+    for listener in document.get("static_resources", {}).get("listeners", []):
+        for chain in listener.get("filter_chains", []):
+            for network_filter in chain.get("filters", []):
+                manager = network_filter.get("typed_config", {})
+                for http_filter in manager.get("http_filters", []):
+                    if http_filter.get("name") != "envoy.filters.http.jwt_authn":
+                        continue
+                    provider = http_filter.get("typed_config", {}).get("providers", {}).get("ingest_token")
+                    if provider is None or any(provider is seen for _, seen in found):
+                        continue
+                    found.append((listener.get("name", "<unnamed>"), provider))
+    return found
+
+
+jwt_authn_providers = read_jwt_authn_providers(envoy_document)
+if not jwt_authn_providers:
+    fail(f"{EXAMPLE_CONFIGMAP} carries no ingest_token provider; update this check or the example")
+for listener_name, provider in jwt_authn_providers:
+    stated = {
+        "issuer": provider.get("issuer"),
+        "remote_jwks.http_uri.uri": provider.get("remote_jwks", {}).get("http_uri", {}).get("uri"),
+    }
+    # Every audience, not the first: an empty one further down the list is
+    # accepted by Envoy and admits a token carrying no audience of its own.
+    # A provider with no list at all reports the same way, as `audiences[0]`.
+    for position, audience in enumerate(provider.get("audiences") or [None]):
+        stated[f"audiences[{position}]"] = audience
+    empty = sorted(name for name, value in stated.items() if not (isinstance(value, str) and value.strip()))
+    if empty:
+        fail(
+            f"{EXAMPLE_CONFIGMAP} leaves {', '.join(empty)} of the {listener_name} listener empty: "
+            f"the provider then checks nothing that field stands for, and admits tokens it exists "
+            f"to refuse"
+        )
+    else:
+        ok(f"the {listener_name} provider names an issuer, its audiences and a JWKS uri")
+
+sys.exit(report_failures())

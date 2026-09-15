@@ -10,19 +10,16 @@
 #     `remote_jwks.http_uri.uri`;
 #   - the `ingest_tokens_only` policy: the payload `typ` it matches, which is the
 #     issuer's own discriminator of which application token this is, and the JOSE
-#     `typ` it matches beside it, which says the bearer is an access token. The
-#     chart carries them as `ingest.authProxy.jwt.tokenType` and
-#     `ingest.authProxy.jwt.headerType`; here they are literals because this file
-#     is not templated;
+#     `typ` it matches beside it, which says the bearer is an access token;
 #   - the `token_issuer_jwks` cluster: the endpoint `address`, the `sni`, and the
 #     SAN matcher under `match_typed_subject_alt_names` — all three name the JWKS
 #     host, and the last two are what authenticate it;
 #   - the `timeout` on both routes, the ceiling on how long the proxy waits for
-#     icegate to answer one OTLP request. The chart carries it as
-#     `ingest.authProxy.upstreamTimeout` and this file repeats its default.
+#     icegate to answer one OTLP request. The deployment example repeats the same
+#     value, and `make envoy-config-test` compares the two.
 #
-# The listeners below deliberately do NOT terminate TLS, unlike the ones the Helm
-# chart renders (`config/helm/icegate/templates/configmap-authproxy.yaml`, where
+# The listeners below deliberately do NOT terminate TLS, unlike the ones of the
+# deployment example (`config/helm/auth-proxy/configmap-envoy.yaml`, where
 # each filter chain carries a `DownstreamTlsContext`): the stand is local and
 # deploys no certificate, so it takes the ingest token over plain HTTP. Copying
 # this file into a deployment therefore requires adding that `transport_socket`
@@ -46,7 +43,7 @@ static_resources:
                     - name: otlp_http
                       domains: ["*"]
                       routes:
-                        # Every path; same reason as the chart's otlp_http listener.
+                        # Every path; same reason as the example's otlp_http listener.
                         - match: { prefix: / }
                           route: { cluster: icegate_otlp_http, timeout: "30s" }
                 http_filters: &ingest_token_filters
@@ -54,8 +51,8 @@ static_resources:
                   # jwt_authn writes the value from the token. A filter, and this
                   # one first, because route-level request_headers_to_remove is
                   # applied by the router filter at the end of the chain and would
-                  # delete the value the token put there. Same order the chart
-                  # renders in icegate.authProxyHttpFilters.
+                  # delete the value the token put there. Same order the
+                  # deployment example carries.
                   - name: envoy.filters.http.header_mutation
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
@@ -72,7 +69,7 @@ static_resources:
                           forward: false
                           # Both halves of the token reach the rbac policy below,
                           # which is the only filter that reads either. Same keys
-                          # the chart's icegate.authProxyHttpFilters renders.
+                          # the deployment example renders.
                           header_in_metadata: jwt_header
                           payload_in_metadata: jwt_payload
                           clock_skew_seconds: 60
@@ -101,16 +98,18 @@ static_resources:
                   # jwt_authn checks and neither of which the audience stands in
                   # for: the JOSE `typ` of the header, which says the object is
                   # an access token, and the payload `typ`, the issuer's own
-                  # discriminator of which application token this is.
+                  # discriminator of which application token this is. Beside them
+                  # the tenant_id claim, for the reason the deployment example
+                  # states: a token without it reaches icegate as a request with
+                  # no tenant and is answered 400, when the fault is the token.
                   - name: envoy.filters.http.rbac
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
                       rules:
                         action: ALLOW
                         policies:
-                          # `principals.metadata` is marked deprecated by Envoy
-                          # 1.36 (it still loads, with a warning); see the same
-                          # note in the chart's icegate.authProxyHttpFilters.
+                          # `principals.metadata` is the form the pinned image
+                          # accepts; see the same note in the deployment example.
                           ingest_tokens_only:
                             permissions:
                               - any: true
@@ -131,6 +130,17 @@ static_resources:
                                           - key: typ
                                         value:
                                           string_match: { exact: ingest }
+                                    # Any non-empty value: which tenant the token
+                                    # names is the issuer's decision, an empty one
+                                    # names none.
+                                    - metadata:
+                                        filter: envoy.filters.http.jwt_authn
+                                        path:
+                                          - key: jwt_payload
+                                          - key: tenant_id
+                                        value:
+                                          string_match:
+                                            safe_regex: { regex: ".+" }
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

@@ -21,6 +21,14 @@ belongs behind an auth proxy that authenticates the sender and writes
 `x-scope-orgid` itself. Without one, any client on the network chooses the tenant
 it writes to.
 
+Any proxy in front of the receivers has a floor on its upstream timeout: an OTLP
+request is answered only once the batch is durable in the WAL, so a proxy that
+gives up before `WAL_ACK_TIMEOUT` (`src/wal/writer.rs`) reports a failure for a
+write that still commits, and the sender's retry writes the batch twice. This
+holds for an ingress controller's read timeout as much as for a sidecar's route
+timeout. A deployment example that respects it, checked against that constant by
+`make helm-metadata-test`, is [`config/helm/auth-proxy`](../../config/helm/auth-proxy/README.md).
+
 ## Checking the auth proxy on the dev stand
 
 `make run-docker-proxy-release` brings the stand up with the Envoy sidecar in
@@ -33,9 +41,9 @@ owns the published OTLP ports.
 
 The header of `config/docker/auth-proxy/envoy.yaml` states which of its
 issuer-specific values are placeholders to be pointed at yours, and why its
-listeners carry no TLS while the chart's
-(`config/helm/icegate/templates/configmap-authproxy.yaml`) do — the reason
-`scripts/authproxy-test.sh` runs the chart's cases over `https` and the stand's
+listeners carry no TLS while the deployment example's
+(`config/helm/auth-proxy/configmap-envoy.yaml`) do — the reason
+`scripts/authproxy-test.sh` runs the example's cases over `https` and the stand's
 over `http`.
 
 Nothing on the stand mints a token, so both of its OTLP senders are refused while
