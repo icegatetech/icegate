@@ -1,3 +1,12 @@
+# One tenant for the whole stand, named `demo`, because that is what the
+# collector sends: `X-Scope-OrgID: demo` in otel-collector/config.yaml, on the
+# logs of every service that uses the fluentd driver. In single mode a header
+# naming any other tenant is rejected, so `default` here would 400 every batch.
+# `otelgen` (profile `load`) sends no header at all and therefore also lands in
+# `demo`; view its data through the "Loki (demo)" / "Tempo (demo)" datasources.
+tenant: !single
+  id: demo
+
 catalog:
   backend: !s3
     warehouse: catalog

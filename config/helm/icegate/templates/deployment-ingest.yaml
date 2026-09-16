@@ -38,21 +38,26 @@ spec:
           securityContext:
             {{- include "icegate.containerSecurityContext" . | nindent 12 }}
           ports:
-            {{- if .Values.ingest.otlpGrpc.enabled }}
+            {{- /* A loopback bind declares no port: nothing outside the pod can
+                   address it, and the name would be taken from the container
+                   that does listen there — port names are unique across a pod,
+                   and the Service addresses them by name. */}}
+            {{- if and .Values.ingest.otlpGrpc.enabled (not (include "icegate.isLoopbackHost" .Values.ingest.otlpGrpc.host)) }}
             - name: otlp-grpc
               containerPort: {{ .Values.ingest.otlpGrpc.port }}
               protocol: TCP
             {{- end }}
-            {{- if .Values.ingest.otlpHttp.enabled }}
+            {{- if and .Values.ingest.otlpHttp.enabled (not (include "icegate.isLoopbackHost" .Values.ingest.otlpHttp.host)) }}
             - name: otlp-http
               containerPort: {{ .Values.ingest.otlpHttp.port }}
               protocol: TCP
             {{- end }}
-            {{- if .Values.ingest.metrics.enabled }}
+            {{- /* Declared unconditionally: the operational listener runs
+                   whatever ingest.metrics.enabled says, because the probes hit
+                   /health on it. */}}
             - name: metrics
               containerPort: {{ .Values.ingest.metrics.port }}
               protocol: TCP
-            {{- end }}
           env:
             {{- include "icegate.awsEnv" . | nindent 12 }}
             - name: RUST_LOG
@@ -82,6 +87,9 @@ spec:
             - name: cache
               mountPath: {{ .Values.ingest.cache.diskDir }}
             {{- end }}
+        {{- with .Values.ingest.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       volumes:
         - name: config
           configMap:
@@ -92,6 +100,9 @@ spec:
         - name: cache
           emptyDir:
             sizeLimit: {{ .Values.ingest.cache.volumeSizeLimit }}
+        {{- end }}
+        {{- with .Values.ingest.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.ingest.nodeSelector }}
       nodeSelector:

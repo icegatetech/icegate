@@ -15,6 +15,24 @@ pub use metrics::{metrics_arrow_schema, metrics_to_record_batch};
 pub use operations::{operations_arrow_schema, operations_to_record_batch};
 pub use spans::{spans_arrow_schema, spans_to_record_batch};
 
+/// Fixtures shared by the tests of every signal, and by the tests of the callers
+/// that drive a transform (`wal::batch`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use icegate_common::TenantId;
+
+    /// The tenant a transform case writes to, as the newtype the entry points
+    /// take.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `id` is not a usable tenant identifier, which in a test is a
+    /// broken fixture rather than an input to handle.
+    pub(crate) fn test_tenant(id: &str) -> TenantId {
+        TenantId::new(id).expect("a test fixture names a valid tenant identifier")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The operations module must be reachable both path-qualified (the handler

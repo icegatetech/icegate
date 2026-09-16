@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, run_metrics_server};
+use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, run_operational_server};
 use icegate_queue::QueueCleaner;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -76,43 +76,42 @@ impl MaintenanceServices {
     }
 }
 
-/// The metrics server task, or `None` when metrics are disabled.
-type MetricsServerTask = Option<JoinHandle<icegate_common::error::Result<()>>>;
+/// The operational server task. Always present: the listener runs whatever
+/// `metrics.enabled` says, because `/health` is served from it.
+type OperationalServerTask = JoinHandle<icegate_common::error::Result<()>>;
 
 /// Unwind a partially started service stack and return the failure that caused
 /// it.
 ///
 /// One path for every startup failure: cancel the shared token so in-flight
 /// catalog retries stop, drain whatever is already running, then stop the
-/// metrics server. Without it each new service adds another copy of this block
-/// to the startup sequence, and a copy that forgets one of the three steps leaks
-/// a worker pool or the metrics task.
+/// operational server. Without it each new service adds another copy of this
+/// block to the startup sequence, and a copy that forgets one of the three steps
+/// leaks a worker pool or the operational task.
 async fn abort_startup(
     error: MaintainError,
     cancel_token: &CancellationToken,
     services: MaintenanceServices,
     metrics_cancel: &CancellationToken,
-    metrics_server: MetricsServerTask,
+    operational_server: OperationalServerTask,
 ) -> MaintainError {
     cancel_token.cancel();
     if let Err(drain_error) = services.drain().await {
         tracing::error!("worker drain error after a startup failure: {drain_error}");
     }
     metrics_cancel.cancel();
-    if let Some(server) = metrics_server {
-        let _ = server.await;
-    }
+    let _ = operational_server.await;
     error
 }
 
 /// Execute the run command.
 ///
-/// Loads the maintain configuration, initialises tracing, starts the Prometheus
-/// metrics server (when `metrics.enabled`), builds the Iceberg catalog, starts
-/// the compaction service and (when enabled) the orphan-file GC service, WAL
-/// cleanup, and the LLM pricing crawler, then blocks until a shutdown signal
-/// arrives. On shutdown all worker pools are drained and the metrics server is
-/// stopped before returning.
+/// Loads the maintain configuration, initialises tracing, starts the operational
+/// server (`/health`, plus `/metrics` when `metrics.enabled`), builds the Iceberg
+/// catalog, starts the compaction service and (when enabled) the orphan-file GC
+/// service, WAL cleanup, and the LLM pricing crawler, then blocks until a
+/// shutdown signal arrives. On shutdown all worker pools are drained and the
+/// operational server is stopped before returning.
 ///
 /// # Errors
 ///
@@ -142,69 +141,69 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
         None
     };
 
-    // Serve `/metrics` for the lifetime of the service; the token stops it on
-    // shutdown. `run_metrics_server` is a no-op when metrics are disabled, so it
-    // is only spawned when a runtime exists.
+    // Serve `/health` — and `/metrics` when a runtime exists — for the lifetime
+    // of the service; the token stops it on shutdown. Spawned unconditionally:
+    // the probe endpoint does not depend on whether metrics are scraped.
     let metrics_cancel = CancellationToken::new();
-    let metrics_server = metrics_runtime.as_ref().map(|runtime| {
-        let registry = runtime.registry();
+    let operational_server = {
+        let registry = metrics_runtime.as_ref().map(MetricsRuntime::registry);
         let metrics_config = config.metrics.clone();
         let token = metrics_cancel.clone();
-        tokio::spawn(async move { run_metrics_server(metrics_config, registry, token).await })
-    });
+        tokio::spawn(async move { run_operational_server(metrics_config, registry, token).await })
+    };
 
     // Cancellation token for coordinated shutdown, created before the catalog so
     // the S3 catalog's CAS/transient retry loops abort promptly on SIGINT/SIGTERM
     // instead of running to their retry budget while the process is shutting down.
     // Distinct from `metrics_cancel`, which must outlive the worker drain so
-    // `/metrics` keeps serving until the very end.
+    // the operational endpoints keep serving until the very end.
     let cancel_token = CancellationToken::new();
     let mut services = MaintenanceServices::default();
     let io = match start_services(&mut services, &config, &cancel_token).await {
         Ok(io) => io,
         Err(error) => {
-            return Err(abort_startup(error, &cancel_token, services, &metrics_cancel, metrics_server).await);
+            return Err(abort_startup(error, &cancel_token, services, &metrics_cancel, operational_server).await);
         }
     };
 
-    // Wait for shutdown, but watch the metrics server task at the same time: it
-    // only resolves before a shutdown signal if it failed to start (e.g. its port
-    // is already bound). Surfacing that here aborts the service immediately rather
-    // than deferring the error until shutdown, which could be days later.
-    let (metrics_server, metrics_startup_error) = wait_for_shutdown(metrics_server).await;
+    // Wait for shutdown, but watch the operational server task at the same time:
+    // it only resolves before a shutdown signal if it failed to start (e.g. its
+    // port is already bound). Surfacing that here aborts the service immediately
+    // rather than deferring the error until shutdown, which could be days later.
+    let (operational_server, operational_startup_error) = wait_for_shutdown(operational_server).await;
 
     // Abort in-flight catalog CAS/transient retry loops before draining: a commit
     // caught mid-retry at SIGTERM stops at the next checkpoint instead of running
     // out its full retry budget, so the worker drain below completes promptly.
     cancel_token.cancel();
     tracing::info!("draining maintenance workers");
-    // Defer surfacing a worker-drain failure until the metrics server has been
-    // stopped below, so a drain error never leaks the metrics task.
+    // Defer surfacing a worker-drain failure until the operational server has
+    // been stopped below, so a drain error never leaks that task.
     let drain_result = services.drain().await;
 
-    // Stop the metrics server and wait for it to unbind before the runtime (and
-    // its meter provider) drop at end of scope.
+    // Stop the operational server and wait for it to unbind before the runtime
+    // (and its meter provider) drop at end of scope.
     metrics_cancel.cancel();
-    if let Some(server) = metrics_server {
+    if let Some(server) = operational_server {
         match server.await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::error!("metrics server error: {err}"),
-            Err(join_err) => tracing::error!("metrics server task failed to join: {join_err}"),
+            Ok(Err(err)) => tracing::error!("operational server error: {err}"),
+            Err(join_err) => tracing::error!("operational server task failed to join: {join_err}"),
         }
     }
     // Closed once nothing reads through it any more — the pools have drained and
-    // the metrics server has unbound — as [`IoHandle::close`] requires. This is
-    // the ordinary stop; a startup failure never reaches here and drops the
+    // the operational server has unbound — as [`IoHandle::close`] requires. This
+    // is the ordinary stop; a startup failure never reaches here and drops the
     // handle instead, which is safe only while maintain configures no cache (see
     // [`start_services`]).
     io.close().await;
     drop(metrics_runtime);
 
-    // Surface a worker-drain failure first, then any deferred metrics startup
-    // error — both only after the metrics server has unbound and the runtime has
+    // Surface a worker-drain failure first, then any deferred operational-server
+    // startup error — both only after that server has unbound and the runtime has
     // been dropped, so shutdown still runs in order on either error path.
     drain_result?;
-    if let Some(err) = metrics_startup_error {
+    if let Some(err) = operational_startup_error {
         return Err(err);
     }
     Ok(())
@@ -304,39 +303,33 @@ fn build_wal_cleaner(io: &IoHandle, config: &MaintainConfig) -> Result<Arc<Queue
 }
 
 /// Block until a shutdown signal arrives, while also watching the spawned
-/// metrics server task.
+/// operational server task.
 ///
-/// [`run_metrics_server`] runs until its cancellation token fires, so its task
-/// only finishes *before* a shutdown signal when it failed to start (typically a
-/// `TcpListener::bind` failure on an already-used port). Racing the two lets the
-/// service fail fast on that startup error instead of deferring it to shutdown.
+/// [`run_operational_server`] runs until its cancellation token fires, so its
+/// task only finishes *before* a shutdown signal when it failed to start
+/// (typically a `TcpListener::bind` failure on an already-used port). Racing the
+/// two lets the service fail fast on that startup error instead of deferring it
+/// to shutdown.
 ///
-/// Returns the still-pending metrics handle (so the caller can stop it
-/// gracefully) together with the startup error, if the task ended early with one.
+/// Returns the still-pending handle (so the caller can stop it gracefully), or
+/// `None` when the task already ended, together with the startup error it ended
+/// with, if any.
 async fn wait_for_shutdown(
-    metrics_server: Option<JoinHandle<icegate_common::error::Result<()>>>,
-) -> (
-    Option<JoinHandle<icegate_common::error::Result<()>>>,
-    Option<MaintainError>,
-) {
-    let Some(mut server) = metrics_server else {
-        shutdown_signal().await;
-        return (None, None);
-    };
-
+    mut operational_server: OperationalServerTask,
+) -> (Option<OperationalServerTask>, Option<MaintainError>) {
     tokio::select! {
-        () = shutdown_signal() => (Some(server), None),
-        joined = &mut server => {
-            // The metrics task ended before shutdown: a startup failure. The
-            // handle is now consumed, so return `None` in its place.
+        () = shutdown_signal() => (Some(operational_server), None),
+        joined = &mut operational_server => {
+            // The task ended before shutdown: a startup failure. The handle is
+            // now consumed, so return `None` in its place.
             let error = match joined {
                 Ok(Ok(())) => {
-                    tracing::warn!("metrics server stopped before shutdown signal");
+                    tracing::warn!("operational server stopped before shutdown signal");
                     None
                 }
                 Ok(Err(err)) => Some(MaintainError::from(err)),
                 Err(join_err) => {
-                    tracing::error!("metrics server task failed to join: {join_err}");
+                    tracing::error!("operational server task failed to join: {join_err}");
                     None
                 }
             };

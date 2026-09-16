@@ -134,12 +134,23 @@
         "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Container image settings." },
         "shift": { "type": ["object", "null"], "additionalProperties": true, "description": "WAL-to-Iceberg shift settings." },
         "cache": { "type": ["object", "null"], "additionalProperties": true, "description": "IO and metadata cache settings." },
-        "otlpHttp": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP HTTP receiver." },
-        "otlpGrpc": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP gRPC receiver." },
-        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Metrics endpoint settings." },
+        "tenant": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Which tenant an incoming OTLP request writes to.",
+          "properties": {
+            "mode": { "type": ["string", "null"], "enum": ["single", "multi", null], "description": "single: one tenant for the deployment, named by id. multi: the tenant comes from the x-scope-orgid header only." },
+            "id": { "type": ["string", "null"], "description": "The tenant served in single mode. Required when mode is single." }
+          }
+        },
+        "otlpHttp": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP HTTP receiver, including the bind address." },
+        "otlpGrpc": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP gRPC receiver, including the bind address." },
+        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Operational listener: /health always, /metrics when enabled." },
         "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings." },
         "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
         "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },
+        "extraContainers": { "type": ["array", "null"], "description": "Additional containers in the ingest pod, rendered as written; a loopback OTLP bind requires an entry declaring that port name." },
+        "extraVolumes": { "type": ["array", "null"], "description": "Additional volumes for the ingest pod, rendered as written." },
         "resources": { "type": ["object", "null"], "description": "Pod resource requests and limits." },
         "nodeSelector": { "type": ["object", "null"], "description": "Node selector." },
         "tolerations": { "type": ["array", "null"], "description": "Tolerations." },

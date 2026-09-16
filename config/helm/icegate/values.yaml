@@ -378,9 +378,32 @@ ingest:
       ## maxPrefetchBytes: 4194304  # 4 MiB (metadata is small)
       ## prefetchColumns: []        # empty = all columns
 
-  ## OTLP HTTP receiver
+  ## Which tenant an incoming OTLP request writes to.
+  ##   single — the deployment serves one tenant; `id` is used and the
+  ##            x-scope-orgid header must either be absent or name that same id.
+  ##   multi  — the tenant comes from x-scope-orgid only; a request without a
+  ##            valid header is rejected with 400 / INVALID_ARGUMENT.
+  ## `multi` takes the tenant from whoever reaches the port, so it belongs behind
+  ## something that authenticates the sender and writes x-scope-orgid itself.
+  ## Nothing in this chart checks that such a thing is there — see
+  ## config/helm/auth-proxy for a sidecar that does it, and
+  ## crates/icegate-ingest/README.md for what ingest expects of any proxy.
+  tenant:
+    mode: single
+    id: "default"
+
+  ## The OTLP receivers. `host` is the bind address: 0.0.0.0 publishes the
+  ## receiver on the Pod IP, a loopback address keeps it inside the pod, where
+  ## only another container of the same pod reaches it — which is what a proxy
+  ## sidecar in extraContainers needs. A loopback bind also stops the container
+  ## declaring the port: the name then belongs to whichever container listens on
+  ## it, and the Service follows the name. Hence a loopback bind is accepted only
+  ## alongside an entry in extraContainers declaring that name — otlp-http or
+  ## otlp-grpc — since the Service addresses its targetPort by it; the render
+  ## refuses the pair and states the condition in full.
   otlpHttp:
     enabled: true
+    host: "0.0.0.0"
     port: 4318
     ## Max decompressed request body, in bytes (hard limit). A request exceeding
     ## this is rejected with a clean HTTP 413 — the body is drained first so the
@@ -392,11 +415,15 @@ ingest:
   ## OTLP gRPC receiver
   otlpGrpc:
     enabled: true
+    host: "0.0.0.0"
     port: 4317
 
-  ## Prometheus metrics endpoint
+  ## Operational listener: always serves /health, and /metrics when enabled.
+  ## Unlike the OTLP listeners this one must stay reachable from the pod IP — the
+  ## probes address it there, and so does the ServiceMonitor scrape.
   metrics:
     enabled: true
+    host: "0.0.0.0"
     port: 9091
     path: /metrics
 
@@ -411,6 +438,17 @@ ingest:
 
   ## Extra environment variables
   extraEnv: []
+
+  ## Extra containers in the ingest pod, passed through as written. An auth proxy
+  ## sidecar goes here together with the loopback binds above; see
+  ## config/helm/auth-proxy/values-authproxy.yaml for a complete set. The one
+  ## thing the chart reads of an entry is `ports[].name`: a loopback OTLP bind
+  ## requires one declaring the port name that bind gave up, otlp-http or
+  ## otlp-grpc.
+  extraContainers: []
+
+  ## Extra volumes for the ingest pod, passed through as written.
+  extraVolumes: []
 
   resources:
     requests:
@@ -429,6 +467,15 @@ ingest:
   service:
     type: ClusterIP
     annotations: {}
+    ## The OTLP ports the Service publishes — what a sender addresses. Left
+    ## unset, each follows the receiver port above, which is the right answer
+    ## while icegate is itself the published listener. A sidecar that owns the
+    ## published ports takes those numbers for itself and moves the receivers to
+    ## the loopback; the two are different from then on, the receiver ports being
+    ## what the sidecar proxies to and these what senders keep addressing. See
+    ## config/helm/auth-proxy/values-authproxy.yaml.
+    otlpHttpPort: null
+    otlpGrpcPort: null
 
   ## Ingress
   ingress:
@@ -467,17 +514,28 @@ ingest:
     ## Image for the bucket check (must contain the AWS CLI).
     awsCliImage: amazon/aws-cli:2.36.34
 
-  ## Liveness and readiness probe overrides
+  ## Liveness and readiness probe overrides for the icegate container.
+  ## Both hit /health on the operational listener, addressed by the port name the
+  ## Deployment declares unconditionally, so the probe follows ingest.metrics.port
+  ## instead of holding a second copy of it. The OTLP ports are not probed: they
+  ## may belong to a container in extraContainers, and the answer would then be
+  ## that container's health rather than icegate's.
+  ##
+  ## A sidecar that publishes those ports carries a probe of its own, stated
+  ## beside it in extraContainers — otherwise it can die with its container still
+  ## up, leaving the pod Ready with nothing answering on the published ports.
   livenessProbe:
-    tcpSocket:
-      port: 4317
+    httpGet:
+      path: /health
+      port: metrics
     initialDelaySeconds: 15
     periodSeconds: 20
     timeoutSeconds: 5
     failureThreshold: 3
   readinessProbe:
-    tcpSocket:
-      port: 4317
+    httpGet:
+      path: /health
+      port: metrics
     initialDelaySeconds: 5
     periodSeconds: 10
     timeoutSeconds: 5

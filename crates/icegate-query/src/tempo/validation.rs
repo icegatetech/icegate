@@ -211,7 +211,7 @@ pub fn validate_tag_name(name: &str) -> Result<()> {
 }
 
 /// Allow-list character class for tag-name path parameters. Mirrors
-/// `is_valid_tenant_id` but additionally permits `.` (dotted scope
+/// `TenantId::is_valid` but additionally permits `.` (dotted scope
 /// notation), `:` (used by the `event:` / `link:` intrinsic prefixes),
 /// and the `-` / `_` separators that appear in `OTel` semantic-
 /// convention keys.

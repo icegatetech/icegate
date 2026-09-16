@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use icegate_common::{CatalogBuilder, IoHandle, MemoryPressure, MetricsRuntime, run_metrics_server};
+use icegate_common::{CatalogBuilder, IoHandle, MemoryPressure, MetricsRuntime, run_operational_server};
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
@@ -130,12 +130,6 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         &pressure,
     );
 
-    if handles.is_empty() {
-        tracing::warn!("No query servers are enabled in configuration");
-        io_cache.close().await;
-        return Ok(());
-    }
-
     tracing::info!("All enabled query servers started");
     tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
     let failure = await_shutdown(handles, &cancel_token).await;
@@ -168,8 +162,10 @@ type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error
 /// Spawn one async task per enabled server, returning their join handles.
 ///
 /// The metrics server's error is boxed to match the query servers' return
-/// type so the caller can treat every handle uniformly. Returns an empty
-/// vector when no server is enabled.
+/// type so the caller can treat every handle uniformly. Never returns an empty
+/// vector: the operational listener is spawned whatever the configuration says,
+/// and [`QueryConfig::validate`] has already refused a document enabling no
+/// query protocol.
 fn spawn_servers(
     config: &QueryConfig,
     query_engine: &Arc<QueryEngine>,
@@ -180,13 +176,15 @@ fn spawn_servers(
 ) -> Vec<ServerHandle> {
     let mut handles = Vec::new();
 
-    // Metrics server
-    if let Some(runtime) = metrics_runtime {
+    // Operational server. Spawned whatever `metrics.enabled` says: the listener
+    // owns `/health`, and the kubelet probes it even on a deployment that
+    // scrapes no metrics.
+    {
         let metrics_config = config.metrics.clone();
         let token = cancel_token.clone();
-        let registry = runtime.registry();
+        let registry = metrics_runtime.map(|runtime| runtime.registry());
         handles.push(tokio::spawn(async move {
-            run_metrics_server(metrics_config, registry, token)
+            run_operational_server(metrics_config, registry, token)
                 .await
                 .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
         }));

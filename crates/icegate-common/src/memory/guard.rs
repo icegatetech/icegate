@@ -20,7 +20,7 @@ const METER_NAME: &str = "icegate-memory-guard";
 
 /// Runtime configuration for the process memory-pressure guard.
 ///
-/// Mirrors `MetricsConfig`: every field has a `serde` default and `Default`
+/// Mirrors `OperationalConfig`: every field has a `serde` default and `Default`
 /// delegates to the same `default_*` fns, so the deserialize path and
 /// `Default::default()` cannot drift apart.
 #[derive(Debug, Clone, Serialize, Deserialize)]

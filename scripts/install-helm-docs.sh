@@ -2,7 +2,7 @@
 # Install the pinned helm-docs release into /usr/local/bin.
 #
 # The pinned version lives here and nowhere else: helm-docs regenerates the chart
-# README both in CI (.github/workflows/helm-lint.yml, which diffs it) and at tag
+# README both in CI (.github/workflows/deploy-config.yml, which diffs it) and at tag
 # time (.github/workflows/release.yml, which ships the result), and two copies of
 # a tool version drift into two different READMEs.
 #
