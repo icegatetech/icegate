@@ -386,6 +386,14 @@ Spans whose typed attributes fail strict parsing (non-numeric `temperature`, non
 underlying span still lands in `spans`. The `operations` write is best-effort and never
 fails the traces OTLP response.
 
+A span also qualifies when it carries a `gen_ai.evaluation.name` attribute or a
+`gen_ai.evaluation.result` span event. Evaluation results are stored in the `evaluations`
+column: the span's own flat `gen_ai.evaluation.*` result first, then one element per
+`gen_ai.evaluation.result` event in event order; NULL when the span carries none. A dedicated
+evaluator span is its own row (`operation_name = 'evaluation'`) and joins to the evaluated row
+through `parent_span_id -> span_id` or `evaluations[i].response_id -> response_id`. Results
+produced later, outside the trace, are not merged at ingest.
+
 ```sql
 -- Create the operations table
 CREATE TABLE iceberg.triplecloud.operations (
@@ -407,7 +415,7 @@ CREATE TABLE iceberg.triplecloud.operations (
     ingested_timestamp TIMESTAMP(6) WITH TIME ZONE NOT NULL,
 
     -- Discrimination
-    operation_name VARCHAR NOT NULL,       -- chat | embeddings | retrieval | execute_tool | ... | other
+    operation_name VARCHAR NOT NULL,       -- chat | embeddings | retrieval | execute_tool | evaluation | ... | other
 
     -- Provider / model
     provider_name VARCHAR,
@@ -477,10 +485,22 @@ CREATE TABLE iceberg.triplecloud.operations (
     tool_call_arguments VARCHAR,
     tool_call_result VARCHAR,
 
-    -- List columns (placed last for contiguous Iceberg field IDs)
+    -- List columns (placed after the scalars for contiguous Iceberg field IDs)
     stop_sequences ARRAY(VARCHAR),
     finish_reasons ARRAY(VARCHAR),
-    encoding_formats ARRAY(VARCHAR)        -- float | base64
+    encoding_formats ARRAY(VARCHAR),       -- float | base64
+
+    -- Evaluation results (OTel GenAI gen_ai.evaluation.result), one element per
+    -- result on the span; NULL when none. Appended after the List<String> block
+    -- (ids 65-72) so every pre-existing field id stays put.
+    evaluations ARRAY(ROW(
+        name VARCHAR,                      -- gen_ai.evaluation.name
+        score_value DOUBLE,                -- gen_ai.evaluation.score.value
+        score_label VARCHAR,               -- gen_ai.evaluation.score.label
+        explanation VARCHAR,               -- gen_ai.evaluation.explanation
+        response_id VARCHAR,               -- gen_ai.response.id carried by the result
+        error_type VARCHAR                 -- error.type when the evaluation itself failed
+    ))
 )
 WITH (
     format = 'PARQUET',
@@ -639,9 +659,21 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 
 ---
 
-**Version:** 1.6
-**Last Updated:** 2026-08-13
+**Version:** 1.7
+**Last Updated:** 2026-09-22
 **Schema Source:** `crates/icegate-common/src/schema.rs`
+
+**Notable Changes in v1.7:**
+- `operations` gains `evaluations` (`ARRAY(ROW(...))`, field ids 65–72 appended after the
+  `List<String>` block): the OTel GenAI `gen_ai.evaluation.result` shape, one element per result
+  found on the span (flat `gen_ai.evaluation.*` attributes first, then one per span event).
+- A span qualifies as an operation when it carries `gen_ai.evaluation.name` or a
+  `gen_ai.evaluation.result` span event. A span no convention classifies but that carries
+  evaluations is `operation_name = 'evaluation'`; OpenInference `EVALUATOR` now maps to
+  `evaluation` (was `evaluator`).
+- Breaking for `operations`. `migrate upgrade` does not rewrite in place: **drain the WAL queue
+  first**, then drop `operations` through the catalog and re-run `migrate create`. Data in
+  `operations` is lost; the other tables are untouched.
 
 **Notable Changes in v1.6:**
 - Attribute keys are stored in OTel-native dotted form on every table (e.g. `k8s.pod.name`, not `k8s_pod_name`). Ingest no longer rewrites `.` to `_`.

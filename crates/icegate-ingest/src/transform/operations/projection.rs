@@ -12,7 +12,9 @@ use icegate_common::TenantId;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::{Span, span::Event};
 
-use super::convention::{CONVENTIONS, field_precedence};
+use super::convention::{
+    CONVENTIONS, EVALUATION_OPERATION_NAME, OperationConvention, evaluation_event_filter, field_precedence,
+};
 use crate::error::Result;
 use crate::transform::attributes::{
     extract_bool, extract_f64, extract_i64, extract_string_list, extract_string_value, is_zero_bytes, nanos_to_micros,
@@ -199,6 +201,27 @@ pub(crate) enum OperationField {
     ToolCallResult,
 }
 
+/// Fields of one evaluation result — the OTEL `GenAI` `gen_ai.evaluation.result`
+/// shape — resolved through the convention registry into one element of the
+/// `evaluations` column. Each variant maps to exactly one field of the element
+/// struct. Kept apart from [`OperationField`]: those name whole columns, these
+/// name fields inside one nested column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EvaluationField {
+    /// `evaluations[].name` — the evaluation metric.
+    Name,
+    /// `evaluations[].score_value` — numeric score.
+    ScoreValue,
+    /// `evaluations[].score_label` — human-readable score.
+    ScoreLabel,
+    /// `evaluations[].explanation` — evaluator's free-form reasoning.
+    Explanation,
+    /// `evaluations[].response_id` — id of the evaluated response.
+    ResponseId,
+    /// `evaluations[].error_type` — error class when the evaluation failed.
+    ErrorType,
+}
+
 /// Owned, Arrow-decoupled projection of one `operations` row.
 ///
 /// Required columns (`tenant_id`, identity, timing, `operation_name`) are plain
@@ -331,6 +354,30 @@ pub(crate) struct OperationRow {
     pub(crate) tool_call_arguments: Option<String>,
     /// Tool call result (faithful JSON).
     pub(crate) tool_call_result: Option<String>,
+    /// Evaluation results found on the span (flat result first, then one per
+    /// evaluation event, in event order); NULL list when it carries none.
+    pub(crate) evaluations: Option<Vec<EvaluationResult>>,
+}
+
+/// One evaluation result — the OTEL `GenAI` `gen_ai.evaluation.result` shape —
+/// projected into one element of the `evaluations` column. Every field is
+/// optional: a result is identified by where it was found (a flat attribute
+/// set on the span, or a named span event), not by which fields it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EvaluationResult {
+    /// Evaluation metric name.
+    pub(crate) name: Option<String>,
+    /// Numeric score.
+    pub(crate) score_value: Option<f64>,
+    /// Human-readable score label.
+    pub(crate) score_label: Option<String>,
+    /// Evaluator's free-form explanation of the score.
+    pub(crate) explanation: Option<String>,
+    /// Id of the evaluated response: the correlation key when the result is
+    /// not on the evaluated span itself.
+    pub(crate) response_id: Option<String>,
+    /// Error class when the evaluation itself failed.
+    pub(crate) error_type: Option<String>,
 }
 
 /// Validate a 16-byte non-zero `trace_id`, copying it into a fixed array.
@@ -696,6 +743,85 @@ fn resolve_time_to_first_chunk_ms(view: &AttributeView) -> Result<Option<i64>> {
     Ok(None)
 }
 
+/// Returns the first registered convention whose flat evaluation marker (its
+/// [`EvaluationField::Name`] key) is present on the span — the convention that
+/// owns the span's own evaluation result. `None` when no span-level result
+/// exists; a score or label without a name is not a result.
+fn find_flat_evaluation_convention(view: &AttributeView) -> Option<&'static dyn OperationConvention> {
+    CONVENTIONS.iter().copied().find(|convention| {
+        convention
+            .evaluation_field_keys(EvaluationField::Name)
+            .iter()
+            .any(|key| view.has(key))
+    })
+}
+
+/// Returns the first registered convention that names `event` as an
+/// evaluation-result carrier.
+fn find_evaluation_event_convention(event: &Event) -> Option<&'static dyn OperationConvention> {
+    CONVENTIONS
+        .iter()
+        .copied()
+        .find(|convention| convention.evaluation_event_names().contains(&event.name.as_str()))
+}
+
+/// Resolve one evaluation result out of `view` through `convention`'s keys.
+///
+/// Strings are read verbatim (as every string column is); `score_value` is a
+/// strict `f64` parse, so a present non-numeric score is a projection failure
+/// that drops the whole row (D6).
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` when a present score fails strict parsing.
+fn resolve_evaluation_result(view: &AttributeView, convention: &dyn OperationConvention) -> Result<EvaluationResult> {
+    let first_str = |field: EvaluationField| {
+        convention
+            .evaluation_field_keys(field)
+            .iter()
+            .find_map(|&key| extract_string_value(view.get(key)))
+    };
+    let mut score_value = None;
+    for &key in convention.evaluation_field_keys(EvaluationField::ScoreValue) {
+        if let Some(value) = view.get(key) {
+            score_value = extract_f64(Some(value), "evaluations.score_value")?;
+            break;
+        }
+    }
+    Ok(EvaluationResult {
+        name: first_str(EvaluationField::Name),
+        score_value,
+        score_label: first_str(EvaluationField::ScoreLabel),
+        explanation: first_str(EvaluationField::Explanation),
+        response_id: first_str(EvaluationField::ResponseId),
+        error_type: first_str(EvaluationField::ErrorType),
+    })
+}
+
+/// Resolve every evaluation result the span carries: its own flat result first
+/// (when a convention's name key is on the span), then one per span event a
+/// convention names as an evaluation carrier, in event order. `None` when the
+/// span carries no evaluation at all, so the column is a NULL list rather than
+/// an empty one.
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` when any present score fails strict
+/// parsing (D6): the whole row is dropped, never a partial list.
+fn resolve_evaluations(view: &AttributeView, events: &[Event]) -> Result<Option<Vec<EvaluationResult>>> {
+    let mut results = Vec::new();
+    if let Some(convention) = find_flat_evaluation_convention(view) {
+        results.push(resolve_evaluation_result(view, convention)?);
+    }
+    for event in events {
+        if let Some(convention) = find_evaluation_event_convention(event) {
+            let event_view = AttributeView::new(&event.attributes);
+            results.push(resolve_evaluation_result(&event_view, convention)?);
+        }
+    }
+    Ok((!results.is_empty()).then_some(results))
+}
+
 /// Project one OTLP span (+ scope + tenant) into an optional operations row.
 ///
 /// `Ok(None)` = no convention marker present (non-LLM span; caller counts as
@@ -719,10 +845,16 @@ pub(crate) fn project_operation_row(
 ) -> Result<Option<OperationRow>> {
     let view = AttributeView::new(&span.attributes);
 
+    // Attribute markers and name prefixes qualify as before; a span whose only
+    // GenAI content is an evaluation event (a dedicated evaluator span) has
+    // nothing else to qualify it, so its events are checked too.
     let qualifies = CONVENTIONS.iter().any(|conv| {
         conv.marker_keys().iter().any(|key| view.has(key))
             || conv.name_prefixes().iter().any(|prefix| span.name.starts_with(prefix))
-    });
+    }) || span
+        .events
+        .iter()
+        .any(|event| evaluation_event_filter().contains(&event.name.as_str()));
     if !qualifies {
         return Ok(None);
     }
@@ -734,10 +866,20 @@ pub(crate) fn project_operation_row(
         _ => None,
     };
 
+    let evaluations = resolve_evaluations(&view, &span.events)?;
+    // Adapters decide first, so an LLM span carrying evaluation results keeps
+    // its own operation. A span no adapter can classify is an evaluation when
+    // results are all it carries (a dedicated evaluator span), else `other`.
     let operation_name = CONVENTIONS
         .iter()
         .find_map(|conv| conv.classify_operation(&span.name, &view))
-        .unwrap_or_else(|| "other".to_string());
+        .unwrap_or_else(|| {
+            if evaluations.is_some() {
+                EVALUATION_OPERATION_NAME.to_string()
+            } else {
+                "other".to_string()
+            }
+        });
 
     let timestamp = nanos_to_micros(span.start_time_unix_nano);
     let end_timestamp = nanos_to_micros(span.end_time_unix_nano);
@@ -868,6 +1010,7 @@ pub(crate) fn project_operation_row(
             &span.events,
             OperationField::ToolCallResult,
         )?,
+        evaluations,
     }))
 }
 
@@ -877,6 +1020,7 @@ mod tests {
     use opentelemetry_proto::tonic::trace::v1::{Span, Status, span::Event};
 
     use super::*;
+    use crate::error::IngestError;
     use crate::transform::test_support::test_tenant;
 
     /// Build a string-valued OTLP `KeyValue` for tests.
@@ -1062,6 +1206,7 @@ mod tests {
             tool_definitions: None,
             tool_call_arguments: None,
             tool_call_result: None,
+            evaluations: None,
         };
 
         assert_eq!(row.tenant_id, "tenant-a");
@@ -1070,6 +1215,7 @@ mod tests {
         assert_eq!(row.finish_reasons, Some(vec!["stop".to_string()]));
         assert_eq!(row.stop_sequences, None);
         assert_eq!(row.parent_span_id, None);
+        assert_eq!(row.evaluations, None);
     }
 
     #[test]
@@ -1227,6 +1373,213 @@ mod tests {
             .expect("ok")
             .expect("row");
         assert_eq!(row.duration_micros, 0);
+    }
+
+    /// Build a `gen_ai.evaluation.result` span event carrying the given attributes.
+    fn evaluation_event(attributes: Vec<KeyValue>) -> Event {
+        Event {
+            time_unix_nano: 2_500_000_000,
+            name: "gen_ai.evaluation.result".to_string(),
+            attributes,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    #[test]
+    fn evaluation_events_on_an_llm_span_project_one_result_each_in_event_order() {
+        let mut span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("gen_ai.response.id", "resp-1"),
+        ]);
+        span.events = vec![
+            evaluation_event(vec![
+                kv_str("gen_ai.evaluation.name", "Relevance"),
+                kv_dbl("gen_ai.evaluation.score.value", 0.9),
+                kv_str("gen_ai.evaluation.score.label", "relevant"),
+                kv_str("gen_ai.response.id", "resp-1"),
+            ]),
+            evaluation_event(vec![
+                kv_str("gen_ai.evaluation.name", "Fluency"),
+                // An integer score is widened, as every double column is.
+                kv_int("gen_ai.evaluation.score.value", 4),
+                kv_str("gen_ai.evaluation.explanation", "reads naturally"),
+                kv_str("error.type", "timeout"),
+            ]),
+        ];
+        let row = project_operation_row(&span, None, &test_tenant("tenant-a"), Some("svc"), 999)
+            .expect("projection ok")
+            .expect("llm span -> row");
+        // The LLM span keeps its own classification; evaluations ride along.
+        assert_eq!(row.operation_name, "chat");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![
+                EvaluationResult {
+                    name: Some("Relevance".to_string()),
+                    score_value: Some(0.9),
+                    score_label: Some("relevant".to_string()),
+                    explanation: None,
+                    response_id: Some("resp-1".to_string()),
+                    error_type: None,
+                },
+                EvaluationResult {
+                    name: Some("Fluency".to_string()),
+                    score_value: Some(4.0),
+                    score_label: None,
+                    explanation: Some("reads naturally".to_string()),
+                    response_id: None,
+                    error_type: Some("timeout".to_string()),
+                },
+            ])
+        );
+        // An event's error.type belongs to that result, not to the row.
+        assert_eq!(row.error_type, None);
+    }
+
+    #[test]
+    fn flat_evaluation_attributes_on_an_llm_span_project_one_result_before_events() {
+        let mut span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("gen_ai.response.id", "resp-2"),
+            kv_str("gen_ai.evaluation.name", "Groundedness"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.25),
+            kv_str("gen_ai.evaluation.score.label", "fail"),
+        ]);
+        span.events = vec![evaluation_event(vec![kv_str("gen_ai.evaluation.name", "Relevance")])];
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
+        assert_eq!(row.operation_name, "chat");
+        assert_eq!(row.response_id, Some("resp-2".to_string()));
+        let results = row.evaluations.expect("flat result plus one event");
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0],
+            EvaluationResult {
+                name: Some("Groundedness".to_string()),
+                score_value: Some(0.25),
+                score_label: Some("fail".to_string()),
+                explanation: None,
+                response_id: Some("resp-2".to_string()),
+                error_type: None,
+            }
+        );
+        assert_eq!(results[1].name, Some("Relevance".to_string()));
+    }
+
+    #[test]
+    fn dedicated_evaluator_span_with_only_evaluation_attributes_is_an_evaluation_row() {
+        let mut span = span_with(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.9),
+            kv_str("gen_ai.response.id", "resp-1"),
+        ]);
+        span.parent_span_id = vec![9u8; 8];
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("evaluator span -> row");
+        assert_eq!(row.operation_name, "evaluation");
+        // Both correlation keys to the evaluated LLM row survive.
+        assert_eq!(row.parent_span_id, Some([9u8; 8]));
+        assert_eq!(row.response_id, Some("resp-1".to_string()));
+        assert_eq!(row.evaluations.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn dedicated_evaluator_span_with_only_an_evaluation_event_qualifies_as_evaluation() {
+        let mut span = span_with(vec![kv_str("http.method", "POST")]);
+        span.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 1.0),
+        ])];
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("event-only evaluator span -> row");
+        assert_eq!(row.operation_name, "evaluation");
+        assert_eq!(row.evaluations.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn malformed_evaluation_score_drops_the_row_wherever_it_sits() {
+        // D6: a present, non-numeric score is a projection failure for the flat
+        // result and for an event result alike.
+        let mut flat = span_with(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_str("gen_ai.evaluation.score.value", "high"),
+        ]);
+        flat.name = "flat".to_string();
+        let mut event = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
+        event.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_str("gen_ai.evaluation.score.value", "high"),
+        ])];
+        for span in [flat, event] {
+            let error = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+                .expect_err("strict parse failure drops the row");
+            assert!(matches!(error, IngestError::Validation(_)), "{error}");
+        }
+    }
+
+    #[test]
+    fn evaluation_event_without_a_name_still_projects_its_score() {
+        // Absent means NULL (never a dropped row): the event name alone
+        // identifies the result.
+        let mut span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
+        span.events = vec![evaluation_event(vec![kv_dbl("gen_ai.evaluation.score.value", 0.5)])];
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                name: None,
+                score_value: Some(0.5),
+                score_label: None,
+                explanation: None,
+                response_id: None,
+                error_type: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn error_type_and_response_id_alone_never_make_an_evaluation_result() {
+        // Both keys are shared with row-level columns; only the evaluation name
+        // opens a flat result.
+        let span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("error.type", "timeout"),
+            kv_str("gen_ai.response.id", "resp-1"),
+        ]);
+        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
+        assert_eq!(row.evaluations, None);
+        assert_eq!(row.error_type, Some("timeout".to_string()));
+    }
+
+    #[test]
+    fn a_score_without_a_name_does_not_qualify_a_span() {
+        let span = span_with(vec![kv_dbl("gen_ai.evaluation.score.value", 0.9)]);
+        assert_eq!(
+            project_operation_row(&span, None, &test_tenant("t"), None, 1).expect("ok"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unrelated_span_event_does_not_qualify_a_span() {
+        let mut span = span_with(vec![kv_str("http.method", "GET")]);
+        span.events = vec![Event {
+            time_unix_nano: 1_500_000_000,
+            name: "exception".to_string(),
+            attributes: vec![kv_str("exception.type", "IOError")],
+            dropped_attributes_count: 0,
+        }];
+        assert_eq!(
+            project_operation_row(&span, None, &test_tenant("t"), None, 1).expect("ok"),
+            None
+        );
     }
 
     /// Build a Claude Code span with the given name and attributes.

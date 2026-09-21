@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use super::claude_code::ClaudeCode;
 use super::openinference::OpenInference;
 use super::otel::OtelGenAi;
-use super::projection::{AttributeView, OperationField};
+use super::projection::{AttributeView, EvaluationField, OperationField};
 use super::traceloop::Traceloop;
 use crate::error::{IngestError, Result};
 
@@ -105,6 +105,28 @@ pub(crate) trait OperationConvention: Send + Sync {
         &[]
     }
 
+    /// Span *event* names that each carry one evaluation result in their
+    /// attributes (OTEL `GenAI`: `gen_ai.evaluation.result`). Every matching event
+    /// becomes one element of the `evaluations` column, read through
+    /// [`Self::evaluation_field_keys`], and a span carrying such an event
+    /// qualifies as an operation even without a marker attribute — a dedicated
+    /// evaluator span has nothing else to qualify it. Default: this convention
+    /// sources no evaluations from events.
+    fn evaluation_event_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Ordered candidate attribute keys this convention offers for one `field`
+    /// of an evaluation result. Read against the span's own attributes (a flat
+    /// result, present iff the [`EvaluationField::Name`] key is) and against
+    /// each event named in [`Self::evaluation_event_names`]. The
+    /// [`EvaluationField::Name`] keys double as marker keys for this
+    /// convention, so a flat result and qualification agree on one key. Empty
+    /// slice when this convention does not source the field.
+    fn evaluation_field_keys(&self, _field: EvaluationField) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Classifies a span into a canonical `operation_name` from its `span_name`
     /// and attributes, or `None` when this convention cannot decide (the next
     /// adapter then tries). `span_name` is the OTLP span name, letting name-based
@@ -115,6 +137,36 @@ pub(crate) trait OperationConvention: Send + Sync {
 /// Precedence-ordered convention registry: earlier wins on shared keys. This
 /// slice is the whole extension surface — append an adapter to add an SDK.
 pub(crate) static CONVENTIONS: &[&dyn OperationConvention] = &[&OtelGenAi, &OpenInference, &Traceloop, &ClaudeCode];
+
+/// Canonical `operation_name` of an evaluation: the value every convention maps
+/// its evaluator spans to (`OpenInference` `EVALUATOR`, and a span that carries
+/// only `gen_ai.evaluation.*` results). One name for one concept, so a consumer
+/// filters evaluations with a single predicate.
+pub(crate) const EVALUATION_OPERATION_NAME: &str = "evaluation";
+
+/// Cached union of every registered convention's evaluation event names.
+static EVALUATION_EVENT_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+/// Returns the deduplicated union of every convention's
+/// [`OperationConvention::evaluation_event_names`] in registry order, computed
+/// once. The per-event qualification check runs for every span on the ingest
+/// hot path, so it walks this flat slice instead of dispatching into each
+/// adapter per event.
+pub(crate) fn evaluation_event_filter() -> &'static [&'static str] {
+    EVALUATION_EVENT_NAMES
+        .get_or_init(|| {
+            let mut names = Vec::new();
+            for convention in CONVENTIONS {
+                for name in convention.evaluation_event_names() {
+                    if !names.contains(name) {
+                        names.push(*name);
+                    }
+                }
+            }
+            names
+        })
+        .as_slice()
+}
 
 /// Flattens every convention's `field_keys(field)` into a single
 /// precedence-ordered vector, preserving registry order. Pulled out as a free
@@ -332,6 +384,7 @@ mod tests {
         assert_eq!(
             markers,
             vec![
+                "gen_ai.evaluation.name",
                 "gen_ai.operation.name",
                 "gen_ai.provider.name",
                 "gen_ai.system",
@@ -341,6 +394,13 @@ mod tests {
                 "traceloop.span.kind",
             ]
         );
+    }
+
+    #[test]
+    fn evaluation_event_filter_equals_union_of_adapter_event_names() {
+        // Only the OTEL GenAI convention defines an evaluation event today; the
+        // filter must widen automatically when another adapter declares one.
+        assert_eq!(evaluation_event_filter(), &["gen_ai.evaluation.result"]);
     }
 
     #[test]

@@ -16,15 +16,21 @@ mod traceloop;
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float64Array, Int32Builder, Int64Array, ListBuilder, RecordBatch,
-    StringBuilder, TimestampMicrosecondArray,
+    ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float64Array, Float64Builder, Int32Builder, Int64Array,
+    ListBuilder, RecordBatch, StringBuilder, StructBuilder, TimestampMicrosecondArray,
 };
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Fields, Schema};
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::TenantId;
+use icegate_common::schema::{
+    COL_ERROR_TYPE, COL_EVALUATIONS, COL_EXPLANATION, COL_NAME, COL_RESPONSE_ID, COL_SCORE_LABEL, COL_SCORE_VALUE,
+};
 
-use self::projection::{OperationRow, project_operation_row};
-use super::attributes::{SERVICE_NAME_KEY, extract_string_value, list_element_field, now_micros};
+use self::projection::{EvaluationResult, OperationRow, project_operation_row};
+use super::attributes::{
+    SERVICE_NAME_KEY, extract_string_value, field_builder_missing, list_element_field, list_struct_fields,
+    nested_field_index, nested_struct_builders, now_micros,
+};
 
 /// Process-wide cache of the derived operations Arrow schema.
 static OPERATIONS_ARROW_SCHEMA: OnceLock<std::result::Result<Arc<Schema>, String>> = OnceLock::new();
@@ -222,6 +228,13 @@ pub fn operations_to_record_batch(
     let mut stop_sequences_b = ListBuilder::new(StringBuilder::new()).with_field(stop_sequences_elem);
     let mut finish_reasons_b = ListBuilder::new(StringBuilder::new()).with_field(finish_reasons_elem);
     let mut encoding_formats_b = ListBuilder::new(StringBuilder::new()).with_field(encoding_formats_elem);
+    let (evaluations_elem, evaluation_fields) = list_struct_fields(&schema, COL_EVALUATIONS)?;
+    let mut evaluations_b = ListBuilder::new(StructBuilder::new(
+        evaluation_fields.iter().cloned().collect::<Vec<_>>(),
+        nested_struct_builders(&evaluation_fields, COL_EVALUATIONS)?,
+    ))
+    .with_field(evaluations_elem);
+    let evaluation_slots = EvaluationSlots::from_fields(&evaluation_fields)?;
 
     for row in &rows {
         trace_id_b.append_value(row.trace_id)?;
@@ -300,6 +313,7 @@ pub fn operations_to_record_batch(
         append_str_list(&mut stop_sequences_b, row.stop_sequences.as_ref());
         append_str_list(&mut finish_reasons_b, row.finish_reasons.as_ref());
         append_str_list(&mut encoding_formats_b, row.encoding_formats.as_ref());
+        append_evaluations(&mut evaluations_b, &evaluation_slots, row.evaluations.as_ref())?;
     }
 
     let columns: Vec<ArrayRef> = vec![
@@ -364,6 +378,7 @@ pub fn operations_to_record_batch(
         Arc::new(stop_sequences_b.finish()),
         Arc::new(finish_reasons_b.finish()),
         Arc::new(encoding_formats_b.finish()),
+        Arc::new(evaluations_b.finish()),
     ];
 
     let batch = RecordBatch::try_new(schema, columns).map_err(|e| {
@@ -382,12 +397,84 @@ fn append_opt_str(builder: &mut StringBuilder, value: Option<&str>) {
     }
 }
 
+/// Slot indices of the `evaluations` element struct, read from the schema's
+/// own `Fields` so a reorder cannot bind a value to the wrong builder.
+struct EvaluationSlots {
+    name: usize,
+    score_value: usize,
+    score_label: usize,
+    explanation: usize,
+    response_id: usize,
+    error_type: usize,
+}
+
+impl EvaluationSlots {
+    /// Resolve every slot by field name.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IngestError::Validation` when the schema's element struct lacks
+    /// one of the fields — a schema drift, reported rather than panicked on.
+    fn from_fields(fields: &Fields) -> crate::error::Result<Self> {
+        Ok(Self {
+            name: nested_field_index(fields, COL_EVALUATIONS, COL_NAME)?,
+            score_value: nested_field_index(fields, COL_EVALUATIONS, COL_SCORE_VALUE)?,
+            score_label: nested_field_index(fields, COL_EVALUATIONS, COL_SCORE_LABEL)?,
+            explanation: nested_field_index(fields, COL_EVALUATIONS, COL_EXPLANATION)?,
+            response_id: nested_field_index(fields, COL_EVALUATIONS, COL_RESPONSE_ID)?,
+            error_type: nested_field_index(fields, COL_EVALUATIONS, COL_ERROR_TYPE)?,
+        })
+    }
+}
+
+/// Append one optional evaluation list as a NULL-or-populated `List<Struct>`
+/// entry, one struct per [`EvaluationResult`].
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` when a struct slot is missing or has an
+/// unexpected builder type (schema drift; see [`field_builder_missing`]).
+fn append_evaluations(
+    builder: &mut ListBuilder<StructBuilder>,
+    slots: &EvaluationSlots,
+    value: Option<&Vec<EvaluationResult>>,
+) -> crate::error::Result<()> {
+    let Some(results) = value else {
+        builder.append_null();
+        return Ok(());
+    };
+    let struct_builder = builder.values();
+    for result in results {
+        let mut append_str = |slot: usize, field: &str, text: Option<&str>| -> crate::error::Result<()> {
+            struct_builder
+                .field_builder::<StringBuilder>(slot)
+                .ok_or_else(|| field_builder_missing(COL_EVALUATIONS, field))?
+                .append_option(text);
+            Ok(())
+        };
+        append_str(slots.name, COL_NAME, result.name.as_deref())?;
+        append_str(slots.score_label, COL_SCORE_LABEL, result.score_label.as_deref())?;
+        append_str(slots.explanation, COL_EXPLANATION, result.explanation.as_deref())?;
+        append_str(slots.response_id, COL_RESPONSE_ID, result.response_id.as_deref())?;
+        append_str(slots.error_type, COL_ERROR_TYPE, result.error_type.as_deref())?;
+        struct_builder
+            .field_builder::<Float64Builder>(slots.score_value)
+            .ok_or_else(|| field_builder_missing(COL_EVALUATIONS, COL_SCORE_VALUE))?
+            .append_option(result.score_value);
+        struct_builder.append(true);
+    }
+    builder.append(true);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, ListArray, StringArray};
+    use arrow::array::{
+        Array, BooleanArray, Float64Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+    };
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, any_value::Value};
-    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span::Event};
 
     use super::operations_to_record_batch;
     use crate::transform::test_support::test_tenant;
@@ -453,6 +540,195 @@ mod tests {
                 message: String::new(),
                 code: 1,
             }),
+        }
+    }
+
+    /// Build a `gen_ai.evaluation.result` span event carrying the given attributes.
+    fn evaluation_event(attributes: Vec<KeyValue>) -> Event {
+        Event {
+            time_unix_nano: 1_500_000_000,
+            name: "gen_ai.evaluation.result".to_string(),
+            attributes,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    fn span_with_events(span_id: u8, attributes: Vec<KeyValue>, events: Vec<Event>) -> Span {
+        let mut span = span_with(span_id, attributes);
+        span.events = events;
+        span
+    }
+
+    fn request_with(spans: Vec<Span>) -> ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    /// Two LLM spans: one evaluated twice, one not evaluated at all.
+    fn evaluated_and_plain_request() -> ExportTraceServiceRequest {
+        let evaluated = span_with_events(
+            1,
+            vec![
+                kv_str("gen_ai.operation.name", "chat"),
+                kv_str("gen_ai.response.id", "resp-1"),
+            ],
+            vec![
+                evaluation_event(vec![
+                    kv_str("gen_ai.evaluation.name", "Relevance"),
+                    kv_dbl("gen_ai.evaluation.score.value", 0.9),
+                    kv_str("gen_ai.evaluation.score.label", "relevant"),
+                ]),
+                evaluation_event(vec![
+                    kv_str("gen_ai.evaluation.name", "Fluency"),
+                    kv_int("gen_ai.evaluation.score.value", 4),
+                    kv_str("gen_ai.evaluation.explanation", "reads naturally"),
+                    kv_str("gen_ai.response.id", "resp-1"),
+                ]),
+            ],
+        );
+        let plain = span_with(2, vec![kv_str("gen_ai.operation.name", "chat")]);
+        request_with(vec![evaluated, plain])
+    }
+
+    /// Assert the `evaluations` column of `batch` holds the two results of the
+    /// evaluated span in row 0 and a NULL list in row 1, addressed by name.
+    fn assert_evaluations_column(batch: &RecordBatch) {
+        let evaluations = batch
+            .column_by_name("evaluations")
+            .expect("evaluations column present")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("evaluations is List");
+        let first = evaluations.value(0);
+        let results = first.as_any().downcast_ref::<StructArray>().expect("elements are Struct");
+        assert_eq!(results.len(), 2);
+        let strings = |field: &str| -> Vec<Option<String>> {
+            results
+                .column_by_name(field)
+                .unwrap_or_else(|| panic!("element field {field} present"))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap_or_else(|| panic!("element field {field} is Utf8"))
+                .iter()
+                .map(|value| value.map(str::to_string))
+                .collect()
+        };
+        assert_eq!(
+            strings("name"),
+            vec![Some("Relevance".to_string()), Some("Fluency".to_string())]
+        );
+        assert_eq!(strings("score_label"), vec![Some("relevant".to_string()), None]);
+        assert_eq!(strings("explanation"), vec![None, Some("reads naturally".to_string())]);
+        assert_eq!(strings("response_id"), vec![None, Some("resp-1".to_string())]);
+        assert_eq!(strings("error_type"), vec![None, None]);
+        let scores = results
+            .column_by_name("score_value")
+            .expect("score_value present")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("score_value is Float64");
+        assert_eq!(scores.iter().collect::<Vec<_>>(), vec![Some(0.9), Some(4.0)]);
+        assert!(
+            evaluations.is_null(1),
+            "a span without evaluations is a NULL list, not an empty one"
+        );
+    }
+
+    #[test]
+    fn evaluations_land_as_a_list_of_structs_addressed_by_field_name() {
+        // Guards both the position of the new column in the hand-ordered
+        // `columns` vec and the slot binding inside the element struct.
+        let (batch_opt, drops) =
+            operations_to_record_batch(&evaluated_and_plain_request(), &test_tenant("tenant-a")).expect("batch ok");
+        let batch = batch_opt.expect("two llm spans -> batch");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(drops, 0);
+        assert_evaluations_column(&batch);
+    }
+
+    #[test]
+    fn evaluations_round_trip_through_the_production_parquet_writer_with_iceberg_field_ids() {
+        // Schema-change contract (docs/tests.md): the production writer
+        // properties and a real Parquet reader must agree on the nested column,
+        // and the Iceberg field ids must survive into the file — the shift
+        // writer and every Iceberg reader bind columns by id, not by name.
+        use bytes::Bytes;
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let (batch_opt, _) =
+            operations_to_record_batch(&evaluated_and_plain_request(), &test_tenant("tenant-a")).expect("batch ok");
+        let batch = batch_opt.expect("batch");
+
+        let write_config = crate::shift::config::ShiftWriteConfig::default();
+        let properties = icegate_common::parquet_writer::build_writer_properties(
+            write_config.row_group_size,
+            write_config.data_page_size_limit_bytes,
+            icegate_common::parquet_encoding::OPERATIONS_BLOOM_COLUMNS,
+            icegate_common::parquet_encoding::OPERATIONS_COLUMN_ENCODINGS,
+        );
+        let mut file = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(properties)).expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+        let bytes = Bytes::from(file);
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+            .expect("reader")
+            .build()
+            .expect("build reader");
+        let read_back: Vec<RecordBatch> = reader.collect::<Result<_, _>>().expect("read all");
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].num_rows(), 2);
+        assert_evaluations_column(&read_back[0]);
+
+        let file_reader = SerializedFileReader::new(bytes).expect("file reader");
+        let root = file_reader.metadata().file_metadata().schema_descr().root_schema();
+        let evaluations = root
+            .get_fields()
+            .iter()
+            .find(|node| node.name() == "evaluations")
+            .expect("evaluations group in the parquet schema");
+        let mut ids = Vec::new();
+        collect_field_ids(evaluations, &mut ids);
+        let names: Vec<&str> = ids.iter().map(|(name, _)| name.as_str()).collect();
+        let numbers: Vec<i32> = ids.iter().map(|(_, id)| *id).collect();
+        // list 65, element struct 66, then the six fields in declaration order.
+        assert_eq!(numbers, vec![65, 66, 67, 68, 69, 70, 71, 72]);
+        assert_eq!(
+            &names[2..],
+            &[
+                "name",
+                "score_value",
+                "score_label",
+                "explanation",
+                "response_id",
+                "error_type"
+            ]
+        );
+    }
+
+    /// Collect `(name, field_id)` for every node under `node` that carries an
+    /// id, in schema order; the repeated `list` wrapper has none and is skipped.
+    fn collect_field_ids(node: &parquet::schema::types::Type, out: &mut Vec<(String, i32)>) {
+        let info = node.get_basic_info();
+        if info.has_id() {
+            out.push((node.name().to_string(), info.id()));
+        }
+        if let parquet::schema::types::Type::GroupType { fields, .. } = node {
+            for field in fields {
+                collect_field_ids(field, out);
+            }
         }
     }
 

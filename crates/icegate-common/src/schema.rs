@@ -459,16 +459,18 @@ pub fn spans_schema() -> Result<Schema> {
 ///
 /// `operations` is a typed columnar projection icegate maintains over the
 /// LLM/GenAI-flavoured subset of trace `spans` (see TRI-72 design). Every span
-/// carrying at least one LLM/GenAI marker attribute is projected into exactly
-/// one `operations` row (1:1 by `span_id`), with `gen_ai.*` / `OpenInference` /
+/// carrying at least one LLM/GenAI marker attribute, or a
+/// `gen_ai.evaluation.result` span event, is projected into exactly one
+/// `operations` row (1:1 by `span_id`), with `gen_ai.*` / `OpenInference` /
 /// `Traceloop` semantic-convention attributes normalized into typed columns.
 ///
 /// # Field IDs
 /// 58 scalar fields occupy IDs 1–58 in declaration order; the three
-/// `List<String>` columns are declared last so their element IDs are
-/// contiguous: `stop_sequences` (59, element 60), `finish_reasons`
-/// (61, element 62), `encoding_formats` (63, element 64).
-/// `highest_field_id() == 64`.
+/// `List<String>` columns follow so their element IDs are contiguous:
+/// `stop_sequences` (59, element 60), `finish_reasons` (61, element 62),
+/// `encoding_formats` (63, element 64). `evaluations`, a `List<Struct>`
+/// appended later, takes 65 (element 66, struct fields 67–72).
+/// `highest_field_id() == 72`.
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
@@ -480,8 +482,9 @@ pub fn spans_schema() -> Result<Schema> {
 #[allow(clippy::too_many_lines)]
 pub fn operations_schema() -> Result<Schema> {
     // Field IDs are hardcoded so reading top-to-bottom gives the assignment
-    // order. The three `List<String>` columns are placed last so their element
-    // IDs (60, 62, 64) stay contiguous after every scalar (1..=58) is assigned.
+    // order. The three `List<String>` columns follow the scalars (1..=58) so
+    // their element IDs (60, 62, 64) stay contiguous; `evaluations` was appended
+    // after them (65..=72) so every pre-existing ID stays put.
     let schema = Schema::builder()
         .with_schema_id(5)
         .with_fields(vec![
@@ -818,6 +821,51 @@ pub fn operations_schema() -> Result<Schema> {
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     64,
                     Type::Primitive(PrimitiveType::String),
+                    true,
+                )))),
+            )),
+            // ── evaluations: List<Struct>, appended after the List<String> block
+            // so every pre-existing id stays put. Parent 65 / element 66; struct
+            // fields 67–72 mirror the `gen_ai.evaluation.result` event. One
+            // element per result on the span: a flat `gen_ai.evaluation.*`
+            // attribute set first, then one per span event, in event order.
+            Arc::new(NestedField::optional(
+                65,
+                COL_EVALUATIONS,
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    66,
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::optional(
+                            67,
+                            COL_NAME,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            68,
+                            COL_SCORE_VALUE,
+                            Type::Primitive(PrimitiveType::Double),
+                        )),
+                        Arc::new(NestedField::optional(
+                            69,
+                            COL_SCORE_LABEL,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            70,
+                            COL_EXPLANATION,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            71,
+                            COL_RESPONSE_ID,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            72,
+                            COL_ERROR_TYPE,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                    ])),
                     true,
                 )))),
             )),
@@ -1800,6 +1848,25 @@ pub const COL_ZERO_THRESHOLD: &str = "zero_threshold";
 /// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
 pub const LEVEL_ALIAS: &str = "level";
 
+// ── Operations table column name constants ───────────────────────────
+
+/// Operations — evaluation results (`List<Struct>`), one element per
+/// `gen_ai.evaluation.result` found on the span; NULL when it carries none.
+/// The nested `name` field reuses [`COL_NAME`].
+pub const COL_EVALUATIONS: &str = "evaluations";
+/// Operations — `evaluations` element: numeric score (`DOUBLE`).
+pub const COL_SCORE_VALUE: &str = "score_value";
+/// Operations — `evaluations` element: human-readable score label.
+pub const COL_SCORE_LABEL: &str = "score_label";
+/// Operations — `evaluations` element: evaluator's free-form explanation.
+pub const COL_EXPLANATION: &str = "explanation";
+/// Operations — provider response id; also the `evaluations` element field
+/// naming the evaluated response.
+pub const COL_RESPONSE_ID: &str = "response_id";
+/// Operations — error class; also the `evaluations` element field for a failed
+/// evaluation.
+pub const COL_ERROR_TYPE: &str = "error_type";
+
 // ── Prices table column name constants ───────────────────────────────
 
 /// Prices — selling platform, matching `operations.provider_name`.
@@ -2033,9 +2100,10 @@ mod tests {
     #[test]
     fn test_operations_schema() {
         let schema = operations_schema().expect("Failed to create operations schema");
-        // 58 scalar fields (1..=58) + 3 List<String> columns whose parent/element
-        // IDs run 59..=64. highest_field_id includes list element IDs.
-        assert_eq!(schema.highest_field_id(), 64);
+        // 58 scalar fields (1..=58), 3 List<String> columns (59..=64), and the
+        // `evaluations` List<Struct> appended last (65..=72). highest_field_id
+        // includes nested ids.
+        assert_eq!(schema.highest_field_id(), 72);
         assert_eq!(schema.schema_id(), 5);
         assert!(schema.field_by_name("tenant_id").is_some());
         assert!(schema.field_by_name("trace_id").is_some());
@@ -2044,6 +2112,7 @@ mod tests {
         assert!(schema.field_by_name("stop_sequences").is_some());
         assert!(schema.field_by_name("finish_reasons").is_some());
         assert!(schema.field_by_name("encoding_formats").is_some());
+        assert!(schema.field_by_name("evaluations").is_some());
         assert!(
             schema.field_by_name("cloud_account_id").is_none(),
             "cloud_account_id must be gone"
@@ -2124,6 +2193,41 @@ mod tests {
         assert_eq!(
             *span_id.field_type,
             Type::Primitive(iceberg::spec::PrimitiveType::Fixed(8))
+        );
+    }
+
+    #[test]
+    fn test_operations_evaluations_is_an_optional_list_of_structs_with_ids_65_to_72() {
+        use iceberg::spec::{PrimitiveType, Type};
+
+        let schema = operations_schema().expect("Failed to create operations schema");
+        let evaluations = schema.field_by_name(COL_EVALUATIONS).expect("evaluations field");
+        assert_eq!(evaluations.id, 65);
+        assert!(!evaluations.required, "a span without evaluations stores a NULL list");
+        let Type::List(list) = &*evaluations.field_type else {
+            panic!("evaluations must be List");
+        };
+        assert_eq!(list.element_field.id, 66);
+        assert!(list.element_field.required, "list elements are never NULL");
+        let Type::Struct(element) = &*list.element_field.field_type else {
+            panic!("evaluations element must be Struct");
+        };
+        // The element is the gen_ai.evaluation.result event, field for field.
+        let fields: Vec<(i32, &str, &Type, bool)> = element
+            .fields()
+            .iter()
+            .map(|field| (field.id, field.name.as_str(), &*field.field_type, field.required))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                (67, "name", &Type::Primitive(PrimitiveType::String), false),
+                (68, "score_value", &Type::Primitive(PrimitiveType::Double), false),
+                (69, "score_label", &Type::Primitive(PrimitiveType::String), false),
+                (70, "explanation", &Type::Primitive(PrimitiveType::String), false),
+                (71, "response_id", &Type::Primitive(PrimitiveType::String), false),
+                (72, "error_type", &Type::Primitive(PrimitiveType::String), false),
+            ]
         );
     }
 

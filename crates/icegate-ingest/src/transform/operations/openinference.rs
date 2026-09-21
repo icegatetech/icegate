@@ -1,6 +1,6 @@
 //! `OpenInference` semantic-convention adapter.
 
-use super::convention::OperationConvention;
+use super::convention::{EVALUATION_OPERATION_NAME, OperationConvention};
 use super::projection::{AttributeView, OperationField};
 use crate::transform::attributes::extract_string_value;
 
@@ -118,7 +118,7 @@ impl OperationConvention for OpenInference {
             "CHAIN" => "chain",
             "RERANKER" => "reranker",
             "GUARDRAIL" => "guardrail",
-            "EVALUATOR" => "evaluator",
+            "EVALUATOR" => EVALUATION_OPERATION_NAME,
             _ => "other",
         };
         Some(normalized.to_string())
@@ -230,10 +230,16 @@ mod tests {
 
     #[test]
     fn classify_lowercases_passthrough_kinds() {
-        // RERANKER / GUARDRAIL / EVALUATOR are lowercased verbatim (spec section 4).
+        // RERANKER / GUARDRAIL are lowercased verbatim (spec section 4).
         assert_eq!(classify("RERANKER"), Some("reranker".to_string()));
         assert_eq!(classify("GUARDRAIL"), Some("guardrail".to_string()));
-        assert_eq!(classify("EVALUATOR"), Some("evaluator".to_string()));
+    }
+
+    #[test]
+    fn classify_maps_evaluator_to_the_shared_evaluation_name() {
+        // Same concept as an OTEL span carrying gen_ai.evaluation.* results, so
+        // both must land under one operation_name.
+        assert_eq!(classify("EVALUATOR"), Some("evaluation".to_string()));
     }
 
     #[test]
