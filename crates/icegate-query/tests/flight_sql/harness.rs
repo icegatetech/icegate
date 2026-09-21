@@ -37,11 +37,12 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, METRICS_TABLE, PRICES_TABLE,
-    SPANS_TABLE, TENANT_ID_HEADER, catalog::CatalogBuilder, schema,
+    SPANS_TABLE, TENANT_ID_HEADER, TenantResolver, catalog::CatalogBuilder, schema,
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
     flight_sql::FlightSqlConfig,
+    infra::{metrics::QueryMetrics, runtime::QueryRuntime},
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -70,8 +71,10 @@ impl TestServer {
     /// Bind a Flight SQL server on an ephemeral port and return a
     /// channel + the underlying Iceberg catalog (so tests can write
     /// fixture rows).
+    /// Runs the server under `multi`, which is what a deployment behind the
+    /// auth proxy carries: every client of this suite names its tenant.
     pub async fn start() -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
-        Self::start_with_engine_config(QueryEngineConfig::default()).await
+        Self::start_with(QueryEngineConfig::default(), TenantResolver::Multi).await
     }
 
     /// Variant of [`Self::start`] running the server on a specific engine
@@ -79,6 +82,22 @@ impl TestServer {
     /// deadline fire cannot use the 30 s default.
     pub async fn start_with_engine_config(
         engine_config: QueryEngineConfig,
+    ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
+        Self::start_with(engine_config, TenantResolver::Multi).await
+    }
+
+    /// Variant of [`Self::start`] running the server under a tenant policy of
+    /// the caller's choosing — the only way to drive the `single` refusal, where
+    /// a header naming another tenant is what the policy exists to catch.
+    pub async fn start_with_tenant_policy(
+        tenant_resolver: TenantResolver,
+    ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
+        Self::start_with(QueryEngineConfig::default(), tenant_resolver).await
+    }
+
+    async fn start_with(
+        engine_config: QueryEngineConfig,
+        tenant_resolver: TenantResolver,
     ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
         let warehouse_path = tempfile::tempdir()?;
         let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
@@ -110,19 +129,18 @@ impl TestServer {
 
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();
-        let server_engine = Arc::clone(&query_engine);
+        let runtime = QueryRuntime {
+            engine: Arc::clone(&query_engine),
+            metrics: Arc::new(QueryMetrics::new_disabled()),
+            pressure: icegate_common::MemoryPressure::inert(),
+            tenant_resolver,
+        };
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let mut server_handle = tokio::spawn(async move {
-            icegate_query::flight_sql::run_with_port_tx(
-                server_engine,
-                flight_sql_config,
-                cancel_token_clone,
-                Some(port_tx),
-                icegate_common::MemoryPressure::inert(),
-            )
-            .await
-            .unwrap();
+            icegate_query::flight_sql::run_with_port_tx(runtime, flight_sql_config, cancel_token_clone, Some(port_tx))
+                .await
+                .unwrap();
         });
 
         // Drain the task on either failure before unwinding: `warehouse_path` drops

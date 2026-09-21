@@ -4,12 +4,12 @@
 //! lock-free pressure flag; the axum/tonic adapters shed new requests while the
 //! flag is set. Inert when no finite cgroup limit exists (dev/CI/bare-metal).
 pub mod cgroup;
-#[cfg(feature = "shed-tonic")]
+#[cfg(feature = "grpc")]
 pub mod grpc;
 pub mod guard;
 pub mod http;
 
-#[cfg(feature = "shed-tonic")]
+#[cfg(feature = "grpc")]
 pub use grpc::MemoryShedInterceptor;
 pub use guard::{MemoryPressure, MemoryPressureConfig, MemoryPressureSampler, UsageReader};
 pub use http::{SHED_RETRY_AFTER_SECS, ShedPolicy, default_shed_response, drain_request_body, shed_when_pressured};

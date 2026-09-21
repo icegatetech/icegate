@@ -31,7 +31,7 @@ fn get_logical_plan(df: &DataFrame) -> &LogicalPlan {
 }
 use icegate_common::{
     CancellationToken, CatalogBackend, CatalogBuilder, CatalogConfig, ICEBERG_CATALOG, ICEGATE_NAMESPACE, IoHandle,
-    LOGS_TABLE, schema::logs_schema,
+    LOGS_TABLE, TenantId, schema::logs_schema,
 };
 
 use crate::logql::{
@@ -217,7 +217,7 @@ async fn create_test_context() -> (SessionContext, QueryContext) {
     session_ctx.register_catalog("iceberg", Arc::new(iceberg_provider));
 
     let query_ctx = QueryContext {
-        tenant_id: "test-tenant".to_string(),
+        tenant_id: TenantId::new("test-tenant").expect("valid tenant id"),
         start: Utc.timestamp_opt(0, 0).unwrap(),
         end: Utc.timestamp_opt(100, 0).unwrap(), // 100 seconds from epoch
         limit: None,
@@ -1484,7 +1484,7 @@ fn unwrap_null_passthrough_fixture() -> (SessionContext, QueryContext) {
     register_logs_fixture(&ctx, Arc::new(table));
 
     let query_ctx = QueryContext {
-        tenant_id: TENANT.to_string(),
+        tenant_id: TenantId::new(TENANT).expect("valid tenant id"),
         start: grid_point,
         end: grid_point,
         limit: None,
@@ -1619,7 +1619,7 @@ fn grouping_filter_fixture(log_rows: &[&[(&str, &str)]]) -> (SessionContext, Que
     register_logs_fixture(&ctx, Arc::new(table));
 
     let query_ctx = QueryContext {
-        tenant_id: TENANT.to_string(),
+        tenant_id: TenantId::new(TENANT).expect("valid tenant id"),
         start: grid_point,
         end: grid_point,
         limit: None,
@@ -2088,7 +2088,7 @@ fn ungrouped_aggregation_fixture(log_rows: &[&[(&str, &str)]]) -> (SessionContex
     register_logs_fixture(&ctx, Arc::new(table));
 
     let query_ctx = QueryContext {
-        tenant_id: TENANT.to_string(),
+        tenant_id: TenantId::new(TENANT).expect("valid tenant id"),
         start: grid_point,
         end: grid_point,
         limit: None,

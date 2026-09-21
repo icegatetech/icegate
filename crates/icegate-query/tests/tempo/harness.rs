@@ -36,12 +36,13 @@ use iceberg::{
 };
 use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE, TenantResolver,
     catalog::CatalogBuilder,
     schema::{self, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES},
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
+    infra::{metrics::QueryMetrics, runtime::QueryRuntime},
     tempo::TempoConfig,
 };
 use reqwest::Client;
@@ -118,20 +119,21 @@ impl TestServer {
         ));
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();
-        let server_engine = Arc::clone(&query_engine);
+        // `multi`: every case of this suite names its tenant, which is what a
+        // deployment behind the auth proxy carries.
+        let runtime = QueryRuntime {
+            engine: Arc::clone(&query_engine),
+            metrics: Arc::new(QueryMetrics::new_disabled()),
+            pressure: icegate_common::MemoryPressure::inert(),
+            tenant_resolver: TenantResolver::Multi,
+        };
 
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let mut server_handle = tokio::spawn(async move {
-            icegate_query::tempo::run_with_port_tx(
-                server_engine,
-                tempo_config,
-                cancel_token_clone,
-                Some(port_tx),
-                icegate_common::MemoryPressure::inert(),
-            )
-            .await
-            .unwrap();
+            icegate_query::tempo::run_with_port_tx(runtime, tempo_config, cancel_token_clone, Some(port_tx))
+                .await
+                .unwrap();
         });
 
         // Drain the task on either failure before unwinding: `warehouse_path` drops

@@ -6,21 +6,20 @@
 //! servers ([`crate::loki::server::run`]) so the orchestration logic in
 //! `cli::commands::run` can drive every server with one pattern.
 //!
-//! Unlike the HTTP servers, no [`crate::infra::metrics::QueryMetrics`] is
-//! threaded in: the upstream `FlightSqlService` owns the request and
-//! query-execution loop and exposes no hook to record the per-query
-//! metrics (parse / plan / execute / rows / bytes) the HTTP handlers
-//! emit. Wiring meaningful Flight SQL metrics needs an upstream hook or a
-//! dedicated gRPC middleware layer and is tracked as a follow-up; an
-//! unused `QueryMetrics` argument is deliberately not carried here so the
-//! signature doesn't imply observability that isn't wired.
+//! The [`QueryRuntime`] this server is started with carries
+//! [`QueryMetrics`](crate::infra::metrics::QueryMetrics), and the tenant
+//! interceptor records its refusals through them. Per-query metrics (parse /
+//! plan / execute / rows / bytes) are still absent: the upstream
+//! `FlightSqlService` owns the request and query-execution loop and exposes no
+//! hook to record them. Wiring those needs an upstream hook or a dedicated gRPC
+//! middleware layer and is tracked as a follow-up.
 
 use std::{sync::Arc, time::Duration};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::execution::context::SQLOptions;
 use datafusion_flight_sql_server::service::FlightSqlService;
-use icegate_common::{MemoryPressure, MemoryShedInterceptor};
+use icegate_common::{MemoryShedInterceptor, TenantPolicyInterceptor};
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -28,8 +27,11 @@ use tonic::service::interceptor::InterceptedService;
 
 use super::FlightSqlConfig;
 use super::provider::IceGateSessionStateProvider;
-use crate::engine::QueryEngine;
 use crate::infra::deadline::ResponseDeadlineLayer;
+use crate::infra::{
+    metrics::{PROTOCOL_FLIGHT_SQL, QueryTenantRejectionRecorder},
+    runtime::QueryRuntime,
+};
 
 /// Build the SQL execution options enforced on every client query.
 ///
@@ -54,12 +56,11 @@ fn read_only_sql_options() -> SQLOptions {
 /// Returns an error if the listener fails to bind or the underlying
 /// tonic transport reports a fatal error.
 pub async fn run(
-    engine: Arc<QueryEngine>,
+    runtime: QueryRuntime,
     config: FlightSqlConfig,
     cancel_token: CancellationToken,
-    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(engine, config, cancel_token, None, pressure).await
+    run_with_port_tx(runtime, config, cancel_token, None).await
 }
 
 /// Variant of [`run`] that publishes the actually bound port on a
@@ -71,11 +72,10 @@ pub async fn run(
 /// Returns an error if the listener fails to bind or the underlying
 /// tonic transport reports a fatal error.
 pub async fn run_with_port_tx(
-    engine: Arc<QueryEngine>,
+    runtime: QueryRuntime,
     config: FlightSqlConfig,
     cancel_token: CancellationToken,
     port_tx: Option<oneshot::Sender<u16>>,
-    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Bind via the `(host, port)` tuple so tonic resolves hostnames and
     // IPv6 literals through `ToSocketAddrs`. Parsing a `"host:port"`
@@ -90,16 +90,33 @@ pub async fn run_with_port_tx(
         let _ = tx.send(local_addr.port());
     }
 
-    let query_deadline_secs = engine.config().max_query_duration_secs;
-    let provider = Box::new(IceGateSessionStateProvider::new(engine));
+    let query_deadline_secs = runtime.engine.config().max_query_duration_secs;
+    let provider = Box::new(IceGateSessionStateProvider::new(Arc::clone(&runtime.engine)));
     let service = FlightSqlService::new_with_provider(provider).with_sql_options(read_only_sql_options());
     let svc = FlightServiceServer::new(service)
         .max_decoding_message_size(config.max_message_size)
         .max_encoding_message_size(config.max_message_size);
     // Wrap the already-configured server so `InterceptedService` preserves the
     // codec size limits and `NamedService::NAME`; rejecting here happens at
-    // HTTP/2 HEADERS time, before protobuf decode / session build.
-    let intercepted = InterceptedService::new(svc, MemoryShedInterceptor::new(pressure, "flight_sql"));
+    // HTTP/2 HEADERS time, before protobuf decode / session build. NOT codegen
+    // `with_interceptor`, which rebuilds the service and reverts those limits.
+    //
+    // Nested, shed outermost: the outer interceptor runs first, and one atomic
+    // read of the pressure flag is cheaper than reading the tenant metadata and
+    // allocating the identifier. The OTLP/gRPC server and both HTTP routers
+    // order their two layers the same way.
+    let with_tenant = InterceptedService::new(
+        svc,
+        TenantPolicyInterceptor::new(
+            runtime.tenant_resolver.clone(),
+            QueryTenantRejectionRecorder::new(Arc::clone(&runtime.metrics)),
+            PROTOCOL_FLIGHT_SQL,
+        ),
+    );
+    let intercepted = InterceptedService::new(
+        with_tenant,
+        MemoryShedInterceptor::new(runtime.pressure.clone(), PROTOCOL_FLIGHT_SQL),
+    );
 
     // `DoGet` streams, so the response future resolves long before the query
     // does: only a deadline that spans the BODY bounds how long a Flight SQL
@@ -130,10 +147,18 @@ mod tests {
     use arrow_flight::error::FlightError;
     use arrow_flight::sql::client::FlightSqlServiceClient;
     use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
+    use icegate_common::{MemoryPressure, TenantPolicy, TenantResolver};
+    use opentelemetry::metrics::MeterProvider as _;
     use tonic::transport::Endpoint;
 
     use super::*;
-    use crate::test_support::build_stalling_engine;
+    use crate::{
+        infra::metrics::{
+            QueryMetrics,
+            test_support::{build_meter_provider, find_counter_total},
+        },
+        test_support::{build_pressured_memory, build_stalling_engine},
+    };
 
     /// Query deadline the test server runs with: the narrowest the engine config
     /// accepts, so the call ends in a second rather than in the default 30.
@@ -151,12 +176,79 @@ mod tests {
     /// transport-level bound would report.
     #[tokio::test]
     async fn a_planning_phase_outliving_the_deadline_fails_with_deadline_exceeded() {
+        let status = serve_and_plan_one_query(QueryRuntime {
+            engine: build_stalling_engine(DEADLINE_SECS),
+            metrics: Arc::new(QueryMetrics::new_disabled()),
+            pressure: MemoryPressure::inert(),
+            // The deployment's own tenant: this case is about the deadline, and
+            // its client names no tenant.
+            tenant_resolver: TenantPolicy::default().into_resolver().expect("the default policy resolves"),
+        })
+        .await;
+
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    }
+
+    /// Under memory pressure the shed interceptor answers first, whatever the
+    /// tenant policy would have said: `run_with_port_tx` nests it outside the
+    /// tenant interceptor, and a client sees that order only through which
+    /// status arrives — `RESOURCE_EXHAUSTED` from `MemoryShedInterceptor`
+    /// rather than `INVALID_ARGUMENT` from the tenant refusal. The client names
+    /// no tenant, so under `multi` the tenant interceptor would refuse it too.
+    #[tokio::test]
+    async fn a_request_without_a_tenant_is_shed_before_the_tenant_interceptor() {
+        let status = serve_and_plan_one_query(QueryRuntime {
+            engine: build_stalling_engine(DEADLINE_SECS),
+            metrics: Arc::new(QueryMetrics::new_disabled()),
+            pressure: build_pressured_memory(),
+            tenant_resolver: TenantResolver::Multi,
+        })
+        .await;
+
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    /// The refusal is counted under this surface's own protocol label, through
+    /// the metrics of the runtime the server was started with. Driven through
+    /// the server because what could break is the constant and the recorder
+    /// this call site hands the interceptor.
+    #[tokio::test]
+    async fn a_refused_rpc_counts_a_rejection_for_this_protocol() {
+        let (provider, exporter) = build_meter_provider();
+
+        let status = serve_and_plan_one_query(QueryRuntime {
+            engine: build_stalling_engine(DEADLINE_SECS),
+            metrics: Arc::new(QueryMetrics::new(&provider.meter("flight_sql_tenant_rejections"))),
+            pressure: MemoryPressure::inert(),
+            tenant_resolver: TenantResolver::Multi,
+        })
+        .await;
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        provider.force_flush().expect("failed to flush metrics");
+        assert_eq!(
+            find_counter_total(
+                &exporter,
+                "icegate_query_tenant_rejections",
+                &[("protocol", "flight_sql"), ("reason", "missing")],
+            ),
+            1
+        );
+    }
+
+    /// Start a server over `runtime` on port `0`, plan one query naming no
+    /// tenant, then cancel the server and wait for it to stop.
+    ///
+    /// Returns the gRPC status the call failed with. Panics, only once the
+    /// server and its listener are gone, when the server did not stop within
+    /// [`SHUTDOWN_TIMEOUT`] or the call did not end in a gRPC status.
+    async fn serve_and_plan_one_query(runtime: QueryRuntime) -> tonic::Status {
         let cancel_token = CancellationToken::new();
         let (port_tx, port_rx) = oneshot::channel();
         let server_token = cancel_token.clone();
         let mut server = tokio::spawn(async move {
             run_with_port_tx(
-                build_stalling_engine(DEADLINE_SECS),
+                runtime,
                 FlightSqlConfig {
                     enabled: true,
                     host: "127.0.0.1".to_string(),
@@ -165,7 +257,6 @@ mod tests {
                 },
                 server_token,
                 Some(port_tx),
-                MemoryPressure::inert(),
             )
             .await
             .expect("the Flight SQL server runs until it is cancelled");
@@ -184,8 +275,7 @@ mod tests {
             SHUTDOWN_TIMEOUT.as_secs()
         );
 
-        let status = outcome.unwrap_or_else(|failure| panic!("{failure}"));
-        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        outcome.unwrap_or_else(|failure| panic!("{failure}"))
     }
 
     /// Plan one query against the server that reports its port on `port_rx`, and
@@ -212,15 +302,15 @@ mod tests {
         .await
         .map_err(|_elapsed| {
             format!(
-                "the deadline must end planning well before the test's own {}s bound",
+                "the call must end within the test's own {}s bound",
                 RPC_TIMEOUT.as_secs()
             )
         })?;
 
         match planned {
-            Ok(_info) => Err("planning past the deadline must not return flight info".to_string()),
+            Ok(_info) => Err("the call must fail, not return flight info".to_string()),
             Err(FlightError::Tonic(status)) => Ok(*status),
-            Err(other) => Err(format!("the deadline must arrive as a gRPC status, got: {other}")),
+            Err(other) => Err(format!("the call must fail with a gRPC status, got: {other}")),
         }
     }
 }

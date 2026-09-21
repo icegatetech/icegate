@@ -19,7 +19,7 @@ name = "query"
 path = "src/main.rs"
 
 [dependencies]
-icegate-common = { workspace = true, features = ["shed-tonic"] }
+icegate-common = { workspace = true, features = ["grpc"] }
 icegate-queue = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }
@@ -101,6 +101,9 @@ harness = false
 
 [dev-dependencies]
 icegate-common = { workspace = true, features = ["test-harness"] }
+# `testing` carries `InMemoryMetricExporter`, which is how a test reads back the
+# labels a counter was incremented with.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }

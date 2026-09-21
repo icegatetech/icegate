@@ -15,18 +15,29 @@ datasources:
   datasources.yaml:
     apiVersion: 1
     datasources:
+      # The stands write one tenant, `demo` (ingest.tenant of each overlay), and
+      # their query service runs `multi`, which refuses a query that carries no
+      # X-Scope-OrgID. So every datasource that reads IceGate sends the header.
       - name: Loki
         type: loki
         access: proxy
         url: http://icegate-query.icegate.svc.cluster.local.:3100
         isDefault: false
         editable: false
+        jsonData:
+          httpHeaderName1: X-Scope-OrgID
+        secureJsonData:
+          httpHeaderValue1: demo
       - name: Tempo
         type: tempo
         access: proxy
         url: http://icegate-query.icegate.svc.cluster.local.:3200
         isDefault: false
         editable: false
+        jsonData:
+          httpHeaderName1: X-Scope-OrgID
+        secureJsonData:
+          httpHeaderValue1: demo
       - name: Prometheus
         type: prometheus
         access: proxy

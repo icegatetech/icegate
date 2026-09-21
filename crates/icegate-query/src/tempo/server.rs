@@ -2,12 +2,11 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use icegate_common::MemoryPressure;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::TempoConfig;
-use crate::engine::QueryEngine;
+use crate::{engine::QueryEngine, infra::runtime::QueryRuntime};
 
 /// Shared application state for Tempo server
 #[derive(Clone)]
@@ -23,12 +22,11 @@ pub struct TempoState {
 ///
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
-    engine: Arc<QueryEngine>,
+    runtime: QueryRuntime,
     config: TempoConfig,
     cancel_token: CancellationToken,
-    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(engine, config, cancel_token, None, pressure).await
+    run_with_port_tx(runtime, config, cancel_token, None).await
 }
 
 /// Run the Tempo HTTP server with optional port notification
@@ -40,17 +38,18 @@ pub async fn run(
 ///
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run_with_port_tx(
-    engine: Arc<QueryEngine>,
+    runtime: QueryRuntime,
     config: TempoConfig,
     cancel_token: CancellationToken,
     port_tx: Option<oneshot::Sender<u16>>,
-    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = TempoState { engine };
+    let state = TempoState {
+        engine: Arc::clone(&runtime.engine),
+    };
 
-    let app = super::routes::routes(state, pressure);
+    let app = super::routes::routes(state, &runtime);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;

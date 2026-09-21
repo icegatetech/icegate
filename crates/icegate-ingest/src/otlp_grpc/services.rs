@@ -42,7 +42,7 @@ const STATUS_OK: &str = "ok";
 /// # Errors
 ///
 /// Returns `Status::internal` when the extension is absent. That means the
-/// server was assembled without [`TenantPolicyInterceptor`](super::tenant::TenantPolicyInterceptor)
+/// server was assembled without [`TenantPolicyInterceptor`](icegate_common::TenantPolicyInterceptor)
 /// — a defect in the server wiring, not a client error — so the branch is
 /// unreachable on a correctly built server.
 fn read_request_tenant<T>(request: &Request<T>) -> Result<TenantId, Status> {

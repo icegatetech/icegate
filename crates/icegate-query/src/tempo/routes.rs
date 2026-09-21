@@ -3,8 +3,14 @@
 use std::time::Duration;
 
 use axum::{Router, extract::DefaultBodyLimit, http::StatusCode, routing::get};
-use icegate_common::{MemoryPressure, ShedPolicy, default_shed_response, shed_when_pressured};
+use icegate_common::{ShedPolicy, default_shed_response, shed_when_pressured};
 use tower_http::timeout::TimeoutLayer;
+
+use crate::infra::{
+    metrics::{PROTOCOL_TEMPO, QueryTenantRejectionRecorder},
+    runtime::QueryRuntime,
+    tenant::{RequestTenantPolicy, build_rejection_response, resolve_request_tenant},
+};
 
 /// HTTP status returned when a request exceeds the configured query duration.
 /// `503 Service Unavailable` matches axum's recommendation for an
@@ -12,11 +18,13 @@ use tower_http::timeout::TimeoutLayer;
 /// than blaming the query for being malformed.
 const TIMEOUT_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
 
-/// Readiness/liveness paths exempt from memory-pressure shedding. `/api/echo`
-/// is Grafana's search-tab liveness probe and must keep answering `200`.
+/// Readiness/liveness paths exempt from memory-pressure shedding and from
+/// tenant resolution. `/api/echo` is Grafana's search-tab liveness probe and
+/// must keep answering `200` — under memory pressure, and under a `multi`
+/// policy, which neither probe carries a tenant for.
 const TEMPO_SHED_BYPASS: &[&str] = &["/ready", "/api/echo"];
 
-use super::{handlers, server::TempoState, validation::MAX_BODY_BYTES};
+use super::{error::TempoError, handlers, server::TempoState, validation::MAX_BODY_BYTES};
 
 /// Build the Tempo HTTP router.
 ///
@@ -47,8 +55,15 @@ use super::{handlers, server::TempoState, validation::MAX_BODY_BYTES};
 ///   catalog hang or runaway scan. The value comes from the engine
 ///   config rather than a constant because it is one side of the WAL
 ///   retention contract (see [`crate::engine::QueryEngineConfig`]).
-pub fn routes(state: TempoState, pressure: MemoryPressure) -> Router {
+pub fn routes(state: TempoState, runtime: &QueryRuntime) -> Router {
     let query_timeout = Duration::from_secs(state.engine.config().max_query_duration_secs);
+    let tenant_policy = RequestTenantPolicy::new(
+        runtime.tenant_resolver.clone(),
+        QueryTenantRejectionRecorder::new(std::sync::Arc::clone(&runtime.metrics)),
+        PROTOCOL_TEMPO,
+        TEMPO_SHED_BYPASS,
+    );
+    let pressure = runtime.pressure.clone();
     Router::new()
         .route("/api/traces/{trace_id}", get(handlers::get_trace))
         .route("/api/v2/traces/{trace_id}", get(handlers::get_trace_v2))
@@ -65,9 +80,15 @@ pub fn routes(state: TempoState, pressure: MemoryPressure) -> Router {
         .route("/ready", get(handlers::ready))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TimeoutLayer::with_status_code(TIMEOUT_STATUS, query_timeout))
+        // Directly under the shed layer, for the reason stated on the Loki
+        // router: a request carrying no usable tenant takes none of the query
+        // budget, while a node under memory pressure still sheds first.
+        .layer(axum::middleware::from_fn(move |req, next| {
+            resolve_request_tenant(tenant_policy.clone(), build_rejection_response::<TempoError>, req, next)
+        }))
         .layer(axum::middleware::from_fn(move |req, next| {
             shed_when_pressured(
-                ShedPolicy::new(pressure.clone(), "tempo", TEMPO_SHED_BYPASS, None),
+                ShedPolicy::new(pressure.clone(), PROTOCOL_TEMPO, TEMPO_SHED_BYPASS, None),
                 default_shed_response,
                 req,
                 next,
@@ -85,33 +106,22 @@ mod tests {
         http::{Request, StatusCode},
     };
     use icegate_common::{
-        CatalogBackend, CatalogConfig, IoHandle, MemoryPressure, MemoryPressureConfig, MemoryPressureSampler,
-        UsageReader, catalog::CatalogBuilder,
+        CatalogBackend, CatalogConfig, DEFAULT_TENANT_ID, IoHandle, MemoryPressure, TenantId, TenantResolver,
+        catalog::CatalogBuilder,
     };
+    use opentelemetry::metrics::MeterProvider as _;
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::engine::{QueryEngine, QueryEngineConfig};
-
-    /// Deterministic pressured handle: 95 of 100 bytes crosses the 0.90
-    /// high-watermark on the first `sample_once`.
-    fn pressured_guard() -> MemoryPressure {
-        struct FullReader;
-        impl UsageReader for FullReader {
-            fn limit_bytes(&self) -> u64 {
-                100
-            }
-            fn read_working_set_bytes(&self) -> icegate_common::error::Result<u64> {
-                Ok(95)
-            }
-        }
-        let config = MemoryPressureConfig::default();
-        let sampler = MemoryPressureSampler::with_reader(&config, Arc::new(FullReader));
-        let guard = sampler.handle();
-        sampler.sample_once().expect("sample_once");
-        guard
-    }
+    use crate::{
+        engine::{QueryEngine, QueryEngineConfig},
+        infra::metrics::{
+            QueryMetrics,
+            test_support::{build_meter_provider, find_counter_total},
+        },
+        test_support::build_pressured_memory,
+    };
 
     /// Builds the router state over a fresh temp-dir warehouse, returning the
     /// directory guard alongside it. The caller MUST hold the guard for as long
@@ -139,6 +149,23 @@ mod tests {
         (TempoState { engine }, warehouse)
     }
 
+    /// The runtime the router is built from. `tenant_resolver` defaults to the
+    /// deployment's own tenant, which is what every case that is not about
+    /// tenancy needs: under it a request with no header resolves and reaches
+    /// the handler, exactly as it did before the policy existed.
+    fn build_runtime(state: &TempoState, pressure: MemoryPressure, tenant_resolver: TenantResolver) -> QueryRuntime {
+        QueryRuntime {
+            engine: Arc::clone(&state.engine),
+            metrics: Arc::new(QueryMetrics::new_disabled()),
+            pressure,
+            tenant_resolver,
+        }
+    }
+
+    fn single_default_tenant() -> TenantResolver {
+        TenantResolver::Single(TenantId::new(DEFAULT_TENANT_ID).expect("the default tenant id is valid"))
+    }
+
     fn get_request(uri: &str) -> Request<Body> {
         Request::builder().method("GET").uri(uri).body(Body::empty()).expect("request")
     }
@@ -146,7 +173,8 @@ mod tests {
     #[tokio::test]
     async fn inert_guard_allows_requests() {
         let (state, _warehouse) = build_state().await;
-        let app = routes(state, MemoryPressure::inert());
+        let runtime = build_runtime(&state, MemoryPressure::inert(), single_default_tenant());
+        let app = routes(state, &runtime);
         let response = app.oneshot(get_request("/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -154,7 +182,8 @@ mod tests {
     #[tokio::test]
     async fn pressured_guard_sheds_work_path() {
         let (state, _warehouse) = build_state().await;
-        let app = routes(state, pressured_guard());
+        let runtime = build_runtime(&state, build_pressured_memory(), single_default_tenant());
+        let app = routes(state, &runtime);
         let response = app.oneshot(get_request("/api/search")).await.expect("response");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -162,7 +191,8 @@ mod tests {
     #[tokio::test]
     async fn pressured_guard_bypasses_ready() {
         let (state, _warehouse) = build_state().await;
-        let app = routes(state, pressured_guard());
+        let runtime = build_runtime(&state, build_pressured_memory(), single_default_tenant());
+        let app = routes(state, &runtime);
         let response = app.oneshot(get_request("/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -170,9 +200,65 @@ mod tests {
     #[tokio::test]
     async fn pressured_guard_bypasses_echo() {
         let (state, _warehouse) = build_state().await;
-        let app = routes(state, pressured_guard());
+        let runtime = build_runtime(&state, build_pressured_memory(), single_default_tenant());
+        let app = routes(state, &runtime);
         let response = app.oneshot(get_request("/api/echo")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Refused, and counted under this surface's own protocol label. Driven
+    /// through the router because the constant and the recorder are what each
+    /// router hands the shared layer on its own.
+    #[tokio::test]
+    async fn a_refused_request_counts_a_rejection_for_this_protocol() {
+        let (provider, exporter) = build_meter_provider();
+        let (state, _warehouse) = build_state().await;
+        let runtime = QueryRuntime {
+            engine: Arc::clone(&state.engine),
+            metrics: Arc::new(QueryMetrics::new(&provider.meter("tempo_tenant_rejections"))),
+            pressure: MemoryPressure::inert(),
+            tenant_resolver: TenantResolver::Multi,
+        };
+        let app = routes(state, &runtime);
+
+        let response = app.oneshot(get_request("/api/search/tags")).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        provider.force_flush().expect("failed to flush metrics");
+        assert_eq!(
+            find_counter_total(
+                &exporter,
+                "icegate_query_tenant_rejections",
+                &[("protocol", "tempo"), ("reason", "missing")],
+            ),
+            1
+        );
+    }
+
+    /// Both probes must answer under `multi`, where nothing carries a tenant:
+    /// a `400` on either is a restart of a pod that is serving correctly, or
+    /// Grafana hiding its search builder behind a connection banner.
+    #[tokio::test]
+    async fn multi_leaves_the_probe_paths_alone() {
+        for path in TEMPO_SHED_BYPASS {
+            let (state, _warehouse) = build_state().await;
+            let runtime = build_runtime(&state, MemoryPressure::inert(), TenantResolver::Multi);
+            let app = routes(state, &runtime);
+            let response = app.oneshot(get_request(path)).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{path} must answer under multi");
+        }
+    }
+
+    /// Under memory pressure the shed layer answers first, whatever the tenant
+    /// policy would have said: it is the outer of the two, and Flight SQL nests
+    /// its interceptors the same way round.
+    #[tokio::test]
+    async fn a_request_without_a_tenant_is_shed_before_the_tenant_layer() {
+        let (state, _warehouse) = build_state().await;
+        let runtime = build_runtime(&state, build_pressured_memory(), TenantResolver::Multi);
+        let app = routes(state, &runtime);
+        let response = app.oneshot(get_request("/api/search/tags")).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// Driven over real HTTP: the timeout now comes from the engine config
@@ -183,7 +269,8 @@ mod tests {
         let state = TempoState {
             engine: crate::test_support::build_stalling_engine(1),
         };
-        let (base_url, server) = crate::test_support::serve_router(routes(state, MemoryPressure::inert())).await;
+        let runtime = build_runtime(&state, MemoryPressure::inert(), single_default_tenant());
+        let (base_url, server) = crate::test_support::serve_router(routes(state, &runtime)).await;
 
         let response = reqwest::Client::new()
             .get(format!("{base_url}/api/search?q=%7B%7D"))

@@ -103,11 +103,20 @@
         "image": { "type": ["object", "null"], "additionalProperties": true, "description": "Container image settings." },
         "engine": { "type": ["object", "null"], "additionalProperties": true, "description": "Query engine settings." },
         "cache": { "type": ["object", "null"], "additionalProperties": true, "description": "IO and metadata cache settings." },
+        "tenant": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Whose tenant an incoming read request is served.",
+          "properties": {
+            "mode": { "type": ["string", "null"], "enum": ["single", "multi", null], "description": "single: one tenant for the deployment, named by id. multi: the tenant comes from the x-scope-orgid header only." },
+            "id": { "type": ["string", "null"], "description": "The tenant served in single mode. Required when mode is single." }
+          }
+        },
         "loki": { "type": ["object", "null"], "additionalProperties": true, "description": "Loki-compatible API listener." },
         "prometheus": { "type": ["object", "null"], "additionalProperties": true, "description": "Prometheus-compatible API listener." },
         "tempo": { "type": ["object", "null"], "additionalProperties": true, "description": "Tempo-compatible API listener." },
         "flightSql": { "type": ["object", "null"], "additionalProperties": true, "description": "Arrow Flight SQL listener." },
-        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Metrics endpoint settings." },
+        "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Operational listener: /health always, /metrics when enabled." },
         "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings." },
         "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
         "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },

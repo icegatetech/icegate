@@ -7,7 +7,12 @@
 //! deserialize surfaces only as a pod that will not start.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{collections::HashMap, io::Write as _, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
 use icegate_common::{TENANT_ID_HEADER, TenantPolicy, load_config_file};
 use icegate_ingest::IngestConfig;
@@ -211,60 +216,190 @@ struct DatasourceSecureJsonData {
     http_header_value1: Option<String>,
 }
 
+/// The datasources of `document` that read IceGate, selected by the address
+/// `query_url_prefix` rather than by the header: the header is half of what is
+/// under test, and a datasource that lost it would leave a header-based
+/// selection and take its own failure with it.
+fn select_icegate_readers(document: DatasourcesDocument, query_url_prefix: &str) -> Vec<Datasource> {
+    let icegate_readers: Vec<Datasource> = document
+        .datasources
+        .into_iter()
+        .filter(|datasource| datasource.url.as_deref().is_some_and(|url| url.starts_with(query_url_prefix)))
+        .collect();
+
+    assert!(
+        !icegate_readers.is_empty(),
+        "the stand must provision datasources reading {query_url_prefix}"
+    );
+    icegate_readers
+}
+
+/// Assert that `datasource` names `written_tenant` through the tenant header.
+///
+/// A datasource deliberately pointed at another tenant of the stand would read
+/// nothing, so there is no case for a weaker rule than equality.
+fn assert_datasource_reads_tenant(datasource: &Datasource, written_tenant: &TenantPolicy) {
+    // Grafana spells the header in its wire casing; `TENANT_ID_HEADER` is the
+    // lowercase form HTTP/2 and gRPC store.
+    let header_name = datasource.json_data.http_header_name1.as_deref().unwrap_or_default();
+    assert!(
+        header_name.eq_ignore_ascii_case(TENANT_ID_HEADER),
+        "the {} datasource reads IceGate, so it must name the tenant through {TENANT_ID_HEADER}, not {header_name:?}",
+        datasource.name
+    );
+
+    let header_value = datasource.secure_json_data.http_header_value1.as_deref().unwrap_or_default();
+    assert!(
+        matches!(written_tenant, TenantPolicy::Single { id } if id == header_value),
+        "the {} datasource must read the tenant the stand writes to ({written_tenant:?}), not {header_value:?}",
+        datasource.name
+    );
+}
+
 /// The read side of the stand carries a third copy of the tenant: every Grafana
-/// datasource that queries IceGate sends it as `X-Scope-OrgID`. A query naming a
-/// tenant nothing wrote to is not refused — the read path resolves the tenant
-/// through `resolve_tenant_id` and answers with an empty selection — so a drift
-/// from `config/docker/ingest.yaml` surfaces only as dashboards that went blank,
-/// with no error anywhere.
+/// datasource that queries IceGate sends it as `X-Scope-OrgID`. The read path
+/// resolves the tenant through the `tenant` policy of `config/docker/query.yaml`,
+/// which on the stand is `multi` (pinned by
+/// `the_stand_query_document_reads_the_tenant_each_request_names` in
+/// `crates/icegate-query/tests/config_file.rs`). So a header naming a tenant
+/// nothing wrote to is not refused but answered with an empty selection, and a
+/// drift from `config/docker/ingest.yaml` surfaces only as dashboards that went
+/// blank, with no error anywhere — this test is what catches it.
 ///
 /// The rule asserted here is "every datasource addressing the stand's query
 /// service sends the tenant header, carrying the tenant this stand writes to".
-/// Membership is decided by the address rather than by the header, because the
-/// header is half of what is under test: a datasource that lost it would leave
-/// a header-based selection and take its own failure with it. A datasource
-/// deliberately pointed at another tenant of this stand would read nothing, so
-/// there is no case for a weaker rule; `Prometheus` and `Jaeger` address services
-/// of their own and are not in scope.
+/// `Prometheus` and `Jaeger` address services of their own and are not in scope.
 #[test]
 fn every_stand_datasource_reads_the_tenant_the_stand_writes() {
     let config = IngestConfig::from_file(STAND_INGEST_DOCUMENT).expect("the stand document must load and validate");
 
     let document: DatasourcesDocument =
         load_config_file(Path::new(STAND_DATASOURCES_DOCUMENT)).expect("the stand datasource document must load");
-    let icegate_readers: Vec<Datasource> = document
-        .datasources
-        .into_iter()
-        .filter(|datasource| {
-            datasource
-                .url
-                .as_deref()
-                .is_some_and(|url| url.starts_with(STAND_QUERY_URL_PREFIX))
-        })
-        .collect();
 
+    for datasource in &select_icegate_readers(document, STAND_QUERY_URL_PREFIX) {
+        assert_datasource_reads_tenant(datasource, &config.tenant);
+    }
+}
+
+/// The Grafana values every k8s stand overlay renders (`../../base` of each).
+const K8S_STAND_GRAFANA_VALUES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../config/kustomize/base/values-grafana.yaml"
+);
+
+/// The k8s stands' query service as their datasources address it.
+const K8S_STAND_QUERY_URL_PREFIX: &str = "http://icegate-query.";
+
+/// The directory holding one subdirectory per k8s stand overlay. Every overlay
+/// renders [`K8S_STAND_GRAFANA_VALUES`] and pins its tenants in its own
+/// `values-icegate.yaml`.
+const K8S_STAND_OVERLAYS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/kustomize/overlays");
+
+/// The parts of the Grafana chart values this test reads: the provisioning
+/// document the chart writes out as `datasources.yaml`.
+#[derive(Deserialize)]
+struct GrafanaValues {
+    datasources: GrafanaDatasourceFiles,
+}
+
+#[derive(Deserialize)]
+struct GrafanaDatasourceFiles {
+    #[serde(rename = "datasources.yaml")]
+    provisioning: DatasourcesDocument,
+}
+
+/// The parts of an icegate chart values file this test reads: the tenant its
+/// ingest writes and the tenant policy its query reads through, both in the
+/// chart's `mode`/`id` form.
+#[derive(Deserialize)]
+struct OverlayValues {
+    ingest: OverlayComponentValues,
+    query: OverlayComponentValues,
+}
+
+#[derive(Deserialize)]
+struct OverlayComponentValues {
+    tenant: OverlayTenantValues,
+}
+
+#[derive(Deserialize)]
+struct OverlayTenantValues {
+    mode: String,
+    id: Option<String>,
+}
+
+impl OverlayTenantValues {
+    /// The policy the chart renders from these values (`icegate.tenantYaml`).
+    fn to_tenant_policy(&self) -> TenantPolicy {
+        match self.mode.as_str() {
+            "single" => TenantPolicy::Single {
+                id: self.id.clone().expect("a single-tenant overlay must name its id"),
+            },
+            "multi" => TenantPolicy::Multi,
+            other => panic!("unknown tenant mode {other:?}"),
+        }
+    }
+}
+
+/// The k8s stands carry the same three copies of the tenant as the Compose stand,
+/// and their query service runs `multi` too, so a datasource that lost the header
+/// is answered `400` and one naming another tenant reads nothing. Every overlay
+/// shares one Grafana document, so each overlay's ingest tenant is checked
+/// against the same datasources, and each overlay's query policy is checked to
+/// be `multi`: left to the chart default (`single` on `default`) it would refuse
+/// every one of those datasources while the stand still rendered clean.
+///
+/// The overlays are read off the directory rather than listed, so an overlay
+/// added later is checked without a change here; a directory without
+/// `values-icegate.yaml` fails rather than being skipped.
+#[test]
+fn every_k8s_stand_datasource_reads_the_tenant_the_stand_writes() {
+    let grafana: GrafanaValues =
+        load_config_file(Path::new(K8S_STAND_GRAFANA_VALUES)).expect("the k8s stand Grafana values must load");
+    let icegate_readers = select_icegate_readers(grafana.datasources.provisioning, K8S_STAND_QUERY_URL_PREFIX);
+
+    let overlay_dirs: Vec<PathBuf> = fs::read_dir(K8S_STAND_OVERLAYS_DIR)
+        .expect("the k8s overlays directory must be readable")
+        .map(|entry| entry.expect("an overlay directory entry must be readable").path())
+        .filter(|path| path.is_dir())
+        .collect();
     assert!(
-        !icegate_readers.is_empty(),
-        "the stand must provision datasources reading {STAND_QUERY_URL_PREFIX}"
+        !overlay_dirs.is_empty(),
+        "{K8S_STAND_OVERLAYS_DIR} must hold at least one overlay"
     );
 
-    for datasource in icegate_readers {
-        // Grafana spells the header in its wire casing; `TENANT_ID_HEADER` is the
-        // lowercase form HTTP/2 and gRPC store.
-        let header_name = datasource.json_data.http_header_name1.unwrap_or_default();
-        assert!(
-            header_name.eq_ignore_ascii_case(TENANT_ID_HEADER),
-            "the {} datasource reads IceGate, so it must name the tenant through {TENANT_ID_HEADER}, not {header_name:?}",
-            datasource.name
-        );
+    for overlay_dir in overlay_dirs {
+        let values_path = overlay_dir.join("values-icegate.yaml");
+        let values: OverlayValues = load_config_file(&values_path)
+            .unwrap_or_else(|error| panic!("{} must load: {error}", values_path.display()));
 
         assert_eq!(
-            config.tenant,
-            TenantPolicy::Single {
-                id: datasource.secure_json_data.http_header_value1.unwrap_or_default()
-            },
-            "the {} datasource must read the tenant the stand writes to",
-            datasource.name
+            values.query.tenant.to_tenant_policy(),
+            TenantPolicy::Multi,
+            "{} must run query in multi: its datasources name the tenant in X-Scope-OrgID",
+            values_path.display()
         );
+
+        let written_tenant = values.ingest.tenant.to_tenant_policy();
+        for datasource in &icegate_readers {
+            assert_datasource_reads_tenant(datasource, &written_tenant);
+        }
     }
+}
+
+/// The auth-proxy example writes the tenant each token names, so both of its
+/// components must take the tenant from the request: ingest to write the token's
+/// tenant, query to read it back. Left to the chart default (`single` on
+/// `default`), either side would refuse every tenant the proxy admits.
+#[test]
+fn the_auth_proxy_example_writes_and_reads_the_tenant_each_request_names() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/helm/auth-proxy/values-authproxy.yaml"
+    );
+
+    let values: OverlayValues = load_config_file(Path::new(path)).expect("the auth-proxy example values must load");
+
+    assert_eq!(values.ingest.tenant.to_tenant_policy(), TenantPolicy::Multi);
+    assert_eq!(values.query.tenant.to_tenant_policy(), TenantPolicy::Multi);
 }

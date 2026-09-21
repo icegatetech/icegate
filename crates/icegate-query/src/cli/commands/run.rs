@@ -7,7 +7,12 @@ use icegate_common::{CatalogBuilder, IoHandle, MemoryPressure, MetricsRuntime, r
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
-use crate::{QueryConfig, engine::QueryEngine, error::QueryError, infra::metrics::QueryMetrics};
+use crate::{
+    QueryConfig,
+    engine::QueryEngine,
+    error::QueryError,
+    infra::{metrics::QueryMetrics, runtime::QueryRuntime},
+};
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 #[allow(clippy::expect_used)] // Signal handler registration failures are critical startup errors
@@ -120,15 +125,21 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         }),
     );
 
+    // The tenant policy, resolved once. The line is the only place an operator
+    // learns which mode the deployment runs in before a request is refused;
+    // ingest prints the same one.
+    let tenant_resolver = config.tenant.clone().into_resolver()?;
+    tracing::info!(mode = tenant_resolver.mode(), "Tenant policy resolved");
+
+    let runtime = QueryRuntime {
+        engine: Arc::clone(&query_engine),
+        metrics: Arc::clone(&query_metrics),
+        pressure,
+        tenant_resolver,
+    };
+
     // Spawn one task per enabled server (metrics + each query API).
-    let handles = spawn_servers(
-        &config,
-        &query_engine,
-        &query_metrics,
-        metrics_runtime.as_ref(),
-        &cancel_token,
-        &pressure,
-    );
+    let handles = spawn_servers(&config, &runtime, metrics_runtime.as_ref(), &cancel_token);
 
     tracing::info!("All enabled query servers started");
     tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
@@ -168,11 +179,9 @@ type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error
 /// query protocol.
 fn spawn_servers(
     config: &QueryConfig,
-    query_engine: &Arc<QueryEngine>,
-    query_metrics: &Arc<QueryMetrics>,
+    runtime: &QueryRuntime,
     metrics_runtime: Option<&Arc<MetricsRuntime>>,
     cancel_token: &CancellationToken,
-    pressure: &MemoryPressure,
 ) -> Vec<ServerHandle> {
     let mut handles = Vec::new();
 
@@ -190,48 +199,41 @@ fn spawn_servers(
         }));
     }
 
-    // Query servers
+    // Query servers. Each takes a clone of the one runtime: four refcount
+    // bumps per server, taken here and never again.
     if config.loki.enabled {
-        let engine = Arc::clone(query_engine);
+        let runtime = runtime.clone();
         let loki_config = config.loki.clone();
         let token = cancel_token.clone();
-        let m = Arc::clone(query_metrics);
-        let pressure = pressure.clone();
         handles.push(tokio::spawn(async move {
-            crate::loki::run(engine, loki_config, token, m, pressure).await
+            crate::loki::run(runtime, loki_config, token).await
         }));
     }
 
     if config.prometheus.enabled {
-        let engine = Arc::clone(query_engine);
+        let runtime = runtime.clone();
         let prom_config = config.prometheus.clone();
         let token = cancel_token.clone();
-        let pressure = pressure.clone();
         handles.push(tokio::spawn(async move {
-            crate::prometheus::run(engine, prom_config, token, pressure).await
+            crate::prometheus::run(runtime, prom_config, token).await
         }));
     }
 
     if config.tempo.enabled {
-        let engine = Arc::clone(query_engine);
+        let runtime = runtime.clone();
         let tempo_config = config.tempo.clone();
         let token = cancel_token.clone();
-        let pressure = pressure.clone();
         handles.push(tokio::spawn(async move {
-            crate::tempo::run(engine, tempo_config, token, pressure).await
+            crate::tempo::run(runtime, tempo_config, token).await
         }));
     }
 
     if config.flight_sql.enabled {
-        let engine = Arc::clone(query_engine);
+        let runtime = runtime.clone();
         let flight_sql_config = config.flight_sql.clone();
         let token = cancel_token.clone();
-        let pressure = pressure.clone();
-        // No `QueryMetrics`: the upstream Flight SQL service owns the
-        // request loop and exposes no per-query metrics hook (see
-        // `flight_sql::server`).
         handles.push(tokio::spawn(async move {
-            crate::flight_sql::run(engine, flight_sql_config, token, pressure).await
+            crate::flight_sql::run(runtime, flight_sql_config, token).await
         }));
     }
 

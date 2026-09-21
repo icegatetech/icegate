@@ -58,11 +58,12 @@ spec:
               containerPort: {{ .Values.query.flightSql.port }}
               protocol: TCP
             {{- end }}
-            {{- if .Values.query.metrics.enabled }}
+            {{- /* Declared unconditionally: the operational listener runs
+                   whatever query.metrics.enabled says, because the probes hit
+                   /health on it. */}}
             - name: metrics
               containerPort: {{ .Values.query.metrics.port }}
               protocol: TCP
-            {{- end }}
           env:
             {{- include "icegate.awsEnv" . | nindent 12 }}
             - name: RUST_LOG

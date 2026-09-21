@@ -4,6 +4,7 @@
 //! execution plan implementations (e.g., DataFusion LogicalPlan).
 
 use chrono::{DateTime, TimeDelta, Utc};
+use icegate_common::TenantId;
 
 use super::expr::LogQLExpr;
 use crate::error::Result;
@@ -27,6 +28,7 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 /// ```
 /// use chrono::TimeDelta;
 /// use datafusion::prelude::SessionContext;
+/// use icegate_common::TenantId;
 /// use icegate_query::logql::{
 ///     LogExpr, LogQLExpr, Selector,
 ///     datafusion::DataFusionPlanner,
@@ -36,7 +38,7 @@ pub const DEFAULT_LOG_LIMIT: usize = 100;
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let session_context = SessionContext::new();
 /// let query_context = QueryContext {
-///     tenant_id: "tenant-1".to_string(),
+///     tenant_id: TenantId::new("tenant-1").expect("valid tenant id"),
 ///     start: chrono::Utc::now(),
 ///     end: chrono::Utc::now() + TimeDelta::hours(1),
 ///     limit: None,
@@ -64,7 +66,7 @@ pub enum SortDirection {
 pub struct QueryContext {
     /// Tenant ID for multi-tenancy isolation (extracted from X-Scope-OrgID
     /// header).
-    pub tenant_id: String,
+    pub tenant_id: TenantId,
     /// Start time (inclusive)
     pub start: DateTime<Utc>,
     /// End time (inclusive)

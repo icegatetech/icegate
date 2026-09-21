@@ -36,10 +36,12 @@ use iceberg::{
 };
 use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, catalog::CatalogBuilder, schema,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, TenantResolver, catalog::CatalogBuilder,
+    schema,
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
+    infra::{metrics::QueryMetrics, runtime::QueryRuntime},
     loki::LokiConfig,
 };
 use reqwest::Client;
@@ -175,23 +177,22 @@ impl TestServer {
         ));
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();
-        let server_engine = Arc::clone(&query_engine);
+        // `multi`: every case of this suite names its tenant, which is what a
+        // deployment behind the auth proxy carries.
+        let runtime = QueryRuntime {
+            engine: Arc::clone(&query_engine),
+            metrics: Arc::new(QueryMetrics::new_disabled()),
+            pressure: icegate_common::MemoryPressure::inert(),
+            tenant_resolver: TenantResolver::Multi,
+        };
 
         // Create oneshot channel to receive the actual bound port
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let mut server_handle = tokio::spawn(async move {
-            let disabled_metrics = Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
-            icegate_query::loki::run_with_port_tx(
-                server_engine,
-                loki_config,
-                cancel_token_clone,
-                Some(port_tx),
-                disabled_metrics,
-                icegate_common::MemoryPressure::inert(),
-            )
-            .await
-            .unwrap();
+            icegate_query::loki::run_with_port_tx(runtime, loki_config, cancel_token_clone, Some(port_tx))
+                .await
+                .unwrap();
         });
 
         // Wait for the server to bind and receive the actual port. Drain the task on

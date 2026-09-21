@@ -252,7 +252,7 @@ impl DataFusionPlanner {
         // This filter is applied FIRST and cannot be bypassed by user queries.
         // Since tenant_id is the leading partition key, Iceberg will prune
         // non-matching partitions for efficient query execution.
-        let df = df.filter(col(COL_TENANT_ID).eq(lit(&self.query_ctx.tenant_id)))?;
+        let df = df.filter(col(COL_TENANT_ID).eq(lit(self.query_ctx.tenant_id.as_ref())))?;
 
         // 3. Apply time range filter
         // The timestamp column is Timestamp(Microsecond)
@@ -386,7 +386,7 @@ impl DataFusionPlanner {
         let df = strip_schema_metadata(df)?;
 
         // Mandatory tenant isolation filter (partition pruning)
-        let df = df.filter(col(COL_TENANT_ID).eq(lit(&self.query_ctx.tenant_id)))?;
+        let df = df.filter(col(COL_TENANT_ID).eq(lit(self.query_ctx.tenant_id.as_ref())))?;
 
         // Time range filter for partition pruning
         let ts_col = col(COL_TIMESTAMP);

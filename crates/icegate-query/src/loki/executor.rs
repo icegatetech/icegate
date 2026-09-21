@@ -10,7 +10,7 @@ use datafusion::{
     arrow::array::RecordBatch,
     prelude::{DataFrame, SessionContext},
 };
-use icegate_common::attribute_key::normalize_attribute_key;
+use icegate_common::{TenantId, attribute_key::normalize_attribute_key};
 
 use super::{
     error::{LokiError, LokiResult},
@@ -50,7 +50,7 @@ pub fn parse_time(s: &str) -> DateTime<Utc> {
 /// Handles time range parsing with support for `start`, `end`, and `since`
 /// parameters. Defaults to 6 hours if no time range is specified.
 pub fn build_query_context(
-    tenant_id: String,
+    tenant_id: TenantId,
     start: Option<&String>,
     end: Option<&String>,
     since: Option<&String>,
@@ -244,7 +244,7 @@ impl QueryExecutor {
     #[tracing::instrument(skip(self, params), fields(tenant_id, query = %params.query))]
     pub async fn execute_range_query(
         &self,
-        tenant_id: String,
+        tenant_id: &TenantId,
         params: &RangeQueryParams,
     ) -> LokiResult<QueryResultData> {
         let exec_start = Instant::now();
@@ -254,7 +254,7 @@ impl QueryExecutor {
         let end = params.end.as_ref().map_or(now, |s| parse_time(s));
 
         let query_ctx = QueryContext {
-            tenant_id,
+            tenant_id: tenant_id.clone(),
             start,
             end,
             limit: params.limit.map(|l| l as usize),
@@ -344,11 +344,11 @@ impl QueryExecutor {
     #[tracing::instrument(skip(self, params), fields(tenant_id))]
     pub async fn execute_labels(
         &self,
-        tenant_id: String,
+        tenant_id: &TenantId,
         params: &super::models::LabelsQueryParams,
     ) -> LokiResult<Vec<String>> {
         let query_ctx = build_query_context(
-            tenant_id,
+            tenant_id.clone(),
             params.start.as_ref(),
             params.end.as_ref(),
             params.since.as_ref(),
@@ -364,7 +364,7 @@ impl QueryExecutor {
         let table = self.load_logs_table().await?;
         let scanned = crate::engine::metadata_scan::scan_labels(
             &table,
-            &query_ctx.tenant_id,
+            query_ctx.tenant_id.as_ref(),
             query_ctx.start,
             query_ctx.end,
             &super::LOGS_METADATA_CONFIGS,
@@ -390,12 +390,12 @@ impl QueryExecutor {
     #[tracing::instrument(skip(self, params), fields(tenant_id, label_name))]
     pub async fn execute_label_values(
         &self,
-        tenant_id: String,
+        tenant_id: &TenantId,
         label_name: &str,
         params: &super::models::LabelValuesQueryParams,
     ) -> LokiResult<Vec<String>> {
         let query_ctx = build_query_context(
-            tenant_id,
+            tenant_id.clone(),
             params.start.as_ref(),
             params.end.as_ref(),
             params.since.as_ref(),
@@ -415,7 +415,7 @@ impl QueryExecutor {
         // than one level surfaces once.
         let values = crate::engine::metadata_scan::scan_label_values(
             &table,
-            &query_ctx.tenant_id,
+            query_ctx.tenant_id.as_ref(),
             query_ctx.start,
             query_ctx.end,
             &super::LOGS_VALUES_METADATA_CONFIGS,
@@ -443,14 +443,14 @@ impl QueryExecutor {
     #[tracing::instrument(skip(self, params), fields(tenant_id))]
     pub async fn execute_series(
         &self,
-        tenant_id: String,
+        tenant_id: &TenantId,
         params: &super::models::SeriesQueryParams,
     ) -> LokiResult<Vec<std::collections::HashMap<String, String>>> {
         if params.matchers.is_empty() {
             return Err(QueryError::Validation("match[] parameter required".to_string()).into());
         }
 
-        let query_ctx = build_query_context(tenant_id, params.start.as_ref(), params.end.as_ref(), None);
+        let query_ctx = build_query_context(tenant_id.clone(), params.start.as_ref(), params.end.as_ref(), None);
 
         // Parse all matchers (CPU-bound, offloaded to blocking thread)
         let matchers = params.matchers.clone();

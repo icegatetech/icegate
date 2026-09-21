@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use icegate_common::{
-    CatalogConfig, MemoryPressureConfig, OperationalConfig, StorageConfig, TracingConfig, check_port_conflicts,
-    load_config_file,
+    CatalogConfig, MemoryPressureConfig, OperationalConfig, StorageConfig, TenantPolicy, TracingConfig,
+    check_port_conflicts, load_config_file,
 };
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,17 @@ pub struct QueryConfig {
     /// Queue configuration for WAL segment reading
     #[serde(default)]
     pub queue: QueueConfig,
+    /// How this deployment decides whose tenant a request reads.
+    ///
+    /// Optional: when the `tenant` block is absent the policy defaults to
+    /// `single` on `default`, so configs written before the policy existed keep
+    /// parsing. A request without the header, or naming `default`, is answered
+    /// as before. Two answers changed: a request naming another tenant, once
+    /// served that tenant's rows, and one with a malformed value, once served
+    /// `default`'s rows, are now both refused. A deployment reading several
+    /// tenants sets `tenant: !multi`.
+    #[serde(default)]
+    pub tenant: TenantPolicy,
     /// Loki API server
     pub loki: LokiConfig,
     /// Prometheus API server
@@ -94,6 +105,7 @@ impl QueryConfig {
         self.queue
             .validate()
             .map_err(|e| crate::error::QueryError::Config(e.to_string()))?;
+        self.tenant.validate()?;
         self.loki.validate()?;
         self.prometheus.validate()?;
         self.tempo.validate()?;

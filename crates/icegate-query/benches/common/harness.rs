@@ -84,6 +84,10 @@ fn build_attribute_map(arrow_schema: &Schema, name: &str, rows: &[&[(&str, &str)
     Arc::new(builder.finish())
 }
 
+/// The tenant every benchmark fixture is written under and every benchmark
+/// request names; the server serves exactly this tenant.
+pub const BENCH_TENANT_ID: &str = "test-tenant";
+
 /// Test server configuration and handles
 pub struct TestServer {
     pub client: Client,
@@ -157,22 +161,26 @@ impl TestServer {
 
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();
-        let server_engine = Arc::clone(&query_engine);
+        // `single` on exactly the tenant the fixtures are written under: the
+        // benchmark requests name it in their header, and a resolver serving any
+        // other tenant would answer every one of them `400`.
+        let runtime = icegate_query::infra::runtime::QueryRuntime {
+            engine: Arc::clone(&query_engine),
+            metrics: Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled()),
+            pressure: icegate_common::MemoryPressure::inert(),
+            tenant_resolver: icegate_common::TenantPolicy::Single {
+                id: BENCH_TENANT_ID.to_string(),
+            }
+            .into_resolver()
+            .expect("the benchmark tenant policy resolves"),
+        };
 
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let mut server_handle = tokio::spawn(async move {
-            let disabled_metrics = Arc::new(icegate_query::infra::metrics::QueryMetrics::new_disabled());
-            icegate_query::loki::run_with_port_tx(
-                server_engine,
-                loki_config,
-                cancel_token_clone,
-                Some(port_tx),
-                disabled_metrics,
-                icegate_common::MemoryPressure::inert(),
-            )
-            .await
-            .unwrap();
+            icegate_query::loki::run_with_port_tx(runtime, loki_config, cancel_token_clone, Some(port_tx))
+                .await
+                .unwrap();
         });
 
         let actual_port = match tokio::time::timeout(PORT_BIND_TIMEOUT, port_rx).await {
@@ -245,7 +253,7 @@ pub async fn write_benchmark_logs(
     let body_strs: Vec<String> = (0..count).map(|i| format!("Request processed successfully {}", i)).collect();
 
     for (i, body_str) in body_strs.iter().enumerate() {
-        tenant_ids.push("test-tenant");
+        tenant_ids.push(BENCH_TENANT_ID);
         service_names.push(Some("api"));
         let ts = now_micros - (i64::try_from(i).unwrap_or(0) * time_step);
         timestamps.push(ts);
@@ -349,7 +357,7 @@ pub async fn write_benchmark_logs_with_numeric_attrs(
     let body_strs: Vec<String> = (0..count).map(|i| format!("Request processed {}", i)).collect();
 
     for (i, body_str) in body_strs.iter().enumerate() {
-        tenant_ids.push("test-tenant");
+        tenant_ids.push(BENCH_TENANT_ID);
         service_names.push(Some("api"));
         let ts = now_micros - (i64::try_from(i).unwrap_or(0) * time_step);
         timestamps.push(ts);
@@ -462,7 +470,7 @@ pub async fn write_benchmark_logs_with_varied_labels(
     let body_strs: Vec<String> = (0..count).map(|i| format!("Request {} processed", i)).collect();
 
     for (i, body_str) in body_strs.iter().enumerate() {
-        tenant_ids.push("test-tenant");
+        tenant_ids.push(BENCH_TENANT_ID);
         service_names.push(Some("api"));
         let ts = now_micros - (i64::try_from(i).unwrap_or(0) * time_step);
         timestamps.push(ts);

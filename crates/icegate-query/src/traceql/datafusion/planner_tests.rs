@@ -20,7 +20,7 @@ use datafusion::{
     datasource::MemTable,
     prelude::SessionContext,
 };
-use icegate_common::{SPANS_TABLE_FQN, schema::COL_SCOPE_ATTRIBUTES};
+use icegate_common::{SPANS_TABLE_FQN, TenantId, schema::COL_SCOPE_ATTRIBUTES};
 
 /// Pad an ASCII label up to `N` bytes with trailing zeros so it round-trips
 /// through a `FIXED_LEN_BYTE_ARRAY(N)` column. Lexicographic ordering of
@@ -253,7 +253,7 @@ fn fixture_session() -> SessionContext {
 fn make_query_ctx(tenant: &str) -> QueryContext {
     let now = Utc::now();
     QueryContext {
-        tenant_id: tenant.to_string(),
+        tenant_id: TenantId::new(tenant).expect("valid tenant id"),
         start: now - Duration::days(1),
         end: now + Duration::days(1),
         limit: None,

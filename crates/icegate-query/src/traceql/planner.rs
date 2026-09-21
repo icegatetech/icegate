@@ -1,6 +1,7 @@
 //! Planner trait, [`QueryContext`], and constants for TraceQL planning.
 
 use chrono::{DateTime, TimeDelta, Utc};
+use icegate_common::TenantId;
 
 use super::expr::TraceQLExpr;
 use crate::error::Result;
@@ -27,7 +28,7 @@ pub const DEFAULT_SPANS_PER_SPANSET: usize = 3;
 pub struct QueryContext {
     /// Tenant ID for multi-tenancy isolation (extracted from
     /// `X-Scope-OrgID` header).
-    pub tenant_id: String,
+    pub tenant_id: TenantId,
     /// Start of the query time range (inclusive).
     pub start: DateTime<Utc>,
     /// End of the query time range (inclusive).

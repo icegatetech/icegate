@@ -9,11 +9,11 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use icegate_common::{TENANT_ID_HEADER, TenantHeader, TenantRejection, TenantResolver, drain_request_body};
+use icegate_common::{TenantHeader, TenantRejection, TenantResolver, drain_request_body};
 
 use super::{
     handlers::{PROTOCOL_HTTP, SIGNAL_LOGS, SIGNAL_METRICS, SIGNAL_TRACES},
@@ -38,7 +38,7 @@ pub(super) async fn resolve_request_tenant(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let outcome = resolver.resolve_tenant(read_tenant_header(request.headers()));
+    let outcome = resolver.resolve_tenant(TenantHeader::from_header_map(request.headers()));
 
     let rejection = match outcome {
         Ok(tenant) => {
@@ -56,15 +56,6 @@ pub(super) async fn resolve_request_tenant(
     drain_request_body(request.into_body(), drain_limit_bytes).await;
 
     reject_request(rejection)
-}
-
-/// Read [`TENANT_ID_HEADER`] as the policy input.
-///
-/// Only the mapping from this surface's header map; what the values mean is
-/// [`TenantHeader::from_values`], which the OTLP/gRPC surface reaches the same
-/// way.
-fn read_tenant_header(headers: &HeaderMap) -> TenantHeader<'_> {
-    TenantHeader::from_values(headers.get_all(TENANT_ID_HEADER).iter().map(|value| value.to_str().ok()))
 }
 
 /// The signal a request path belongs to, for the rejection counter's label.
@@ -92,41 +83,7 @@ fn reject_request(rejection: TenantRejection) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
-
     use super::*;
-
-    #[test]
-    fn an_absent_header_reads_as_absent() {
-        assert_eq!(read_tenant_header(&HeaderMap::new()), TenantHeader::Absent);
-    }
-
-    #[test]
-    fn a_single_header_reads_as_its_value() {
-        let mut headers = HeaderMap::new();
-        headers.insert(TENANT_ID_HEADER, HeaderValue::from_static("acme"));
-        assert_eq!(read_tenant_header(&headers), TenantHeader::Once("acme"));
-    }
-
-    #[test]
-    fn two_headers_read_as_duplicated_even_when_they_agree() {
-        let mut headers = HeaderMap::new();
-        headers.append(TENANT_ID_HEADER, HeaderValue::from_static("acme"));
-        headers.append(TENANT_ID_HEADER, HeaderValue::from_static("acme"));
-        assert_eq!(read_tenant_header(&headers), TenantHeader::Duplicated);
-    }
-
-    #[test]
-    fn a_non_ascii_header_reads_as_an_unusable_value() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            TENANT_ID_HEADER,
-            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("byte header value"),
-        );
-        // Empty is rejected by `TenantId::is_valid`, so this reaches the policy
-        // as a named-but-invalid tenant rather than as an absent header.
-        assert_eq!(read_tenant_header(&headers), TenantHeader::Once(""));
-    }
 
     #[test]
     fn signal_labels_follow_the_otlp_paths() {

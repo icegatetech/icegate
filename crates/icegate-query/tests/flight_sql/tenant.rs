@@ -1,7 +1,7 @@
 //! Cross-tenant isolation enforced by the session provider.
 #![allow(clippy::print_stdout, clippy::uninlined_format_args)]
 
-use icegate_common::{DEFAULT_TENANT_ID, ICEGATE_NAMESPACE, LOGS_TABLE};
+use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, TenantPolicy};
 
 use super::harness::{TestServer, count_from_batches, execute_sql, write_logs_file, write_test_logs_for_tenant};
 
@@ -37,30 +37,58 @@ async fn each_tenant_sees_only_their_own_rows() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test]
-async fn missing_tenant_header_falls_back_to_default_tenant() -> Result<(), Box<dyn std::error::Error>> {
+async fn a_request_without_a_tenant_header_is_refused_in_multi() -> Result<(), Box<dyn std::error::Error>> {
+    // A headerless request used to be served the `default` tenant's rows. Under
+    // `multi` there is no tenant to fall back to, and answering one would hand
+    // a caller rows it never named. Seeded so the case can tell a refusal from
+    // an empty table.
     let (server, catalog) = TestServer::start().await?;
 
-    // Seed rows under the default tenant AND a non-default tenant. A table
-    // holding only default-tenant rows can't distinguish correct scoping
-    // from an unscoped leak — both return 3. With a second tenant present,
-    // a broken fallback that returned unscoped results would see all 6
-    // rows; only a fallback that resolves to DEFAULT_TENANT_ID sees exactly
-    // the 3 default rows.
     let table_ident = iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?;
-    let table = catalog.load_table(&table_ident).await?;
-    write_test_logs_for_tenant(&table, &catalog, DEFAULT_TENANT_ID, "default-service", "Default").await?;
-
     let table = catalog.load_table(&table_ident).await?;
     write_test_logs_for_tenant(&table, &catalog, "tenant-other", "other-service", "Other").await?;
 
-    // No tenant header — provider falls back to DEFAULT_TENANT_ID ("default").
     let mut client = server.client(None);
-    let batches = execute_sql(&mut client, "SELECT count(*) FROM iceberg.icegate.logs").await?;
-    assert_eq!(
-        count_from_batches(&batches),
-        3,
-        "headerless client must fall back to the default tenant and see only its 3 rows"
+    let status = execute_sql(&mut client, "SELECT count(*) FROM iceberg.icegate.logs")
+        .await
+        .expect_err("multi must refuse a request carrying no tenant header");
+    assert!(
+        status.to_string().contains("missing tenant"),
+        "the refusal must name the missing tenant, got: {status}"
     );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_request_naming_another_tenant_is_refused_in_single() -> Result<(), Box<dyn std::error::Error>> {
+    // `single` consults the header rather than ignoring it: a caller addressing
+    // another tenant is told so, instead of silently reading this deployment's
+    // own rows under a name it never asked for.
+    let resolver = TenantPolicy::Single {
+        id: "tenant-alpha".to_string(),
+    }
+    .into_resolver()?;
+    let (server, catalog) = TestServer::start_with_tenant_policy(resolver).await?;
+
+    let table_ident = iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, LOGS_TABLE])?;
+    let table = catalog.load_table(&table_ident).await?;
+    write_test_logs_for_tenant(&table, &catalog, "tenant-alpha", "alpha-service", "Alpha").await?;
+
+    let mut client_served = server.client(Some("tenant-alpha"));
+    let batches = execute_sql(&mut client_served, "SELECT count(*) FROM iceberg.icegate.logs").await?;
+    assert_eq!(count_from_batches(&batches), 3, "the served tenant reads its own rows");
+
+    let mut client_other = server.client(Some("tenant-beta"));
+    let status = execute_sql(&mut client_other, "SELECT count(*) FROM iceberg.icegate.logs")
+        .await
+        .expect_err("single must refuse a header naming another tenant");
+    assert!(
+        status.to_string().contains("invalid tenant"),
+        "the refusal must name the tenant as invalid, got: {status}"
+    );
+
     server.shutdown().await;
     Ok(())
 }

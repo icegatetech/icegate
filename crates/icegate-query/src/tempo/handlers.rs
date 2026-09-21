@@ -1,19 +1,20 @@
 //! Tempo API request handlers.
 //!
-//! Thin route handlers that extract the tenant from the `x-scope-orgid`
-//! header, parse query parameters and delegate to [`super::executor`]
+//! Thin route handlers that read the tenant the middleware layer resolved
+//! (see [`crate::infra::tenant`]), parse query parameters and delegate to
+//! [`super::executor`]
 //! for `TraceQL` search, [`super::trace_by_id`] for trace lookup, and
 //! [`super::metadata`] for tag/tag-value discovery.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, TimeZone, Utc};
 use iceberg::expr::Predicate;
-use icegate_common::{TENANT_ID_HEADER, resolve_tenant_id};
+use icegate_common::TenantId;
 use serde_json::json;
 
 use super::{
@@ -36,16 +37,6 @@ use crate::{error::QueryError, traceql::iceberg_predicate::translate_query_to_pr
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Extract tenant ID from HTTP headers.
-///
-/// Returns the header value if present and valid (non-empty, ASCII alphanumeric/hyphens/underscores/colons).
-/// Falls back to `DEFAULT_TENANT_ID` otherwise — matching the
-/// ingest-path behaviour so that data is always queryable under the same
-/// tenant that was used during ingestion.
-fn extract_tenant_id(headers: &HeaderMap) -> String {
-    resolve_tenant_id(headers.get(TENANT_ID_HEADER).and_then(|v| v.to_str().ok()))
-}
 
 /// Convert a Unix epoch second value into a UTC `DateTime`.
 ///
@@ -140,11 +131,12 @@ fn wants_protobuf(headers: &HeaderMap) -> bool {
 #[tracing::instrument(skip_all, fields(tenant_id, trace_id = %trace_id))]
 pub async fn get_trace(
     State(state): State<TempoState>,
+    Extension(tenant_id): Extension<TenantId>,
     headers: HeaderMap,
     Path(trace_id): Path<String>,
     Query(params): Query<TraceLookupParams>,
 ) -> TempoResult<Response> {
-    let Some(result) = fetch_requested_trace(state, &headers, &trace_id, &params).await? else {
+    let Some(result) = fetch_requested_trace(state, &tenant_id, &trace_id, &params).await? else {
         return Ok(build_trace_not_found_response());
     };
 
@@ -174,11 +166,12 @@ pub async fn get_trace(
 #[tracing::instrument(skip_all, fields(tenant_id, trace_id = %trace_id))]
 pub async fn get_trace_v2(
     State(state): State<TempoState>,
+    Extension(tenant_id): Extension<TenantId>,
     headers: HeaderMap,
     Path(trace_id): Path<String>,
     Query(params): Query<TraceLookupParams>,
 ) -> TempoResult<Response> {
-    let Some(result) = fetch_requested_trace(state, &headers, &trace_id, &params).await? else {
+    let Some(result) = fetch_requested_trace(state, &tenant_id, &trace_id, &params).await? else {
         return Ok(build_trace_not_found_response());
     };
 
@@ -200,12 +193,11 @@ pub async fn get_trace_v2(
 /// requesting tenant, which each caller renders as 404.
 async fn fetch_requested_trace(
     state: TempoState,
-    headers: &HeaderMap,
+    tenant_id: &TenantId,
     trace_id: &str,
     params: &TraceLookupParams,
 ) -> TempoResult<Option<FetchResult>> {
-    let tenant_id = extract_tenant_id(headers);
-    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    tracing::Span::current().record("tenant_id", tenant_id.as_ref());
 
     let now = Utc::now();
     let (default_start, default_end) = default_window(now);
@@ -214,7 +206,7 @@ async fn fetch_requested_trace(
     validation::validate_trace_id(trace_id).map_err(TempoError::new)?;
     validation::validate_query_window(start, end).map_err(TempoError::new)?;
 
-    let result = fetch(state.engine, &tenant_id, trace_id, start, end).await?;
+    let result = fetch(state.engine, tenant_id.as_ref(), trace_id, start, end).await?;
     let is_empty = result.batches.iter().all(|b| b.num_rows() == 0);
     Ok((!is_empty).then_some(result))
 }
@@ -258,12 +250,11 @@ fn set_truncated_header(resp: &mut Response, truncated: bool) {
 #[tracing::instrument(skip_all, fields(tenant_id, q = ?params.q))]
 pub async fn search_traces(
     State(state): State<TempoState>,
-    headers: HeaderMap,
+    Extension(tenant_id): Extension<TenantId>,
     Query(params): Query<SearchParams>,
 ) -> TempoResult<Response> {
-    let tenant_id = extract_tenant_id(&headers);
-    tracing::Span::current().record("tenant_id", tenant_id.as_str());
-    let resp = executor::execute(state.engine, tenant_id, &params).await?;
+    tracing::Span::current().record("tenant_id", tenant_id.as_ref());
+    let resp = executor::execute(state.engine, &tenant_id, &params).await?;
     Ok((StatusCode::OK, Json(resp)).into_response())
 }
 
@@ -288,16 +279,16 @@ pub async fn search_traces(
 )]
 pub async fn search_tags_v1(
     State(state): State<TempoState>,
-    headers: HeaderMap,
+    Extension(tenant_id): Extension<TenantId>,
     Query(params): Query<TagsQueryParams>,
 ) -> TempoResult<impl IntoResponse> {
-    let tenant_id = extract_tenant_id(&headers);
-    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    tracing::Span::current().record("tenant_id", tenant_id.as_ref());
     // Tag-list endpoints don't enumerate a specific column, so no
     // self-exclusion applies.
     let extra_predicate = parse_q_to_predicate(params.q.as_deref(), None).await?;
 
-    let tag_names = metadata::list_tags_v1(&state, &tenant_id, params.start, params.end, extra_predicate).await?;
+    let tag_names =
+        metadata::list_tags_v1(&state, tenant_id.as_ref(), params.start, params.end, extra_predicate).await?;
     tracing::Span::current().record("result_count", tag_names.len());
     Ok((StatusCode::OK, Json(TagsV1Response { tag_names })))
 }
@@ -321,11 +312,10 @@ pub async fn search_tags_v1(
 )]
 pub async fn search_tags_v2(
     State(state): State<TempoState>,
-    headers: HeaderMap,
+    Extension(tenant_id): Extension<TenantId>,
     Query(params): Query<TagsQueryParams>,
 ) -> TempoResult<impl IntoResponse> {
-    let tenant_id = extract_tenant_id(&headers);
-    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    tracing::Span::current().record("tenant_id", tenant_id.as_ref());
     let scope_filter = params.scope.as_deref().and_then(Scope::parse);
     if let Some(s) = scope_filter {
         tracing::Span::current().record("scope", s.as_str());
@@ -336,7 +326,7 @@ pub async fn search_tags_v2(
 
     let response: TagsV2Response = metadata::list_tags_v2(
         &state,
-        &tenant_id,
+        tenant_id.as_ref(),
         params.start,
         params.end,
         scope_filter,
@@ -371,12 +361,11 @@ pub async fn search_tags_v2(
 )]
 pub async fn tag_values(
     State(state): State<TempoState>,
-    headers: HeaderMap,
+    Extension(tenant_id): Extension<TenantId>,
     Path(tag_name): Path<String>,
     Query(params): Query<TagValuesQueryParams>,
 ) -> TempoResult<impl IntoResponse> {
-    let tenant_id = extract_tenant_id(&headers);
-    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    tracing::Span::current().record("tenant_id", tenant_id.as_ref());
     validation::validate_tag_name(&tag_name).map_err(TempoError::new)?;
     let limit = params.limit.unwrap_or(TagValuesQueryParams::DEFAULT_LIMIT);
     tracing::Span::current().record("limit", limit);
@@ -391,7 +380,7 @@ pub async fn tag_values(
 
     let tag_values = metadata::list_tag_values(
         &state,
-        &tenant_id,
+        tenant_id.as_ref(),
         &tag_name,
         params.start,
         params.end,
@@ -432,12 +421,11 @@ pub async fn tag_values(
 )]
 pub async fn tag_values_v2(
     State(state): State<TempoState>,
-    headers: HeaderMap,
+    Extension(tenant_id): Extension<TenantId>,
     Path(tag_name): Path<String>,
     Query(params): Query<TagValuesQueryParams>,
 ) -> TempoResult<impl IntoResponse> {
-    let tenant_id = extract_tenant_id(&headers);
-    tracing::Span::current().record("tenant_id", tenant_id.as_str());
+    tracing::Span::current().record("tenant_id", tenant_id.as_ref());
     validation::validate_tag_name(&tag_name).map_err(TempoError::new)?;
     let limit = params.limit.unwrap_or(TagValuesQueryParams::DEFAULT_LIMIT);
     tracing::Span::current().record("limit", limit);
@@ -452,7 +440,7 @@ pub async fn tag_values_v2(
 
     let tag_values = metadata::list_tag_values_v2(
         &state,
-        &tenant_id,
+        tenant_id.as_ref(),
         &tag_name,
         params.start,
         params.end,

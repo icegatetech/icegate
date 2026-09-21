@@ -56,34 +56,15 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use icegate_common::{
-        CatalogBackend, CatalogConfig, IoHandle, MemoryPressure, MemoryPressureConfig, MemoryPressureSampler,
-        UsageReader, catalog::CatalogBuilder,
-    };
+    use icegate_common::{CatalogBackend, CatalogConfig, IoHandle, MemoryPressure, catalog::CatalogBuilder};
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::engine::{QueryEngine, QueryEngineConfig};
-
-    /// Deterministic pressured handle: 95 of 100 bytes crosses the 0.90
-    /// high-watermark on the first `sample_once`.
-    fn pressured_guard() -> MemoryPressure {
-        struct FullReader;
-        impl UsageReader for FullReader {
-            fn limit_bytes(&self) -> u64 {
-                100
-            }
-            fn read_working_set_bytes(&self) -> icegate_common::error::Result<u64> {
-                Ok(95)
-            }
-        }
-        let config = MemoryPressureConfig::default();
-        let sampler = MemoryPressureSampler::with_reader(&config, Arc::new(FullReader));
-        let guard = sampler.handle();
-        sampler.sample_once().expect("sample_once");
-        guard
-    }
+    use crate::{
+        engine::{QueryEngine, QueryEngineConfig},
+        test_support::build_pressured_memory,
+    };
 
     /// Builds the router state over a fresh temp-dir warehouse, returning the
     /// directory guard alongside it. The caller MUST hold the guard for as long
@@ -126,7 +107,7 @@ mod tests {
     #[tokio::test]
     async fn pressured_guard_sheds_work_path() {
         let (state, _warehouse) = build_state().await;
-        let app = routes(state, pressured_guard());
+        let app = routes(state, build_pressured_memory());
         let response = app.oneshot(get_request("/api/v1/query")).await.expect("response");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -134,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn pressured_guard_bypasses_ready() {
         let (state, _warehouse) = build_state().await;
-        let app = routes(state, pressured_guard());
+        let app = routes(state, build_pressured_memory());
         let response = app.oneshot(get_request("/-/ready")).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }

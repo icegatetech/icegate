@@ -19,9 +19,10 @@ testing = ["test-harness", "testcontainers", "aws-config", "aws-sdk-s3"]
 # Harness helpers for draining a spawned server task. tokio-only, so a test or
 # benchmark that needs them does not also build the testcontainers/S3 stack.
 test-harness = []
-# gRPC request-shedding interceptor. Only `icegate-query`/`icegate-ingest` (which
+# The tonic adapters of this crate: the memory-pressure shedding interceptor and
+# the tenant policy interceptor. Only `icegate-query`/`icegate-ingest` (which
 # already depend on tonic) opt in; keeps `icegate-maintain`/jobmanager off tonic.
-shed-tonic = ["dep:tonic"]
+grpc = ["dep:tonic"]
 
 [dependencies]
 # Iceberg
@@ -71,7 +72,7 @@ opentelemetry-resource-detectors = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-prometheus = { workspace = true }
 prometheus = { workspace = true }
-# gRPC adapter only (feature `shed-tonic`); workspace pins 0.14.
+# gRPC adapters only (feature `grpc`); workspace pins 0.14.
 tonic = { workspace = true, optional = true }
 
 # OpenTelemetry tracing
@@ -87,7 +88,7 @@ aws-sdk-s3 = { workspace = true, optional = true }
 # Self-reference with `testing` enabled so integration tests under `tests/`
 # can reach `icegate_common::testing` (object-storage container + S3 bucket helpers).
 # Cargo unifies this with the library build for test targets only.
-icegate-common = { path = ".", features = ["testing", "shed-tonic"] }
+icegate-common = { path = ".", features = ["testing", "grpc"] }
 # Parquet-compaction manifest-scan integration test: seed data files via the
 # owned S3 catalog + Iceberg writer, then enumerate them with bounds.
 icegate-catalog-s3 = { workspace = true }

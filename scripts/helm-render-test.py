@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Render the chart the ways a default render does not cover, and read the result.
 
-The tenant policy, the OTLP bind addresses and the ingest operational listener are
-the three places where a rendering mistake fails open rather than loudly: a
-`single` policy with no id rejects every batch, a published OTLP port with nothing
-in front of it is writable by any neighbour in the namespace, and a loopback
+The tenant policy, the OTLP bind addresses and the operational listener are the
+three places where a rendering mistake fails open rather than loudly: a `single`
+policy with no id rejects every request, a published OTLP port with nothing in
+front of it is writable by any neighbour in the namespace, and a loopback
 `ingest.metrics.host` answers the container alone, so both probes fail with nothing
 to say beyond that. None of the three is visible in the default render, so each is
 rendered here on purpose.
+
+Both components carry the tenant policy and the operational listener the probes
+address, so those two checks run per component off `COMPONENTS`. The rest is
+ingest-only, because the sidecar split is: only ingest has listener hosts,
+published-port keys, extraContainers and a NOTES port-forward command.
 
 Every check states the message it expects a guard to fail with. That message is the
 contract with the operator who hits the guard, so a guard that starts refusing for
@@ -24,8 +29,9 @@ from chartlib import (  # noqa: E402  (path set above so this file runs from the
     capture_render_error,
     fail,
     ok,
+    read_component_config,
+    read_container_port,
     read_container_port_names,
-    read_ingest_config,
     read_service_port,
     render_chart,
     render_notes,
@@ -33,6 +39,9 @@ from chartlib import (  # noqa: E402  (path set above so this file runs from the
 )
 
 EXAMPLE_VALUES = "config/helm/auth-proxy/values-authproxy.yaml"
+
+# The components carrying a tenant policy and an operational listener of their own.
+COMPONENTS = ("ingest", "query")
 
 # A sidecar declaring the two published OTLP port names, which is what a loopback
 # receiver bind requires of ingest.extraContainers. Stated once because several
@@ -84,56 +93,113 @@ def check_render_refuses(description: str, expected: str, *args: str) -> None:
         ok(f"{description} is refused, naming {expected!r}")
 
 
-def check_tenant_policy() -> None:
-    """The tagged union the pod loads, and the three ways of asking for a broken one."""
+def check_tenant_policy(component: str) -> None:
+    """The tagged union the pod loads, and the four ways of asking for a broken one."""
     check_render_refuses(
-        "tenant.mode=single without tenant.id",
-        "ingest.tenant.id is required",
+        f"{component}.tenant.mode=single without tenant.id",
+        f"{component}.tenant.id is required",
         "--set",
-        "ingest.tenant.mode=single",
+        f"{component}.tenant.mode=single",
         "--set",
-        "ingest.tenant.id=",
+        f"{component}.tenant.id=",
     )
     # An unknown mode is caught by the values schema, which names the path it
     # rejected rather than the chart's own message.
-    check_render_refuses("an unknown tenant.mode", "/ingest/tenant/mode", "--set", "ingest.tenant.mode=bogus")
     check_render_refuses(
-        "an absent tenant.mode",
-        "ingest.tenant.mode must be single or multi",
+        f"an unknown {component}.tenant.mode",
+        f"/{component}/tenant/mode",
         "--set",
-        "ingest.tenant.mode=null",
+        f"{component}.tenant.mode=bogus",
+    )
+    # A misspelt key would otherwise render silently and leave the component on
+    # the chart's default policy. The quoted path is the object itself, not a key
+    # under it, so the refusal is for the unknown key and not for `mode`.
+    check_render_refuses(
+        f"an unknown key under {component}.tenant",
+        f"'/{component}/tenant': additional properties 'Mode' not allowed",
+        "--set",
+        f"{component}.tenant.Mode=multi",
+    )
+    check_render_refuses(
+        f"an absent {component}.tenant.mode",
+        f"{component}.tenant.mode must be single or multi",
+        "--set",
+        f"{component}.tenant.mode=null",
     )
 
-    if "tenant: !multi" not in render_chart("--set", "ingest.tenant.mode=multi"):
-        fail("tenant.mode=multi must render the !multi tag")
+    template = f"templates/configmap-{component}.yaml"
+    if "tenant: !multi" not in render_chart("--set", f"{component}.tenant.mode=multi", show_only=template):
+        fail(f"{component}.tenant.mode=multi must render the !multi tag")
     else:
-        ok("tenant.mode=multi renders the !multi tag")
+        ok(f"{component}.tenant.mode=multi renders the !multi tag")
 
-    rendered = render_chart(show_only="templates/configmap-ingest.yaml")
+    rendered = render_chart(show_only=template)
     if "tenant: !single" not in rendered:
-        fail("the default render must carry the !single tag")
+        fail(f"the default {component} render must carry the !single tag")
     elif 'id: "default"' not in rendered:
-        fail("the default render must name the chart's tenant id")
+        fail(f"the default {component} render must name the chart's tenant id")
     else:
-        ok("the default render carries !single and the chart's tenant id")
+        ok(f"the default {component} render carries !single and the chart's tenant id")
 
-    named = render_chart("--set", "ingest.tenant.id=acme", show_only="templates/configmap-ingest.yaml")
+    named = render_chart("--set", f"{component}.tenant.id=acme", show_only=template)
     if 'id: "acme"' not in named:
-        fail("ingest.tenant.id must reach the rendered tenant section")
+        fail(f"{component}.tenant.id must reach the rendered tenant section")
     else:
-        ok("ingest.tenant.id reaches the rendered tenant section")
+        ok(f"{component}.tenant.id reaches the rendered tenant section")
 
 
-def check_operational_listener() -> None:
-    """The listener the probes address, and the binds that would leave them blind."""
-    rendered = render_chart("--set", "ingest.metrics.enabled=false", show_only="templates/deployment-ingest.yaml")
+def check_probe_target(component: str) -> None:
+    """The port the probes address, its number, and that disabling metrics does not take it away.
+
+    The operational listener carries `/health` whatever `metrics.enabled` says, so
+    the port has to stay declared: a probe naming a port no container declares is
+    a restart loop on a pod that serves correctly.
+    """
+    rendered = render_chart(
+        "--set", f"{component}.metrics.enabled=false", show_only=f"templates/deployment-{component}.yaml"
+    )
     if "metrics" not in read_container_port_names(rendered):
-        fail("the metrics port must be declared even with ingest.metrics.enabled=false: the probes address it by name")
+        fail(
+            f"the {component} metrics port must be declared even with "
+            f"{component}.metrics.enabled=false: the probes address it by name"
+        )
     elif rendered.count("port: metrics") != 2:
-        fail("both probes must still address the metrics port by name")
+        fail(f"both {component} probes must still address the metrics port by name")
+    elif rendered.count("path: /health") != 2:
+        fail(f"both {component} probes must address /health on the operational listener")
     else:
-        ok("ingest.metrics.enabled=false keeps the port declared and both probes addressing it")
+        ok(f"{component}.metrics.enabled=false keeps the port declared and both probes on /health")
 
+    # The probes address the port by name, so they reach the operational listener
+    # only while the number declared under that name is the one the component
+    # binds. A non-default number, because a literal in either template renders the
+    # default exactly like the value does.
+    port = 19091
+    port_args = ("--set", f"{component}.metrics.port={port}")
+    declared = read_container_port(
+        render_chart(*port_args, show_only=f"templates/deployment-{component}.yaml"), "metrics"
+    )
+    bound = (
+        read_component_config(
+            render_chart(*port_args, show_only=f"templates/configmap-{component}.yaml"), f"{component}.yaml"
+        )
+        .get("metrics", {})
+        .get("port")
+    )
+    if declared != port:
+        fail(f"{component}.metrics.port must reach the metrics containerPort: expected {port}, got {declared}")
+    elif bound != port:
+        fail(f"{component}.metrics.port must reach metrics.port of {component}.yaml: expected {port}, got {bound}")
+    else:
+        ok(f"{component}.metrics.port reaches both the metrics containerPort and {component}.yaml")
+
+
+def check_operational_host() -> None:
+    """The ingest binds that would leave the probes blind.
+
+    Ingest-only: `query.metrics.host` is not a value, so the query operational
+    listener cannot be moved anywhere and has no guard to exercise.
+    """
     # Every spelling the guard names, the bracketed IPv6 loopback included: that is
     # the form run_operational_server parses out of `{host}:{port}`, so a guard
     # blind to it would refuse the roundabout spellings alone.
@@ -198,7 +264,7 @@ def check_otlp_port_names() -> None:
             ok(f"a loopback bind leaves {port_name} to the sidecar alone")
 
     # And the config the pod loads carries that host, so the two cannot disagree.
-    config = read_ingest_config(render_chart(*loopback_args, show_only="templates/configmap-ingest.yaml"))
+    config = read_component_config(render_chart(*loopback_args, show_only="templates/configmap-ingest.yaml"), "ingest.yaml")
     for values_key, _, section, _ in SIGNALS:
         if config.get(section, {}).get("host") != "127.0.0.1":
             fail(f"ingest.{values_key}.host must reach the rendered {section} section")
@@ -251,7 +317,7 @@ def check_service_ports() -> None:
     # the render, so this case does not become a second copy of the ports
     # values.yaml ships.
     service = render_chart(show_only="templates/service-ingest.yaml")
-    config = read_ingest_config(render_chart(show_only="templates/configmap-ingest.yaml"))
+    config = read_component_config(render_chart(show_only="templates/configmap-ingest.yaml"), "ingest.yaml")
     for values_key, port_name, section, _ in SIGNALS:
         published = read_service_port(service, port_name)
         bound = config.get(section, {}).get("port")
@@ -269,7 +335,7 @@ def check_service_ports() -> None:
     # the sidecar proxies to it — the whole point of the pair being two keys.
     split_args = split_port_args()
     service = render_chart(*split_args, show_only="templates/service-ingest.yaml")
-    config = read_ingest_config(render_chart(*split_args, show_only="templates/configmap-ingest.yaml"))
+    config = read_component_config(render_chart(*split_args, show_only="templates/configmap-ingest.yaml"), "ingest.yaml")
     for values_key, port_name, section, _ in SIGNALS:
         want_published, want_bound = SPLIT_PORTS[values_key]
         published = read_service_port(service, port_name)
@@ -330,8 +396,11 @@ def check_pod_extensions() -> None:
     ok("ingest.extraContainers and ingest.extraVolumes reach the pod as written")
 
 
-check_tenant_policy()
-check_operational_listener()
+for component_name in COMPONENTS:
+    check_tenant_policy(component_name)
+    check_probe_target(component_name)
+
+check_operational_host()
 check_otlp_port_names()
 check_otlp_host_guards()
 check_service_ports()

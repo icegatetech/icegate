@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use datafusion::arrow::array::RecordBatch;
+use icegate_common::TenantId;
 
 use super::{
     error::{TempoError, TempoResult},
@@ -45,7 +46,7 @@ use crate::{
 /// - 500 for engine / `DataFusion` failures.
 pub async fn execute(
     engine: Arc<QueryEngine>,
-    tenant_id: String,
+    tenant_id: &TenantId,
     params: &SearchParams,
 ) -> TempoResult<SearchResponse> {
     // ----- time window -----
@@ -87,7 +88,7 @@ pub async fn execute(
     let limit = validation::clamp_search_limit(params.limit);
 
     let qctx = QueryContext {
-        tenant_id,
+        tenant_id: tenant_id.clone(),
         start,
         end,
         limit,
