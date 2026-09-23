@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use super::claude_code::ClaudeCode;
 use super::openinference::OpenInference;
 use super::otel::OtelGenAi;
-use super::projection::{AttributeView, EvaluationField, OperationField};
+use super::projection::{AttributeView, EvaluationField, EvaluationScope, OperationField};
 use super::traceloop::Traceloop;
 use crate::error::{IngestError, Result};
 
@@ -106,23 +106,42 @@ pub(crate) trait OperationConvention: Send + Sync {
     }
 
     /// Span *event* names that each carry one evaluation result in their
-    /// attributes (OTEL `GenAI`: `gen_ai.evaluation.result`). Every matching event
-    /// becomes one element of the `evaluations` column, read through
-    /// [`Self::evaluation_field_keys`], and a span carrying such an event
-    /// qualifies as an operation even without a marker attribute — a dedicated
-    /// evaluator span has nothing else to qualify it. Default: this convention
-    /// sources no evaluations from events.
+    /// attributes. Every matching event becomes one element of the
+    /// `evaluations` column, read through [`Self::evaluation_field_keys`], and
+    /// a span carrying such an event qualifies as an operation even without a
+    /// marker attribute — a dedicated evaluator span has nothing else to
+    /// qualify it. Default: this convention sources no evaluations from events.
     fn evaluation_event_names(&self) -> &'static [&'static str] {
         &[]
     }
 
-    /// Ordered candidate attribute keys this convention offers for one `field`
-    /// of an evaluation result. Read against the span's own attributes (a flat
-    /// result, present iff the [`EvaluationField::Name`] key is) and against
-    /// each event named in [`Self::evaluation_event_names`]. The
-    /// [`EvaluationField::Name`] keys double as marker keys for this
-    /// convention, so a flat result and qualification agree on one key. Empty
-    /// slice when this convention does not source the field.
+    /// Indexed attribute arrays this convention flattens evaluation results
+    /// into (`<prefix>.<index>.<element>.<field>`), each with the scope its
+    /// results are about. Every element becomes one result, its fields read
+    /// through [`Self::evaluation_field_keys`] by their `<field>` suffix.
+    /// Default: this convention sources no evaluations from attribute arrays.
+    fn evaluation_arrays(&self) -> &'static [EvaluationArraySource] {
+        &[]
+    }
+
+    /// Whether this convention also reads one flat result off the span's own
+    /// attributes, through the same [`Self::evaluation_field_keys`] it reads an
+    /// event with. Only the metric and its outcome are taken from there: the
+    /// span's `error.type` and response id describe its own operation.
+    /// Default: no.
+    fn states_flat_evaluation(&self) -> bool {
+        false
+    }
+
+    /// Ordered candidate keys this convention offers for one `field` of an
+    /// evaluation result, within one result's own attribute set: an event named
+    /// in [`Self::evaluation_event_names`], an element of one of
+    /// [`Self::evaluation_arrays`] (keys are then `<field>` suffixes), or the
+    /// span's own attributes when [`Self::states_flat_evaluation`] — a flat
+    /// result present iff the [`EvaluationField::Name`] key is. A result's name
+    /// is evaluation evidence that qualifies the span by itself, so it is not
+    /// repeated in [`Self::marker_keys`], which name only operation evidence.
+    /// Empty slice when this convention does not source the field.
     fn evaluation_field_keys(&self, _field: EvaluationField) -> &'static [&'static str] {
         &[]
     }
@@ -134,15 +153,76 @@ pub(crate) trait OperationConvention: Send + Sync {
     fn classify_operation(&self, span_name: &str, attrs: &AttributeView) -> Option<String>;
 }
 
+/// One indexed attribute array of evaluation results a convention declares:
+/// its elements are keyed `<prefix>.<index>.<element>.<field>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EvaluationArraySource {
+    /// Key prefix naming the array, without the trailing dot.
+    pub(crate) prefix: &'static str,
+    /// Segment naming one element, between the index and the field.
+    pub(crate) element: &'static str,
+    /// What every result in the array is about.
+    pub(crate) scope: EvaluationScope,
+}
+
+impl EvaluationArraySource {
+    /// Declare the array keyed `<prefix>.<index>.<element>.<field>` whose
+    /// results are about `scope`.
+    pub(crate) const fn new(prefix: &'static str, element: &'static str, scope: EvaluationScope) -> Self {
+        Self { prefix, element, scope }
+    }
+}
+
 /// Precedence-ordered convention registry: earlier wins on shared keys. This
 /// slice is the whole extension surface — append an adapter to add an SDK.
 pub(crate) static CONVENTIONS: &[&dyn OperationConvention] = &[&OtelGenAi, &OpenInference, &Traceloop, &ClaudeCode];
 
 /// Canonical `operation_name` of an evaluation: the value every convention maps
 /// its evaluator spans to (`OpenInference` `EVALUATOR`, and a span that carries
-/// only `gen_ai.evaluation.*` results). One name for one concept, so a consumer
-/// filters evaluations with a single predicate.
+/// only evaluation results). One name for one concept, so a consumer filters
+/// evaluations with a single predicate.
 pub(crate) const EVALUATION_OPERATION_NAME: &str = "evaluation";
+
+/// One registered evaluation array, with the key that shows it is present.
+pub(crate) struct RegisteredEvaluationArray {
+    /// Convention that declares the array and whose keys read its elements.
+    pub(crate) convention: &'static dyn OperationConvention,
+    /// The array itself.
+    pub(crate) source: &'static EvaluationArraySource,
+    /// Name key of the array's first element. Indices start at zero and every
+    /// element is named, so an array in the declared shape always carries this
+    /// key, and one lookup tells whether a span carries the array without
+    /// scanning its keys. An array without a named first element is not read.
+    pub(crate) first_name_key: String,
+}
+
+/// Cached list of every registered evaluation array.
+static EVALUATION_ARRAYS: OnceLock<Vec<RegisteredEvaluationArray>> = OnceLock::new();
+
+/// Returns every convention's [`OperationConvention::evaluation_arrays`] in
+/// registry order, each with its first element's name key, computed once. An
+/// array whose convention names no [`EvaluationField::Name`] key is left out:
+/// its results could never be complete.
+pub(crate) fn registered_evaluation_arrays() -> &'static [RegisteredEvaluationArray] {
+    EVALUATION_ARRAYS
+        .get_or_init(|| {
+            let mut arrays = Vec::new();
+            for &convention in CONVENTIONS {
+                let Some(name_key) = convention.evaluation_field_keys(EvaluationField::Name).first() else {
+                    continue;
+                };
+                for source in convention.evaluation_arrays() {
+                    arrays.push(RegisteredEvaluationArray {
+                        convention,
+                        source,
+                        first_name_key: format!("{}.0.{}.{name_key}", source.prefix, source.element),
+                    });
+                }
+            }
+            arrays
+        })
+        .as_slice()
+}
 
 /// Cached union of every registered convention's evaluation event names.
 static EVALUATION_EVENT_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -384,7 +464,6 @@ mod tests {
         assert_eq!(
             markers,
             vec![
-                "gen_ai.evaluation.name",
                 "gen_ai.operation.name",
                 "gen_ai.provider.name",
                 "gen_ai.system",
@@ -401,6 +480,38 @@ mod tests {
         // Only the OTEL GenAI convention defines an evaluation event today; the
         // filter must widen automatically when another adapter declares one.
         assert_eq!(evaluation_event_filter(), &["gen_ai.evaluation.result"]);
+    }
+
+    #[test]
+    fn registered_evaluation_arrays_are_found_by_their_first_named_element() {
+        let keys: Vec<(&str, EvaluationScope)> = registered_evaluation_arrays()
+            .iter()
+            .map(|array| (array.first_name_key.as_str(), array.source.scope))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("evaluations.0.evaluation.name", EvaluationScope::Span),
+                ("annotations.0.annotation.name", EvaluationScope::Span),
+                ("trace.evaluations.0.evaluation.name", EvaluationScope::Trace),
+                ("trace.annotations.0.annotation.name", EvaluationScope::Trace),
+                ("session.evaluations.0.evaluation.name", EvaluationScope::Session),
+                ("session.annotations.0.annotation.name", EvaluationScope::Session),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_convention_that_sources_evaluations_names_them() {
+        // A result without a name is never stored, so a convention offering
+        // evaluation events or arrays without a name key would source nothing.
+        for convention in CONVENTIONS {
+            let sources_evaluations =
+                !convention.evaluation_event_names().is_empty() || !convention.evaluation_arrays().is_empty();
+            if sources_evaluations {
+                assert!(!convention.evaluation_field_keys(EvaluationField::Name).is_empty());
+            }
+        }
     }
 
     #[test]

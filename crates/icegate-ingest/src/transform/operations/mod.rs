@@ -23,14 +23,14 @@ use arrow::datatypes::{Fields, Schema};
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::TenantId;
 use icegate_common::schema::{
-    COL_ERROR_TYPE, COL_EVALUATIONS, COL_EXPLANATION, COL_NAME, COL_RESPONSE_ID, COL_SCORE_LABEL, COL_SCORE_VALUE,
+    COL_ANNOTATOR_KIND, COL_ERROR_TYPE, COL_EVALUATION_METADATA, COL_EVALUATIONS, COL_EXPLANATION, COL_IDENTIFIER,
+    COL_NAME, COL_RESPONSE_ID, COL_SCORE_LABEL, COL_SCORE_VALUE, COL_TARGET_SCOPE, COL_TARGET_SPAN_ID,
+    COL_TARGET_TRACE_ID,
 };
 
 use self::projection::{EvaluationResult, OperationRow, project_operation_row};
-use super::attributes::{
-    SERVICE_NAME_KEY, extract_string_value, field_builder_missing, list_element_field, list_struct_fields,
-    nested_field_index, nested_struct_builders, now_micros,
-};
+use super::attributes::{SERVICE_NAME_KEY, extract_string_value, list_element_field, list_struct_fields, now_micros};
+use super::nested_builders::{field_builder_missing, nested_field_index, nested_struct_builders};
 
 /// Process-wide cache of the derived operations Arrow schema.
 static OPERATIONS_ARROW_SCHEMA: OnceLock<std::result::Result<Arc<Schema>, String>> = OnceLock::new();
@@ -122,6 +122,7 @@ pub fn operations_to_record_batch(
     let mut rows: Vec<OperationRow> = Vec::with_capacity(total_spans);
     let mut drops: usize = 0;
     let mut non_llm_skipped: usize = 0;
+    let mut skipped_evaluations: usize = 0;
 
     let empty_attrs: Vec<opentelemetry_proto::tonic::common::v1::KeyValue> = Vec::new();
     // TODO(low): this is a second full walk of every span, independent of the
@@ -140,7 +141,10 @@ pub fn operations_to_record_batch(
             let scope = scope_spans.scope.as_ref();
             for span in &scope_spans.spans {
                 match project_operation_row(span, scope, tenant_id, service_name.as_deref(), ingested_at) {
-                    Ok(Some(row)) => rows.push(row),
+                    Ok(Some(projected)) => {
+                        skipped_evaluations += projected.skipped_evaluations;
+                        rows.push(projected.row);
+                    }
                     Ok(None) => non_llm_skipped += 1,
                     Err(error) => {
                         tracing::debug!(%error, "Dropping operations row (strict projection failure)");
@@ -156,6 +160,13 @@ pub fn operations_to_record_batch(
             non_llm_skipped,
             llm_rows = rows.len(),
             "Skipped non-LLM spans during operations projection"
+        );
+    }
+    if skipped_evaluations > 0 {
+        tracing::debug!(
+            skipped_evaluations,
+            llm_rows = rows.len(),
+            "Skipped incomplete evaluation results during operations projection"
         );
     }
 
@@ -406,6 +417,12 @@ struct EvaluationSlots {
     explanation: usize,
     response_id: usize,
     error_type: usize,
+    annotator_kind: usize,
+    identifier: usize,
+    metadata: usize,
+    target_scope: usize,
+    target_trace_id: usize,
+    target_span_id: usize,
 }
 
 impl EvaluationSlots {
@@ -416,13 +433,20 @@ impl EvaluationSlots {
     /// Returns `IngestError::Validation` when the schema's element struct lacks
     /// one of the fields — a schema drift, reported rather than panicked on.
     fn from_fields(fields: &Fields) -> crate::error::Result<Self> {
+        let slot = |field: &str| nested_field_index(fields, COL_EVALUATIONS, field);
         Ok(Self {
-            name: nested_field_index(fields, COL_EVALUATIONS, COL_NAME)?,
-            score_value: nested_field_index(fields, COL_EVALUATIONS, COL_SCORE_VALUE)?,
-            score_label: nested_field_index(fields, COL_EVALUATIONS, COL_SCORE_LABEL)?,
-            explanation: nested_field_index(fields, COL_EVALUATIONS, COL_EXPLANATION)?,
-            response_id: nested_field_index(fields, COL_EVALUATIONS, COL_RESPONSE_ID)?,
-            error_type: nested_field_index(fields, COL_EVALUATIONS, COL_ERROR_TYPE)?,
+            name: slot(COL_NAME)?,
+            score_value: slot(COL_SCORE_VALUE)?,
+            score_label: slot(COL_SCORE_LABEL)?,
+            explanation: slot(COL_EXPLANATION)?,
+            response_id: slot(COL_RESPONSE_ID)?,
+            error_type: slot(COL_ERROR_TYPE)?,
+            annotator_kind: slot(COL_ANNOTATOR_KIND)?,
+            identifier: slot(COL_IDENTIFIER)?,
+            metadata: slot(COL_EVALUATION_METADATA)?,
+            target_scope: slot(COL_TARGET_SCOPE)?,
+            target_trace_id: slot(COL_TARGET_TRACE_ID)?,
+            target_span_id: slot(COL_TARGET_SPAN_ID)?,
         })
     }
 }
@@ -452,25 +476,69 @@ fn append_evaluations(
                 .append_option(text);
             Ok(())
         };
-        append_str(slots.name, COL_NAME, result.name.as_deref())?;
+        append_str(slots.name, COL_NAME, Some(&result.name))?;
         append_str(slots.score_label, COL_SCORE_LABEL, result.score_label.as_deref())?;
         append_str(slots.explanation, COL_EXPLANATION, result.explanation.as_deref())?;
         append_str(slots.response_id, COL_RESPONSE_ID, result.response_id.as_deref())?;
         append_str(slots.error_type, COL_ERROR_TYPE, result.error_type.as_deref())?;
+        append_str(
+            slots.annotator_kind,
+            COL_ANNOTATOR_KIND,
+            result.annotator_kind.as_deref(),
+        )?;
+        append_str(slots.identifier, COL_IDENTIFIER, result.identifier.as_deref())?;
+        append_str(slots.metadata, COL_EVALUATION_METADATA, result.metadata.as_deref())?;
+        append_str(slots.target_scope, COL_TARGET_SCOPE, Some(result.target_scope.as_str()))?;
         struct_builder
             .field_builder::<Float64Builder>(slots.score_value)
             .ok_or_else(|| field_builder_missing(COL_EVALUATIONS, COL_SCORE_VALUE))?
             .append_option(result.score_value);
+        append_fixed_id(
+            struct_builder,
+            slots.target_trace_id,
+            COL_TARGET_TRACE_ID,
+            result.target_trace_id.as_ref().map(<[u8; 16]>::as_slice),
+        )?;
+        append_fixed_id(
+            struct_builder,
+            slots.target_span_id,
+            COL_TARGET_SPAN_ID,
+            result.target_span_id.as_ref().map(<[u8; 8]>::as_slice),
+        )?;
         struct_builder.append(true);
     }
     builder.append(true);
     Ok(())
 }
 
+/// Append one optional fixed-width id to the `evaluations` struct slot `slot`.
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` when the slot is missing or not a
+/// fixed-size binary builder, and the Arrow error when `id` does not match
+/// the slot's width.
+fn append_fixed_id(
+    struct_builder: &mut StructBuilder,
+    slot: usize,
+    field: &str,
+    id: Option<&[u8]>,
+) -> crate::error::Result<()> {
+    let id_builder = struct_builder
+        .field_builder::<FixedSizeBinaryBuilder>(slot)
+        .ok_or_else(|| field_builder_missing(COL_EVALUATIONS, field))?;
+    match id {
+        Some(bytes) => id_builder.append_value(bytes)?,
+        None => id_builder.append_null(),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        Array, BooleanArray, Float64Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+        Array, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array, ListArray, RecordBatch, StringArray,
+        StructArray,
     };
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, any_value::Value};
@@ -573,13 +641,22 @@ mod tests {
         }
     }
 
-    /// Two LLM spans: one evaluated twice, one not evaluated at all.
+    /// Two LLM spans: one evaluated four times — twice through `OpenInference`
+    /// attribute arrays (span and trace scope), twice through OTEL `GenAI`
+    /// events — and one not evaluated at all.
     fn evaluated_and_plain_request() -> ExportTraceServiceRequest {
         let evaluated = span_with_events(
             1,
             vec![
                 kv_str("gen_ai.operation.name", "chat"),
                 kv_str("gen_ai.response.id", "resp-1"),
+                kv_str("evaluations.0.evaluation.name", "hallucination"),
+                kv_int("evaluations.0.evaluation.score", 1),
+                kv_str("evaluations.0.evaluation.annotator_kind", "LLM"),
+                kv_str("evaluations.0.evaluation.identifier", "judge-v2"),
+                kv_str("evaluations.0.evaluation.metadata", "{\"rubric_version\":\"2\"}"),
+                kv_str("trace.evaluations.0.evaluation.name", "retrieval_quality"),
+                kv_dbl("trace.evaluations.0.evaluation.score", 0.5),
             ],
             vec![
                 evaluation_event(vec![
@@ -592,6 +669,7 @@ mod tests {
                     kv_int("gen_ai.evaluation.score.value", 4),
                     kv_str("gen_ai.evaluation.explanation", "reads naturally"),
                     kv_str("gen_ai.response.id", "resp-1"),
+                    kv_str("error.type", "timeout"),
                 ]),
             ],
         );
@@ -599,8 +677,9 @@ mod tests {
         request_with(vec![evaluated, plain])
     }
 
-    /// Assert the `evaluations` column of `batch` holds the two results of the
-    /// evaluated span in row 0 and a NULL list in row 1, addressed by name.
+    /// Assert the `evaluations` column of `batch` holds the four results of the
+    /// evaluated span in row 0 and a NULL list in row 1, every field addressed
+    /// by name.
     fn assert_evaluations_column(batch: &RecordBatch) {
         let evaluations = batch
             .column_by_name("evaluations")
@@ -610,7 +689,7 @@ mod tests {
             .expect("evaluations is List");
         let first = evaluations.value(0);
         let results = first.as_any().downcast_ref::<StructArray>().expect("elements are Struct");
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 4);
         let strings = |field: &str| -> Vec<Option<String>> {
             results
                 .column_by_name(field)
@@ -622,21 +701,60 @@ mod tests {
                 .map(|value| value.map(str::to_string))
                 .collect()
         };
+        let text = |value: &str| Some(value.to_string());
         assert_eq!(
             strings("name"),
-            vec![Some("Relevance".to_string()), Some("Fluency".to_string())]
+            vec![
+                text("hallucination"),
+                text("retrieval_quality"),
+                text("Relevance"),
+                text("Fluency")
+            ]
         );
-        assert_eq!(strings("score_label"), vec![Some("relevant".to_string()), None]);
-        assert_eq!(strings("explanation"), vec![None, Some("reads naturally".to_string())]);
-        assert_eq!(strings("response_id"), vec![None, Some("resp-1".to_string())]);
-        assert_eq!(strings("error_type"), vec![None, None]);
+        assert_eq!(strings("score_label"), vec![None, None, text("relevant"), None]);
+        assert_eq!(strings("explanation"), vec![None, None, None, text("reads naturally")]);
+        assert_eq!(strings("response_id"), vec![None, None, None, text("resp-1")]);
+        assert_eq!(strings("error_type"), vec![None, None, None, text("timeout")]);
+        assert_eq!(strings("annotator_kind"), vec![text("LLM"), None, None, None]);
+        assert_eq!(strings("identifier"), vec![text("judge-v2"), None, None, None]);
+        assert_eq!(
+            strings("metadata"),
+            vec![text("{\"rubric_version\":\"2\"}"), None, None, None]
+        );
+        assert_eq!(
+            strings("target_scope"),
+            vec![text("span"), text("trace"), text("span"), text("span")]
+        );
         let scores = results
             .column_by_name("score_value")
             .expect("score_value present")
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("score_value is Float64");
-        assert_eq!(scores.iter().collect::<Vec<_>>(), vec![Some(0.9), Some(4.0)]);
+        assert_eq!(
+            scores.iter().collect::<Vec<_>>(),
+            vec![Some(1.0), Some(0.5), Some(0.9), Some(4.0)]
+        );
+        let ids = |field: &str| -> Vec<Option<Vec<u8>>> {
+            results
+                .column_by_name(field)
+                .unwrap_or_else(|| panic!("element field {field} present"))
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap_or_else(|| panic!("element field {field} is FixedSizeBinary"))
+                .iter()
+                .map(|value| value.map(<[u8]>::to_vec))
+                .collect()
+        };
+        // Every result is recorded on the span it evaluates; the trace-scoped
+        // one names the trace alone.
+        let own_trace = Some(vec![7u8; 16]);
+        let own_span = Some(vec![1u8; 8]);
+        assert_eq!(ids("target_trace_id"), vec![own_trace; 4]);
+        assert_eq!(
+            ids("target_span_id"),
+            vec![own_span.clone(), None, own_span.clone(), own_span]
+        );
         assert!(
             evaluations.is_null(1),
             "a span without evaluations is a NULL list, not an empty one"
@@ -703,8 +821,8 @@ mod tests {
         collect_field_ids(evaluations, &mut ids);
         let names: Vec<&str> = ids.iter().map(|(name, _)| name.as_str()).collect();
         let numbers: Vec<i32> = ids.iter().map(|(_, id)| *id).collect();
-        // list 65, element struct 66, then the six fields in declaration order.
-        assert_eq!(numbers, vec![65, 66, 67, 68, 69, 70, 71, 72]);
+        // list, element struct, then the element's fields in declaration order.
+        assert_eq!(numbers, (65..=78).collect::<Vec<i32>>());
         assert_eq!(
             &names[2..],
             &[
@@ -713,7 +831,13 @@ mod tests {
                 "score_label",
                 "explanation",
                 "response_id",
-                "error_type"
+                "error_type",
+                "annotator_kind",
+                "identifier",
+                "metadata",
+                "target_scope",
+                "target_trace_id",
+                "target_span_id"
             ]
         );
     }

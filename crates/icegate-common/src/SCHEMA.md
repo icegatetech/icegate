@@ -386,13 +386,44 @@ Spans whose typed attributes fail strict parsing (non-numeric `temperature`, non
 underlying span still lands in `spans`. The `operations` write is best-effort and never
 fails the traces OTLP response.
 
-A span also qualifies when it carries a `gen_ai.evaluation.name` attribute or a
-`gen_ai.evaluation.result` span event. Evaluation results are stored in the `evaluations`
-column: the span's own flat `gen_ai.evaluation.*` result first, then one element per
-`gen_ai.evaluation.result` event in event order; NULL when the span carries none. A dedicated
-evaluator span is its own row (`operation_name = 'evaluation'`) and joins to the evaluated row
-through `parent_span_id -> span_id` or `evaluations[i].response_id -> response_id`. Results
-produced later, outside the trace, are not merged at ingest.
+#### Evaluation results
+
+A span also qualifies when it carries an evaluation result, and each complete result becomes
+one element of the `evaluations` column (NULL when the span carries none). Results are read, in
+this order, from:
+
+1. the span's own `gen_ai.evaluation.*` attributes, as one flat result — its metric and
+   outcome only; the span's `error.type` and `gen_ai.response.id` stay in the row's columns;
+2. OpenInference attribute arrays — `evaluations.<i>.evaluation.*`, `annotations.<i>.annotation.*`,
+   and their `trace.`- and `session.`-prefixed forms — one result per element, by index. An
+   array is recognized by its first element's name (`<array>.0.<element>.name`);
+3. `gen_ai.evaluation.result` span events, one result per event, in event order.
+
+A result is stored only when it names its metric and carries an outcome: a score, a label, an
+explanation, or the error type of a failed evaluation. Anything else is skipped and counted; it
+never fails the row. A present score that is not numeric fails strict parsing like any typed
+attribute and drops the row. `metadata` is kept only when it holds a JSON object.
+
+Every element states what it is about in `target_scope` (`span`, `trace`, or `session`) and
+`target_trace_id` / `target_span_id`:
+
+- Results recorded on any operation other than an evaluation are about that span: a `span`
+  result targets the span itself, a `trace` result its trace.
+- An evaluation span (`operation_name = 'evaluation'`) records results about something else.
+  With exactly one span link (none dropped), they target the linked span, or its trace for a
+  `trace` result. Otherwise the evaluated span is unknown: a `span` result's targets are NULL,
+  and a `trace` result keeps the trace it was recorded in. A single link with unusable ids
+  leaves every target NULL.
+- A `session` result is about the session in the row's `conversation_id`; its target ids are
+  NULL.
+
+To find the results about a row, match `(target_trace_id, target_span_id)` to its
+`(trace_id, span_id)` — including results on its own row. `parent_span_id` is never a target.
+When a target is unknown, the result's `response_id` is the only correlation it carries.
+
+Evaluation results sent as OTLP log records go through the logs pipeline and are not projected
+into `operations`, and a result that arrives after the evaluated span was ingested is not merged
+into that span's row.
 
 ```sql
 -- Create the operations table
@@ -490,16 +521,22 @@ CREATE TABLE iceberg.triplecloud.operations (
     finish_reasons ARRAY(VARCHAR),
     encoding_formats ARRAY(VARCHAR),       -- float | base64
 
-    -- Evaluation results (OTel GenAI gen_ai.evaluation.result), one element per
-    -- result on the span; NULL when none. Appended after the List<String> block
-    -- (ids 65-72) so every pre-existing field id stays put.
+    -- Evaluation results, one element per complete result on the span; NULL when
+    -- none. Appended after the List<String> block so every earlier field id
+    -- stays put. See "Evaluation results" above for sources and targets.
     evaluations ARRAY(ROW(
-        name VARCHAR,                      -- gen_ai.evaluation.name
-        score_value DOUBLE,                -- gen_ai.evaluation.score.value
-        score_label VARCHAR,               -- gen_ai.evaluation.score.label
-        explanation VARCHAR,               -- gen_ai.evaluation.explanation
-        response_id VARCHAR,               -- gen_ai.response.id carried by the result
-        error_type VARCHAR                 -- error.type when the evaluation itself failed
+        name VARCHAR NOT NULL,             -- metric: gen_ai.evaluation.name | OpenInference name
+        score_value DOUBLE,                -- gen_ai.evaluation.score.value | score
+        score_label VARCHAR,               -- gen_ai.evaluation.score.label | label
+        explanation VARCHAR,               -- gen_ai.evaluation.explanation | explanation
+        response_id VARCHAR,               -- gen_ai.response.id stated by the result
+        error_type VARCHAR,                -- error.type when the evaluation itself failed
+        annotator_kind VARCHAR,            -- OpenInference annotator_kind: HUMAN | LLM | CODE | custom
+        identifier VARCHAR,                -- OpenInference identifier
+        metadata VARCHAR,                  -- OpenInference metadata, a JSON object as text
+        target_scope VARCHAR NOT NULL,     -- span | trace | session
+        target_trace_id VARBINARY,         -- 16 bytes; NULL when unknown or session scope
+        target_span_id VARBINARY           -- 8 bytes; span scope only, NULL when unknown
     ))
 )
 WITH (
@@ -660,17 +697,19 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 ---
 
 **Version:** 1.7
-**Last Updated:** 2026-09-22
+**Last Updated:** 2026-09-23
 **Schema Source:** `crates/icegate-common/src/schema.rs`
 
 **Notable Changes in v1.7:**
-- `operations` gains `evaluations` (`ARRAY(ROW(...))`, field ids 65–72 appended after the
-  `List<String>` block): the OTel GenAI `gen_ai.evaluation.result` shape, one element per result
-  found on the span (flat `gen_ai.evaluation.*` attributes first, then one per span event).
-- A span qualifies as an operation when it carries `gen_ai.evaluation.name` or a
-  `gen_ai.evaluation.result` span event. A span no convention classifies but that carries
-  evaluations is `operation_name = 'evaluation'`; OpenInference `EVALUATOR` now maps to
-  `evaluation` (was `evaluator`).
+- `operations` gains `evaluations` (`ARRAY(ROW(...))`, appended after the `List<String>`
+  block): one element per complete evaluation result on the span, read from flat
+  `gen_ai.evaluation.*` attributes, OpenInference evaluation/annotation arrays, and
+  `gen_ai.evaluation.result` span events, each stating what it is about (`target_scope`,
+  `target_trace_id`, `target_span_id`).
+- A span qualifies as an operation when it carries an evaluation result. A span that only
+  evaluation results qualified, and that no convention classifies, is
+  `operation_name = 'evaluation'`; OpenInference `EVALUATOR` now maps to `evaluation` (was
+  `evaluator`).
 - Breaking for `operations`. `migrate upgrade` does not rewrite in place: **drain the WAL queue
   first**, then drop `operations` through the catalog and re-run `migrate create`. Data in
   `operations` is lost; the other tables are untouched.

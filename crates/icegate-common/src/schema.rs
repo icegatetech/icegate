@@ -459,18 +459,16 @@ pub fn spans_schema() -> Result<Schema> {
 ///
 /// `operations` is a typed columnar projection icegate maintains over the
 /// LLM/GenAI-flavoured subset of trace `spans` (see TRI-72 design). Every span
-/// carrying at least one LLM/GenAI marker attribute, or a
-/// `gen_ai.evaluation.result` span event, is projected into exactly one
-/// `operations` row (1:1 by `span_id`), with `gen_ai.*` / `OpenInference` /
-/// `Traceloop` semantic-convention attributes normalized into typed columns.
+/// carrying at least one LLM/GenAI marker attribute, or an evaluation result,
+/// is projected into exactly one `operations` row (1:1 by `span_id`), with
+/// `gen_ai.*` / `OpenInference` / `Traceloop` semantic-convention attributes
+/// normalized into typed columns.
 ///
 /// # Field IDs
-/// 58 scalar fields occupy IDs 1–58 in declaration order; the three
-/// `List<String>` columns follow so their element IDs are contiguous:
-/// `stop_sequences` (59, element 60), `finish_reasons` (61, element 62),
-/// `encoding_formats` (63, element 64). `evaluations`, a `List<Struct>`
-/// appended later, takes 65 (element 66, struct fields 67–72).
-/// `highest_field_id() == 72`.
+/// The scalar fields take the lowest ids in declaration order; the three
+/// `List<String>` columns follow them so each list and its element hold
+/// adjacent ids. `evaluations`, a `List<Struct>`, is appended after that block
+/// so every earlier id stays where it was.
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
@@ -482,9 +480,7 @@ pub fn spans_schema() -> Result<Schema> {
 #[allow(clippy::too_many_lines)]
 pub fn operations_schema() -> Result<Schema> {
     // Field IDs are hardcoded so reading top-to-bottom gives the assignment
-    // order. The three `List<String>` columns follow the scalars (1..=58) so
-    // their element IDs (60, 62, 64) stay contiguous; `evaluations` was appended
-    // after them (65..=72) so every pre-existing ID stays put.
+    // order.
     let schema = Schema::builder()
         .with_schema_id(5)
         .with_fields(vec![
@@ -583,7 +579,7 @@ pub fn operations_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 17,
-                "response_id",
+                COL_RESPONSE_ID,
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── sampling ─────────────────────────────────────────────────
@@ -733,7 +729,7 @@ pub fn operations_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 47,
-                "error_type",
+                COL_ERROR_TYPE,
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── agent / workflow ─────────────────────────────────────────
@@ -824,18 +820,17 @@ pub fn operations_schema() -> Result<Schema> {
                     true,
                 )))),
             )),
-            // ── evaluations: List<Struct>, appended after the List<String> block
-            // so every pre-existing id stays put. Parent 65 / element 66; struct
-            // fields 67–72 mirror the `gen_ai.evaluation.result` event. One
-            // element per result on the span: a flat `gen_ai.evaluation.*`
-            // attribute set first, then one per span event, in event order.
+            // ── evaluations: List<Struct> appended after the List<String> block,
+            // one element per evaluation result the span carries. The metric
+            // and its outcome come first, then the provenance the conventions
+            // attach to a result, then what the result is about.
             Arc::new(NestedField::optional(
                 65,
                 COL_EVALUATIONS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     66,
                     Type::Struct(StructType::new(vec![
-                        Arc::new(NestedField::optional(
+                        Arc::new(NestedField::required(
                             67,
                             COL_NAME,
                             Type::Primitive(PrimitiveType::String),
@@ -864,6 +859,36 @@ pub fn operations_schema() -> Result<Schema> {
                             72,
                             COL_ERROR_TYPE,
                             Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            73,
+                            COL_ANNOTATOR_KIND,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            74,
+                            COL_IDENTIFIER,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            75,
+                            COL_EVALUATION_METADATA,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::required(
+                            76,
+                            COL_TARGET_SCOPE,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            77,
+                            COL_TARGET_TRACE_ID,
+                            Type::Primitive(PrimitiveType::Fixed(16)),
+                        )),
+                        Arc::new(NestedField::optional(
+                            78,
+                            COL_TARGET_SPAN_ID,
+                            Type::Primitive(PrimitiveType::Fixed(8)),
                         )),
                     ])),
                     true,
@@ -1850,22 +1875,40 @@ pub const LEVEL_ALIAS: &str = "level";
 
 // ── Operations table column name constants ───────────────────────────
 
-/// Operations — evaluation results (`List<Struct>`), one element per
-/// `gen_ai.evaluation.result` found on the span; NULL when it carries none.
-/// The nested `name` field reuses [`COL_NAME`].
+/// Operations — evaluation results (`List<Struct>`), one element per complete
+/// result found on the span; NULL when it carries none. The element's `name`
+/// field reuses [`COL_NAME`].
 pub const COL_EVALUATIONS: &str = "evaluations";
 /// Operations — `evaluations` element: numeric score (`DOUBLE`).
 pub const COL_SCORE_VALUE: &str = "score_value";
-/// Operations — `evaluations` element: human-readable score label.
+/// Operations — `evaluations` element: categorical, human-readable score.
 pub const COL_SCORE_LABEL: &str = "score_label";
-/// Operations — `evaluations` element: evaluator's free-form explanation.
+/// Operations — `evaluations` element: the judge's free-form reason.
 pub const COL_EXPLANATION: &str = "explanation";
-/// Operations — provider response id; also the `evaluations` element field
-/// naming the evaluated response.
+/// Operations — provider response id: a top-level column, and the
+/// `evaluations` element field naming the evaluated response.
 pub const COL_RESPONSE_ID: &str = "response_id";
-/// Operations — error class; also the `evaluations` element field for a failed
-/// evaluation.
+/// Operations — error class: a top-level column for the operation, and the
+/// `evaluations` element field for an evaluation that itself failed.
 pub const COL_ERROR_TYPE: &str = "error_type";
+/// Operations — `evaluations` element: kind of judge (`HUMAN`, `LLM`, `CODE`,
+/// or a custom value).
+pub const COL_ANNOTATOR_KIND: &str = "annotator_kind";
+/// Operations — `evaluations` element: producer-assigned id, stable across
+/// results with the same name and target.
+pub const COL_IDENTIFIER: &str = "identifier";
+/// Operations — `evaluations` element: extra result or judge data, a JSON
+/// object serialized as text. Unrelated to the metrics [`COL_METADATA`] map.
+pub const COL_EVALUATION_METADATA: &str = "metadata";
+/// Operations — `evaluations` element: what the result is about — `span`,
+/// `trace`, or `session`.
+pub const COL_TARGET_SCOPE: &str = "target_scope";
+/// Operations — `evaluations` element: trace of the evaluated span (`span`
+/// scope) or the evaluated trace (`trace` scope); NULL when unknown.
+pub const COL_TARGET_TRACE_ID: &str = "target_trace_id";
+/// Operations — `evaluations` element: the evaluated span (`span` scope only);
+/// NULL for the wider scopes and when unknown.
+pub const COL_TARGET_SPAN_ID: &str = "target_span_id";
 
 // ── Prices table column name constants ───────────────────────────────
 
@@ -2101,9 +2144,9 @@ mod tests {
     fn test_operations_schema() {
         let schema = operations_schema().expect("Failed to create operations schema");
         // 58 scalar fields (1..=58), 3 List<String> columns (59..=64), and the
-        // `evaluations` List<Struct> appended last (65..=72). highest_field_id
+        // `evaluations` List<Struct> appended last (65..=78). highest_field_id
         // includes nested ids.
-        assert_eq!(schema.highest_field_id(), 72);
+        assert_eq!(schema.highest_field_id(), 78);
         assert_eq!(schema.schema_id(), 5);
         assert!(schema.field_by_name("tenant_id").is_some());
         assert!(schema.field_by_name("trace_id").is_some());
@@ -2197,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operations_evaluations_is_an_optional_list_of_structs_with_ids_65_to_72() {
+    fn test_operations_evaluations_is_an_optional_list_of_structs_with_ids_65_to_78() {
         use iceberg::spec::{PrimitiveType, Type};
 
         let schema = operations_schema().expect("Failed to create operations schema");
@@ -2212,7 +2255,9 @@ mod tests {
         let Type::Struct(element) = &*list.element_field.field_type else {
             panic!("evaluations element must be Struct");
         };
-        // The element is the gen_ai.evaluation.result event, field for field.
+        // One evaluation result: the metric and its outcome, where it came
+        // from, and what it is about. Only the name and the target scope are
+        // on every stored result.
         let fields: Vec<(i32, &str, &Type, bool)> = element
             .fields()
             .iter()
@@ -2221,12 +2266,18 @@ mod tests {
         assert_eq!(
             fields,
             vec![
-                (67, "name", &Type::Primitive(PrimitiveType::String), false),
+                (67, "name", &Type::Primitive(PrimitiveType::String), true),
                 (68, "score_value", &Type::Primitive(PrimitiveType::Double), false),
                 (69, "score_label", &Type::Primitive(PrimitiveType::String), false),
                 (70, "explanation", &Type::Primitive(PrimitiveType::String), false),
                 (71, "response_id", &Type::Primitive(PrimitiveType::String), false),
                 (72, "error_type", &Type::Primitive(PrimitiveType::String), false),
+                (73, "annotator_kind", &Type::Primitive(PrimitiveType::String), false),
+                (74, "identifier", &Type::Primitive(PrimitiveType::String), false),
+                (75, "metadata", &Type::Primitive(PrimitiveType::String), false),
+                (76, "target_scope", &Type::Primitive(PrimitiveType::String), true),
+                (77, "target_trace_id", &Type::Primitive(PrimitiveType::Fixed(16)), false),
+                (78, "target_span_id", &Type::Primitive(PrimitiveType::Fixed(8)), false),
             ]
         );
     }

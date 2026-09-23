@@ -21,9 +21,9 @@ use icegate_common::{
 
 use super::attributes::{
     SERVICE_NAME_KEY, attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named,
-    extract_string_value, field_builder_missing, is_zero_bytes, nested_field_index, nested_struct_builders, now_micros,
-    u32_count_to_i32,
+    extract_string_value, is_zero_bytes, now_micros, u32_count_to_i32,
 };
+use super::nested_builders::{field_builder_missing, nested_field_index, nested_struct_builders};
 
 /// Process-wide cache of the derived spans Arrow schema.
 static SPANS_ARROW_SCHEMA: OnceLock<std::result::Result<Arc<Schema>, String>> = OnceLock::new();

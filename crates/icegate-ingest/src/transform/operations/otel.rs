@@ -7,19 +7,15 @@ use crate::transform::attributes::extract_string_value;
 /// OTEL `GenAI` semantic-convention adapter. Sources the canonical `gen_ai.*`
 /// keys (with deprecated `gen_ai.system` / `OpenInference` `llm.system` kept as
 /// provider fallbacks), and classifies via verbatim `gen_ai.operation.name`.
-/// Also sources evaluation results from flat `gen_ai.evaluation.*` attributes
-/// and from `gen_ai.evaluation.result` span events. First in the registry, so
-/// OTEL wins on every shared key.
+/// Also sources evaluation results: one per `gen_ai.evaluation.result` span
+/// event, plus one flat result when the span's own attributes carry
+/// `gen_ai.evaluation.name`. First in the registry, so OTEL wins on every
+/// shared key.
 pub(crate) struct OtelGenAi;
 
 impl OperationConvention for OtelGenAi {
     fn marker_keys(&self) -> &'static [&'static str] {
-        &[
-            "gen_ai.operation.name",
-            "gen_ai.provider.name",
-            "gen_ai.system",
-            "gen_ai.evaluation.name",
-        ]
+        &["gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.system"]
     }
 
     fn field_keys(&self, field: OperationField) -> &'static [&'static str] {
@@ -81,6 +77,10 @@ impl OperationConvention for OtelGenAi {
         &["gen_ai.evaluation.result"]
     }
 
+    fn states_flat_evaluation(&self) -> bool {
+        true
+    }
+
     fn evaluation_field_keys(&self, field: EvaluationField) -> &'static [&'static str] {
         match field {
             EvaluationField::Name => &["gen_ai.evaluation.name"],
@@ -89,6 +89,7 @@ impl OperationConvention for OtelGenAi {
             EvaluationField::Explanation => &["gen_ai.evaluation.explanation"],
             EvaluationField::ResponseId => &["gen_ai.response.id"],
             EvaluationField::ErrorType => &["error.type"],
+            EvaluationField::AnnotatorKind | EvaluationField::Identifier | EvaluationField::Metadata => &[],
         }
     }
 
@@ -153,13 +154,6 @@ mod tests {
     fn input_messages_sourced_from_input_messages() {
         let keys = OtelGenAi.field_keys(OperationField::InputMessages);
         assert_eq!(keys, &["gen_ai.input.messages"]);
-    }
-
-    #[test]
-    fn markers_include_the_evaluation_name_key() {
-        // A dedicated evaluator span carries no gen_ai.operation.name; its
-        // required gen_ai.evaluation.name is what makes it an operation.
-        assert!(OtelGenAi.marker_keys().contains(&"gen_ai.evaluation.name"));
     }
 
     #[test]
