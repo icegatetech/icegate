@@ -1,7 +1,7 @@
 //! `OpenInference` semantic-convention adapter.
 
-use super::convention::OperationConvention;
-use super::projection::{AttributeView, OperationField};
+use super::convention::{EVALUATION_OPERATION_NAME, EvaluationArraySource, OperationConvention};
+use super::projection::{AttributeView, EvaluationField, EvaluationScope, OperationField};
 use crate::transform::attributes::extract_string_value;
 
 /// `OpenInference` (Arize) semantic-convention adapter. Second in the registry,
@@ -22,6 +22,10 @@ use crate::transform::attributes::extract_string_value;
 ///   [`OperationConvention::indexed_field_prefixes`].
 /// - **`llm.finish_reason` is one string** where OTEL's equivalent column is an
 ///   array — see [`OperationConvention::singular_list_field_keys`].
+/// - **Evaluation results are indexed attribute arrays**, in two equivalent
+///   terminologies (`evaluations.<i>.evaluation.*`, `annotations.<i>.annotation.*`)
+///   and three scopes (the span, `trace.`, `session.`) — see
+///   [`OperationConvention::evaluation_arrays`].
 ///
 /// Attribute families the spec defines that this adapter does *not* source,
 /// because `operations` has no column for them: `llm.cost.*`,
@@ -91,6 +95,33 @@ impl OperationConvention for OpenInference {
         }
     }
 
+    fn evaluation_arrays(&self) -> &'static [EvaluationArraySource] {
+        // Two terminologies for one shape, each in three scopes.
+        const ARRAYS: &[EvaluationArraySource] = &[
+            EvaluationArraySource::new("evaluations", "evaluation", EvaluationScope::Span),
+            EvaluationArraySource::new("annotations", "annotation", EvaluationScope::Span),
+            EvaluationArraySource::new("trace.evaluations", "evaluation", EvaluationScope::Trace),
+            EvaluationArraySource::new("trace.annotations", "annotation", EvaluationScope::Trace),
+            EvaluationArraySource::new("session.evaluations", "evaluation", EvaluationScope::Session),
+            EvaluationArraySource::new("session.annotations", "annotation", EvaluationScope::Session),
+        ];
+        ARRAYS
+    }
+
+    fn evaluation_field_keys(&self, field: EvaluationField) -> &'static [&'static str] {
+        // Suffixes within one array element; both terminologies share them.
+        match field {
+            EvaluationField::Name => &["name"],
+            EvaluationField::ScoreValue => &["score"],
+            EvaluationField::ScoreLabel => &["label"],
+            EvaluationField::Explanation => &["explanation"],
+            EvaluationField::AnnotatorKind => &["annotator_kind"],
+            EvaluationField::Identifier => &["identifier"],
+            EvaluationField::Metadata => &["metadata"],
+            EvaluationField::ResponseId | EvaluationField::ErrorType => &[],
+        }
+    }
+
     fn indexed_field_prefixes(&self, field: OperationField) -> &'static [&'static str] {
         match field {
             // `llm.prompts` / `llm.choices` are the completions-API counterparts
@@ -118,7 +149,7 @@ impl OperationConvention for OpenInference {
             "CHAIN" => "chain",
             "RERANKER" => "reranker",
             "GUARDRAIL" => "guardrail",
-            "EVALUATOR" => "evaluator",
+            "EVALUATOR" => EVALUATION_OPERATION_NAME,
             _ => "other",
         };
         Some(normalized.to_string())
@@ -230,10 +261,16 @@ mod tests {
 
     #[test]
     fn classify_lowercases_passthrough_kinds() {
-        // RERANKER / GUARDRAIL / EVALUATOR are lowercased verbatim (spec section 4).
+        // RERANKER / GUARDRAIL are lowercased verbatim (spec section 4).
         assert_eq!(classify("RERANKER"), Some("reranker".to_string()));
         assert_eq!(classify("GUARDRAIL"), Some("guardrail".to_string()));
-        assert_eq!(classify("EVALUATOR"), Some("evaluator".to_string()));
+    }
+
+    #[test]
+    fn classify_maps_evaluator_to_the_shared_evaluation_name() {
+        // Same concept as an OTEL span carrying gen_ai.evaluation.* results, so
+        // both must land under one operation_name.
+        assert_eq!(classify("EVALUATOR"), Some("evaluation".to_string()));
     }
 
     #[test]

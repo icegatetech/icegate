@@ -80,14 +80,16 @@ query:
 ingest:
   enabled: true
   replicaCount: 1
-  ## The only sender into ingest on these stands is the collector, and it sets
-  ## X-Scope-OrgID: demo (config/kustomize/base/otel-collector/configmap.yaml).
-  ## In single mode a header naming another tenant is rejected, so the id has to
-  ## be the one the collector sends. multi is not used here: with no auth proxy
-  ## in front, it would let any sender that reaches the port pick the tenant.
+  ## Two senders share this stand's ingest under different tenants: the
+  ## collector sets X-Scope-OrgID: demo (config/kustomize/base/otel-collector/
+  ## configmap.yaml), and the icegate-ee demo writes under the workspace id the
+  ## control plane queries it by. Single mode serves one tenant and rejects the
+  ## other, so this stand runs multi. With no auth proxy in front, any sender
+  ## that reaches the port picks its tenant — acceptable on a laptop cluster
+  ## only; a shared deployment keeps single, or multi behind
+  ## config/helm/auth-proxy.
   tenant:
-    mode: single
-    id: "demo"
+    mode: multi
   waitForDependencies:
     enabled: true
     buckets:

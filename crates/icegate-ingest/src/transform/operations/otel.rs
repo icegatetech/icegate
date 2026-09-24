@@ -1,13 +1,16 @@
 //! OTEL `GenAI` semantic-convention adapter.
 
 use super::convention::OperationConvention;
-use super::projection::{AttributeView, OperationField};
+use super::projection::{AttributeView, EvaluationField, OperationField};
 use crate::transform::attributes::extract_string_value;
 
 /// OTEL `GenAI` semantic-convention adapter. Sources the canonical `gen_ai.*`
 /// keys (with deprecated `gen_ai.system` / `OpenInference` `llm.system` kept as
 /// provider fallbacks), and classifies via verbatim `gen_ai.operation.name`.
-/// First in the registry, so OTEL wins on every shared key.
+/// Also sources evaluation results: one per `gen_ai.evaluation.result` span
+/// event, plus one flat result when the span's own attributes carry
+/// `gen_ai.evaluation.name`. First in the registry, so OTEL wins on every
+/// shared key.
 pub(crate) struct OtelGenAi;
 
 impl OperationConvention for OtelGenAi {
@@ -67,6 +70,26 @@ impl OperationConvention for OtelGenAi {
             OperationField::ToolDefinitions => &["gen_ai.tool.definitions"],
             OperationField::ToolCallArguments => &["gen_ai.tool.call.arguments"],
             OperationField::ToolCallResult => &["gen_ai.tool.call.result"],
+        }
+    }
+
+    fn evaluation_event_names(&self) -> &'static [&'static str] {
+        &["gen_ai.evaluation.result"]
+    }
+
+    fn states_flat_evaluation(&self) -> bool {
+        true
+    }
+
+    fn evaluation_field_keys(&self, field: EvaluationField) -> &'static [&'static str] {
+        match field {
+            EvaluationField::Name => &["gen_ai.evaluation.name"],
+            EvaluationField::ScoreValue => &["gen_ai.evaluation.score.value"],
+            EvaluationField::ScoreLabel => &["gen_ai.evaluation.score.label"],
+            EvaluationField::Explanation => &["gen_ai.evaluation.explanation"],
+            EvaluationField::ResponseId => &["gen_ai.response.id"],
+            EvaluationField::ErrorType => &["error.type"],
+            EvaluationField::AnnotatorKind | EvaluationField::Identifier | EvaluationField::Metadata => &[],
         }
     }
 
@@ -131,6 +154,39 @@ mod tests {
     fn input_messages_sourced_from_input_messages() {
         let keys = OtelGenAi.field_keys(OperationField::InputMessages);
         assert_eq!(keys, &["gen_ai.input.messages"]);
+    }
+
+    #[test]
+    fn evaluation_results_are_sourced_from_the_gen_ai_evaluation_result_event() {
+        assert_eq!(OtelGenAi.evaluation_event_names(), &["gen_ai.evaluation.result"]);
+    }
+
+    #[test]
+    fn evaluation_field_keys_follow_the_gen_ai_evaluation_attributes() {
+        assert_eq!(
+            OtelGenAi.evaluation_field_keys(EvaluationField::Name),
+            &["gen_ai.evaluation.name"]
+        );
+        assert_eq!(
+            OtelGenAi.evaluation_field_keys(EvaluationField::ScoreValue),
+            &["gen_ai.evaluation.score.value"]
+        );
+        assert_eq!(
+            OtelGenAi.evaluation_field_keys(EvaluationField::ScoreLabel),
+            &["gen_ai.evaluation.score.label"]
+        );
+        assert_eq!(
+            OtelGenAi.evaluation_field_keys(EvaluationField::Explanation),
+            &["gen_ai.evaluation.explanation"]
+        );
+        assert_eq!(
+            OtelGenAi.evaluation_field_keys(EvaluationField::ResponseId),
+            &["gen_ai.response.id"]
+        );
+        assert_eq!(
+            OtelGenAi.evaluation_field_keys(EvaluationField::ErrorType),
+            &["error.type"]
+        );
     }
 
     #[test]

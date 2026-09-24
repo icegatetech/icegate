@@ -6,13 +6,16 @@
 //! typed resolvers.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use icegate_common::TenantId;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::{Span, span::Event};
 
-use super::convention::{CONVENTIONS, field_precedence};
+use super::convention::{
+    CONVENTIONS, EVALUATION_OPERATION_NAME, EvaluationArraySource, OperationConvention, RegisteredEvaluationArray,
+    evaluation_event_filter, field_precedence, registered_evaluation_arrays,
+};
 use crate::error::Result;
 use crate::transform::attributes::{
     extract_bool, extract_f64, extract_i64, extract_string_list, extract_string_value, is_zero_bytes, nanos_to_micros,
@@ -199,6 +202,55 @@ pub(crate) enum OperationField {
     ToolCallResult,
 }
 
+/// Fields of one evaluation result resolved through the convention registry
+/// into one element of the `evaluations` column. Each variant maps to exactly
+/// one field of the element struct. Kept apart from [`OperationField`]: those
+/// name whole columns, these name fields inside one nested column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EvaluationField {
+    /// `evaluations[].name` — the evaluation metric.
+    Name,
+    /// `evaluations[].score_value` — numeric score.
+    ScoreValue,
+    /// `evaluations[].score_label` — categorical score.
+    ScoreLabel,
+    /// `evaluations[].explanation` — the judge's free-form reasoning.
+    Explanation,
+    /// `evaluations[].response_id` — id of the evaluated response.
+    ResponseId,
+    /// `evaluations[].error_type` — error class when the evaluation failed.
+    ErrorType,
+    /// `evaluations[].annotator_kind` — kind of judge.
+    AnnotatorKind,
+    /// `evaluations[].identifier` — producer-assigned result id.
+    Identifier,
+    /// `evaluations[].metadata` — extra result data as a JSON object.
+    Metadata,
+}
+
+/// What one evaluation result is about: the span it targets, that span's whole
+/// trace, or the session named by the row's `conversation_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvaluationScope {
+    /// One span.
+    Span,
+    /// One trace.
+    Trace,
+    /// One session.
+    Session,
+}
+
+impl EvaluationScope {
+    /// The value stored in `evaluations[].target_scope`.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Span => "span",
+            Self::Trace => "trace",
+            Self::Session => "session",
+        }
+    }
+}
+
 /// Owned, Arrow-decoupled projection of one `operations` row.
 ///
 /// Required columns (`tenant_id`, identity, timing, `operation_name`) are plain
@@ -331,6 +383,54 @@ pub(crate) struct OperationRow {
     pub(crate) tool_call_arguments: Option<String>,
     /// Tool call result (faithful JSON).
     pub(crate) tool_call_result: Option<String>,
+    /// Complete evaluation results found on the span, in resolution order;
+    /// NULL list when it carries none.
+    pub(crate) evaluations: Option<Vec<EvaluationResult>>,
+}
+
+/// One complete evaluation result, projected into one element of the
+/// `evaluations` column: it always names its metric and states what it is
+/// about; everything else is whatever the convention carried.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EvaluationResult {
+    /// Evaluation metric name, never empty.
+    pub(crate) name: String,
+    /// Numeric score.
+    pub(crate) score_value: Option<f64>,
+    /// Categorical score.
+    pub(crate) score_label: Option<String>,
+    /// The judge's free-form explanation of the score.
+    pub(crate) explanation: Option<String>,
+    /// Id of the evaluated response, as the result states it.
+    pub(crate) response_id: Option<String>,
+    /// Error class when the evaluation itself failed.
+    pub(crate) error_type: Option<String>,
+    /// Kind of judge that produced the result.
+    pub(crate) annotator_kind: Option<String>,
+    /// Producer-assigned id, stable across results with the same name and
+    /// target.
+    pub(crate) identifier: Option<String>,
+    /// Extra result data; only ever a JSON object serialized as text.
+    pub(crate) metadata: Option<String>,
+    /// What the result is about.
+    pub(crate) target_scope: EvaluationScope,
+    /// Trace of the evaluated span or the evaluated trace; `None` when the
+    /// scope names no trace or the target is unknown.
+    pub(crate) target_trace_id: Option<[u8; 16]>,
+    /// The evaluated span; `None` for the wider scopes or an unknown target.
+    pub(crate) target_span_id: Option<[u8; 8]>,
+}
+
+/// One span's projection: its `operations` row, plus how many evaluation
+/// results the span carried that the row leaves out as incomplete.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProjectedOperation {
+    /// The `operations` row.
+    pub(crate) row: OperationRow,
+    /// Evaluation results found on the span but not stored in
+    /// [`OperationRow::evaluations`], because they lack what every result
+    /// must carry. Surfaced by the caller; the row itself is still written.
+    pub(crate) skipped_evaluations: usize,
 }
 
 /// Validate a 16-byte non-zero `trace_id`, copying it into a fixed array.
@@ -696,13 +796,359 @@ fn resolve_time_to_first_chunk_ms(view: &AttributeView) -> Result<Option<i64>> {
     Ok(None)
 }
 
+/// Returns the first registered convention that reads one flat result off the
+/// span's own attributes and whose [`EvaluationField::Name`] key is present
+/// there. `None` when no span-level result exists; a score or label without a
+/// name is not a result.
+fn find_flat_evaluation_convention(view: &AttributeView) -> Option<&'static dyn OperationConvention> {
+    CONVENTIONS.iter().copied().find(|convention| {
+        convention.states_flat_evaluation()
+            && convention
+                .evaluation_field_keys(EvaluationField::Name)
+                .iter()
+                .any(|key| view.has(key))
+    })
+}
+
+/// Returns the first registered convention that names `event` as an
+/// evaluation-result carrier.
+fn find_evaluation_event_convention(event: &Event) -> Option<&'static dyn OperationConvention> {
+    CONVENTIONS
+        .iter()
+        .copied()
+        .find(|convention| convention.evaluation_event_names().contains(&event.name.as_str()))
+}
+
+/// Whether `span` carries any evaluation result: a flat result on its own
+/// attributes, a registered attribute array, or an evaluation event.
+///
+/// Runs for every span that no operation marker qualified, so each check is a
+/// hash lookup or a pass over the span's events — never a scan of its keys.
+fn carries_evaluation(view: &AttributeView, span: &Span) -> bool {
+    find_flat_evaluation_convention(view).is_some()
+        || registered_evaluation_arrays()
+            .iter()
+            .any(|array| view.has(&array.first_name_key))
+        || span
+            .events
+            .iter()
+            .any(|event| evaluation_event_filter().contains(&event.name.as_str()))
+}
+
+/// What the results recorded on one span are about.
+#[derive(Debug, Clone, Copy)]
+enum EvaluationSubject {
+    /// A known span: the span itself when results are recorded inline on an
+    /// operation, or the span a post-hoc carrier's single link points at.
+    Span {
+        /// Trace of the subject span.
+        trace_id: [u8; 16],
+        /// The subject span.
+        span_id: [u8; 8],
+    },
+    /// An evaluation span that points at no single span: the evaluated span is
+    /// unknown, though the trace the results are recorded in is not.
+    Trace {
+        /// The trace the evaluation span is recorded in.
+        trace_id: [u8; 16],
+    },
+    /// A carrier whose single link carries unusable ids.
+    Unknown,
+}
+
+/// Decide what the results recorded on `span` are about.
+///
+/// Results recorded on any operation other than an evaluation are about that
+/// operation's own span. An evaluation span's results describe something else:
+/// the span its single link points at when it is a post-hoc carrier (exactly
+/// one link, none dropped by the SDK), and otherwise no span it identifies.
+/// Parentage is never taken for the target — the conventions do not give a
+/// parent that meaning.
+fn resolve_evaluation_subject(
+    span: &Span,
+    is_evaluation_span: bool,
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+) -> EvaluationSubject {
+    if !is_evaluation_span {
+        return EvaluationSubject::Span { trace_id, span_id };
+    }
+    match span.links.as_slice() {
+        [link] if span.dropped_links_count == 0 => {
+            let linked_trace = <[u8; 16]>::try_from(link.trace_id.as_slice())
+                .ok()
+                .filter(|id| !is_zero_bytes(id));
+            let linked_span = <[u8; 8]>::try_from(link.span_id.as_slice())
+                .ok()
+                .filter(|id| !is_zero_bytes(id));
+            match (linked_trace, linked_span) {
+                (Some(trace_id), Some(span_id)) => EvaluationSubject::Span { trace_id, span_id },
+                (None, _) | (_, None) => EvaluationSubject::Unknown,
+            }
+        }
+        _ => EvaluationSubject::Trace { trace_id },
+    }
+}
+
+/// The `(target_trace_id, target_span_id)` of a result with `scope` whose
+/// carrying span is about `subject`. A session result names neither: its
+/// session is the row's `conversation_id`.
+const fn resolve_evaluation_target(
+    scope: EvaluationScope,
+    subject: EvaluationSubject,
+) -> (Option<[u8; 16]>, Option<[u8; 8]>) {
+    match (scope, subject) {
+        (EvaluationScope::Span, EvaluationSubject::Span { trace_id, span_id }) => (Some(trace_id), Some(span_id)),
+        (EvaluationScope::Trace, EvaluationSubject::Span { trace_id, .. } | EvaluationSubject::Trace { trace_id }) => {
+            (Some(trace_id), None)
+        }
+        (EvaluationScope::Span, EvaluationSubject::Trace { .. } | EvaluationSubject::Unknown)
+        | (EvaluationScope::Trace, EvaluationSubject::Unknown)
+        | (
+            EvaluationScope::Session,
+            EvaluationSubject::Span { .. } | EvaluationSubject::Trace { .. } | EvaluationSubject::Unknown,
+        ) => (None, None),
+    }
+}
+
+/// Where one evaluation result is read from, which decides the fields it
+/// states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvaluationCarrier {
+    /// A result's own attribute set — an evaluation event or an array element:
+    /// every field found there belongs to the result.
+    ResultAttributes,
+    /// The span's own attributes read as one flat result: only the metric and
+    /// its outcome belong to it. `error.type` and the response id there
+    /// describe the span's own operation, and stay in the row's columns.
+    SpanAttributes,
+}
+
+impl EvaluationCarrier {
+    /// Whether a result read from this carrier states `field`.
+    const fn states(self, field: EvaluationField) -> bool {
+        match self {
+            Self::ResultAttributes => true,
+            Self::SpanAttributes => matches!(
+                field,
+                EvaluationField::Name
+                    | EvaluationField::ScoreValue
+                    | EvaluationField::ScoreLabel
+                    | EvaluationField::Explanation
+            ),
+        }
+    }
+}
+
+/// Last value `key` carries in `attributes`, skipping value-less entries: the
+/// answer [`AttributeView::get`] gives, without building its index for the few
+/// keys one evaluation event is read through.
+fn last_attribute_value<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a AnyValue> {
+    attributes
+        .iter()
+        .rev()
+        .find_map(|kv| if kv.key == key { kv.value.as_ref() } else { None })
+}
+
+/// `text` when it holds a JSON object — the only shape `metadata` may store —
+/// checked without building the value.
+fn json_object_text(text: String) -> Option<String> {
+    let is_object = text.trim_start().starts_with('{') && serde_json::from_str::<serde::de::IgnoredAny>(&text).is_ok();
+    is_object.then_some(text)
+}
+
+/// How one result is read: the convention whose keys name its fields, where its
+/// attributes sit, and what it is about.
+struct EvaluationReading<'c> {
+    /// Convention whose [`OperationConvention::evaluation_field_keys`] apply.
+    convention: &'c dyn OperationConvention,
+    /// Where the attributes sit, which decides the fields read.
+    carrier: EvaluationCarrier,
+    /// What the result is about.
+    scope: EvaluationScope,
+    /// What the carrying span's results are about.
+    subject: EvaluationSubject,
+}
+
+/// Resolve one evaluation result, reading each key's value with `lookup`;
+/// `None` when the result is incomplete (see [`is_complete_evaluation`]).
+///
+/// Strings are read verbatim (as every string column is), except `metadata`,
+/// kept only when it is a JSON object; `score_value` is a strict `f64` parse,
+/// so a present non-numeric score is a projection failure that drops the whole
+/// row (D6).
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` when a present score fails strict parsing.
+fn resolve_evaluation_result<'a>(
+    lookup: impl Fn(&str) -> Option<&'a AnyValue>,
+    reading: &EvaluationReading<'_>,
+) -> Result<Option<EvaluationResult>> {
+    let keys = |field: EvaluationField| -> &'static [&'static str] {
+        if reading.carrier.states(field) {
+            reading.convention.evaluation_field_keys(field)
+        } else {
+            &[]
+        }
+    };
+    let first_str = |field: EvaluationField| keys(field).iter().find_map(|&key| extract_string_value(lookup(key)));
+    let mut score_value = None;
+    for &key in keys(EvaluationField::ScoreValue) {
+        if let Some(value) = lookup(key) {
+            score_value = extract_f64(Some(value), "evaluations.score_value")?;
+            break;
+        }
+    }
+    let name = first_str(EvaluationField::Name);
+    let score_label = first_str(EvaluationField::ScoreLabel);
+    let explanation = first_str(EvaluationField::Explanation);
+    let error_type = first_str(EvaluationField::ErrorType);
+    let has_outcome = score_value.is_some() || score_label.is_some() || explanation.is_some() || error_type.is_some();
+    let Some(name) = name.filter(|name| is_complete_evaluation(name, has_outcome)) else {
+        return Ok(None);
+    };
+    let (target_trace_id, target_span_id) = resolve_evaluation_target(reading.scope, reading.subject);
+    Ok(Some(EvaluationResult {
+        name,
+        score_value,
+        score_label,
+        explanation,
+        response_id: first_str(EvaluationField::ResponseId),
+        error_type,
+        annotator_kind: first_str(EvaluationField::AnnotatorKind),
+        identifier: first_str(EvaluationField::Identifier),
+        metadata: first_str(EvaluationField::Metadata).and_then(json_object_text),
+        target_scope: reading.scope,
+        target_trace_id,
+        target_span_id,
+    }))
+}
+
+/// Split an attribute key of `source` into its element index and field suffix;
+/// `None` for a key that only shares the prefix.
+fn split_array_key<'k>(key: &'k str, source: &EvaluationArraySource) -> Option<(usize, &'k str)> {
+    let (index, rest) = key.strip_prefix(source.prefix)?.strip_prefix('.')?.split_once('.')?;
+    let index = index.parse::<usize>().ok()?;
+    let field = rest.strip_prefix(source.element)?.strip_prefix('.')?;
+    Some((index, field))
+}
+
+/// Resolve every element of `array` found in `attributes`, one result per
+/// index in ascending order, into `found`.
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` when an element's present score fails
+/// strict parsing (D6).
+fn resolve_array_evaluations(
+    attributes: &[KeyValue],
+    array: &RegisteredEvaluationArray,
+    subject: EvaluationSubject,
+    found: &mut Vec<Option<EvaluationResult>>,
+) -> Result<()> {
+    let mut elements: BTreeMap<usize, Vec<(&str, &AnyValue)>> = BTreeMap::new();
+    for kv in attributes {
+        if let Some(value) = kv.value.as_ref()
+            && let Some((index, field)) = split_array_key(&kv.key, array.source)
+        {
+            elements.entry(index).or_default().push((field, value));
+        }
+    }
+    let reading = EvaluationReading {
+        convention: array.convention,
+        carrier: EvaluationCarrier::ResultAttributes,
+        scope: array.source.scope,
+        subject,
+    };
+    for fields in elements.values() {
+        // Last write wins within an element, as it does across span attributes.
+        let lookup = |key: &str| fields.iter().rev().find_map(|&(field, value)| (field == key).then_some(value));
+        found.push(resolve_evaluation_result(lookup, &reading)?);
+    }
+    Ok(())
+}
+
+/// Evaluation results resolved from one span.
+struct ResolvedEvaluations {
+    /// Complete results in resolution order; `None` when none survived, so the
+    /// column is a NULL list rather than an empty one.
+    results: Option<Vec<EvaluationResult>>,
+    /// Results found on the span but left out by [`is_complete_evaluation`].
+    skipped: usize,
+}
+
+/// Whether a result is one the `evaluations` column stores: it names its
+/// metric and carries an outcome — a score, a label, an explanation, or the
+/// error the evaluation ended in. Without a name a score cannot be attributed
+/// to any metric, and without an outcome there is nothing to store.
+const fn is_complete_evaluation(name: &str, has_outcome: bool) -> bool {
+    !name.is_empty() && has_outcome
+}
+
+/// Resolve every evaluation result `span` carries, in this order: the flat
+/// result on its own attributes, then each registered attribute array present
+/// on it (registry order, elements by index), then one result per evaluation
+/// event (event order). Incomplete results are counted and left out rather
+/// than failing the row.
+///
+/// # Errors
+///
+/// Returns `IngestError::Validation` when any present score fails strict
+/// parsing (D6): the whole row is dropped, never a partial list.
+fn resolve_evaluations(view: &AttributeView, span: &Span, subject: EvaluationSubject) -> Result<ResolvedEvaluations> {
+    let mut found: Vec<Option<EvaluationResult>> = Vec::new();
+    if let Some(convention) = find_flat_evaluation_convention(view) {
+        let reading = EvaluationReading {
+            convention,
+            carrier: EvaluationCarrier::SpanAttributes,
+            scope: EvaluationScope::Span,
+            subject,
+        };
+        found.push(resolve_evaluation_result(|key| view.get(key), &reading)?);
+    }
+    for array in registered_evaluation_arrays() {
+        if view.has(&array.first_name_key) {
+            resolve_array_evaluations(&span.attributes, array, subject, &mut found)?;
+        }
+    }
+    for event in &span.events {
+        // The cached name filter settles most events without asking any
+        // convention; only an evaluation event pays for the owner lookup.
+        if !evaluation_event_filter().contains(&event.name.as_str()) {
+            continue;
+        }
+        if let Some(convention) = find_evaluation_event_convention(event) {
+            let reading = EvaluationReading {
+                convention,
+                carrier: EvaluationCarrier::ResultAttributes,
+                scope: EvaluationScope::Span,
+                subject,
+            };
+            found.push(resolve_evaluation_result(
+                |key| last_attribute_value(&event.attributes, key),
+                &reading,
+            )?);
+        }
+    }
+    let found_count = found.len();
+    let results: Vec<EvaluationResult> = found.into_iter().flatten().collect();
+    Ok(ResolvedEvaluations {
+        skipped: found_count - results.len(),
+        results: (!results.is_empty()).then_some(results),
+    })
+}
+
 /// Project one OTLP span (+ scope + tenant) into an optional operations row.
 ///
-/// `Ok(None)` = no convention marker present (non-LLM span; caller counts as
-/// `non_llm_skipped`). `Err` = hard projection failure (invalid id, or a failed
-/// strict typed parse / token overflow under D6); the caller drops the row and
-/// counts it in `drops`. Pure: no I/O, no clock, no globals — `ingested_at`
-/// (micros) is injected so a later backfill can replay the original watermark.
+/// `Ok(None)` = no convention marker and no evaluation evidence present
+/// (non-LLM span; caller counts as `non_llm_skipped`). `Err` = hard projection
+/// failure (invalid id, or a failed strict typed parse / token overflow under
+/// D6); the caller drops the row and counts it in `drops`. Incomplete
+/// evaluation results do not fail the row: they are left out of it and counted
+/// in [`ProjectedOperation::skipped_evaluations`]. Pure: no I/O, no clock, no
+/// globals — `ingested_at` (micros) is injected so a later backfill can replay
+/// the original watermark.
 ///
 /// # Errors
 ///
@@ -716,14 +1162,18 @@ pub(crate) fn project_operation_row(
     tenant_id: &TenantId,
     service_name: Option<&str>,
     ingested_at: i64,
-) -> Result<Option<OperationRow>> {
+) -> Result<Option<ProjectedOperation>> {
     let view = AttributeView::new(&span.attributes);
 
-    let qualifies = CONVENTIONS.iter().any(|conv| {
+    // Evaluation evidence qualifies a span on its own — a dedicated evaluator
+    // span has nothing else to qualify it — but it is kept apart from the
+    // operation markers because it cannot say what kind of operation the span
+    // is; see the `operation_name` fallback below.
+    let qualified_by_operation_marker = CONVENTIONS.iter().any(|conv| {
         conv.marker_keys().iter().any(|key| view.has(key))
             || conv.name_prefixes().iter().any(|prefix| span.name.starts_with(prefix))
     });
-    if !qualifies {
+    if !qualified_by_operation_marker && !carries_evaluation(&view, span) {
         return Ok(None);
     }
 
@@ -734,10 +1184,26 @@ pub(crate) fn project_operation_row(
         _ => None,
     };
 
+    // Adapters decide first, so an LLM span carrying evaluation results keeps
+    // its own operation. A span no adapter can classify is an evaluation only
+    // when evaluation evidence alone qualified it (a dedicated evaluator span);
+    // a span an operation marker qualified is an evaluated operation of an
+    // unknown kind, so it stays `other`.
     let operation_name = CONVENTIONS
         .iter()
         .find_map(|conv| conv.classify_operation(&span.name, &view))
-        .unwrap_or_else(|| "other".to_string());
+        .unwrap_or_else(|| {
+            if qualified_by_operation_marker {
+                "other".to_string()
+            } else {
+                EVALUATION_OPERATION_NAME.to_string()
+            }
+        });
+    let subject = resolve_evaluation_subject(span, operation_name == EVALUATION_OPERATION_NAME, trace_id, span_id);
+    let ResolvedEvaluations {
+        results: evaluations,
+        skipped: skipped_evaluations,
+    } = resolve_evaluations(&view, span, subject)?;
 
     let timestamp = nanos_to_micros(span.start_time_unix_nano);
     let end_timestamp = nanos_to_micros(span.end_time_unix_nano);
@@ -777,7 +1243,7 @@ pub(crate) fn project_operation_row(
 
     let time_to_first_chunk_ms = resolve_time_to_first_chunk_ms(&view)?;
 
-    Ok(Some(OperationRow {
+    let row = OperationRow {
         tenant_id: tenant_id.as_ref().to_string(),
         trace_id,
         span_id,
@@ -868,16 +1334,38 @@ pub(crate) fn project_operation_row(
             &span.events,
             OperationField::ToolCallResult,
         )?,
+        evaluations,
+    };
+    Ok(Some(ProjectedOperation {
+        row,
+        skipped_evaluations,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, any_value::Value};
-    use opentelemetry_proto::tonic::trace::v1::{Span, Status, span::Event};
+    use opentelemetry_proto::tonic::trace::v1::{
+        Span, Status,
+        span::{Event, Link},
+    };
 
     use super::*;
+    use crate::error::IngestError;
     use crate::transform::test_support::test_tenant;
+
+    /// Project `span` and keep only its row: most cases here are about the
+    /// columns, not about the incomplete evaluation results left out of them.
+    fn project_row(
+        span: &Span,
+        scope: Option<&InstrumentationScope>,
+        tenant_id: &TenantId,
+        service_name: Option<&str>,
+        ingested_at: i64,
+    ) -> Result<Option<OperationRow>> {
+        project_operation_row(span, scope, tenant_id, service_name, ingested_at)
+            .map(|projected| projected.map(|projected| projected.row))
+    }
 
     /// Build a string-valued OTLP `KeyValue` for tests.
     fn kv_str(key: &str, value: &str) -> KeyValue {
@@ -1062,6 +1550,7 @@ mod tests {
             tool_definitions: None,
             tool_call_arguments: None,
             tool_call_result: None,
+            evaluations: None,
         };
 
         assert_eq!(row.tenant_id, "tenant-a");
@@ -1070,6 +1559,7 @@ mod tests {
         assert_eq!(row.finish_reasons, Some(vec!["stop".to_string()]));
         assert_eq!(row.stop_sequences, None);
         assert_eq!(row.parent_span_id, None);
+        assert_eq!(row.evaluations, None);
     }
 
     #[test]
@@ -1094,7 +1584,7 @@ mod tests {
             },
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("tenant-a"), Some("svc"), 999)
+        let row = project_row(&span, None, &test_tenant("tenant-a"), Some("svc"), 999)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1120,7 +1610,7 @@ mod tests {
             kv_str("session.id", "sess-1"),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1147,7 +1637,7 @@ mod tests {
             kv_str("traceloop.workflow.name", "wf-1"),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1168,7 +1658,7 @@ mod tests {
             kv_str("llm.system", "oi-provider"),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1180,7 +1670,7 @@ mod tests {
     fn minimal_matching_span_leaves_optionals_null() {
         let span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1195,18 +1685,14 @@ mod tests {
     #[test]
     fn non_llm_span_yields_none() {
         let span = span_with(vec![kv_str("http.method", "GET")]);
-        assert!(
-            project_operation_row(&span, None, &test_tenant("t"), None, 1)
-                .expect("ok")
-                .is_none()
-        );
+        assert!(project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").is_none());
     }
 
     #[test]
     fn bad_trace_id_on_matching_span_is_err() {
         let mut span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
         span.trace_id = vec![0u8; 16];
-        assert!(project_operation_row(&span, None, &test_tenant("t"), None, 1).is_err());
+        assert!(project_row(&span, None, &test_tenant("t"), None, 1).is_err());
     }
 
     #[test]
@@ -1215,7 +1701,7 @@ mod tests {
             kv_str("gen_ai.operation.name", "chat"),
             kv_str("gen_ai.request.temperature", "hot"),
         ]);
-        assert!(project_operation_row(&span, None, &test_tenant("t"), None, 1).is_err());
+        assert!(project_row(&span, None, &test_tenant("t"), None, 1).is_err());
     }
 
     #[test]
@@ -1223,10 +1709,683 @@ mod tests {
         let mut span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
         span.start_time_unix_nano = 3_000_000_000;
         span.end_time_unix_nano = 1_000_000_000;
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.duration_micros, 0);
+    }
+
+    /// Build a `gen_ai.evaluation.result` span event carrying the given attributes.
+    fn evaluation_event(attributes: Vec<KeyValue>) -> Event {
+        Event {
+            time_unix_nano: 2_500_000_000,
+            name: "gen_ai.evaluation.result".to_string(),
+            attributes,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    /// Trace id [`span_with`] gives every fixture span.
+    const OWN_TRACE_ID: [u8; 16] = [1u8; 16];
+    /// Span id [`span_with`] gives every fixture span.
+    const OWN_SPAN_ID: [u8; 8] = [2u8; 8];
+
+    /// A span-scoped result named `name` about the fixture span itself, with
+    /// every other field empty; each case overrides the fields it is about.
+    fn result_about_own_span(name: &str) -> EvaluationResult {
+        EvaluationResult {
+            name: name.to_string(),
+            score_value: None,
+            score_label: None,
+            explanation: None,
+            response_id: None,
+            error_type: None,
+            annotator_kind: None,
+            identifier: None,
+            metadata: None,
+            target_scope: EvaluationScope::Span,
+            target_trace_id: Some(OWN_TRACE_ID),
+            target_span_id: Some(OWN_SPAN_ID),
+        }
+    }
+
+    /// Build a span link to the given ids.
+    fn link_to(trace_id: &[u8], span_id: &[u8]) -> Link {
+        Link {
+            trace_id: trace_id.to_vec(),
+            span_id: span_id.to_vec(),
+            trace_state: String::new(),
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn evaluation_events_on_an_llm_span_project_one_result_each_in_event_order() {
+        let mut span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("gen_ai.response.id", "resp-1"),
+        ]);
+        span.events = vec![
+            evaluation_event(vec![
+                kv_str("gen_ai.evaluation.name", "Relevance"),
+                kv_dbl("gen_ai.evaluation.score.value", 0.9),
+                kv_str("gen_ai.evaluation.score.label", "relevant"),
+                kv_str("gen_ai.response.id", "resp-1"),
+            ]),
+            evaluation_event(vec![
+                kv_str("gen_ai.evaluation.name", "Fluency"),
+                // An integer score is widened, as every double column is.
+                kv_int("gen_ai.evaluation.score.value", 4),
+                kv_str("gen_ai.evaluation.explanation", "reads naturally"),
+                kv_str("error.type", "timeout"),
+            ]),
+        ];
+        let row = project_row(&span, None, &test_tenant("tenant-a"), Some("svc"), 999)
+            .expect("projection ok")
+            .expect("llm span -> row");
+        // The LLM span keeps its own classification, and results recorded on it
+        // are about it.
+        assert_eq!(row.operation_name, "chat");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![
+                EvaluationResult {
+                    score_value: Some(0.9),
+                    score_label: Some("relevant".to_string()),
+                    response_id: Some("resp-1".to_string()),
+                    ..result_about_own_span("Relevance")
+                },
+                EvaluationResult {
+                    score_value: Some(4.0),
+                    explanation: Some("reads naturally".to_string()),
+                    error_type: Some("timeout".to_string()),
+                    ..result_about_own_span("Fluency")
+                },
+            ])
+        );
+        // An event's error.type belongs to that result, not to the row.
+        assert_eq!(row.error_type, None);
+    }
+
+    #[test]
+    fn dedicated_evaluator_span_with_only_an_evaluation_event_qualifies_as_evaluation() {
+        let mut span = span_with(vec![kv_str("http.method", "POST")]);
+        span.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 1.0),
+        ])];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("event-only evaluator span -> row");
+        assert_eq!(row.operation_name, "evaluation");
+        // An evaluation span's results are about something else, and it names
+        // no linked span, so what they evaluate is unknown.
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(1.0),
+                target_trace_id: None,
+                target_span_id: None,
+                ..result_about_own_span("Relevance")
+            }])
+        );
+    }
+
+    #[test]
+    fn an_unclassified_llm_span_carrying_evaluations_stays_other() {
+        // A provider marker qualified the span, so it is an operation of a kind
+        // no adapter can name; results evaluate it, they do not make it an
+        // evaluator.
+        let mut span = span_with(vec![kv_str("gen_ai.provider.name", "openai")]);
+        span.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.9),
+        ])];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.operation_name, "other");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.9),
+                ..result_about_own_span("Relevance")
+            }])
+        );
+    }
+
+    #[test]
+    fn a_flat_result_comes_before_event_results() {
+        let mut span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("gen_ai.evaluation.name", "Groundedness"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.25),
+            kv_str("gen_ai.evaluation.score.label", "fail"),
+            kv_str("gen_ai.evaluation.explanation", "cites nothing"),
+        ]);
+        span.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.75),
+        ])];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![
+                EvaluationResult {
+                    score_value: Some(0.25),
+                    score_label: Some("fail".to_string()),
+                    explanation: Some("cites nothing".to_string()),
+                    ..result_about_own_span("Groundedness")
+                },
+                EvaluationResult {
+                    score_value: Some(0.75),
+                    ..result_about_own_span("Relevance")
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_flat_result_leaves_the_spans_own_error_and_response_id_to_the_row() {
+        // On the span itself those keys describe the span's own operation — a
+        // failed LLM call, the LLM's response — not the evaluation of it.
+        let span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("error.type", "timeout"),
+            kv_str("gen_ai.response.id", "resp-2"),
+            kv_str("gen_ai.evaluation.name", "Groundedness"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.25),
+        ]);
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.error_type, Some("timeout".to_string()));
+        assert_eq!(row.response_id, Some("resp-2".to_string()));
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.25),
+                ..result_about_own_span("Groundedness")
+            }])
+        );
+    }
+
+    #[test]
+    fn dedicated_evaluator_span_with_only_evaluation_attributes_is_an_evaluation_row() {
+        let mut span = span_with(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.9),
+            kv_str("gen_ai.response.id", "resp-1"),
+        ]);
+        span.parent_span_id = vec![9u8; 8];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("evaluator span -> row");
+        assert_eq!(row.operation_name, "evaluation");
+        // Its parent stays on the row, but parentage never names what a result
+        // is about: with no link, the target is unknown.
+        assert_eq!(row.parent_span_id, Some([9u8; 8]));
+        assert_eq!(row.response_id, Some("resp-1".to_string()));
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.9),
+                target_trace_id: None,
+                target_span_id: None,
+                ..result_about_own_span("Relevance")
+            }])
+        );
+    }
+
+    #[test]
+    fn openinference_span_evaluations_project_in_index_order_with_their_provenance() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("evaluations.0.evaluation.name", "hallucination"),
+            kv_int("evaluations.0.evaluation.score", 1),
+            kv_str("evaluations.0.evaluation.label", "hallucinated"),
+            kv_str("evaluations.0.evaluation.explanation", "The claim is not supported."),
+            kv_str("evaluations.0.evaluation.annotator_kind", "LLM"),
+            kv_str("evaluations.0.evaluation.identifier", "judge-v2"),
+            kv_str("evaluations.0.evaluation.metadata", "{\"rubric_version\":\"2\"}"),
+            // Indices order as numbers, not as text, and need not be contiguous.
+            kv_dbl("evaluations.10.evaluation.score", 0.3),
+            kv_str("evaluations.10.evaluation.name", "toxicity"),
+            kv_str("evaluations.2.evaluation.name", "relevance"),
+            kv_str("evaluations.2.evaluation.label", "relevant"),
+        ]);
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.operation_name, "chat");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![
+                EvaluationResult {
+                    score_value: Some(1.0),
+                    score_label: Some("hallucinated".to_string()),
+                    explanation: Some("The claim is not supported.".to_string()),
+                    annotator_kind: Some("LLM".to_string()),
+                    identifier: Some("judge-v2".to_string()),
+                    metadata: Some("{\"rubric_version\":\"2\"}".to_string()),
+                    ..result_about_own_span("hallucination")
+                },
+                EvaluationResult {
+                    score_label: Some("relevant".to_string()),
+                    ..result_about_own_span("relevance")
+                },
+                EvaluationResult {
+                    score_value: Some(0.3),
+                    ..result_about_own_span("toxicity")
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn openinference_annotations_are_read_as_evaluations() {
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "CHAIN"),
+            kv_str("annotations.0.annotation.name", "hallucination"),
+            kv_int("annotations.0.annotation.score", 0),
+            kv_str("annotations.0.annotation.annotator_kind", "HUMAN"),
+        ]);
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.0),
+                annotator_kind: Some("HUMAN".to_string()),
+                ..result_about_own_span("hallucination")
+            }])
+        );
+    }
+
+    #[test]
+    fn openinference_trace_and_session_feedback_keep_their_scope() {
+        // Neither is about the span it is recorded on, so neither may read as
+        // span feedback: a trace result names the trace, a session result the
+        // session in the row's `conversation_id`.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "CHAIN"),
+            kv_str("session.id", "session-123"),
+            kv_str("trace.evaluations.0.evaluation.name", "retrieval_quality"),
+            kv_dbl("trace.evaluations.0.evaluation.score", 0.92),
+            kv_str("session.annotations.0.annotation.name", "conversational_coherence"),
+            kv_str("session.annotations.0.annotation.label", "coherent"),
+        ]);
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.conversation_id, Some("session-123".to_string()));
+        assert_eq!(
+            row.evaluations,
+            Some(vec![
+                EvaluationResult {
+                    score_value: Some(0.92),
+                    target_scope: EvaluationScope::Trace,
+                    target_span_id: None,
+                    ..result_about_own_span("retrieval_quality")
+                },
+                EvaluationResult {
+                    score_label: Some("coherent".to_string()),
+                    target_scope: EvaluationScope::Session,
+                    target_trace_id: None,
+                    target_span_id: None,
+                    ..result_about_own_span("conversational_coherence")
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_span_carrying_only_openinference_evaluations_is_an_evaluation() {
+        let span = span_with(vec![
+            kv_str("evaluations.0.evaluation.name", "relevance"),
+            kv_dbl("evaluations.0.evaluation.score", 0.8),
+        ]);
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("evaluation-only span -> row");
+        assert_eq!(row.operation_name, "evaluation");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.8),
+                target_trace_id: None,
+                target_span_id: None,
+                ..result_about_own_span("relevance")
+            }])
+        );
+    }
+
+    #[test]
+    fn openinference_metadata_that_is_not_a_json_object_is_left_null() {
+        // The field's contract is a JSON object; anything else is dropped from
+        // the result rather than stored as if it were one.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("evaluations.0.evaluation.name", "relevance"),
+            kv_dbl("evaluations.0.evaluation.score", 0.8),
+            kv_str("evaluations.0.evaluation.metadata", "[1, 2]"),
+            kv_str("evaluations.1.evaluation.name", "fluency"),
+            kv_dbl("evaluations.1.evaluation.score", 0.6),
+            kv_str("evaluations.1.evaluation.metadata", "not json"),
+        ]);
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        let results = row.evaluations.expect("both results kept");
+        assert_eq!(
+            results.iter().map(|result| result.metadata.clone()).collect::<Vec<_>>(),
+            vec![None, None]
+        );
+    }
+
+    #[test]
+    fn an_openinference_array_is_read_only_through_its_named_first_element() {
+        // Indices are zero-based and every element is named, so a named first
+        // element is how an array is recognized without scanning every key of
+        // every span.
+        let unmarked = span_with(vec![
+            kv_str("evaluations.1.evaluation.name", "relevance"),
+            kv_dbl("evaluations.1.evaluation.score", 0.8),
+        ]);
+        assert_eq!(
+            project_row(&unmarked, None, &test_tenant("t"), None, 1).expect("ok"),
+            None
+        );
+        let mut marked = unmarked;
+        marked.attributes.push(kv_str("gen_ai.operation.name", "chat"));
+        let row = project_row(&marked, None, &test_tenant("t"), None, 1)
             .expect("ok")
             .expect("row");
-        assert_eq!(row.duration_micros, 0);
+        assert_eq!(row.evaluations, None);
+    }
+
+    #[test]
+    fn keys_that_only_share_an_evaluation_prefix_are_not_results() {
+        let span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("evaluations.0.evaluation.name", "relevance"),
+            kv_dbl("evaluations.0.evaluation.score", 0.8),
+            kv_int("evaluations.count", 1),
+            kv_str("evaluations.x.evaluation.name", "not an index"),
+            kv_str("evaluations.1.other.name", "not the element"),
+            kv_str("evaluationsx.1.evaluation.name", "not the prefix"),
+        ]);
+        let projected = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
+        assert_eq!(projected.skipped_evaluations, 0);
+        assert_eq!(
+            projected.row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.8),
+                ..result_about_own_span("relevance")
+            }])
+        );
+    }
+
+    #[test]
+    fn element_field_suffixes_are_never_read_off_the_span_itself() {
+        // `OpenInference` keys an element's fields by bare suffixes; a span that
+        // merely has attributes spelled that way states no result.
+        let span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("name", "hallucination"),
+            kv_int("score", 1),
+        ]);
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.evaluations, None);
+    }
+
+    #[test]
+    fn attribute_results_come_before_event_results() {
+        let mut span = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("evaluations.0.evaluation.name", "relevance"),
+            kv_dbl("evaluations.0.evaluation.score", 0.8),
+        ]);
+        span.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Fluency"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.6),
+        ])];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        let names: Vec<String> = row
+            .evaluations
+            .expect("two results")
+            .into_iter()
+            .map(|result| result.name)
+            .collect();
+        assert_eq!(names, vec!["relevance".to_string(), "Fluency".to_string()]);
+    }
+
+    #[test]
+    fn an_evaluation_span_with_one_link_is_about_the_linked_span() {
+        // A post-hoc carrier: the results describe the span its single link
+        // points at, not the carrier.
+        let mut span = span_with(vec![
+            kv_str("openinference.span.kind", "EVALUATOR"),
+            kv_str("evaluations.0.evaluation.name", "hallucination"),
+            kv_str("evaluations.0.evaluation.label", "hallucinated"),
+            kv_str("trace.evaluations.0.evaluation.name", "retrieval_quality"),
+            kv_dbl("trace.evaluations.0.evaluation.score", 0.5),
+        ]);
+        span.links = vec![link_to(&[7u8; 16], &[8u8; 8])];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.operation_name, "evaluation");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![
+                EvaluationResult {
+                    score_label: Some("hallucinated".to_string()),
+                    target_trace_id: Some([7u8; 16]),
+                    target_span_id: Some([8u8; 8]),
+                    ..result_about_own_span("hallucination")
+                },
+                EvaluationResult {
+                    score_value: Some(0.5),
+                    target_scope: EvaluationScope::Trace,
+                    target_trace_id: Some([7u8; 16]),
+                    target_span_id: None,
+                    ..result_about_own_span("retrieval_quality")
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn an_evaluation_event_on_a_linked_evaluation_span_is_about_the_linked_span() {
+        let mut span = span_with(Vec::new());
+        span.links = vec![link_to(&[7u8; 16], &[8u8; 8])];
+        span.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.4),
+        ])];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.operation_name, "evaluation");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.4),
+                target_trace_id: Some([7u8; 16]),
+                target_span_id: Some([8u8; 8]),
+                ..result_about_own_span("Relevance")
+            }])
+        );
+    }
+
+    #[test]
+    fn a_non_evaluation_span_keeps_its_results_even_with_one_link() {
+        // A link on an LLM span relates it to other work; its own results are
+        // still about itself.
+        let mut span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
+        span.links = vec![link_to(&[7u8; 16], &[8u8; 8])];
+        span.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.4),
+        ])];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.4),
+                ..result_about_own_span("Relevance")
+            }])
+        );
+    }
+
+    #[test]
+    fn an_evaluation_span_without_exactly_one_usable_link_has_no_known_target() {
+        let event = evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.4),
+        ]);
+        let mut several = span_with(Vec::new());
+        several.links = vec![link_to(&[7u8; 16], &[8u8; 8]), link_to(&[5u8; 16], &[6u8; 8])];
+        let mut partly_dropped = span_with(Vec::new());
+        partly_dropped.links = vec![link_to(&[7u8; 16], &[8u8; 8])];
+        partly_dropped.dropped_links_count = 1;
+        let mut invalid = span_with(Vec::new());
+        invalid.links = vec![link_to(&[0u8; 16], &[8u8; 8])];
+        for mut span in [several, partly_dropped, invalid] {
+            span.events = vec![event.clone()];
+            let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+            assert_eq!(
+                row.evaluations,
+                Some(vec![EvaluationResult {
+                    score_value: Some(0.4),
+                    target_trace_id: None,
+                    target_span_id: None,
+                    ..result_about_own_span("Relevance")
+                }]),
+                "links: {:?}, dropped: {}",
+                span.links.len(),
+                span.dropped_links_count
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_evaluation_score_drops_the_row_wherever_it_sits() {
+        // D6: a present, non-numeric score is a projection failure for a flat
+        // result, an event result, and an array element alike.
+        let flat = span_with(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_str("gen_ai.evaluation.score.value", "high"),
+        ]);
+        let mut event = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
+        event.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_str("gen_ai.evaluation.score.value", "high"),
+        ])];
+        let array = span_with(vec![
+            kv_str("openinference.span.kind", "LLM"),
+            kv_str("evaluations.0.evaluation.name", "relevance"),
+            kv_str("evaluations.0.evaluation.score", "high"),
+        ]);
+        for span in [flat, event, array] {
+            let error =
+                project_row(&span, None, &test_tenant("t"), None, 1).expect_err("strict parse failure drops the row");
+            assert!(matches!(error, IngestError::Validation(_)), "{error}");
+        }
+    }
+
+    #[test]
+    fn incomplete_evaluation_results_are_skipped_and_counted_without_dropping_the_row() {
+        // A result must name its metric and carry an outcome: a score, a label,
+        // an explanation, or the error the evaluation ended in. One that does
+        // not cannot be attributed to anything, so it is left out, not stored.
+        let mut span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("evaluations.0.evaluation.name", "relevance"),
+            kv_str("evaluations.0.evaluation.annotator_kind", "HUMAN"),
+        ]);
+        span.events = vec![
+            evaluation_event(vec![kv_dbl("gen_ai.evaluation.score.value", 0.5)]),
+            evaluation_event(Vec::new()),
+            evaluation_event(vec![kv_str("gen_ai.evaluation.name", "Relevance")]),
+            evaluation_event(vec![
+                kv_str("gen_ai.evaluation.name", ""),
+                kv_dbl("gen_ai.evaluation.score.value", 0.1),
+            ]),
+            evaluation_event(vec![
+                kv_str("gen_ai.evaluation.name", "Fluency"),
+                kv_str("error.type", "timeout"),
+            ]),
+        ];
+        let projected = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("an incomplete result never fails the row")
+            .expect("row");
+        assert_eq!(projected.skipped_evaluations, 5);
+        assert_eq!(projected.row.operation_name, "chat");
+        assert_eq!(
+            projected.row.evaluations,
+            Some(vec![EvaluationResult {
+                error_type: Some("timeout".to_string()),
+                ..result_about_own_span("Fluency")
+            }])
+        );
+    }
+
+    #[test]
+    fn a_repeated_key_in_an_evaluation_event_resolves_to_its_last_value() {
+        // The same last-write-wins rule the span's own attributes follow; an
+        // entry without a value does not hide the one before it.
+        let mut span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
+        span.events = vec![evaluation_event(vec![
+            kv_str("gen_ai.evaluation.name", "Draft"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.1),
+            kv_str("gen_ai.evaluation.name", "Relevance"),
+            kv_dbl("gen_ai.evaluation.score.value", 0.9),
+            KeyValue {
+                key_strindex: 0,
+                key: "gen_ai.evaluation.name".to_string(),
+                value: None,
+            },
+        ])];
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(
+            row.evaluations,
+            Some(vec![EvaluationResult {
+                score_value: Some(0.9),
+                ..result_about_own_span("Relevance")
+            }])
+        );
+    }
+
+    #[test]
+    fn a_span_whose_results_are_all_incomplete_stores_a_null_list() {
+        let mut span = span_with(vec![kv_str("gen_ai.operation.name", "chat")]);
+        span.events = vec![evaluation_event(vec![kv_dbl("gen_ai.evaluation.score.value", 0.5)])];
+        let projected = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            .expect("ok")
+            .expect("row");
+        assert_eq!(projected.skipped_evaluations, 1);
+        assert_eq!(projected.row.evaluations, None);
+    }
+
+    #[test]
+    fn error_type_and_response_id_alone_never_make_an_evaluation_result() {
+        // Both keys are shared with row-level columns; only the evaluation name
+        // opens a flat result.
+        let span = span_with(vec![
+            kv_str("gen_ai.operation.name", "chat"),
+            kv_str("error.type", "timeout"),
+            kv_str("gen_ai.response.id", "resp-1"),
+        ]);
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
+        assert_eq!(row.evaluations, None);
+        assert_eq!(row.error_type, Some("timeout".to_string()));
+    }
+
+    #[test]
+    fn a_score_without_a_name_does_not_qualify_a_span() {
+        let span = span_with(vec![kv_dbl("gen_ai.evaluation.score.value", 0.9)]);
+        assert_eq!(project_row(&span, None, &test_tenant("t"), None, 1).expect("ok"), None);
+    }
+
+    #[test]
+    fn an_unrelated_span_event_does_not_qualify_a_span() {
+        let mut span = span_with(vec![kv_str("http.method", "GET")]);
+        span.events = vec![Event {
+            time_unix_nano: 1_500_000_000,
+            name: "exception".to_string(),
+            attributes: vec![kv_str("exception.type", "IOError")],
+            dropped_attributes_count: 0,
+        }];
+        assert_eq!(project_row(&span, None, &test_tenant("t"), None, 1).expect("ok"), None);
     }
 
     /// Build a Claude Code span with the given name and attributes.
@@ -1278,7 +2437,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("tenant-a"), Some("claude-code"), 1)
+        let row = project_row(&span, None, &test_tenant("tenant-a"), Some("claude-code"), 1)
             .expect("projection ok")
             .expect("llm span -> row");
 
@@ -1315,7 +2474,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("interaction span -> row");
 
@@ -1336,7 +2495,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1360,7 +2519,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1376,7 +2535,7 @@ mod tests {
             vec![kv_str("tool_name", "Bash"), kv_str("span.type", "tool")],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1395,7 +2554,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1417,7 +2576,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1436,7 +2595,7 @@ mod tests {
             ],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("interaction span -> row");
 
@@ -1467,7 +2626,7 @@ mod tests {
             kv_str("llm.output_messages.0.message.content", "4"),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("an OpenInference LLM span -> row");
 
@@ -1491,7 +2650,7 @@ mod tests {
             kv_str("llm.tools.0.tool.json_schema", r#"{"name":"web_search"}"#),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1511,7 +2670,7 @@ mod tests {
             kv_str("llm.input_messages.0.message.content", "flattened"),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1534,7 +2693,7 @@ mod tests {
             ),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1557,9 +2716,7 @@ mod tests {
             kv_str("openinference.span.kind", "LLM"),
             kv_str("llm.invocation_parameters", r#"{"max_completion_tokens":8192}"#),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         assert_eq!(row.max_tokens, Some(8192));
     }
 
@@ -1574,9 +2731,7 @@ mod tests {
                 r#"{"top_k":40.0,"max_tokens":512.0,"seed":7.0,"n":3.0}"#,
             ),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         assert_eq!(row.top_k, Some(40));
         assert_eq!(row.max_tokens, Some(512));
         assert_eq!(row.seed, Some(7));
@@ -1621,9 +2776,7 @@ mod tests {
                 kv_int("llm.token_count.total", 42),
                 kv_str("llm.invocation_parameters", blob),
             ]);
-            let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-                .expect("ok")
-                .expect("row");
+            let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
             assert_eq!(row.max_tokens, None, "blob {blob} must not populate max_tokens");
             assert_eq!(row.total_tokens, Some(42), "the rest of the row survives blob {blob}");
         }
@@ -1636,9 +2789,7 @@ mod tests {
             kv_dbl("gen_ai.request.temperature", 0.1),
             kv_str("llm.invocation_parameters", r#"{"temperature":0.9}"#),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         assert!((row.temperature.expect("temperature") - 0.1).abs() < f64::EPSILON);
     }
 
@@ -1658,7 +2809,7 @@ mod tests {
                 kv_int("llm.token_count.total", 42),
                 kv_str("llm.invocation_parameters", blob),
             ]);
-            let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+            let row = project_row(&span, None, &test_tenant("t"), None, 1)
                 .expect("a bad blob must not fail the projection")
                 .expect("row survives");
             assert_eq!(row.temperature, None, "blob {blob} must not populate temperature");
@@ -1676,7 +2827,7 @@ mod tests {
             kv_str("tool.parameters", r#"{"q":"string"}"#),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1694,9 +2845,7 @@ mod tests {
             kv_str("tool.parameters", r#"{"q":"string"}"#),
             kv_str("tool.json_schema", r#"{"type":"function"}"#),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         assert_eq!(
             row.tool_definitions.as_deref(),
             Some(r#"{"type":"function"}"#),
@@ -1713,7 +2862,7 @@ mod tests {
             kv_str("openinference.span.kind", "LLM"),
             kv_str("llm.finish_reason", "stop"),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("a singular finish reason must not drop the row")
             .expect("row");
         assert_eq!(row.finish_reasons, Some(vec!["stop".to_string()]));
@@ -1736,9 +2885,7 @@ mod tests {
                 }),
             },
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         assert_eq!(row.finish_reasons, Some(vec!["length".to_string()]));
     }
 
@@ -1748,9 +2895,7 @@ mod tests {
             kv_str("openinference.span.kind", "LLM"),
             kv_str("llm.provider", "azure"),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         assert_eq!(row.provider_name.as_deref(), Some("azure"));
     }
 
@@ -1763,9 +2908,7 @@ mod tests {
             kv_str("llm.provider", "azure"),
             kv_str("llm.system", "openai"),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         assert_eq!(row.provider_name.as_deref(), Some("openai"));
     }
 
@@ -1773,9 +2916,7 @@ mod tests {
     fn embedding_and_reranker_model_names_fill_request_model() {
         for key in ["embedding.model_name", "reranker.model_name"] {
             let span = span_with(vec![kv_str("openinference.span.kind", "LLM"), kv_str(key, "model-x")]);
-            let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-                .expect("ok")
-                .expect("row");
+            let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
             assert_eq!(
                 row.request_model.as_deref(),
                 Some("model-x"),
@@ -1792,9 +2933,7 @@ mod tests {
             kv_str("llm.prompts.0.prompt.text", "def fib(n):"),
             kv_str("llm.choices.0.completion.text", " return n"),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         let input: serde_json::Value =
             serde_json::from_str(row.input_messages.as_deref().expect("present")).expect("json");
         assert_eq!(input[0]["text"], "def fib(n):");
@@ -1811,9 +2950,7 @@ mod tests {
             kv_str("llm.input_messages.0.message.role", "user"),
             kv_str("llm.input_messages.0.message.content", "chat"),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
-            .expect("ok")
-            .expect("row");
+        let row = project_row(&span, None, &test_tenant("t"), None, 1).expect("ok").expect("row");
         let input: serde_json::Value =
             serde_json::from_str(row.input_messages.as_deref().expect("present")).expect("json");
         assert_eq!(input[0]["content"], "chat");
@@ -1826,7 +2963,7 @@ mod tests {
             kv_str("session.id", "conv-42"),
         ]);
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
 
@@ -1841,7 +2978,7 @@ mod tests {
             kv_str("gen_ai.operation.name", "chat"),
             kv_dbl("gen_ai.response.time_to_first_chunk", 1.3),
         ]);
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("row");
         assert_eq!(row.time_to_first_chunk_ms, Some(1300));
@@ -1852,14 +2989,14 @@ mod tests {
         // Claude Code's flat token keys inherit the same strict non-negative
         // contract as every other adapter: a negative count drops the row (D6).
         let span = claude_span("claude_code.llm_request", vec![kv_str("input_tokens", "-5")]);
-        assert!(project_operation_row(&span, None, &test_tenant("t"), None, 1).is_err());
+        assert!(project_row(&span, None, &test_tenant("t"), None, 1).is_err());
     }
 
     #[test]
     fn claude_code_negative_ttft_ms_drops_row() {
         // Exercises the unit-aware resolver's negative guard on the `_ms` path.
         let span = claude_span("claude_code.llm_request", vec![kv_str("ttft_ms", "-1")]);
-        assert!(project_operation_row(&span, None, &test_tenant("t"), None, 1).is_err());
+        assert!(project_row(&span, None, &test_tenant("t"), None, 1).is_err());
     }
 
     #[test]
@@ -1873,7 +3010,7 @@ mod tests {
                 kv_str("span.type", "tool.execution"),
             ],
         );
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool.execution span -> row");
         assert_eq!(row.operation_name, "execute_tool");
@@ -1893,7 +3030,7 @@ mod tests {
             ])],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1918,7 +3055,7 @@ mod tests {
             ])],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
@@ -1947,7 +3084,7 @@ mod tests {
             ])],
         );
 
-        let row = project_operation_row(&span, None, &test_tenant("t"), None, 1)
+        let row = project_row(&span, None, &test_tenant("t"), None, 1)
             .expect("projection ok")
             .expect("tool span -> row");
 
