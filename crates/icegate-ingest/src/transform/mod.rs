@@ -2,11 +2,13 @@
 //!
 //! Split by signal: `logs`, `metrics`, `operations`, and `spans` each own their schema
 //! accessor and `*_to_record_batch` entry point. Shared attribute-flattening, map-field,
-//! and byte-validation helpers live in `attributes`.
+//! and byte-validation helpers live in `attributes`; builders for the nested
+//! `List<Struct>` columns live in `nested_builders`.
 
 mod attributes;
 mod logs;
 mod metrics;
+mod nested_builders;
 pub(crate) mod operations;
 mod spans;
 
