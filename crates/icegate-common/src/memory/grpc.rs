@@ -1,4 +1,4 @@
-//! Tonic gRPC adapter for the memory-pressure guard (feature `shed-tonic`).
+//! Tonic gRPC adapter for the memory-pressure guard (feature `grpc`).
 //!
 //! [`MemoryShedInterceptor`] runs on `Request<()>` (metadata only) at the transport
 //! layer — before protobuf decode, session build, and the handler — rejecting RPCs

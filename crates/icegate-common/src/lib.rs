@@ -110,8 +110,11 @@ pub mod retrier;
 pub mod schema;
 /// Storage configuration.
 pub mod storage;
-/// Tenant identification and the ingest tenant policy.
+/// Tenant identification and the tenant policy every surface resolves through.
 pub mod tenant;
+/// Tonic interceptor resolving the tenant of one gRPC request.
+#[cfg(feature = "grpc")]
+pub mod tenant_interceptor;
 /// OpenTelemetry tracing configuration and utilities.
 pub mod tracing;
 /// Compaction-safe resolution of the last committed WAL offset from snapshots.
@@ -127,7 +130,7 @@ pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle};
 pub use config::{ServerConfig, check_port_conflicts, load_config_file};
 pub use error::{CommonError as Error, Result};
 pub use manifest_scan::{DataFileStats, list_data_files_with_stats};
-#[cfg(feature = "shed-tonic")]
+#[cfg(feature = "grpc")]
 pub use memory::MemoryShedInterceptor;
 pub use memory::{
     MemoryPressure, MemoryPressureConfig, MemoryPressureSampler, SHED_RETRY_AFTER_SECS, ShedPolicy, UsageReader,
@@ -148,9 +151,11 @@ pub use storage::{
     is_retryable_error_source, is_retryable_object_store_error, register_foyer_metrics,
 };
 pub use tenant::{
-    DEFAULT_TENANT_ID, TENANT_ID_HEADER, TenantHeader, TenantId, TenantPolicy, TenantRejection, TenantResolver,
-    is_valid_tenant_id, resolve_tenant_id,
+    DEFAULT_TENANT_ID, TENANT_ID_HEADER, TenantHeader, TenantId, TenantPolicy, TenantRejection,
+    TenantRejectionRecorder, TenantResolver, is_valid_tenant_id,
 };
+#[cfg(feature = "grpc")]
+pub use tenant_interceptor::TenantPolicyInterceptor;
 // Re-exported so `CatalogBuilder::from_config` callers can name the shutdown
 // token type without a direct `tokio-util` dependency.
 pub use tokio_util::sync::CancellationToken;

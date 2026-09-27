@@ -4,9 +4,9 @@
 //! [`SessionStateProvider::new_context`] for every incoming Flight SQL
 //! request. We use that hook to:
 //!
-//! 1. Extract the tenant identifier from the gRPC `x-scope-orgid`
-//!    metadata header (falling back to the shared `default` tenant when
-//!    absent or malformed, mirroring the Loki/Tempo behaviour).
+//! 1. Read the [`TenantId`] the tenant interceptor resolved and placed in
+//!    the request extensions (see
+//!    [`TenantPolicyInterceptor`](icegate_common::TenantPolicyInterceptor)).
 //! 2. Build a fresh `SessionContext` via the shared [`QueryEngine`].
 //! 3. Swap the session's `iceberg` catalog for a
 //!    [`TenantScopedCatalogProvider`] decorator. The decorator:
@@ -26,10 +26,10 @@ use datafusion::catalog::CatalogProvider;
 use datafusion::execution::context::SessionState;
 use datafusion::prelude::SessionContext;
 use datafusion_flight_sql_server::session::SessionStateProvider;
+use icegate_common::TenantId;
 use tonic::{Request, Status};
 
 use super::tenant_catalog::TenantScopedCatalogProvider;
-use super::tenant_id::resolve_tenant_id;
 use crate::engine::QueryEngine;
 
 /// IceGate-specific `SessionStateProvider`.
@@ -52,7 +52,17 @@ impl IceGateSessionStateProvider {
 #[async_trait]
 impl SessionStateProvider for IceGateSessionStateProvider {
     async fn new_context(&self, request: &Request<()>) -> Result<SessionState, Status> {
-        let tenant_id = resolve_tenant_id(request.metadata());
+        // `internal`, not `unauthenticated`: an absent extension means the
+        // server was assembled without the tenant interceptor — a defect in the
+        // wiring, not a property of the request. That the upstream service
+        // carries the extensions of the original request into the one handed
+        // here, on `GetFlightInfo` and on the `DoGet` that streams a statement's
+        // rows alike, is pinned by `each_tenant_sees_only_their_own_rows` in
+        // `tests/flight_sql/tenant.rs`.
+        let tenant_id = request
+            .extensions()
+            .get::<TenantId>()
+            .ok_or_else(|| Status::internal("flight-sql: the tenant interceptor did not run"))?;
         let ctx = self
             .engine
             .create_session()
@@ -62,7 +72,7 @@ impl SessionStateProvider for IceGateSessionStateProvider {
         // `catalog_name` (default `iceberg`); look it up under the same
         // name rather than a hardcoded constant so a non-default catalog
         // name doesn't break every request.
-        install_tenant_scope(&ctx, &self.engine.config().catalog_name, &tenant_id)
+        install_tenant_scope(&ctx, &self.engine.config().catalog_name, tenant_id.as_ref())
             .map_err(|err| Status::internal(format!("flight-sql: tenant scope installation failed: {err}")))?;
         Ok(ctx.state())
     }
@@ -92,6 +102,3 @@ fn install_tenant_scope(
     ctx.register_catalog(catalog_name, wrapped);
     Ok(())
 }
-
-// Unit tests for tenant resolution live in `tenant_id.rs` so this file
-// stays focused on the session-state-provider plumbing.

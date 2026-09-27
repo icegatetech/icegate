@@ -15,24 +15,16 @@ datasources:
   datasources.yaml:
     apiVersion: 1
     datasources:
-      - name: Loki
-        type: loki
-        access: proxy
-        url: http://icegate-query.icegate.svc.cluster.local.:3100
-        isDefault: false
-        editable: false
-      - name: Tempo
-        type: tempo
-        access: proxy
-        url: http://icegate-query.icegate.svc.cluster.local.:3200
-        isDefault: false
-        editable: false
       - name: Prometheus
         type: prometheus
         access: proxy
         url: http://prometheus-kube-prometheus-prometheus.observability.svc.cluster.local.:9090
         isDefault: false
         editable: false
+      # The stands write one tenant, `demo` (ingest.tenant of each overlay), and
+      # their query service runs `multi`, which refuses a query that carries no
+      # X-Scope-OrgID. So every datasource that reads IceGate sends the header.
+      #
       # Demo datasources are wired together for trace<->logs
       # correlation. Stable `uid:` values let each side reference
       # the other by UID (Grafana's `tracesToLogsV2` and

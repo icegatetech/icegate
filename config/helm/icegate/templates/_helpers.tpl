@@ -175,22 +175,26 @@ backend: !s3
 {{- end }}
 
 {{/*
-Render the ingest tenant policy (zero-indented).
+Render a component's tenant policy (zero-indented).
 Produces the YAML tagged union: `!single { id }` or `!multi`.
 Callers must use `nindent N` to place at the correct indentation level.
 
 `fail` rather than a default: a `single` policy with no id would deserialize into
-an empty tenant that no request can name, and the pod would reject every batch.
+an empty tenant that no request can name, and the pod would reject every request
+— a batch on the write side, a query on the read side.
+
+Usage: include "icegate.tenantYaml" (dict "context" . "component" "query")
 */}}
 {{- define "icegate.tenantYaml" -}}
-{{- if eq .Values.ingest.tenant.mode "single" -}}
-{{- if not .Values.ingest.tenant.id }}{{ fail "ingest.tenant.id is required when ingest.tenant.mode is single" }}{{ end -}}
+{{- $tenant := (index .context.Values .component).tenant -}}
+{{- if eq $tenant.mode "single" -}}
+{{- if not $tenant.id }}{{ fail (printf "%s.tenant.id is required when %s.tenant.mode is single" .component .component) }}{{ end -}}
 tenant: !single
-  id: {{ .Values.ingest.tenant.id | quote }}
-{{- else if eq .Values.ingest.tenant.mode "multi" -}}
+  id: {{ $tenant.id | quote }}
+{{- else if eq $tenant.mode "multi" -}}
 tenant: !multi
 {{- else -}}
-{{ fail (printf "ingest.tenant.mode must be single or multi, got %q" .Values.ingest.tenant.mode) }}
+{{ fail (printf "%s.tenant.mode must be single or multi, got %q" .component $tenant.mode) }}
 {{- end -}}
 {{- end }}
 

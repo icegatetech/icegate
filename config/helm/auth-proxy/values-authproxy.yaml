@@ -11,6 +11,16 @@
 ## sender addresses rather than what icegate binds. Leave any of them at its
 ## chart default and the pod either refuses to start, publishes icegate
 ## unguarded, or answers on a port no sender was told to use.
+query:
+  ## Ingest below writes the tenants the tokens name, so query reads the tenant
+  ## the reader names in x-scope-orgid; under the chart default (`single` on
+  ## `default`) nothing written through the proxy could be read. The proxy fronts
+  ## ingest alone (README.md, "What it does not cover"): the header is believed
+  ## as sent, so the query port must be reachable only by readers already trusted
+  ## to name any tenant.
+  tenant:
+    mode: multi
+
 ingest:
   ## The proxy writes x-scope-orgid from the token's tenant_id claim, so the
   ## tenant comes from the token. `single` is legitimate here only when the

@@ -2,11 +2,10 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use icegate_common::MemoryPressure;
 use tokio_util::sync::CancellationToken;
 
 use super::PrometheusConfig;
-use crate::engine::QueryEngine;
+use crate::{engine::QueryEngine, infra::runtime::QueryRuntime};
 
 /// Shared application state for Prometheus server
 #[derive(Clone)]
@@ -22,16 +21,20 @@ pub struct PrometheusState {
 ///
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
-    engine: Arc<QueryEngine>,
+    runtime: QueryRuntime,
     config: PrometheusConfig,
     cancel_token: CancellationToken,
-    pressure: MemoryPressure,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
-    let state = PrometheusState { engine };
+    let state = PrometheusState {
+        engine: Arc::clone(&runtime.engine),
+    };
 
-    let app = super::routes::routes(state, pressure);
+    // No tenant layer: every handler of this surface is a `501` stub that reads
+    // no tenant (`prometheus/handlers.rs`). It goes on when PromQL does, and
+    // until then a layer here would refuse requests the surface never serves.
+    let app = super::routes::routes(state, runtime.pressure.clone());
 
     tracing::info!("Prometheus API server listening on {}", addr);
 

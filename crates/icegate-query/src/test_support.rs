@@ -10,9 +10,43 @@ use async_trait::async_trait;
 use axum::Router;
 use iceberg::table::Table;
 use iceberg::{Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation, TableIdent};
+use icegate_common::{MemoryPressure, MemoryPressureConfig, MemoryPressureSampler, UsageReader};
 use tokio::net::TcpListener;
 
 use crate::engine::{QueryEngine, QueryEngineConfig};
+
+/// `UsageReader` whose usage sits above the default high watermark;
+/// [`build_pressured_memory`] asserts that it does.
+struct NearlyFullMemoryReader;
+
+impl UsageReader for NearlyFullMemoryReader {
+    fn limit_bytes(&self) -> u64 {
+        100
+    }
+
+    fn read_working_set_bytes(&self) -> icegate_common::error::Result<u64> {
+        Ok(95)
+    }
+}
+
+/// Build a [`MemoryPressure`] handle that reports pressure under the default
+/// [`MemoryPressureConfig`], without touching a real cgroup.
+///
+/// Asserts the handle is under pressure before returning it, so a watermark
+/// default moving past the reader's usage fails here rather than letting the
+/// bypass cases — a probe expected to answer under pressure — pass with no
+/// pressure to bypass.
+pub fn build_pressured_memory() -> MemoryPressure {
+    let sampler =
+        MemoryPressureSampler::with_reader(&MemoryPressureConfig::default(), Arc::new(NearlyFullMemoryReader));
+    let pressure = sampler.handle();
+    sampler.sample_once().expect("sample the stub reader");
+    assert!(
+        pressure.is_under_pressure(),
+        "the stub reader's usage must cross the default high watermark"
+    );
+    pressure
+}
 
 /// Catalog whose every call never completes.
 ///

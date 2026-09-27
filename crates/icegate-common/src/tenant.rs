@@ -1,17 +1,18 @@
-//! Tenant identification and the ingest tenant policy.
+//! Tenant identification and the tenant policy every surface resolves through.
 //!
-//! Two independent policies live here, and they are not interchangeable:
+//! [`TenantPolicy`] is the deployment's decision, and it never falls back
+//! silently: a request whose header names a tenant the deployment does not serve
+//! is rejected, so a sender is never told its data landed in its own tenant
+//! while it was written to another one, and a reader is never handed another
+//! tenant's rows because its own header was malformed.
 //!
-//! - [`resolve_tenant_id`] is the read-side fallback shared by the query
-//!   protocols (Loki, Tempo, Flight SQL): an absent or malformed header resolves
-//!   to [`DEFAULT_TENANT_ID`].
-//! - [`TenantPolicy`] is the write-side decision used by ingest. It never falls
-//!   back silently: a request whose header names a tenant the deployment does not
-//!   serve is rejected, so a sender is never told its data landed in its own
-//!   tenant while it was written to another one.
+//! Where the refusal is counted is [`TenantRejectionRecorder`]: the counter name
+//! and its label set belong to the component, so this crate states the port and
+//! nothing about the metric behind it.
 
 use std::{fmt, sync::Arc};
 
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CommonError, Result};
@@ -35,25 +36,6 @@ pub fn is_valid_tenant_id(value: &str) -> bool {
     TenantId::is_valid(value)
 }
 
-/// Resolve a tenant identifier from an optional raw header value.
-///
-/// Returns the value when present and valid per [`TenantId::is_valid`],
-/// otherwise [`DEFAULT_TENANT_ID`]. This is the single fallback policy
-/// shared by every query protocol (Loki, Tempo, Flight SQL); callers only
-/// differ in how they pull the raw string out of their header/metadata
-/// map, so centralising the validate-or-default step here keeps tenant
-/// resolution defined in exactly one place.
-///
-/// Ingest does **not** use this function: a write resolves through
-/// [`TenantResolver`], which fails closed instead of defaulting.
-#[must_use]
-pub fn resolve_tenant_id(header_value: Option<&str>) -> String {
-    // TODO(high): deprecated, use TenantResolver in query component
-    header_value
-        .filter(|value| TenantId::is_valid(value))
-        .map_or_else(|| DEFAULT_TENANT_ID.to_string(), String::from)
-}
-
 /// The configuration error a single-tenant policy naming an unusable identifier
 /// is refused with.
 ///
@@ -67,7 +49,7 @@ fn invalid_tenant_id_error(id: &str) -> CommonError {
     ))
 }
 
-/// Tenant identifier carried through one ingest request.
+/// Tenant identifier carried through one request, write or read.
 ///
 /// `Arc<str>` rather than `String`: in [`TenantResolver::Single`] the configured
 /// identifier is cloned once per request and a clone is a refcount bump, so the
@@ -161,6 +143,16 @@ impl<'a> TenantHeader<'a> {
         }
         Self::Once(first.unwrap_or(""))
     }
+
+    /// Read the header from the header map of one HTTP request.
+    ///
+    /// Stated once for every HTTP surface, so an OTLP/HTTP write and a Loki or
+    /// Tempo read carrying the same header resolve it the same way; what the
+    /// values mean is [`Self::from_values`].
+    #[must_use]
+    pub fn from_header_map(headers: &'a HeaderMap) -> Self {
+        Self::from_values(headers.get_all(TENANT_ID_HEADER).iter().map(|value| value.to_str().ok()))
+    }
 }
 
 /// Why a request carries no usable tenant.
@@ -192,11 +184,12 @@ impl TenantRejection {
         }
     }
 
-    /// What the sender is told about this rejection.
+    /// What the caller is told about this rejection.
     ///
-    /// One text per variant for every protocol: OTLP/HTTP renders it into the
-    /// JSON error body and OTLP/gRPC into the `Status` message, so a sender that
-    /// switches transport is not told two different things about one refusal.
+    /// One text per variant for every protocol: an HTTP surface renders it into
+    /// its error body and a gRPC surface into the `Status` message, so a caller
+    /// that switches protocol is not told two different things about one
+    /// refusal.
     #[must_use]
     pub const fn message(self) -> &'static str {
         match self {
@@ -207,7 +200,18 @@ impl TenantRejection {
     }
 }
 
-/// How ingest decides which tenant a request writes to.
+/// Where a component records a refused tenant resolution.
+///
+/// A port rather than a metrics type: the counter behind it and its label set
+/// belong to the component, while `TenantPolicyInterceptor` of this crate
+/// (feature `grpc`) reports through it and must know neither.
+pub trait TenantRejectionRecorder: Clone + Send + Sync + 'static {
+    /// Record one refusal that happened on `protocol`, with `reason` taken from
+    /// [`TenantRejection::reason`].
+    fn add_tenant_rejection(&self, protocol: &str, reason: &str);
+}
+
+/// How a deployment decides which tenant a request belongs to.
 ///
 /// Serialised as a YAML tagged union (`tenant: !single` with a nested `id`, or
 /// `tenant: !multi`), the same shape as `CatalogBackend` and `StorageBackend`.
@@ -219,7 +223,7 @@ pub enum TenantPolicy {
     /// One tenant for the whole deployment. A request may omit the header, but
     /// a header naming any other tenant is rejected.
     Single {
-        /// The identifier every request of this deployment writes to.
+        /// The one tenant every request of this deployment is served as.
         id: String,
     },
     /// The tenant comes from the request and only from the request. A request
@@ -326,6 +330,8 @@ impl TenantResolver {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
+
     use super::*;
 
     /// Build the resolver of a `single` policy, asserting the policy is sound.
@@ -338,10 +344,6 @@ mod tests {
     #[test]
     fn a_tenant_id_may_carry_the_colon_that_separates_org_from_workspace() {
         assert!(is_valid_tenant_id("2q4mHrPd9kL:7xZa1vB3nQe"));
-        assert_eq!(
-            resolve_tenant_id(Some("2q4mHrPd9kL:7xZa1vB3nQe")),
-            "2q4mHrPd9kL:7xZa1vB3nQe"
-        );
     }
 
     /// Widening to `:` must not widen to anything else: path traversal, quotes and
@@ -371,18 +373,6 @@ mod tests {
         assert!(!TenantId::is_valid("has.dot"));
         assert!(!TenantId::is_valid("emoji\u{1F600}"));
         assert!(!TenantId::is_valid("tab\there"));
-    }
-
-    #[test]
-    fn resolve_tenant_id_honours_valid_value() {
-        assert_eq!(resolve_tenant_id(Some("tenant-a")), "tenant-a");
-    }
-
-    #[test]
-    fn resolve_tenant_id_falls_back_on_absent_or_invalid() {
-        assert_eq!(resolve_tenant_id(None), DEFAULT_TENANT_ID);
-        assert_eq!(resolve_tenant_id(Some("has space")), DEFAULT_TENANT_ID);
-        assert_eq!(resolve_tenant_id(Some("")), DEFAULT_TENANT_ID);
     }
 
     #[test]
@@ -530,6 +520,38 @@ mod tests {
             single_resolver("acme").resolve_tenant(header),
             Err(TenantRejection::Invalid)
         );
+    }
+
+    #[test]
+    fn an_absent_header_reads_as_absent() {
+        assert_eq!(TenantHeader::from_header_map(&HeaderMap::new()), TenantHeader::Absent);
+    }
+
+    #[test]
+    fn a_single_header_reads_as_its_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(TENANT_ID_HEADER, HeaderValue::from_static("acme"));
+        assert_eq!(TenantHeader::from_header_map(&headers), TenantHeader::Once("acme"));
+    }
+
+    #[test]
+    fn two_headers_read_as_duplicated_even_when_they_agree() {
+        let mut headers = HeaderMap::new();
+        headers.append(TENANT_ID_HEADER, HeaderValue::from_static("acme"));
+        headers.append(TENANT_ID_HEADER, HeaderValue::from_static("acme"));
+        assert_eq!(TenantHeader::from_header_map(&headers), TenantHeader::Duplicated);
+    }
+
+    #[test]
+    fn a_non_ascii_header_reads_as_an_unusable_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TENANT_ID_HEADER,
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("byte header value"),
+        );
+        // Empty is rejected by `TenantId::is_valid`, so this reaches the policy
+        // as a named-but-invalid tenant rather than as an absent header.
+        assert_eq!(TenantHeader::from_header_map(&headers), TenantHeader::Once(""));
     }
 
     /// The startup log line is the only place an operator learns which mode the

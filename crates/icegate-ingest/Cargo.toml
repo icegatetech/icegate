@@ -19,7 +19,7 @@ name = "ingest"
 path = "src/main.rs"
 
 [dependencies]
-icegate-common = { workspace = true, features = ["shed-tonic"] }
+icegate-common = { workspace = true, features = ["grpc"] }
 icegate-queue = { path = "../icegate-queue" }
 jobmanager = { workspace = true }
 
@@ -76,13 +76,16 @@ futures = { workspace = true }
 [dev-dependencies]
 # The shift end-to-end test drives the production assembly against a real object store, which the
 # `testing` feature provides (container bootstrap plus bucket/object-store helpers).
-icegate-common = { workspace = true, features = ["testing", "shed-tonic"] }
+icegate-common = { workspace = true, features = ["testing", "grpc"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 flate2 = "1"
 zstd = "0.13"
 # Owns the configuration documents `tests/config_file.rs` hands
 # `IngestConfig::from_file`, so they are removed on failure and panic alike.
 tempfile = { workspace = true }
+# Parses the k8s stand collector document `tests/config_file.rs` unwraps from its
+# ConfigMap, where it is a string rather than a file `load_config_file` can read.
+serde_yaml = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # `test-util` enables the paused-clock (`start_paused`) test runtime used to

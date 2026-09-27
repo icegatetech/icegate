@@ -127,7 +127,9 @@ The tenant an OTLP request writes to is decided by the ingest `tenant` policy: a
 - **Loki API**: `http://localhost:3100` - Query logs using Loki-compatible API ✅ **Currently Supported** (`query`, `query_range`, `labels`, `label/{name}/values`, `series`)
 - **Tempo API**: `http://localhost:3200` - Query traces using Tempo-compatible API ✅ **Currently Supported** (`traces/{id}`, `search` with TraceQL, `search/tags`, `search/tag/{name}/values`, plus the `v2` variants). Unsupported TraceQL features return `501`
 - **Prometheus API**: `http://localhost:9090` - Query metrics ⚠️ **Planned** — the routes are mounted but every handler returns `501 Not Implemented`; only `/-/ready` responds
-- **Arrow Flight SQL**: `grpc://localhost:8815` - General-purpose SQL over the merged WAL + Iceberg view; read-only, tenant identified by the `x-scope-orgid` gRPC metadata header (defaults to `default`). See [Querying via Flight SQL](#querying-via-flight-sql) below for supported clients.
+- **Arrow Flight SQL**: `grpc://localhost:8815` - General-purpose SQL over the merged WAL + Iceberg view; read-only, tenant taken from the `x-scope-orgid` gRPC metadata header. See [Querying via Flight SQL](#querying-via-flight-sql) below for supported clients.
+
+Whose tenant a read serves is decided by the query `tenant` policy, the same shape ingest carries: under `single` the deployment serves one tenant and a request naming another is refused; under `multi` the tenant comes from `x-scope-orgid` and a request without a valid one is refused rather than served a default. The stand's query runs `multi` and reads the tenant `x-scope-orgid` names: the bundled Grafana datasources send `demo`, and a request without the header is refused. See [crates/icegate-query/README.md](crates/icegate-query/README.md).
 
 #### Visualization
 - **Grafana**: `http://localhost:3000` - Dashboard and visualization (no login required)
@@ -163,7 +165,7 @@ The `analytics` profile starts Trino together with an Iceberg REST endpoint (`ht
 
 ## Querying via Flight SQL
 
-IceGate exposes an [Apache Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) gRPC endpoint on `:8815`. Queries run server-side through Apache DataFusion against the merged WAL + Iceberg view, so only result sets cross the wire — aggregations and joins do not pull raw rows to the client. The endpoint is strictly read-only (DDL and DML are rejected) and identifies tenants from the `x-scope-orgid` gRPC metadata header.
+IceGate exposes an [Apache Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) gRPC endpoint on `:8815`. Queries run server-side through Apache DataFusion against the merged WAL + Iceberg view, so only result sets cross the wire — aggregations and joins do not pull raw rows to the client. The endpoint is strictly read-only (DDL and DML are rejected) and takes the tenant from the `x-scope-orgid` gRPC metadata header, as the query `tenant` policy decides.
 
 ### Supported clients
 
@@ -182,7 +184,7 @@ import adbc_driver_flightsql.dbapi
 
 conn = adbc_driver_flightsql.dbapi.connect(
     "grpc://localhost:8815",
-    db_kwargs={"adbc.flight.sql.rpc.call_header.x-scope-orgid": "tenant-alpha"},
+    db_kwargs={"adbc.flight.sql.rpc.call_header.x-scope-orgid": "demo"},
 )
 with conn.cursor() as cur:
     cur.execute("SELECT count(*) FROM iceberg.icegate.logs")

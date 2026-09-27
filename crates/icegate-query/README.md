@@ -38,9 +38,7 @@ There are intentionally no convenience views in the default catalog: a single ca
 
 The Flight SQL session reads the tenant identifier from the `x-scope-orgid` gRPC metadata header — the same Grafana convention used by the HTTP APIs. Any client capable of setting a gRPC header (ADBC, JDBC, the Apache Arrow Flight SQL ODBC driver, `grpcurl -H`) can supply it.
 
-If the header is absent or does not match `[A-Za-z0-9_-]+`, the request falls back to the shared `default` tenant.
-
-There is **no authentication** — the Flight SQL endpoint trusts the gateway in front of it, exactly like the HTTP APIs trust their `X-Scope-OrgID` header.
+Which tenant a request reads, and which requests are refused, is decided by the `tenant` policy: see [Whose tenant a request reads](#whose-tenant-a-request-reads).
 
 ### Isolation guarantees
 
@@ -137,6 +135,66 @@ When adding support for a new client, the bare-minimum smoke test is:
 - **Cancellation**: queries are cancelled when the gRPC stream is dropped by the client; there is no cooperative server-side cancel beyond that.
 - **Arrow `Map` columns over older drivers**: the attribute columns are `Map<Utf8, Utf8>` — `resource_attributes`, `scope_attributes`, and one record-level map per table (`log_attributes` on `logs`/`events`, `span_attributes` on `spans`, `data_point_attributes` on `metrics`). JDBC drivers <17.0 and `pyarrow` <14 may render them as `List<Struct<key, value>>`. Workaround: project-specific keys (`resource_attributes['service.version']`) which collapses to `Utf8`. Keys are stored in OTel-native dotted form, so address them as `service.version`, not `service_version`; the dot-to-underscore mapping applies only to the Loki label API.
 
+## Whose tenant a request reads
+
+Every protocol resolves the tenant through one policy, the `tenant` block of
+`query.yaml`, and the answer decides which rows the request can reach at all.
+
+```yaml
+tenant: !single
+  id: "default"   # one tenant for the whole deployment
+# or
+tenant: !multi    # the tenant comes from x-scope-orgid, and only from there
+```
+
+The input is the `x-scope-orgid` header, and the two modes read it differently:
+
+| Header             | `!single { id }`                  | `!multi`   |
+|--------------------|-----------------------------------|------------|
+| absent             | `id`                              | refused    |
+| present, `== id`   | `id`                              | that value |
+| present, other     | refused                           | that value |
+| present, malformed | refused                           | refused    |
+| present twice      | refused                           | refused    |
+
+A `query.yaml` without a `tenant` block runs `!single` on `default`. Before the
+policy existed such a deployment served a request naming another tenant that
+tenant's rows, and a request with a malformed value the rows of `default`; both
+are now refused. A deployment reading several tenants sets `tenant: !multi`.
+
+`!single` consults the header rather than ignoring it, so a reader addressing
+another tenant is told so instead of being served this deployment's rows under a
+name it never asked for. A value is malformed unless it passes
+`TenantId::is_valid` in `icegate-common`.
+
+A refusal is the protocol's own: `400` with the protocol's error body on Loki and
+Tempo, `INVALID_ARGUMENT` on Flight SQL. `INVALID_ARGUMENT` rather than
+`UNAUTHENTICATED` because the request is malformed as far as this deployment is
+concerned, and no credential would make it succeed as sent. The readiness paths
+(`/ready` on Loki and Tempo, and Tempo's `/api/echo`) are exempt: no probe carries
+a tenant, and refusing one would restart a pod that is serving correctly.
+
+`!multi` takes the tenant from whoever reaches the port: the header is believed
+as sent, and this crate authenticates nobody. So under `!multi` the listeners are
+reachable only by callers already trusted to name any tenant — an untrusted
+reader on that port reads every tenant by choosing the header value. PromQL is
+the one protocol outside all of this: every one of its handlers is a `501` stub
+that reads no tenant.
+
+Each refusal increments `icegate_query_tenant_rejections`, a counter with two
+labels:
+
+| Label      | Values                                        |
+|------------|-----------------------------------------------|
+| `protocol` | `loki`, `tempo`, `flight_sql`                 |
+| `reason`   | `missing`, `invalid`, `duplicate_header`      |
+
+`missing` is an absent header under `!multi`; `invalid` is a malformed value, or
+one naming a tenant a `!single` deployment does not serve; `duplicate_header` is
+the header present more than once, which is refused even when the two values
+agree — two values mean the sender and something on the path disagree, and
+picking either resolves that disagreement silently.
+
 ## Configuration
 
 Each protocol has its own block in `query.yaml`:
@@ -152,4 +210,4 @@ Set `enabled: false` on any block to leave its listener unbound. All four server
 
 ## Architecture in one sentence
 
-Four protocol-specific handlers (`crate::loki`, `crate::prometheus`, `crate::tempo`, `crate::flight_sql`) translate their respective wire formats into DataFusion SQL/`LogicalPlan` and run them against a shared engine that surfaces Iceberg cold storage merged with WAL hot data; tenant isolation lives in the `TableProvider` layer for Flight SQL and in route handlers for the HTTP APIs.
+Four protocol-specific handlers (`crate::loki`, `crate::prometheus`, `crate::tempo`, `crate::flight_sql`) translate their respective wire formats into DataFusion SQL/`LogicalPlan` and run them against a shared engine that surfaces Iceberg cold storage merged with WAL hot data; the tenant of a request is resolved once at the edge — a middleware layer on the HTTP routers, a tonic interceptor on Flight SQL — and the isolation it decides is then enforced in the `TableProvider` layer for Flight SQL and in the query executors for the HTTP APIs.

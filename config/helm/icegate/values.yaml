@@ -146,6 +146,20 @@ query:
   enabled: true
   replicaCount: 1
 
+  ## Whose tenant an incoming read request is served.
+  ##   single — the deployment serves one tenant; `id` is used and the
+  ##            x-scope-orgid header must either be absent or name that same id.
+  ##   multi  — the tenant comes from x-scope-orgid only; a request without a
+  ##            valid header is rejected with 400 (Loki, Tempo) or
+  ##            INVALID_ARGUMENT (Flight SQL).
+  ## `multi` takes the tenant from whoever reaches the port: the header is
+  ## believed as sent, and nothing in this chart authenticates the reader behind
+  ## it. So the port has to be reachable only by callers already trusted to name
+  ## any tenant — see crates/icegate-query/README.md.
+  tenant:
+    mode: single
+    id: "default"
+
   image:
     repository: ghcr.io/icegatetech/icegate-query
     tag: ""  # defaults to Chart.appVersion
@@ -295,19 +309,25 @@ query:
     ## Image for the bucket check (must contain the AWS CLI).
     awsCliImage: amazon/aws-cli:2.36.34
 
-  ## Liveness and readiness probe overrides
+  ## Liveness and readiness probe overrides.
+  ## Both hit /health on the operational listener, addressed by the port name
+  ## the Deployment declares unconditionally, so the probe follows
+  ## query.metrics.port instead of holding a second copy of it. A protocol port
+  ## is not probed: query.loki.enabled=false leaves no such port on the
+  ## container, and the kubelet then restarts a pod that serves the three
+  ## protocols it was asked for.
   livenessProbe:
     httpGet:
-      path: /ready
-      port: 3100
+      path: /health
+      port: metrics
     initialDelaySeconds: 15
     periodSeconds: 20
     timeoutSeconds: 5
     failureThreshold: 3
   readinessProbe:
     httpGet:
-      path: /ready
-      port: 3100
+      path: /health
+      port: metrics
     initialDelaySeconds: 5
     periodSeconds: 10
     timeoutSeconds: 5

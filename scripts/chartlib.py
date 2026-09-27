@@ -15,6 +15,7 @@ Failures accumulate in a module-level list, so a script collects them by calling
 
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 try:
@@ -155,6 +156,15 @@ def read_service_port(manifests: str, port_name: str) -> int | None:
     return None
 
 
+def iter_container_ports(manifests: str) -> Iterator[dict]:
+    """Every `ports[]` entry of every container of a rendered Deployment, in order."""
+    for document in load_documents(manifests):
+        if document.get("kind") != "Deployment":
+            continue
+        for container in document.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+            yield from container.get("ports", [])
+
+
 def read_container_port_names(manifests: str) -> list[str]:
     """Every `ports[].name` of every container of a rendered Deployment, with repeats.
 
@@ -162,19 +172,23 @@ def read_container_port_names(manifests: str) -> list[str]:
     within a Pod, the Service addresses its `targetPort` by it, and a second
     declaration renders and lints clean while the API server refuses the Pod.
     """
-    names: list[str] = []
-    for document in load_documents(manifests):
-        if document.get("kind") != "Deployment":
-            continue
-        for container in document.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
-            for port in container.get("ports", []):
-                if "name" in port:
-                    names.append(port["name"])
-    return names
+    return [port["name"] for port in iter_container_ports(manifests) if "name" in port]
 
 
-def read_ingest_config(manifests: str) -> dict:
-    """The `ingest.yaml` the rendered ConfigMap carries.
+def read_container_port(manifests: str, port_name: str) -> int | None:
+    """The `containerPort` a rendered Deployment declares under `port_name`.
+
+    Read out of the render for the reason `read_service_port` is: a check comparing
+    it with the port a component binds must not become a copy of `values.yaml`.
+    """
+    return next(
+        (port.get("containerPort") for port in iter_container_ports(manifests) if port.get("name") == port_name),
+        None,
+    )
+
+
+def read_component_config(manifests: str, key: str) -> dict:
+    """The config file the rendered ConfigMap carries under `data.<key>`, e.g. `ingest.yaml`.
 
     The tenant section is a YAML tagged union (`!single` / `!multi`), which
     `safe_load` refuses, so the document is read with a loader that keeps an
@@ -185,7 +199,7 @@ def read_ingest_config(manifests: str) -> dict:
     for document in load_documents(manifests):
         if document.get("kind") != "ConfigMap":
             continue
-        body = document.get("data", {}).get("ingest.yaml")
+        body = document.get("data", {}).get(key)
         if body:
             return yaml.load(body, Loader=_TolerantLoader) or {}
     return {}

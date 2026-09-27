@@ -33,6 +33,13 @@ queue:
 query:
   enabled: true
   replicaCount: 1
+  ## The stand writes one tenant, `demo` (ingest.tenant below), and every reader
+  ## of it — the Grafana datasources of config/kustomize/base/values-grafana.yaml —
+  ## sends X-Scope-OrgID: demo. The read path trusts that header, so multi serves
+  ## the stand without restating the writer's id here; a request without the
+  ## header is refused rather than served a default.
+  tenant:
+    mode: multi
   engine:
     walQueryEnabled: true
   cache:

@@ -119,7 +119,7 @@ impl DataFusionPlanner {
     }
 
     fn apply_tenant_and_time(&self, df: DataFrame) -> Result<DataFrame> {
-        let tenant_filter = col(COL_TENANT_ID).eq(lit(&self.query_ctx.tenant_id));
+        let tenant_filter = col(COL_TENANT_ID).eq(lit(self.query_ctx.tenant_id.as_ref()));
         let df = df.filter(tenant_filter)?;
         let start_lit = lit(ScalarValue::TimestampMicrosecond(
             Some(self.query_ctx.start.timestamp_micros()),

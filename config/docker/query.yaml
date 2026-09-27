@@ -1,3 +1,11 @@
+# The stand reads whichever tenant its writers named: `demo` on the plain stand
+# (config/docker/ingest.yaml), the token's tenant behind the auth proxy
+# (docker-compose.proxy.yml reuses this document). Every reader of the stand
+# sends x-scope-orgid — the Grafana datasources send `demo` — and the read path
+# trusts that header, so `multi` serves both stands with one document. A request
+# without the header is refused rather than served a default.
+tenant: !multi
+
 catalog:
   backend: !s3
     warehouse: catalog

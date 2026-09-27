@@ -1,6 +1,6 @@
 //! OTLP gRPC server implementation.
 
-use icegate_common::{MemoryPressure, MemoryShedInterceptor, TenantResolver};
+use icegate_common::{MemoryPressure, MemoryShedInterceptor, TenantPolicyInterceptor, TenantResolver};
 use opentelemetry_proto::tonic::collector::{
     logs::v1::logs_service_server::LogsServiceServer, metrics::v1::metrics_service_server::MetricsServiceServer,
     trace::v1::trace_service_server::TraceServiceServer,
@@ -10,8 +10,8 @@ use tonic::{service::interceptor::InterceptedService, transport::Server};
 
 use super::{
     OtlpGrpcConfig,
-    services::{OtlpGrpcService, SIGNAL_LOGS, SIGNAL_METRICS, SIGNAL_TRACES},
-    tenant::TenantPolicyInterceptor,
+    services::{OtlpGrpcService, PROTOCOL_GRPC, SIGNAL_LOGS, SIGNAL_METRICS, SIGNAL_TRACES},
+    tenant::OtlpTenantRejectionRecorder,
 };
 
 /// Run the OTLP gRPC server.
@@ -43,8 +43,13 @@ pub async fn run(
 
     // One tenant interceptor per server: the signal it labels its rejections with
     // is the service's own, known statically, so no request path is parsed.
-    let make_tenant_interceptor =
-        |signal| TenantPolicyInterceptor::new(tenant_resolver.clone(), metrics.clone(), signal);
+    let make_tenant_interceptor = |signal| {
+        TenantPolicyInterceptor::new(
+            tenant_resolver.clone(),
+            OtlpTenantRejectionRecorder::new(metrics.clone(), signal),
+            PROTOCOL_GRPC,
+        )
+    };
 
     tracing::info!("Starting OTLP gRPC server on {}", addr);
 

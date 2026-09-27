@@ -4,13 +4,28 @@
 //! every phase of the query request lifecycle: HTTP handling, LogQL parsing,
 //! query planning, DataFusion execution, and response formatting.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use icegate_common::TenantRejectionRecorder;
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram, Meter, MeterProvider as _, UpDownCounter},
 };
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+/// The `protocol` label of the Flight SQL read surface.
+///
+/// The three constants below are the single source of that label: all three
+/// surfaces resolve the tenant through the same policy, and a label spelled at
+/// the call site would drift from the one the dashboards are keyed on.
+pub const PROTOCOL_FLIGHT_SQL: &str = "flight_sql";
+/// The `protocol` label of the Loki read surface.
+pub const PROTOCOL_LOKI: &str = "loki";
+/// The `protocol` label of the Tempo read surface.
+pub const PROTOCOL_TEMPO: &str = "tempo";
 
 /// Histogram bucket boundaries (in seconds) for fast sub-phases like parse,
 /// plan, and format, which typically complete in low milliseconds.
@@ -67,6 +82,7 @@ pub struct QueryMetrics {
     session_create_duration: Histogram<f64>,
     errors_total: Counter<u64>,
     active_queries: UpDownCounter<i64>,
+    tenant_rejections_total: Counter<u64>,
 
     // Per-source scan metrics
     wal_scan_rows: Histogram<f64>,
@@ -99,6 +115,7 @@ impl QueryMetrics {
             session_create_duration: meter.f64_histogram("icegate_query_session_create_duration").build(),
             errors_total: meter.u64_counter("icegate_query_errors").build(),
             active_queries: meter.i64_up_down_counter("icegate_query_active_queries").build(),
+            tenant_rejections_total: meter.u64_counter("icegate_query_tenant_rejections").build(),
             wal_scan_rows: meter.f64_histogram("icegate_query_wal_scan_rows").build(),
             wal_scan_bytes: meter.f64_histogram("icegate_query_wal_scan_bytes").build(),
             wal_scan_compressed_bytes: meter.f64_histogram("icegate_query_wal_scan_compressed_bytes").build(),
@@ -166,6 +183,10 @@ impl QueryMetrics {
             .i64_up_down_counter("icegate_query_active_queries")
             .with_description("Currently executing queries")
             .build();
+        let tenant_rejections_total = meter
+            .u64_counter("icegate_query_tenant_rejections")
+            .with_description("Requests refused because they carried no usable tenant")
+            .build();
 
         let wal_scan_rows = meter
             .f64_histogram("icegate_query_wal_scan_rows")
@@ -211,6 +232,7 @@ impl QueryMetrics {
             session_create_duration,
             errors_total,
             active_queries,
+            tenant_rejections_total,
             wal_scan_rows,
             wal_scan_bytes,
             wal_scan_compressed_bytes,
@@ -389,6 +411,49 @@ impl QueryMetrics {
     }
 }
 
+/// Writes a refused tenant resolution into `icegate_query_tenant_rejections`.
+///
+/// A newtype over `Arc<QueryMetrics>` because the port demands `Clone` and the
+/// routers clone the service — interceptor and recorder included — on every
+/// request: a clone of this recorder is one refcount increment, where a clone
+/// of [`QueryMetrics`] would bump the refcount of each of its instruments. The
+/// port cannot be implemented on `Arc<QueryMetrics>` directly: the orphan rule
+/// refuses it, since both `Arc` and the trait are foreign here.
+///
+/// Stated only as the port, with no inherent method beside it: two definitions
+/// of one action on one type resolve by inherent-first and would silently
+/// recurse if either call site were written the other way round.
+#[derive(Clone)]
+pub struct QueryTenantRejectionRecorder(Arc<QueryMetrics>);
+
+impl QueryTenantRejectionRecorder {
+    /// Build a recorder writing into `metrics`.
+    #[must_use]
+    pub const fn new(metrics: Arc<QueryMetrics>) -> Self {
+        Self(metrics)
+    }
+}
+
+impl TenantRejectionRecorder for QueryTenantRejectionRecorder {
+    /// `protocol` is one of [`PROTOCOL_FLIGHT_SQL`], [`PROTOCOL_LOKI`],
+    /// [`PROTOCOL_TEMPO`]; `reason` comes from
+    /// [`TenantRejection::reason`](icegate_common::TenantRejection::reason) and
+    /// from nowhere else, since a hand-written string here would drift from the
+    /// variants the resolver returns.
+    fn add_tenant_rejection(&self, protocol: &str, reason: &str) {
+        if !self.0.enabled {
+            return;
+        }
+        self.0.tenant_rejections_total.add(
+            1,
+            &[
+                KeyValue::new("protocol", protocol.to_string()),
+                KeyValue::new("reason", reason.to_string()),
+            ],
+        );
+    }
+}
+
 /// Helper that tracks timing for a single query request.
 ///
 /// Increments the active-queries gauge on creation and decrements on drop,
@@ -436,6 +501,140 @@ impl Drop for QueryRequestRecorder<'_> {
         // record the request as an error to keep the gauge consistent.
         if !self.finished {
             self.finish("error");
+        }
+    }
+}
+
+/// Reading recorded measurements back in a test: a meter provider that exports
+/// into memory, and the lookup over what it exported.
+///
+/// Lives here rather than beside one test module because the routers assert on
+/// the same counter this file defines, and how a measurement is found by name
+/// and labels should be defined once. Counters export cumulatively and a
+/// provider exports again when it shuts down, so the lookup reads the last
+/// export that carried the metric rather than adding the exports up.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use opentelemetry::KeyValue;
+    use opentelemetry_sdk::metrics::{
+        InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        data::{AggregatedMetrics, MetricData},
+    };
+
+    /// Meter provider recording into memory, together with the exporter its
+    /// measurements land in. They reach the exporter only after `force_flush`.
+    pub(crate) fn build_meter_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        (provider, exporter)
+    }
+
+    /// Total the counter `metric_name` reached across the data points carrying
+    /// **exactly** `expected_labels`; zero when it was never incremented with
+    /// them.
+    ///
+    /// Exact rather than "at least": the label set of this counter is the
+    /// contract the dashboards are keyed on, and an extra label is a dimension
+    /// change this is what catches.
+    pub(crate) fn find_counter_total(
+        exporter: &InMemoryMetricExporter,
+        metric_name: &str,
+        expected_labels: &[(&str, &str)],
+    ) -> u64 {
+        let mut latest = None;
+        for batch in exporter.get_finished_metrics().unwrap_or_default() {
+            for scope in batch.scope_metrics() {
+                for metric in scope.metrics().filter(|metric| metric.name() == metric_name) {
+                    let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                        continue;
+                    };
+                    let mut export_total = None;
+                    for point in sum.data_points() {
+                        let labels = metric_labels(&point.attributes().cloned().collect::<Vec<_>>());
+                        if labels_match(&labels, expected_labels) {
+                            export_total = Some(export_total.unwrap_or(0_u64).saturating_add(point.value()));
+                        }
+                    }
+                    if export_total.is_some() {
+                        latest = export_total;
+                    }
+                }
+            }
+        }
+        latest.unwrap_or(0)
+    }
+
+    fn metric_labels(attributes: &[KeyValue]) -> Vec<(String, String)> {
+        let mut labels = attributes
+            .iter()
+            .map(|kv| (kv.key.as_str().to_string(), kv.value.as_str().into_owned()))
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels
+    }
+
+    fn labels_match(labels: &[(String, String)], expected: &[(&str, &str)]) -> bool {
+        labels.len() == expected.len()
+            && expected.iter().all(|(key, value)| {
+                labels
+                    .iter()
+                    .any(|(label_key, label_value)| label_key == key && label_value == value)
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use icegate_common::TenantRejection;
+    use opentelemetry::metrics::MeterProvider as _;
+
+    use super::{
+        PROTOCOL_FLIGHT_SQL, PROTOCOL_LOKI, PROTOCOL_TEMPO, QueryMetrics, QueryTenantRejectionRecorder,
+        TenantRejectionRecorder,
+        test_support::{build_meter_provider, find_counter_total},
+    };
+
+    /// The label set `icegate_query_tenant_rejections` carries, spelled out:
+    /// it is what the dashboards are keyed on, and unlike ingest's counter it
+    /// carries no `signal`. Every protocol and every reason is driven, because
+    /// a surface passing the wrong constant is invisible from one case. The
+    /// expected values are literals rather than the constants, so renaming a
+    /// label value fails here instead of silently re-keying the dashboards.
+    #[test]
+    fn a_refused_request_counts_a_rejection_labelled_by_protocol_and_reason() {
+        let (provider, exporter) = build_meter_provider();
+        let recorder = QueryTenantRejectionRecorder::new(Arc::new(QueryMetrics::new(
+            &provider.meter("test_query_tenant_rejections"),
+        )));
+
+        let cases = [
+            (PROTOCOL_LOKI, "loki", TenantRejection::Missing, "missing"),
+            (PROTOCOL_TEMPO, "tempo", TenantRejection::Invalid, "invalid"),
+            (
+                PROTOCOL_FLIGHT_SQL,
+                "flight_sql",
+                TenantRejection::DuplicateHeader,
+                "duplicate_header",
+            ),
+        ];
+        for (protocol, _, rejection, _) in cases {
+            recorder.add_tenant_rejection(protocol, rejection.reason());
+        }
+
+        provider.force_flush().expect("failed to flush metrics");
+        for (_, protocol_label, _, reason_label) in cases {
+            assert_eq!(
+                find_counter_total(
+                    &exporter,
+                    "icegate_query_tenant_rejections",
+                    &[("protocol", protocol_label), ("reason", reason_label)],
+                ),
+                1,
+                "{protocol_label}/{reason_label} must be counted once, under those two labels alone"
+            );
         }
     }
 }
