@@ -1,5 +1,6 @@
 //! Flight SQL gRPC integration tests.
 
+mod bloom_filter;
 mod deadline;
 mod harness;
 mod metadata;

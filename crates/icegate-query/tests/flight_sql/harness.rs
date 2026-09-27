@@ -401,7 +401,14 @@ pub async fn write_spans_file(
     );
 
     let batch = RecordBatch::try_new(arrow_schema, columns)?;
-    commit_data_file(table, catalog, batch, &format!("spans-{now_micros}")).await
+    commit_data_file(
+        table,
+        catalog,
+        batch,
+        &format!("spans-{now_micros}"),
+        WriterProperties::builder().build(),
+    )
+    .await
 }
 
 /// A `LIST` column where every row is an empty list.
@@ -449,18 +456,21 @@ fn build_attribute_map(
 }
 
 /// Write one batch as a single Parquet data file and commit it to `table`.
-async fn commit_data_file(
+///
+/// `writer_properties` decides the file's physical layout — row groups,
+/// encodings, bloom filters — so a test of read-side pruning can reproduce
+/// the production writer policy.
+pub async fn commit_data_file(
     table: &Table,
     catalog: &Arc<dyn Catalog>,
     batch: RecordBatch,
     file_suffix: &str,
+    writer_properties: WriterProperties,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(file_suffix.to_string(), None, DataFileFormat::Parquet);
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::builder().build(),
-        table.metadata().current_schema().clone(),
-    );
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(writer_properties, table.metadata().current_schema().clone());
     let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer_builder,
         table.file_io().clone(),
@@ -509,12 +519,6 @@ pub async fn write_test_logs_for_tenant(
 /// pruning and must be enforced by the wrapper's row-level filter. That is
 /// exactly the production WAL hot-segment layout the tenant wrapper has to
 /// defend against.
-///
-/// Schema layout follows `icegate_common::schema::logs_schema`; the helper
-/// is intentionally narrower than the production writer in
-/// `tests/loki/harness.rs` — Flight SQL tests only need enough rows to
-/// assert tenant isolation, not full attribute-key coverage.
-#[allow(clippy::too_many_lines)]
 pub async fn write_logs_file(
     table: &Table,
     catalog: &Arc<dyn Catalog>,
@@ -524,15 +528,65 @@ pub async fn write_logs_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let row_count = tenant_ids.len();
     let unique_suffix = format!(
         "{}-{}",
         tenant_ids.first().copied().unwrap_or("empty"),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
     );
+    // Distinct trace/span ids per row, derived from the row index so the
+    // values stay unique without a fixed lookup table. The full index is
+    // encoded little-endian (a `u128` fills the 16-byte trace id, a `u64`
+    // the 8-byte span id) so ids don't collide once the row count exceeds
+    // 256 — a single-byte index would wrap.
+    let rows: Vec<LogRow<'_>> = tenant_ids
+        .iter()
+        .enumerate()
+        .map(|(i, tenant_id)| LogRow {
+            tenant_id,
+            trace_id: (i as u128).to_le_bytes(),
+            span_id: (i as u64).to_le_bytes(),
+        })
+        .collect();
+    let batch = build_logs_batch(table, &rows, service_name, body_prefix)?;
+    commit_data_file(
+        table,
+        catalog,
+        batch,
+        &unique_suffix,
+        WriterProperties::builder().build(),
+    )
+    .await
+}
+
+/// Identity of one fixture log row: its tenant and its trace/span ids.
+// Field names are the `logs` column names they fill.
+#[allow(clippy::struct_field_names)]
+pub struct LogRow<'a> {
+    pub tenant_id: &'a str,
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+}
+
+/// Build one `logs` batch with a row per entry of `rows`, in order.
+///
+/// Schema layout follows `icegate_common::schema::logs_schema`; the helper
+/// is intentionally narrower than the production writer in
+/// `tests/loki/harness.rs` — Flight SQL tests only need enough rows to
+/// assert tenant isolation and id lookups, not full attribute-key coverage.
+pub fn build_logs_batch(
+    table: &Table,
+    rows: &[LogRow<'_>],
+    service_name: &str,
+    body_prefix: &str,
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let row_count = rows.len();
     let now_micros = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
 
-    let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(tenant_ids.to_vec()));
+    let tenant_id_arr: ArrayRef = Arc::new(StringArray::from(
+        rows.iter().map(|row| row.tenant_id).collect::<Vec<_>>(),
+    ));
     let service_name_arr: ArrayRef = Arc::new(StringArray::from(vec![Some(service_name); row_count]));
 
     let timestamps: Vec<i64> = (0..row_count).map(|i| now_micros - (i as i64) * 1000).collect();
@@ -565,7 +619,7 @@ pub async fn write_logs_file(
     // `tests/loki/harness.rs::write_test_logs_for_tenant`. scope/log levels
     // are legitimately empty: this fixture carries no per-scope or
     // per-record attributes.
-    let resource_pairs: Vec<[(&str, &str); 1]> = tenant_ids.iter().map(|t| [("tenant.marker", *t)]).collect();
+    let resource_pairs: Vec<[(&str, &str); 1]> = rows.iter().map(|row| [("tenant.marker", row.tenant_id)]).collect();
     let resource_rows: Vec<&[(&str, &str)]> = resource_pairs.iter().map(<[(&str, &str); 1]>::as_slice).collect();
     let resource_attributes = build_attribute_map(&arrow_schema, schema::COL_RESOURCE_ATTRIBUTES, &resource_rows)?;
 
@@ -573,21 +627,16 @@ pub async fn write_logs_file(
     let scope_attributes = build_attribute_map(&arrow_schema, schema::COL_SCOPE_ATTRIBUTES, &empty_rows)?;
     let log_attributes = build_attribute_map(&arrow_schema, schema::COL_LOG_ATTRIBUTES, &empty_rows)?;
 
-    // Distinct trace/span ids per row, derived from the row index so the
-    // values stay unique without a fixed lookup table. The full index is
-    // encoded little-endian (a `u128` fills the 16-byte trace id, a `u64`
-    // the 8-byte span id) so ids don't collide once `row_count` exceeds
-    // 256 — a single-byte index would wrap.
     let mut trace_id_builder = FixedSizeBinaryBuilder::new(16);
     let mut span_id_builder = FixedSizeBinaryBuilder::new(8);
-    for i in 0..row_count {
-        trace_id_builder.append_value((i as u128).to_le_bytes())?;
-        span_id_builder.append_value((i as u64).to_le_bytes())?;
+    for row in rows {
+        trace_id_builder.append_value(row.trace_id)?;
+        span_id_builder.append_value(row.span_id)?;
     }
     let trace_id: ArrayRef = Arc::new(trace_id_builder.finish());
     let span_id: ArrayRef = Arc::new(span_id_builder.finish());
 
-    let batch = RecordBatch::try_new(
+    Ok(RecordBatch::try_new(
         arrow_schema,
         vec![
             tenant_id_arr,
@@ -603,7 +652,5 @@ pub async fn write_logs_file(
             scope_attributes,
             log_attributes,
         ],
-    )?;
-
-    commit_data_file(table, catalog, batch, &unique_suffix).await
+    )?)
 }

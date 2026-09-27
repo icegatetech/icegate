@@ -18,9 +18,7 @@ pub struct SourceMetrics {
     pub iceberg_bytes: usize,
     /// Compressed bytes read from Iceberg Parquet files.
     ///
-    /// Currently always 0: iceberg-rust does not expose I/O-level byte
-    /// counters, and `FileScanTask.length` (full file size) is not a valid
-    /// proxy after column projection and row-group filtering.
+    /// Always 0: the Iceberg scan does not fill it.
     pub iceberg_compressed_bytes: usize,
     /// Rows read from WAL segments.
     pub wal_rows: usize,
@@ -61,10 +59,7 @@ impl ExecutionPlanVisitor for SourceMetricsCollector {
             "IcegateIcebergScan" => {
                 self.result.iceberg_rows += extract_metric_value(&metrics, "output_rows");
                 self.result.iceberg_bytes += extract_metric_value(&metrics, "output_bytes");
-                // Note: compressed_bytes is not available from the Iceberg scan.
-                // FileScanTask.length is the full file size, not the compressed
-                // bytes actually read after column projection and row-group
-                // filtering. iceberg-rust does not expose I/O-level byte counters.
+                // `iceberg_compressed_bytes` is not filled; see its doc.
             }
             "DataSourceExec" => {
                 self.result.wal_rows += extract_metric_value(&metrics, "output_rows");

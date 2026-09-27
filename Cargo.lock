@@ -4959,7 +4959,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=dbc1452a0ecb79c043c6078257d110cb9b152b3c#dbc1452a0ecb79c043c6078257d110cb9b152b3c"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5016,7 +5016,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=dbc1452a0ecb79c043c6078257d110cb9b152b3c#dbc1452a0ecb79c043c6078257d110cb9b152b3c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5031,7 +5031,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=dbc1452a0ecb79c043c6078257d110cb9b152b3c#dbc1452a0ecb79c043c6078257d110cb9b152b3c"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5050,7 +5050,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-s3tables"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=dbc1452a0ecb79c043c6078257d110cb9b152b3c#dbc1452a0ecb79c043c6078257d110cb9b152b3c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5063,7 +5063,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=dbc1452a0ecb79c043c6078257d110cb9b152b3c#dbc1452a0ecb79c043c6078257d110cb9b152b3c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5079,7 +5079,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
-source = "git+https://github.com/icegatetech/iceberg-rust?rev=22d0e8b29f3ba7f6c99395088a8fe5cddb24117d#22d0e8b29f3ba7f6c99395088a8fe5cddb24117d"
+source = "git+https://github.com/icegatetech/iceberg-rust?rev=dbc1452a0ecb79c043c6078257d110cb9b152b3c#dbc1452a0ecb79c043c6078257d110cb9b152b3c"
 dependencies = [
  "anyhow",
  "async-trait",

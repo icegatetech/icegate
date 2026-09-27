@@ -8,6 +8,7 @@
 //! - `ExecutionPlanMetricsSet` with `BaselineMetrics`
 //! - `metrics()` override that returns actual metrics (upstream returns `None`)
 //! - Metrics tracking via `ExecutionPlanMetricsSet`
+//! - Bloom filter row group pruning, reported in [`IcebergScanMetrics`]
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -27,6 +28,7 @@ use iceberg::table::Table;
 use tracing::instrument;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use super::iceberg_scan_metrics::IcebergScanMetrics;
 
 /// Default batch size for Iceberg table scans.
 const ICEBERG_SCAN_BATCH_SIZE: usize = 8192;
@@ -42,6 +44,7 @@ fn to_datafusion_error(error: iceberg::Error) -> datafusion::error::DataFusionEr
 /// - Per-partition `BaselineMetrics` (`output_rows`, `output_bytes`,
 ///   `elapsed_compute`)
 /// - Metrics tracking via `ExecutionPlanMetricsSet`
+/// - Bloom filter row group pruning, reported in [`IcebergScanMetrics`]
 #[derive(Debug)]
 pub(super) struct IcegateIcebergScan {
     /// Iceberg table instance.
@@ -136,14 +139,14 @@ impl ExecutionPlan for IcegateIcebergScan {
     }
 
     fn execute(&self, partition: usize, _context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let metrics = IcebergScanMetrics::new(&self.metrics, partition);
 
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             self.projection.clone(),
             self.predicates.clone(),
-            baseline,
+            metrics,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -168,22 +171,25 @@ impl DisplayAs for IcegateIcebergScan {
 
 /// Build and execute an Iceberg table scan, tracking metrics.
 ///
-/// Uses `TableScan::to_arrow()` which streams `plan_files()` directly into
-/// `ArrowReaderBuilder::read()`, so data reading begins as soon as the first
-/// file task arrives from manifest scanning — no collect barrier.
+/// Streams `TableScan::plan_files()` into the table's `ArrowReader`
+/// (`reader_builder() … read(plan_files)`), so data reading begins as soon as
+/// the first file task arrives from manifest scanning — no collect barrier.
 ///
-/// Note: `compressed_bytes` is not tracked because `FileScanTask.length` is the
-/// full Parquet file size, not the compressed bytes actually read. With column
-/// projection and row-group filtering, the actual I/O is much smaller than the
-/// file size. The iceberg-rust `ArrowReaderBuilder` does not expose I/O-level
-/// byte counters.
-#[instrument(skip(table), fields(table = %table.identifier()))]
+/// The reader is built here rather than through `TableScan::to_arrow()`
+/// because `read` returns the reader's `ScanMetrics` alongside the stream.
+/// This is the only place in icegate that enables bloom filter pruning. The
+/// reader's bloom filter counters are transferred into `metrics` by
+/// [`IcebergScanMetrics::track_batch_stream`].
+///
+/// `SourceMetrics::iceberg_compressed_bytes` is not filled from this scan;
+/// see its doc.
+#[instrument(skip(table, metrics), fields(table = %table.identifier()))]
 async fn get_batch_stream(
     table: Table,
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
-    baseline: BaselineMetrics,
+    metrics: IcebergScanMetrics,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     // Build a single scan with projection and predicates.
     let scan_builder = snapshot_id.map_or_else(|| table.scan(), |id| table.scan().snapshot_id(id));
@@ -194,19 +200,18 @@ async fn get_batch_stream(
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
-    let table_scan = scan_builder
-        .with_batch_size(Some(ICEBERG_SCAN_BATCH_SIZE))
+    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
+
+    let scan_result = table
+        .reader_builder()
+        .with_batch_size(ICEBERG_SCAN_BATCH_SIZE)
         .with_row_selection_enabled(true)
+        .with_bloom_filter_enabled(true)
         .build()
+        .read(table_scan.plan_files().await.map_err(to_datafusion_error)?)
         .map_err(to_datafusion_error)?;
 
-    // Stream file plan directly into ArrowReader via to_arrow() — data
-    // reading starts as soon as the first file task arrives from manifest
-    // scanning, eliminating the collect barrier.
-    let stream = table_scan.to_arrow().await.map_err(to_datafusion_error)?;
-
-    let mapped =
-        stream.map(move |result| result.map_err(to_datafusion_error).map(|batch| batch.record_output(&baseline)));
-
-    Ok(Box::pin(mapped))
+    let scan_metrics = scan_result.metrics().clone();
+    let batches = scan_result.stream().map(|result| result.map_err(to_datafusion_error));
+    Ok(Box::pin(metrics.track_batch_stream(batches, scan_metrics)))
 }
