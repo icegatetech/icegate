@@ -20,6 +20,7 @@
 
 mod catalog;
 mod expr_to_predicate;
+mod iceberg_scan_metrics;
 mod metrics;
 mod scan;
 mod schema;
