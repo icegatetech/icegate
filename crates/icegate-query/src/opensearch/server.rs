@@ -44,7 +44,7 @@ pub async fn run_with_port_tx(
         ServerListener::bind(&config.host, config.port, ApplicationProtocol::Http1, &listener_runtime).await?;
     let local_address = listener.local_addr();
     let state = OpenSearchState {
-        node: Arc::new(NodeIdentity::new(&config.cluster_name, version)),
+        node: Arc::new(NodeIdentity::new(&config.cluster_name, version, local_address)),
     };
     let app = super::routes::build_router(state, &runtime, &config);
     tracing::info!("OpenSearch API server listening on {}", local_address);

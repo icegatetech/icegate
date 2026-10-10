@@ -1,9 +1,10 @@
 //! The `OpenSearch` router and its middleware.
 //!
 //! Layers, outermost first: memory-pressure shed → tenant resolution → deadline → request
-//! metrics → body limit → handler. Shed, tenant and deadline come in the order of the Loki and
-//! Tempo routers, and each answers in the `OpenSearch` envelope. There are no bypass paths: every
-//! request carries the tenant header, and the kubelet probes the operational listener instead.
+//! metrics → body limit → `filter_path` → handler. Shed, tenant and deadline come in the order of
+//! the Loki and Tempo routers, and each answers in the `OpenSearch` envelope. There are no bypass
+//! paths: every request carries the tenant header, and the kubelet probes the operational
+//! listener instead.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,9 +17,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use icegate_common::{ShedPolicy, shed_when_pressured};
 
-use super::cluster::info;
+use super::cluster::{datasources, health, info};
 use super::config::OpenSearchConfig;
 use super::error::OpenSearchError;
+use super::filter_path::apply_filter_path;
 use super::state::OpenSearchState;
 use crate::infra::metrics::{PROTOCOL_OPENSEARCH, QueryMetrics, QueryRequestRecorder, QueryTenantRejectionRecorder};
 use crate::infra::runtime::QueryRuntime;
@@ -52,8 +54,15 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
 
     Router::new()
         .route("/", get(info::describe_cluster))
+        .route("/_nodes", get(info::list_nodes))
+        .route("/_cluster/health", get(health::report_cluster_health))
+        .route(
+            "/_plugins/_query/_datasources",
+            get(datasources::list_query_datasources),
+        )
         .fallback(answer_unmatched_route)
         .method_not_allowed_fallback(answer_unmatched_route)
+        .layer(middleware::from_fn(apply_filter_path))
         .layer(DefaultBodyLimit::max(config.max_request_body_bytes))
         .layer(middleware::from_fn(move |request, next| {
             record_request(Arc::clone(&metrics), request, next)
@@ -118,7 +127,7 @@ mod tests {
     use futures::StreamExt as _;
     use icegate_common::{MemoryPressure, TENANT_ID_HEADER, TenantResolver};
     use opentelemetry::metrics::MeterProvider as _;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tower::ServiceExt as _;
 
     use super::*;
@@ -143,7 +152,11 @@ mod tests {
             tenant_resolver,
         };
         let state = OpenSearchState {
-            node: Arc::new(NodeIdentity::new(&config.cluster_name, version)),
+            node: Arc::new(NodeIdentity::new(
+                &config.cluster_name,
+                version,
+                "127.0.0.1:9200".parse().expect("socket address"),
+            )),
         };
         build_router(state, &runtime, &config)
     }
@@ -352,5 +365,195 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// The router's catalog never answers, so an answer within the bound proves the poll reads no
+    /// table. The node id is `derive_identifier("node", "icegate")`, computed independently in
+    /// `node.rs`'s tests.
+    #[tokio::test]
+    async fn nodes_answers_without_a_catalog_and_honours_filter_path() {
+        let app = build_test_router(
+            MemoryPressure::inert(),
+            TenantResolver::Multi,
+            QueryMetrics::new_disabled(),
+        );
+        let uri = "/_nodes?filter_path=nodes.*.version%2Cnodes.*.http.publish_address%2Cnodes.*.ip";
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(build_request("GET", uri, Some("tenant-a"))),
+        )
+        .await
+        .expect("answered without waiting on the catalog")
+        .expect("response");
+
+        let (status, body) = read_envelope(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"nodes": {"Qd9sEClXGyasivmx7Po0bQ": {
+                "version": "3.9.0",
+                "ip": "127.0.0.1",
+                "http": {"publish_address": "127.0.0.1:9200"}
+            }}})
+        );
+    }
+
+    #[tokio::test]
+    async fn query_datasources_answers_an_empty_list_without_reading_a_table() {
+        let app = build_test_router(
+            MemoryPressure::inert(),
+            TenantResolver::Multi,
+            QueryMetrics::new_disabled(),
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(build_request("GET", "/_plugins/_query/_datasources", Some("tenant-a"))),
+        )
+        .await
+        .expect("answered without waiting on the catalog")
+        .expect("response");
+
+        let (status, body) = read_envelope(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!([]));
+    }
+
+    /// The health poll is answered from the node identity alone; the catalog that never answers
+    /// proves it, as for the other polls.
+    #[tokio::test]
+    async fn cluster_health_answers_green_without_reading_a_table() {
+        let app = build_test_router(
+            MemoryPressure::inert(),
+            TenantResolver::Multi,
+            QueryMetrics::new_disabled(),
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(build_request("GET", "/_cluster/health", Some("tenant-a"))),
+        )
+        .await
+        .expect("answered without waiting on the catalog")
+        .expect("response");
+
+        let (status, body) = read_envelope(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "green");
+    }
+
+    /// A refusal under `filter_path` is still the whole envelope: one refused by the handler's
+    /// parameters, one refused by the fallback.
+    #[tokio::test]
+    async fn an_error_answer_keeps_its_envelope_under_filter_path() {
+        for uri in [
+            "/_nodes?filter_path=nodes.*.version&unknown_knob=1",
+            "/_no_such_api?filter_path=nodes",
+        ] {
+            let app = build_test_router(
+                MemoryPressure::inert(),
+                TenantResolver::Multi,
+                QueryMetrics::new_disabled(),
+            );
+
+            let response = app
+                .oneshot(build_request("GET", uri, Some("tenant-a")))
+                .await
+                .expect("response");
+
+            let (status, body) = read_envelope(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["status"], 400, "{uri}");
+            assert_eq!(body["error"]["type"], "illegal_argument_exception", "{uri}");
+            assert_eq!(
+                body["error"]["root_cause"][0]["type"], "illegal_argument_exception",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_filter_path_is_a_400_envelope() {
+        let app = build_test_router(
+            MemoryPressure::inert(),
+            TenantResolver::Multi,
+            QueryMetrics::new_disabled(),
+        );
+
+        let response = app
+            .oneshot(build_request(
+                "GET",
+                "/_nodes?filter_path=nodes..version",
+                Some("tenant-a"),
+            ))
+            .await
+            .expect("response");
+
+        let (status, body) = read_envelope(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    }
+
+    /// Repeating `filter_path` adds paths: the values are applied as one comma list.
+    #[tokio::test]
+    async fn a_repeated_filter_path_keeps_the_paths_of_every_value() {
+        let app = build_test_router(
+            MemoryPressure::inert(),
+            TenantResolver::Multi,
+            QueryMetrics::new_disabled(),
+        );
+
+        let response = app
+            .oneshot(build_request(
+                "GET",
+                "/_nodes?filter_path=nodes.*.version&filter_path=nodes.*.ip",
+                Some("tenant-a"),
+            ))
+            .await
+            .expect("response");
+
+        let (status, body) = read_envelope(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"nodes": {"Qd9sEClXGyasivmx7Po0bQ": {"version": "3.9.0", "ip": "127.0.0.1"}}})
+        );
+    }
+
+    /// A `HEAD` request under `filter_path` answers like the filtered `GET`: no body, and the
+    /// `Content-Length` of the filtered body, `{}` under a filter that matches nothing. A filter
+    /// that does not parse is refused with `400` as on `GET`.
+    #[tokio::test]
+    async fn a_head_request_under_filter_path_answers_like_the_filtered_get() {
+        let app = build_test_router(
+            MemoryPressure::inert(),
+            TenantResolver::Multi,
+            QueryMetrics::new_disabled(),
+        );
+
+        let filtered_response = app
+            .clone()
+            .oneshot(build_request("HEAD", "/?filter_path=x", Some("tenant-a")))
+            .await
+            .expect("response");
+        let refused_response = app
+            .oneshot(build_request("HEAD", "/?filter_path=a..b", Some("tenant-a")))
+            .await
+            .expect("response");
+
+        assert_eq!(filtered_response.status(), StatusCode::OK);
+        assert_eq!(
+            filtered_response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        let filtered_body = axum::body::to_bytes(filtered_response.into_body(), usize::MAX)
+            .await
+            .expect("HEAD body");
+        assert!(filtered_body.is_empty());
+        assert_eq!(refused_response.status(), StatusCode::BAD_REQUEST);
     }
 }

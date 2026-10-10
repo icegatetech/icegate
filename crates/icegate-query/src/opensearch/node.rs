@@ -4,6 +4,8 @@
 //! build: the hash and the date are fixed placeholders no release changes, and only
 //! `version.number` follows the configuration.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
@@ -31,29 +33,46 @@ pub(crate) const TAGLINE: &str = "The OpenSearch Project: https://opensearch.org
 
 /// The identity the listener reports as a cluster of one node.
 ///
-/// `cluster_uuid` derives from the cluster name alone, so it is the same across restarts and
-/// replicas of one deployment, and two listeners configured with one cluster name report one
-/// identifier.
+/// `cluster_uuid` and `node_id` derive from the cluster name alone, so they are the same across
+/// restarts and replicas of one deployment, and two listeners configured with one cluster name
+/// report the same identifiers.
 #[derive(Debug, Clone)]
 pub(crate) struct NodeIdentity {
     /// Reported `cluster_name`.
     pub(crate) cluster_name: String,
     /// Reported `cluster_uuid`: [`derive_identifier`] of purpose `cluster` and the cluster name.
     pub(crate) cluster_uuid: String,
+    /// Key of the node under `nodes` in `/_nodes`: [`derive_identifier`] of purpose `node` and the
+    /// cluster name.
+    pub(crate) node_id: String,
     /// Reported node `name`: the cluster name followed by `-node`.
     pub(crate) node_name: String,
     /// Reported `version.number`.
     pub(crate) version: EmulatedVersion,
+    /// Reported `http.bound_address`: the address the listener bound, as bound.
+    pub(crate) bound_address: SocketAddr,
+    /// Reported `ip` and `http.publish_address`: the bound address, with an unspecified IP
+    /// replaced by the loopback of its family.
+    pub(crate) publish_address: SocketAddr,
 }
 
 impl NodeIdentity {
-    /// Describe the one node of the cluster named `cluster_name`, reporting `version`.
-    pub(crate) fn new(cluster_name: &str, version: EmulatedVersion) -> Self {
+    /// Describe the one node of the cluster named `cluster_name`, reporting `version` and bound at
+    /// `bound_address`.
+    pub(crate) fn new(cluster_name: &str, version: EmulatedVersion, bound_address: SocketAddr) -> Self {
+        let publish_ip = match bound_address.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip @ (IpAddr::V4(_) | IpAddr::V6(_)) => ip,
+        };
         Self {
             cluster_name: cluster_name.to_string(),
             cluster_uuid: derive_identifier("cluster", cluster_name),
+            node_id: derive_identifier("node", cluster_name),
             node_name: format!("{cluster_name}-node"),
             version,
+            bound_address,
+            publish_address: SocketAddr::new(publish_ip, bound_address.port()),
         }
     }
 }
@@ -99,5 +118,24 @@ mod tests {
     fn a_derived_identifier_matches_an_independently_computed_sha256_prefix() {
         assert_eq!(derive_identifier("cluster", "icegate"), "Ih3Zl_fD_365ZMtVDguPfg");
         assert_eq!(derive_identifier("node", "icegate"), "Qd9sEClXGyasivmx7Po0bQ");
+    }
+
+    /// An unspecified bind address is not one a client can connect to, so the loopback of its
+    /// family is published with the bound port; a concrete address is published as bound. The
+    /// bound address itself is reported as bound, never rewritten.
+    #[test]
+    fn an_unspecified_bind_address_publishes_loopback_on_the_bound_port() {
+        let version = EmulatedVersion::parse("3.9.0").expect("version");
+        let cases = [
+            ("0.0.0.0:9200", "127.0.0.1:9200"),
+            ("[::]:19200", "[::1]:19200"),
+            ("10.1.2.3:9200", "10.1.2.3:9200"),
+        ];
+        for (bound_text, published_text) in cases {
+            let node = NodeIdentity::new("icegate", version, bound_text.parse().expect("socket address"));
+
+            assert_eq!(node.publish_address.to_string(), published_text, "{bound_text}");
+            assert_eq!(node.bound_address.to_string(), bound_text, "{bound_text}");
+        }
     }
 }

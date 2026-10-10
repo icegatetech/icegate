@@ -101,3 +101,116 @@ async fn head_root_answers_200() {
     assert_eq!(response.status(), 200);
     server.shutdown().await;
 }
+
+/// Whatever it is asked to wait for, the single node is green at once: the waiting parameters are
+/// accepted and ignored.
+#[tokio::test]
+async fn cluster_health_is_green_for_one_node_whatever_it_waits_for() {
+    let (server, _catalog) = TestServer::start().await;
+
+    let response = server
+        .request(
+            Method::GET,
+            Some(TENANT),
+            "/_cluster/health?wait_for_status=green&timeout=5s&wait_for_nodes=1&level=cluster",
+        )
+        .send()
+        .await
+        .expect("GET /_cluster/health");
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("JSON body");
+    assert_eq!(
+        body,
+        json!({
+            "cluster_name": "icegate",
+            "status": "green",
+            "timed_out": false,
+            "number_of_nodes": 1,
+            "number_of_data_nodes": 1,
+            "discovered_cluster_manager": true,
+            "active_primary_shards": 0,
+            "active_shards": 0,
+            "relocating_shards": 0,
+            "initializing_shards": 0,
+            "unassigned_shards": 0,
+            "delayed_unassigned_shards": 0,
+            "number_of_pending_tasks": 0,
+            "number_of_in_flight_fetch": 0,
+            "task_max_waiting_in_queue_millis": 0,
+            "active_shards_percent_as_number": 100.0
+        })
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unknown_parameter_is_refused_in_the_envelope() {
+    let (server, _catalog) = TestServer::start().await;
+
+    for path in [
+        "/?unknown_knob=1",
+        "/_nodes?unknown_knob=1",
+        "/_cluster/health?unknown_knob=1",
+        "/_plugins/_query/_datasources?unknown_knob=1",
+    ] {
+        let response = server.request(Method::GET, Some(TENANT), path).send().await.expect("request");
+
+        assert_eq!(response.status(), 400, "{path}");
+        let body: Value = response.json().await.expect("JSON body");
+        assert_eq!(body["status"], 400, "{path}");
+        assert_eq!(body["error"]["type"], "illegal_argument_exception", "{path}");
+    }
+    server.shutdown().await;
+}
+
+/// A version-poll-style request: this `filter_path` and a product-origin header. The answer keeps
+/// exactly the version, the IP and the publish address of the one node, keyed by a stable node
+/// id. The publish address is the harness's bound address, read from its base URL.
+#[tokio::test]
+async fn a_filtered_version_poll_returns_only_version_ip_and_publish_address() {
+    let (server, _catalog) = TestServer::start().await;
+    let publish_address = server.base_url.strip_prefix("http://").expect("an http base URL").to_string();
+
+    let response = server
+        .request(
+            Method::GET,
+            Some(TENANT),
+            "/_nodes?filter_path=nodes.*.version%2Cnodes.*.http.publish_address%2Cnodes.*.ip",
+        )
+        .header("x-opensearch-product-origin", "opensearch-dashboards")
+        .send()
+        .await
+        .expect("GET /_nodes");
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("JSON body");
+    let root = body.as_object().expect("an object");
+    assert_eq!(root.len(), 1, "only `nodes` survives the filter: {body}");
+    let nodes = body["nodes"].as_object().expect("a nodes object");
+    assert_eq!(nodes.len(), 1);
+    let (node_id, node) = nodes.iter().next().expect("one node");
+    assert!(is_url_safe_identifier(node_id), "{node_id}");
+    assert_eq!(
+        node,
+        &json!({"version": "3.9.0", "ip": "127.0.0.1", "http": {"publish_address": publish_address}})
+    );
+    server.shutdown().await;
+}
+
+/// IceGate defines no query data source, so the lookup is the static empty list.
+#[tokio::test]
+async fn query_datasources_answers_an_empty_list() {
+    let (server, _catalog) = TestServer::start().await;
+
+    let response = server
+        .request(Method::GET, Some(TENANT), "/_plugins/_query/_datasources")
+        .send()
+        .await
+        .expect("GET /_plugins/_query/_datasources");
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("JSON body");
+    assert_eq!(body, json!([]));
+    server.shutdown().await;
+}
