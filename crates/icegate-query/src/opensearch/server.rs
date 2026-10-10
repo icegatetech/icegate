@@ -5,6 +5,7 @@ use std::sync::Arc;
 use icegate_common::{ApplicationProtocol, ListenerRuntime, ServerListener};
 use tokio::sync::oneshot;
 
+use super::catalog::IndexCatalog;
 use super::config::{EmulatedVersion, OpenSearchConfig};
 use super::node::NodeIdentity;
 use super::state::OpenSearchState;
@@ -45,6 +46,7 @@ pub async fn run_with_port_tx(
     let local_address = listener.local_addr();
     let state = OpenSearchState {
         node: Arc::new(NodeIdentity::new(&config.cluster_name, version, local_address)),
+        catalog: IndexCatalog::new(Arc::clone(&runtime.engine)),
     };
     let app = super::routes::build_router(state, &runtime, &config);
     tracing::info!("OpenSearch API server listening on {}", local_address);

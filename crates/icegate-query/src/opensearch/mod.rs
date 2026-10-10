@@ -7,6 +7,7 @@
 //! on every query surface, and every data read goes through the tenant-scoped catalog of
 //! `engine::tenant_scope`.
 
+mod catalog;
 mod cluster;
 mod config;
 mod error;

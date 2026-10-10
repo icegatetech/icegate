@@ -2,8 +2,10 @@
 //!
 //! Every failure the listener answers is rendered here: handler errors, middleware refusals
 //! (shed, deadline, tenant) and unmatched routes, so a client never reads a bare string or an
-//! empty body. The shape is `{"error": {"root_cause": [{type, reason}], type, reason}, "status": N}`;
-//! a `503` adds `details` beside `reason` and a `Retry-After` header.
+//! empty body. The shape is
+//! `{"error": {"root_cause": [{type, reason, <metadata>}], type, reason, <metadata>}, "status": N}`,
+//! where the metadata keys (for example the missing `index`) are present only on errors that carry
+//! them; a `503` adds `details` beside `reason` and a `Retry-After` header.
 //!
 //! `503` is reserved for conditions a client should retry unchanged (memory-pressure shedding,
 //! the query deadline); a limit a request can avoid by asking for less is a `4xx`, never a `503`.
@@ -27,6 +29,8 @@ pub(crate) struct OpenSearchError {
     error_type: &'static str,
     /// The envelope's `reason`, on the error and on its root cause.
     reason: String,
+    /// Extra keys rendered after `type` and `reason`, on the error and on its root cause.
+    metadata: Map<String, Value>,
 }
 
 impl OpenSearchError {
@@ -36,6 +40,7 @@ impl OpenSearchError {
             status,
             error_type,
             reason: reason.into(),
+            metadata: Map::new(),
         }
     }
 
@@ -70,6 +75,26 @@ impl OpenSearchError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "exception", reason)
     }
 
+    /// Attach `key: value` to the error and its root cause.
+    fn with_metadata(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.metadata.insert(key.to_string(), value.into());
+        self
+    }
+
+    /// `index` does not exist (`404`). `index` is the concrete name that is missing, or the whole
+    /// expression when it matched nothing and the endpoint disallows an empty match.
+    pub(crate) fn index_not_found(index: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{index}]"),
+        )
+        .with_metadata("index", index)
+        .with_metadata("index_uuid", "_na_")
+        .with_metadata("resource.id", index)
+        .with_metadata("resource.type", "index_or_alias")
+    }
+
     /// No route serves `method` on `path`: a `400` `illegal_argument_exception` in the envelope,
     /// never a `404` or `405`.
     pub(crate) fn no_handler(method: &Method, path: &str) -> Self {
@@ -83,13 +108,17 @@ impl IntoResponse for OpenSearchError {
         if self.status.is_server_error() && !is_retryable {
             tracing::error!(error_type = self.error_type, reason = %self.reason, "opensearch request failed");
         }
+        let mut cause = Map::new();
+        cause.insert("type".to_string(), json!(self.error_type));
+        cause.insert("reason".to_string(), json!(self.reason));
+        cause.extend(self.metadata);
         let mut error = Map::new();
+        // The root cause repeats the error's keys: built once, cloned into the cause list.
         error.insert(
             "root_cause".to_string(),
-            json!([{"type": self.error_type, "reason": self.reason}]),
+            Value::Array(vec![Value::Object(cause.clone())]),
         );
-        error.insert("type".to_string(), json!(self.error_type));
-        error.insert("reason".to_string(), json!(self.reason));
+        error.extend(cause);
         if is_retryable {
             error.insert("details".to_string(), json!(self.reason));
         }
@@ -267,5 +296,23 @@ mod tests {
         assert_eq!(body["error"]["type"], "illegal_argument_exception");
         assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
         assert!(body["error"]["reason"].is_string());
+    }
+
+    #[tokio::test]
+    async fn index_not_found_carries_the_index_metadata_in_error_and_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::index_not_found("nope")).await;
+
+        let cause = json!({
+            "type": "index_not_found_exception",
+            "reason": "no such index [nope]",
+            "index": "nope",
+            "index_uuid": "_na_",
+            "resource.id": "nope",
+            "resource.type": "index_or_alias"
+        });
+        let mut error = cause.clone();
+        error["root_cause"] = json!([cause]);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, json!({ "error": error, "status": 404 }));
     }
 }

@@ -3,6 +3,7 @@
 //!
 //! - `cluster`: the cluster-level endpoints
 //! - `harness`: the listener over a temporary warehouse, and a reqwest client
+//! - `indices`: `_resolve/index` and `<index>/_settings`
 //! - `listener`: the listener's start-up
 //! - `rustfs_conditional`: the object-store guarantees the system-index store builds on
 

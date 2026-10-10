@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use icegate_common::{ShedPolicy, shed_when_pressured};
 
-use super::cluster::{datasources, health, info};
+use super::cluster::{datasources, health, info, resolve, settings};
 use super::config::OpenSearchConfig;
 use super::error::OpenSearchError;
 use super::filter_path::apply_filter_path;
@@ -60,6 +60,8 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
             "/_plugins/_query/_datasources",
             get(datasources::list_query_datasources),
         )
+        .route("/_resolve/index/{expression}", get(resolve::resolve_index))
+        .route("/{index}/_settings/{setting}", get(settings::read_index_setting))
         .fallback(answer_unmatched_route)
         .method_not_allowed_fallback(answer_unmatched_route)
         .layer(middleware::from_fn(apply_filter_path))
@@ -132,6 +134,7 @@ mod tests {
 
     use super::*;
     use crate::infra::metrics::test_support::{build_meter_provider, find_counter_total};
+    use crate::opensearch::catalog::IndexCatalog;
     use crate::opensearch::config::EmulatedVersion;
     use crate::opensearch::error::read_envelope;
     use crate::opensearch::node::NodeIdentity;
@@ -145,8 +148,9 @@ mod tests {
             ..OpenSearchConfig::default()
         };
         let version = EmulatedVersion::parse(&config.version).expect("the default version parses");
+        let engine = build_stalling_engine(30);
         let runtime = QueryRuntime {
-            engine: build_stalling_engine(30),
+            engine: Arc::clone(&engine),
             metrics: Arc::new(metrics),
             pressure,
             tenant_resolver,
@@ -157,6 +161,7 @@ mod tests {
                 version,
                 "127.0.0.1:9200".parse().expect("socket address"),
             )),
+            catalog: IndexCatalog::new(engine),
         };
         build_router(state, &runtime, &config)
     }
