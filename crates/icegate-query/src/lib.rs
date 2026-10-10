@@ -23,6 +23,9 @@ pub mod loki;
 /// LogQL query language implementation
 pub mod logql;
 
+/// OpenSearch-compatible API server (Query DSL, Lucene, PPL, saved objects)
+pub mod opensearch;
+
 /// Prometheus API server (PromQL)
 pub mod prometheus;
 

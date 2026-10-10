@@ -124,6 +124,19 @@
         "prometheus": { "type": ["object", "null"], "additionalProperties": true, "description": "Prometheus-compatible API listener." },
         "tempo": { "type": ["object", "null"], "additionalProperties": true, "description": "Tempo-compatible API listener." },
         "flightSql": { "type": ["object", "null"], "additionalProperties": true, "description": "Arrow Flight SQL listener." },
+        "opensearch": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "OpenSearch-compatible API listener.",
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Run the listener." },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Listener port." },
+            "version": { "type": "string", "description": "Version reported by GET / and /_nodes: canonical MAJOR.MINOR.PATCH, major 3." },
+            "clusterName": { "type": "string", "minLength": 1, "description": "Cluster name reported by GET /, /_nodes and /_cluster/health." },
+            "maxRequestBodyBytes": { "type": "integer", "minimum": 1, "description": "Largest request body accepted, in bytes." },
+            "fieldDiscoveryWindowSecs": { "type": "integer", "minimum": 1, "description": "Field-discovery window, in seconds." }
+          }
+        },
         "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Operational listener: /health always, /metrics when enabled." },
         "tls": {
           "type": ["object", "null"],

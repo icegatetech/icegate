@@ -266,6 +266,21 @@ query:
     port: 8815
     maxMessageSize: 16777216
 
+  ## OpenSearch-compatible API (Query DSL, Lucene, PPL, saved objects).
+  opensearch:
+    # -- Run the OpenSearch-compatible listener. Off by default: it authenticates no caller, and the tenant is decided by query.tenant as on every query surface.
+    enabled: false
+    # -- Listener port.
+    port: 9200
+    # -- Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup.
+    version: "3.9.0"
+    # -- Cluster name reported by GET /, /_nodes and /_cluster/health. It seeds the stable cluster and node identifiers, so changing it changes them.
+    clusterName: icegate
+    # -- Largest request body the listener accepts, in bytes. It also bounds how much of a refused request's body is drained.
+    maxRequestBodyBytes: 33554432
+    # -- How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys.
+    fieldDiscoveryWindowSecs: 86400
+
   ## Prometheus metrics endpoint
   metrics:
     enabled: true

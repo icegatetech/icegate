@@ -83,6 +83,14 @@ data:
       host: "0.0.0.0"
       port: {{ .Values.query.flightSql.port | default 8815 }}
       max_message_size: {{ .Values.query.flightSql.maxMessageSize | default 16777216 | int }}
+    opensearch:
+      enabled: {{ .Values.query.opensearch.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.query.opensearch.port }}
+      version: {{ .Values.query.opensearch.version | quote }}
+      cluster_name: {{ .Values.query.opensearch.clusterName | quote }}
+      max_request_body_bytes: {{ .Values.query.opensearch.maxRequestBodyBytes | int }}
+      field_discovery_window_secs: {{ .Values.query.opensearch.fieldDiscoveryWindowSecs | int }}
     metrics:
       enabled: {{ .Values.query.metrics.enabled }}
       host: "0.0.0.0"

@@ -9,10 +9,17 @@ front of it is writable by any neighbour in the namespace, and a loopback
 to say beyond that. None of the three is visible in the default render, so each is
 rendered here on purpose.
 
+A section the binary reads with every key optional fails quietly instead: a value
+the template drops, or renders under a name the binary does not read, leaves the
+binary on its code default with no error anywhere. The default render cannot show
+it, because the chart default and the code default are the same value, so such a
+section is rendered here with every value moved off its default.
+
 Both components carry the tenant policy and the operational listener the probes
-address, so those two checks run per component off `COMPONENTS`. The rest is
-ingest-only, because the sidecar split is: only ingest has listener hosts,
-published-port keys, extraContainers and a NOTES port-forward command.
+address, so those two checks run per component off `COMPONENTS`. The `opensearch`
+section is query's alone. The rest is ingest-only, because the sidecar split is:
+only ingest has listener hosts, published-port keys, extraContainers and a NOTES
+port-forward command.
 
 Every check states the message it expects a guard to fail with. That message is the
 contract with the operator who hits the guard, so a guard that starts refusing for
@@ -337,6 +344,30 @@ LONG_FULLNAME_CASES = (  # (description, global.fullnameOverride, expected migra
     ("a fullname cut at a hyphen", "icegate-" + "x" * 46 + "-yyyyy", "icegate-" + "x" * 46 + "-migrate"),
 )
 
+# Every `query.opensearch` value moved off its chart default, and the section of
+# query.yaml it must render into, under the names the binary reads. Both are
+# literals, so the check is not a second reading of the template. The values go in
+# through `--set-json`, which reads a number as a float the way a values file does,
+# so the body limit, being above a million, also pins the `| int` that keeps it out
+# of the exponent form the binary refuses.
+OPENSEARCH_VALUES = {
+    "enabled": True,
+    "port": 9201,
+    "version": "3.10.1",
+    "clusterName": "c1",
+    "maxRequestBodyBytes": 1048577,
+    "fieldDiscoveryWindowSecs": 3601,
+}
+OPENSEARCH_SECTION = {
+    "enabled": True,
+    "host": "0.0.0.0",
+    "port": 9201,
+    "version": "3.10.1",
+    "cluster_name": "c1",
+    "max_request_body_bytes": 1048577,
+    "field_discovery_window_secs": 3601,
+}
+
 
 def digest_for_row(position: int) -> str:
     """A well-formed digest that no other row of `IMAGE_DIGEST_KEYS` shares.
@@ -489,6 +520,30 @@ def check_probe_target(component: str) -> None:
         fail(f"{component}.metrics.port must reach metrics.port of {component}.yaml: expected {port}, got {bound}")
     else:
         ok(f"{component}.metrics.port reaches both the metrics containerPort and {component}.yaml")
+
+
+def pair_values_with_types(mapping: dict) -> dict:
+    """`mapping` with each value paired with its type, so comparing two results compares types too.
+
+    Python holds `1048577.0 == 1048577` and `True == 1`, while the binary refuses a
+    float where it reads an integer, so a plain comparison would pass a render the
+    binary cannot load.
+    """
+    return {key: (type(value), value) for key, value in mapping.items()}
+
+
+def check_opensearch_section() -> None:
+    """Every `query.opensearch` value reaches query.yaml under the name the binary reads."""
+    rendered = render_chart(
+        "--set-json",
+        f"query.opensearch={json.dumps(OPENSEARCH_VALUES)}",
+        show_only="templates/configmap-query.yaml",
+    )
+    section = read_component_config(rendered, "query.yaml").get("opensearch") or {}
+    if pair_values_with_types(section) != pair_values_with_types(OPENSEARCH_SECTION):
+        fail(f"query.opensearch must render into query.yaml as {OPENSEARCH_SECTION}, got {section}")
+    else:
+        ok("every query.opensearch value reaches the opensearch section of query.yaml under the name the binary reads")
 
 
 def check_operational_host() -> None:
@@ -1497,6 +1552,7 @@ for component_name in COMPONENTS:
     check_tenant_policy(component_name)
     check_probe_target(component_name)
 
+check_opensearch_section()
 check_operational_host()
 check_otlp_port_names()
 check_otlp_host_guards()

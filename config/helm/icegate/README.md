@@ -443,6 +443,12 @@ an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 | query.metrics.path | string | `"/metrics"` |  |
 | query.metrics.port | int | `9091` |  |
 | query.nodeSelector | object | `{}` |  |
+| query.opensearch.clusterName | string | `"icegate"` | Cluster name reported by GET /, /_nodes and /_cluster/health. It seeds the stable cluster and node identifiers, so changing it changes them. |
+| query.opensearch.enabled | bool | `false` | Run the OpenSearch-compatible listener. Off by default: it authenticates no caller, and the tenant is decided by query.tenant as on every query surface. |
+| query.opensearch.fieldDiscoveryWindowSecs | int | `86400` | How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys. |
+| query.opensearch.maxRequestBodyBytes | int | `33554432` | Largest request body the listener accepts, in bytes. It also bounds how much of a refused request's body is drained. |
+| query.opensearch.port | int | `9200` | Listener port. |
+| query.opensearch.version | string | `"3.9.0"` | Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup. |
 | query.pdb.enabled | bool | `false` |  |
 | query.pdb.minAvailable | int | `1` |  |
 | query.prometheus.enabled | bool | `true` |  |
