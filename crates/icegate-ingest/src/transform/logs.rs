@@ -8,14 +8,17 @@ use arrow::{
 };
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::{
-    TenantId,
-    schema::{COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES},
+    LOGS_TABLE, TenantId,
+    schema::{
+        COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, SERVICE_NAME_ATTRIBUTE_KEY,
+        promoted_resource_keys,
+    },
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use super::attributes::{
-    SERVICE_NAME_KEY, attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named,
-    extract_string_value, is_zero_bytes, merge_dotted_levels, now_micros, serialize_any_value_to_json,
+    attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named, extract_string_value,
+    is_zero_bytes, merge_dotted_levels, now_micros, serialize_any_value_to_json,
 };
 
 /// Process-wide cache of the derived logs Arrow schema.
@@ -121,14 +124,14 @@ pub fn logs_to_record_batch(
         // Extract service.name from resource attributes
         let service_name = resource_attrs
             .iter()
-            .find(|kv| kv.key == SERVICE_NAME_KEY)
+            .find(|kv| kv.key == SERVICE_NAME_ATTRIBUTE_KEY)
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
         // Flattened once per ResourceLogs / ScopeLogs and reused by every log
         // record beneath: both inputs are fixed at their own nesting level, so
         // re-flattening them per record would rebuild an identical BTreeMap
         // (and every key/value String in it) for each row of the export.
-        let resource_attributes = merge_dotted_levels(&[resource_attrs], LOG_PROMOTED_RESOURCE_KEYS);
+        let resource_attributes = merge_dotted_levels(&[resource_attrs], promoted_resource_keys(LOGS_TABLE));
 
         for scope_logs in &resource_logs.scope_logs {
             let scope_attrs = scope_logs.scope.as_ref().map_or(&empty_attrs, |s| &s.attributes);
@@ -246,13 +249,6 @@ pub fn logs_to_record_batch(
         crate::error::IngestError::Validation(format!("Failed to create RecordBatch: {e}"))
     })
 }
-
-/// Resource-attribute keys, in their OTLP dotted form, that already have a
-/// dedicated top-level column on the logs table. Dropped from the resource
-/// level so the MAP holds no redundant copy — smaller Parquet pages and a
-/// tidier row-group key dictionary. A more specific level may still supply
-/// the same key as a deliberate override.
-const LOG_PROMOTED_RESOURCE_KEYS: &[&str] = &[SERVICE_NAME_KEY];
 
 /// Validates and writes raw `trace_id` and `span_id` bytes directly into the
 /// top-level fixed-size binary builders.
@@ -465,7 +461,7 @@ mod tests {
         //   resource/scope/log attributes.
         // - `severity_text` and `level`: same — never OTLP attribute keys.
         // - `service.name`: promoted to its own top-level column and
-        //   suppressed via `LOG_PROMOTED_RESOURCE_KEYS`.
+        //   suppressed via `icegate_common::schema::promoted_resource_keys`.
         // - `service_name`: a producer may emit this spelling directly, and it
         //   reaches the query layer as the same label as `service.name`, so it
         //   is suppressed too. This fixture does not supply it — see
@@ -576,6 +572,57 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .expect("StringArray");
         assert_eq!(service_name.value(0), "api");
+    }
+
+    /// Ingest drops from the resource map exactly the keys `promoted_resource_keys` lists, the
+    /// single list a reader resolves a resource path with. For a listed key the dotted spelling
+    /// fills its column, and both spellings a producer may send, dotted and underscored, leave the
+    /// resource map.
+    #[test]
+    fn every_promoted_logs_resource_key_fills_its_column_and_leaves_the_resource_map() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![
+                        kv("service.name", "checkout"),
+                        kv("service_name", "legacy-name"),
+                        kv("kept.key", "kept-value"),
+                    ],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let column_values = [("service.name", "checkout")];
+
+        let batch = logs_to_record_batch(&request, &test_tenant("t1"))
+            .expect("transform")
+            .expect("batch");
+
+        assert_eq!(
+            map_pairs(&batch, COL_RESOURCE_ATTRIBUTES),
+            std::collections::BTreeMap::from([("kept.key".to_string(), "kept-value".to_string())])
+        );
+        for promoted_key in promoted_resource_keys(LOGS_TABLE) {
+            let (_, expected_value) = column_values
+                .iter()
+                .find(|(key, _)| *key == promoted_key.attribute_key)
+                .expect("the request carries every promoted key");
+            let column = batch
+                .column_by_name(promoted_key.column)
+                .expect("promoted column")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("utf8 column");
+            assert_eq!(column.value(0), *expected_value, "{}", promoted_key.attribute_key);
+        }
     }
 
     fn kv(key: &str, value: &str) -> KeyValue {

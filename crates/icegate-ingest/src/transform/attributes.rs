@@ -6,24 +6,14 @@ use arrow::{
     datatypes::{DataType, Fields, Schema},
 };
 use icegate_common::attribute_key::{matches_wire_name, normalize_attribute_key};
+use icegate_common::schema::PromotedResourceKey;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
 
-/// OTLP semantic-convention resource-attribute keys, in the dotted form they
-/// arrive on the wire, that the transforms read by name.
-///
-/// Spelled once here rather than per signal because every transform matches the
-/// same keys — to fill a promoted top-level column, and to suppress the now
-/// redundant map copy through [`merge_dotted_levels`]. They belong to this
-/// module and not to `icegate_common::schema`, which describes table columns:
-/// the dotted key is what OTLP puts in an attribute map, and the column it is
-/// promoted into is spelled differently and lives at a different layer
-/// (`service.name` -> `icegate_common::schema::COL_SERVICE_NAME`).
-pub(crate) const SERVICE_NAME_KEY: &str = "service.name";
-/// See [`SERVICE_NAME_KEY`]. Promoted to its own column on metrics only.
-pub(crate) const SERVICE_INSTANCE_ID_KEY: &str = "service.instance.id";
-/// See [`SERVICE_NAME_KEY`]. Promoted to `operations.environment`.
+/// OTLP resource attribute naming the deployment environment, in the dotted form it arrives on
+/// the wire. Promoted to `operations.environment`.
 pub(crate) const DEPLOYMENT_ENVIRONMENT_NAME_KEY: &str = "deployment.environment.name";
-/// See [`SERVICE_NAME_KEY`]. Fallback source of `operations.environment`.
+/// Fallback source of `operations.environment`, read when the resource does not set
+/// [`DEPLOYMENT_ENVIRONMENT_NAME_KEY`].
 pub(crate) const DEPLOYMENT_ENVIRONMENT_KEY: &str = "deployment.environment";
 
 /// Extracts a string value from an OTLP `AnyValue` reference.
@@ -650,11 +640,11 @@ pub(crate) fn extract_map_fields_from_nested_struct(
 
 /// Merge dotted-flattened attributes from several precedence levels into one
 /// sorted, deduplicated map. Levels apply in order, so a later (more specific)
-/// level overwrites an earlier one on key collision. Any key in
-/// `skip_in_first` is dropped **only** from the first (most-general) level —
-/// used to suppress keys already promoted to a dedicated top-level column while
-/// still letting a more-specific level re-supply an override (mirrors the logs
-/// `LOG_PROMOTED_RESOURCE_KEYS` rule).
+/// level overwrites an earlier one on key collision. A key listed in
+/// `promoted_keys` is dropped **only** from the first (most-general) level:
+/// it already has a column of its own (see
+/// `icegate_common::schema::promoted_resource_keys`), while a more specific
+/// level may still re-supply it as a deliberate override.
 ///
 /// Suppression matches by **wire name**, not by the raw dotted string: a
 /// promoted `service.name` also drops a resource attribute spelled
@@ -664,21 +654,25 @@ pub(crate) fn extract_map_fields_from_nested_struct(
 /// the wire in place of the promoted column's.
 pub(crate) fn merge_dotted_levels(
     levels: &[&[KeyValue]],
-    skip_in_first: &[&str],
+    promoted_keys: &[PromotedResourceKey],
 ) -> std::collections::BTreeMap<String, String> {
-    let skip_wire_names: Vec<_> = skip_in_first.iter().map(|promoted| normalize_attribute_key(promoted)).collect();
-    let mut merged = std::collections::BTreeMap::new();
-    for (level_idx, attrs) in levels.iter().enumerate() {
-        for kv in *attrs {
-            for (key, value) in flatten_any_value_dotted(&kv.key, kv.value.as_ref()) {
-                if level_idx == 0 && skip_wire_names.iter().any(|wire_name| matches_wire_name(&key, wire_name)) {
+    let suppressed_wire_names: Vec<_> = promoted_keys
+        .iter()
+        .map(|promoted_key| normalize_attribute_key(promoted_key.attribute_key))
+        .collect();
+    let mut merged_attributes = std::collections::BTreeMap::new();
+    for (level_index, level_attributes) in levels.iter().enumerate() {
+        for key_value in *level_attributes {
+            for (key, value) in flatten_any_value_dotted(&key_value.key, key_value.value.as_ref()) {
+                if level_index == 0 && suppressed_wire_names.iter().any(|wire_name| matches_wire_name(&key, wire_name))
+                {
                     continue;
                 }
-                merged.insert(key, value);
+                merged_attributes.insert(key, value);
             }
         }
     }
-    merged
+    merged_attributes
 }
 
 /// Flatten a single attribute list and deduplicate keys into a sorted

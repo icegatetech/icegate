@@ -321,12 +321,12 @@ pub fn spans_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 20,
-                "dropped_events_count",
+                COL_DROPPED_EVENTS_COUNT,
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
                 21,
-                "dropped_links_count",
+                COL_DROPPED_LINKS_COUNT,
                 Type::Primitive(PrimitiveType::Int),
             )),
             // Nested events (NO trace_id/span_id — inherits from parent span).
@@ -1533,7 +1533,7 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 3,
-                "service_instance_id",
+                COL_SERVICE_INSTANCE_ID,
                 Type::Primitive(PrimitiveType::String),
             )),
             // Timestamp fields
@@ -1600,7 +1600,7 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 15,
-                "value_int",
+                COL_VALUE_INT,
                 Type::Primitive(PrimitiveType::Long),
             )),
             // Common histogram fields (for histogram, exponential_histogram, and summary)
@@ -1756,23 +1756,26 @@ pub fn metrics_sort_order(schema: &Schema) -> Result<SortOrder> {
         )
     })?;
 
-    let service_name_field = schema.field_by_name("service_name").ok_or_else(|| {
+    let service_name_field = schema.field_by_name(COL_SERVICE_NAME).ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
-            "field 'service_name' not found in metrics schema",
+            format!("field '{COL_SERVICE_NAME}' not found in metrics schema"),
         )
     })?;
 
-    let service_instance_id_field = schema.field_by_name("service_instance_id").ok_or_else(|| {
+    let service_instance_id_field = schema.field_by_name(COL_SERVICE_INSTANCE_ID).ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
-            "field 'service_instance_id' not found in metrics schema",
+            format!("field '{COL_SERVICE_INSTANCE_ID}' not found in metrics schema"),
         )
     })?;
 
-    let timestamp_field = schema
-        .field_by_name("timestamp")
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'timestamp' not found in metrics schema"))?;
+    let timestamp_field = schema.field_by_name(COL_TIMESTAMP).ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("field '{COL_TIMESTAMP}' not found in metrics schema"),
+        )
+    })?;
 
     let sort_order = SortOrder::builder()
         .with_order_id(4)
@@ -1853,6 +1856,9 @@ pub const COL_SEVERITY_TEXT: &str = "severity_text";
 pub const COL_SERVICE_NAME: &str = "service_name";
 /// Operations — deployment environment of the resource that produced the operation.
 pub const COL_ENVIRONMENT: &str = "environment";
+/// Metrics — service instance column, promoted from the [`SERVICE_INSTANCE_ID_ATTRIBUTE_KEY`]
+/// resource attribute.
+pub const COL_SERVICE_INSTANCE_ID: &str = "service_instance_id";
 /// W3C Trace Context trace identifier (`FIXED_LEN_BYTE_ARRAY(16)`).
 pub const COL_TRACE_ID: &str = "trace_id";
 /// W3C Trace Context span identifier (`FIXED_LEN_BYTE_ARRAY(8)`).
@@ -1884,6 +1890,10 @@ pub const COL_ATTRIBUTES: &str = "attributes";
 /// Spans — OTLP-reported count of attributes dropped before export (`INT`).
 /// Present on the span itself and inside the `events` / `links` structs.
 pub const COL_DROPPED_ATTRIBUTES_COUNT: &str = "dropped_attributes_count";
+/// Spans — OTLP-reported count of events dropped before export (`INT`).
+pub const COL_DROPPED_EVENTS_COUNT: &str = "dropped_events_count";
+/// Spans — OTLP-reported count of links dropped before export (`INT`).
+pub const COL_DROPPED_LINKS_COUNT: &str = "dropped_links_count";
 /// Spans/metrics — OTLP `flags` bitmask (`INT`).
 ///
 /// The bits differ per table: on spans (the span itself and the `links`
@@ -1905,6 +1915,8 @@ pub const COL_COUNT: &str = "count";
 pub const COL_ZERO_COUNT: &str = "zero_count";
 /// Metrics — point value as `DOUBLE`.
 pub const COL_VALUE_DOUBLE: &str = "value_double";
+/// Metrics — point value as `BIGINT`; [`COL_VALUE_DOUBLE`] holds the other kind.
+pub const COL_VALUE_INT: &str = "value_int";
 /// Metrics — histogram/summary sum (`DOUBLE`).
 pub const COL_SUM: &str = "sum";
 /// Metrics — histogram min (`DOUBLE`).
@@ -2105,6 +2117,60 @@ pub const TRACEQL_INTRINSIC_TAGS: &[&str] = &[
     "trace:rootName",
     "trace:rootService",
 ];
+
+/// OTLP resource attribute naming the service, in the dotted form it arrives on the wire.
+pub const SERVICE_NAME_ATTRIBUTE_KEY: &str = "service.name";
+/// OTLP resource attribute naming the service instance, in the dotted form it arrives on the
+/// wire.
+pub const SERVICE_INSTANCE_ID_ATTRIBUTE_KEY: &str = "service.instance.id";
+
+/// A resource attribute that ingest moves out of a table's resource map into a column of its own.
+///
+/// The key is absent from the stored map of such a table, so a reader resolves a resource path
+/// naming it to [`Self::column`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromotedResourceKey {
+    /// The attribute key as sent on the wire, dotted.
+    pub attribute_key: &'static str,
+    /// The column that holds the attribute's value.
+    pub column: &'static str,
+}
+
+/// Promoted resource keys of the logs table.
+const LOGS_PROMOTED_RESOURCE_KEYS: &[PromotedResourceKey] = &[PromotedResourceKey {
+    attribute_key: SERVICE_NAME_ATTRIBUTE_KEY,
+    column: COL_SERVICE_NAME,
+}];
+
+/// Promoted resource keys of the metrics table.
+const METRICS_PROMOTED_RESOURCE_KEYS: &[PromotedResourceKey] = &[
+    PromotedResourceKey {
+        attribute_key: SERVICE_NAME_ATTRIBUTE_KEY,
+        column: COL_SERVICE_NAME,
+    },
+    PromotedResourceKey {
+        attribute_key: SERVICE_INSTANCE_ID_ATTRIBUTE_KEY,
+        column: COL_SERVICE_INSTANCE_ID,
+    },
+];
+
+/// The resource attributes `table` promotes to columns.
+///
+/// This is the single list for both sides: ingest drops each listed key from the table's
+/// resource map, so a reader resolves a resource path naming one of them to
+/// [`PromotedResourceKey::column`].
+///
+/// Only logs and metrics promote keys. The list is empty for every other table: spans and events
+/// keep every resource attribute in their resource map, and operations and prices have no
+/// resource map.
+#[must_use]
+pub fn promoted_resource_keys(table: &str) -> &'static [PromotedResourceKey] {
+    match table {
+        crate::LOGS_TABLE => LOGS_PROMOTED_RESOURCE_KEYS,
+        crate::METRICS_TABLE => METRICS_PROMOTED_RESOURCE_KEYS,
+        _ => &[],
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2804,6 +2870,36 @@ mod tests {
                 schema.field_by_name("attributes").is_none(),
                 "{table} must not carry a merged `attributes` column"
             );
+        }
+    }
+
+    /// The expected pairs are literals: the map is the single list ingest drops from the resource
+    /// map and a reader resolves a resource path with, so a renamed key or column must fail here
+    /// rather than move both sides at once.
+    #[test]
+    fn promoted_resource_keys_name_the_service_identity_columns_of_logs_and_metrics_only() {
+        let pairs = |table: &str| {
+            promoted_resource_keys(table)
+                .iter()
+                .map(|promoted_key| (promoted_key.attribute_key, promoted_key.column))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(pairs(crate::LOGS_TABLE), vec![("service.name", "service_name")]);
+        assert_eq!(
+            pairs(crate::METRICS_TABLE),
+            vec![
+                ("service.name", "service_name"),
+                ("service.instance.id", "service_instance_id")
+            ]
+        );
+        for table in [
+            crate::SPANS_TABLE,
+            crate::OPERATIONS_TABLE,
+            crate::EVENTS_TABLE,
+            crate::PRICES_TABLE,
+        ] {
+            assert!(pairs(table).is_empty(), "{table} promotes no resource key");
         }
     }
 }
