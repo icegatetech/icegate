@@ -52,7 +52,8 @@ pub const PRICES_EFFECTIVE_BY_TIME_OF_DAY_TABLE: &str = "prices_effective_by_tim
 /// Tables in the IceGate namespace that carry no `tenant_id` and hold identical
 /// rows for every tenant.
 ///
-/// The Flight SQL tenant decorator consults this allowlist and passes matching
+/// The tenant-scoped catalog that `icegate-query` installs on a query session (its
+/// `engine::tenant_scope` module) consults this allowlist and passes matching
 /// tables through **unwrapped**. Everything absent from this list is still
 /// wrapped, and a table with no `tenant_id` column fails closed at
 /// catalog-resolution time — so forgetting to add a genuinely tenant-scoped

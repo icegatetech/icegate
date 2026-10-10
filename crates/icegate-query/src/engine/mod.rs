@@ -8,6 +8,7 @@ mod config;
 mod core;
 pub(crate) mod metadata_scan;
 pub(crate) mod provider;
+pub(crate) mod tenant_scope;
 
 pub use core::QueryEngine;
 

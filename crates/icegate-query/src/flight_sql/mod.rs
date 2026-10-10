@@ -23,7 +23,6 @@
 mod config;
 mod provider;
 mod server;
-mod tenant_catalog;
 
 pub use config::FlightSqlConfig;
 pub use server::{run, run_with_port_tx};
