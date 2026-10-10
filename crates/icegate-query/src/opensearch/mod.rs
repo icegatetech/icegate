@@ -7,6 +7,13 @@
 //! on every query surface, and every data read goes through the tenant-scoped catalog of
 //! `engine::tenant_scope`.
 
+mod cluster;
 mod config;
+mod error;
+mod node;
+mod routes;
+mod server;
+mod state;
 
 pub use config::OpenSearchConfig;
+pub use server::{run, run_with_port_tx};

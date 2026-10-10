@@ -1,4 +1,4 @@
-{{- if and .Values.query.enabled (or .Values.query.loki.enabled .Values.query.prometheus.enabled .Values.query.tempo.enabled .Values.query.flightSql.enabled .Values.query.metrics.enabled) -}}
+{{- if and .Values.query.enabled (or .Values.query.loki.enabled .Values.query.prometheus.enabled .Values.query.tempo.enabled .Values.query.flightSql.enabled .Values.query.opensearch.enabled .Values.query.metrics.enabled) -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -48,6 +48,15 @@ spec:
       targetPort: flight-sql
       protocol: TCP
       {{- with include "icegate.appProtocol" (dict "service" .Values.query.service "port" "flightSql") }}
+      {{ . }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.query.opensearch.enabled }}
+    - name: opensearch
+      port: {{ .Values.query.opensearch.port }}
+      targetPort: opensearch
+      protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.query.service "port" "opensearch") }}
       {{ . }}
       {{- end }}
     {{- end }}

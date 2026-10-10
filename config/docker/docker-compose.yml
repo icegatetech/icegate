@@ -212,6 +212,7 @@ services:
       - "9090:9090"
       - "3200:3200"
       - "8815:8815"
+      - "9200:9200"
     volumes:
       - ./query.yaml:/etc/icegate/query.yaml:ro
     depends_on:

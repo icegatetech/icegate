@@ -12,6 +12,9 @@ use std::{io::Write as _, path::PathBuf};
 use icegate_common::{TenantPolicy, TlsConfig};
 use icegate_query::QueryConfig;
 
+/// The stand's query document.
+const STAND_QUERY_DOCUMENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/docker/query.yaml");
+
 /// The stand's query reads the tenant each reader names: the plain stand writes
 /// `demo`, the auth-proxy stand writes the token's tenant, and both run this one
 /// document. That every stand datasource sends the header carrying the tenant
@@ -20,9 +23,7 @@ use icegate_query::QueryConfig;
 /// `crates/icegate-ingest/tests/config_file.rs`.
 #[test]
 fn the_stand_query_document_reads_the_tenant_each_request_names() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/docker/query.yaml");
-
-    let config = QueryConfig::from_file(path).expect("the stand query document must load and validate");
+    let config = QueryConfig::from_file(STAND_QUERY_DOCUMENT).expect("the stand query document must load and validate");
 
     assert_eq!(config.tenant, TenantPolicy::Multi);
 }
@@ -120,4 +121,14 @@ fn a_document_with_a_tls_block_loads_its_paths_and_the_default_reload_interval()
 #[test]
 fn a_document_without_a_tls_block_serves_plaintext() {
     assert_eq!(load_document("").tls, None);
+}
+
+/// The stand serves the `OpenSearch` API on 9200, the port `docker-compose.yml` publishes for the
+/// `query` service.
+#[test]
+fn the_stand_query_document_serves_opensearch_on_9200() {
+    let config = QueryConfig::from_file(STAND_QUERY_DOCUMENT).expect("the stand query document must load and validate");
+
+    assert!(config.opensearch.enabled);
+    assert_eq!(config.opensearch.port, 9200);
 }

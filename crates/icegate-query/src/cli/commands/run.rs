@@ -249,6 +249,15 @@ fn spawn_servers(
         }));
     }
 
+    if config.opensearch.enabled {
+        let runtime = runtime.clone();
+        let opensearch_config = config.opensearch.clone();
+        let listener_runtime = listener_runtime.clone();
+        handles.push(tokio::spawn(async move {
+            crate::opensearch::run(runtime, opensearch_config, listener_runtime).await
+        }));
+    }
+
     handles
 }
 
@@ -317,7 +326,8 @@ mod tests {
     };
 
     use icegate_common::{
-        DEFAULT_TLS_RELOAD_INTERVAL_SECS, HEALTH_PATH, OperationalConfig, ServerCertificate, TenantResolver, TlsConfig,
+        DEFAULT_TLS_RELOAD_INTERVAL_SECS, HEALTH_PATH, OperationalConfig, ServerCertificate, TENANT_ID_HEADER,
+        TenantResolver, TlsConfig,
     };
     use rcgen::{CertificateParams, KeyPair};
     use reqwest::{Client, StatusCode, Version};
@@ -326,8 +336,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        flight_sql::FlightSqlConfig, loki::LokiConfig, prometheus::PrometheusConfig, tempo::TempoConfig,
-        test_support::build_stalling_engine,
+        flight_sql::FlightSqlConfig, loki::LokiConfig, opensearch::OpenSearchConfig, prometheus::PrometheusConfig,
+        tempo::TempoConfig, test_support::build_stalling_engine,
     };
 
     /// The upper bound of every wait, so a hang fails the test instead of the run.
@@ -352,6 +362,8 @@ mod tests {
 
     /// Request `path` over `https` from the listener on `port` until it answers, with a client
     /// that trusts only `certificate_pem`, and return the answer's status and HTTP version.
+    /// The request names a tenant because the `OpenSearch` listener has no path that goes without
+    /// one; the probe paths of the other listeners ignore the header.
     async fn get_over_tls(certificate_pem: &str, port: u16, path: &str) -> Result<(StatusCode, Version), String> {
         let root = reqwest::Certificate::from_pem(certificate_pem.as_bytes()).expect("parse the test certificate");
         let client = Client::builder()
@@ -364,7 +376,7 @@ mod tests {
         // The servers bind on their own tasks, so the first attempts may find the port closed.
         let attempts = async {
             loop {
-                match client.get(&url).send().await {
+                match client.get(&url).header(TENANT_ID_HEADER, "tls-test").send().await {
                     Ok(response) => return (response.status(), response.version()),
                     Err(error) => last_error = error.to_string(),
                 }
@@ -376,7 +388,7 @@ mod tests {
     }
 
     /// Every listener the binary spawns presents the one certificate it was handed, and speaks the
-    /// protocol its clients do: `http/1.1` on the four HTTP listeners (the client offers `h2` as
+    /// protocol its clients do: `http/1.1` on the five HTTP listeners (the client offers `h2` as
     /// well), `h2` on Flight SQL (a gRPC channel opens only once it is negotiated). A listener
     /// left on plaintext would not complete the handshake, so each answer below proves its own
     /// listener.
@@ -404,6 +416,7 @@ mod tests {
             prometheus_port,
             tempo_port,
             flight_sql_port,
+            opensearch_port,
             operational_port,
         ] = reserve_ports();
         let host = Ipv4Addr::LOCALHOST.to_string();
@@ -429,6 +442,12 @@ mod tests {
                 port: flight_sql_port,
                 ..FlightSqlConfig::default()
             },
+            opensearch: OpenSearchConfig {
+                enabled: true,
+                host: host.clone(),
+                port: opensearch_port,
+                ..OpenSearchConfig::default()
+            },
             metrics: OperationalConfig {
                 host,
                 port: operational_port,
@@ -447,14 +466,15 @@ mod tests {
 
         let handles = spawn_servers(&config, &runtime, None, &listener_runtime);
 
-        // Four query servers and the operational one: the fixture reaches every listener.
-        assert_eq!(handles.len(), 5);
+        // Five query servers and the operational one: the fixture reaches every listener.
+        assert_eq!(handles.len(), 6);
         let pem = certificate.pem();
         let mut answers = Vec::new();
         for (name, port, path) in [
             ("Loki", loki_port, "/ready"),
             ("Prometheus", prometheus_port, "/-/ready"),
             ("Tempo", tempo_port, "/ready"),
+            ("OpenSearch", opensearch_port, "/"),
             ("operational", operational_port, HEALTH_PATH),
         ] {
             answers.push((name, get_over_tls(&pem, port, path).await));

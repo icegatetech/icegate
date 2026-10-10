@@ -18,14 +18,17 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 
 /// The `protocol` label of the Flight SQL read surface.
 ///
-/// The three constants below are the single source of that label: all three
-/// surfaces resolve the tenant through the same policy, and a label spelled at
-/// the call site would drift from the one the dashboards are keyed on.
+/// The constants below are the single source of that label: every surface resolves the tenant
+/// through the same policy, and a label spelled at the call site would drift from the one the
+/// dashboards are keyed on.
 pub const PROTOCOL_FLIGHT_SQL: &str = "flight_sql";
 /// The `protocol` label of the Loki read surface.
 pub const PROTOCOL_LOKI: &str = "loki";
 /// The `protocol` label of the Tempo read surface.
 pub const PROTOCOL_TEMPO: &str = "tempo";
+/// The `protocol` label of the `OpenSearch` read surface. The same value is its `surface` label
+/// of memory shedding and its `api` label of the request metrics.
+pub const PROTOCOL_OPENSEARCH: &str = "opensearch";
 
 /// Histogram bucket boundaries (in seconds) for fast sub-phases like parse,
 /// plan, and format, which typically complete in low milliseconds.
@@ -436,7 +439,7 @@ impl QueryTenantRejectionRecorder {
 
 impl TenantRejectionRecorder for QueryTenantRejectionRecorder {
     /// `protocol` is one of [`PROTOCOL_FLIGHT_SQL`], [`PROTOCOL_LOKI`],
-    /// [`PROTOCOL_TEMPO`]; `reason` comes from
+    /// [`PROTOCOL_TEMPO`], [`PROTOCOL_OPENSEARCH`]; `reason` comes from
     /// [`TenantRejection::reason`](icegate_common::TenantRejection::reason) and
     /// from nowhere else, since a hand-written string here would drift from the
     /// variants the resolver returns.
@@ -592,8 +595,8 @@ mod tests {
     use opentelemetry::metrics::MeterProvider as _;
 
     use super::{
-        PROTOCOL_FLIGHT_SQL, PROTOCOL_LOKI, PROTOCOL_TEMPO, QueryMetrics, QueryTenantRejectionRecorder,
-        TenantRejectionRecorder,
+        PROTOCOL_FLIGHT_SQL, PROTOCOL_LOKI, PROTOCOL_OPENSEARCH, PROTOCOL_TEMPO, QueryMetrics,
+        QueryTenantRejectionRecorder, TenantRejectionRecorder,
         test_support::{build_meter_provider, find_counter_total},
     };
 
@@ -619,6 +622,7 @@ mod tests {
                 TenantRejection::DuplicateHeader,
                 "duplicate_header",
             ),
+            (PROTOCOL_OPENSEARCH, "opensearch", TenantRejection::Missing, "missing"),
         ];
         for (protocol, _, rejection, _) in cases {
             recorder.add_tenant_rejection(protocol, rejection.reason());

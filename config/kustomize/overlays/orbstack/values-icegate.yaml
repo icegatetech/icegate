@@ -66,6 +66,9 @@ query:
   tempo:
     enabled: true
     port: 3200
+  opensearch:
+    enabled: true
+    port: 9200
   tracing:
     enabled: true
     otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317

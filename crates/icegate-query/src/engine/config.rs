@@ -69,7 +69,7 @@ pub struct QueryEngineConfig {
     pub max_age_secs: u64,
 
     /// Hard ceiling (in seconds) on the wall-clock time a single query may take,
-    /// enforced at every transport (Loki, Prometheus, Tempo, Flight SQL).
+    /// enforced at every transport (Loki, Prometheus, Tempo, Flight SQL, `OpenSearch`).
     ///
     /// It bounds how long a query can outlive the catalog provider it was
     /// planned against, and so how far behind the current WAL boundary a live

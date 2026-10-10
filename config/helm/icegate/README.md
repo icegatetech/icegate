@@ -469,6 +469,7 @@ an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 | query.service.appProtocol.flightSql | string | `""` |  |
 | query.service.appProtocol.loki | string | `""` |  |
 | query.service.appProtocol.metrics | string | `""` |  |
+| query.service.appProtocol.opensearch | string | `""` |  |
 | query.service.appProtocol.prometheus | string | `""` |  |
 | query.service.appProtocol.tempo | string | `""` |  |
 | query.service.type | string | `"ClusterIP"` |  |

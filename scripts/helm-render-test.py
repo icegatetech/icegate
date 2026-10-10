@@ -15,11 +15,17 @@ binary on its code default with no error anywhere. The default render cannot sho
 it, because the chart default and the code default are the same value, so such a
 section is rendered here with every value moved off its default.
 
+A listener port fails quietly as well: a containerPort or Service port spelled as
+a literal renders the default exactly like the value does, and a Service whose
+render condition omits the listener publishes nothing for it. The OpenSearch
+listener is off by default, so its port is rendered here enabled on a
+non-default number, and enabled as the only listener.
+
 Both components carry the tenant policy and the operational listener the probes
 address, so those two checks run per component off `COMPONENTS`. The `opensearch`
-section is query's alone. The rest is ingest-only, because the sidecar split is:
-only ingest has listener hosts, published-port keys, extraContainers and a NOTES
-port-forward command.
+section and the OpenSearch listener port are query's alone. The rest is
+ingest-only, because the sidecar split is: only ingest has listener hosts,
+published-port keys, extraContainers and a NOTES port-forward command.
 
 Every check states the message it expects a guard to fail with. That message is the
 contract with the operator who hits the guard, so a guard that starts refusing for
@@ -114,6 +120,7 @@ APP_PROTOCOL_PORTS = (  # (component, values key, rendered port name, service te
     ("query", "prometheus", "prometheus", "templates/service-query.yaml"),
     ("query", "tempo", "tempo", "templates/service-query.yaml"),
     ("query", "flightSql", "flight-sql", "templates/service-query.yaml"),
+    ("query", "opensearch", "opensearch", "templates/service-query.yaml"),
     ("query", "metrics", "metrics", "templates/service-query.yaml"),
     ("maintain", "metrics", "metrics", "templates/service-maintain.yaml"),
     ("catalogServer", "http", "http", "templates/service-catalog.yaml"),
@@ -134,6 +141,8 @@ SERVICE_PORT_ARGS = (
     "catalog.backend=s3",
     "--set",
     "query.flightSql.enabled=true",
+    "--set",
+    "query.opensearch.enabled=true",
 )
 
 # Every values path that names an image, with the workload and container the render
@@ -1548,6 +1557,52 @@ def check_migrate_service_account_name_refused() -> None:
         ok(f"serviceAccount.name {MIGRATE_SERVICE_ACCOUNT} renders while migrate is off")
 
 
+def check_opensearch_listener() -> None:
+    """The OpenSearch listener's port: absent while disabled, one number everywhere once enabled.
+
+    The listener is off by default, so the default render must publish nothing for it. Enabled on
+    a non-default number, the container port, the Service port and query.yaml must all carry that
+    number, because a literal in any template renders the default exactly like the value does.
+    Enabled as the only listener, with every other protocol and the metrics endpoint off, it must
+    still get its Service: the render condition lists the listeners that publish a port.
+    """
+    deployment = render_chart(show_only="templates/deployment-query.yaml")
+    service = render_chart(show_only="templates/service-query.yaml")
+    if "opensearch" in read_container_port_names(deployment) or read_service_port(service, "opensearch") is not None:
+        fail("the default render must publish no port for the disabled OpenSearch listener")
+    else:
+        ok("the default render publishes no OpenSearch port")
+
+    port = 19200
+    port_args = ("--set", "query.opensearch.enabled=true", "--set", f"query.opensearch.port={port}")
+    declared = read_container_port(render_chart(*port_args, show_only="templates/deployment-query.yaml"), "opensearch")
+    published = read_service_port(render_chart(*port_args, show_only="templates/service-query.yaml"), "opensearch")
+    rendered = read_component_config(
+        render_chart(*port_args, show_only="templates/configmap-query.yaml"), "query.yaml"
+    ).get("opensearch", {})
+    if declared != port:
+        fail(f"query.opensearch.port must reach the opensearch containerPort: expected {port}, got {declared}")
+    elif published != port:
+        fail(f"query.opensearch.port must reach the opensearch Service port: expected {port}, got {published}")
+    elif rendered.get("port") != port or rendered.get("enabled") is not True:
+        fail(f"query.opensearch must reach query.yaml as enabled on {port}, got {rendered}")
+    else:
+        ok(f"query.opensearch.port reaches the containerPort, the Service and query.yaml as {port}")
+
+    alone_args = (
+        "--set", "query.loki.enabled=false",
+        "--set", "query.prometheus.enabled=false",
+        "--set", "query.tempo.enabled=false",
+        "--set", "query.flightSql.enabled=false",
+        "--set", "query.metrics.enabled=false",
+        "--set", "query.opensearch.enabled=true",
+    )
+    if read_service_port(render_chart(*alone_args), "opensearch") is None:
+        fail("an OpenSearch-only release must still render the query Service with the opensearch port")
+    else:
+        ok("an OpenSearch-only release renders the query Service with the opensearch port")
+
+
 for component_name in COMPONENTS:
     check_tenant_policy(component_name)
     check_probe_target(component_name)
@@ -1585,5 +1640,6 @@ check_migrate_service_account_name_refused()
 # The Secret volume is a new volume type in every pod that serves TLS; the level allows
 # `secret`, and this proves the pods rendered with it on still meet the level.
 check_restricted_profile(*(flag for component in TLS_COMPONENTS for flag in tls_args(component)))
+check_opensearch_listener()
 
 sys.exit(report_failures())

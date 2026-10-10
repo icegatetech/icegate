@@ -211,7 +211,7 @@ query:
     ## rather than commented out, and unsetting it fails the render.
     maxAgeSecs: 30
     ## Hard ceiling (seconds) on one query's wall clock, enforced on Loki,
-    ## Prometheus, Tempo and Flight SQL. Together with maxAgeSecs it bounds how
+    ## Prometheus, Tempo, Flight SQL and OpenSearch. Together with maxAgeSecs it bounds how
     ## long a query can hold a cached provider, and so how far behind the
     ## committed WAL boundary a live reader can be — which is the window
     ## maintain.walCleanup.keepSegmentsCount has to cover in segments. Raising
@@ -352,6 +352,7 @@ query:
       prometheus: ""
       tempo: ""
       flightSql: ""
+      opensearch: ""
       metrics: ""
 
   ## Ingress
