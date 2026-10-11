@@ -1,4 +1,5 @@
-//! The data indices one tenant sees, and how an index expression selects them.
+//! The data indices one tenant sees and how an index expression selects them, how it selects the
+//! tenant's system indices, and how a request that reads one kind of index is told which.
 
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
 
@@ -53,6 +54,27 @@ pub(crate) enum Profile {
     Native,
 }
 
+/// Something an index expression selects by name: a data index, or a system index or alias name.
+trait SelectableIndex {
+    /// The name the expression's parts match.
+    fn index_name(&self) -> &str;
+    /// Whether a wildcard can select it, or only its exact name.
+    fn is_wildcard_visible(&self) -> bool;
+}
+
+/// A system index or alias name. Every one is wildcard-visible here: whether a wildcard reaches
+/// the system side at all, the hidden rule, is decided before, by
+/// [`IndexExpression::partition_system_parts`].
+impl SelectableIndex for &str {
+    fn index_name(&self) -> &str {
+        self
+    }
+
+    fn is_wildcard_visible(&self) -> bool {
+        true
+    }
+}
+
 /// One data index the tenant sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexEntry {
@@ -80,6 +102,16 @@ impl IndexEntry {
     /// The naming profile that maps this index's field names onto its table.
     pub(crate) const fn profile(&self) -> Profile {
         self.profile
+    }
+}
+
+impl SelectableIndex for IndexEntry {
+    fn index_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_wildcard_visible(&self) -> bool {
+        self.is_wildcard_visible
     }
 }
 
@@ -127,66 +159,116 @@ impl IndexSet {
         expression: &IndexExpression,
         options: IndexOptions,
     ) -> Result<Vec<&IndexEntry>, OpenSearchError> {
-        let mut selection_flags = vec![false; self.entries.len()];
-        match &expression.selection {
-            Selection::AllVisible => {
-                for (is_entry_selected, entry) in selection_flags.iter_mut().zip(&self.entries) {
-                    *is_entry_selected = is_expanded_by_wildcard(entry, "*", options.expand_wildcards);
-                }
-            }
-            Selection::Parts(parts) => {
-                for part in parts {
-                    self.apply_part(part, options, &mut selection_flags)?;
-                }
-            }
-        }
-        let resolved_entries: Vec<&IndexEntry> = self
-            .entries
-            .iter()
-            .zip(selection_flags)
-            .filter_map(|(entry, is_entry_selected)| is_entry_selected.then_some(entry))
-            .collect();
+        let resolved_entries: Vec<&IndexEntry> = match &expression.selection {
+            Selection::AllVisible => self
+                .entries
+                .iter()
+                .filter(|entry| is_expanded_by_wildcard(*entry, "*", options.expand_wildcards))
+                .collect(),
+            Selection::Parts(parts) => select_items_by_parts(&self.entries, parts, options)?.collect(),
+        };
         if resolved_entries.is_empty() && !options.allow_no_indices {
             return Err(OpenSearchError::index_not_found(expression.text()));
         }
         Ok(resolved_entries)
     }
+}
 
-    /// Apply one part to the selection built by the parts before it.
-    fn apply_part(
-        &self,
-        part: &ExpressionPart,
-        options: IndexOptions,
-        selection_flags: &mut [bool],
-    ) -> Result<(), OpenSearchError> {
+/// The items of `items` (sorted by name, each name once) that `parts` select under `options`, in
+/// name order. The parts apply left to right: a wildcard inclusion adds what it expands to (see
+/// [`is_expanded_by_wildcard`]), a concrete inclusion adds the item of that exact name, and an
+/// exclusion removes every item it matches.
+///
+/// # Errors
+///
+/// Returns `index_not_found_exception` for a missing concrete name unless `ignore_unavailable`.
+fn select_items_by_parts<'a, T: SelectableIndex>(
+    items: &'a [T],
+    parts: &[ExpressionPart],
+    options: IndexOptions,
+) -> Result<impl Iterator<Item = &'a T>, OpenSearchError> {
+    let mut selection_flags = vec![false; items.len()];
+    for part in parts {
         match part {
             ExpressionPart::Include(pattern) if has_wildcard(pattern) => {
-                for (is_entry_selected, entry) in selection_flags.iter_mut().zip(&self.entries) {
-                    *is_entry_selected |= is_expanded_by_wildcard(entry, pattern, options.expand_wildcards);
+                for (is_item_selected, item) in selection_flags.iter_mut().zip(items) {
+                    *is_item_selected |= is_expanded_by_wildcard(item, pattern, options.expand_wildcards);
                 }
             }
-            ExpressionPart::Include(name) => {
-                // `entries` is sorted by name, so a concrete name is one binary search.
-                match self.entries.binary_search_by(|entry| entry.name.as_str().cmp(name.as_str())) {
+            // `items` is sorted by name, so a concrete name is one binary search.
+            ExpressionPart::Include(concrete_name) => {
+                match items.binary_search_by(|item| item.index_name().cmp(concrete_name.as_str())) {
                     Ok(position) => selection_flags[position] = true,
                     Err(_) if options.ignore_unavailable => {}
-                    Err(_) => return Err(OpenSearchError::index_not_found(name)),
+                    Err(_) => return Err(OpenSearchError::index_not_found(concrete_name)),
                 }
             }
             ExpressionPart::Exclude(pattern) => {
-                for (is_entry_selected, entry) in selection_flags.iter_mut().zip(&self.entries) {
-                    *is_entry_selected &= !matches_glob(pattern, &entry.name);
+                for (is_item_selected, item) in selection_flags.iter_mut().zip(items) {
+                    *is_item_selected &= !matches_glob(pattern, item.index_name());
                 }
             }
         }
-        Ok(())
+    }
+    Ok(items
+        .iter()
+        .zip(selection_flags)
+        .filter_map(|(item, is_item_selected)| is_item_selected.then_some(item)))
+}
+
+/// What an index expression resolves to on a request that reads one kind of index.
+#[derive(Debug)]
+pub(crate) enum IndexTarget<'a> {
+    /// Data indices, in name order.
+    Data(Vec<&'a IndexEntry>),
+    /// Concrete system indices, aliases resolved, in name order, each once.
+    System(Vec<String>),
+}
+
+/// The names among `names` (a tenant's system index and alias names, sorted) that `parts` select
+/// under `options`, in name order. Wildcards match only while open indices are expanded.
+///
+/// # Errors
+///
+/// Returns `index_not_found_exception` for a missing concrete name unless `ignore_unavailable`.
+pub(super) fn select_system_names<'a>(
+    names: &[&'a str],
+    parts: &[ExpressionPart],
+    options: IndexOptions,
+) -> Result<Vec<&'a str>, OpenSearchError> {
+    Ok(select_items_by_parts(names, parts, options)?.copied().collect())
+}
+
+/// Decide what `expression` targets from its resolved data and system sides: a request reads
+/// data indices or system indices, never both.
+///
+/// # Errors
+///
+/// Returns `illegal_argument_exception` naming the system indices when both sides are non-empty,
+/// and `index_not_found_exception` naming the expression when both are empty and
+/// `allow_no_indices` is false.
+pub(super) fn choose_index_target<'a>(
+    expression: &IndexExpression,
+    data_entries: Vec<&'a IndexEntry>,
+    system_indices: Vec<String>,
+    allow_no_indices: bool,
+) -> Result<IndexTarget<'a>, OpenSearchError> {
+    match (data_entries.is_empty(), system_indices.is_empty()) {
+        (false, false) => Err(OpenSearchError::illegal_argument(format!(
+            "[{}] mixes the system indices [{}] with data indices; one request reads one or the other",
+            expression.text(),
+            system_indices.join(",")
+        ))),
+        (true, false) => Ok(IndexTarget::System(system_indices)),
+        (true, true) if !allow_no_indices => Err(OpenSearchError::index_not_found(expression.text())),
+        (false | true, true) => Ok(IndexTarget::Data(data_entries)),
     }
 }
 
-/// Whether wildcard `pattern` expands to `entry`: only wildcard-visible entries take part, and
-/// only while open indices are expanded.
-fn is_expanded_by_wildcard(entry: &IndexEntry, pattern: &str, expand_wildcards: ExpandWildcards) -> bool {
-    entry.is_wildcard_visible && expand_wildcards.is_open && matches_glob(pattern, &entry.name)
+/// Whether wildcard `pattern` expands to `item`: only while open indices are expanded, and only
+/// to a wildcard-visible item. Without open indices no name is matched against the pattern.
+fn is_expanded_by_wildcard<T: SelectableIndex>(item: &T, pattern: &str, expand_wildcards: ExpandWildcards) -> bool {
+    expand_wildcards.is_open && item.is_wildcard_visible() && matches_glob(pattern, item.index_name())
 }
 
 #[cfg(test)]
@@ -359,5 +441,120 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["type"], "index_not_found_exception");
         assert_eq!(body["error"]["index"], ".kibana");
+    }
+
+    /// A tenant's system index and alias names, sorted as the snapshot lists them.
+    const SYSTEM_NAMES: [&str; 3] = [".kibana", ".kibana_1", ".opensearch_dashboards"];
+
+    fn build_options(expand_wildcards: Option<&str>, ignore_unavailable: bool) -> IndexOptions {
+        IndexOptions {
+            ignore_unavailable,
+            allow_no_indices: true,
+            expand_wildcards: ExpandWildcards::parse(expand_wildcards).expect("a served value"),
+        }
+    }
+
+    fn select_names(
+        expression_text: &str,
+        expand_wildcards: Option<&str>,
+    ) -> Result<Vec<&'static str>, OpenSearchError> {
+        let options = build_options(expand_wildcards, false);
+        let partition = IndexExpression::parse(expression_text)
+            .expect("a valid expression")
+            .partition_system_parts(options.expand_wildcards.is_hidden);
+        select_system_names(&SYSTEM_NAMES, &partition.system_parts, options)
+    }
+
+    /// IceGate's rule: dot-prefixed indices are hidden, so a wildcard reaches them only with
+    /// `expand_wildcards` including hidden, while a pattern starting with `.` reaches them always.
+    #[tokio::test]
+    async fn dot_prefixed_names_resolve_to_system_indices_only_with_hidden_or_a_dot_pattern() {
+        assert_eq!(select_names("*", None).expect("open"), Vec::<&str>::new());
+        assert_eq!(select_names("", None).expect("open"), Vec::<&str>::new());
+        assert_eq!(select_names("*", Some("all")).expect("all"), SYSTEM_NAMES);
+        assert_eq!(select_names("_all", Some("open,hidden")).expect("hidden"), SYSTEM_NAMES);
+        assert_eq!(
+            select_names(".kib*", None).expect("a dot pattern"),
+            [".kibana", ".kibana_1"]
+        );
+        assert_eq!(select_names(".kibana", None).expect("a dot name"), [".kibana"]);
+        assert_eq!(
+            select_names("*,-.kibana_1", Some("all")).expect("an exclusion"),
+            [".kibana", ".opensearch_dashboards"]
+        );
+        assert_eq!(select_names(".k*", Some("none")).expect("none"), Vec::<&str>::new());
+        assert_eq!(
+            select_names("logs", Some("all")).expect("a data name"),
+            Vec::<&str>::new()
+        );
+        let partition = IndexExpression::parse(".kib*").expect("valid").partition_system_parts(false);
+        assert!(
+            partition.data_expression.is_none(),
+            "a dot-only expression has no data part"
+        );
+
+        let (status, body) = render_envelope(select_names(".missing", None).expect_err("a missing dot name")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["index"], ".missing");
+        let ignored_selection = select_system_names(
+            &SYSTEM_NAMES,
+            &IndexExpression::parse(".missing")
+                .expect("valid")
+                .partition_system_parts(false)
+                .system_parts,
+            build_options(None, true),
+        );
+        assert_eq!(ignored_selection.expect("ignore_unavailable"), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn an_expression_mixing_system_and_data_indices_is_refused_naming_the_system_indices() {
+        let index_set = IndexSet::from_table_names(["logs".to_string(), "spans".to_string()]);
+        let options = build_options(None, false);
+        let resolve_sides = |expression_text: &str| {
+            let expression = IndexExpression::parse(expression_text).expect("a valid expression");
+            let partition = expression.partition_system_parts(false);
+            let data_entries = partition.data_expression.as_ref().map_or_else(Vec::new, |data_expression| {
+                index_set.resolve(data_expression, options).expect("data resolves")
+            });
+            let system_indices: Vec<String> = select_system_names(&[".kibana_1"], &partition.system_parts, options)
+                .expect("system resolves")
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            (expression, data_entries, system_indices)
+        };
+
+        let (expression, data_entries, system_indices) = resolve_sides("logs,.kibana_1");
+        let refusal = choose_index_target(&expression, data_entries, system_indices, true).expect_err("mixed");
+        let (status, body) = render_envelope(refusal).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(".kibana_1")),
+            "{body}"
+        );
+
+        let (expression, data_entries, system_indices) = resolve_sides(".kibana_1");
+        assert!(matches!(
+            choose_index_target(&expression, data_entries, system_indices, true),
+            Ok(IndexTarget::System(names)) if names == [".kibana_1"]
+        ));
+        let (expression, data_entries, system_indices) = resolve_sides("logs");
+        assert!(matches!(
+            choose_index_target(&expression, data_entries, system_indices, true),
+            Ok(IndexTarget::Data(entries)) if entries.iter().map(|entry| entry.name()).eq(["logs"])
+        ));
+        let (expression, data_entries, system_indices) = resolve_sides("nothing*");
+        assert!(matches!(
+            choose_index_target(&expression, data_entries, system_indices, true),
+            Ok(IndexTarget::Data(entries)) if entries.is_empty()
+        ));
+        let (expression, data_entries, system_indices) = resolve_sides("nothing*");
+        let empty_refusal =
+            choose_index_target(&expression, data_entries, system_indices, false).expect_err("no indices disallowed");
+        assert_eq!(render_envelope(empty_refusal).await.0, StatusCode::NOT_FOUND);
     }
 }

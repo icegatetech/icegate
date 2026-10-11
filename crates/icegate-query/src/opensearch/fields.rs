@@ -1,24 +1,30 @@
 //! `_field_caps`, `_mapping` and `_mapping/field`: field discovery for index patterns, field
 //! pickers and time-field checks.
+//!
+//! An expression reads data indices or system indices, never both. A system index's fields come
+//! from the mapping it was created with: `_field_caps` derives them from it, `_mapping` answers it
+//! as stored, and `_mapping/field` is not served for it.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
 use axum::Json;
 use axum::extract::{Extension, State};
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use futures::future::try_join_all;
 use icegate_common::TenantId;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::catalog::{
-    FieldListing, FieldType, IndexExpression, IndexField, IndexOptions, TenantSession, read_index_options,
+    FieldListing, FieldType, IndexEntry, IndexExpression, IndexField, IndexTarget, TenantSession, read_index_options,
 };
 use super::error::OpenSearchError;
 use super::extract::{EndpointParameters, Parameters, PathParameters, RequestBody, deserialize_flag};
 use super::glob::matches_glob;
 use super::state::OpenSearchState;
+use super::system_index::{IndexKeyedAnswer, MappedField, SystemSnapshot};
 
 /// The metadata fields `_field_caps` reports beside an index's own fields, as
 /// `(name, searchable, aggregatable)`; each is typed with its own name. Exactly these three, each
@@ -30,6 +36,55 @@ const METADATA_FIELD_CAPABILITIES: [(&str, bool, bool); 3] = [
     ("_index", false, false),
     ("_source", false, false),
 ];
+
+/// What `_field_caps` reads of one field of one index, whether a table's column or a system
+/// index's stored mapping declares it.
+trait CapabilityField {
+    /// The field's name.
+    fn name(&self) -> &str;
+    /// The type `_field_caps` reports.
+    fn type_name(&self) -> &str;
+    /// Whether a query can match on the field.
+    fn is_searchable(&self) -> bool;
+    /// Whether an aggregation can use the field.
+    fn is_aggregatable(&self) -> bool;
+}
+
+impl CapabilityField for IndexField {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn type_name(&self) -> &str {
+        self.field_type.name()
+    }
+
+    fn is_searchable(&self) -> bool {
+        self.is_searchable
+    }
+
+    fn is_aggregatable(&self) -> bool {
+        self.is_aggregatable
+    }
+}
+
+impl CapabilityField for MappedField {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    fn is_searchable(&self) -> bool {
+        self.is_searchable
+    }
+
+    fn is_aggregatable(&self) -> bool {
+        self.is_aggregatable
+    }
+}
 
 /// Query parameters of `_field_caps`.
 #[derive(Debug, Deserialize)]
@@ -72,29 +127,42 @@ impl EndpointParameters for MappingParameters {
         &["local", "include_defaults", "cluster_manager_timeout", "master_timeout"];
 }
 
-/// The fields of every index `expression_text` selects, in index-name order, all listed at the
-/// same request time `now`.
+/// The fields of every entry of `entries`, in their order, all listed at the same request time
+/// `now`.
 async fn list_fields_per_index(
     session: &TenantSession,
-    expression_text: &str,
-    options: IndexOptions,
+    entries: Vec<&IndexEntry>,
     now: DateTime<Utc>,
     listing: FieldListing,
 ) -> Result<Vec<(String, Vec<IndexField>)>, OpenSearchError> {
-    let expression = IndexExpression::parse(expression_text)?;
-    try_join_all(
-        session
-            .indices()
-            .resolve(&expression, options)?
-            .into_iter()
-            .map(|entry| async move {
-                Ok::<_, OpenSearchError>((
-                    entry.name().to_string(),
-                    session.list_fields(entry, now, listing).await?,
-                ))
-            }),
-    )
+    try_join_all(entries.into_iter().map(|entry| async move {
+        Ok::<_, OpenSearchError>((
+            entry.name().to_string(),
+            session.list_fields(entry, now, listing).await?,
+        ))
+    }))
     .await
+}
+
+/// The fields every system index of `indices` declares in its stored mapping, in their order.
+///
+/// # Errors
+///
+/// Returns `index_not_found_exception` for an index the snapshot does not hold.
+fn list_system_fields_per_index(
+    snapshot: &SystemSnapshot,
+    indices: Vec<String>,
+) -> Result<Vec<(String, Vec<MappedField>)>, OpenSearchError> {
+    indices
+        .into_iter()
+        .map(|index| {
+            let fields = snapshot
+                .find_index(&index)
+                .ok_or_else(|| OpenSearchError::index_not_found(&index))?
+                .list_mapped_fields();
+            Ok((index, fields))
+        })
+        .collect()
 }
 
 /// Whether answering `patterns` needs MAP keys. A MAP key's field name is `<column>.<key>`, so
@@ -109,7 +177,7 @@ fn choose_field_listing(patterns: &[&str]) -> FieldListing {
 }
 
 /// `GET|POST [/<index>]/_field_caps`. Both methods answer the same, and an absent body and `{}`
-/// are the same request.
+/// are the same request. A system index reports the fields of its stored mapping.
 pub(crate) async fn describe_field_capabilities(
     State(state): State<OpenSearchState>,
     Extension(tenant): Extension<TenantId>,
@@ -125,16 +193,21 @@ pub(crate) async fn describe_field_capabilities(
     )?;
     let expression_text = index.map(|PathParameters(text)| text).unwrap_or_default();
     let patterns: Vec<&str> = parameters.fields.as_deref().unwrap_or("*").split(',').collect();
+    let expression = IndexExpression::parse(&expression_text)?;
     let session = state.catalog.open_session(&tenant).await?;
-    let fields_by_index = list_fields_per_index(
-        &session,
-        &expression_text,
-        options,
-        Utc::now(),
-        choose_field_listing(&patterns),
-    )
-    .await?;
-    Ok(Json(render_field_capabilities(&fields_by_index, &patterns)))
+    let rendered_capabilities = match session.resolve_target(&expression, options).await? {
+        IndexTarget::Data(entries) => {
+            let fields_by_index =
+                list_fields_per_index(&session, entries, Utc::now(), choose_field_listing(&patterns)).await?;
+            render_field_capabilities(&fields_by_index, &patterns)
+        }
+        IndexTarget::System(indices) => {
+            let fields_by_index =
+                list_system_fields_per_index(&session.read_system_snapshot().await?.snapshot, indices)?;
+            render_field_capabilities(&fields_by_index, &patterns)
+        }
+    };
+    Ok(Json(rendered_capabilities))
 }
 
 /// Accept an empty body or `{}`; refuse any key (such as `index_filter`), since ignoring it would
@@ -153,15 +226,15 @@ fn refuse_body_keys(body: &[u8]) -> Result<(), OpenSearchError> {
 
 /// Render `_field_caps` for `fields_by_index` (in index-name order), listing only the fields one
 /// of `patterns` matches, the metadata fields included.
-fn render_field_capabilities(fields_by_index: &[(String, Vec<IndexField>)], patterns: &[&str]) -> Value {
+fn render_field_capabilities<F: CapabilityField>(fields_by_index: &[(String, Vec<F>)], patterns: &[&str]) -> Value {
     let is_requested = |name: &str| patterns.iter().any(|pattern| matches_glob(pattern, name));
-    let mut members_by_field: BTreeMap<&str, BTreeMap<&'static str, Vec<(&str, &IndexField)>>> = BTreeMap::new();
+    let mut members_by_field: BTreeMap<&str, BTreeMap<&str, Vec<(&str, &F)>>> = BTreeMap::new();
     for (index, fields) in fields_by_index {
-        for field in fields.iter().filter(|field| is_requested(&field.name)) {
+        for field in fields.iter().filter(|field| is_requested(field.name())) {
             members_by_field
-                .entry(field.name.as_str())
+                .entry(field.name())
                 .or_default()
-                .entry(field.field_type.name())
+                .entry(field.type_name())
                 .or_default()
                 .push((index.as_str(), field));
         }
@@ -199,60 +272,88 @@ fn render_field_capabilities(fields_by_index: &[(String, Vec<IndexField>)], patt
 
 /// One type's capability entry. `indices` is listed only on a type conflict; the
 /// `non_searchable_indices` / `non_aggregatable_indices` lists only when the indices disagree.
-fn render_capability(field_type: &str, members: &[(&str, &IndexField)], has_type_conflict: bool) -> Value {
-    let is_searchable = members.iter().all(|(_, field)| field.is_searchable);
-    let is_aggregatable = members.iter().all(|(_, field)| field.is_aggregatable);
+fn render_capability<F: CapabilityField>(field_type: &str, members: &[(&str, &F)], has_type_conflict: bool) -> Value {
+    let is_searchable = members.iter().all(|(_, field)| field.is_searchable());
+    let is_aggregatable = members.iter().all(|(_, field)| field.is_aggregatable());
     let mut capability = json!({"type": field_type, "searchable": is_searchable, "aggregatable": is_aggregatable});
     if has_type_conflict {
         capability["indices"] = members.iter().map(|(index, _)| *index).collect();
     }
-    if !is_searchable && members.iter().any(|(_, field)| field.is_searchable) {
+    if !is_searchable && members.iter().any(|(_, field)| field.is_searchable()) {
         capability["non_searchable_indices"] = members
             .iter()
-            .filter(|(_, field)| !field.is_searchable)
+            .filter(|(_, field)| !field.is_searchable())
             .map(|(index, _)| *index)
             .collect();
     }
-    if !is_aggregatable && members.iter().any(|(_, field)| field.is_aggregatable) {
+    if !is_aggregatable && members.iter().any(|(_, field)| field.is_aggregatable()) {
         capability["non_aggregatable_indices"] = members
             .iter()
-            .filter(|(_, field)| !field.is_aggregatable)
+            .filter(|(_, field)| !field.is_aggregatable())
             .map(|(index, _)| *index)
             .collect();
     }
     capability
 }
 
-/// `GET [/<index>]/_mapping`: `{<index>: {mappings: {properties}}}` per selected index.
+/// A system index as `_mapping` describes it.
+#[derive(Serialize)]
+struct StoredMappings<'a> {
+    /// The mappings as stored.
+    mappings: &'a Value,
+}
+
+/// `GET [/<index>]/_mapping`: `{<index>: {mappings: {properties}}}` per selected data index, and
+/// `{<index>: {mappings: <stored mapping>}}` per selected system index, its mapping as stored.
 pub(crate) async fn describe_mappings(
     State(state): State<OpenSearchState>,
     Extension(tenant): Extension<TenantId>,
     index: Option<PathParameters<String>>,
     Parameters(parameters): Parameters<MappingParameters>,
-) -> Result<Json<Value>, OpenSearchError> {
+) -> Result<Response, OpenSearchError> {
     let options = read_index_options(
         parameters.ignore_unavailable,
         parameters.allow_no_indices,
         parameters.expand_wildcards.as_deref(),
     )?;
     let expression_text = index.map(|PathParameters(text)| text).unwrap_or_default();
+    let expression = IndexExpression::parse(&expression_text)?;
     let session = state.catalog.open_session(&tenant).await?;
-    let fields_by_index = list_fields_per_index(
-        &session,
-        &expression_text,
-        options,
-        Utc::now(),
-        FieldListing::WithMapKeys,
-    )
-    .await?;
-    let body: Map<String, Value> = fields_by_index
-        .into_iter()
-        .map(|(index, fields)| {
-            let properties = Value::Object(render_properties(&fields));
-            (index, build_object("mappings", build_object("properties", properties)))
-        })
-        .collect();
-    Ok(Json(Value::Object(body)))
+    match session.resolve_target(&expression, options).await? {
+        IndexTarget::Data(entries) => {
+            let body: Map<String, Value> =
+                list_fields_per_index(&session, entries, Utc::now(), FieldListing::WithMapKeys)
+                    .await?
+                    .into_iter()
+                    .map(|(index, fields)| {
+                        let properties = Value::Object(render_properties(&fields));
+                        (index, build_object("mappings", build_object("properties", properties)))
+                    })
+                    .collect();
+            Ok(Json(Value::Object(body)).into_response())
+        }
+        IndexTarget::System(indices) => {
+            let snapshot = &session.read_system_snapshot().await?.snapshot;
+            let descriptions = indices
+                .iter()
+                .map(|index| {
+                    let system_index = snapshot
+                        .find_index(index)
+                        .ok_or_else(|| OpenSearchError::index_not_found(index))?;
+                    Ok((
+                        index.as_str(),
+                        StoredMappings {
+                            mappings: &system_index.mappings,
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>, OpenSearchError>>()?;
+            Ok(Json(IndexKeyedAnswer {
+                descriptions: &descriptions,
+            })
+            .into_response())
+        }
+    }
 }
 
 /// Mapping properties in the order of `fields`, which is the schema column order: IceGate's
@@ -303,7 +404,9 @@ fn build_object(key: &str, value: Value) -> Value {
     Value::Object(object)
 }
 
-/// `GET /<index>/_mapping/field/<fields>`, keyed by the index expression as requested.
+/// `GET /<index>/_mapping/field/<fields>`, keyed by the index expression as requested. Served for
+/// data indices only: a system index is refused with `400`, and `GET /<index>/_mapping` answers
+/// its stored mapping.
 pub(crate) async fn describe_field_mappings(
     State(state): State<OpenSearchState>,
     Extension(tenant): Extension<TenantId>,
@@ -316,20 +419,22 @@ pub(crate) async fn describe_field_mappings(
         parameters.expand_wildcards.as_deref(),
     )?;
     let patterns: Vec<&str> = fields_text.split(',').collect();
+    let expression = IndexExpression::parse(&expression_text)?;
     let session = state.catalog.open_session(&tenant).await?;
-    let fields_by_index = list_fields_per_index(
-        &session,
-        &expression_text,
-        options,
-        Utc::now(),
-        choose_field_listing(&patterns),
-    )
-    .await?;
-    Ok(Json(render_field_mappings(
-        &fields_by_index,
-        &patterns,
-        &expression_text,
-    )?))
+    match session.resolve_target(&expression, options).await? {
+        IndexTarget::Data(entries) => {
+            let fields_by_index =
+                list_fields_per_index(&session, entries, Utc::now(), choose_field_listing(&patterns)).await?;
+            Ok(Json(render_field_mappings(
+                &fields_by_index,
+                &patterns,
+                &expression_text,
+            )?))
+        }
+        IndexTarget::System(_) => Err(OpenSearchError::illegal_argument(
+            "field mappings of system indices are not served; GET /<index>/_mapping answers the stored mapping",
+        )),
+    }
 }
 
 /// The field mappings of every field one of `patterns` matches across `fields_by_index`, under
@@ -437,6 +542,7 @@ mod tests {
     async fn count_request_enumerations(warehouse: &LogsWarehouse, request: FieldRequest) -> u64 {
         let (provider, exporter) = build_meter_provider();
         let config = OpenSearchConfig::default();
+        let system_store = build_in_memory_system_index_store();
         let state = OpenSearchState {
             node: Arc::new(NodeIdentity::new(
                 &config.cluster_name,
@@ -446,11 +552,12 @@ mod tests {
             catalog: IndexCatalog::new(
                 Arc::clone(&warehouse.engine),
                 Arc::new(QueryMetrics::new(&provider.meter("field_request_test"))),
+                Arc::clone(&system_store),
                 CatalogSettings {
                     field_discovery_window: Duration::from_hours(24),
                 },
             ),
-            system_store: build_in_memory_system_index_store(),
+            system_store,
         };
         let tenant = Extension(TenantId::new("tenant-a").expect("a valid tenant"));
         let mapping_parameters = MappingParameters {
@@ -461,7 +568,9 @@ mod tests {
         let answer = match request {
             FieldRequest::FieldMappings(fields) => {
                 let path = PathParameters((LOGS_TABLE.to_string(), fields.to_string()));
-                describe_field_mappings(State(state), tenant, path, Parameters(mapping_parameters)).await
+                describe_field_mappings(State(state), tenant, path, Parameters(mapping_parameters))
+                    .await
+                    .map(IntoResponse::into_response)
             }
             FieldRequest::FieldCapabilities(fields) => {
                 let parameters = FieldCapabilitiesParameters {
@@ -479,6 +588,7 @@ mod tests {
                     RequestBody(Bytes::new()),
                 )
                 .await
+                .map(IntoResponse::into_response)
             }
             FieldRequest::Mappings => {
                 let index = Some(PathParameters(LOGS_TABLE.to_string()));

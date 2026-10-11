@@ -147,7 +147,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::opensearch::system_index::snapshot::SystemOperation;
+    use crate::opensearch::system_index::snapshot::{AliasAction, SystemOperation};
 
     fn build_snapshot() -> SystemSnapshot {
         let mut snapshot = SystemSnapshot::default();
@@ -198,6 +198,60 @@ mod tests {
         let decoded_object = decode_snapshot_object(&encoded_object.bytes).expect("decode");
         assert_eq!(decoded_object.snapshot, snapshot);
         assert_eq!(decoded_object.decoded_len, encoded_object.decoded_len);
+    }
+
+    /// The snapshot JSON is what every other replica and every restart reads: the alias map is
+    /// written under `aliases`, each alias keyed to its index, and read back into the same snapshot.
+    #[test]
+    fn a_snapshot_holding_an_alias_round_trips_through_its_object_with_its_alias_map() {
+        let mut snapshot = build_snapshot();
+        snapshot
+            .apply(&SystemOperation::ApplyAliasActions {
+                actions: vec![AliasAction::Add {
+                    index: ".kibana_1".to_string(),
+                    alias: ".kibana".to_string(),
+                }],
+            })
+            .expect("add the alias");
+        let lineage = SnapshotLineage {
+            predecessor: None,
+            operation_ids: Vec::new(),
+        };
+
+        let encoded_object = encode_snapshot_object(&lineage, &snapshot).expect("encode");
+
+        let decompressed_bytes = zstd::decode_all(&encoded_object.bytes[..]).expect("the object is valid zstd");
+        let snapshot_json: Value = serde_json::from_slice(&decompressed_bytes).expect("snapshot JSON");
+        assert_eq!(
+            snapshot_json,
+            json!({
+                "indices": {".kibana_1": {"mappings": {"dynamic": "strict"}, "settings": {"number_of_shards": 1}}},
+                "aliases": {".kibana": ".kibana_1"}
+            })
+        );
+        let decoded_object = decode_snapshot_object(&encoded_object.bytes).expect("decode");
+        assert_eq!(decoded_object.snapshot, snapshot);
+        assert_eq!(decoded_object.snapshot.resolve_name(".kibana"), Some(".kibana_1"));
+    }
+
+    /// A snapshot object stored before snapshots held aliases has no `aliases` key. It is
+    /// assembled here from the format's layout (the lineage frame's magic number and payload
+    /// length, little-endian, then the zstd frame of the snapshot JSON), as such a writer stored it.
+    #[test]
+    fn a_snapshot_object_without_an_alias_map_decodes_with_its_indices_and_no_alias() {
+        let lineage_json = br#"{"predecessor":null,"operation_ids":[]}"#;
+        let snapshot_json =
+            br#"{"indices":{".kibana_1":{"mappings":{"dynamic":"strict"},"settings":{"number_of_shards":1}}}}"#;
+        let mut object_bytes = vec![0x50, 0x2A, 0x4D, 0x18];
+        object_bytes.extend_from_slice(&u32::try_from(lineage_json.len()).expect("a short lineage").to_le_bytes());
+        object_bytes.extend_from_slice(lineage_json);
+        object_bytes.extend(zstd::encode_all(&snapshot_json[..], zstd::DEFAULT_COMPRESSION_LEVEL).expect("compress"));
+
+        let decoded_object = decode_snapshot_object(&object_bytes).expect("decode");
+
+        assert_eq!(decoded_object.snapshot.alias_names().count(), 0);
+        assert_eq!(decoded_object.snapshot.resolve_name(".kibana"), None);
+        assert_eq!(decoded_object.snapshot, build_snapshot());
     }
 
     #[test]

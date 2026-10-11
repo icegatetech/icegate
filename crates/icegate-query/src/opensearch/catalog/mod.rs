@@ -1,7 +1,7 @@
-//! The `OpenSearch` index catalog: where an index expression resolves to the tables a tenant may
-//! read, and where those tables' fields and the tenant's figures in them are listed. Every
-//! `OpenSearch` handler that reaches table data starts here, so the tenant scope cannot be
-//! skipped. Two metadata reads do not go through it: MAP-key enumeration (see
+//! The `OpenSearch` index catalog: where an index expression resolves to the tables and the system
+//! indices a tenant may read, and where those tables' fields and the tenant's figures in them are
+//! listed. Every `OpenSearch` handler that reaches table data starts here, so the tenant scope
+//! cannot be skipped. Two metadata reads do not go through it: MAP-key enumeration (see
 //! [`TenantSession::list_fields`]) prunes to the tenant by its identity partition, and so does the
 //! footprint count (see [`TenantSession::count_footprint`]), except in a global table, which it
 //! counts whole.
@@ -12,6 +12,7 @@ mod map_key_cache;
 mod native;
 mod registry;
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,14 +27,17 @@ use icegate_common::schema::{
     COL_SPAN_ATTRIBUTES,
 };
 use icegate_common::{ICEGATE_NAMESPACE, TenantId, icegate_table_ident};
+use tokio::sync::OnceCell;
 
+use self::expression::ExpressionPart;
 pub(crate) use self::expression::IndexExpression;
 pub(crate) use self::field::{FieldType, IndexField};
 use self::map_key_cache::{MapKeyCache, MapKeys, MapKeysVersion};
 use self::native::list_native_fields;
-pub(crate) use self::registry::{IndexEntry, IndexOptions, IndexSet, read_index_options};
-use self::registry::{Profile, find_telemetry_table};
+pub(crate) use self::registry::{IndexEntry, IndexOptions, IndexSet, IndexTarget, read_index_options};
+use self::registry::{Profile, choose_index_target, find_telemetry_table, select_system_names};
 use super::error::OpenSearchError;
+use super::system_index::{CurrentSnapshot, SystemIndexStore, SystemSnapshot};
 use crate::engine::QueryEngine;
 use crate::engine::metadata_scan::{MetadataScanConfig, scan_label_levels};
 use crate::engine::tenant_scope::{TenantFootprint, count_tenant_footprint, install_tenant_scope};
@@ -90,13 +94,15 @@ pub(crate) struct CatalogSettings {
     pub(crate) field_discovery_window: Duration,
 }
 
-/// Resolves indices and fields against the tables a tenant may read.
+/// Resolves indices and fields against the tables and the system indices a tenant may read.
 #[derive(Clone)]
 pub(crate) struct IndexCatalog {
     /// The engine whose sessions list the tables.
     engine: Arc<QueryEngine>,
     /// Where MAP-key enumerations are counted.
     metrics: Arc<QueryMetrics>,
+    /// The store the tenants' system indices are read from.
+    system_store: Arc<SystemIndexStore>,
     /// The catalog's settings, handed to every session.
     settings: CatalogSettings,
     /// MAP-key enumerations shared by every session of this catalog.
@@ -104,11 +110,18 @@ pub(crate) struct IndexCatalog {
 }
 
 impl IndexCatalog {
-    /// A catalog over the tables of `engine`, counting MAP-key enumerations into `metrics`.
-    pub(crate) fn new(engine: Arc<QueryEngine>, metrics: Arc<QueryMetrics>, settings: CatalogSettings) -> Self {
+    /// A catalog over the tables of `engine` and the system indices of `system_store`, counting
+    /// MAP-key enumerations into `metrics`.
+    pub(crate) fn new(
+        engine: Arc<QueryEngine>,
+        metrics: Arc<QueryMetrics>,
+        system_store: Arc<SystemIndexStore>,
+        settings: CatalogSettings,
+    ) -> Self {
         Self {
             engine,
             metrics,
+            system_store,
             settings,
             map_key_cache: Arc::new(MapKeyCache::new(MAP_KEY_CACHE_TENANTS)),
         }
@@ -116,9 +129,11 @@ impl IndexCatalog {
 
     /// Open a session scoped to `tenant`, with the data indices it sees: one per table its
     /// tenant-scoped catalog lists in the IceGate namespace, except dot-prefixed names, which are
-    /// system indices. This is the only way an `OpenSearch` handler reaches table data, so every
-    /// read goes through the tenant scope, MAP-key enumeration and the footprint count aside (see
-    /// [`TenantSession::list_fields`] and [`TenantSession::count_footprint`]).
+    /// system indices. The tenant's system indices are read from the store when the session first
+    /// needs them (see [`TenantSession::read_system_snapshot`]). This is the only way an
+    /// `OpenSearch` handler reaches table data, so every read goes through the tenant scope,
+    /// MAP-key enumeration and the footprint count aside (see [`TenantSession::list_fields`] and
+    /// [`TenantSession::count_footprint`]).
     ///
     /// # Errors
     ///
@@ -146,8 +161,43 @@ impl IndexCatalog {
             metrics: Arc::clone(&self.metrics),
             settings: self.settings,
             map_key_cache: Arc::clone(&self.map_key_cache),
+            system_store: Arc::clone(&self.system_store),
+            system_snapshot: OnceCell::new(),
         })
     }
+}
+
+/// The system indices and aliases an index expression lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SystemListing {
+    /// Concrete system indices the expression names, in name order.
+    pub(crate) indices: Vec<String>,
+    /// Aliases the expression names, in name order.
+    pub(crate) aliases: Vec<String>,
+}
+
+impl SystemListing {
+    /// The concrete indices the listing names: its indices and the index of each alias, in name
+    /// order, each once.
+    pub(crate) fn resolve_concrete_indices(&self, snapshot: &SystemSnapshot) -> Vec<String> {
+        let concrete_indices: BTreeSet<&str> = self
+            .indices
+            .iter()
+            .map(String::as_str)
+            .chain(self.aliases.iter().filter_map(|alias| snapshot.resolve_name(alias)))
+            .collect();
+        concrete_indices.into_iter().map(str::to_string).collect()
+    }
+}
+
+/// What a listing endpoint (`_resolve/index`, `_cat/indices`) shows for an expression: the data
+/// and the system indices it names, side by side.
+#[derive(Debug)]
+pub(crate) struct IndexListing<'a> {
+    /// Data indices, in name order.
+    pub(crate) data_entries: Vec<&'a IndexEntry>,
+    /// System indices and aliases.
+    pub(crate) system_listing: SystemListing,
 }
 
 /// A tenant-scoped view of the catalog for one request.
@@ -169,12 +219,134 @@ pub(crate) struct TenantSession {
     settings: CatalogSettings,
     /// MAP-key enumerations shared with every session of the same catalog.
     map_key_cache: Arc<MapKeyCache>,
+    /// The store the tenant's system indices are read from.
+    system_store: Arc<SystemIndexStore>,
+    /// The tenant's system-index state, read at most once per session, so every system-index
+    /// decision of one request sees one snapshot.
+    system_snapshot: OnceCell<CurrentSnapshot>,
 }
 
 impl TenantSession {
     /// The data indices the tenant sees.
     pub(crate) const fn indices(&self) -> &IndexSet {
         &self.indices
+    }
+
+    /// The tenant's system-index state, read from the store on the first call of this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's read error.
+    pub(crate) async fn read_system_snapshot(&self) -> Result<&CurrentSnapshot, OpenSearchError> {
+        self.system_snapshot
+            .get_or_try_init(|| self.system_store.read(&self.tenant))
+            .await
+    }
+
+    /// Resolve `expression` for a request that reads one kind of index: data indices, or system
+    /// indices (aliases resolved). The system snapshot is read only when a part names a system
+    /// index or `expand_wildcards` includes hidden.
+    ///
+    /// # Errors
+    ///
+    /// Returns `illegal_argument_exception` naming the system indices when the expression selects
+    /// data and system indices together; `index_not_found_exception` per `options`; the store's
+    /// read error.
+    pub(crate) async fn resolve_target(
+        &self,
+        expression: &IndexExpression,
+        options: IndexOptions,
+    ) -> Result<IndexTarget<'_>, OpenSearchError> {
+        let listing = self
+            .list_targets(
+                expression,
+                IndexOptions {
+                    allow_no_indices: true,
+                    ..options
+                },
+            )
+            .await?;
+        let system_indices = self.resolve_listed_system_indices(listing.system_listing).await?;
+        choose_index_target(
+            expression,
+            listing.data_entries,
+            system_indices,
+            options.allow_no_indices,
+        )
+    }
+
+    /// The concrete system indices `system_listing` names, in name order, each once: its indices
+    /// as listed when it names no alias, otherwise those and the index of each alias. Only a
+    /// listing naming an alias reads the snapshot, which [`Self::list_targets`] already read for
+    /// this session when it listed the alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's read error.
+    pub(crate) async fn resolve_listed_system_indices(
+        &self,
+        system_listing: SystemListing,
+    ) -> Result<Vec<String>, OpenSearchError> {
+        if system_listing.aliases.is_empty() {
+            return Ok(system_listing.indices);
+        }
+        Ok(system_listing.resolve_concrete_indices(&self.read_system_snapshot().await?.snapshot))
+    }
+
+    /// List what `expression` names on both sides, for the endpoints that show data and system
+    /// indices together. The system snapshot is read as for [`Self::resolve_target`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `index_not_found_exception` per `options`, and the store's read error.
+    pub(crate) async fn list_targets(
+        &self,
+        expression: &IndexExpression,
+        options: IndexOptions,
+    ) -> Result<IndexListing<'_>, OpenSearchError> {
+        let partition = expression.partition_system_parts(options.expand_wildcards.is_hidden);
+        // Each side may come out empty: only both together decide whether nothing was named.
+        let side_options = IndexOptions {
+            allow_no_indices: true,
+            ..options
+        };
+        let data_entries = match &partition.data_expression {
+            Some(data_expression) => self.indices.resolve(data_expression, side_options)?,
+            None => Vec::new(),
+        };
+        let system_listing = if partition.system_parts.is_empty() {
+            SystemListing::default()
+        } else {
+            self.select_system_targets(&partition.system_parts, side_options).await?
+        };
+        let is_nothing_named =
+            data_entries.is_empty() && system_listing.indices.is_empty() && system_listing.aliases.is_empty();
+        if is_nothing_named && !options.allow_no_indices {
+            return Err(OpenSearchError::index_not_found(expression.text()));
+        }
+        Ok(IndexListing {
+            data_entries,
+            system_listing,
+        })
+    }
+
+    /// The system indices and aliases `parts` select in the tenant's snapshot.
+    async fn select_system_targets(
+        &self,
+        parts: &[ExpressionPart],
+        options: IndexOptions,
+    ) -> Result<SystemListing, OpenSearchError> {
+        let snapshot = &self.read_system_snapshot().await?.snapshot;
+        // Selection needs the names sorted; both lists come in name order, and no alias shares
+        // an index's name.
+        let names = merge_name_ordered_lists(snapshot.index_names(), snapshot.alias_names(), |name| *name);
+        let (indices, aliases): (Vec<&str>, Vec<&str>) = select_system_names(&names, parts, options)?
+            .into_iter()
+            .partition(|name| snapshot.find_index(name).is_some());
+        Ok(SystemListing {
+            indices: indices.into_iter().map(str::to_string).collect(),
+            aliases: aliases.into_iter().map(str::to_string).collect(),
+        })
     }
 
     /// The fields of `entry`, in schema column order.
@@ -308,6 +480,29 @@ impl TenantSession {
     }
 }
 
+/// Merge `left` and `right`, each in name order, into one list in name order, in one pass over
+/// both; on equal names the item of `left` comes first.
+pub(crate) fn merge_name_ordered_lists<'a, T>(
+    left: impl Iterator<Item = T>,
+    right: impl Iterator<Item = T>,
+    read_name: impl Fn(&T) -> &'a str,
+) -> Vec<T> {
+    let mut merged = Vec::with_capacity(left.size_hint().0 + right.size_hint().0);
+    let mut left = left.peekable();
+    let mut right = right.peekable();
+    while let (Some(left_item), Some(right_item)) = (left.peek(), right.peek()) {
+        let next_item = if read_name(right_item) < read_name(left_item) {
+            right.next()
+        } else {
+            left.next()
+        };
+        merged.extend(next_item);
+    }
+    merged.extend(left);
+    merged.extend(right);
+    merged
+}
+
 /// End of the discovery window for a request at `now`: the end of the minute that holds `now`.
 /// Every request within one minute scans the same window, which is what lets [`MapKeyCache`]
 /// answer as a fresh scan would.
@@ -329,6 +524,8 @@ mod tests {
     use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE, schema};
     use opentelemetry::metrics::MeterProvider as _;
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+    use rand::rngs::StdRng;
+    use rand::{Rng as _, SeedableRng as _};
 
     use super::*;
     use crate::infra::metrics::test_support::{build_meter_provider, find_counter_total};
@@ -357,6 +554,7 @@ mod tests {
         IndexCatalog::new(
             Arc::clone(engine),
             Arc::new(QueryMetrics::new(&provider.meter("map_key_enumeration_test"))),
+            crate::test_support::build_in_memory_system_index_store(),
             CatalogSettings { field_discovery_window },
         )
     }
@@ -636,6 +834,49 @@ mod tests {
         );
     }
 
+    /// Each side of a listing may come out empty on its own: only an expression naming nothing on
+    /// either side is the missing-index `404`, and only when no indices are disallowed.
+    #[tokio::test]
+    async fn a_listing_naming_nothing_on_either_side_is_404_only_when_no_indices_are_disallowed() {
+        let warehouse = build_logs_warehouse().await;
+        let (provider, _exporter) = build_meter_provider();
+        let session = build_counted_catalog(&warehouse.engine, &provider, ONE_DAY)
+            .open_session(&build_tenant(TENANT_A))
+            .await
+            .expect("a session");
+        let build_listing_options = |allow_no_indices: bool| IndexOptions {
+            ignore_unavailable: true,
+            allow_no_indices,
+            expand_wildcards: ExpandWildcards::parse(Some("all")).expect("a served value"),
+        };
+        let nothing_expression = IndexExpression::parse("nothing*,.nothing*").expect("a valid expression");
+        let logs_expression = IndexExpression::parse("logs,.nothing*").expect("a valid expression");
+
+        let empty_listing = session
+            .list_targets(&nothing_expression, build_listing_options(true))
+            .await
+            .expect("an empty listing");
+        let error = session
+            .list_targets(&nothing_expression, build_listing_options(false))
+            .await
+            .expect_err("nothing is named");
+        let logs_listing = session
+            .list_targets(&logs_expression, build_listing_options(false))
+            .await
+            .expect("logs is named");
+
+        assert!(empty_listing.data_entries.is_empty());
+        assert_eq!(empty_listing.system_listing, SystemListing::default());
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["index"], "nothing*,.nothing*");
+        assert_eq!(
+            logs_listing.data_entries.iter().map(|entry| entry.name()).collect::<Vec<_>>(),
+            [LOGS_TABLE]
+        );
+        assert_eq!(logs_listing.system_listing, SystemListing::default());
+    }
+
     /// A configured window reaching back before the earliest representable instant has no start
     /// to scan from, so the listing is a `500` rather than a scan over some other window. Both
     /// ways of overflowing are covered: a window too long for a time delta, and one whose start
@@ -658,6 +899,61 @@ mod tests {
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{window:?}");
             assert_eq!(body["error"]["type"], "exception", "{window:?}");
             assert_eq!(count_logs_enumerations(&provider, &exporter), 0, "{window:?}");
+        }
+    }
+
+    /// The merge takes the right item first, the left item first, or the rest of the side left
+    /// over; these cases reach each, with either side empty, either side running out first,
+    /// interleaved names and a tie.
+    #[test]
+    fn two_name_ordered_lists_merge_into_one_name_ordered_list() {
+        let cases: [(&[&str], &[&str], &[&str]); 6] = [
+            (&[], &[], &[]),
+            (&[".a"], &[], &[".a"]),
+            (&[], &[".a"], &[".a"]),
+            (&[".b", ".d"], &[".a", ".c", ".e"], &[".a", ".b", ".c", ".d", ".e"]),
+            (&[".a", ".b"], &[".c", ".d"], &[".a", ".b", ".c", ".d"]),
+            (&[".c", ".d"], &[".a", ".b"], &[".a", ".b", ".c", ".d"]),
+        ];
+        for (left_names, right_names, expected_names) in cases {
+            let merged_names =
+                merge_name_ordered_lists(left_names.iter().copied(), right_names.iter().copied(), |name| *name);
+
+            assert_eq!(merged_names, expected_names, "{left_names:?} and {right_names:?}");
+        }
+        let tied_items = merge_name_ordered_lists(
+            [(".a", "left")].into_iter(),
+            [(".a", "right")].into_iter(),
+            |(name, _)| *name,
+        );
+        assert_eq!(tied_items, [(".a", "left"), (".a", "right")]);
+    }
+
+    /// Sorting the concatenation is the independent oracle; names are drawn from a small
+    /// alphabet, so ties and long runs on one side are frequent.
+    #[test]
+    fn merging_agrees_with_sorting_the_concatenation_on_seeded_lists() {
+        let mut generator = StdRng::seed_from_u64(0x5EED_3E26);
+        let draw_sorted_names = |generator: &mut StdRng| -> Vec<String> {
+            let name_count = generator.random_range(0..=6);
+            let mut names: Vec<String> =
+                (0..name_count).map(|_| format!(".{}", generator.random_range(0..10))).collect();
+            names.sort_unstable();
+            names
+        };
+        for _ in 0..1_000 {
+            let left_names = draw_sorted_names(&mut generator);
+            let right_names = draw_sorted_names(&mut generator);
+            let mut expected_names: Vec<&str> = left_names.iter().chain(&right_names).map(String::as_str).collect();
+            expected_names.sort_unstable();
+
+            let merged_names = merge_name_ordered_lists(
+                left_names.iter().map(String::as_str),
+                right_names.iter().map(String::as_str),
+                |name| *name,
+            );
+
+            assert_eq!(merged_names, expected_names, "{left_names:?} and {right_names:?}");
         }
     }
 }

@@ -1,5 +1,5 @@
-//! `GET /<index>/_settings/index.number_of_shards`: every IceGate index reports one shard. No
-//! other setting is served.
+//! `GET /<index>/_settings/index.number_of_shards`: every IceGate index, data or system, reports
+//! one shard. No other setting is served.
 
 use axum::Json;
 use axum::extract::{Extension, State};
@@ -7,7 +7,7 @@ use icegate_common::TenantId;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::opensearch::catalog::{IndexExpression, read_index_options};
+use crate::opensearch::catalog::{IndexExpression, IndexTarget, read_index_options};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, Parameters, PathParameters, deserialize_flag};
 use crate::opensearch::state::OpenSearchState;
@@ -38,7 +38,8 @@ impl EndpointParameters for SettingsParameters {
 }
 
 /// `GET /<index>/_settings/<setting>`: `{<index>: {settings: ...}}` per selected index, with the
-/// shard count `"1"` in the flat (`flat_settings`) or the nested form.
+/// shard count `"1"` in the flat (`flat_settings`) or the nested form. The expression selects data
+/// indices or system indices (an alias answers under the index it names), never both.
 pub(crate) async fn read_index_setting(
     State(state): State<OpenSearchState>,
     Extension(tenant): Extension<TenantId>,
@@ -62,11 +63,13 @@ pub(crate) async fn read_index_setting(
         json!({"index": {"number_of_shards": "1"}})
     };
     let session = state.catalog.open_session(&tenant).await?;
-    let body: Map<String, Value> = session
-        .indices()
-        .resolve(&expression, options)?
+    let names: Vec<String> = match session.resolve_target(&expression, options).await? {
+        IndexTarget::Data(entries) => entries.into_iter().map(|entry| entry.name().to_string()).collect(),
+        IndexTarget::System(indices) => indices,
+    };
+    let body: Map<String, Value> = names
         .into_iter()
-        .map(|entry| (entry.name().to_string(), json!({"settings": settings.clone()})))
+        .map(|name| (name, json!({"settings": settings.clone()})))
         .collect();
     Ok(Json(Value::Object(body)))
 }

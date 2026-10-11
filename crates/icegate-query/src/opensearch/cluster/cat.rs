@@ -1,4 +1,4 @@
-//! `GET /_cat/indices[/<expression>]` and `GET /_cat/plugins`.
+//! `GET /_cat/indices[/<expression>]`, `GET /_cat/plugins` and `GET /_cat/templates/<pattern>`.
 //!
 //! Values are strings or null, and `format` is matched case-insensitively. `docs.count` and the
 //! store sizes are the requesting tenant's committed figures, never table-wide ones; rows still
@@ -17,7 +17,6 @@ use icegate_common::TenantId;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::engine::tenant_scope::TenantFootprint;
 use crate::opensearch::catalog::{IndexEntry, IndexExpression, IndexOptions};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, ExpandWildcards, Parameters, PathParameters, deserialize_flag};
@@ -116,6 +115,18 @@ const EMULATED_PLUGIN_COMPONENTS: [&str; 2] = ["opensearch-observability", "open
 /// The columns of `_cat/plugins`, in order.
 const PLUGIN_COLUMNS: [&str; 3] = ["name", "component", "version"];
 
+/// The columns of `_cat/templates`, in order.
+const TEMPLATE_COLUMNS: [&str; 5] = ["name", "index_patterns", "order", "version", "composed_of"];
+
+/// The figures of one `_cat/indices` row; `None` renders as null.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatFigures {
+    /// `docs.count`.
+    document_count: Option<u64>,
+    /// `store.size` and `pri.store.size`.
+    store_bytes: Option<u64>,
+}
+
 /// The rendering a `_cat` request asks for with `format`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatFormat {
@@ -193,10 +204,26 @@ impl EndpointParameters for CatPluginsParameters {
     const IGNORED: &'static [&'static str] = &["local", "cluster_manager_timeout", "master_timeout"];
 }
 
+/// Query parameters of `_cat/templates`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatTemplatesParameters {
+    /// `format`: `json` or text (`txt`), matched case-insensitively; absent means text.
+    format: Option<String>,
+    /// `v`: whether text output starts with a header line.
+    #[serde(rename = "v", default, deserialize_with = "deserialize_flag")]
+    has_header: Option<bool>,
+}
+
+impl EndpointParameters for CatTemplatesParameters {
+    const IGNORED: &'static [&'static str] = &["local", "cluster_manager_timeout", "master_timeout"];
+}
+
 /// `GET /_cat/indices[/<expression>]`; `GET /_cat/indices/` (trailing slash) names no index and
 /// answers like `/_cat/indices`. Without an expression every index the tenant sees is listed,
 /// exact-name tables included, as long as `expand_wildcards` expands to open indices; otherwise
-/// nothing is listed.
+/// nothing is listed. A dot-prefixed system index is listed only when a part starts with `.` or
+/// `expand_wildcards` includes hidden; an alias lists the index it names.
 pub(crate) async fn list_cat_indices(
     State(state): State<OpenSearchState>,
     Extension(tenant): Extension<TenantId>,
@@ -225,19 +252,37 @@ pub(crate) async fn list_cat_indices(
         .map(|PathParameters(expression_text)| IndexExpression::parse(&expression_text))
         .transpose()?;
     let session = state.catalog.open_session(&tenant).await?;
-    let entries: Vec<&IndexEntry> = match expression {
+    let (entries, system_indices): (Vec<&IndexEntry>, Vec<String>) = match expression {
         // No expression lists every index, exact-name tables included, which no wildcard selects.
         // Like a wildcard, it honours whether `expand_wildcards` expands to open indices, so it
-        // lists nothing otherwise.
-        None if expand_wildcards.is_open => session.indices().entries().iter().collect(),
-        None => Vec::new(),
+        // lists nothing otherwise. The system indices are hidden, so they are listed only when
+        // hidden indices are asked for too.
+        None if expand_wildcards.is_open => {
+            // Asking for hidden indices lists every system index; each alias names one of them,
+            // so the aliases add none.
+            let system_indices = if expand_wildcards.is_hidden {
+                session
+                    .read_system_snapshot()
+                    .await?
+                    .snapshot
+                    .index_names()
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (session.indices().entries().iter().collect(), system_indices)
+        }
+        None => (Vec::new(), Vec::new()),
         Some(expression) => {
             let options = IndexOptions {
                 ignore_unavailable: false,
                 allow_no_indices: true,
                 expand_wildcards,
             };
-            session.indices().resolve(&expression, options)?
+            let listing = session.list_targets(&expression, options).await?;
+            let system_indices = session.resolve_listed_system_indices(listing.system_listing).await?;
+            (listing.data_entries, system_indices)
         }
     };
     // A count loads the table from the catalog and reads its manifests, so it runs only when a
@@ -248,16 +293,32 @@ pub(crate) async fn list_cat_indices(
     } else {
         Vec::new()
     };
-    let rows: Vec<Vec<CatCell<'_>>> = entries
+    let mut rows: Vec<Vec<CatCell<'_>>> = entries
         .iter()
         .zip(footprints.into_iter().chain(iter::repeat(None)))
         .map(|(entry, footprint)| {
+            let figures = CatFigures {
+                document_count: footprint.map(|footprint| footprint.record_count),
+                store_bytes: footprint.map(|footprint| footprint.file_size_bytes),
+            };
             columns
                 .iter()
-                .map(|column| render_cell(*column, entry, footprint, &tenant, byte_rendering))
+                .map(|column| render_cell(*column, entry.name(), figures, &tenant, byte_rendering))
                 .collect()
         })
         .collect();
+    // A system index holds its mappings and settings in the tenant's snapshot and no document,
+    // and has no storage of its own: its count is 0 and its sizes are null.
+    let system_figures = CatFigures {
+        document_count: Some(0),
+        store_bytes: None,
+    };
+    rows.extend(system_indices.iter().map(|index| {
+        columns
+            .iter()
+            .map(|column| render_cell(*column, index, system_figures, &tenant, byte_rendering))
+            .collect::<Vec<_>>()
+    }));
     let column_names: Vec<&str> = columns.iter().copied().map(CatIndicesColumn::name).collect();
     Ok(render_rows(
         &column_names,
@@ -293,13 +354,28 @@ pub(crate) async fn list_cat_plugins(
     ))
 }
 
-/// One `_cat/indices` cell; a figure column is null when `footprint` is `None`. The index `uuid`
-/// is derived from the tenant and the index name, so it is stable per tenant and shared by no two
-/// tenants.
+/// `GET /_cat/templates/<pattern>`: no index template exists, so every pattern lists none. Reads
+/// no table and no system index.
+pub(crate) async fn list_index_templates(
+    PathParameters(_): PathParameters<String>,
+    Parameters(parameters): Parameters<CatTemplatesParameters>,
+) -> Result<Response, OpenSearchError> {
+    let format = CatFormat::parse(parameters.format.as_deref())?;
+    Ok(render_rows(
+        &TEMPLATE_COLUMNS,
+        Vec::new(),
+        format,
+        parameters.has_header.unwrap_or(false),
+    ))
+}
+
+/// One `_cat/indices` cell of the index `index`; a figure column is null when its figure is
+/// `None`. The index `uuid` is derived from the tenant and the index name, so it is stable per
+/// tenant and shared by no two tenants.
 fn render_cell<'a>(
     column: CatIndicesColumn,
-    entry: &'a IndexEntry,
-    footprint: Option<TenantFootprint>,
+    index: &'a str,
+    figures: CatFigures,
     tenant: &TenantId,
     byte_rendering: ByteRendering,
 ) -> CatCell<'a> {
@@ -310,16 +386,15 @@ fn render_cell<'a>(
     match column {
         CatIndicesColumn::Health => Some(Cow::Borrowed("green")),
         CatIndicesColumn::Status => Some(Cow::Borrowed("open")),
-        CatIndicesColumn::Index => Some(Cow::Borrowed(entry.name())),
-        CatIndicesColumn::Uuid => Some(Cow::Owned(derive_identifier(
-            "index",
-            &format!("{tenant}/{}", entry.name()),
-        ))),
+        CatIndicesColumn::Index => Some(Cow::Borrowed(index)),
+        CatIndicesColumn::Uuid => Some(Cow::Owned(derive_identifier("index", &format!("{tenant}/{index}")))),
         CatIndicesColumn::PrimaryShards => Some(Cow::Borrowed("1")),
         CatIndicesColumn::ReplicaShards | CatIndicesColumn::DocsDeleted => Some(Cow::Borrowed("0")),
-        CatIndicesColumn::DocsCount => footprint.map(|footprint| Cow::Owned(footprint.record_count.to_string())),
+        CatIndicesColumn::DocsCount => figures
+            .document_count
+            .map(|document_count| Cow::Owned(document_count.to_string())),
         CatIndicesColumn::StoreSize | CatIndicesColumn::PrimaryStoreSize => {
-            footprint.map(|footprint| Cow::Owned(render_bytes(footprint.file_size_bytes)))
+            figures.store_bytes.map(|store_bytes| Cow::Owned(render_bytes(store_bytes)))
         }
     }
 }
@@ -456,7 +531,18 @@ mod tests {
         let tenant_a = build_tenant("tenant-a");
         let tenant_b = build_tenant("tenant-b");
         let render_uuid = |entry: &IndexEntry, tenant: &TenantId| {
-            render_cell(CatIndicesColumn::Uuid, entry, None, tenant, ByteRendering::Human).map(Cow::into_owned)
+            let figures = CatFigures {
+                document_count: None,
+                store_bytes: None,
+            };
+            render_cell(
+                CatIndicesColumn::Uuid,
+                entry.name(),
+                figures,
+                tenant,
+                ByteRendering::Human,
+            )
+            .map(Cow::into_owned)
         };
 
         let tenant_a_logs_uuid = render_uuid(logs_entry, &tenant_a);

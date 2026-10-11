@@ -148,6 +148,39 @@ async fn a_replica_reading_after_another_replicas_write_sees_it() {
     second_replica.shutdown().await;
 }
 
+/// The replica that applies an alias caches the state it wrote; a replica that never read the
+/// tenant can resolve the alias only from the snapshot object stored in RustFS.
+#[tokio::test]
+async fn an_alias_applied_on_one_replica_resolves_on_another_that_never_read_the_tenant() {
+    let (_container, config) = start_rustfs().await;
+    let (first_replica, second_replica) = start_replicas(&config).await;
+    assert_eq!(put_index(&first_replica, "aliased", ".kibana_1").await, StatusCode::OK);
+    let alias_status = first_replica
+        .request(Method::POST, Some("aliased"), "/_aliases")
+        .json(&json!({"actions": [{"add": {"index": ".kibana_1", "alias": ".kibana"}}]}))
+        .send()
+        .await
+        .expect("POST _aliases")
+        .status();
+
+    let index_through_alias: serde_json::Value = second_replica
+        .request(Method::GET, Some("aliased"), "/.kibana")
+        .send()
+        .await
+        .expect("GET through the alias")
+        .json()
+        .await
+        .expect("a JSON body");
+
+    assert_eq!(alias_status, StatusCode::OK);
+    assert_eq!(
+        index_through_alias,
+        json!({".kibana_1": {"aliases": {".kibana": {}}, "mappings": {"dynamic": "strict"}, "settings": {}}})
+    );
+    first_replica.shutdown().await;
+    second_replica.shutdown().await;
+}
+
 /// The tenant segment is the tenant identifier verbatim; `:` must survive every S3 request the
 /// store sends.
 #[tokio::test]

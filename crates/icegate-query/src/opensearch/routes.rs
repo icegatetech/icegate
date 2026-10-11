@@ -14,7 +14,7 @@ use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use icegate_common::{ShedPolicy, shed_when_pressured};
 
 use super::cluster::{cat, datasources, health, info, resolve, settings};
@@ -23,7 +23,10 @@ use super::error::OpenSearchError;
 use super::fields;
 use super::filter_path::apply_filter_path;
 use super::state::OpenSearchState;
-use super::system_index::{create_system_index, describe_system_index};
+use super::system_index::{
+    apply_aliases, create_system_index, delete_index_template, describe_system_index, get_alias, get_index_aliases,
+    refresh_index,
+};
 use crate::infra::metrics::{PROTOCOL_OPENSEARCH, QueryMetrics, QueryRequestRecorder, QueryTenantRejectionRecorder};
 use crate::infra::runtime::QueryRuntime;
 use crate::infra::tenant::{RequestTenantPolicy, build_rejection_response, resolve_request_tenant};
@@ -82,6 +85,12 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
         .route("/{index}/_mapping", get(fields::describe_mappings))
         .route("/{index}/_mapping/field/{fields}", get(fields::describe_field_mappings))
         .route("/{index}", get(describe_system_index).put(create_system_index))
+        .route("/_alias/{name}", get(get_alias))
+        .route("/{index}/_alias", get(get_index_aliases))
+        .route("/_aliases", post(apply_aliases))
+        .route("/{index}/_refresh", get(refresh_index).post(refresh_index))
+        .route("/_template/{name}", delete(delete_index_template))
+        .route("/_cat/templates/{pattern}", get(cat::list_index_templates))
         .fallback(answer_unmatched_route)
         .method_not_allowed_fallback(answer_unmatched_route)
         .layer(middleware::from_fn(apply_filter_path))
@@ -188,6 +197,7 @@ mod tests {
             pressure,
             tenant_resolver,
         };
+        let system_store = build_in_memory_system_index_store();
         let state = OpenSearchState {
             node: Arc::new(NodeIdentity::new(
                 &config.cluster_name,
@@ -197,11 +207,12 @@ mod tests {
             catalog: IndexCatalog::new(
                 engine,
                 Arc::clone(&runtime.metrics),
+                Arc::clone(&system_store),
                 CatalogSettings {
                     field_discovery_window: Duration::from_secs(60),
                 },
             ),
-            system_store: build_in_memory_system_index_store(),
+            system_store,
         };
         build_router(state, &runtime, &config)
     }

@@ -256,6 +256,13 @@ pub(crate) struct SystemIndexStore {
     shared: Arc<StoreShared>,
 }
 
+/// Renders the store's name only: its shared cache and write queues are not rendered.
+impl std::fmt::Debug for SystemIndexStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SystemIndexStore").finish_non_exhaustive()
+    }
+}
+
 /// What the store's handlers and its write loops share.
 struct StoreShared {
     /// The object-store client and the tenants' paths.
@@ -978,6 +985,7 @@ mod tests {
 
     use super::*;
     use crate::opensearch::error::render_envelope;
+    use crate::opensearch::system_index::snapshot::AliasAction;
 
     const LOCATION: &str = "s3://opensearch-test/opensearch-system";
     const TENANT_A: &str = "tenant-a";
@@ -1515,6 +1523,41 @@ mod tests {
         let current_snapshot = other_replica.read(&tenant).await.expect("the pointer names an existing object");
         assert!(current_snapshot.snapshot.find_index(".kibana_1").is_some());
         assert!(current_snapshot.snapshot.find_index(".kibana_2").is_some());
+    }
+
+    /// The writing replica caches the state it wrote and serves it from a not-modified answer, so
+    /// only a replica that has cached nothing proves the alias reached the stored snapshot object.
+    #[tokio::test]
+    async fn an_alias_applied_on_one_replica_resolves_on_a_replica_that_has_cached_nothing() {
+        let (_double, scripted_replica, other_replica) = build_replicas(build_limits());
+        let tenant = build_tenant(TENANT_A);
+        scripted_replica
+            .write(&tenant, build_index_creation(".kibana_1"))
+            .await
+            .expect("create the index");
+
+        let alias_outcome = scripted_replica
+            .write(
+                &tenant,
+                SystemOperation::ApplyAliasActions {
+                    actions: vec![AliasAction::Add {
+                        index: ".kibana_1".to_string(),
+                        alias: ".kibana".to_string(),
+                    }],
+                },
+            )
+            .await;
+
+        assert_eq!(
+            alias_outcome.expect("the alias is applied"),
+            SystemOutcome::AliasesApplied
+        );
+        let current_snapshot = other_replica.read(&tenant).await.expect("read");
+        assert_eq!(current_snapshot.snapshot.resolve_name(".kibana"), Some(".kibana_1"));
+        assert_eq!(
+            current_snapshot.snapshot.list_aliases_of(".kibana_1").collect::<Vec<_>>(),
+            [".kibana"]
+        );
     }
 
     #[tokio::test]

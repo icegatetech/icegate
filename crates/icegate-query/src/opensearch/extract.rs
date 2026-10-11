@@ -100,12 +100,15 @@ where
 
 /// What a wildcard expands to (`expand_wildcards`).
 ///
-/// IceGate has no closed indices, so `closed` expands to nothing. No data index is hidden, so
-/// `hidden` adds nothing to the other values, and on its own it expands to no data index.
+/// IceGate has no closed indices, so `closed` expands to nothing. The dot-prefixed system indices
+/// are hidden: a wildcard reaches them only with `hidden`, while a pattern starting with `.`
+/// reaches them regardless. `hidden` alone, without `open`, expands to nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExpandWildcards {
     /// Wildcards match open indices.
     pub(crate) is_open: bool,
+    /// Wildcards also match hidden indices.
+    pub(crate) is_hidden: bool,
 }
 
 impl ExpandWildcards {
@@ -116,13 +119,24 @@ impl ExpandWildcards {
     /// Returns `illegal_argument_exception` for any other value, an empty one included.
     pub(crate) fn parse(text: Option<&str>) -> Result<Self, OpenSearchError> {
         let Some(text) = text else {
-            return Ok(Self { is_open: true });
+            return Ok(Self {
+                is_open: true,
+                is_hidden: false,
+            });
         };
-        let mut expand_wildcards = Self { is_open: false };
+        let mut expand_wildcards = Self {
+            is_open: false,
+            is_hidden: false,
+        };
         for expansion in text.split(',') {
             match expansion {
-                "open" | "all" => expand_wildcards.is_open = true,
-                "hidden" | "closed" | "none" => {}
+                "open" => expand_wildcards.is_open = true,
+                "hidden" => expand_wildcards.is_hidden = true,
+                "all" => {
+                    expand_wildcards.is_open = true;
+                    expand_wildcards.is_hidden = true;
+                }
+                "closed" | "none" => {}
                 unknown_expansion => {
                     return Err(OpenSearchError::illegal_argument(format!(
                         "no enum constant for expand_wildcards [{unknown_expansion}]"
@@ -297,25 +311,24 @@ mod tests {
         assert!(read_flag("ignore_unavailable=TRUE").is_err());
     }
 
-    /// `hidden` is accepted and leaves `is_open` as the other values set it.
+    /// `hidden` sets only `is_hidden`, `all` sets both flags, and `closed` and `none` set neither.
     #[test]
     fn expand_wildcards_reads_open_hidden_all_none_and_closed() {
         let cases = [
-            (None, true),
-            (Some("open"), true),
-            (Some("hidden"), false),
-            (Some("open,hidden"), true),
-            (Some("all"), true),
-            (Some("none"), false),
-            (Some("closed"), false),
-            (Some("closed,open"), true),
+            (None, true, false),
+            (Some("open"), true, false),
+            (Some("hidden"), false, true),
+            (Some("open,hidden"), true, true),
+            (Some("all"), true, true),
+            (Some("none"), false, false),
+            (Some("closed"), false, false),
+            (Some("closed,open"), true, false),
         ];
-        for (text, is_open) in cases {
-            assert_eq!(
-                ExpandWildcards::parse(text).expect("a served value").is_open,
-                is_open,
-                "{text:?}"
-            );
+        for (text, is_open, is_hidden) in cases {
+            let expand_wildcards = ExpandWildcards::parse(text).expect("a served value");
+
+            assert_eq!(expand_wildcards.is_open, is_open, "{text:?}");
+            assert_eq!(expand_wildcards.is_hidden, is_hidden, "{text:?}");
         }
         assert!(ExpandWildcards::parse(Some("everything")).is_err());
         assert!(ExpandWildcards::parse(Some("open,")).is_err());

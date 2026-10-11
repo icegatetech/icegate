@@ -1,5 +1,7 @@
 //! Index expressions: the comma list of names and patterns one request targets.
 
+use std::borrow::Cow;
+
 use crate::opensearch::error::OpenSearchError;
 
 /// One element of an index expression.
@@ -83,6 +85,96 @@ impl IndexExpression {
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
+
+    /// Split the expression into its data part and its system parts.
+    ///
+    /// A part starting with `.` names system indices only. With `is_hidden`, a wildcard part and
+    /// an expression that selects everything (`""`, `_all`) also select system indices, and every
+    /// exclusion applies to them too. The data part keeps its parts' relative order; an exclusion
+    /// that followed a system part may then lead it, and applied to the empty selection it removes
+    /// nothing, as it removed no data index before.
+    pub(crate) fn partition_system_parts(&self, is_hidden: bool) -> ExpressionPartition {
+        let parts = match &self.selection {
+            Selection::AllVisible => {
+                let system_parts = if is_hidden {
+                    vec![ExpressionPart::Include("*".to_string())]
+                } else {
+                    Vec::new()
+                };
+                return ExpressionPartition {
+                    data_expression: Some(self.clone()),
+                    system_parts,
+                };
+            }
+            Selection::Parts(parts) => parts,
+        };
+        let has_system_part = parts
+            .iter()
+            .any(|part| matches!(part, ExpressionPart::Include(pattern) if pattern.starts_with('.')));
+        if !has_system_part && !is_hidden {
+            return ExpressionPartition {
+                data_expression: Some(self.clone()),
+                system_parts: Vec::new(),
+            };
+        }
+        let mut data_parts = Vec::new();
+        let mut system_parts = Vec::new();
+        for part in parts {
+            match part {
+                ExpressionPart::Include(pattern) if pattern.starts_with('.') => system_parts.push(part.clone()),
+                ExpressionPart::Include(pattern) => {
+                    if is_hidden && has_wildcard(pattern) {
+                        system_parts.push(part.clone());
+                    }
+                    data_parts.push(part.clone());
+                }
+                ExpressionPart::Exclude(pattern) => {
+                    system_parts.push(part.clone());
+                    if !pattern.starts_with('.') {
+                        data_parts.push(part.clone());
+                    }
+                }
+            }
+        }
+        let has_inclusion =
+            |parts: &[ExpressionPart]| parts.iter().any(|part| matches!(part, ExpressionPart::Include(_)));
+        let data_expression = has_inclusion(&data_parts).then(|| Self::from_parts(data_parts));
+        if !has_inclusion(&system_parts) {
+            system_parts.clear();
+        }
+        ExpressionPartition {
+            data_expression,
+            system_parts,
+        }
+    }
+
+    /// An expression of already validated `parts`, its text rebuilt from them.
+    fn from_parts(parts: Vec<ExpressionPart>) -> Self {
+        let text = parts
+            .iter()
+            .map(|part| match part {
+                ExpressionPart::Include(pattern) => Cow::Borrowed(pattern.as_str()),
+                ExpressionPart::Exclude(pattern) => Cow::Owned(format!("-{pattern}")),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Self {
+            text,
+            selection: Selection::Parts(parts),
+        }
+    }
+}
+
+/// An index expression split by what each part can select.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpressionPartition {
+    /// The expression the data path resolves: the parts that can select a data index, which are
+    /// the whole expression when no part starts with `.` and hidden indices are not expanded, or
+    /// when the expression selects everything; `None` when no inclusion is left for the data path.
+    pub(crate) data_expression: Option<IndexExpression>,
+    /// The parts system indices are resolved with, in request order; empty when the expression
+    /// cannot select a system index.
+    pub(super) system_parts: Vec<ExpressionPart>,
 }
 
 /// Whether `pattern` holds a wildcard character.
