@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use icegate_common::{ShedPolicy, shed_when_pressured};
 
-use super::cluster::{datasources, health, info, resolve, settings};
+use super::cluster::{cat, datasources, health, info, resolve, settings};
 use super::config::OpenSearchConfig;
 use super::error::OpenSearchError;
 use super::fields;
@@ -61,6 +61,12 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
             "/_plugins/_query/_datasources",
             get(datasources::list_query_datasources),
         )
+        .route("/_cat/indices", get(cat::list_cat_indices))
+        // The trailing-slash form names no index and answers like `/_cat/indices`. It is routed
+        // here alone: no router-wide trailing-slash rule makes any other route answer one.
+        .route("/_cat/indices/", get(cat::list_cat_indices))
+        .route("/_cat/indices/{index}", get(cat::list_cat_indices))
+        .route("/_cat/plugins", get(cat::list_cat_plugins))
         .route("/_resolve/index/{expression}", get(resolve::resolve_index))
         .route("/{index}/_settings/{setting}", get(settings::read_index_setting))
         .route(
@@ -145,6 +151,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
+    use crate::engine::QueryEngine;
     use crate::infra::metrics::test_support::{build_meter_provider, find_counter_total};
     use crate::opensearch::catalog::{CatalogSettings, IndexCatalog};
     use crate::opensearch::config::EmulatedVersion;
@@ -155,12 +162,22 @@ mod tests {
     /// The router over an engine whose catalog never answers: a route that answers at all read
     /// no table.
     fn build_test_router(pressure: MemoryPressure, tenant_resolver: TenantResolver, metrics: QueryMetrics) -> Router {
+        build_test_router_with_engine(build_stalling_engine(30), pressure, tenant_resolver, metrics)
+    }
+
+    /// The router over `engine`; the runtime and the index catalog read through the same engine,
+    /// so its deadline and its catalog are the ones every layer sees.
+    fn build_test_router_with_engine(
+        engine: Arc<QueryEngine>,
+        pressure: MemoryPressure,
+        tenant_resolver: TenantResolver,
+        metrics: QueryMetrics,
+    ) -> Router {
         let config = OpenSearchConfig {
             enabled: true,
             ..OpenSearchConfig::default()
         };
         let version = EmulatedVersion::parse(&config.version).expect("the default version parses");
-        let engine = build_stalling_engine(30);
         let runtime = QueryRuntime {
             engine: Arc::clone(&engine),
             metrics: Arc::new(metrics),
@@ -578,5 +595,30 @@ mod tests {
             .expect("HEAD body");
         assert!(filtered_body.is_empty());
         assert_eq!(refused_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A catalog that accepted the request and went silent is cut off at the engine's query
+    /// ceiling, and the client reads the 503 envelope instead of waiting. The paused clock
+    /// advances to the one-second ceiling as soon as nothing else can run.
+    #[tokio::test(start_paused = true)]
+    async fn a_catalog_that_never_answers_is_cut_off_at_the_deadline_in_the_envelope() {
+        let app = build_test_router_with_engine(
+            build_stalling_engine(1),
+            MemoryPressure::inert(),
+            TenantResolver::Multi,
+            QueryMetrics::new_disabled(),
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.oneshot(build_request("GET", "/_cat/indices", Some("tenant-a"))),
+        )
+        .await
+        .expect("answered within the bound")
+        .expect("a response");
+
+        let (status, body) = read_envelope(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "query_deadline_exceeded_exception");
     }
 }

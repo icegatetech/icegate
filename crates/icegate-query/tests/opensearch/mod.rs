@@ -1,3 +1,4 @@
+mod cat;
 mod cluster;
 mod data;
 mod fields;

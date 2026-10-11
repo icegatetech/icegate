@@ -1,11 +1,17 @@
-//! Tenant isolation for read surfaces that resolve tables through the session catalog.
+//! Tenant isolation for read surfaces that resolve tables through the session catalog, and a
+//! tenant's figures from table metadata.
 //!
 //! [`install_tenant_scope`] swaps the session's Iceberg catalog for a decorator that enforces
 //! `tenant_id = '<t>'` on every scan and hides the column (see [`catalog`]). A surface that
 //! installs it adds no tenant predicate of its own: isolation stays anchored to this one layer,
 //! so no two surfaces that install it can diverge in what a tenant may read.
+//!
+//! [`count_tenant_footprint`] reads a tenant's committed figures in one table from snapshot
+//! metadata, without the decorator: it prunes to the tenant's identity partition, except a global
+//! table, which is counted whole.
 
 mod catalog;
+mod record_counts;
 
 use std::sync::Arc;
 
@@ -15,6 +21,7 @@ use datafusion::prelude::SessionContext;
 use icegate_common::TenantId;
 
 use self::catalog::TenantScopedCatalogProvider;
+pub(crate) use self::record_counts::{TenantFootprint, count_tenant_footprint};
 
 /// Install the tenant-scoped catalog decorator on `ctx`.
 ///

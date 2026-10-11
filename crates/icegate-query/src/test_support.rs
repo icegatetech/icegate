@@ -26,7 +26,7 @@ use icegate_common::schema::{
 };
 use icegate_common::{
     CatalogBackend, CatalogBuilder, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, MemoryPressure,
-    MemoryPressureConfig, MemoryPressureSampler, UsageReader, icegate_table_ident,
+    MemoryPressureConfig, MemoryPressureSampler, TenantId, UsageReader, icegate_table_ident,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -186,13 +186,15 @@ pub struct LogsWarehouse {
     _directory: tempfile::TempDir,
 }
 
-/// Build a [`LogsWarehouse`] with an empty `logs` table and an empty in-memory WAL.
-pub async fn build_logs_warehouse() -> LogsWarehouse {
-    let directory = tempfile::tempdir().expect("a warehouse directory");
+/// An in-memory catalog over a temporary warehouse, with the IceGate namespace created and no
+/// table in it. The directory removes the warehouse on drop, so the caller holds it while the
+/// catalog is used.
+pub async fn build_icegate_catalog() -> (tempfile::TempDir, Arc<dyn Catalog>) {
+    let warehouse = tempfile::tempdir().expect("a warehouse directory");
     let catalog = CatalogBuilder::from_config(
         &CatalogConfig {
             backend: CatalogBackend::Memory,
-            warehouse: directory.path().to_str().expect("a UTF-8 path").to_string(),
+            warehouse: warehouse.path().to_str().expect("a UTF-8 path").to_string(),
             properties: HashMap::new(),
             cache: None,
         },
@@ -201,11 +203,22 @@ pub async fn build_logs_warehouse() -> LogsWarehouse {
     )
     .await
     .expect("an in-memory catalog");
-    let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
     catalog
-        .create_namespace(&namespace, HashMap::new())
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
         .await
         .expect("the IceGate namespace");
+    (warehouse, catalog)
+}
+
+/// The tenant `id`; a test names only valid tenants.
+pub fn build_tenant(id: &str) -> TenantId {
+    TenantId::new(id).expect("a valid tenant")
+}
+
+/// Build a [`LogsWarehouse`] with an empty `logs` table and an empty in-memory WAL.
+pub async fn build_logs_warehouse() -> LogsWarehouse {
+    let (directory, catalog) = build_icegate_catalog().await;
+    let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
     let logs_schema = schema::logs_schema().expect("the logs schema");
     let creation = TableCreation::builder()
         .name(LOGS_TABLE.to_string())

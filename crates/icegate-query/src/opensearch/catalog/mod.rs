@@ -1,7 +1,10 @@
 //! The `OpenSearch` index catalog: where an index expression resolves to the tables a tenant may
-//! read, and where those tables' fields are listed. Every `OpenSearch` handler that reaches table
-//! data starts here, so the tenant scope cannot be skipped, MAP-key enumeration aside (see
-//! [`TenantSession::list_fields`]).
+//! read, and where those tables' fields and the tenant's figures in them are listed. Every
+//! `OpenSearch` handler that reaches table data starts here, so the tenant scope cannot be
+//! skipped. Two metadata reads do not go through it: MAP-key enumeration (see
+//! [`TenantSession::list_fields`]) prunes to the tenant by its identity partition, and so does the
+//! footprint count (see [`TenantSession::count_footprint`]), except in a global table, which it
+//! counts whole.
 
 mod expression;
 mod field;
@@ -16,6 +19,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::catalog::SchemaProvider;
+use datafusion::logical_expr::TableType;
 use iceberg::expr::Predicate;
 use icegate_common::schema::{
     COL_DATA_POINT_ATTRIBUTES, COL_LOG_ATTRIBUTES, COL_METADATA, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES,
@@ -32,7 +36,7 @@ use self::registry::{Profile, find_telemetry_table};
 use super::error::OpenSearchError;
 use crate::engine::QueryEngine;
 use crate::engine::metadata_scan::{MetadataScanConfig, scan_label_levels};
-use crate::engine::tenant_scope::install_tenant_scope;
+use crate::engine::tenant_scope::{TenantFootprint, count_tenant_footprint, install_tenant_scope};
 use crate::error::QueryError;
 use crate::infra::metrics::QueryMetrics;
 
@@ -113,8 +117,8 @@ impl IndexCatalog {
     /// Open a session scoped to `tenant`, with the data indices it sees: one per table its
     /// tenant-scoped catalog lists in the IceGate namespace, except dot-prefixed names, which are
     /// system indices. This is the only way an `OpenSearch` handler reaches table data, so every
-    /// read goes through the tenant scope, MAP-key enumeration aside (see
-    /// [`TenantSession::list_fields`]).
+    /// read goes through the tenant scope, MAP-key enumeration and the footprint count aside (see
+    /// [`TenantSession::list_fields`] and [`TenantSession::count_footprint`]).
     ///
     /// # Errors
     ///
@@ -152,11 +156,12 @@ pub(crate) struct TenantSession {
     /// The tenant-scoped IceGate namespace: every table it yields is filtered to the tenant and
     /// hides `tenant_id`.
     namespace: Arc<dyn SchemaProvider>,
-    /// The tenant the session is scoped to; MAP-key enumeration prunes to it.
+    /// The tenant the session is scoped to; MAP-key enumeration and the footprint count of a
+    /// tenant-partitioned table prune to it.
     tenant: TenantId,
     /// The data indices the tenant sees, listed when the session opened.
     indices: IndexSet,
-    /// The engine whose catalog MAP-key enumeration loads tables from.
+    /// The engine whose catalog MAP-key enumeration and the footprint count load tables from.
     engine: Arc<QueryEngine>,
     /// Where MAP-key enumerations are counted.
     metrics: Arc<QueryMetrics>,
@@ -177,9 +182,8 @@ impl TenantSession {
     /// With [`FieldListing::WithMapKeys`], a telemetry table's MAP columns list the tenant's keys
     /// in committed Iceberg data within the discovery window that ends at the end of the minute
     /// holding `now`; keys present only in the WAL are not listed. Exact-name tables and
-    /// [`FieldListing::ColumnsOnly`] list no MAP keys and enumerate nothing. The enumeration is
-    /// the one read that does not go through the tenant-scoped catalog: it prunes to the tenant by
-    /// its identity partition.
+    /// [`FieldListing::ColumnsOnly`] list no MAP keys and enumerate nothing. The enumeration does
+    /// not go through the tenant-scoped catalog: it prunes to the tenant by its identity partition.
     ///
     /// # Errors
     ///
@@ -211,6 +215,33 @@ impl TenantSession {
         match entry.profile() {
             Profile::Native => list_native_fields(&arrow_schema, map_keys),
         }
+    }
+
+    /// The tenant's committed footprint in `entry`'s table; `None` for a view, which has no
+    /// storage of its own. Like MAP-key enumeration, it does not go through the tenant-scoped
+    /// catalog: [`count_tenant_footprint`] prunes to the tenant by its identity partition (a
+    /// global table is counted whole).
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the table cannot be loaded, or when [`count_tenant_footprint`] refuses
+    /// to count it.
+    pub(crate) async fn count_footprint(&self, entry: &IndexEntry) -> Result<Option<TenantFootprint>, OpenSearchError> {
+        let table_type = self
+            .namespace
+            .table_type(entry.table())
+            .await
+            .map_err(|error| OpenSearchError::internal(error.to_string()))?;
+        if table_type == Some(TableType::View) {
+            return Ok(None);
+        }
+        let table = self
+            .engine
+            .catalog()
+            .load_table(&icegate_table_ident(entry.table()))
+            .await
+            .map_err(QueryError::from)?;
+        Ok(Some(count_tenant_footprint(&table, &self.tenant).await?))
     }
 
     /// The tenant's MAP keys in `table`: from the cache when the table's current snapshot and the
@@ -303,7 +334,7 @@ mod tests {
     use crate::infra::metrics::test_support::{build_meter_provider, find_counter_total};
     use crate::opensearch::error::render_envelope;
     use crate::opensearch::extract::ExpandWildcards;
-    use crate::test_support::{LogAttributesRow, build_logs_warehouse, commit_log_attributes_rows};
+    use crate::test_support::{LogAttributesRow, build_logs_warehouse, build_tenant, commit_log_attributes_rows};
 
     const TENANT_A: &str = "tenant-a";
     const TENANT_B: &str = "tenant-b";
@@ -314,10 +345,6 @@ mod tests {
 
     fn parse_instant(text: &str) -> DateTime<Utc> {
         text.parse().expect("an RFC 3339 instant")
-    }
-
-    fn build_tenant(id: &str) -> TenantId {
-        TenantId::new(id).expect("a valid tenant")
     }
 
     /// A catalog over `engine` with a discovery window of `field_discovery_window`, counting its

@@ -1,6 +1,7 @@
 //! OpenSearch-compatible API integration tests. Every request is a literal in the test, and every
 //! expected result is stated there.
 //!
+//! - `cat`: `_cat/indices` and `_cat/plugins`
 //! - `cluster`: the cluster-level endpoints
 //! - `data`: table rows with explicit values, written through the production writer
 //! - `fields`: `_field_caps`, `_mapping` and `_mapping/field`

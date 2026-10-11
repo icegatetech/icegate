@@ -110,6 +110,11 @@ impl IndexSet {
         Self { entries }
     }
 
+    /// Every entry, in name order.
+    pub(crate) fn entries(&self) -> &[IndexEntry] {
+        &self.entries
+    }
+
     /// The entries `expression` selects under `options`, in name order, each at most once.
     ///
     /// # Errors

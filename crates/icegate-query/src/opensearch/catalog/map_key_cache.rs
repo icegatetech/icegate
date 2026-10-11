@@ -93,10 +93,7 @@ mod tests {
     use icegate_common::{LOGS_TABLE, SPANS_TABLE};
 
     use super::*;
-
-    fn build_tenant(id: &str) -> TenantId {
-        TenantId::new(id).expect("a valid tenant")
-    }
+    use crate::test_support::build_tenant;
 
     const fn build_version(snapshot_id: i64, window_end_secs: i64) -> MapKeysVersion {
         MapKeysVersion {

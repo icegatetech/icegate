@@ -2903,8 +2903,9 @@ mod tests {
         }
     }
 
-    /// Field discovery prunes MAP keys to a tenant from partition data alone. That is exact only
-    /// while every table carrying `tenant_id` identity-partitions it.
+    /// Field discovery prunes MAP keys to a tenant from partition data alone, and `_cat/indices`
+    /// counts a tenant's rows and bytes from the data files planned for its partition. Both are
+    /// exact only while every table carrying `tenant_id` identity-partitions it.
     #[test]
     fn every_table_carrying_tenant_id_identity_partitions_it() {
         type SpecBuilder = fn(&Schema) -> Result<PartitionSpec>;
