@@ -15,6 +15,7 @@ use crate::{
     engine::QueryEngine,
     error::QueryError,
     infra::{metrics::QueryMetrics, runtime::QueryRuntime},
+    opensearch::SystemObjectStore,
 };
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
@@ -147,8 +148,22 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
         tenant_resolver,
     };
 
+    // Built before any listener starts, so a location the process cannot address stops startup
+    // here instead of at the first saved-object write.
+    let system_store = if config.opensearch.enabled {
+        Some(crate::opensearch::build_system_object_store(&config)?)
+    } else {
+        None
+    };
+
     // Spawn one task per enabled server (metrics + each query API).
-    let handles = spawn_servers(&config, &runtime, metrics_runtime.as_ref(), &listener_runtime);
+    let handles = spawn_servers(
+        &config,
+        &runtime,
+        metrics_runtime.as_ref(),
+        &listener_runtime,
+        system_store,
+    );
 
     tracing::info!("All enabled query servers started");
     tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
@@ -185,7 +200,8 @@ type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error
 /// type so the caller can treat every handle uniformly. Never returns an empty
 /// vector: the operational listener is spawned whatever the configuration says,
 /// and [`QueryConfig::validate`] has already refused a document enabling no
-/// query protocol.
+/// query protocol. `system_store` is `Some` exactly when the `OpenSearch`
+/// listener is enabled.
 ///
 /// Every server binds with a clone of `listener_runtime`, so they stop on its
 /// token and, when it carries a certificate, all present that one.
@@ -194,6 +210,7 @@ fn spawn_servers(
     runtime: &QueryRuntime,
     metrics_runtime: Option<&Arc<MetricsRuntime>>,
     listener_runtime: &ListenerRuntime,
+    system_store: Option<SystemObjectStore>,
 ) -> Vec<ServerHandle> {
     let mut handles = Vec::new();
 
@@ -249,12 +266,12 @@ fn spawn_servers(
         }));
     }
 
-    if config.opensearch.enabled {
+    if let Some(system_store) = system_store {
         let runtime = runtime.clone();
         let opensearch_config = config.opensearch.clone();
         let listener_runtime = listener_runtime.clone();
         handles.push(tokio::spawn(async move {
-            crate::opensearch::run(runtime, opensearch_config, listener_runtime).await
+            crate::opensearch::run(runtime, opensearch_config, system_store, listener_runtime).await
         }));
     }
 
@@ -329,6 +346,7 @@ mod tests {
         DEFAULT_TLS_RELOAD_INTERVAL_SECS, HEALTH_PATH, OperationalConfig, ServerCertificate, TENANT_ID_HEADER,
         TenantResolver, TlsConfig,
     };
+    use object_store::memory::InMemory;
     use rcgen::{CertificateParams, KeyPair};
     use reqwest::{Client, StatusCode, Version};
     use tempfile::TempDir;
@@ -337,7 +355,7 @@ mod tests {
     use super::*;
     use crate::{
         flight_sql::FlightSqlConfig, loki::LokiConfig, opensearch::OpenSearchConfig, prometheus::PrometheusConfig,
-        tempo::TempoConfig, test_support::build_stalling_engine,
+        tempo::TempoConfig, test_support::build_logs_warehouse,
     };
 
     /// The upper bound of every wait, so a hang fails the test instead of the run.
@@ -455,8 +473,10 @@ mod tests {
             },
             ..QueryConfig::default()
         };
+        // A catalog that answers: the `OpenSearch` listener reads it before it binds.
+        let warehouse = build_logs_warehouse().await;
         let runtime = QueryRuntime {
-            engine: build_stalling_engine(1),
+            engine: Arc::clone(&warehouse.engine),
             metrics: Arc::new(QueryMetrics::new_disabled()),
             pressure: MemoryPressure::inert(),
             tenant_resolver: TenantResolver::Multi,
@@ -464,7 +484,9 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let listener_runtime = ListenerRuntime::new(cancel_token.clone(), Some(Arc::new(server_certificate)));
 
-        let handles = spawn_servers(&config, &runtime, None, &listener_runtime);
+        let system_store = SystemObjectStore::new(Arc::new(InMemory::new()), "s3://tls-test/opensearch-system")
+            .expect("a system store over memory");
+        let handles = spawn_servers(&config, &runtime, None, &listener_runtime, Some(system_store));
 
         // Five query servers and the operational one: the fixture reaches every listener.
         assert_eq!(handles.len(), 6);

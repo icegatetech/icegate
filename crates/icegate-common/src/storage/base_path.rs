@@ -13,8 +13,13 @@ const S3_SCHEMES: [&str; 2] = ["s3://", "s3a://"];
 /// URI scheme served from the local filesystem; a leading `/` names one too.
 const LOCAL_SCHEME: &str = "file://";
 
-/// Strip the S3 scheme from `base_path`, leaving `bucket/prefix`.
-pub(super) fn strip_s3_scheme(base_path: &str) -> Option<&str> {
+/// `base_path` without its `s3://` or `s3a://` scheme, leaving `bucket/prefix`; `None` for any
+/// other path.
+///
+/// These are the schemes a base path such as `queue.common.base_path` resolves to S3, so a
+/// component accepting an S3 location of its own recognises exactly the same ones.
+#[must_use]
+pub fn strip_s3_scheme(base_path: &str) -> Option<&str> {
     S3_SCHEMES.iter().find_map(|scheme| base_path.strip_prefix(scheme))
 }
 

@@ -21,6 +21,9 @@ mod node;
 mod routes;
 mod server;
 mod state;
+pub(crate) mod system_index;
 
-pub use config::OpenSearchConfig;
+pub use config::{OpenSearchConfig, SystemIndicesConfig};
 pub use server::{run, run_with_port_tx};
+pub use system_index::{SystemObjectStore, build_system_object_store};
+pub(crate) use system_index::{refuse_overlapping_locations, resolve_system_indices_location};

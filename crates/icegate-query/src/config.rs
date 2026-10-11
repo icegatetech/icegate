@@ -156,6 +156,13 @@ impl QueryConfig {
             &self.metrics,
         ])?;
 
+        // The listener's startup refuses table locations it lists through the catalog; only this
+        // document knows the WAL base path, so that half of the overlap rule is checked here.
+        if self.opensearch.enabled {
+            let location = crate::opensearch::resolve_system_indices_location(self)?;
+            crate::opensearch::refuse_overlapping_locations(&location, &[self.queue.common.base_path.as_str()])?;
+        }
+
         Ok(())
     }
 }
@@ -246,7 +253,10 @@ mod tests {
             ("prometheus", |config| config.prometheus.enabled = true),
             ("tempo", |config| config.tempo.enabled = true),
             ("flight_sql", |config| config.flight_sql.enabled = true),
-            ("opensearch", |config| config.opensearch.enabled = true),
+            ("opensearch", |config| {
+                config.opensearch.enabled = true;
+                config.opensearch.system_indices.location = Some("s3://warehouse/opensearch-system".to_string());
+            }),
         ];
 
         for (protocol, enable) in cases {
@@ -267,9 +277,52 @@ mod tests {
         let mut config = build_config_without_protocols();
         config.loki.enabled = true;
         config.opensearch.enabled = true;
+        // A resolvable location, so the port conflict is the only refusal left.
+        config.opensearch.system_indices.location = Some("s3://warehouse/opensearch-system".to_string());
         config.validate().expect("opensearch on its own port validates");
         config.opensearch.port = config.loki.port;
 
         assert!(matches!(config.validate(), Err(QueryError::Config(_))));
+    }
+
+    /// The listener's store needs the conditional writes of an S3 location, so an enabled listener
+    /// over memory or filesystem storage names its own location or the document is refused.
+    #[test]
+    fn opensearch_on_a_non_s3_storage_without_a_system_location_is_rejected() {
+        let mut config = build_config_without_protocols();
+        config.opensearch.enabled = true;
+        config.opensearch.system_indices.location = Some("s3://warehouse/opensearch-system".to_string());
+        config.validate().expect("memory storage with a configured location validates");
+        config.opensearch.system_indices.location = None;
+
+        assert!(matches!(config.validate(), Err(QueryError::Config(_))));
+    }
+
+    /// The WAL cleaner deletes what it finds under the queue's base path, so a system location
+    /// inside it would lose snapshot objects; one containing it would list WAL segments.
+    #[test]
+    fn a_system_indices_location_overlapping_the_wal_base_path_is_rejected() {
+        let mut config = build_config_without_protocols();
+        config.opensearch.enabled = true;
+        config.queue.common.base_path = "s3://queue/".to_string();
+        config.storage.backend = icegate_common::StorageBackend::S3(icegate_common::S3Config {
+            bucket: "warehouse".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+        });
+        config
+            .validate()
+            .expect("the default location s3://warehouse/opensearch-system is beside the WAL");
+
+        for location in ["s3://queue", "s3://queue/opensearch-system", "s3a://queue/"] {
+            config.opensearch.system_indices.location = Some(location.to_string());
+
+            assert!(
+                matches!(config.validate(), Err(QueryError::Config(message)) if message.contains("overlaps `s3://queue/`")),
+                "{location} overlaps the WAL base path"
+            );
+        }
     }
 }

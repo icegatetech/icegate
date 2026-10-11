@@ -20,7 +20,8 @@ use icegate_common::{
 use icegate_query::engine::{QueryEngine, QueryEngineConfig};
 use icegate_query::infra::metrics::QueryMetrics;
 use icegate_query::infra::runtime::QueryRuntime;
-use icegate_query::opensearch::OpenSearchConfig;
+use icegate_query::opensearch::{OpenSearchConfig, SystemObjectStore};
+use object_store::memory::InMemory;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -87,6 +88,9 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 /// Bound on every request a test sends, so a listener that stops answering fails the test
 /// instead of hanging it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Location of the in-memory system-index store a harness listener uses unless the test passes
+/// its own store.
+const IN_MEMORY_SYSTEM_LOCATION: &str = "s3://opensearch-test/opensearch-system";
 
 /// A running `OpenSearch` listener over a temporary warehouse.
 pub struct TestServer {
@@ -108,8 +112,9 @@ impl TestServer {
         Self::start_with_config(OpenSearchConfig::default()).await
     }
 
-    /// Start with `config`, whose `enabled`, `host` and `port` are overridden for the test. A
-    /// listener that does not start fails the test here, with the step that failed.
+    /// Start with `config`, whose `enabled`, `host` and `port` are overridden for the test, and an
+    /// in-memory system-index store. A listener that does not start fails the test here, with the
+    /// step that failed.
     pub async fn start_with_config(config: OpenSearchConfig) -> (Self, Arc<dyn Catalog>) {
         match Self::try_start_with_config(config).await {
             Ok(started) => started,
@@ -117,9 +122,33 @@ impl TestServer {
         }
     }
 
-    /// [`TestServer::start_with_config`] with its failure returned. A listener already spawned
-    /// when a later step fails is stopped before the error returns.
+    /// Start with `config`, whose `enabled`, `host` and `port` are overridden for the test, and
+    /// with the system indices in `system_store`. A listener that does not start fails the test
+    /// here, with the step that failed.
+    pub async fn start_with_system_store(
+        config: OpenSearchConfig,
+        system_store: SystemObjectStore,
+    ) -> (Self, Arc<dyn Catalog>) {
+        match Self::try_start_with_system_store(config, system_store).await {
+            Ok(started) => started,
+            Err(error) => panic!("the OpenSearch listener did not start: {error}"),
+        }
+    }
+
+    /// [`TestServer::start_with_config`] with its failure returned.
     async fn try_start_with_config(config: OpenSearchConfig) -> Result<(Self, Arc<dyn Catalog>), SetupError> {
+        let system_store = build_in_memory_system_object_store()?;
+        Self::try_start_with_system_store(config, system_store).await
+    }
+
+    /// [`TestServer::start_with_system_store`] with its failure returned. A listener already
+    /// spawned when a later step fails is stopped before the error returns. One whose startup
+    /// checks fail reports no port, and the drain re-raises its own failure, which names the
+    /// check.
+    async fn try_start_with_system_store(
+        config: OpenSearchConfig,
+        system_store: SystemObjectStore,
+    ) -> Result<(Self, Arc<dyn Catalog>), SetupError> {
         let (runtime, catalog, warehouse) = build_runtime().await?;
         // Built before the listener is spawned, so its failure leaves no task running.
         let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()?;
@@ -136,8 +165,14 @@ impl TestServer {
         let (port_tx, port_rx) = oneshot::channel::<u16>();
         let mut server_handle = tokio::spawn(async move {
             let listener_runtime = ListenerRuntime::plaintext(server_token);
-            let outcome =
-                icegate_query::opensearch::run_with_port_tx(runtime, config, listener_runtime, Some(port_tx)).await;
+            let outcome = icegate_query::opensearch::run_with_port_tx(
+                runtime,
+                config,
+                system_store,
+                listener_runtime,
+                Some(port_tx),
+            )
+            .await;
             // The task's panic is how a listener failure reaches the test: the drain re-raises it.
             if let Err(error) = outcome {
                 panic!("the OpenSearch listener failed: {error}");
@@ -239,6 +274,16 @@ pub async fn build_runtime() -> Result<(QueryRuntime, Arc<dyn Catalog>, tempfile
         tenant_resolver: TenantResolver::Multi,
     };
     Ok((runtime, catalog, warehouse))
+}
+
+/// An in-memory system-index store that passes the listener's startup checks: `InMemory`
+/// supports every conditional operation, and its location overlaps no table of the temporary
+/// warehouse.
+pub fn build_in_memory_system_object_store() -> Result<SystemObjectStore, SetupError> {
+    Ok(SystemObjectStore::new(
+        Arc::new(InMemory::new()),
+        IN_MEMORY_SYSTEM_LOCATION,
+    )?)
 }
 
 /// Whether the listener at `base_url` answers HTTP within the poll budget. Any answer counts:

@@ -17,6 +17,7 @@ use icegate_common::{
     schema::{COL_BODY, COL_SEVERITY_TEXT, COL_TIMESTAMP},
 };
 use icegate_query::QueryConfig;
+use icegate_query::opensearch::build_system_object_store;
 use serde::Deserialize;
 
 /// The stand's query document.
@@ -272,4 +273,16 @@ fn every_stand_opensearch_datasource_states_the_version_the_stand_reports() {
             datasource.name
         );
     }
+}
+
+/// The stand stores its tables in the `warehouse` bucket and sets no system location, so its
+/// saved objects live beside the tables under the default prefix. Building the client sends no
+/// request, so this needs no running store.
+#[test]
+fn the_stand_query_document_resolves_the_system_location_to_the_warehouse_bucket() {
+    let config = QueryConfig::from_file(STAND_QUERY_DOCUMENT).expect("the stand query document must load and validate");
+
+    let system_store = build_system_object_store(&config).expect("the stand's client builds");
+
+    assert_eq!(system_store.location(), "s3://warehouse/opensearch-system");
 }

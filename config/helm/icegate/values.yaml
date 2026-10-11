@@ -280,6 +280,16 @@ query:
     maxRequestBodyBytes: 33554432
     # -- How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys.
     fieldDiscoveryWindowSecs: 86400
+    ## Per-tenant store of the dot-prefixed system indices (saved objects).
+    systemIndices:
+      # -- s3:// or s3a:// URL the store writes under. Empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs). It must not overlap a table location or the WAL base path; the listener refuses to start otherwise.
+      location: ""
+      # -- Longest scroll a system-index search may open, in seconds. A superseded snapshot object is kept this long plus the query deadline.
+      maxScrollLifetimeSecs: 900
+      # -- Bound of the decoded-snapshot cache, in bytes; at least maxSnapshotBytes.
+      cacheMaxBytes: 268435456
+      # -- Largest decoded snapshot one tenant may hold, in bytes. A write past it is answered 413 and changes nothing.
+      maxSnapshotBytes: 134217728
 
   ## Prometheus metrics endpoint
   metrics:

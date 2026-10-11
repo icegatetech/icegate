@@ -91,6 +91,13 @@ data:
       cluster_name: {{ .Values.query.opensearch.clusterName | quote }}
       max_request_body_bytes: {{ .Values.query.opensearch.maxRequestBodyBytes | int }}
       field_discovery_window_secs: {{ .Values.query.opensearch.fieldDiscoveryWindowSecs | int }}
+      system_indices:
+        {{- with .Values.query.opensearch.systemIndices.location }}
+        location: {{ . | quote }}
+        {{- end }}
+        max_scroll_lifetime_secs: {{ .Values.query.opensearch.systemIndices.maxScrollLifetimeSecs | int }}
+        cache_max_bytes: {{ .Values.query.opensearch.systemIndices.cacheMaxBytes | int }}
+        max_snapshot_bytes: {{ .Values.query.opensearch.systemIndices.maxSnapshotBytes | int }}
     metrics:
       enabled: {{ .Values.query.metrics.enabled }}
       host: "0.0.0.0"

@@ -134,7 +134,18 @@
             "version": { "type": "string", "description": "Version reported by GET / and /_nodes: canonical MAJOR.MINOR.PATCH, major 3." },
             "clusterName": { "type": "string", "minLength": 1, "description": "Cluster name reported by GET /, /_nodes and /_cluster/health." },
             "maxRequestBodyBytes": { "type": "integer", "minimum": 1, "description": "Largest request body accepted, in bytes." },
-            "fieldDiscoveryWindowSecs": { "type": "integer", "minimum": 1, "description": "Field-discovery window, in seconds." }
+            "fieldDiscoveryWindowSecs": { "type": "integer", "minimum": 1, "description": "Field-discovery window, in seconds." },
+            "systemIndices": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "description": "Per-tenant store of the dot-prefixed system indices.",
+              "properties": {
+                "location": { "type": "string", "pattern": "^$|^s3a?://[^/]+", "description": "s3:// or s3a:// URL; empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs)." },
+                "maxScrollLifetimeSecs": { "type": "integer", "minimum": 1, "description": "Longest system-index scroll, in seconds." },
+                "cacheMaxBytes": { "type": "integer", "minimum": 1, "description": "Bound of the decoded-snapshot cache, in bytes." },
+                "maxSnapshotBytes": { "type": "integer", "minimum": 1, "description": "Largest decoded snapshot per tenant, in bytes." }
+              }
+            }
           }
         },
         "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Operational listener: /health always, /metrics when enabled." },

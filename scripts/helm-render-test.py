@@ -15,6 +15,14 @@ binary on its code default with no error anywhere. The default render cannot sho
 it, because the chart default and the code default are the same value, so such a
 section is rendered here with every value moved off its default.
 
+One `opensearch` value has the opposite failure. An empty `systemIndices.location`
+asks the binary to resolve its default location, which the binary reads only from
+an absent key: rendered as an empty string, it is a location the query
+configuration refuses to load, so every release on the chart defaults that
+enables the listener would fail to start. The listener is off by default, so the
+chart defaults are rendered here with it enabled, and the section is read for the
+key it must not carry.
+
 A listener port fails quietly as well: a containerPort or Service port spelled as
 a literal renders the default exactly like the value does, and a Service whose
 render condition omits the listener publishes nothing for it. The OpenSearch
@@ -357,8 +365,8 @@ LONG_FULLNAME_CASES = (  # (description, global.fullnameOverride, expected migra
 # query.yaml it must render into, under the names the binary reads. Both are
 # literals, so the check is not a second reading of the template. The values go in
 # through `--set-json`, which reads a number as a float the way a values file does,
-# so the body limit, being above a million, also pins the `| int` that keeps it out
-# of the exponent form the binary refuses.
+# so the body limit and the two system-index byte bounds, all above a million, also
+# pin the `| int` that keeps each out of the exponent form the binary refuses.
 OPENSEARCH_VALUES = {
     "enabled": True,
     "port": 9201,
@@ -366,6 +374,12 @@ OPENSEARCH_VALUES = {
     "clusterName": "c1",
     "maxRequestBodyBytes": 1048577,
     "fieldDiscoveryWindowSecs": 3601,
+    "systemIndices": {
+        "location": "s3://saved-objects/tenants",
+        "maxScrollLifetimeSecs": 901,
+        "cacheMaxBytes": 268435457,
+        "maxSnapshotBytes": 134217729,
+    },
 }
 OPENSEARCH_SECTION = {
     "enabled": True,
@@ -375,6 +389,20 @@ OPENSEARCH_SECTION = {
     "cluster_name": "c1",
     "max_request_body_bytes": 1048577,
     "field_discovery_window_secs": 3601,
+    "system_indices": {
+        "location": "s3://saved-objects/tenants",
+        "max_scroll_lifetime_secs": 901,
+        "cache_max_bytes": 268435457,
+        "max_snapshot_bytes": 134217729,
+    },
+}
+
+# The system_indices section an enabled release renders on the chart defaults: the
+# three bounds, and no location, so the binary resolves the default one.
+SYSTEM_INDICES_DEFAULT_SECTION = {
+    "max_scroll_lifetime_secs": 900,
+    "cache_max_bytes": 268435456,
+    "max_snapshot_bytes": 134217728,
 }
 
 
@@ -536,9 +564,13 @@ def pair_values_with_types(mapping: dict) -> dict:
 
     Python holds `1048577.0 == 1048577` and `True == 1`, while the binary refuses a
     float where it reads an integer, so a plain comparison would pass a render the
-    binary cannot load.
+    binary cannot load. A nested mapping is paired the same way, recursively, so a
+    float inside a nested section is caught too.
     """
-    return {key: (type(value), value) for key, value in mapping.items()}
+    return {
+        key: pair_values_with_types(value) if isinstance(value, dict) else (type(value), value)
+        for key, value in mapping.items()
+    }
 
 
 def check_opensearch_section() -> None:
@@ -553,6 +585,20 @@ def check_opensearch_section() -> None:
         fail(f"query.opensearch must render into query.yaml as {OPENSEARCH_SECTION}, got {section}")
     else:
         ok("every query.opensearch value reaches the opensearch section of query.yaml under the name the binary reads")
+
+
+def check_system_indices_default_location() -> None:
+    """An empty `query.opensearch.systemIndices.location` renders no `location` key at all."""
+    rendered = render_chart("--set", "query.opensearch.enabled=true", show_only="templates/configmap-query.yaml")
+    opensearch = read_component_config(rendered, "query.yaml").get("opensearch") or {}
+    section = opensearch.get("system_indices") or {}
+    if pair_values_with_types(section) != pair_values_with_types(SYSTEM_INDICES_DEFAULT_SECTION):
+        fail(
+            f"an enabled release on the chart defaults must render system_indices as "
+            f"{SYSTEM_INDICES_DEFAULT_SECTION}, with no location, got {section}"
+        )
+    else:
+        ok("an empty query.opensearch.systemIndices.location renders no location, so the binary resolves its default")
 
 
 def check_operational_host() -> None:
@@ -1608,6 +1654,7 @@ for component_name in COMPONENTS:
     check_probe_target(component_name)
 
 check_opensearch_section()
+check_system_indices_default_location()
 check_operational_host()
 check_otlp_port_names()
 check_otlp_host_guards()

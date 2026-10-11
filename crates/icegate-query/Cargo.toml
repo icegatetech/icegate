@@ -100,6 +100,8 @@ chrono = { workspace = true }
 
 # Utilities
 itoa = { workspace = true }
+# Fresh object names: the startup probe's key and each snapshot object's name.
+uuid = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [[bench]]

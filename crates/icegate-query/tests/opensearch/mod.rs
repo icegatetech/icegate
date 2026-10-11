@@ -6,3 +6,4 @@ mod harness;
 mod indices;
 mod listener;
 mod rustfs_conditional;
+mod system_store_rustfs;

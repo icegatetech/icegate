@@ -176,7 +176,7 @@ pub use retrier::{Retrier, RetrierConfig, RetryError};
 pub use storage::{
     IceGateStorage, IceGateStorageFactory, ObjectStoreWithPath, OperatorRegistry, PrefetchConfig, S3Config,
     StorageBackend, StorageCache, StorageConfig, StorageLayersConfig, build_storage_cache, is_persistent_base_path,
-    is_retryable_error_source, is_retryable_object_store_error, register_foyer_metrics,
+    is_retryable_error_source, is_retryable_object_store_error, register_foyer_metrics, strip_s3_scheme,
 };
 pub use tenant::{
     DEFAULT_TENANT_ID, TENANT_ID_HEADER, TenantHeader, TenantId, TenantPolicy, TenantRejection,

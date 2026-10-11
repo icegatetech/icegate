@@ -5,6 +5,7 @@ use std::fmt;
 use icegate_common::ServerConfig;
 use serde::{Deserialize, Serialize};
 
+use super::system_index::parse_s3_location;
 use crate::error::{QueryError, Result};
 
 /// Default bind address.
@@ -21,6 +22,13 @@ const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_FIELD_DISCOVERY_WINDOW_SECS: u64 = 24 * 60 * 60;
 /// The only major version IceGate emulates.
 const EMULATED_MAJOR_VERSION: u32 = 3;
+/// Default longest scroll a system-index search may open, in seconds.
+const DEFAULT_MAX_SCROLL_LIFETIME_SECS: u64 = 900;
+/// Default bound of one tenant's decoded snapshot: four `_bulk` bodies at the default
+/// [`DEFAULT_MAX_REQUEST_BODY_BYTES`] fit in it.
+const DEFAULT_MAX_SNAPSHOT_BYTES: usize = 4 * DEFAULT_MAX_REQUEST_BODY_BYTES;
+/// Default bound of the decoded-snapshot cache: two snapshots at the default bound.
+const DEFAULT_SYSTEM_CACHE_MAX_BYTES: usize = 2 * DEFAULT_MAX_SNAPSHOT_BYTES;
 
 /// The `OpenSearch`-compatible listener.
 ///
@@ -49,6 +57,8 @@ pub struct OpenSearchConfig {
     /// attribute-map keys. A key seen only before the window, or only in the WAL, is not listed;
     /// a path naming it still resolves.
     pub field_discovery_window_secs: u64,
+    /// The per-tenant store of dot-prefixed system indices.
+    pub system_indices: SystemIndicesConfig,
 }
 
 impl OpenSearchConfig {
@@ -59,7 +69,8 @@ impl OpenSearchConfig {
     ///
     /// Returns [`QueryError::Config`] for a blank host or cluster name, a zero
     /// `max_request_body_bytes` or `field_discovery_window_secs`, or a
-    /// [`version`](Self::version) outside its documented form.
+    /// [`version`](Self::version) outside its documented form, and every error of
+    /// [`SystemIndicesConfig::validate`].
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -80,7 +91,8 @@ impl OpenSearchConfig {
                 "OpenSearch field_discovery_window_secs must be greater than zero".into(),
             ));
         }
-        EmulatedVersion::parse(&self.version).map(|_| ())
+        EmulatedVersion::parse(&self.version)?;
+        self.system_indices.validate()
     }
 }
 
@@ -94,6 +106,7 @@ impl Default for OpenSearchConfig {
             cluster_name: DEFAULT_CLUSTER_NAME.to_string(),
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             field_discovery_window_secs: DEFAULT_FIELD_DISCOVERY_WINDOW_SECS,
+            system_indices: SystemIndicesConfig::default(),
         }
     }
 }
@@ -109,6 +122,81 @@ impl ServerConfig for OpenSearchConfig {
 
     fn port(&self) -> u16 {
         self.port
+    }
+}
+
+/// Where and within which bounds the per-tenant system-index store keeps saved objects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SystemIndicesConfig {
+    /// `s3://` or `s3a://` URL the store writes under. `None` resolves to
+    /// [`DEFAULT_LOCATION_PREFIX`](Self::DEFAULT_LOCATION_PREFIX) under the storage bucket (the
+    /// location [`build_system_object_store`](crate::opensearch::build_system_object_store)
+    /// resolves and [`SystemObjectStore::location`](crate::opensearch::SystemObjectStore::location)
+    /// reports), and is an error when the storage backend is not S3. It must not overlap a table
+    /// location or the WAL base path.
+    pub location: Option<String>,
+    /// Longest `scroll=` a system-index search may open, in seconds. Garbage collection keeps a
+    /// superseded snapshot object this long plus the query deadline after its successor was
+    /// written, so a scroll never loses the snapshot it reads.
+    pub max_scroll_lifetime_secs: u64,
+    /// Bound of the decoded-snapshot cache, in bytes; at least `max_snapshot_bytes`.
+    pub cache_max_bytes: usize,
+    /// Largest decoded (uncompressed JSON) snapshot one tenant may hold, in bytes. A write that
+    /// would exceed it is refused with `413` and changes nothing.
+    pub max_snapshot_bytes: usize,
+}
+
+impl SystemIndicesConfig {
+    /// The key prefix, under the storage bucket, that a `None` [`location`](Self::location)
+    /// resolves to.
+    pub const DEFAULT_LOCATION_PREFIX: &str = "opensearch-system";
+
+    /// Validate the bounds and the form of the location.
+    ///
+    /// Whether the location overlaps another owner's objects is checked where each input is
+    /// known: `QueryConfig::validate` checks the WAL base path, and the listener's startup checks
+    /// the table locations it lists through the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError::Config`] for a zero bound, a cache smaller than one snapshot, or a
+    /// location that is not an `s3://` or `s3a://` URL naming a bucket.
+    pub fn validate(&self) -> Result<()> {
+        let zero_bound = [
+            ("max_scroll_lifetime_secs", self.max_scroll_lifetime_secs == 0),
+            ("cache_max_bytes", self.cache_max_bytes == 0),
+            ("max_snapshot_bytes", self.max_snapshot_bytes == 0),
+        ]
+        .into_iter()
+        .find_map(|(key, is_zero)| is_zero.then_some(key));
+        if let Some(key) = zero_bound {
+            return Err(QueryError::Config(format!(
+                "opensearch.system_indices.{key} must be greater than zero"
+            )));
+        }
+        if self.cache_max_bytes < self.max_snapshot_bytes {
+            return Err(QueryError::Config(format!(
+                "opensearch.system_indices.cache_max_bytes ({}) must be at least max_snapshot_bytes ({}): \
+                 the cache holds whole decoded snapshots",
+                self.cache_max_bytes, self.max_snapshot_bytes
+            )));
+        }
+        if let Some(location) = &self.location {
+            parse_s3_location(location)?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for SystemIndicesConfig {
+    fn default() -> Self {
+        Self {
+            location: None,
+            max_scroll_lifetime_secs: DEFAULT_MAX_SCROLL_LIFETIME_SECS,
+            cache_max_bytes: DEFAULT_SYSTEM_CACHE_MAX_BYTES,
+            max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
+        }
     }
 }
 
@@ -309,6 +397,12 @@ mod tests {
             "cluster_name": "c1",
             "max_request_body_bytes": 1_048_577,
             "field_discovery_window_secs": 3601,
+            "system_indices": {
+                "location": "s3://saved-objects/tenants",
+                "max_scroll_lifetime_secs": 901,
+                "cache_max_bytes": 268_435_457,
+                "max_snapshot_bytes": 134_217_729,
+            },
         }))
         .expect("a section naming every key deserializes");
 
@@ -319,6 +413,13 @@ mod tests {
         assert_eq!(config.cluster_name, "c1");
         assert_eq!(config.max_request_body_bytes, 1_048_577);
         assert_eq!(config.field_discovery_window_secs, 3601);
+        assert_eq!(
+            config.system_indices.location.as_deref(),
+            Some("s3://saved-objects/tenants")
+        );
+        assert_eq!(config.system_indices.max_scroll_lifetime_secs, 901);
+        assert_eq!(config.system_indices.cache_max_bytes, 268_435_457);
+        assert_eq!(config.system_indices.max_snapshot_bytes, 134_217_729);
     }
 
     #[test]
@@ -333,5 +434,129 @@ mod tests {
         assert_eq!(config.cluster_name, "icegate");
         assert_eq!(config.max_request_body_bytes, 33_554_432);
         assert_eq!(config.field_discovery_window_secs, 86_400);
+        assert_eq!(config.system_indices.location, None);
+        assert_eq!(config.system_indices.max_scroll_lifetime_secs, 900);
+        assert_eq!(config.system_indices.cache_max_bytes, 268_435_456);
+        assert_eq!(config.system_indices.max_snapshot_bytes, 134_217_728);
+    }
+
+    /// The size of one maximum saved-object import; IceGate sizes the snapshot bound for two such
+    /// imports plus one reindexed copy of both.
+    const IMPORT_BOUND_BYTES: usize = 26_214_400;
+
+    #[test]
+    fn system_indices_defaults_hold_two_maximum_imports_and_their_reindex_copy() {
+        let defaults = SystemIndicesConfig::default();
+
+        assert_eq!(defaults.location, None);
+        assert_eq!(defaults.max_scroll_lifetime_secs, 900);
+        assert_eq!(defaults.max_snapshot_bytes, 134_217_728);
+        assert_eq!(defaults.cache_max_bytes, 268_435_456);
+        assert!(defaults.max_snapshot_bytes >= 4 * IMPORT_BOUND_BYTES);
+        assert!(defaults.cache_max_bytes >= defaults.max_snapshot_bytes);
+        assert!(defaults.validate().is_ok());
+    }
+
+    /// The store keeps its objects where every replica reaches them with conditional create,
+    /// compare-and-swap and conditional GET, so only an S3 URL naming a bucket is accepted. A
+    /// leading `//` names an empty first segment, which a path parser would strip and so address
+    /// another prefix than the one the overlap rule compares.
+    #[test]
+    fn system_indices_validation_refuses_a_non_s3_location() {
+        for location in [
+            "/var/data",
+            "file:///x",
+            "memory://bucket",
+            "s3://",
+            "s3:///prefix",
+            "s3://bucket/a//b",
+            "s3://bucket//prefix",
+        ] {
+            let config = SystemIndicesConfig {
+                location: Some(location.to_string()),
+                ..SystemIndicesConfig::default()
+            };
+
+            assert!(
+                matches!(config.validate(), Err(QueryError::Config(_))),
+                "{location:?} must be refused"
+            );
+        }
+        for location in [
+            "s3://bucket",
+            "s3://bucket/opensearch-system",
+            "s3a://bucket/nested/prefix/",
+        ] {
+            let config = SystemIndicesConfig {
+                location: Some(location.to_string()),
+                ..SystemIndicesConfig::default()
+            };
+
+            assert!(config.validate().is_ok(), "{location:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn system_indices_validation_refuses_zero_limits() {
+        let cases: [(&str, fn(&mut SystemIndicesConfig)); 3] = [
+            ("max_scroll_lifetime_secs", |config| config.max_scroll_lifetime_secs = 0),
+            ("cache_max_bytes", |config| config.cache_max_bytes = 0),
+            ("max_snapshot_bytes", |config| config.max_snapshot_bytes = 0),
+        ];
+        for (key, zero) in cases {
+            let mut config = SystemIndicesConfig::default();
+            zero(&mut config);
+
+            assert!(
+                matches!(config.validate(), Err(QueryError::Config(message)) if message.contains(key)),
+                "{key}"
+            );
+        }
+    }
+
+    /// The zero refusal stops at zero: the smallest non-zero bounds are accepted.
+    #[test]
+    fn system_indices_validation_accepts_limits_of_one() {
+        let config = SystemIndicesConfig {
+            location: None,
+            max_scroll_lifetime_secs: 1,
+            cache_max_bytes: 1,
+            max_snapshot_bytes: 1,
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    /// The cache holds whole decoded snapshots, so a bound below one snapshot could never hold the
+    /// largest one; equal is the smallest accepted bound.
+    #[test]
+    fn system_indices_validation_refuses_a_cache_smaller_than_one_snapshot() {
+        let undersized_cache_config = SystemIndicesConfig {
+            cache_max_bytes: 1_000_000,
+            max_snapshot_bytes: 1_000_001,
+            ..SystemIndicesConfig::default()
+        };
+        let equal_cache_config = SystemIndicesConfig {
+            cache_max_bytes: 1_000_000,
+            max_snapshot_bytes: 1_000_000,
+            ..SystemIndicesConfig::default()
+        };
+
+        assert!(matches!(undersized_cache_config.validate(), Err(QueryError::Config(_))));
+        assert!(equal_cache_config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_enabled_section_validates_its_system_indices() {
+        let config = OpenSearchConfig {
+            enabled: true,
+            system_indices: SystemIndicesConfig {
+                max_snapshot_bytes: 0,
+                ..SystemIndicesConfig::default()
+            },
+            ..OpenSearchConfig::default()
+        };
+
+        assert!(matches!(config.validate(), Err(QueryError::Config(_))));
     }
 }

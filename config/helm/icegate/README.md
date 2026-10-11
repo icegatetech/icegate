@@ -448,6 +448,10 @@ an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 | query.opensearch.fieldDiscoveryWindowSecs | int | `86400` | How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys. |
 | query.opensearch.maxRequestBodyBytes | int | `33554432` | Largest request body the listener accepts, in bytes. It also bounds how much of a refused request's body is drained. |
 | query.opensearch.port | int | `9200` | Listener port. |
+| query.opensearch.systemIndices.cacheMaxBytes | int | `268435456` | Bound of the decoded-snapshot cache, in bytes; at least maxSnapshotBytes. |
+| query.opensearch.systemIndices.location | string | `""` | s3:// or s3a:// URL the store writes under. Empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs). It must not overlap a table location or the WAL base path; the listener refuses to start otherwise. |
+| query.opensearch.systemIndices.maxScrollLifetimeSecs | int | `900` | Longest scroll a system-index search may open, in seconds. A superseded snapshot object is kept this long plus the query deadline. |
+| query.opensearch.systemIndices.maxSnapshotBytes | int | `134217728` | Largest decoded snapshot one tenant may hold, in bytes. A write past it is answered 413 and changes nothing. |
 | query.opensearch.version | string | `"3.9.0"` | Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup. |
 | query.pdb.enabled | bool | `false` |  |
 | query.pdb.minAvailable | int | `1` |  |

@@ -26,7 +26,7 @@ use icegate_common::schema::{
 };
 use icegate_common::{
     CatalogBackend, CatalogBuilder, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, MemoryPressure,
-    MemoryPressureConfig, MemoryPressureSampler, TenantId, UsageReader, icegate_table_ident,
+    MemoryPressureConfig, MemoryPressureSampler, SPANS_TABLE, TenantId, UsageReader, icegate_table_ident,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -347,4 +347,70 @@ fn build_string_map_column<'a>(
         builder.append(true)?;
     }
     Ok(Arc::new(builder.finish()))
+}
+
+/// Build an in-memory Iceberg catalog over `memory://warehouse` with no namespace in it. Its
+/// storage keys any path string, `s3://` included, so a table created in it at an S3 location
+/// touches no object store.
+pub async fn build_catalog_without_namespace() -> Arc<dyn Catalog> {
+    CatalogBuilder::from_config(
+        &CatalogConfig {
+            backend: CatalogBackend::Memory,
+            warehouse: "memory://warehouse".to_string(),
+            properties: HashMap::new(),
+            cache: None,
+        },
+        &IoHandle::noop(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("an in-memory catalog")
+}
+
+/// Build an in-memory Iceberg catalog holding the IceGate namespace and one `logs` table created
+/// at `table_location` with its production schema, partition spec and sort order, for the checks
+/// that compare locations against the catalog's tables.
+pub async fn build_catalog_with_logs_table_at(table_location: &str) -> Arc<dyn Catalog> {
+    let catalog = build_catalog_without_namespace().await;
+    let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("the IceGate namespace");
+    let logs_schema = schema::logs_schema().expect("the logs schema");
+    let creation = TableCreation::builder()
+        .name(LOGS_TABLE.to_string())
+        .location(table_location.to_string())
+        .partition_spec(schema::logs_partition_spec(&logs_schema).expect("the logs partition spec"))
+        .sort_order(schema::logs_sort_order(&logs_schema).expect("the logs sort order"))
+        .schema(logs_schema)
+        .build();
+    catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("the logs table at the stated location");
+    catalog
+}
+
+/// Build the catalog of [`build_catalog_with_logs_table_at`] with a `spans` table beside the `logs`
+/// one, created at `spans_location` with its production schema, partition spec and sort order, for
+/// the checks that must compare against every table the catalog lists.
+pub async fn build_catalog_with_logs_and_spans_tables_at(
+    logs_location: &str,
+    spans_location: &str,
+) -> Arc<dyn Catalog> {
+    let catalog = build_catalog_with_logs_table_at(logs_location).await;
+    let spans_schema = schema::spans_schema().expect("the spans schema");
+    let creation = TableCreation::builder()
+        .name(SPANS_TABLE.to_string())
+        .location(spans_location.to_string())
+        .partition_spec(schema::spans_partition_spec(&spans_schema).expect("the spans partition spec"))
+        .sort_order(schema::spans_sort_order(&spans_schema).expect("the spans sort order"))
+        .schema(spans_schema)
+        .build();
+    catalog
+        .create_table(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), creation)
+        .await
+        .expect("the spans table at the stated location");
+    catalog
 }
