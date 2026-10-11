@@ -20,6 +20,7 @@ use icegate_common::{ShedPolicy, shed_when_pressured};
 use super::cluster::{datasources, health, info, resolve, settings};
 use super::config::OpenSearchConfig;
 use super::error::OpenSearchError;
+use super::fields;
 use super::filter_path::apply_filter_path;
 use super::state::OpenSearchState;
 use crate::infra::metrics::{PROTOCOL_OPENSEARCH, QueryMetrics, QueryRequestRecorder, QueryTenantRejectionRecorder};
@@ -62,6 +63,17 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
         )
         .route("/_resolve/index/{expression}", get(resolve::resolve_index))
         .route("/{index}/_settings/{setting}", get(settings::read_index_setting))
+        .route(
+            "/_field_caps",
+            get(fields::describe_field_capabilities).post(fields::describe_field_capabilities),
+        )
+        .route(
+            "/{index}/_field_caps",
+            get(fields::describe_field_capabilities).post(fields::describe_field_capabilities),
+        )
+        .route("/_mapping", get(fields::describe_mappings))
+        .route("/{index}/_mapping", get(fields::describe_mappings))
+        .route("/{index}/_mapping/field/{fields}", get(fields::describe_field_mappings))
         .fallback(answer_unmatched_route)
         .method_not_allowed_fallback(answer_unmatched_route)
         .layer(middleware::from_fn(apply_filter_path))

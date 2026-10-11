@@ -75,6 +75,21 @@ impl OpenSearchError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "exception", reason)
     }
 
+    /// A request body or query the parser refuses, an unsupported construct or an unknown body
+    /// key included (`400`).
+    pub(crate) fn parsing(reason: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "parsing_exception", reason)
+    }
+
+    /// The request body exceeds `opensearch.max_request_body_bytes` (`413`).
+    pub(crate) fn payload_too_large() -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "illegal_argument_exception",
+            "request body exceeds opensearch.max_request_body_bytes",
+        )
+    }
+
     /// Attach `key: value` to the error and its root cause.
     fn with_metadata(mut self, key: &str, value: impl Into<Value>) -> Self {
         self.metadata.insert(key.to_string(), value.into());

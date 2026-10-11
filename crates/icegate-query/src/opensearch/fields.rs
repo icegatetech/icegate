@@ -1,0 +1,523 @@
+//! `_field_caps`, `_mapping` and `_mapping/field`: field discovery for index patterns, field
+//! pickers and time-field checks.
+
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+
+use axum::Json;
+use axum::extract::{Extension, State};
+use futures::future::try_join_all;
+use icegate_common::TenantId;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+
+use super::catalog::{FieldType, IndexExpression, IndexField, IndexOptions, TenantSession, read_index_options};
+use super::error::OpenSearchError;
+use super::extract::{EndpointParameters, Parameters, PathParameters, RequestBody, deserialize_flag};
+use super::glob::matches_glob;
+use super::state::OpenSearchState;
+
+/// The metadata fields `_field_caps` reports beside an index's own fields, as
+/// `(name, searchable, aggregatable)`; each is typed with its own name. Exactly these three, each
+/// flagged with what IceGate serves: `_id` is searchable through `ids` queries and not
+/// aggregatable; `_index` and `_source` are neither. No other metadata field is reported, so no
+/// client is offered a capability IceGate would refuse.
+const METADATA_FIELD_CAPABILITIES: [(&str, bool, bool); 3] = [
+    ("_id", true, false),
+    ("_index", false, false),
+    ("_source", false, false),
+];
+
+/// Query parameters of `_field_caps`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FieldCapabilitiesParameters {
+    /// Comma-separated field patterns; absent means every field.
+    fields: Option<String>,
+    /// Skip a missing concrete index instead of answering `404`; absent means `404`.
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    ignore_unavailable: Option<bool>,
+    /// Answer an empty result when nothing matches instead of `404`; absent means the empty
+    /// result.
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    allow_no_indices: Option<bool>,
+    /// What a wildcard of the expression expands to; absent means open indices.
+    expand_wildcards: Option<String>,
+}
+
+impl EndpointParameters for FieldCapabilitiesParameters {
+    const IGNORED: &'static [&'static str] = &[];
+}
+
+/// Query parameters of `_mapping` and `_mapping/field`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MappingParameters {
+    /// Skip a missing concrete index instead of answering `404`; absent means `404`.
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    ignore_unavailable: Option<bool>,
+    /// Answer an empty result when nothing matches instead of `404`; absent means the empty
+    /// result.
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    allow_no_indices: Option<bool>,
+    /// What a wildcard of the expression expands to; absent means open indices.
+    expand_wildcards: Option<String>,
+}
+
+impl EndpointParameters for MappingParameters {
+    const IGNORED: &'static [&'static str] =
+        &["local", "include_defaults", "cluster_manager_timeout", "master_timeout"];
+}
+
+/// The fields of every index `expression_text` selects, in index-name order.
+async fn list_fields_per_index(
+    session: &TenantSession,
+    expression_text: &str,
+    options: IndexOptions,
+) -> Result<Vec<(String, Vec<IndexField>)>, OpenSearchError> {
+    let expression = IndexExpression::parse(expression_text)?;
+    try_join_all(
+        session
+            .indices()
+            .resolve(&expression, options)?
+            .into_iter()
+            .map(|entry| async move {
+                Ok::<_, OpenSearchError>((entry.name().to_string(), session.list_fields(entry).await?))
+            }),
+    )
+    .await
+}
+
+/// `GET|POST [/<index>]/_field_caps`. Both methods answer the same, and an absent body and `{}`
+/// are the same request.
+pub(crate) async fn describe_field_capabilities(
+    State(state): State<OpenSearchState>,
+    Extension(tenant): Extension<TenantId>,
+    index: Option<PathParameters<String>>,
+    Parameters(parameters): Parameters<FieldCapabilitiesParameters>,
+    RequestBody(body): RequestBody,
+) -> Result<Json<Value>, OpenSearchError> {
+    refuse_body_keys(&body)?;
+    let options = read_index_options(
+        parameters.ignore_unavailable,
+        parameters.allow_no_indices,
+        parameters.expand_wildcards.as_deref(),
+    )?;
+    let expression_text = index.map(|PathParameters(text)| text).unwrap_or_default();
+    let patterns: Vec<&str> = parameters.fields.as_deref().unwrap_or("*").split(',').collect();
+    let session = state.catalog.open_session(&tenant).await?;
+    let fields_by_index = list_fields_per_index(&session, &expression_text, options).await?;
+    Ok(Json(render_field_capabilities(&fields_by_index, &patterns)))
+}
+
+/// Accept an empty body or `{}`; refuse any key (such as `index_filter`), since ignoring it would
+/// answer a different question than the one asked.
+fn refuse_body_keys(body: &[u8]) -> Result<(), OpenSearchError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    let object: Map<String, Value> = serde_json::from_slice(body)
+        .map_err(|error| OpenSearchError::parsing(format!("request body is not a JSON object: {error}")))?;
+    if let Some(key) = object.keys().next() {
+        return Err(OpenSearchError::parsing(format!("request does not support [{key}]")));
+    }
+    Ok(())
+}
+
+/// Render `_field_caps` for `fields_by_index` (in index-name order), listing only the fields one
+/// of `patterns` matches, the metadata fields included.
+fn render_field_capabilities(fields_by_index: &[(String, Vec<IndexField>)], patterns: &[&str]) -> Value {
+    let is_requested = |name: &str| patterns.iter().any(|pattern| matches_glob(pattern, name));
+    let mut members_by_field: BTreeMap<&str, BTreeMap<&'static str, Vec<(&str, &IndexField)>>> = BTreeMap::new();
+    for (index, fields) in fields_by_index {
+        for field in fields.iter().filter(|field| is_requested(&field.name)) {
+            members_by_field
+                .entry(field.name.as_str())
+                .or_default()
+                .entry(field.field_type.name())
+                .or_default()
+                .push((index.as_str(), field));
+        }
+    }
+    let mut rendered_fields = Map::new();
+    for (name, members_by_type) in members_by_field {
+        let has_type_conflict = members_by_type.len() > 1;
+        let rendered_capabilities: Map<String, Value> = members_by_type
+            .into_iter()
+            .map(|(field_type, members)| {
+                (
+                    field_type.to_string(),
+                    render_capability(field_type, &members, has_type_conflict),
+                )
+            })
+            .collect();
+        rendered_fields.insert(name.to_string(), Value::Object(rendered_capabilities));
+    }
+    for (name, is_searchable, is_aggregatable) in METADATA_FIELD_CAPABILITIES {
+        if is_requested(name) {
+            rendered_fields.insert(
+                name.to_string(),
+                json!({ name: {"type": name, "searchable": is_searchable, "aggregatable": is_aggregatable} }),
+            );
+        }
+    }
+    let mut body = Map::new();
+    body.insert(
+        "indices".to_string(),
+        fields_by_index.iter().map(|(index, _)| index.as_str()).collect(),
+    );
+    body.insert("fields".to_string(), Value::Object(rendered_fields));
+    Value::Object(body)
+}
+
+/// One type's capability entry. `indices` is listed only on a type conflict; the
+/// `non_searchable_indices` / `non_aggregatable_indices` lists only when the indices disagree.
+fn render_capability(field_type: &str, members: &[(&str, &IndexField)], has_type_conflict: bool) -> Value {
+    let is_searchable = members.iter().all(|(_, field)| field.is_searchable);
+    let is_aggregatable = members.iter().all(|(_, field)| field.is_aggregatable);
+    let mut capability = json!({"type": field_type, "searchable": is_searchable, "aggregatable": is_aggregatable});
+    if has_type_conflict {
+        capability["indices"] = members.iter().map(|(index, _)| *index).collect();
+    }
+    if !is_searchable && members.iter().any(|(_, field)| field.is_searchable) {
+        capability["non_searchable_indices"] = members
+            .iter()
+            .filter(|(_, field)| !field.is_searchable)
+            .map(|(index, _)| *index)
+            .collect();
+    }
+    if !is_aggregatable && members.iter().any(|(_, field)| field.is_aggregatable) {
+        capability["non_aggregatable_indices"] = members
+            .iter()
+            .filter(|(_, field)| !field.is_aggregatable)
+            .map(|(index, _)| *index)
+            .collect();
+    }
+    capability
+}
+
+/// `GET [/<index>]/_mapping`: `{<index>: {mappings: {properties}}}` per selected index.
+pub(crate) async fn describe_mappings(
+    State(state): State<OpenSearchState>,
+    Extension(tenant): Extension<TenantId>,
+    index: Option<PathParameters<String>>,
+    Parameters(parameters): Parameters<MappingParameters>,
+) -> Result<Json<Value>, OpenSearchError> {
+    let options = read_index_options(
+        parameters.ignore_unavailable,
+        parameters.allow_no_indices,
+        parameters.expand_wildcards.as_deref(),
+    )?;
+    let expression_text = index.map(|PathParameters(text)| text).unwrap_or_default();
+    let session = state.catalog.open_session(&tenant).await?;
+    let fields_by_index = list_fields_per_index(&session, &expression_text, options).await?;
+    let body: Map<String, Value> = fields_by_index
+        .into_iter()
+        .map(|(index, fields)| {
+            let properties = Value::Object(render_properties(&fields));
+            (index, build_object("mappings", build_object("properties", properties)))
+        })
+        .collect();
+    Ok(Json(Value::Object(body)))
+}
+
+/// Mapping properties in the order of `fields`, which is the schema column order: IceGate's
+/// contract, kept on the wire because icegate-query enables `serde_json`'s `preserve_order`. A
+/// field with a parent nests under its parent's `properties` by its stored key, so a key with
+/// dots stays one property.
+fn render_properties(fields: &[IndexField]) -> Map<String, Value> {
+    let mut properties = Map::new();
+    for field in fields {
+        let mapping = json!({"type": field.field_type.name()});
+        match &field.parent {
+            Some(parent) => {
+                // The MAP column precedes its keys in schema order, so the lookup hits for every key;
+                // only a key listed without its column pays for an owned copy of the parent's name.
+                let leaf_name = read_leaf_name(field);
+                if let Some(parent_mapping) = properties.get_mut(parent.as_str()) {
+                    parent_mapping["properties"][leaf_name] = mapping;
+                } else {
+                    let mut parent_mapping = json!({"type": "object"});
+                    parent_mapping["properties"][leaf_name] = mapping;
+                    properties.insert(parent.clone(), parent_mapping);
+                }
+            }
+            None => {
+                properties.entry(field.name.clone()).or_insert(mapping);
+            }
+        }
+    }
+    properties
+}
+
+/// The name of `field` under its parent: the whole stored key of a MAP key, dots included; the
+/// field's own name when it has no parent.
+fn read_leaf_name(field: &IndexField) -> &str {
+    field
+        .parent
+        .as_deref()
+        .and_then(|parent| field.name.strip_prefix(parent))
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or(&field.name)
+}
+
+/// `{key: value}`, taking `value` as built: interpolating it into `json!` would serialize it into
+/// a copy.
+fn build_object(key: &str, value: Value) -> Value {
+    let mut object = Map::new();
+    object.insert(key.to_string(), value);
+    Value::Object(object)
+}
+
+/// `GET /<index>/_mapping/field/<fields>`, keyed by the index expression as requested.
+pub(crate) async fn describe_field_mappings(
+    State(state): State<OpenSearchState>,
+    Extension(tenant): Extension<TenantId>,
+    PathParameters((expression_text, fields_text)): PathParameters<(String, String)>,
+    Parameters(parameters): Parameters<MappingParameters>,
+) -> Result<Json<Value>, OpenSearchError> {
+    let options = read_index_options(
+        parameters.ignore_unavailable,
+        parameters.allow_no_indices,
+        parameters.expand_wildcards.as_deref(),
+    )?;
+    let patterns: Vec<&str> = fields_text.split(',').collect();
+    let session = state.catalog.open_session(&tenant).await?;
+    let fields_by_index = list_fields_per_index(&session, &expression_text, options).await?;
+    Ok(Json(render_field_mappings(
+        &fields_by_index,
+        &patterns,
+        &expression_text,
+    )?))
+}
+
+/// The field mappings of every field one of `patterns` matches across `fields_by_index`, under
+/// `{<expression_text>: {mappings: {<field>: {full_name, mapping: {<leaf>: {type}}}}}}`.
+///
+/// # Errors
+///
+/// Returns `illegal_argument_exception` when a matched field has different types in two of the
+/// selected indices: one answer per field cannot hold both.
+fn render_field_mappings(
+    fields_by_index: &[(String, Vec<IndexField>)],
+    patterns: &[&str],
+    expression_text: &str,
+) -> Result<Value, OpenSearchError> {
+    let mut mappings: BTreeMap<&str, (FieldType, &IndexField)> = BTreeMap::new();
+    for field in fields_by_index.iter().flat_map(|(_, fields)| fields) {
+        if !patterns.iter().any(|pattern| matches_glob(pattern, &field.name)) {
+            continue;
+        }
+        match mappings.entry(field.name.as_str()) {
+            Entry::Vacant(vacant_entry) => {
+                vacant_entry.insert((field.field_type, field));
+            }
+            Entry::Occupied(occupied_entry) => {
+                let (existing_type, _) = *occupied_entry.get();
+                if existing_type != field.field_type {
+                    return Err(OpenSearchError::illegal_argument(format!(
+                        "field [{}] has types [{}] and [{}] across [{expression_text}]",
+                        field.name,
+                        existing_type.name(),
+                        field.field_type.name()
+                    )));
+                }
+            }
+        }
+    }
+    let rendered_mappings: Map<String, Value> = mappings
+        .into_iter()
+        .map(|(name, (field_type, field))| {
+            (
+                name.to_string(),
+                json!({"full_name": name, "mapping": { read_leaf_name(field): {"type": field_type.name()} }}),
+            )
+        })
+        .collect();
+    Ok(build_object(
+        expression_text,
+        build_object("mappings", Value::Object(rendered_mappings)),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use icegate_common::schema::{COL_BODY, COL_LOG_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT};
+    use serde_json::json;
+
+    use super::*;
+    use crate::opensearch::error::render_envelope;
+
+    fn build_leaf(name: &str, field_type: FieldType, is_searchable: bool, is_aggregatable: bool) -> IndexField {
+        IndexField {
+            name: name.to_string(),
+            field_type,
+            is_searchable,
+            is_aggregatable,
+            parent: None,
+        }
+    }
+
+    fn list_rendered_names(body: &Value) -> Vec<String> {
+        let mut names: Vec<String> = body["fields"].as_object().expect("fields").keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn one_type_across_indices_renders_without_an_indices_list() {
+        let fields_by_index = vec![
+            (
+                "logs".to_string(),
+                vec![build_leaf(COL_SERVICE_NAME, FieldType::Keyword, true, true)],
+            ),
+            (
+                "spans".to_string(),
+                vec![build_leaf(COL_SERVICE_NAME, FieldType::Keyword, true, true)],
+            ),
+        ];
+
+        let body = render_field_capabilities(&fields_by_index, &[COL_SERVICE_NAME]);
+
+        assert_eq!(
+            body,
+            json!({
+                "indices": ["logs", "spans"],
+                "fields": {
+                    COL_SERVICE_NAME: {"keyword": {"type": "keyword", "searchable": true, "aggregatable": true}}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn a_type_conflict_lists_the_indices_of_each_type() {
+        let fields_by_index = vec![
+            ("a".to_string(), vec![build_leaf("value", FieldType::Long, true, true)]),
+            (
+                "b".to_string(),
+                vec![build_leaf("value", FieldType::Keyword, true, true)],
+            ),
+        ];
+
+        let body = render_field_capabilities(&fields_by_index, &["value"]);
+
+        assert_eq!(
+            body["fields"]["value"],
+            json!({
+                "long": {"type": "long", "searchable": true, "aggregatable": true, "indices": ["a"]},
+                "keyword": {"type": "keyword", "searchable": true, "aggregatable": true, "indices": ["b"]}
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_searchability_lists_the_non_searchable_indices() {
+        let fields_by_index = vec![
+            ("a".to_string(), vec![build_leaf("f", FieldType::Keyword, true, true)]),
+            ("b".to_string(), vec![build_leaf("f", FieldType::Keyword, false, false)]),
+        ];
+
+        let body = render_field_capabilities(&fields_by_index, &["f"]);
+
+        assert_eq!(
+            body["fields"]["f"]["keyword"],
+            json!({
+                "type": "keyword",
+                "searchable": false,
+                "aggregatable": false,
+                "non_searchable_indices": ["b"],
+                "non_aggregatable_indices": ["b"]
+            })
+        );
+    }
+
+    #[test]
+    fn field_patterns_select_by_glob_and_metadata_fields_follow_the_patterns() {
+        let fields_by_index = vec![(
+            "logs".to_string(),
+            vec![
+                build_leaf(COL_BODY, FieldType::Text, true, false),
+                build_leaf(COL_SEVERITY_TEXT, FieldType::Keyword, true, true),
+            ],
+        )];
+
+        let severity_capabilities = render_field_capabilities(&fields_by_index, &["sev*"]);
+        let every_capability = render_field_capabilities(&fields_by_index, &["*"]);
+        let metadata_capabilities = render_field_capabilities(&fields_by_index, &["_*"]);
+        let body_and_id_capabilities = render_field_capabilities(&fields_by_index, &[COL_BODY, "_id"]);
+
+        assert_eq!(list_rendered_names(&severity_capabilities), [COL_SEVERITY_TEXT]);
+        assert_eq!(
+            list_rendered_names(&every_capability),
+            ["_id", "_index", "_source", COL_BODY, COL_SEVERITY_TEXT]
+        );
+        assert_eq!(
+            list_rendered_names(&metadata_capabilities),
+            ["_id", "_index", "_source"]
+        );
+        assert_eq!(list_rendered_names(&body_and_id_capabilities), ["_id", COL_BODY]);
+    }
+
+    /// `_mapping/field` answers one mapping per field for the whole expression, so a field typed
+    /// differently across the selected indices has no answer and is refused rather than one type
+    /// being picked.
+    #[tokio::test]
+    async fn mapping_field_refuses_a_field_typed_differently_across_indices() {
+        let fields_by_index = vec![
+            ("a".to_string(), vec![build_leaf("value", FieldType::Long, true, true)]),
+            (
+                "b".to_string(),
+                vec![build_leaf("value", FieldType::Keyword, true, true)],
+            ),
+        ];
+
+        let error = render_field_mappings(&fields_by_index, &["value"], "a,b").expect_err("a type conflict");
+        let agreeing_mappings = render_field_mappings(&fields_by_index[..1], &["value"], "a").expect("one type");
+
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(
+            agreeing_mappings,
+            json!({"a": {"mappings": {"value": {"full_name": "value", "mapping": {"value": {"type": "long"}}}}}})
+        );
+    }
+
+    /// A field under a structural parent (a MAP column's key) nests under it by its whole stored
+    /// key, so a key with dots stays one property, in `_mapping` and in `_mapping/field` alike. A
+    /// key listed without its column first still nests under an `object` parent.
+    #[test]
+    fn a_field_with_a_parent_nests_under_it_by_its_whole_stored_key() {
+        let method_field = format!("{COL_LOG_ATTRIBUTES}.http.method");
+        let fields_by_index = vec![(
+            "logs".to_string(),
+            vec![
+                IndexField::object(COL_LOG_ATTRIBUTES.to_string()),
+                IndexField::leaf(
+                    method_field.clone(),
+                    FieldType::Keyword,
+                    Some(COL_LOG_ATTRIBUTES.to_string()),
+                ),
+            ],
+        )];
+
+        let properties = render_properties(&fields_by_index[0].1);
+        let properties_without_column = render_properties(&fields_by_index[0].1[1..]);
+        let field_mappings =
+            render_field_mappings(&fields_by_index, &[method_field.as_str()], "logs").expect("one type");
+
+        let expected_properties =
+            json!({COL_LOG_ATTRIBUTES: {"type": "object", "properties": {"http.method": {"type": "keyword"}}}});
+        assert_eq!(Value::Object(properties), expected_properties);
+        assert_eq!(Value::Object(properties_without_column), expected_properties);
+        assert_eq!(
+            field_mappings,
+            json!({"logs": {"mappings": {method_field.as_str(): {
+                "full_name": method_field,
+                "mapping": {"http.method": {"type": "keyword"}}
+            }}}})
+        );
+    }
+}

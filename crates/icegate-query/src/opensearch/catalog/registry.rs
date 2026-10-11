@@ -11,6 +11,11 @@ use crate::opensearch::glob::matches_glob;
 /// table the tenant may read resolves only by its exact name.
 pub(super) const TELEMETRY_TABLES: [&str; 5] = [LOGS_TABLE, SPANS_TABLE, EVENTS_TABLE, METRICS_TABLE, OPERATIONS_TABLE];
 
+/// The telemetry table named `table`, as its `'static` constant; `None` for any other table.
+pub(super) fn find_telemetry_table(table: &str) -> Option<&'static str> {
+    TELEMETRY_TABLES.into_iter().find(|telemetry_table| *telemetry_table == table)
+}
+
 /// How resolution treats missing names and empty results. Each endpoint passes its own options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IndexOptions {
@@ -22,11 +27,41 @@ pub(crate) struct IndexOptions {
     pub(crate) expand_wildcards: ExpandWildcards,
 }
 
+/// The index options of an endpoint that reads named indices, from its query flags: a missing
+/// concrete name is an error and an empty match is not, and wildcards expand to open indices,
+/// unless the request says otherwise.
+///
+/// # Errors
+///
+/// Returns `illegal_argument_exception` for an unknown `expand_wildcards` value.
+pub(crate) fn read_index_options(
+    ignore_unavailable: Option<bool>,
+    allow_no_indices: Option<bool>,
+    expand_wildcards: Option<&str>,
+) -> Result<IndexOptions, OpenSearchError> {
+    Ok(IndexOptions {
+        ignore_unavailable: ignore_unavailable.unwrap_or(false),
+        allow_no_indices: allow_no_indices.unwrap_or(true),
+        expand_wildcards: ExpandWildcards::parse(expand_wildcards)?,
+    })
+}
+
+/// The naming profile an index name selects: how its field names map onto its table's columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Profile {
+    /// Columns under their stored names.
+    Native,
+}
+
 /// One data index the tenant sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexEntry {
-    /// The index name clients use, which is the table name.
+    /// The index name clients use.
     name: String,
+    /// The table the index reads.
+    table: String,
+    /// How the index's field names map onto the table's columns.
+    profile: Profile,
     /// Whether a wildcard can select the index, or only its exact name.
     is_wildcard_visible: bool,
 }
@@ -35,6 +70,16 @@ impl IndexEntry {
     /// The index name clients use.
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The table this index reads. Equal to the name under the native profile.
+    pub(crate) fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// The naming profile that maps this index's field names onto its table.
+    pub(crate) const fn profile(&self) -> Profile {
+        self.profile
     }
 }
 
@@ -54,7 +99,9 @@ impl IndexSet {
             .into_iter()
             .filter(|name| !name.starts_with('.'))
             .map(|name| IndexEntry {
-                is_wildcard_visible: TELEMETRY_TABLES.contains(&name.as_str()),
+                is_wildcard_visible: find_telemetry_table(&name).is_some(),
+                table: name.clone(),
+                profile: Profile::Native,
                 name,
             })
             .collect();

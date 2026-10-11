@@ -1,4 +1,6 @@
 mod cluster;
+mod data;
+mod fields;
 mod harness;
 mod indices;
 mod listener;

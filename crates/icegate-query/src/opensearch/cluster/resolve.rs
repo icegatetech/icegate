@@ -40,8 +40,9 @@ pub(crate) async fn resolve_index(
         allow_no_indices: true,
         expand_wildcards: ExpandWildcards::parse(parameters.expand_wildcards.as_deref())?,
     };
-    let indices = state.catalog.list_indices(&tenant).await?;
-    let index_entries: Vec<Value> = indices
+    let session = state.catalog.open_session(&tenant).await?;
+    let index_entries: Vec<Value> = session
+        .indices()
         .resolve(&expression, options)?
         .into_iter()
         .map(|entry| json!({"name": entry.name(), "attributes": ["open"]}))

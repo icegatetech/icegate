@@ -12,6 +12,7 @@ mod cluster;
 mod config;
 mod error;
 mod extract;
+mod fields;
 mod filter_path;
 mod glob;
 mod node;

@@ -7,9 +7,9 @@ use icegate_common::TenantId;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::opensearch::catalog::{IndexExpression, IndexOptions};
+use crate::opensearch::catalog::{IndexExpression, read_index_options};
 use crate::opensearch::error::OpenSearchError;
-use crate::opensearch::extract::{EndpointParameters, ExpandWildcards, Parameters, PathParameters, deserialize_flag};
+use crate::opensearch::extract::{EndpointParameters, Parameters, PathParameters, deserialize_flag};
 use crate::opensearch::state::OpenSearchState;
 
 /// The one setting this endpoint serves.
@@ -51,18 +51,19 @@ pub(crate) async fn read_index_setting(
         )));
     }
     let expression = IndexExpression::parse(&expression_text)?;
-    let options = IndexOptions {
-        ignore_unavailable: parameters.ignore_unavailable.unwrap_or(false),
-        allow_no_indices: parameters.allow_no_indices.unwrap_or(true),
-        expand_wildcards: ExpandWildcards::parse(parameters.expand_wildcards.as_deref())?,
-    };
+    let options = read_index_options(
+        parameters.ignore_unavailable,
+        parameters.allow_no_indices,
+        parameters.expand_wildcards.as_deref(),
+    )?;
     let settings = if parameters.flat_settings.unwrap_or(false) {
         json!({ NUMBER_OF_SHARDS_SETTING: "1" })
     } else {
         json!({"index": {"number_of_shards": "1"}})
     };
-    let indices = state.catalog.list_indices(&tenant).await?;
-    let body: Map<String, Value> = indices
+    let session = state.catalog.open_session(&tenant).await?;
+    let body: Map<String, Value> = session
+        .indices()
         .resolve(&expression, options)?
         .into_iter()
         .map(|entry| (entry.name().to_string(), json!({"settings": settings.clone()})))

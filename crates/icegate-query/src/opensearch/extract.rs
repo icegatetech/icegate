@@ -1,8 +1,9 @@
 //! Request extractors that refuse in the `OpenSearch` envelope instead of axum's plain-text
 //! rejections.
 
-use axum::extract::rejection::PathRejection;
-use axum::extract::{FromRequestParts, Path};
+use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, FailedToBufferBody, PathRejection};
+use axum::extract::{FromRequest, FromRequestParts, OptionalFromRequestParts, Path, Request};
 use axum::http::request::Parts;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
@@ -157,6 +158,23 @@ where
     }
 }
 
+/// A route without the parameter yields `None`; a parameter that is present but rejected answers
+/// the envelope.
+impl<T, S> OptionalFromRequestParts<S> for PathParameters<T>
+where
+    T: DeserializeOwned + Send + 'static,
+    S: Send + Sync,
+{
+    type Rejection = OpenSearchError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Option<Self>, Self::Rejection> {
+        <Path<T> as OptionalFromRequestParts<S>>::from_request_parts(parts, state)
+            .await
+            .map(|path| path.map(|Path(value)| Self(value)))
+            .map_err(map_path_rejection)
+    }
+}
+
 /// The envelope for a rejected path parameter: `400` for what the client sent, `500` for a route
 /// whose parameters do not fit its handler, a wiring mistake no request can fix.
 // Taken by value so that it is the `map_err` callback itself; it reads the rejection only through
@@ -171,12 +189,36 @@ fn map_path_rejection(rejection: PathRejection) -> OpenSearchError {
     }
 }
 
+/// The raw request body, read up to the router's `DefaultBodyLimit`.
+///
+/// A body over the limit is refused with the `413` envelope, any other read failure with `400`,
+/// so neither reaches the client as axum's plain-text rejection.
+#[derive(Debug)]
+pub(crate) struct RequestBody(pub(crate) Bytes);
+
+impl<S> FromRequest<S> for RequestBody
+where
+    S: Send + Sync,
+{
+    type Rejection = OpenSearchError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Bytes::from_request(request, state).await {
+            Ok(bytes) => Ok(Self(bytes)),
+            Err(BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_))) => {
+                Err(OpenSearchError::payload_too_large())
+            }
+            Err(rejection) => Err(OpenSearchError::illegal_argument(rejection.body_text())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use serde::Deserialize;
     use tower::ServiceExt as _;
 
@@ -298,5 +340,48 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["status"], 500);
         assert_eq!(body["error"]["type"], "exception");
+    }
+
+    /// A body that breaks off mid-transfer, as when the client's connection drops while it sends,
+    /// is a `400` in the envelope rather than axum's plain-text rejection. The same route reads a
+    /// body that arrives whole, so the refusal is the body read's own.
+    #[tokio::test]
+    async fn a_body_that_fails_mid_transfer_is_a_400_envelope() {
+        let app = Router::new().route(
+            "/",
+            post(|RequestBody(body): RequestBody| async move { body.len().to_string() }),
+        );
+        let failing_chunks = futures::stream::iter([
+            Ok(Bytes::from_static(b"{")),
+            Err(std::io::Error::other("connection reset")),
+        ]);
+
+        let whole_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let failed_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .body(Body::from_stream(failing_chunks))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(whole_response.status(), StatusCode::OK);
+        let (status, body) = read_envelope(failed_response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
     }
 }

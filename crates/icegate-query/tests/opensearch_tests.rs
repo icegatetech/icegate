@@ -2,6 +2,8 @@
 //! expected result is stated there.
 //!
 //! - `cluster`: the cluster-level endpoints
+//! - `data`: table rows with explicit values, written through the production writer
+//! - `fields`: `_field_caps`, `_mapping` and `_mapping/field`
 //! - `harness`: the listener over a temporary warehouse, and a reqwest client
 //! - `indices`: `_resolve/index` and `<index>/_settings`
 //! - `listener`: the listener's start-up
