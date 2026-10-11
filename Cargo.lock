@@ -5366,6 +5366,7 @@ dependencies = [
  "icegate-common",
  "icegate-queue",
  "itoa",
+ "lru",
  "object_store",
  "opentelemetry",
  "opentelemetry-proto",

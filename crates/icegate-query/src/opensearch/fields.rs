@@ -6,12 +6,15 @@ use std::collections::btree_map::Entry;
 
 use axum::Json;
 use axum::extract::{Extension, State};
+use chrono::{DateTime, Utc};
 use futures::future::try_join_all;
 use icegate_common::TenantId;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::catalog::{FieldType, IndexExpression, IndexField, IndexOptions, TenantSession, read_index_options};
+use super::catalog::{
+    FieldListing, FieldType, IndexExpression, IndexField, IndexOptions, TenantSession, read_index_options,
+};
 use super::error::OpenSearchError;
 use super::extract::{EndpointParameters, Parameters, PathParameters, RequestBody, deserialize_flag};
 use super::glob::matches_glob;
@@ -69,11 +72,14 @@ impl EndpointParameters for MappingParameters {
         &["local", "include_defaults", "cluster_manager_timeout", "master_timeout"];
 }
 
-/// The fields of every index `expression_text` selects, in index-name order.
+/// The fields of every index `expression_text` selects, in index-name order, all listed at the
+/// same request time `now`.
 async fn list_fields_per_index(
     session: &TenantSession,
     expression_text: &str,
     options: IndexOptions,
+    now: DateTime<Utc>,
+    listing: FieldListing,
 ) -> Result<Vec<(String, Vec<IndexField>)>, OpenSearchError> {
     let expression = IndexExpression::parse(expression_text)?;
     try_join_all(
@@ -82,10 +88,24 @@ async fn list_fields_per_index(
             .resolve(&expression, options)?
             .into_iter()
             .map(|entry| async move {
-                Ok::<_, OpenSearchError>((entry.name().to_string(), session.list_fields(entry).await?))
+                Ok::<_, OpenSearchError>((
+                    entry.name().to_string(),
+                    session.list_fields(entry, now, listing).await?,
+                ))
             }),
     )
     .await
+}
+
+/// Whether answering `patterns` needs MAP keys. A MAP key's field name is `<column>.<key>`, so
+/// only a pattern holding a wildcard or a dot can name one; any other pattern names a column or a
+/// metadata field, and listing the columns enumerates nothing.
+fn choose_field_listing(patterns: &[&str]) -> FieldListing {
+    if patterns.iter().any(|pattern| pattern.contains(['*', '?', '.'])) {
+        FieldListing::WithMapKeys
+    } else {
+        FieldListing::ColumnsOnly
+    }
 }
 
 /// `GET|POST [/<index>]/_field_caps`. Both methods answer the same, and an absent body and `{}`
@@ -106,7 +126,14 @@ pub(crate) async fn describe_field_capabilities(
     let expression_text = index.map(|PathParameters(text)| text).unwrap_or_default();
     let patterns: Vec<&str> = parameters.fields.as_deref().unwrap_or("*").split(',').collect();
     let session = state.catalog.open_session(&tenant).await?;
-    let fields_by_index = list_fields_per_index(&session, &expression_text, options).await?;
+    let fields_by_index = list_fields_per_index(
+        &session,
+        &expression_text,
+        options,
+        Utc::now(),
+        choose_field_listing(&patterns),
+    )
+    .await?;
     Ok(Json(render_field_capabilities(&fields_by_index, &patterns)))
 }
 
@@ -210,7 +237,14 @@ pub(crate) async fn describe_mappings(
     )?;
     let expression_text = index.map(|PathParameters(text)| text).unwrap_or_default();
     let session = state.catalog.open_session(&tenant).await?;
-    let fields_by_index = list_fields_per_index(&session, &expression_text, options).await?;
+    let fields_by_index = list_fields_per_index(
+        &session,
+        &expression_text,
+        options,
+        Utc::now(),
+        FieldListing::WithMapKeys,
+    )
+    .await?;
     let body: Map<String, Value> = fields_by_index
         .into_iter()
         .map(|(index, fields)| {
@@ -283,7 +317,14 @@ pub(crate) async fn describe_field_mappings(
     )?;
     let patterns: Vec<&str> = fields_text.split(',').collect();
     let session = state.catalog.open_session(&tenant).await?;
-    let fields_by_index = list_fields_per_index(&session, &expression_text, options).await?;
+    let fields_by_index = list_fields_per_index(
+        &session,
+        &expression_text,
+        options,
+        Utc::now(),
+        choose_field_listing(&patterns),
+    )
+    .await?;
     Ok(Json(render_field_mappings(
         &fields_by_index,
         &patterns,
@@ -342,12 +383,24 @@ fn render_field_mappings(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use axum::http::StatusCode;
-    use icegate_common::schema::{COL_BODY, COL_LOG_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT};
+    use bytes::Bytes;
+    use icegate_common::LOGS_TABLE;
+    use icegate_common::schema::{COL_BODY, COL_LOG_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_TIMESTAMP};
+    use opentelemetry::metrics::MeterProvider as _;
     use serde_json::json;
 
     use super::*;
+    use crate::infra::metrics::QueryMetrics;
+    use crate::infra::metrics::test_support::{build_meter_provider, find_counter_total};
+    use crate::opensearch::catalog::{CatalogSettings, IndexCatalog};
+    use crate::opensearch::config::{EmulatedVersion, OpenSearchConfig};
     use crate::opensearch::error::render_envelope;
+    use crate::opensearch::node::NodeIdentity;
+    use crate::test_support::{LogAttributesRow, LogsWarehouse, build_logs_warehouse, commit_log_attributes_rows};
 
     fn build_leaf(name: &str, field_type: FieldType, is_searchable: bool, is_aggregatable: bool) -> IndexField {
         IndexField {
@@ -363,6 +416,78 @@ mod tests {
         let mut names: Vec<String> = body["fields"].as_object().expect("fields").keys().cloned().collect();
         names.sort_unstable();
         names
+    }
+
+    /// A field-discovery request to `logs`, as each handler receives it.
+    #[derive(Debug, Clone, Copy)]
+    enum FieldRequest {
+        /// `_mapping/field/<fields>`.
+        FieldMappings(&'static str),
+        /// `_field_caps`, with `fields=<fields>` when given.
+        FieldCapabilities(Option<&'static str>),
+        /// `_mapping`.
+        Mappings,
+    }
+
+    /// The MAP-key enumerations `request` causes as `tenant-a`, served by a catalog of its own,
+    /// so no request is answered from the cache another one filled.
+    async fn count_request_enumerations(warehouse: &LogsWarehouse, request: FieldRequest) -> u64 {
+        let (provider, exporter) = build_meter_provider();
+        let config = OpenSearchConfig::default();
+        let state = OpenSearchState {
+            node: Arc::new(NodeIdentity::new(
+                &config.cluster_name,
+                EmulatedVersion::parse(&config.version).expect("the default version parses"),
+                "127.0.0.1:9200".parse().expect("socket address"),
+            )),
+            catalog: IndexCatalog::new(
+                Arc::clone(&warehouse.engine),
+                Arc::new(QueryMetrics::new(&provider.meter("field_request_test"))),
+                CatalogSettings {
+                    field_discovery_window: Duration::from_hours(24),
+                },
+            ),
+        };
+        let tenant = Extension(TenantId::new("tenant-a").expect("a valid tenant"));
+        let mapping_parameters = MappingParameters {
+            ignore_unavailable: None,
+            allow_no_indices: None,
+            expand_wildcards: None,
+        };
+        let answer = match request {
+            FieldRequest::FieldMappings(fields) => {
+                let path = PathParameters((LOGS_TABLE.to_string(), fields.to_string()));
+                describe_field_mappings(State(state), tenant, path, Parameters(mapping_parameters)).await
+            }
+            FieldRequest::FieldCapabilities(fields) => {
+                let parameters = FieldCapabilitiesParameters {
+                    fields: fields.map(str::to_string),
+                    ignore_unavailable: None,
+                    allow_no_indices: None,
+                    expand_wildcards: None,
+                };
+                let index = Some(PathParameters(LOGS_TABLE.to_string()));
+                describe_field_capabilities(
+                    State(state),
+                    tenant,
+                    index,
+                    Parameters(parameters),
+                    RequestBody(Bytes::new()),
+                )
+                .await
+            }
+            FieldRequest::Mappings => {
+                let index = Some(PathParameters(LOGS_TABLE.to_string()));
+                describe_mappings(State(state), tenant, index, Parameters(mapping_parameters)).await
+            }
+        };
+        let _answer = answer.expect("an answer");
+        provider.force_flush().expect("flushed metrics");
+        find_counter_total(
+            &exporter,
+            "icegate_query_opensearch_map_key_enumerations",
+            &[("table", LOGS_TABLE)],
+        )
     }
 
     #[test]
@@ -519,5 +644,58 @@ mod tests {
                 "mapping": {"http.method": {"type": "keyword"}}
             }}}})
         );
+    }
+
+    /// A MAP key's field name is `<column>.<key>`, so only a pattern holding a wildcard or a dot
+    /// can name one. Every other lookup lists the columns and enumerates nothing.
+    #[test]
+    fn only_a_wildcard_or_a_dotted_pattern_lists_map_keys() {
+        let method_field = format!("{COL_LOG_ATTRIBUTES}.http.method");
+        let cases: [(&[&str], FieldListing); 7] = [
+            (&[COL_TIMESTAMP], FieldListing::ColumnsOnly),
+            (&[COL_TIMESTAMP, COL_LOG_ATTRIBUTES], FieldListing::ColumnsOnly),
+            (&["_id"], FieldListing::ColumnsOnly),
+            (&["*"], FieldListing::WithMapKeys),
+            (&["time?tamp"], FieldListing::WithMapKeys),
+            (&[method_field.as_str()], FieldListing::WithMapKeys),
+            (&[COL_TIMESTAMP, "sev*"], FieldListing::WithMapKeys),
+        ];
+        for (patterns, expected) in cases {
+            assert_eq!(choose_field_listing(patterns), expected, "{patterns:?}");
+        }
+    }
+
+    /// Each handler decides from its own request whether to enumerate: a lookup of a concrete
+    /// column on `_mapping/field` or `_field_caps` scans nothing. The wildcard lookups, the default
+    /// `fields` of `_field_caps` and `_mapping` (which lists every field) each enumerate once,
+    /// which proves the counter sees the scans the concrete lookups skip.
+    #[tokio::test]
+    async fn a_concrete_field_lookup_enumerates_no_map_keys() {
+        let warehouse = build_logs_warehouse().await;
+        commit_log_attributes_rows(
+            &warehouse.catalog,
+            &[LogAttributesRow {
+                tenant_id: "tenant-a",
+                timestamp: "2026-10-10T12:00:00Z",
+                log_attributes: &[("http.method", "GET")],
+            }],
+        )
+        .await;
+        let cases = [
+            (FieldRequest::FieldMappings(COL_TIMESTAMP), 0),
+            (FieldRequest::FieldCapabilities(Some(COL_TIMESTAMP)), 0),
+            (FieldRequest::FieldMappings("*"), 1),
+            (FieldRequest::FieldCapabilities(Some("*")), 1),
+            (FieldRequest::FieldCapabilities(None), 1),
+            (FieldRequest::Mappings, 1),
+        ];
+
+        for (request, expected) in cases {
+            assert_eq!(
+                count_request_enumerations(&warehouse, request).await,
+                expected,
+                "{request:?}"
+            );
+        }
     }
 }

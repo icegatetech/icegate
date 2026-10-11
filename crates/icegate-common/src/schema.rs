@@ -2902,4 +2902,38 @@ mod tests {
             assert!(pairs(table).is_empty(), "{table} promotes no resource key");
         }
     }
+
+    /// Field discovery prunes MAP keys to a tenant from partition data alone. That is exact only
+    /// while every table carrying `tenant_id` identity-partitions it.
+    #[test]
+    fn every_table_carrying_tenant_id_identity_partitions_it() {
+        type SpecBuilder = fn(&Schema) -> Result<PartitionSpec>;
+        let tables: [(&str, Result<Schema>, SpecBuilder); 6] = [
+            ("logs", logs_schema(), logs_partition_spec),
+            ("spans", spans_schema(), spans_partition_spec),
+            ("events", events_schema(), events_partition_spec),
+            ("metrics", metrics_schema(), metrics_partition_spec),
+            ("operations", operations_schema(), operations_partition_spec),
+            ("prices", prices_schema(), prices_partition_spec),
+        ];
+        let mut tenant_scoped_tables = Vec::new();
+        for (table, table_schema, build_spec) in tables {
+            let table_schema = table_schema.expect("schema");
+            let Some(tenant_field) = table_schema.field_by_name("tenant_id") else {
+                continue;
+            };
+            let spec = build_spec(&table_schema).expect("partition spec");
+            assert!(
+                spec.fields()
+                    .iter()
+                    .any(|field| field.source_id == tenant_field.id && field.transform == Transform::Identity),
+                "{table} carries tenant_id without an identity partition on it"
+            );
+            tenant_scoped_tables.push(table);
+        }
+        assert_eq!(
+            tenant_scoped_tables,
+            ["logs", "spans", "events", "metrics", "operations"]
+        );
+    }
 }

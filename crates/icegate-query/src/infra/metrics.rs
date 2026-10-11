@@ -71,7 +71,7 @@ const ROWS_BOUNDARIES: &[f64] = &[
 /// Follows the same `new(&Meter)` / `new_disabled()` pattern used by
 /// `icegate-ingest` metrics. When disabled, all recording methods are
 /// short-circuited.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct QueryMetrics {
     enabled: bool,
     requests_total: Counter<u64>,
@@ -86,6 +86,7 @@ pub struct QueryMetrics {
     errors_total: Counter<u64>,
     active_queries: UpDownCounter<i64>,
     tenant_rejections_total: Counter<u64>,
+    map_key_enumerations_total: Counter<u64>,
 
     // Per-source scan metrics
     wal_scan_rows: Histogram<f64>,
@@ -119,6 +120,7 @@ impl QueryMetrics {
             errors_total: meter.u64_counter("icegate_query_errors").build(),
             active_queries: meter.i64_up_down_counter("icegate_query_active_queries").build(),
             tenant_rejections_total: meter.u64_counter("icegate_query_tenant_rejections").build(),
+            map_key_enumerations_total: meter.u64_counter("icegate_query_opensearch_map_key_enumerations").build(),
             wal_scan_rows: meter.f64_histogram("icegate_query_wal_scan_rows").build(),
             wal_scan_bytes: meter.f64_histogram("icegate_query_wal_scan_bytes").build(),
             wal_scan_compressed_bytes: meter.f64_histogram("icegate_query_wal_scan_compressed_bytes").build(),
@@ -190,6 +192,10 @@ impl QueryMetrics {
             .u64_counter("icegate_query_tenant_rejections")
             .with_description("Requests refused because they carried no usable tenant")
             .build();
+        let map_key_enumerations_total = meter
+            .u64_counter("icegate_query_opensearch_map_key_enumerations")
+            .with_description("OpenSearch MAP-key enumerations that scanned table metadata (cache misses)")
+            .build();
 
         let wal_scan_rows = meter
             .f64_histogram("icegate_query_wal_scan_rows")
@@ -236,6 +242,7 @@ impl QueryMetrics {
             errors_total,
             active_queries,
             tenant_rejections_total,
+            map_key_enumerations_total,
             wal_scan_rows,
             wal_scan_bytes,
             wal_scan_compressed_bytes,
@@ -411,6 +418,15 @@ impl QueryMetrics {
                 KeyValue::new("error_type", error_type.to_string()),
             ],
         );
+    }
+
+    /// Count one MAP-key enumeration of `table` that scanned table metadata, a lookup the
+    /// enumeration cache could not answer.
+    pub fn add_map_key_enumeration(&self, table: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        self.map_key_enumerations_total.add(1, &[KeyValue::new("table", table)]);
     }
 }
 

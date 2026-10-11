@@ -2,8 +2,8 @@
 //! literal, and each expected answer is stated here.
 
 use icegate_common::schema::{
-    COL_BODY, COL_LOG_ATTRIBUTES, COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT,
-    COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID, logs_schema,
+    COL_BODY, COL_LOG_ATTRIBUTES, COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES,
+    COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID, logs_schema,
 };
 use icegate_query::opensearch::OpenSearchConfig;
 use reqwest::Method;
@@ -15,8 +15,9 @@ use super::harness::TestServer;
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
 
-/// 2025-10-09T08:53:20Z, a fixed instant: these tests list columns, never MAP keys, so no
-/// discovery window applies.
+/// 2025-10-09T08:53:20Z, a fixed instant older than the default discovery window, which the
+/// listener anchors at the wall clock: rows written at it list their columns, never their MAP
+/// keys.
 const FIXED_TIMESTAMP_MICROS: i64 = 1_760_000_000_000_000;
 
 /// The wildcard-visible data indices of the harness, in name order: every telemetry table.
@@ -36,6 +37,24 @@ const fn build_log_row<'a>(
         resource_attributes,
         log_attributes,
     }
+}
+
+/// One hour before the wall clock: inside the default discovery window, which the listener
+/// anchors at the request time it reads from the clock.
+fn build_recent_log_row<'a>(
+    tenant_id: &'a str,
+    resource_attributes: &'a [(&'a str, &'a str)],
+    log_attributes: &'a [(&'a str, &'a str)],
+) -> LogRow<'a> {
+    LogRow {
+        timestamp_micros: (chrono::Utc::now() - chrono::TimeDelta::hours(1)).timestamp_micros(),
+        ..build_log_row(tenant_id, resource_attributes, log_attributes)
+    }
+}
+
+/// The field name `<map column>.<stored key>`.
+fn build_map_key_field_name(map_column: &str, key: &str) -> String {
+    format!("{map_column}.{key}")
 }
 
 /// `method path` as `tenant`, with `body` as JSON when given: the status and the JSON body. The
@@ -97,6 +116,7 @@ async fn field_caps_reports_native_types_and_hides_tenant_id() {
         assert_eq!(&fields[name], capability, "{name}");
     }
     assert!(fields.get(COL_TENANT_ID).is_none());
+    assert!(fields.get(format!("{COL_RESOURCE_ATTRIBUTES}.host.name")).is_none());
     server.shutdown().await;
 }
 
@@ -487,26 +507,34 @@ async fn field_caps_and_mapping_of_an_index_name_in_another_case_are_the_404_env
     server.shutdown().await;
 }
 
-/// `_mapping` properties follow the table's schema column order, which is IceGate's contract.
-/// The expected order is the canonical `logs` schema without `tenant_id` (the tenant scope hides
-/// it), read from `icegate_common::schema` rather than from the listener. The parsed object keeps
-/// the response's key order because icegate-query enables `serde_json`'s `preserve_order`, which
-/// this test binary shares.
+/// `_mapping` properties follow the table's schema column order, and a MAP column's keys follow
+/// under its `properties` in stored-key byte order. Both orders are IceGate's contract. The
+/// expected column order is the canonical `logs` schema without `tenant_id` (the tenant scope
+/// hides it), read from `icegate_common::schema` rather than from the listener. The row stores
+/// its keys in neither byte nor length order; byte order puts `Zone` (0x5A) before `http` (0x68),
+/// where a case-folded order would put it last, so the expected list holds only under byte
+/// order. The parsed objects keep the response's key order because icegate-query enables
+/// `serde_json`'s `preserve_order`, which this test binary shares.
 #[tokio::test]
-async fn mapping_properties_follow_the_schema_column_order() {
-    let (server, _catalog) = TestServer::start().await;
+async fn mapping_properties_follow_the_schema_column_order_and_map_keys_their_byte_order() {
+    let (server, catalog) = TestServer::start().await;
+    let log_attributes = [
+        ("user.email", "a@example.com"),
+        ("http.method", "GET"),
+        ("Zone", "eu-1"),
+        ("http", "x"),
+    ];
+    commit_log_rows(&catalog, &[build_recent_log_row(TENANT_A, &[], &log_attributes)])
+        .await
+        .expect("commit rows");
 
     let (status, body) = send_request(&server, Method::GET, TENANT_A, "/logs/_mapping", None)
         .await
         .expect("a JSON answer");
 
     assert_eq!(status, 200);
-    let property_names: Vec<&str> = body["logs"]["mappings"]["properties"]
-        .as_object()
-        .expect("properties")
-        .keys()
-        .map(String::as_str)
-        .collect();
+    let properties = &body["logs"]["mappings"]["properties"];
+    let property_names: Vec<&str> = properties.as_object().expect("properties").keys().map(String::as_str).collect();
     let schema = logs_schema().expect("the logs schema");
     let expected: Vec<&str> = schema
         .as_struct()
@@ -516,5 +544,148 @@ async fn mapping_properties_follow_the_schema_column_order() {
         .filter(|name| *name != COL_TENANT_ID)
         .collect();
     assert_eq!(property_names, expected);
+    let map_keys: Vec<&str> = properties[COL_LOG_ATTRIBUTES]["properties"]
+        .as_object()
+        .expect("log_attributes properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(map_keys, ["Zone", "http", "http.method", "user.email"]);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn field_caps_lists_each_map_key_under_its_own_map_column() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(
+        &catalog,
+        &[build_recent_log_row(
+            TENANT_A,
+            &[("res.only", "1")],
+            &[("log.only", "2")],
+        )],
+    )
+    .await
+    .expect("commit rows");
+
+    let (status, body) = send_request(&server, Method::GET, TENANT_A, "/logs/_field_caps?fields=*", None)
+        .await
+        .expect("a JSON answer");
+
+    assert_eq!(status, 200);
+    let fields = &body["fields"];
+    let keyword_capability = json!({"keyword": {"type": "keyword", "searchable": true, "aggregatable": true}});
+    assert_eq!(
+        fields[&build_map_key_field_name(COL_RESOURCE_ATTRIBUTES, "res.only")],
+        keyword_capability
+    );
+    assert_eq!(
+        fields[&build_map_key_field_name(COL_LOG_ATTRIBUTES, "log.only")],
+        keyword_capability
+    );
+    assert!(fields.get(build_map_key_field_name(COL_LOG_ATTRIBUTES, "res.only")).is_none());
+    assert!(
+        fields
+            .get(build_map_key_field_name(COL_RESOURCE_ATTRIBUTES, "log.only"))
+            .is_none()
+    );
+    assert!(fields.get(build_map_key_field_name(COL_SCOPE_ATTRIBUTES, "res.only")).is_none());
+    server.shutdown().await;
+}
+
+/// The two tenants are committed in one append, into one snapshot (in separate partitions).
+/// Partition pruning alone keeps each tenant's keys out of the other's listing.
+#[tokio::test]
+async fn field_caps_never_lists_another_tenants_map_keys() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(
+        &catalog,
+        &[
+            build_recent_log_row(TENANT_A, &[], &[("a.only", "1")]),
+            build_recent_log_row(TENANT_B, &[], &[("b.only", "2")]),
+        ],
+    )
+    .await
+    .expect("commit rows");
+
+    let (_, first_tenant_capabilities) =
+        send_request(&server, Method::GET, TENANT_A, "/logs/_field_caps?fields=*", None)
+            .await
+            .expect("a JSON answer");
+    let (_, second_tenant_capabilities) =
+        send_request(&server, Method::GET, TENANT_B, "/logs/_field_caps?fields=*", None)
+            .await
+            .expect("a JSON answer");
+    let (_, third_tenant_mappings) = send_request(&server, Method::GET, "tenant-c", "/logs/_mapping", None)
+        .await
+        .expect("a JSON answer");
+
+    let a_only = build_map_key_field_name(COL_LOG_ATTRIBUTES, "a.only");
+    let b_only = build_map_key_field_name(COL_LOG_ATTRIBUTES, "b.only");
+    assert!(first_tenant_capabilities["fields"].get(&a_only).is_some());
+    assert!(first_tenant_capabilities["fields"].get(&b_only).is_none());
+    assert!(second_tenant_capabilities["fields"].get(&b_only).is_some());
+    assert!(second_tenant_capabilities["fields"].get(&a_only).is_none());
+    assert_eq!(
+        third_tenant_mappings["logs"]["mappings"]["properties"][COL_LOG_ATTRIBUTES],
+        json!({"type": "object"})
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn mapping_nests_map_keys_by_stored_key_under_their_column() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(
+        &catalog,
+        &[build_recent_log_row(
+            TENANT_A,
+            &[],
+            &[("http", "x"), ("http.method", "GET")],
+        )],
+    )
+    .await
+    .expect("commit rows");
+
+    let (status, body) = send_request(&server, Method::GET, TENANT_A, "/logs/_mapping", None)
+        .await
+        .expect("a JSON answer");
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["logs"]["mappings"]["properties"][COL_LOG_ATTRIBUTES],
+        json!({
+            "type": "object",
+            "properties": {"http": {"type": "keyword"}, "http.method": {"type": "keyword"}}
+        })
+    );
+    server.shutdown().await;
+}
+
+/// A commit changes the table's snapshot, so the enumeration cached by the first listing is not
+/// reused: the next listing holds the new key.
+#[tokio::test]
+async fn field_caps_lists_a_key_committed_after_an_earlier_listing() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(&catalog, &[build_recent_log_row(TENANT_A, &[], &[("first.key", "1")])])
+        .await
+        .expect("commit rows");
+    let (_, body_before_commit) = send_request(&server, Method::GET, TENANT_A, "/logs/_field_caps?fields=*", None)
+        .await
+        .expect("a JSON answer");
+
+    commit_log_rows(&catalog, &[build_recent_log_row(TENANT_A, &[], &[("second.key", "2")])])
+        .await
+        .expect("commit rows");
+    let (_, body_after_commit) = send_request(&server, Method::GET, TENANT_A, "/logs/_field_caps?fields=*", None)
+        .await
+        .expect("a JSON answer");
+
+    let first_key = build_map_key_field_name(COL_LOG_ATTRIBUTES, "first.key");
+    let second_key = build_map_key_field_name(COL_LOG_ATTRIBUTES, "second.key");
+    assert!(body_before_commit["fields"].get(&first_key).is_some());
+    assert!(body_before_commit["fields"].get(&second_key).is_none());
+    assert!(body_after_commit["fields"].get(&first_key).is_some());
+    assert!(body_after_commit["fields"].get(&second_key).is_some());
     server.shutdown().await;
 }

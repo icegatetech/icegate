@@ -146,7 +146,7 @@ mod tests {
 
     use super::*;
     use crate::infra::metrics::test_support::{build_meter_provider, find_counter_total};
-    use crate::opensearch::catalog::IndexCatalog;
+    use crate::opensearch::catalog::{CatalogSettings, IndexCatalog};
     use crate::opensearch::config::EmulatedVersion;
     use crate::opensearch::error::read_envelope;
     use crate::opensearch::node::NodeIdentity;
@@ -173,7 +173,13 @@ mod tests {
                 version,
                 "127.0.0.1:9200".parse().expect("socket address"),
             )),
-            catalog: IndexCatalog::new(engine),
+            catalog: IndexCatalog::new(
+                engine,
+                Arc::clone(&runtime.metrics),
+                CatalogSettings {
+                    field_discovery_window: Duration::from_secs(60),
+                },
+            ),
         };
         build_router(state, &runtime, &config)
     }
