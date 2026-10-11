@@ -1,8 +1,9 @@
 //! The object-store behaviours the system-index store depends on, against real RustFS:
 //! create-if-absent, compare-and-swap on `ETag` (sequentially and under contention), conditional
 //! GET in both arms (not modified for the current `ETag`, the changed object for an outdated one),
-//! and a last-modified time on objects written by plain put, create, and update (garbage collection
-//! measures supersession age from it).
+//! a last-modified time on objects written by plain put, create, and update (garbage collection
+//! measures supersession age from it), and a GET of a missing key answering not-found (a cold start
+//! reads no state from it).
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
@@ -259,4 +260,16 @@ async fn plain_put_create_and_update_writes_each_carry_a_last_modified_near_the_
             "{path}: {last_modified} is outside [{before}, {after}] widened by {CLOCK_TOLERANCE:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_get_of_a_missing_key_is_not_found() {
+    let (_container, store) = start_store().await;
+
+    let missing_answer = store.get(&Path::from("tenant-a/current")).await;
+
+    assert!(
+        matches!(missing_answer, Err(object_store::Error::NotFound { .. })),
+        "{missing_answer:?}"
+    );
 }

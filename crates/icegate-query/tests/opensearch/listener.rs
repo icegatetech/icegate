@@ -17,11 +17,11 @@ type StartOutcome = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 /// Start the listener over `runtime` at `host:port` with its token already cancelled, so a start
 /// that wrongly succeeds returns at once instead of serving forever. A start that blocks before
 /// it binds fails the test after [`PORT_BIND_TIMEOUT`] instead of hanging it. Returns the outcome
-/// and the port the listener reported, if any. `system_store` passes the startup checks, which
+/// and the port the listener reported, if any. `system_object_store` passes the startup checks, which
 /// run before the bind, so the start fails at the address step under test.
 async fn start_cancelled_listener(
     runtime: QueryRuntime,
-    system_store: SystemObjectStore,
+    system_object_store: SystemObjectStore,
     host: &str,
     port: u16,
 ) -> (StartOutcome, Option<u16>) {
@@ -36,8 +36,13 @@ async fn start_cancelled_listener(
     let (port_tx, port_rx) = oneshot::channel::<u16>();
 
     let listener_runtime = ListenerRuntime::plaintext(cancel_token);
-    let start =
-        icegate_query::opensearch::run_with_port_tx(runtime, config, system_store, listener_runtime, Some(port_tx));
+    let start = icegate_query::opensearch::run_with_port_tx(
+        runtime,
+        config,
+        system_object_store,
+        listener_runtime,
+        Some(port_tx),
+    );
     let outcome = tokio::time::timeout(PORT_BIND_TIMEOUT, start).await.unwrap_or_else(|_elapsed| {
         panic!(
             "the start at {host}:{port} did not return within {}s",
@@ -56,9 +61,9 @@ async fn a_port_already_bound_fails_the_start_without_reporting_a_port() {
     let held_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
     let port = held_listener.local_addr().expect("held address").port();
     let (runtime, _catalog, _warehouse) = build_runtime().await.expect("the listener's runtime");
-    let system_store = build_in_memory_system_object_store().expect("the in-memory system store");
+    let system_object_store = build_in_memory_system_object_store().expect("the in-memory system store");
 
-    let (outcome, reported_port) = start_cancelled_listener(runtime, system_store, "127.0.0.1", port).await;
+    let (outcome, reported_port) = start_cancelled_listener(runtime, system_object_store, "127.0.0.1", port).await;
 
     let error = outcome.expect_err("the held port is refused");
     let io_kind = match error.downcast_ref::<icegate_common::Error>() {
@@ -74,9 +79,9 @@ async fn a_port_already_bound_fails_the_start_without_reporting_a_port() {
 #[tokio::test]
 async fn a_host_that_is_not_an_address_fails_the_start_without_reporting_a_port() {
     let (runtime, _catalog, _warehouse) = build_runtime().await.expect("the listener's runtime");
-    let system_store = build_in_memory_system_object_store().expect("the in-memory system store");
+    let system_object_store = build_in_memory_system_object_store().expect("the in-memory system store");
 
-    let (outcome, reported_port) = start_cancelled_listener(runtime, system_store, "not an address", 0).await;
+    let (outcome, reported_port) = start_cancelled_listener(runtime, system_object_store, "not an address", 0).await;
 
     let error = outcome.expect_err("the host is refused");
     assert!(

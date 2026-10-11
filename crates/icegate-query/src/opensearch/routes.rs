@@ -23,6 +23,7 @@ use super::error::OpenSearchError;
 use super::fields;
 use super::filter_path::apply_filter_path;
 use super::state::OpenSearchState;
+use super::system_index::{create_system_index, describe_system_index};
 use crate::infra::metrics::{PROTOCOL_OPENSEARCH, QueryMetrics, QueryRequestRecorder, QueryTenantRejectionRecorder};
 use crate::infra::runtime::QueryRuntime;
 use crate::infra::tenant::{RequestTenantPolicy, build_rejection_response, resolve_request_tenant};
@@ -80,6 +81,7 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
         .route("/_mapping", get(fields::describe_mappings))
         .route("/{index}/_mapping", get(fields::describe_mappings))
         .route("/{index}/_mapping/field/{fields}", get(fields::describe_field_mappings))
+        .route("/{index}", get(describe_system_index).put(create_system_index))
         .fallback(answer_unmatched_route)
         .method_not_allowed_fallback(answer_unmatched_route)
         .layer(middleware::from_fn(apply_filter_path))
@@ -157,7 +159,9 @@ mod tests {
     use crate::opensearch::config::EmulatedVersion;
     use crate::opensearch::error::read_envelope;
     use crate::opensearch::node::NodeIdentity;
-    use crate::test_support::{build_pressured_memory, build_stalling_engine, serve_router};
+    use crate::test_support::{
+        build_in_memory_system_index_store, build_pressured_memory, build_stalling_engine, serve_router,
+    };
 
     /// The router over an engine whose catalog never answers: a route that answers at all read
     /// no table.
@@ -197,6 +201,7 @@ mod tests {
                     field_discovery_window: Duration::from_secs(60),
                 },
             ),
+            system_store: build_in_memory_system_index_store(),
         };
         build_router(state, &runtime, &config)
     }

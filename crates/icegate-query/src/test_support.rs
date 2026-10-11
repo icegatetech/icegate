@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::future::pending;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -32,6 +33,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{QueryEngine, QueryEngineConfig};
+use crate::opensearch::SystemObjectStore;
+use crate::opensearch::system_index::{SystemIndexLimits, SystemIndexStore};
 
 /// `UsageReader` whose usage sits above the default high watermark;
 /// [`build_pressured_memory`] asserts that it does.
@@ -413,4 +416,22 @@ pub async fn build_catalog_with_logs_and_spans_tables_at(
         .await
         .expect("the spans table at the stated location");
     catalog
+}
+
+/// A system-index store over an empty `InMemory` object store, for the router and catalog tests
+/// that need an `OpenSearchState` but never write a system index.
+pub fn build_in_memory_system_index_store() -> Arc<SystemIndexStore> {
+    let system_object_store = SystemObjectStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "s3://crate-tests/opensearch-system",
+    )
+    .expect("an S3 location");
+    Arc::new(SystemIndexStore::new(
+        system_object_store,
+        SystemIndexLimits {
+            max_snapshot_bytes: 1 << 20,
+            cache_max_bytes: 1 << 20,
+            write_deadline: Duration::from_secs(30),
+        },
+    ))
 }

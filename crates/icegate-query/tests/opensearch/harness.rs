@@ -123,13 +123,13 @@ impl TestServer {
     }
 
     /// Start with `config`, whose `enabled`, `host` and `port` are overridden for the test, and
-    /// with the system indices in `system_store`. A listener that does not start fails the test
-    /// here, with the step that failed.
+    /// with the system indices in `system_object_store`. A listener that does not start fails the
+    /// test here, with the step that failed.
     pub async fn start_with_system_store(
         config: OpenSearchConfig,
-        system_store: SystemObjectStore,
+        system_object_store: SystemObjectStore,
     ) -> (Self, Arc<dyn Catalog>) {
-        match Self::try_start_with_system_store(config, system_store).await {
+        match Self::try_start_with_system_store(config, system_object_store).await {
             Ok(started) => started,
             Err(error) => panic!("the OpenSearch listener did not start: {error}"),
         }
@@ -137,8 +137,8 @@ impl TestServer {
 
     /// [`TestServer::start_with_config`] with its failure returned.
     async fn try_start_with_config(config: OpenSearchConfig) -> Result<(Self, Arc<dyn Catalog>), SetupError> {
-        let system_store = build_in_memory_system_object_store()?;
-        Self::try_start_with_system_store(config, system_store).await
+        let system_object_store = build_in_memory_system_object_store()?;
+        Self::try_start_with_system_store(config, system_object_store).await
     }
 
     /// [`TestServer::start_with_system_store`] with its failure returned. A listener already
@@ -147,7 +147,7 @@ impl TestServer {
     /// check.
     async fn try_start_with_system_store(
         config: OpenSearchConfig,
-        system_store: SystemObjectStore,
+        system_object_store: SystemObjectStore,
     ) -> Result<(Self, Arc<dyn Catalog>), SetupError> {
         let (runtime, catalog, warehouse) = build_runtime().await?;
         // Built before the listener is spawned, so its failure leaves no task running.
@@ -168,7 +168,7 @@ impl TestServer {
             let outcome = icegate_query::opensearch::run_with_port_tx(
                 runtime,
                 config,
-                system_store,
+                system_object_store,
                 listener_runtime,
                 Some(port_tx),
             )

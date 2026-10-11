@@ -9,19 +9,23 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use iceberg::{Catalog, NamespaceIdent};
-use icegate_common::{ICEGATE_NAMESPACE, StorageBackend, strip_s3_scheme};
+use icegate_common::{ICEGATE_NAMESPACE, StorageBackend, TenantId, strip_s3_scheme};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{GetOptions, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutResult, UpdateVersion};
 use uuid::Uuid;
 
+use super::codec::{LINEAGE_FRAME_HEADER_LEN, SnapshotLineage, decode_lineage_frame, measure_lineage_frame};
 use crate::QueryConfig;
 use crate::error::{QueryError, Result};
 use crate::opensearch::SystemIndicesConfig;
+use crate::opensearch::error::OpenSearchError;
 
 /// Path segment holding the startup probe objects. A tenant identifier never contains `.`, so no
 /// tenant's objects share it.
 const PROBE_SEGMENT: &str = ".startup-probe";
+/// Name of the pointer object under a tenant's prefix.
+const POINTER_NAME: &str = "current";
 /// The probe's create-if-absent, as a startup refusal names it.
 const PROBE_CREATE: &str = "conditional create (PutMode::Create)";
 /// The probe's update conditioned on the created object's `ETag`, as a startup refusal names it.
@@ -63,6 +67,63 @@ impl SystemObjectStore {
     #[must_use]
     pub fn location(&self) -> &str {
         &self.location
+    }
+}
+
+impl SystemObjectStore {
+    /// The object-store client.
+    pub(crate) const fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.object_store
+    }
+
+    /// `<base>/<tenant>`: everything one tenant's store holds. The tenant identifier is one path
+    /// segment, verbatim: its character set holds nothing the object-store path encoding escapes,
+    /// so distinct tenants never share a prefix, and a key is never parsed back into a tenant.
+    pub(crate) fn tenant_path(&self, tenant: &TenantId) -> Path {
+        self.base_path.clone().join(tenant.as_ref())
+    }
+
+    /// `<base>/<tenant>/current`: the pointer naming the tenant's current snapshot object.
+    pub(crate) fn pointer_path(&self, tenant: &TenantId) -> Path {
+        self.tenant_path(tenant).join(POINTER_NAME)
+    }
+
+    /// `<base>/<tenant>/<snapshot_name>`: one immutable snapshot object.
+    pub(crate) fn snapshot_path(&self, tenant: &TenantId, snapshot_name: &str) -> Path {
+        self.tenant_path(tenant).join(snapshot_name)
+    }
+
+    /// The lineage of the snapshot object `snapshot_name`, read with two ranged GETs (the lineage
+    /// frame's header, then the frame it declares) and never the snapshot frame. `None` when the
+    /// snapshot object does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the object store fails or the frame is corrupt.
+    pub(crate) async fn read_lineage_frame(
+        &self,
+        tenant: &TenantId,
+        snapshot_name: &str,
+    ) -> std::result::Result<Option<SnapshotLineage>, OpenSearchError> {
+        let path = self.snapshot_path(tenant, snapshot_name);
+        let Some(header) = self.read_object_head(&path, LINEAGE_FRAME_HEADER_LEN).await? else {
+            return Ok(None);
+        };
+        let frame_len = measure_lineage_frame(&header)?;
+        let Some(frame) = self.read_object_head(&path, frame_len).await? else {
+            return Ok(None);
+        };
+        decode_lineage_frame(&frame).map(Some)
+    }
+
+    /// The first `len` bytes of the object at `path`; `None` when it does not exist.
+    async fn read_object_head(&self, path: &Path, len: usize) -> std::result::Result<Option<Bytes>, OpenSearchError> {
+        let end = u64::try_from(len).map_err(|_| OpenSearchError::internal("a lineage frame outgrows a byte range"))?;
+        match self.object_store.get_range(path, 0..end).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(OpenSearchError::internal(format!("cannot read {path}: {error}"))),
+        }
     }
 }
 

@@ -10,7 +10,9 @@ use super::catalog::{CatalogSettings, IndexCatalog};
 use super::config::{EmulatedVersion, OpenSearchConfig};
 use super::node::NodeIdentity;
 use super::state::OpenSearchState;
-use super::system_index::{SystemObjectStore, probe_conditional_operations, refuse_table_location_overlap};
+use super::system_index::{
+    SystemIndexLimits, SystemIndexStore, SystemObjectStore, probe_conditional_operations, refuse_table_location_overlap,
+};
 use crate::infra::runtime::QueryRuntime;
 
 /// Serve the `OpenSearch`-compatible API until the token of `listener_runtime` is cancelled.
@@ -28,10 +30,10 @@ use crate::infra::runtime::QueryRuntime;
 pub async fn run(
     runtime: QueryRuntime,
     config: OpenSearchConfig,
-    system_store: SystemObjectStore,
+    system_object_store: SystemObjectStore,
     listener_runtime: ListenerRuntime,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(runtime, config, system_store, listener_runtime, None).await
+    run_with_port_tx(runtime, config, system_object_store, listener_runtime, None).await
 }
 
 /// [`run`], reporting the bound port on `port_tx` once the listener is bound, so a caller can bind
@@ -47,16 +49,24 @@ pub async fn run(
 pub async fn run_with_port_tx(
     runtime: QueryRuntime,
     config: OpenSearchConfig,
-    system_store: SystemObjectStore,
+    system_object_store: SystemObjectStore,
     listener_runtime: ListenerRuntime,
     port_tx: Option<oneshot::Sender<u16>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    refuse_table_location_overlap(&system_store, runtime.engine.catalog().as_ref()).await?;
-    probe_conditional_operations(&system_store).await?;
+    refuse_table_location_overlap(&system_object_store, runtime.engine.catalog().as_ref()).await?;
+    probe_conditional_operations(&system_object_store).await?;
     tracing::info!(
-        location = system_store.location(),
+        location = system_object_store.location(),
         "OpenSearch system-index store passed its startup checks"
     );
+    let system_index_store = Arc::new(SystemIndexStore::new(
+        system_object_store,
+        SystemIndexLimits {
+            max_snapshot_bytes: config.system_indices.max_snapshot_bytes,
+            cache_max_bytes: config.system_indices.cache_max_bytes,
+            write_deadline: Duration::from_secs(runtime.engine.config().max_query_duration_secs),
+        },
+    ));
     let version = EmulatedVersion::parse(&config.version)?;
     let listener =
         ServerListener::bind(&config.host, config.port, ApplicationProtocol::Http1, &listener_runtime).await?;
@@ -70,6 +80,7 @@ pub async fn run_with_port_tx(
                 field_discovery_window: Duration::from_secs(config.field_discovery_window_secs),
             },
         ),
+        system_store: system_index_store,
     };
     let app = super::routes::build_router(state, &runtime, &config);
     tracing::info!("OpenSearch API server listening on {}", local_address);

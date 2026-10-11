@@ -282,7 +282,7 @@ fn every_stand_opensearch_datasource_states_the_version_the_stand_reports() {
 fn the_stand_query_document_resolves_the_system_location_to_the_warehouse_bucket() {
     let config = QueryConfig::from_file(STAND_QUERY_DOCUMENT).expect("the stand query document must load and validate");
 
-    let system_store = build_system_object_store(&config).expect("the stand's client builds");
+    let system_object_store = build_system_object_store(&config).expect("the stand's client builds");
 
-    assert_eq!(system_store.location(), "s3://warehouse/opensearch-system");
+    assert_eq!(system_object_store.location(), "s3://warehouse/opensearch-system");
 }

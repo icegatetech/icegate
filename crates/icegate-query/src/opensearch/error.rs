@@ -7,8 +7,9 @@
 //! where the metadata keys (for example the missing `index`) are present only on errors that carry
 //! them; a `503` adds `details` beside `reason` and a `Retry-After` header.
 //!
-//! `503` is reserved for conditions a client should retry unchanged (memory-pressure shedding,
-//! the query deadline); a limit a request can avoid by asking for less is a `4xx`, never a `503`.
+//! `503` is reserved for the conditions a client should retry: memory-pressure shedding, the
+//! query deadline and system-index write contention. A limit a request can avoid by asking for
+//! less is a `400`, or a `413` for a body or a snapshot that is too large.
 
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -108,6 +109,52 @@ impl OpenSearchError {
         .with_metadata("index_uuid", "_na_")
         .with_metadata("resource.id", index)
         .with_metadata("resource.type", "index_or_alias")
+    }
+
+    /// The system index `index` already exists (`400`).
+    pub(crate) fn resource_already_exists(index: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "resource_already_exists_exception",
+            format!("index [{index}/_na_] already exists"),
+        )
+        .with_metadata("index", index)
+        .with_metadata("index_uuid", "_na_")
+    }
+
+    /// A write addressed to `index`, which accepts none: a data index, or a name that would create
+    /// an index outside the system indices (`403`).
+    pub(crate) fn cluster_block(index: &str) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "cluster_block_exception",
+            format!("index [{index}] blocked by: [FORBIDDEN/8/index write (api)];"),
+        )
+    }
+
+    /// A system-index write could not be confirmed: its compare-and-swap kept being refused or
+    /// losing its answer, or its snapshot object could not be stored, until the query deadline, or
+    /// a lineage it needed was missing (`503`, retryable). Its outcome is unknown: it may have
+    /// landed.
+    pub(crate) fn write_contention() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write_contention_exception",
+            "the system-index write could not be confirmed; its outcome is unknown, retry later",
+        )
+    }
+
+    /// A system-index write would grow the tenant's decoded snapshot past `max_snapshot_bytes`
+    /// (`413`); nothing was written.
+    pub(crate) fn snapshot_too_large(max_snapshot_bytes: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "illegal_argument_exception",
+            format!(
+                "the write would grow the tenant's system indices past \
+                 opensearch.system_indices.max_snapshot_bytes ({max_snapshot_bytes} bytes)"
+            ),
+        )
     }
 
     /// No route serves `method` on `path`: a `400` `illegal_argument_exception` in the envelope,
@@ -329,5 +376,36 @@ mod tests {
         error["root_cause"] = json!([cause]);
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, json!({ "error": error, "status": 404 }));
+    }
+
+    #[tokio::test]
+    async fn system_store_errors_render_their_status_type_and_metadata() {
+        let (status, body) = render_envelope(OpenSearchError::resource_already_exists(".kibana_1")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "resource_already_exists_exception");
+        assert_eq!(
+            body["error"]["root_cause"][0]["type"],
+            "resource_already_exists_exception"
+        );
+        assert_eq!(body["error"]["index"], ".kibana_1");
+        assert_eq!(body["error"]["root_cause"][0]["index_uuid"], "_na_");
+
+        let (status, body) = render_envelope(OpenSearchError::cluster_block("logs")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "cluster_block_exception");
+        assert_eq!(
+            body["error"]["reason"],
+            "index [logs] blocked by: [FORBIDDEN/8/index write (api)];"
+        );
+        assert_eq!(body["status"], 403);
+
+        let (status, body) = render_envelope(OpenSearchError::write_contention()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "write_contention_exception");
+        assert!(body["error"]["details"].is_string());
+
+        let (status, body) = render_envelope(OpenSearchError::snapshot_too_large(1024)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["status"], 413);
     }
 }

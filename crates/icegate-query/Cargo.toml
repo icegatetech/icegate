@@ -102,6 +102,10 @@ chrono = { workspace = true }
 itoa = { workspace = true }
 # Fresh object names: the startup probe's key and each snapshot object's name.
 uuid = { workspace = true }
+# Snapshot objects of the system-index store are zstd frames.
+zstd = { workspace = true }
+# Jitter of the system-index write loop's backoff, so contending replicas spread apart.
+rand = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [[bench]]

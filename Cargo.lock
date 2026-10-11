@@ -5391,6 +5391,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "zstd 0.13.4",
 ]
 
 [[package]]

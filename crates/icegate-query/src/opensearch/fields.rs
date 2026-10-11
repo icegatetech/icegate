@@ -400,7 +400,10 @@ mod tests {
     use crate::opensearch::config::{EmulatedVersion, OpenSearchConfig};
     use crate::opensearch::error::render_envelope;
     use crate::opensearch::node::NodeIdentity;
-    use crate::test_support::{LogAttributesRow, LogsWarehouse, build_logs_warehouse, commit_log_attributes_rows};
+    use crate::test_support::{
+        LogAttributesRow, LogsWarehouse, build_in_memory_system_index_store, build_logs_warehouse,
+        commit_log_attributes_rows,
+    };
 
     fn build_leaf(name: &str, field_type: FieldType, is_searchable: bool, is_aggregatable: bool) -> IndexField {
         IndexField {
@@ -447,6 +450,7 @@ mod tests {
                     field_discovery_window: Duration::from_hours(24),
                 },
             ),
+            system_store: build_in_memory_system_index_store(),
         };
         let tenant = Extension(TenantId::new("tenant-a").expect("a valid tenant"));
         let mapping_parameters = MappingParameters {

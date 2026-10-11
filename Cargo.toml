@@ -184,6 +184,7 @@ regex = "1.12"
 # Utilities
 itoa = "1"
 bytes = "1.11.1"
+zstd = "0.13"
 base64 = "0.22"
 percent-encoding = "2"
 sha2 = "0.10"

@@ -5,10 +5,16 @@
 //! compare-and-swap and conditional GET; the listener probes them at startup and refuses to start
 //! without them.
 
+mod api;
 mod client;
+mod codec;
+mod snapshot;
+mod store;
 
+pub(crate) use api::{create_system_index, describe_system_index};
 pub use client::{SystemObjectStore, build_system_object_store};
 pub(crate) use client::{
     parse_s3_location, probe_conditional_operations, refuse_overlapping_locations, refuse_table_location_overlap,
     resolve_system_indices_location,
 };
+pub(crate) use store::{SystemIndexLimits, SystemIndexStore};

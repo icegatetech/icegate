@@ -9,6 +9,7 @@
 //! - `indices`: `_resolve/index` and `<index>/_settings`
 //! - `listener`: the listener's start-up
 //! - `rustfs_conditional`: the object-store guarantees the system-index store builds on
+//! - `system_indices`: index-level system-index endpoints and their tenant boundary
 //! - `system_store_rustfs`: the system-index store against RustFS through the production constructor
 
 mod opensearch;
