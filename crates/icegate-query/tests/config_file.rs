@@ -7,10 +7,17 @@
 //! `demo`.
 #![allow(clippy::expect_used)]
 
-use std::{io::Write as _, path::PathBuf};
+use std::{
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
-use icegate_common::{TenantPolicy, TlsConfig};
+use icegate_common::{
+    LOGS_TABLE, SPANS_TABLE, TenantPolicy, TlsConfig, load_config_file,
+    schema::{COL_BODY, COL_SEVERITY_TEXT, COL_TIMESTAMP},
+};
 use icegate_query::QueryConfig;
+use serde::Deserialize;
 
 /// The stand's query document.
 const STAND_QUERY_DOCUMENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/docker/query.yaml");
@@ -131,4 +138,138 @@ fn the_stand_query_document_serves_opensearch_on_9200() {
 
     assert!(config.opensearch.enabled);
     assert_eq!(config.opensearch.port, 9200);
+}
+
+/// The stand's Grafana provisioning, whose `OpenSearch` datasources read the stand's query service.
+const STAND_DATASOURCES_DOCUMENT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../config/docker/grafana/provisioning/datasources/datasources.yaml"
+);
+
+/// The plugin id a Grafana `OpenSearch` datasource names in its `type`.
+const OPENSEARCH_PLUGIN_ID: &str = "grafana-opensearch-datasource";
+
+/// The parts of the stand's datasource provisioning this test reads.
+#[derive(Deserialize)]
+struct DatasourcesDocument {
+    datasources: Vec<Datasource>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Datasource {
+    name: String,
+    // Grafana's `type` names the plugin that serves the datasource.
+    #[serde(rename = "type")]
+    plugin_id: String,
+    #[serde(default)]
+    json_data: DatasourceJsonData,
+}
+
+/// The `jsonData` keys this test reads. `interval` and `pdcInjected` are read only to assert
+/// that the stand provisions neither.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasourceJsonData {
+    database: Option<String>,
+    time_field: Option<String>,
+    log_message_field: Option<String>,
+    log_level_field: Option<String>,
+    version: Option<String>,
+    version_label: Option<String>,
+    flavor: Option<String>,
+    ppl_enabled: Option<bool>,
+    max_concurrent_shard_requests: Option<u64>,
+    interval: Option<serde_json::Value>,
+    pdc_injected: Option<serde_json::Value>,
+}
+
+/// The provisioned `version` and `versionLabel` are a second copy of the version the stand's
+/// IceGate reports, so they are tied to it here: a version bump that misses the provisioning
+/// file fails this test instead of leaving two versions apart. `from_file` validated the
+/// configured version, so it is the canonical version IceGate reports as is. The stand
+/// provisions the logs and the metrics-exploration datasource, each with the fixed `jsonData`
+/// the stand's `OpenSearch` datasources carry.
+///
+/// The index and column names the datasources name are copies of the schema's table and
+/// column names, so they are read from the schema constants: a renamed table or column fails
+/// here instead of leaving a datasource that names something the stand no longer serves.
+#[test]
+fn every_stand_opensearch_datasource_states_the_version_the_stand_reports() {
+    let config = QueryConfig::from_file(STAND_QUERY_DOCUMENT).expect("the stand query document must load and validate");
+    let document: DatasourcesDocument =
+        load_config_file(Path::new(STAND_DATASOURCES_DOCUMENT)).expect("the stand datasource document must load");
+
+    let opensearch_datasources: Vec<&Datasource> = document
+        .datasources
+        .iter()
+        .filter(|datasource| datasource.plugin_id == OPENSEARCH_PLUGIN_ID)
+        .collect();
+
+    let expected_log_fields_by_table = [
+        (LOGS_TABLE, Some(COL_BODY), Some(COL_SEVERITY_TEXT)),
+        (SPANS_TABLE, None, None),
+    ];
+
+    // The provisioning order is not part of the contract, so both sides are put in one order.
+    let mut databases: Vec<Option<&str>> = opensearch_datasources
+        .iter()
+        .map(|datasource| datasource.json_data.database.as_deref())
+        .collect();
+    databases.sort_unstable();
+    let mut expected_databases = expected_log_fields_by_table.map(|(table, ..)| Some(table));
+    expected_databases.sort_unstable();
+    assert_eq!(databases, expected_databases);
+    let expected_label = format!("OpenSearch {}", config.opensearch.version);
+    for datasource in opensearch_datasources {
+        let json_data = &datasource.json_data;
+        assert_eq!(
+            json_data.version.as_deref(),
+            Some(config.opensearch.version.as_str()),
+            "{}",
+            datasource.name
+        );
+        assert_eq!(
+            json_data.version_label.as_deref(),
+            Some(expected_label.as_str()),
+            "{}",
+            datasource.name
+        );
+        assert_eq!(
+            json_data.time_field.as_deref(),
+            Some(COL_TIMESTAMP),
+            "{}",
+            datasource.name
+        );
+        let (_, expected_message_field, expected_level_field) = expected_log_fields_by_table
+            .iter()
+            .copied()
+            .find(|&(table, ..)| json_data.database.as_deref() == Some(table))
+            .expect("the databases assertion admits only the tables listed in the expectations");
+        assert_eq!(
+            json_data.log_message_field.as_deref(),
+            expected_message_field,
+            "{}",
+            datasource.name
+        );
+        assert_eq!(
+            json_data.log_level_field.as_deref(),
+            expected_level_field,
+            "{}",
+            datasource.name
+        );
+        assert_eq!(json_data.flavor.as_deref(), Some("opensearch"), "{}", datasource.name);
+        assert_eq!(json_data.ppl_enabled, Some(true), "{}", datasource.name);
+        assert_eq!(json_data.max_concurrent_shard_requests, Some(5), "{}", datasource.name);
+        assert!(
+            json_data.interval.is_none(),
+            "{} must not set interval",
+            datasource.name
+        );
+        assert!(
+            json_data.pdc_injected.is_none(),
+            "{} must not set pdcInjected",
+            datasource.name
+        );
+    }
 }

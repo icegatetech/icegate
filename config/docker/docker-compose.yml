@@ -312,6 +312,9 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_USERS_DEFAULT_THEME: "system"
+      # The Grafana OpenSearch datasource plugin the stand's OpenSearch datasources use. This is
+      # the one place its version is pinned.
+      GF_PLUGINS_PREINSTALL_SYNC: grafana-opensearch-datasource@2.34.4
     depends_on:
       query:
         condition: service_started

@@ -75,3 +75,46 @@ datasources:
         query: '{trace_id="$${__span.traceId}"}'
     secureJsonData:
       httpHeaderValue1: demo
+  # The OpenSearch API of the stand's query service: one datasource reading the
+  # logs index, and one reading the spans index for metrics exploration.
+  # `version` and `versionLabel` state the version config/docker/query.yaml
+  # resolves; crates/icegate-query/tests/config_file.rs ties them to it, and the
+  # index and field names to the IceGate schema. `interval` stays unset.
+  - name: OpenSearch (demo)
+    uid: opensearch-demo
+    type: grafana-opensearch-datasource
+    access: proxy
+    url: http://query:9200
+    isDefault: false
+    editable: false
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+      database: logs
+      timeField: timestamp
+      logMessageField: body
+      logLevelField: severity_text
+      flavor: opensearch
+      version: "3.9.0"
+      versionLabel: "OpenSearch 3.9.0"
+      maxConcurrentShardRequests: 5
+      pplEnabled: true
+    secureJsonData:
+      httpHeaderValue1: demo
+  - name: OpenSearch spans (demo)
+    uid: opensearch-spans-demo
+    type: grafana-opensearch-datasource
+    access: proxy
+    url: http://query:9200
+    isDefault: false
+    editable: false
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+      database: spans
+      timeField: timestamp
+      flavor: opensearch
+      version: "3.9.0"
+      versionLabel: "OpenSearch 3.9.0"
+      maxConcurrentShardRequests: 5
+      pplEnabled: true
+    secureJsonData:
+      httpHeaderValue1: demo
