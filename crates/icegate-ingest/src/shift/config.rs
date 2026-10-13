@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use jobmanager::{JobStateCodecKind, S3StorageConfig};
+use jobmanager::{JobStateCodecKind, S3Config};
 use serde::{Deserialize, Serialize};
 
 use super::timeout::validate_timeout_ms;
@@ -97,18 +97,18 @@ impl JobsStorageConfig {
     }
 
     /// Convert to jobmanager S3 storage configuration.
-    pub fn to_s3_config(&self) -> Result<S3StorageConfig, IngestError> {
+    pub fn to_s3_config(&self) -> Result<S3Config, IngestError> {
         let access_key_id = self.resolve_access_key_id()?;
         let secret_access_key = self.resolve_secret_access_key()?;
 
-        Ok(S3StorageConfig::new(
+        Ok(S3Config::new(
             self.endpoint.as_str(),
             access_key_id,
             secret_access_key,
             self.bucket.as_str(),
             self.region.as_str(),
         )
-        .with_bucket_prefix(self.prefix.as_str())
+        .with_state_prefix(self.prefix.as_str())
         .with_job_state_codec(self.job_state_codec.into())
         .with_request_timeout(Duration::from_secs(self.request_timeout_secs)))
     }

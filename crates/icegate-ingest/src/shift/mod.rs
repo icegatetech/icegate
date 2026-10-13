@@ -45,7 +45,7 @@ use instrumentation::{
     CommitTaskRunnerWithMetrics, PlanTaskRunnerWithMetrics, QueueReaderWithMetrics, RowGroupsMergerObserverWithMetrics,
     ShiftTaskRunnerWithMetrics, StorageWithMetrics,
 };
-use jobmanager::{JobsManager, JobsManagerHandle, MetricsSink, S3StorageConfig, TaskDefinition};
+use jobmanager::{JobsManager, JobsManagerHandle, MetricsSink, S3Config, TaskDefinition};
 use plan_runner::PlanTaskRunnerImpl;
 pub use planner_partitioning::{CURRENT_PLANNER_PARTITION_SPEC, PlannerPartitionSpec};
 use shift_runner::ShiftTaskRunnerImpl;
@@ -107,7 +107,7 @@ impl Shifter {
         catalog: Arc<dyn Catalog>,
         queue_reader: Arc<ParquetQueueReader>,
         shift_config: Arc<ShiftConfig>,
-        jobs_storage: S3StorageConfig,
+        jobs_storage: S3Config,
         shift_metrics: ShiftMetrics,
         jobs_manager_metrics: Arc<dyn MetricsSink>,
         jobs: &[ShiftJobSpec],
@@ -144,7 +144,7 @@ impl Shifter {
         catalog: Arc<dyn Catalog>,
         queue_reader: Arc<ParquetQueueReader>,
         shift_config: Arc<ShiftConfig>,
-        jobs_storage: S3StorageConfig,
+        jobs_storage: S3Config,
         shift_metrics: ShiftMetrics,
         jobs_manager_metrics: Arc<dyn MetricsSink>,
         jobs: &[ShiftJobSpec],

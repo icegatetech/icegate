@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use jobmanager::{JobStateCodecKind, S3StorageConfig};
+use jobmanager::{JobStateCodecKind, S3Config};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MaintainError;
@@ -123,7 +123,7 @@ impl JobsStorageConfig {
         Ok(())
     }
 
-    /// Convert to a jobmanager [`S3StorageConfig`].
+    /// Convert to a jobmanager [`S3Config`].
     ///
     /// Credentials are taken from the explicit fields when set, otherwise from
     /// the `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables.
@@ -134,18 +134,18 @@ impl JobsStorageConfig {
     ///
     /// Returns [`MaintainError::Config`] if credentials are configured as empty
     /// strings or cannot be resolved from the environment.
-    pub fn to_s3_storage_config(&self, config_block: &str) -> Result<S3StorageConfig, MaintainError> {
+    pub fn to_s3_storage_config(&self, config_block: &str) -> Result<S3Config, MaintainError> {
         let access_key_id = self.resolve_access_key_id(config_block)?;
         let secret_access_key = self.resolve_secret_access_key(config_block)?;
 
-        Ok(S3StorageConfig::new(
+        Ok(S3Config::new(
             self.endpoint.as_str(),
             access_key_id,
             secret_access_key,
             self.bucket.as_str(),
             self.region.as_str(),
         )
-        .with_bucket_prefix(self.prefix.as_str())
+        .with_state_prefix(self.prefix.as_str())
         .with_job_state_codec(self.job_state_codec.into())
         .with_request_timeout(Duration::from_secs(self.request_timeout_secs)))
     }
