@@ -1,7 +1,9 @@
 //! Shift configuration.
 
+use std::fmt;
 use std::time::Duration;
 
+use icegate_common::storage::{REDACTED, StaticCredentials};
 use jobmanager::{JobStateCodecKind, S3Config};
 use serde::{Deserialize, Serialize};
 
@@ -20,11 +22,15 @@ pub enum JobStateCodec {
 }
 
 /// Job storage configuration for shift operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` redacts `secret_access_key`.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JobsStorageConfig {
-    /// S3 endpoint URL. Its scheme selects TLS: `https://` connects over TLS, `http://` does not.
-    pub endpoint: String,
+    /// S3 endpoint URL, for an S3-compatible store or an AWS endpoint the SDK would not pick on
+    /// its own. Its scheme selects TLS: `https://` connects over TLS, `http://` does not.
+    /// Absent (or blank) means the SDK resolves the regional AWS endpoint.
+    pub endpoint: Option<String>,
     /// Bucket name for job state.
     pub bucket: String,
     /// Prefix for job state objects.
@@ -35,16 +41,35 @@ pub struct JobsStorageConfig {
     pub job_state_codec: JobStateCodec,
     /// Request timeout for S3 operations, in seconds.
     pub request_timeout_secs: u64,
-    /// Access key ID for S3 (falls back to env if not set).
+    /// Static access key ID for S3. Set together with `secret_access_key`, or leave both unset to
+    /// sign with the AWS SDK's default credential chain. Blank counts as unset.
     pub access_key_id: Option<String>,
-    /// Secret access key for S3 (falls back to env if not set).
+    /// Static secret access key for S3. Set together with `access_key_id`; see there.
     pub secret_access_key: Option<String>,
+}
+
+// Manual `Debug` so an accidental log of a config holding the storage can never leak the
+// secret key; the access key id is an identifier, not a secret.
+impl fmt::Debug for JobsStorageConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobsStorageConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("job_state_codec", &self.job_state_codec)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &self.secret_access_key.as_ref().map(|_| REDACTED))
+            .finish()
+    }
 }
 
 impl Default for JobsStorageConfig {
     fn default() -> Self {
         Self {
-            endpoint: String::new(),
+            endpoint: None,
             bucket: String::new(),
             prefix: "shifter".to_string(),
             region: "us-east-1".to_string(),
@@ -67,12 +92,11 @@ impl From<JobStateCodec> for JobStateCodecKind {
 
 impl JobsStorageConfig {
     /// Validate job storage configuration values.
+    ///
+    /// An absent endpoint and absent keys are valid: they select the AWS regional endpoint and the
+    /// default credential chain. Half a key pair is rejected by [`Self::to_s3_config`], where the
+    /// keys are read.
     pub fn validate(&self) -> Result<(), IngestError> {
-        if self.endpoint.trim().is_empty() {
-            return Err(IngestError::Config(
-                "jobsmanager.storage.endpoint cannot be empty".to_string(),
-            ));
-        }
         if self.bucket.trim().is_empty() {
             return Err(IngestError::Config(
                 "jobsmanager.storage.bucket cannot be empty".to_string(),
@@ -97,60 +121,43 @@ impl JobsStorageConfig {
     }
 
     /// Convert to jobmanager S3 storage configuration.
+    ///
+    /// Static keys, when configured, sign every request; otherwise the AWS SDK's default
+    /// credential chain does. No environment variable is read here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Config`] naming the `shift.jobsmanager.storage` block when only one
+    /// of the two keys is set.
     pub fn to_s3_config(&self) -> Result<S3Config, IngestError> {
-        let access_key_id = self.resolve_access_key_id()?;
-        let secret_access_key = self.resolve_secret_access_key()?;
+        let credentials =
+            StaticCredentials::from_parts(self.access_key_id.clone(), self.secret_access_key.clone(), None)
+                .map_err(|error| IngestError::Config(format!("shift.jobsmanager.storage: {error}")))?;
 
-        Ok(S3Config::new(
-            self.endpoint.as_str(),
-            access_key_id,
-            secret_access_key,
-            self.bucket.as_str(),
-            self.region.as_str(),
-        )
-        .with_state_prefix(self.prefix.as_str())
-        .with_job_state_codec(self.job_state_codec.into())
-        .with_request_timeout(Duration::from_secs(self.request_timeout_secs)))
+        let mut s3_config = S3Config::new(self.bucket.as_str(), self.region.as_str());
+        if let Some(endpoint) = self.resolve_endpoint() {
+            s3_config = s3_config.with_endpoint(endpoint);
+        }
+        if let Some(credentials) = credentials {
+            s3_config = s3_config.with_static_credentials(
+                credentials.access_key_id,
+                credentials.secret_access_key,
+                credentials.session_token,
+            );
+        }
+
+        Ok(s3_config
+            .with_state_prefix(self.prefix.as_str())
+            .with_job_state_codec(self.job_state_codec.into())
+            .with_request_timeout(Duration::from_secs(self.request_timeout_secs)))
     }
 
-    fn resolve_access_key_id(&self) -> Result<String, IngestError> {
-        if let Some(access_key_id) = &self.access_key_id {
-            if access_key_id.trim().is_empty() {
-                return Err(IngestError::Config(
-                    "jobsmanager.storage.access_key_id cannot be empty".to_string(),
-                ));
-            }
-            return Ok(access_key_id.clone());
-        }
-
-        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-            .map_err(|_| IngestError::Config("AWS_ACCESS_KEY_ID environment variable is not set".to_string()))?;
-        if access_key_id.trim().is_empty() {
-            return Err(IngestError::Config(
-                "AWS_ACCESS_KEY_ID environment variable is empty".to_string(),
-            ));
-        }
-        Ok(access_key_id)
-    }
-
-    fn resolve_secret_access_key(&self) -> Result<String, IngestError> {
-        if let Some(secret_access_key) = &self.secret_access_key {
-            if secret_access_key.trim().is_empty() {
-                return Err(IngestError::Config(
-                    "jobsmanager.storage.secret_access_key cannot be empty".to_string(),
-                ));
-            }
-            return Ok(secret_access_key.clone());
-        }
-
-        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-            .map_err(|_| IngestError::Config("AWS_SECRET_ACCESS_KEY environment variable is not set".to_string()))?;
-        if secret_access_key.trim().is_empty() {
-            return Err(IngestError::Config(
-                "AWS_SECRET_ACCESS_KEY environment variable is empty".to_string(),
-            ));
-        }
-        Ok(secret_access_key)
+    /// The endpoint to connect to, or `None` when the SDK should resolve the regional AWS one.
+    ///
+    /// A blank value counts as absent: a deployment that renders `endpoint: ""` for "no endpoint"
+    /// must not hand the SDK an endpoint named by the empty string.
+    fn resolve_endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref().filter(|endpoint| !endpoint.trim().is_empty())
     }
 }
 
@@ -378,7 +385,121 @@ impl ShiftTimeoutsConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShiftConfig, ShiftJobsManagerConfig, ShiftTimeoutsConfig, default_jobs_manager_worker_count};
+    use super::{
+        JobsStorageConfig, ShiftConfig, ShiftJobsManagerConfig, ShiftTimeoutsConfig, default_jobs_manager_worker_count,
+    };
+    use crate::error::IngestError;
+
+    /// A job storage that names only the bucket: no endpoint, no keys.
+    fn storage_with_bucket_only() -> JobsStorageConfig {
+        JobsStorageConfig {
+            bucket: "jobs".to_string(),
+            ..JobsStorageConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_storage_without_an_endpoint() {
+        storage_with_bucket_only()
+            .validate()
+            .expect("an absent endpoint is the AWS regional endpoint, not a mistake");
+    }
+
+    /// No environment variable is read, so the outcome cannot depend on the
+    /// `AWS_*` variables of the process running the test.
+    #[test]
+    fn to_s3_config_succeeds_without_keys_or_endpoint() {
+        assert!(storage_with_bucket_only().to_s3_config().is_ok());
+    }
+
+    /// A deployment may render `endpoint: ""` for "no endpoint". The S3 config
+    /// cannot be inspected, so the rule is checked where it is decided.
+    #[test]
+    fn to_s3_config_treats_a_blank_endpoint_as_none() {
+        let cases = [
+            (None, None),
+            (Some(""), None),
+            (Some("  "), None),
+            (Some("http://localhost:9000"), Some("http://localhost:9000")),
+        ];
+
+        for (configured, resolved) in cases {
+            let storage = JobsStorageConfig {
+                endpoint: configured.map(str::to_string),
+                ..storage_with_bucket_only()
+            };
+
+            assert_eq!(storage.resolve_endpoint(), resolved, "endpoint {configured:?}");
+            assert!(
+                storage.validate().is_ok(),
+                "endpoint {configured:?} must pass validation"
+            );
+            assert!(
+                storage.to_s3_config().is_ok(),
+                "endpoint {configured:?} must convert to an S3 config"
+            );
+        }
+    }
+
+    #[test]
+    fn to_s3_config_accepts_a_complete_key_pair() {
+        let storage = JobsStorageConfig {
+            access_key_id: Some("access-key".to_string()),
+            secret_access_key: Some("secret-key".to_string()),
+            ..storage_with_bucket_only()
+        };
+
+        assert!(storage.to_s3_config().is_ok());
+    }
+
+    /// A deployment that renders `access_key_id: ""` for "no static key" means
+    /// no static key, not a key named by the empty string.
+    #[test]
+    fn to_s3_config_treats_blank_keys_as_absent() {
+        let storage = JobsStorageConfig {
+            access_key_id: Some(String::new()),
+            secret_access_key: Some("  ".to_string()),
+            ..storage_with_bucket_only()
+        };
+
+        assert!(storage.to_s3_config().is_ok());
+    }
+
+    #[test]
+    fn half_a_key_pair_names_the_config_block() {
+        let halves = [(Some("access-key"), None), (None, Some("secret-key"))];
+
+        for (access_key_id, secret_access_key) in halves {
+            let storage = JobsStorageConfig {
+                access_key_id: access_key_id.map(str::to_string),
+                secret_access_key: secret_access_key.map(str::to_string),
+                ..storage_with_bucket_only()
+            };
+
+            assert!(
+                matches!(
+                    storage.to_s3_config(),
+                    Err(IngestError::Config(ref message)) if message.contains("shift.jobsmanager.storage")
+                ),
+                "half a key pair ({access_key_id:?}, {secret_access_key:?}) must be a config error naming the block"
+            );
+        }
+    }
+
+    /// The secret reaches logs through any `{:?}` of a config that holds the storage,
+    /// so the formatted storage itself must not carry it.
+    #[test]
+    fn debug_output_does_not_contain_the_secret_access_key() {
+        let storage = JobsStorageConfig {
+            access_key_id: Some("access-key".to_string()),
+            secret_access_key: Some("secret-key-must-not-leak".to_string()),
+            ..storage_with_bucket_only()
+        };
+
+        let formatted = format!("{storage:?}");
+
+        assert!(!formatted.contains("secret-key-must-not-leak"), "got {formatted}");
+    }
 
     #[test]
     fn shift_read_default_input_bytes_bounds() {

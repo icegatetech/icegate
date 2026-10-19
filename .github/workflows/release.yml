@@ -64,6 +64,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # A version that half-published is used up: cut the next version instead of
+      # re-running. A version tag names one build for good, and pushing it again would
+      # repoint the tag away from content that may already be signed and pulled. The
+      # chart is checked here too, so a chart version that already exists stops the
+      # run before any image is pushed. Only the version tags are checked; the moving
+      # tags (`<major>.<minor>`, `latest`) exist by design.
+      - name: Check the version is unpublished
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          refs=("ghcr.io/icegatetech/charts/icegate:${VERSION}")
+          for target in query ingest maintain catalog; do
+            refs+=("${IMAGE_PREFIX}-${target}:${VERSION}")
+          done
+          python3 scripts/release-check-unpublished.py "${refs[@]}"
+
       - name: Generate build timestamp
         id: timestamp
         run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
@@ -129,6 +145,7 @@ jobs:
             type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
 
       - name: Build and push
+        id: bake
         uses: docker/bake-action@v6
         with:
           files: |
@@ -153,6 +170,55 @@ jobs:
             *.args.BUILD_DATE=${{ steps.timestamp.outputs.value }}
             *.cache-from=type=gha,scope=release
             *.cache-to=type=gha,mode=max,scope=release
+
+      # Both pins repeat what the v0.2.0-rc10 run resolved for `@v3`: that run logged
+      # `cosign-release: v2.5.2` and its signatures verified. A moving tag in a step
+      # that signs releases would change the signer without a diff to review.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+        with:
+          cosign-release: v2.5.2
+
+      # Signed by digest, never by tag: a tag can be repointed after the push, and the
+      # signature would then cover whatever it points at by then. `--recursive` signs
+      # the multi-arch index and every manifest it lists.
+      - name: Sign images
+        env:
+          COSIGN_YES: "true"
+          BAKE_METADATA: ${{ steps.bake.outputs.metadata }}
+        run: |
+          set -euo pipefail
+          for target in query ingest maintain catalog; do
+            digest=$(jq -r --arg t "$target" '.[$t]["containerimage.digest"]' <<<"${BAKE_METADATA}")
+            if [[ -z "${digest}" || "${digest}" == "null" ]]; then
+              echo "::error::bake metadata has no image digest for target '${target}'; nothing to sign"
+              exit 1
+            fi
+            cosign sign --recursive "${IMAGE_PREFIX}-${target}@${digest}"
+          done
+
+      # The identity names this tag, so a signature from any other workflow or tag
+      # fails here. The index and every manifest it lists are verified one by one, so
+      # a gap in `--recursive` fails the release instead of reaching a user.
+      - name: Verify image signatures
+        env:
+          BAKE_METADATA: ${{ steps.bake.outputs.metadata }}
+        run: |
+          set -euo pipefail
+          for target in query ingest maintain catalog; do
+            image="${IMAGE_PREFIX}-${target}"
+            digest=$(jq -r --arg t "$target" '.[$t]["containerimage.digest"]' <<<"${BAKE_METADATA}")
+            platform_digests=$(docker buildx imagetools inspect --raw "${image}@${digest}" | jq -r '.manifests[].digest')
+            if [[ -z "${platform_digests}" ]]; then
+              echo "::error::${image}@${digest} lists no per-platform manifests; refusing to verify only the index"
+              exit 1
+            fi
+            while read -r reference_digest; do
+              cosign verify "${image}@${reference_digest}" \
+                --certificate-identity "https://github.com/icegatetech/icegate/.github/workflows/release.yml@${GITHUB_REF}" \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            done <<<"${digest}"$'\n'"${platform_digests}"
+          done
 
   # ── Helm chart (OCI artifact → GHCR) ─────────────────────────────────────
   helm-chart:
@@ -222,14 +288,40 @@ jobs:
       - name: Package chart
         run: helm package config/helm/icegate
 
+      # Only the chart is checked here: the `docker` job this one needs has already
+      # pushed the images, so checking them would fail every re-run of this job alone.
+      # A chart that was pushed and then failed to sign is still refused as used up.
+      - name: Check the chart version is unpublished
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 scripts/release-check-unpublished.py "ghcr.io/icegatetech/charts/icegate:${VERSION}"
+
+      # The digest is what gets signed and verified below; the tag is only a name
+      # for it. helm prints it on stdout, which is the one place this job learns it.
       - name: Push chart to GHCR
-        run: helm push "icegate-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/icegatetech/charts
+        run: |
+          set -euo pipefail
+          OUTPUT=$(helm push "icegate-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/icegatetech/charts 2>&1) || {
+            echo "${OUTPUT}"
+            exit 1
+          }
+          echo "${OUTPUT}"
+          DIGEST=$(sed -nE 's/^Digest: (sha256:[0-9a-f]{64}).*/\1/p' <<<"${OUTPUT}")
+          if [[ -z "${DIGEST}" ]]; then
+            echo "::error::helm push printed no 'Digest: sha256:...' line; nothing to sign"
+            exit 1
+          fi
+          echo "CHART_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
 
       - name: Install oras
         uses: oras-project/setup-oras@v1
 
+      # Same pins as the docker job, for the same reason.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+        with:
+          cosign-release: v2.5.2
 
       - name: Push Artifact Hub repository metadata
         run: |
@@ -241,15 +333,12 @@ jobs:
       - name: Sign the chart
         env:
           COSIGN_YES: "true"
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          cosign sign "ghcr.io/icegatetech/charts/icegate:${VERSION}"
+        run: cosign sign "ghcr.io/icegatetech/charts/icegate@${CHART_DIGEST}"
 
       - name: Verify the signature
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          cosign verify "ghcr.io/icegatetech/charts/icegate:${VERSION}" \
-            --certificate-identity-regexp 'https://github.com/icegatetech/icegate/.*' \
+          cosign verify "ghcr.io/icegatetech/charts/icegate@${CHART_DIGEST}" \
+            --certificate-identity "https://github.com/icegatetech/icegate/.github/workflows/release.yml@${GITHUB_REF}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
   # ── GitHub Release ────────────────────────────────────────────────────────

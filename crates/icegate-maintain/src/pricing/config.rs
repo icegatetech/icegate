@@ -224,12 +224,11 @@ mod tests {
     /// An enabled config whose jobs-state storage is populated enough to reach
     /// the crawler's own checks. `PricingConfig::validate` now also validates
     /// the `jobsmanager` block (as `GcConfig::validate` does), so a bare
-    /// `default()` with `enabled = true` fails on the empty S3 endpoint before
+    /// `default()` with `enabled = true` fails on the empty S3 bucket before
     /// the tunable under test is ever reached.
     fn enabled_config() -> PricingConfig {
         let mut config = PricingConfig::default();
         config.enabled = true;
-        config.jobsmanager.storage.endpoint = "http://localhost:9000".to_string();
         config.jobsmanager.storage.bucket = "warehouse".to_string();
         config
     }

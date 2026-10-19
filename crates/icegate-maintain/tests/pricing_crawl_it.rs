@@ -289,7 +289,7 @@ async fn pricing_runner_builds_starts_and_drains() {
             poll_interval_ms: 100,
             scan_interval_secs: 1,
             storage: JobsStorageConfig {
-                endpoint: conn.endpoint.clone(),
+                endpoint: Some(conn.endpoint.clone()),
                 bucket: BUCKET_NAME.to_string(),
                 prefix: "pricing".to_string(),
                 region: "us-east-1".to_string(),

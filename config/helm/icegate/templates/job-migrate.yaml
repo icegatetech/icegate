@@ -26,10 +26,10 @@ spec:
       securityContext:
         {{- include "icegate.podSecurityContext" . | nindent 8 }}
       restartPolicy: OnFailure
-      {{- include "icegate.waitForDeps" (dict "context" . "config" .Values.migrate.waitForDependencies) | nindent 6 }}
+      {{- include "icegate.waitForDeps" (dict "context" . "config" .Values.migrate.waitForDependencies "component" "migrate") | nindent 6 }}
       containers:
         - name: migrate
-          image: {{ include "icegate.image" (dict "image" .Values.migrate.image "tag" .Chart.AppVersion) }}
+          image: {{ include "icegate.image" (dict "image" .Values.migrate.image "tag" .Chart.AppVersion "key" "migrate.image") }}
           imagePullPolicy: {{ .Values.migrate.image.pullPolicy }}
           command:
             - /usr/local/bin/entrypoint

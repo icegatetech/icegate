@@ -33,6 +33,14 @@
         "name": { "type": ["string", "null"], "description": "Name of an existing ServiceAccount to use instead of creating one." }
       }
     },
+    "podSecurity": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Pod Security checks on what an operator adds to a pod.",
+      "properties": {
+        "checkRestricted": { "type": ["boolean", "null"], "description": "Fail the render when an entry of ingest.extraContainers or ingest.extraVolumes breaks the restricted Pod Security level." }
+      }
+    },
     "catalog": {
       "type": ["object", "null"],
       "additionalProperties": true,
@@ -117,6 +125,16 @@
         "tempo": { "type": ["object", "null"], "additionalProperties": true, "description": "Tempo-compatible API listener." },
         "flightSql": { "type": ["object", "null"], "additionalProperties": true, "description": "Arrow Flight SQL listener." },
         "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Operational listener: /health always, /metrics when enabled." },
+        "tls": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Server-side TLS for every listener of the query component, the operational one included.",
+          "properties": {
+            "enabled": { "type": ["boolean", "null"], "description": "Serve TLS on every listener of the component and switch its probes and ServiceMonitor endpoint to https." },
+            "secretName": { "type": ["string", "null"], "description": "Secret holding tls.crt and tls.key. Required when enabled." },
+            "reloadIntervalSecs": { "type": ["integer", "null"], "minimum": 1, "description": "Seconds between re-reads of the two files. Unset, the component default applies. The component refuses a value above its upper bound, icegate_common::listener::MAX_TLS_RELOAD_INTERVAL_SECS, when it starts." }
+          }
+        },
         "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings." },
         "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
         "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },
@@ -155,6 +173,16 @@
         "otlpHttp": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP HTTP receiver, including the bind address." },
         "otlpGrpc": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP gRPC receiver, including the bind address." },
         "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Operational listener: /health always, /metrics when enabled." },
+        "tls": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Server-side TLS for the OTLP receivers and the operational listener of the ingest component.",
+          "properties": {
+            "enabled": { "type": ["boolean", "null"], "description": "Serve TLS on every listener of the component and switch its probes and ServiceMonitor endpoint to https." },
+            "secretName": { "type": ["string", "null"], "description": "Secret holding tls.crt and tls.key. Required when enabled." },
+            "reloadIntervalSecs": { "type": ["integer", "null"], "minimum": 1, "description": "Seconds between re-reads of the two files. Unset, the component default applies. The component refuses a value above its upper bound, icegate_common::listener::MAX_TLS_RELOAD_INTERVAL_SECS, when it starts." }
+          }
+        },
         "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings." },
         "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
         "extraEnv": { "type": ["array", "null"], "description": "Additional environment variables." },
@@ -201,6 +229,16 @@
         "walCleanup": { "type": ["object", "null"], "additionalProperties": true, "description": "WAL segment reclamation settings." },
         "pricing": { "type": ["object", "null"], "additionalProperties": true, "description": "LLM pricing table settings." },
         "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Metrics endpoint settings." },
+        "tls": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Server-side TLS for the operational listener of the maintain component.",
+          "properties": {
+            "enabled": { "type": ["boolean", "null"], "description": "Serve TLS on every listener of the component and switch its probes and ServiceMonitor endpoint to https." },
+            "secretName": { "type": ["string", "null"], "description": "Secret holding tls.crt and tls.key. Required when enabled." },
+            "reloadIntervalSecs": { "type": ["integer", "null"], "minimum": 1, "description": "Seconds between re-reads of the two files. Unset, the component default applies. The component refuses a value above its upper bound, icegate_common::listener::MAX_TLS_RELOAD_INTERVAL_SECS, when it starts." }
+          }
+        },
         "service": { "type": ["object", "null"], "additionalProperties": true, "description": "Service settings." },
         "tracing": { "type": ["object", "null"], "additionalProperties": true, "description": "OTLP tracing settings. Enabling this requires maintain.tracing.otlpEndpoint; a Helm required guard enforces it." },
         "rustLog": { "type": ["string", "null"], "description": "RUST_LOG filter for the component." },
@@ -211,6 +249,14 @@
         "affinity": { "type": ["object", "null"], "description": "Affinity rules." },
         "livenessProbe": { "type": ["object", "null"], "description": "Liveness probe." },
         "waitForDependencies": { "type": ["object", "null"], "additionalProperties": true, "description": "Init-container dependency gate." }
+      }
+    },
+    "tls": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "TLS settings shared by the components that serve it.",
+      "properties": {
+        "caConfigMapName": { "type": ["string", "null"], "description": "ConfigMap holding ca.crt, the CA of the serving certificates. Required for a ServiceMonitor that scrapes a component serving TLS." }
       }
     },
     "serviceMonitor": {

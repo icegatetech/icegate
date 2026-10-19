@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use icegate_common::{
-    CatalogConfig, MemoryPressureConfig, OperationalConfig, StorageConfig, TenantPolicy, TracingConfig,
+    CatalogConfig, MemoryPressureConfig, OperationalConfig, StorageConfig, TenantPolicy, TlsConfig, TracingConfig,
     check_port_conflicts, load_config_file,
 };
 use icegate_queue::QueueConfig;
@@ -36,6 +36,10 @@ pub struct IngestConfig {
     /// How the tenant of an incoming request is decided.
     #[serde(default)]
     pub tenant: TenantPolicy,
+    /// Server-side TLS for every listener of this process: OTLP gRPC, OTLP HTTP and the
+    /// operational one. Absent means all of them serve plaintext.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     /// OTLP HTTP server
     pub otlp_http: OtlpHttpConfig,
     /// OTLP gRPC server
@@ -105,6 +109,9 @@ impl IngestConfig {
         self.catalog.validate()?;
         self.storage.validate()?;
         self.tenant.validate()?;
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
+        }
         self.otlp_http.validate()?;
         self.otlp_grpc.validate()?;
         self.shift.validate()?;
@@ -124,17 +131,19 @@ impl IngestConfig {
 
 #[cfg(test)]
 mod tests {
-    use icegate_common::TenantPolicy;
+    use std::path::PathBuf;
+
+    use icegate_common::{DEFAULT_TLS_RELOAD_INTERVAL_SECS, TenantPolicy, TlsConfig};
 
     use super::IngestConfig;
     use crate::error::IngestError;
 
     /// A default config with the two blocks that do not validate as-is filled
-    /// in: tracing (enabled with no OTLP endpoint) and the shift job storage.
+    /// in: tracing (enabled with no OTLP endpoint) and the shift job storage
+    /// (no bucket).
     fn valid_config() -> IngestConfig {
         let mut config = IngestConfig::default();
         config.tracing.enabled = false;
-        config.shift.jobsmanager.storage.endpoint = "http://localhost:9000".to_string();
         config.shift.jobsmanager.storage.bucket = "warehouse".to_string();
         config
     }
@@ -199,5 +208,22 @@ mod tests {
                 id: "default".to_string()
             }
         );
+    }
+
+    /// A `tls` validation failure must propagate out of `IngestConfig::validate`, proving the
+    /// block is wired into the aggregate validator rather than merely deserialized: without
+    /// it the failure would surface only when the certificate is loaded at startup.
+    #[test]
+    fn validate_rejects_a_tls_block_with_an_empty_private_key_path() {
+        let mut config = valid_config();
+        config.validate().expect("baseline ingest config is valid");
+
+        config.tls = Some(TlsConfig {
+            certificate_path: PathBuf::from("/tls/tls.crt"),
+            private_key_path: PathBuf::new(),
+            reload_interval_secs: DEFAULT_TLS_RELOAD_INTERVAL_SECS,
+        });
+
+        assert!(matches!(config.validate(), Err(IngestError::Config(_))));
     }
 }

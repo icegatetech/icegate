@@ -1,10 +1,7 @@
 //! OTLP HTTP server implementation
 
-use std::net::SocketAddr;
-
-use icegate_common::{MemoryPressure, TenantResolver};
+use icegate_common::{ApplicationProtocol, ListenerRuntime, MemoryPressure, ServerListener, TenantResolver};
 use icegate_queue::WriteChannel;
-use tokio_util::sync::CancellationToken;
 
 use super::OtlpHttpConfig;
 use crate::infra::metrics::OtlpMetrics;
@@ -24,24 +21,26 @@ pub struct OtlpHttpState {
 
 /// Run the OTLP HTTP server
 ///
+/// Binds `config.host:config.port` and serves over TLS, offering ALPN `http/1.1`, when
+/// `runtime` carries a certificate, and plaintext otherwise. Returns once the runtime's token
+/// is cancelled and the server has drained.
+///
 /// # Errors
 ///
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
     state: OtlpHttpState,
     config: OtlpHttpConfig,
-    cancel_token: CancellationToken,
+    runtime: ListenerRuntime,
     memory_pressure: MemoryPressure,
     tenant_resolver: TenantResolver,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-
     let app = super::routes::routes(state, config.max_body_bytes, memory_pressure, tenant_resolver);
 
-    tracing::info!("OTLP HTTP server listening on {}", addr);
+    let listener = ServerListener::bind(&config.host, config.port, ApplicationProtocol::Http1, &runtime).await?;
+    tracing::info!("OTLP HTTP server listening on {}", listener.local_addr());
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
+    let cancel_token = runtime.cancel_token().clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             cancel_token.cancelled().await;

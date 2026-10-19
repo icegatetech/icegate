@@ -1,9 +1,9 @@
 //! Tempo HTTP server implementation
 
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
+use icegate_common::{ApplicationProtocol, ListenerRuntime, ServerListener};
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 
 use super::TempoConfig;
 use crate::{engine::QueryEngine, infra::runtime::QueryRuntime};
@@ -18,15 +18,19 @@ pub struct TempoState {
 
 /// Run the Tempo HTTP server
 ///
+/// Binds `config.host:config.port` and serves over TLS, offering ALPN `http/1.1`, when
+/// `listener_runtime` carries a certificate, and plaintext otherwise. Returns once the
+/// runtime's token is cancelled and the server has drained.
+///
 /// # Errors
 ///
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
     runtime: QueryRuntime,
     config: TempoConfig,
-    cancel_token: CancellationToken,
+    listener_runtime: ListenerRuntime,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(runtime, config, cancel_token, None).await
+    run_with_port_tx(runtime, config, listener_runtime, None).await
 }
 
 /// Run the Tempo HTTP server with optional port notification
@@ -40,19 +44,18 @@ pub async fn run(
 pub async fn run_with_port_tx(
     runtime: QueryRuntime,
     config: TempoConfig,
-    cancel_token: CancellationToken,
+    listener_runtime: ListenerRuntime,
     port_tx: Option<oneshot::Sender<u16>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-
     let state = TempoState {
         engine: Arc::clone(&runtime.engine),
     };
 
     let app = super::routes::routes(state, &runtime);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let local_addr = listener.local_addr()?;
+    let listener =
+        ServerListener::bind(&config.host, config.port, ApplicationProtocol::Http1, &listener_runtime).await?;
+    let local_addr = listener.local_addr();
 
     tracing::info!("Tempo API server listening on {}", local_addr);
 
@@ -61,6 +64,7 @@ pub async fn run_with_port_tx(
         let _ = tx.send(local_addr.port());
     }
 
+    let cancel_token = listener_runtime.cancel_token().clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             cancel_token.cancelled().await;

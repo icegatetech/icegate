@@ -32,16 +32,41 @@ Four HTTP filters run on both listeners, and the order is the contract:
    request naming no tenant. All three are pinned by that same script.
 4. `router` proxies what survived, to icegate on the pod loopback.
 
-Each listener terminates TLS from the Secret named in `values-authproxy.yaml`;
-the OTLP/gRPC one also negotiates `h2` through ALPN.
+Both hops carry TLS. Each listener terminates it with icegate's own certificate,
+read through `sds-server-certificate.yaml`, the second key of the ConfigMap, so a
+renewed certificate is served to new connections without restarting the proxy;
+the OTLP/gRPC listener also negotiates `h2` through ALPN. The router then reaches
+icegate's loopback receivers over TLS too, and verifies icegate's certificate by
+the ingest Service's DNS name rather than by the loopback address it dials, so a
+certificate issued for another name is not forwarded to. The cases `certificate
+rotation` and `wrong upstream name` of
+[`scripts/authproxy-test.sh`](../../../scripts/authproxy-test.sh) fail if either
+stops holding.
+
+## What it requires
+
+Two objects in the release's namespace, which this repository does not ship and
+`values-authproxy.yaml` names:
+
+- the Secret `ingest.tls.secretName` names, keys `tls.crt` and `tls.key`, whose
+  SAN carries the name the upstream clusters of `configmap-envoy.yaml` verify
+  (the anchor `ingest_service_name`): the ingest Service's DNS name for the
+  release and namespace of the install below. icegate and the proxy both serve
+  it, so it is also the certificate a sender verifies;
+- the ConfigMap `tls.caConfigMapName` names, holding under `ca.crt` the CA that
+  signed that certificate. The proxy verifies icegate against it.
 
 ## Install
 
 ```bash
-kubectl apply -f config/helm/auth-proxy/configmap-envoy.yaml
-helm install icegate oci://ghcr.io/icegatetech/charts/icegate \
+kubectl apply --namespace default -f config/helm/auth-proxy/configmap-envoy.yaml
+helm install icegate oci://ghcr.io/icegatetech/charts/icegate --namespace default \
   -f config/helm/auth-proxy/values-authproxy.yaml
 ```
+
+The release `icegate` in the namespace `default` is what the ingest Service name
+of `configmap-envoy.yaml` is written for; installing under another name or into
+another namespace changes it, as "What you must set" describes.
 
 The ConfigMap is named `ingest-authproxy`, without the release name every chart
 resource carries. Two releases in one namespace therefore mount the same
@@ -64,9 +89,12 @@ The chart rolls the pod on a change to its own ConfigMap, through the
 the chart's — nothing renders it, so nothing hashes it, and the rollout is the
 step that replaces it in the pod.
 
+A renewed certificate is the exception: once it is in the mounted Secret, the
+proxy serves it to new connections without a restart (see "What it does").
+
 ## What you must set
 
-Four values name something outside this repository, and the example cannot know
+Five values name something outside this repository, and the example cannot know
 any of them:
 
 - `issuer` of the `ingest_token` provider — every token your issuer signs carries
@@ -78,7 +106,15 @@ any of them:
   documentation and resolves nowhere, so the filter holds no signing keys and
   refuses every request;
 - `secretName` of the `authproxy-tls` volume — without that Secret in the
-  namespace the pod never starts, because the volume cannot be mounted.
+  namespace the pod never starts, because the volume cannot be mounted. It is
+  the Secret `ingest.tls.secretName` names as well, so the two change together;
+- `configMap.name` of the `authproxy-ca` volume, together with
+  `tls.caConfigMapName` — the CA ConfigMap of "What it requires".
+
+One more follows the install rather than anything outside it: the ingest Service
+name the upstream clusters verify, written once at the anchor
+`ingest_service_name` of `configmap-envoy.yaml`. Another release or namespace
+changes it, together with the SAN of the certificate.
 
 A JWKS uri on `http://` — a holder inside the same protected network — needs one
 more change: the `transport_socket` of the `token_issuer_jwks` cluster is deleted
@@ -128,13 +164,18 @@ request is refused.
   copy of this configuration, and compares this file's ports against the example's
   own: the upstream clusters against the receiver ports, and the listeners against
   `ingest.service.otlpHttpPort` / `ingest.service.otlpGrpcPort`, which is what the
-  Service publishes;
+  Service publishes. It also compares the TLS wiring against the sidecar's mounts:
+  the SDS file against the ConfigMap's, the certificate files and the watched
+  directory against the Secret's, the CA of both upstream clusters against the CA
+  ConfigMap's, and each cluster's SNI against its SAN matcher;
 - `make authproxy-test` runs this document against a throwaway token issuer and
   asserts the rules end to end — the header the client sent, the tenant the
   upstream receives, the three markers the policy demands (both `typ` and a
   non-empty `tenant_id`, the last of them refused 403 here rather than 400 by
   icegate), expiry within and past the clock skew, and the route timeout on both
-  codecs. The script's own header lists every case;
+  codecs — over TLS on both hops, plus a certificate rotation without a restart
+  and an upstream certificate issued for another name. The script's own header
+  lists every case;
 - `make helm-metadata-test` compares the route timeouts against the WAL
   acknowledgement deadline, as described above, and refuses an empty `issuer`,
   `audiences` or JWKS uri in `configmap-envoy.yaml`.

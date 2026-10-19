@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::credentials::REDACTED;
 use crate::error::{CommonError, Result};
 
 /// Storage configuration
@@ -59,10 +60,7 @@ impl std::fmt::Debug for S3Config {
             .field("region", &self.region)
             .field("endpoint", &self.endpoint)
             .field("access_key_id", &self.access_key_id)
-            .field(
-                "secret_access_key",
-                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
-            )
+            .field("secret_access_key", &self.secret_access_key.as_ref().map(|_| REDACTED))
             .finish()
     }
 }

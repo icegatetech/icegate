@@ -41,7 +41,6 @@ arrow-flight = { workspace = true }
 
 # gRPC server
 tonic = { workspace = true }
-tokio-stream = { workspace = true }
 # Middleware of our own: the Flight SQL response-body deadline layer
 # (`infra::deadline`) implements tower's `Layer`/`Service` over `http` bodies.
 tower = { workspace = true }
@@ -114,3 +113,9 @@ http-body-util = "0.1"
 # `test-util` enables the paused-clock (`start_paused`) test runtime the response
 # deadline tests run on, so a 30 s deadline costs no wall-clock time.
 tokio = { workspace = true, features = ["test-util"] }
+# The TLS cases (`tests/support/tls_certificate.rs`, `cli::commands::run` tests): rcgen mints the
+# certificate the listeners present.
+rcgen = { workspace = true }
+# The gRPC client of the same cases. The workspace builds rustls on aws-lc-rs only, so the
+# client uses that backend too rather than adding `ring`.
+tonic = { workspace = true, features = ["tls-aws-lc"] }

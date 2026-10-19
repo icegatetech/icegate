@@ -25,11 +25,11 @@ use opentelemetry::metrics::{Meter, MeterProvider as _};
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, InstrumentKind, SdkMeterProvider, Stream};
 use prometheus::{Encoder, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::ServerConfig,
     error::{CommonError, Result},
+    listener::{ApplicationProtocol, ListenerRuntime, ServerListener},
 };
 
 /// Operational listener configuration.
@@ -293,25 +293,26 @@ fn build_operational_router(registry: Option<Arc<Registry>>, path: &str) -> Rout
 
 /// Run the operational server.
 ///
-/// Binds `config.host:config.port` unconditionally and serves [`HEALTH_PATH`];
-/// `registry` decides whether `config.path` is served alongside it. Returns when
-/// `cancel_token` is cancelled and the listener has unbound.
+/// Binds `config.host:config.port` unconditionally through a [`ServerListener`],
+/// with TLS when `runtime` carries a certificate, and serves [`HEALTH_PATH`];
+/// `registry` decides whether `config.path` is served alongside it. Returns once
+/// the runtime's token is cancelled and the open connections have drained.
 ///
 /// # Errors
 ///
-/// Returns an error if the address cannot be bound or the server stops with a
-/// fatal error.
+/// Returns an error if the address cannot be bound, the TLS configuration cannot
+/// be built, or the server stops with a fatal error.
 pub async fn run_operational_server(
     config: OperationalConfig,
     registry: Option<Arc<Registry>>,
-    cancel_token: CancellationToken,
+    runtime: ListenerRuntime,
 ) -> Result<()> {
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = ServerListener::bind(&config.host, config.port, ApplicationProtocol::Http1, &runtime).await?;
     let app = build_operational_router(registry, &config.path);
 
-    tracing::info!("Operational server listening on {}", addr);
+    tracing::info!(addr = %listener.local_addr(), "Operational server listening");
 
+    let cancel_token = runtime.cancel_token().clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             cancel_token.cancelled().await;
@@ -370,6 +371,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::CancellationToken;
 
     /// Issue a `GET` against the operational router and return status and body.
     async fn get_path(router: Router, path: &str) -> (StatusCode, String) {
@@ -457,7 +459,7 @@ mod tests {
         // Bounded: a server that did take the port would serve until cancelled.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_operational_server(config, None, CancellationToken::new()),
+            run_operational_server(config, None, ListenerRuntime::plaintext(CancellationToken::new())),
         )
         .await
         .expect("the server must return rather than serve on a port it cannot bind");

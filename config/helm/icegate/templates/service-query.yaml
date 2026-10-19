@@ -20,29 +20,44 @@ spec:
       port: {{ .Values.query.loki.port }}
       targetPort: loki
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.query.service "port" "loki") }}
+      {{ . }}
+      {{- end }}
     {{- end }}
     {{- if .Values.query.prometheus.enabled }}
     - name: prometheus
       port: {{ .Values.query.prometheus.port }}
       targetPort: prometheus
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.query.service "port" "prometheus") }}
+      {{ . }}
+      {{- end }}
     {{- end }}
     {{- if .Values.query.tempo.enabled }}
     - name: tempo
       port: {{ .Values.query.tempo.port }}
       targetPort: tempo
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.query.service "port" "tempo") }}
+      {{ . }}
+      {{- end }}
     {{- end }}
     {{- if .Values.query.flightSql.enabled }}
     - name: flight-sql
       port: {{ .Values.query.flightSql.port }}
       targetPort: flight-sql
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.query.service "port" "flightSql") }}
+      {{ . }}
+      {{- end }}
     {{- end }}
     {{- if .Values.query.metrics.enabled }}
     - name: metrics
       port: {{ .Values.query.metrics.port }}
       targetPort: metrics
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.query.service "port" "metrics") }}
+      {{ . }}
+      {{- end }}
     {{- end }}
 {{- end }}

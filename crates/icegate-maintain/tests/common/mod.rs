@@ -3,11 +3,15 @@
 //! Centralizes the object-store bootstrap contract — container start, bucket
 //! creation, and concrete [`S3Catalog`] construction — shared verbatim across
 //! the maintain integration tests, plus the `logs` writer path and the raw
-//! object-store listing the sweep tests assert against.
+//! object-store listing the sweep tests assert against. The
+//! [`recording_endpoint`] module is a local HTTP fake for tests that assert on
+//! the requests a client sends.
 
 // Each integration-test binary pulls this module in via `mod common;` and may
 // exercise only a subset of these helpers, so unused-item lints are expected.
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
+
+pub mod recording_endpoint;
 
 use std::collections::HashMap;
 use std::sync::Arc;

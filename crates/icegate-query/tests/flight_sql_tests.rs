@@ -6,5 +6,8 @@
 //! - `tenant`: cross-tenant isolation enforced by the session provider
 //! - `read_only`: DDL/DML rejection by `SQLOptions`
 //! - `metadata`: catalog/schema/table introspection RPCs
+//! - `tls`: the listener served over TLS
 
 mod flight_sql;
+#[path = "support/tls_certificate.rs"]
+mod tls_certificate;

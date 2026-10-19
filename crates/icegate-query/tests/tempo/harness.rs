@@ -36,7 +36,7 @@ use iceberg::{
 };
 use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, SPANS_TABLE, TenantResolver,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, ListenerRuntime, SPANS_TABLE, TenantResolver,
     catalog::CatalogBuilder,
     schema::{self, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES},
 };
@@ -131,9 +131,14 @@ impl TestServer {
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let mut server_handle = tokio::spawn(async move {
-            icegate_query::tempo::run_with_port_tx(runtime, tempo_config, cancel_token_clone, Some(port_tx))
-                .await
-                .unwrap();
+            icegate_query::tempo::run_with_port_tx(
+                runtime,
+                tempo_config,
+                ListenerRuntime::plaintext(cancel_token_clone),
+                Some(port_tx),
+            )
+            .await
+            .unwrap();
         });
 
         // Drain the task on either failure before unwinding: `warehouse_path` drops

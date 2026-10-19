@@ -27,7 +27,7 @@ spec:
         {{- include "icegate.podSecurityContext" . | nindent 8 }}
       containers:
         - name: catalog
-          image: {{ include "icegate.image" (dict "image" .Values.catalogServer.image "tag" .Chart.AppVersion) }}
+          image: {{ include "icegate.image" (dict "image" .Values.catalogServer.image "tag" .Chart.AppVersion "key" "catalogServer.image") }}
           imagePullPolicy: {{ .Values.catalogServer.image.pullPolicy }}
           command:
             - /usr/local/bin/entrypoint

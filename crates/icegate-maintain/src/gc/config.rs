@@ -160,7 +160,6 @@ mod tests {
     /// A `GcConfig` whose jobs-storage is populated enough to pass validation.
     fn valid_config() -> GcConfig {
         let mut config = GcConfig::default();
-        config.jobsmanager.storage.endpoint = "http://localhost:9000".to_string();
         config.jobsmanager.storage.bucket = "warehouse".to_string();
         config
     }
@@ -201,7 +200,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_jobs_storage() {
-        // Default storage has an empty endpoint/bucket.
+        // Default storage has an empty bucket.
         assert!(GcConfig::default().validate().is_err());
     }
 

@@ -1,11 +1,13 @@
 //! OTLP gRPC server implementation.
 
-use icegate_common::{MemoryPressure, MemoryShedInterceptor, TenantPolicyInterceptor, TenantResolver};
+use icegate_common::{
+    ApplicationProtocol, ListenerRuntime, MemoryPressure, MemoryShedInterceptor, ServerListener,
+    TenantPolicyInterceptor, TenantResolver,
+};
 use opentelemetry_proto::tonic::collector::{
     logs::v1::logs_service_server::LogsServiceServer, metrics::v1::metrics_service_server::MetricsServiceServer,
     trace::v1::trace_service_server::TraceServiceServer,
 };
-use tokio_util::sync::CancellationToken;
 use tonic::{service::interceptor::InterceptedService, transport::Server};
 
 use super::{
@@ -19,20 +21,24 @@ use super::{
 /// Starts a tonic gRPC server that handles `OpenTelemetry` Protocol requests
 /// for logs, traces, and metrics ingestion.
 ///
+/// Binds `config.host:config.port` and serves over TLS, offering ALPN `h2`, when `runtime`
+/// carries a certificate, and plaintext otherwise. Returns once the runtime's token is
+/// cancelled and the server has drained.
+///
 /// # Errors
 ///
 /// Returns an error if:
-/// - The socket address cannot be parsed
 /// - The server fails to bind to the address
 /// - The server encounters a fatal error during operation
 pub async fn run(
     service: OtlpGrpcService,
     config: OtlpGrpcConfig,
-    cancel_token: CancellationToken,
+    runtime: ListenerRuntime,
     memory_pressure: MemoryPressure,
     tenant_resolver: TenantResolver,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = format!("{}:{}", config.host, config.port).parse()?;
+    let listener = ServerListener::bind(&config.host, config.port, ApplicationProtocol::Grpc, &runtime).await?;
+    let cancel_token = runtime.cancel_token().clone();
     let metrics = service.metrics();
 
     // Reject before protobuf decode / session build while under memory pressure. Wrapping
@@ -51,7 +57,7 @@ pub async fn run(
         )
     };
 
-    tracing::info!("Starting OTLP gRPC server on {}", addr);
+    tracing::info!("Starting OTLP gRPC server on {}", listener.local_addr());
 
     // Nested wrapping, shed outermost: the outer interceptor runs first, and
     // shedding under memory pressure must precede reading the tenant headers.
@@ -78,7 +84,7 @@ pub async fn run(
             ),
             shed,
         ))
-        .serve_with_shutdown(addr, async move {
+        .serve_with_incoming_shutdown(listener.into_incoming(), async move {
             cancel_token.cancelled().await;
             tracing::info!("OTLP gRPC server shutting down gracefully");
         })

@@ -19,10 +19,10 @@ use std::{sync::Arc, time::Duration};
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::execution::context::SQLOptions;
 use datafusion_flight_sql_server::service::FlightSqlService;
-use icegate_common::{MemoryShedInterceptor, TenantPolicyInterceptor};
-use tokio::{net::TcpListener, sync::oneshot};
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_util::sync::CancellationToken;
+use icegate_common::{
+    ApplicationProtocol, ListenerRuntime, MemoryShedInterceptor, ServerListener, TenantPolicyInterceptor,
+};
+use tokio::sync::oneshot;
 use tonic::service::interceptor::InterceptedService;
 
 use super::FlightSqlConfig;
@@ -51,6 +51,10 @@ fn read_only_sql_options() -> SQLOptions {
 /// Mirrors [`crate::loki::server::run`] so the spawn site in
 /// `cli::commands::run` does not need server-specific knowledge.
 ///
+/// Binds `config.host:config.port` and serves over TLS, offering ALPN `h2`, when
+/// `listener_runtime` carries a certificate, and plaintext otherwise. Returns once
+/// the runtime's token is cancelled and the server has drained.
+///
 /// # Errors
 ///
 /// Returns an error if the listener fails to bind or the underlying
@@ -58,9 +62,9 @@ fn read_only_sql_options() -> SQLOptions {
 pub async fn run(
     runtime: QueryRuntime,
     config: FlightSqlConfig,
-    cancel_token: CancellationToken,
+    listener_runtime: ListenerRuntime,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_port_tx(runtime, config, cancel_token, None).await
+    run_with_port_tx(runtime, config, listener_runtime, None).await
 }
 
 /// Variant of [`run`] that publishes the actually bound port on a
@@ -74,15 +78,15 @@ pub async fn run(
 pub async fn run_with_port_tx(
     runtime: QueryRuntime,
     config: FlightSqlConfig,
-    cancel_token: CancellationToken,
+    listener_runtime: ListenerRuntime,
     port_tx: Option<oneshot::Sender<u16>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Bind via the `(host, port)` tuple so tonic resolves hostnames and
-    // IPv6 literals through `ToSocketAddrs`. Parsing a `"host:port"`
-    // string into a `SocketAddr` only accepts numeric IPs and would
-    // reject `localhost` or a bracketless IPv6 host.
-    let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
-    let local_addr = listener.local_addr()?;
+    // `ServerListener` resolves hostnames and IPv6 literals as a `(host, port)`
+    // pair, so a name such as `localhost` binds where parsing the pair into a
+    // `SocketAddr` would reject it.
+    let listener =
+        ServerListener::bind(&config.host, config.port, ApplicationProtocol::Grpc, &listener_runtime).await?;
+    let local_addr = listener.local_addr();
     tracing::info!(addr = %local_addr, "Flight SQL gRPC server listening");
     if let Some(tx) = port_tx {
         // Receiver gone is benign — the test simply isn't waiting on the
@@ -122,6 +126,7 @@ pub async fn run_with_port_tx(
     // does: only a deadline that spans the BODY bounds how long a Flight SQL
     // query may hold a catalog provider (see `crate::infra::deadline`).
     let query_deadline = Duration::from_secs(query_deadline_secs);
+    let cancel_token = listener_runtime.cancel_token().clone();
 
     tonic::transport::Server::builder()
         // The layer covers both halves of a call — the response phase (planning,
@@ -132,7 +137,7 @@ pub async fn run_with_port_tx(
         // would report differently depending on which half was running.
         .layer(ResponseDeadlineLayer::new(query_deadline))
         .add_service(intercepted)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+        .serve_with_incoming_shutdown(listener.into_incoming(), async move {
             cancel_token.cancelled().await;
             tracing::info!("Flight SQL server shutting down gracefully...");
         })
@@ -149,6 +154,7 @@ mod tests {
     use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
     use icegate_common::{MemoryPressure, TenantPolicy, TenantResolver};
     use opentelemetry::metrics::MeterProvider as _;
+    use tokio_util::sync::CancellationToken;
     use tonic::transport::Endpoint;
 
     use super::*;
@@ -255,7 +261,7 @@ mod tests {
                     port: 0,
                     max_message_size: 16 * 1024 * 1024,
                 },
-                server_token,
+                ListenerRuntime::plaintext(server_token),
                 Some(port_tx),
             )
             .await

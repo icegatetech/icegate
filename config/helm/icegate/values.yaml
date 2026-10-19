@@ -17,6 +17,17 @@ serviceAccount:
   annotations: {}
   name: ""
 
+## Pod Security
+podSecurity:
+  ## Hold the entries of ingest.extraContainers and ingest.extraVolumes to the
+  ## restricted Pod Security level, failing the render with a message that names the
+  ## entry and the setting. The pods the chart itself declares meet that level either
+  ## way (scripts/helm-render-test.py checks every one); this key only decides whether
+  ## what you add is held to it. A container that states no runAsNonRoot, runAsUser or
+  ## seccompProfile is judged by the pod's. Off by default: an always-on check would
+  ## refuse a sidecar that an operator runs where the level is not enforced.
+  checkRestricted: false
+
 ## Iceberg catalog configuration (shared by all components)
 catalog:
   ## Backend type: "s3", "rest", "s3tables", or "glue"
@@ -92,7 +103,10 @@ queue:
 ## AWS credentials
 aws:
   ## Name of an existing Secret containing aws-access-key-id and aws-secret-access-key keys.
-  ## Leave empty when using IRSA/Workload Identity.
+  ## They are rendered into the pods as AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+  ## Leave empty to render no keys: the services then take their S3 credentials from the
+  ## AWS default credential chain (Pod Identity, IRSA, environment), the job storage of
+  ## ingest and maintain included.
   existingSecret: ""
   region: us-east-1
 
@@ -106,6 +120,10 @@ catalogServer:
   image:
     repository: ghcr.io/icegatetech/icegate-catalog
     tag: ""  # defaults to Chart.appVersion
+    ## Optional image digest (sha256: followed by 64 lowercase hex characters).
+    ## When set, the image is rendered as repository:tag@digest. Every image key
+    ## below takes one.
+    digest: ""
     pullPolicy: IfNotPresent
 
   http:
@@ -138,6 +156,11 @@ catalogServer:
   service:
     type: ClusterIP
     annotations: {}
+    ## The appProtocol of each Service port, by key. Unset renders no field on
+    ## that port. The value is whatever the component reading Services expects
+    ## (for example kubernetes.io/h2c); the chart picks none.
+    appProtocol:
+      http: ""
 
 ## ---------------------------------------------------------------------------
 ## Query component
@@ -163,6 +186,8 @@ query:
   image:
     repository: ghcr.io/icegatetech/icegate-query
     tag: ""  # defaults to Chart.appVersion
+    ## See catalogServer.image.digest.
+    digest: ""
     pullPolicy: IfNotPresent
 
   ## Query engine settings
@@ -242,6 +267,34 @@ query:
     port: 9091
     path: /metrics
 
+  ## Server-side TLS for every listener of this component, the operational one
+  ## included, so /health and /metrics are served over TLS too. Off, the component
+  ## serves plaintext. On, the render also switches the probes and the ServiceMonitor
+  ## endpoint to https.
+  ##
+  ## secretName names a Secret in the release namespace holding tls.crt (the
+  ## certificate chain, leaf first) and tls.key. It is mounted as a whole directory,
+  ## never through subPath, because the component re-reads both files in place to pick
+  ## up a renewal. The ServiceMonitor sets tlsConfig.serverName to the Service's DNS
+  ## name, <fullname>-<component>.<namespace>.svc: issue the certificate for it.
+  ##
+  ## With TLS on, the Service's target ports serve TLS, so anything in front of them,
+  ## including this chart's Ingress, which renders only the Service and port as its
+  ## backend, must connect to the backend over TLS.
+  ##
+  ## The certificate in service is scraped as icegate_tls_certificate_not_after_seconds
+  ## (its expiry, in seconds since the Unix epoch) and icegate_tls_certificate_reloads_total
+  ## (reloads, by outcome), on every component. The exporter derives these names from the
+  ## instruments', and crates/icegate-common/tests/tls_scraped_metrics.rs pins them.
+  tls:
+    enabled: false
+    secretName: ""
+    ## Seconds between re-reads of the two files, at least 1. Left unset, nothing is
+    ## rendered and the component's own default applies (icegate_common::listener::TlsConfig).
+    ## The component refuses a value above its upper bound,
+    ## icegate_common::listener::MAX_TLS_RELOAD_INTERVAL_SECS, when it starts.
+    # reloadIntervalSecs: 60
+
   ## OpenTelemetry tracing
   tracing:
     enabled: true
@@ -271,6 +324,15 @@ query:
   service:
     type: ClusterIP
     annotations: {}
+    ## The appProtocol of each Service port, by key. Unset renders no field on
+    ## that port. The value is whatever the component reading Services expects
+    ## (for example kubernetes.io/h2c); the chart picks none.
+    appProtocol:
+      loki: ""
+      prometheus: ""
+      tempo: ""
+      flightSql: ""
+      metrics: ""
 
   ## Ingress
   ingress:
@@ -295,7 +357,12 @@ query:
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
     enabled: false
-    image: busybox:1.38.0
+    ## Image for the endpoint check. A set digest is rendered as
+    ## repository:tag@digest.
+    image:
+      repository: busybox
+      tag: "1.38.0"
+      digest: ""
     ## Endpoints to poll (HTTP GET). Query starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
@@ -307,7 +374,11 @@ query:
     buckets: []
     #  - warehouse
     ## Image for the bucket check (must contain the AWS CLI).
-    awsCliImage: amazon/aws-cli:2.36.34
+    awsCliImage:
+      repository: amazon/aws-cli
+      tag: "2.36.34"
+      ## See query.waitForDependencies.image.digest.
+      digest: ""
 
   ## Liveness and readiness probe overrides.
   ## Both hit /health on the operational listener, addressed by the port name
@@ -316,6 +387,10 @@ query:
   ## is not probed: query.loki.enabled=false leaves no such port on the
   ## container, and the kubelet then restarts a pod that serves the three
   ## protocols it was asked for.
+  ##
+  ## With query.tls.enabled the render adds `scheme: HTTPS` to an httpGet probe that
+  ## states no scheme; one that states its own, or is not an httpGet, is rendered as
+  ## written.
   livenessProbe:
     httpGet:
       path: /health
@@ -343,6 +418,8 @@ ingest:
   image:
     repository: ghcr.io/icegatetech/icegate-ingest
     tag: ""  # defaults to Chart.appVersion
+    ## See catalogServer.image.digest.
+    digest: ""
     pullPolicy: IfNotPresent
 
   ## Shift configuration (WAL -> Iceberg)
@@ -368,8 +445,11 @@ ingest:
       workerCount: 2
       pollIntervalMs: 1000
       iterationIntervalMillisecs: 30000
+      ## Jobs-state storage (S3). Credentials are not configured here: see
+      ## `aws.existingSecret`.
       storage:
-        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## Defaults to storage.s3.endpoint when empty; with both empty no endpoint is
+        ## rendered and the regional AWS endpoint is used. Its scheme selects TLS:
         ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
@@ -447,6 +527,19 @@ ingest:
     port: 9091
     path: /metrics
 
+  ## Server-side TLS for the OTLP receivers and the operational listener alike.
+  ## See query.tls. A sidecar in extraContainers that publishes the OTLP ports is
+  ## not covered: it serves what it is configured to serve.
+  ##
+  ## With TLS on, the Service's target ports serve TLS, so anything in front of them,
+  ## including this chart's Ingress, which renders only the Service and port as its
+  ## backend, must connect to the backend over TLS.
+  tls:
+    enabled: false
+    secretName: ""
+    ## See query.tls.reloadIntervalSecs.
+    # reloadIntervalSecs: 60
+
   ## OpenTelemetry tracing
   tracing:
     enabled: true
@@ -496,6 +589,13 @@ ingest:
     ## config/helm/auth-proxy/values-authproxy.yaml.
     otlpHttpPort: null
     otlpGrpcPort: null
+    ## The appProtocol of each Service port, by key. Unset renders no field on
+    ## that port. The value is whatever the component reading Services expects
+    ## (for example kubernetes.io/h2c); the chart picks none.
+    appProtocol:
+      otlpGrpc: ""
+      otlpHttp: ""
+      metrics: ""
 
   ## Ingress
   ingress:
@@ -520,7 +620,11 @@ ingest:
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
     enabled: false
-    image: busybox:1.38.0
+    image:
+      repository: busybox
+      tag: "1.38.0"
+      ## See query.waitForDependencies.image.digest.
+      digest: ""
     ## Endpoints to poll (HTTP GET). Ingest starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
@@ -532,7 +636,11 @@ ingest:
     buckets: []
     #  - warehouse
     ## Image for the bucket check (must contain the AWS CLI).
-    awsCliImage: amazon/aws-cli:2.36.34
+    awsCliImage:
+      repository: amazon/aws-cli
+      tag: "2.36.34"
+      ## See query.waitForDependencies.image.digest.
+      digest: ""
 
   ## Liveness and readiness probe overrides for the icegate container.
   ## Both hit /health on the operational listener, addressed by the port name the
@@ -544,6 +652,10 @@ ingest:
   ## A sidecar that publishes those ports carries a probe of its own, stated
   ## beside it in extraContainers — otherwise it can die with its container still
   ## up, leaving the pod Ready with nothing answering on the published ports.
+  ##
+  ## With ingest.tls.enabled the render adds `scheme: HTTPS` to an httpGet probe that
+  ## states no scheme; one that states its own, or is not an httpGet, is rendered as
+  ## written. Probes of extraContainers are never touched.
   livenessProbe:
     httpGet:
       path: /health
@@ -570,6 +682,8 @@ migrate:
   image:
     repository: ghcr.io/icegatetech/icegate-maintain
     tag: ""  # defaults to Chart.appVersion
+    ## See catalogServer.image.digest.
+    digest: ""
     pullPolicy: IfNotPresent
 
   resources:
@@ -610,7 +724,11 @@ migrate:
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
     enabled: true
-    image: busybox:1.38.0
+    image:
+      repository: busybox
+      tag: "1.38.0"
+      ## See query.waitForDependencies.image.digest.
+      digest: ""
     ## Endpoints to poll (HTTP GET). Migrate starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
@@ -622,7 +740,11 @@ migrate:
     buckets: []
     #  - warehouse
     ## Image for the bucket check (must contain the AWS CLI).
-    awsCliImage: amazon/aws-cli:2.36.34
+    awsCliImage:
+      repository: amazon/aws-cli
+      tag: "2.36.34"
+      ## See query.waitForDependencies.image.digest.
+      digest: ""
 
 ## ---------------------------------------------------------------------------
 ## Maintain component (long-running `maintain run` service)
@@ -649,6 +771,8 @@ maintain:
   image:
     repository: ghcr.io/icegatetech/icegate-maintain
     tag: ""  # defaults to Chart.appVersion
+    ## See catalogServer.image.digest.
+    digest: ""
     pullPolicy: IfNotPresent
 
   ## Compaction tuning (maps to the binary's CompactionConfig).
@@ -710,9 +834,10 @@ maintain:
       ## Jobmanager worker poll interval, in milliseconds.
       pollIntervalMs: 1000
       ## Jobs-state storage (S3), same shape ingest's shift uses. Credentials are
-      ## taken from the AWS env vars injected into the pod, not configured here.
+      ## not configured here: see `aws.existingSecret`.
       storage:
-        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## Defaults to storage.s3.endpoint when empty; with both empty no endpoint is
+        ## rendered and the regional AWS endpoint is used. Its scheme selects TLS:
         ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
@@ -758,8 +883,8 @@ maintain:
       ## Per-table sweep task deadline, in seconds.
       sweepTimeoutSecs: 3600
     ## Jobs-manager settings: the sweep's own worker pool and a distinct "gc"
-    ## job-state prefix. Credentials come from the pod's AWS env vars, not
-    ## configured here.
+    ## job-state prefix. Credentials are not configured here: see
+    ## `aws.existingSecret`.
     jobsmanager:
       ## Period of the per-table GC discovery loop, in seconds (default: daily).
       scanIntervalSecs: 86400
@@ -769,7 +894,8 @@ maintain:
       ## Jobmanager worker poll interval, in milliseconds.
       pollIntervalMs: 1000
       storage:
-        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## Defaults to storage.s3.endpoint when empty; with both empty no endpoint is
+        ## rendered and the regional AWS endpoint is used. Its scheme selects TLS:
         ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
@@ -815,7 +941,7 @@ maintain:
     cleanupTimeoutSecs: 600
     ## Jobs-manager settings: cleanup's own worker pool and a distinct
     ## "wal_cleanup" job-state prefix, so it never contends with gc or compaction.
-    ## Credentials come from the pod's AWS env vars, not configured here.
+    ## Credentials are not configured here: see `aws.existingSecret`.
     jobsmanager:
       ## Period of the per-topic cleanup loop, in seconds.
       scanIntervalSecs: 600
@@ -825,7 +951,8 @@ maintain:
       ## Jobmanager worker poll interval, in milliseconds.
       pollIntervalMs: 1000
       storage:
-        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## Defaults to storage.s3.endpoint when empty; with both empty no endpoint is
+        ## rendered and the regional AWS endpoint is used. Its scheme selects TLS:
         ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
@@ -882,8 +1009,10 @@ maintain:
       ## One worker: the single crawl task fetches all sources concurrently itself.
       workerCount: 1
       pollIntervalMs: 1000
+      ## Credentials are not configured here: see `aws.existingSecret`.
       storage:
-        ## Defaults to storage.s3.endpoint when empty. Its scheme selects TLS:
+        ## Defaults to storage.s3.endpoint when empty; with both empty no endpoint is
+        ## rendered and the regional AWS endpoint is used. Its scheme selects TLS:
         ## an https:// endpoint connects over TLS, http:// does not.
         endpoint: ""
         bucket: jobs
@@ -901,11 +1030,23 @@ maintain:
     port: 9091
     path: /metrics
 
+  ## Server-side TLS for the operational listener. See query.tls.
+  tls:
+    enabled: false
+    secretName: ""
+    ## See query.tls.reloadIntervalSecs.
+    # reloadIntervalSecs: 60
+
   ## Kubernetes Service exposing the metrics port. Created only when
   ## metrics.enabled — the compactor has no other inbound endpoint.
   service:
     type: ClusterIP
     annotations: {}
+    ## The appProtocol of each Service port, by key. Unset renders no field on
+    ## that port. The value is whatever the component reading Services expects
+    ## (for example kubernetes.io/h2c); the chart picks none.
+    appProtocol:
+      metrics: ""
 
   ## OpenTelemetry tracing, rendered into the maintain ConfigMap exactly as for
   ## ingest and query. With tracing enabled the service refuses to start without
@@ -936,13 +1077,20 @@ maintain:
   ## Liveness probe override. Empty by default — the Deployment restarts the
   ## container if the process exits. When metrics.enabled, the /metrics endpoint
   ## (metrics.port) can back an httpGet/tcpSocket probe; set one here to override.
+  ## With maintain.tls.enabled the render adds `scheme: HTTPS` to an httpGet probe
+  ## that states no scheme; one that states its own, or is not an httpGet, is
+  ## rendered as written.
   livenessProbe: {}
 
   ## Wait for catalog and storage to be ready before starting the compactor.
   ## Uses a busybox init container to poll the endpoints.
   waitForDependencies:
     enabled: false
-    image: busybox:1.38.0
+    image:
+      repository: busybox
+      tag: "1.38.0"
+      ## See query.waitForDependencies.image.digest.
+      digest: ""
     ## Endpoints to poll (HTTP GET). Compaction starts only when all return 2xx.
     endpoints: []
     #  - http://rustfs-svc:9000/health/ready
@@ -954,11 +1102,27 @@ maintain:
     buckets: []
     #  - warehouse
     ## Image for the bucket check (must contain the AWS CLI).
-    awsCliImage: amazon/aws-cli:2.36.34
+    awsCliImage:
+      repository: amazon/aws-cli
+      tag: "2.36.34"
+      ## See query.waitForDependencies.image.digest.
+      digest: ""
+
+## ---------------------------------------------------------------------------
+## TLS (shared by the components that serve it: <component>.tls)
+## ---------------------------------------------------------------------------
+tls:
+  ## Name of a ConfigMap holding ca.crt, the CA that signed the serving
+  ## certificates, for the callers of those listeners. The ServiceMonitor of a
+  ## component with <component>.tls.enabled names it as the CA of its scrape
+  ## (tlsConfig.ca), so the render refuses a TLS scrape without it. Nothing else in
+  ## the chart reads it.
+  caConfigMapName: ""
 
 ## ---------------------------------------------------------------------------
 ## ServiceMonitor (Prometheus Operator)
 ## ---------------------------------------------------------------------------
+## A component with <component>.tls.enabled is scraped over https; see tls.caConfigMapName.
 serviceMonitor:
   enabled: false
   interval: 30s

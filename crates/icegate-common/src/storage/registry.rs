@@ -32,6 +32,7 @@ use opendal::services::S3Config;
 use super::base_path::{is_local_base_path, strip_s3_scheme};
 use super::builder::{ObjectStoreWithPath, create_local_store, create_memory_store};
 use super::config::StorageBackend;
+use super::credentials::{StaticCredentials, discard_blank_value};
 use super::icegate_s3::build_s3_operator;
 use super::layers::{StorageLayers, StorageLayersConfig};
 use crate::error::{CommonError, Result};
@@ -289,8 +290,8 @@ impl OperatorRegistry {
     ///
     /// Credentials configured for the backend win; otherwise the ambient AWS
     /// environment is used, which is how a deployment authenticates through an
-    /// IAM role. Both halves of a key pair must resolve or neither — a half
-    /// configured pair signs nothing and would fail per request instead.
+    /// IAM role. Which sources are tried is decided here; whether the resolved
+    /// values are a usable set is [`StaticCredentials::from_parts`]'s rule.
     ///
     /// # Errors
     ///
@@ -307,35 +308,29 @@ impl OperatorRegistry {
             _ => (None, DEFAULT_S3_REGION.to_string(), None, None),
         };
 
-        let access_key_id = configured_key_id
-            .filter(|value| !value.is_empty())
-            .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|value| !value.is_empty()));
-        let secret_access_key = configured_secret_key
-            .filter(|value| !value.is_empty())
-            .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok().filter(|value| !value.is_empty()));
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok().filter(|value| !value.is_empty());
+        let access_key_id =
+            discard_blank_value(configured_key_id).or_else(|| read_environment_value("AWS_ACCESS_KEY_ID"));
+        let secret_access_key =
+            discard_blank_value(configured_secret_key).or_else(|| read_environment_value("AWS_SECRET_ACCESS_KEY"));
+        let session_token = read_environment_value("AWS_SESSION_TOKEN");
 
-        if access_key_id.is_some() != secret_access_key.is_some() {
-            return Err(CommonError::Config(
-                "AWS credentials partially configured; set both AWS_ACCESS_KEY_ID and \
-                 AWS_SECRET_ACCESS_KEY, or neither"
-                    .to_string(),
-            ));
-        }
-        if session_token.is_some() && access_key_id.is_none() {
-            return Err(CommonError::Config(
-                "AWS_SESSION_TOKEN requires both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY".to_string(),
-            ));
-        }
+        let credentials =
+            StaticCredentials::from_parts(access_key_id, secret_access_key, session_token).map_err(|error| {
+                CommonError::Config(format!(
+                    "S3 credentials from the storage backend or the AWS_* environment: {error}"
+                ))
+            })?;
 
         // The bucket is left unset: it is the other half of the cache key, and
         // `build_s3_operator` puts it on the builder.
         let mut config = S3Config::default();
         config.endpoint = endpoint;
         config.region = Some(region);
-        config.access_key_id = access_key_id;
-        config.secret_access_key = secret_access_key;
-        config.session_token = session_token;
+        if let Some(credentials) = credentials {
+            config.access_key_id = Some(credentials.access_key_id);
+            config.secret_access_key = Some(credentials.secret_access_key);
+            config.session_token = credentials.session_token;
+        }
         Ok(config)
     }
 
@@ -351,6 +346,12 @@ impl OperatorRegistry {
     pub(crate) const fn layers(&self) -> &StorageLayers {
         &self.layers
     }
+}
+
+/// The value of the environment variable `name`, with a blank or unset
+/// variable alike read as absent.
+fn read_environment_value(name: &str) -> Option<String> {
+    discard_blank_value(std::env::var(name).ok())
 }
 
 #[cfg(test)]

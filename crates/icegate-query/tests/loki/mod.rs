@@ -10,6 +10,7 @@
 //! - `labels`: Label metadata endpoint tests (labels, label values, series)
 //! - `tenant`: Tenant isolation tests
 //! - `trace`: Trace ID and span ID query tests
+//! - `tls`: The listener served over TLS
 
 mod grouping;
 mod harness;
@@ -18,5 +19,6 @@ mod metrics;
 mod pipeline;
 mod query_range;
 mod tenant;
+mod tls;
 mod trace;
 mod unwrap;

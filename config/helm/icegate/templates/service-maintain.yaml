@@ -19,4 +19,7 @@ spec:
       port: {{ .Values.maintain.metrics.port }}
       targetPort: metrics
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.maintain.service "port" "metrics") }}
+      {{ . }}
+      {{- end }}
 {{- end }}

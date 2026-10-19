@@ -31,10 +31,10 @@ spec:
       serviceAccountName: {{ include "icegate.serviceAccountName" . }}
       securityContext:
         {{- include "icegate.podSecurityContext" . | nindent 8 }}
-      {{- include "icegate.waitForDeps" (dict "context" . "config" .Values.maintain.waitForDependencies) | nindent 6 }}
+      {{- include "icegate.waitForDeps" (dict "context" . "config" .Values.maintain.waitForDependencies "component" "maintain") | nindent 6 }}
       containers:
         - name: maintain
-          image: {{ include "icegate.image" (dict "image" .Values.maintain.image "tag" .Chart.AppVersion) }}
+          image: {{ include "icegate.image" (dict "image" .Values.maintain.image "tag" .Chart.AppVersion "key" "maintain.image") }}
           imagePullPolicy: {{ .Values.maintain.image.pullPolicy }}
           command:
             - /usr/local/bin/entrypoint
@@ -60,7 +60,7 @@ spec:
             {{- end }}
           {{- with .Values.maintain.livenessProbe }}
           livenessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- include "icegate.probe" (dict "probe" . "isTlsEnabled" ($.Values.maintain.tls).enabled) | nindent 12 }}
           {{- end }}
           resources:
             {{- toYaml .Values.maintain.resources | nindent 12 }}
@@ -70,12 +70,18 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            {{- if ($.Values.maintain.tls).enabled }}
+            {{- include "icegate.tlsVolumeMount" . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "icegate.componentName" (dict "context" . "component" "maintain") }}
         - name: tmp
           emptyDir: {}
+        {{- if ($.Values.maintain.tls).enabled }}
+        {{- include "icegate.tlsVolume" (dict "context" . "component" "maintain") | nindent 8 }}
+        {{- end }}
       {{- with .Values.maintain.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

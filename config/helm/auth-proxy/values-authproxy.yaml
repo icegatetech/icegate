@@ -1,7 +1,7 @@
 ## Ingest behind the Envoy auth proxy of configmap-envoy.yaml.
 ##
-##   kubectl apply -f config/helm/auth-proxy/configmap-envoy.yaml
-##   helm install icegate oci://ghcr.io/icegatetech/charts/icegate \
+##   kubectl apply --namespace default -f config/helm/auth-proxy/configmap-envoy.yaml
+##   helm install icegate oci://ghcr.io/icegatetech/charts/icegate --namespace default \
 ##     -f config/helm/auth-proxy/values-authproxy.yaml
 ##
 ## `tenant`, `otlpHttp`, `otlpGrpc`, `service`, `extraContainers` and
@@ -45,6 +45,16 @@ ingest:
   service:
     otlpHttpPort: 4318
     otlpGrpcPort: 4317
+
+  ## icegate serves TLS on every listener, the loopback receivers above included,
+  ## because the proxy reaches them over TLS: configmap-envoy.yaml verifies the
+  ## certificate by the ingest Service name. One Secret serves both hops — icegate
+  ## mounts it through the chart, the proxy through the authproxy-tls volume
+  ## below, which must name the same Secret. `make envoy-config-test` compares the
+  ## two.
+  tls:
+    enabled: true
+    secretName: ingest-tls
 
   extraContainers:
     - name: auth-proxy
@@ -110,14 +120,29 @@ ingest:
         - name: authproxy-tls
           mountPath: /etc/icegate/tls
           readOnly: true
+        - name: authproxy-ca
+          mountPath: /etc/icegate/ca
+          readOnly: true
 
   extraVolumes:
     - name: authproxy-config
       configMap:
         name: ingest-authproxy
-    ## Server certificate the proxy presents, keys tls.crt and tls.key. Create it
-    ## yourself (cert-manager, or `kubectl create secret tls ingest-tls ...`):
-    ## this repository ships no certificate and no issuer.
+    ## The certificate the proxy presents and icegate presents to the proxy, keys
+    ## tls.crt and tls.key, issued for the ingest Service name configmap-envoy.yaml
+    ## verifies: the Secret ingest.tls.secretName above names. Create it yourself
+    ## (cert-manager, or `kubectl create secret tls ingest-tls ...`): this
+    ## repository ships no certificate and no issuer.
     - name: authproxy-tls
       secret:
         secretName: ingest-tls
+    ## The CA that signed it, key ca.crt: the ConfigMap tls.caConfigMapName below
+    ## names, which the proxy verifies icegate's certificate against.
+    - name: authproxy-ca
+      configMap:
+        name: icegate-ca
+
+tls:
+  ## The CA ConfigMap of the authproxy-ca volume above, read by the proxy. The
+  ## chart reads it too, as the CA of a ServiceMonitor scrape when one is enabled.
+  caConfigMapName: icegate-ca

@@ -20,7 +20,7 @@ The Flight SQL endpoint exposes the IceGate data lake as a generic SQL warehouse
 ### Address & catalog layout
 
 ```text
-grpc://<host>:8815                  # plaintext gRPC (TLS terminated at the gateway)
+grpc://<host>:8815                  # plaintext gRPC unless the `tls` block is set
 catalog:   iceberg
 schema:    icegate
 tables:    logs | spans | events | metrics
@@ -131,7 +131,7 @@ When adding support for a new client, the bare-minimum smoke test is:
 - **Handshake**: the upstream `datafusion-flight-sql-server` returns `Unimplemented` for `do_handshake` by design ([Apache Arrow guidance](https://github.com/apache/arrow/issues/23836)). Use metadata headers instead. BI tools that hard-require a handshake response need configuration tweaks or a future server-side stub.
 - **Transactions**: `BeginTransaction` / `EndTransaction` return `Unimplemented`. The endpoint is stateless; clients that issue transactions unconditionally on connect will fail at that step.
 - **Parameter binding**: `do_put_prepared_statement_query` is not implemented — most clients fall back to inlined literal SQL.
-- **TLS**: no built-in TLS; terminate at the gateway. Plain gRPC only.
+- **TLS**: off unless the top-level `tls` block of the query configuration is set; see `QueryConfig::tls`. Without it the endpoint serves plain gRPC and TLS is terminated at the gateway.
 - **Cancellation**: queries are cancelled when the gRPC stream is dropped by the client; there is no cooperative server-side cancel beyond that.
 - **Arrow `Map` columns over older drivers**: the attribute columns are `Map<Utf8, Utf8>` — `resource_attributes`, `scope_attributes`, and one record-level map per table (`log_attributes` on `logs`/`events`, `span_attributes` on `spans`, `data_point_attributes` on `metrics`). JDBC drivers <17.0 and `pyarrow` <14 may render them as `List<Struct<key, value>>`. Workaround: project-specific keys (`resource_attributes['service.version']`) which collapses to `Utf8`. Keys are stored in OTel-native dotted form, so address them as `service.version`, not `service_version`; the dot-to-underscore mapping applies only to the Loki label API.
 
