@@ -35,7 +35,7 @@
     },
     "podSecurity": {
       "type": ["object", "null"],
-      "additionalProperties": true,
+      "additionalProperties": false,
       "description": "Pod Security checks on what an operator adds to a pod.",
       "properties": {
         "checkRestricted": { "type": ["boolean", "null"], "description": "Fail the render when an entry of ingest.extraContainers or ingest.extraVolumes breaks the restricted Pod Security level." }

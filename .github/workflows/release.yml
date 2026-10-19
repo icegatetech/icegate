@@ -10,6 +10,13 @@ permissions:
   packages: write
   id-token: write
 
+# Two runs for one tag would both pass "Check the version is unpublished" before either
+# pushes. Queued instead of run side by side, the later run finds the version published
+# and stops there.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io

@@ -1,5 +1,6 @@
 {{- if .Values.ingest.enabled -}}
 {{- include "icegate.validateRestrictedExtensions" . -}}
+{{- include "icegate.validateExtraVolumeNames" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

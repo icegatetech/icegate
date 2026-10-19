@@ -481,6 +481,32 @@ Usage: include "icegate.validateRestrictedExtensions" .
 {{- end }}
 
 {{/*
+Fail the render when an `ingest.extraVolumes` entry takes the name of a volume the chart
+itself renders in `deployment-ingest.yaml`. Pod volume names must be unique, so the
+collision would otherwise surface only when the API server refuses the Deployment.
+
+Only the names the chart renders for these values count: `cache` and the TLS volume
+are reserved only while `ingest.cache.enabled` / `ingest.tls.enabled` add them. The
+`config` and `tmp` names here must match the ones `deployment-ingest.yaml` declares.
+
+Usage: include "icegate.validateExtraVolumeNames" .
+*/}}
+{{- define "icegate.validateExtraVolumeNames" -}}
+{{- $chartVolumeNames := list "config" "tmp" }}
+{{- if (.Values.ingest.cache).enabled }}
+{{- $chartVolumeNames = append $chartVolumeNames "cache" }}
+{{- end }}
+{{- if (.Values.ingest.tls).enabled }}
+{{- $chartVolumeNames = append $chartVolumeNames (include "icegate.tlsVolumeName" .) }}
+{{- end }}
+{{- range $volume := default (list) .Values.ingest.extraVolumes }}
+{{- if has (toString $volume.name) $chartVolumeNames }}
+{{- fail (printf "ingest.extraVolumes[%s]: the chart already renders a pod volume named %s; give this volume another name" $volume.name $volume.name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Fail the render when the retention window, the query provider cache, and the GC
 grace period are not ordered so that a query can never plan against files that
 are already gone:
@@ -764,13 +790,20 @@ tls:
 {{- end }}
 
 {{/*
-The pod volume carrying a component's TLS Secret. Its name is the one
-`icegate.tlsVolumeMount` mounts.
+The name of the pod volume carrying a component's TLS Secret, shared by the volume,
+its mount and `icegate.validateExtraVolumeNames`.
+*/}}
+{{- define "icegate.tlsVolumeName" -}}
+tls
+{{- end }}
+
+{{/*
+The pod volume carrying a component's TLS Secret, mounted by `icegate.tlsVolumeMount`.
 
 Usage: include "icegate.tlsVolume" (dict "context" . "component" "ingest")
 */}}
 {{- define "icegate.tlsVolume" -}}
-- name: tls
+- name: {{ include "icegate.tlsVolumeName" . }}
   secret:
     secretName: {{ (index .context.Values .component).tls.secretName | quote }}
 {{- end }}
@@ -784,7 +817,7 @@ up a renewal, so the whole Secret volume is mounted rather than single files fro
 Usage: include "icegate.tlsVolumeMount" .
 */}}
 {{- define "icegate.tlsVolumeMount" -}}
-- name: tls
+- name: {{ include "icegate.tlsVolumeName" . }}
   mountPath: {{ include "icegate.tlsMountPath" . }}
   readOnly: true
 {{- end }}

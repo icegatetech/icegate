@@ -1279,6 +1279,41 @@ def check_tls_render_refusals() -> None:
         ok("TLS with ingest.metrics.enabled=false asks for no CA, as no ServiceMonitor is rendered")
 
 
+def check_pod_security_unknown_key_refused() -> None:
+    """A misspelt podSecurity switch is refused rather than leaving the guard silently off."""
+    check_render_refuses(
+        "an unknown key under podSecurity",
+        "'/podSecurity': additional properties 'checkRestrict' not allowed",
+        "--set",
+        "podSecurity.checkRestricted=true",
+        "--set",
+        "podSecurity.checkRestrict=true",
+    )
+
+
+def check_extra_volume_name_collisions() -> None:
+    """An extra volume may not take the name of a volume the chart renders for the same values."""
+    for chart_volume_name, args in (
+        ("config", ()),
+        ("tmp", ()),
+        ("cache", ("--set", "ingest.cache.enabled=true")),
+        ("tls", tls_args("ingest")),
+    ):
+        check_render_refuses(
+            f"an extra volume named {chart_volume_name}",
+            f"ingest.extraVolumes[{chart_volume_name}]: the chart already renders a pod volume named {chart_volume_name}",
+            *args,
+            "--set-json",
+            f'ingest.extraVolumes=[{{"name":"{chart_volume_name}","emptyDir":{{}}}}]',
+        )
+    # A name is reserved only while the chart renders that volume: with TLS off, `tls` is free.
+    error = capture_render_error("--set-json", 'ingest.extraVolumes=[{"name":"tls","emptyDir":{}}]')
+    if error is not None:
+        fail(f"an extra volume named tls must render while ingest.tls is off:\n{error}")
+    else:
+        ok("an extra volume named tls renders while ingest.tls is off")
+
+
 for component_name in COMPONENTS:
     check_tenant_policy(component_name)
     check_probe_target(component_name)
@@ -1305,6 +1340,8 @@ check_tls_reload_interval()
 check_tls_reload_interval_digits()
 check_tls_probe_passthrough()
 check_tls_render_refusals()
+check_pod_security_unknown_key_refused()
+check_extra_volume_name_collisions()
 # The Secret volume is a new volume type in every pod that serves TLS; the level allows
 # `secret`, and this proves the pods rendered with it on still meet the level.
 check_restricted_profile(*(flag for component in TLS_COMPONENTS for flag in tls_args(component)))
