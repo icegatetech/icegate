@@ -5733,7 +5733,7 @@ dependencies = [
 [[package]]
 name = "jobmanager"
 version = "0.1.0"
-source = "git+https://github.com/icegatetech/jobmanager?rev=90b27349b1304dba6d7df17fcd4f494430be68b7#90b27349b1304dba6d7df17fcd4f494430be68b7"
+source = "git+https://github.com/icegatetech/jobmanager?rev=a88e4a0123ada360f8f9b2a22dfd72d83db315db#a88e4a0123ada360f8f9b2a22dfd72d83db315db"
 dependencies = [
  "async-trait",
  "aws-config",
