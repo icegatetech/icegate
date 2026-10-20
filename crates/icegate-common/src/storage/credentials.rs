@@ -37,7 +37,7 @@ pub struct StaticCredentials {
 /// the path of its own config (`jobs_storage.credentials`, say) when it
 /// reports the error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum IncompleteCredentials {
+pub enum StaticCredentialsError {
     /// Exactly one of the access key id and the secret access key is set. A
     /// half pair signs nothing, so it fails per request, far from its cause,
     /// if it is let through.
@@ -62,14 +62,14 @@ impl StaticCredentials {
     ///
     /// # Errors
     ///
-    /// Returns [`IncompleteCredentials::HalfKeyPair`] when only one key is set,
-    /// and [`IncompleteCredentials::SessionTokenWithoutKeys`] when a token is
+    /// Returns [`StaticCredentialsError::HalfKeyPair`] when only one key is set,
+    /// and [`StaticCredentialsError::SessionTokenWithoutKeys`] when a token is
     /// set with neither key.
     pub fn from_parts(
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
         session_token: Option<String>,
-    ) -> Result<Option<Self>, IncompleteCredentials> {
+    ) -> Result<Option<Self>, StaticCredentialsError> {
         let access_key_id = discard_blank_value(access_key_id);
         let secret_access_key = discard_blank_value(secret_access_key);
         let session_token = discard_blank_value(session_token);
@@ -80,9 +80,9 @@ impl StaticCredentials {
                 secret_access_key,
                 session_token,
             })),
-            (None, None) if session_token.is_some() => Err(IncompleteCredentials::SessionTokenWithoutKeys),
+            (None, None) if session_token.is_some() => Err(StaticCredentialsError::SessionTokenWithoutKeys),
             (None, None) => Ok(None),
-            (Some(_), None) | (None, Some(_)) => Err(IncompleteCredentials::HalfKeyPair),
+            (Some(_), None) | (None, Some(_)) => Err(StaticCredentialsError::HalfKeyPair),
         }
     }
 }
@@ -117,7 +117,7 @@ mod tests {
         access_key_id: Option<&str>,
         secret_access_key: Option<&str>,
         session_token: Option<&str>,
-    ) -> Result<Option<StaticCredentials>, IncompleteCredentials> {
+    ) -> Result<Option<StaticCredentials>, StaticCredentialsError> {
         StaticCredentials::from_parts(
             access_key_id.map(str::to_string),
             secret_access_key.map(str::to_string),
@@ -193,7 +193,7 @@ mod tests {
         for (access_key_id, secret_access_key) in cases {
             assert_eq!(
                 resolve_credentials(access_key_id, secret_access_key, None),
-                Err(IncompleteCredentials::HalfKeyPair),
+                Err(StaticCredentialsError::HalfKeyPair),
                 "{access_key_id:?} {secret_access_key:?}"
             );
         }
@@ -203,7 +203,7 @@ mod tests {
     fn half_a_key_pair_is_rejected_even_with_a_token() {
         assert_eq!(
             resolve_credentials(Some("key"), None, Some("token")),
-            Err(IncompleteCredentials::HalfKeyPair)
+            Err(StaticCredentialsError::HalfKeyPair)
         );
     }
 
@@ -211,7 +211,7 @@ mod tests {
     fn a_session_token_without_keys_is_rejected() {
         assert_eq!(
             resolve_credentials(None, None, Some("token")),
-            Err(IncompleteCredentials::SessionTokenWithoutKeys)
+            Err(StaticCredentialsError::SessionTokenWithoutKeys)
         );
     }
 

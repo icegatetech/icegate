@@ -32,7 +32,7 @@ pub use base_path::is_persistent_base_path;
 pub use builder::ObjectStoreWithPath;
 pub use cache::{StorageCache, build_storage_cache, register_foyer_metrics};
 pub use config::{S3Config, StorageBackend, StorageConfig};
-pub use credentials::{IncompleteCredentials, REDACTED, StaticCredentials};
+pub use credentials::{REDACTED, StaticCredentials, StaticCredentialsError};
 pub use icegate_storage::{IceGateStorage, IceGateStorageFactory};
 pub use layers::StorageLayersConfig;
 pub use prefetch::PrefetchConfig;
