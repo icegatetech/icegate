@@ -67,7 +67,7 @@ icegate-queue = { path = "crates/icegate-queue" }
 # The rev is the head of icegatetech/jobmanager#11 (S3 credentials from the default chain,
 # optional endpoint), which IceGate's job storage needs; bump it to the merged commit once that
 # pull request lands.
-jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "a88e4a0123ada360f8f9b2a22dfd72d83db315db", features = ["metrics-otel"] }
+jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "c7c7b24af50c5d462a0eb6a89f51074ca1079ce9", features = ["metrics-otel"] }
 
 # Arrow ecosystem (must match iceberg's version)
 arrow = { version = "58.4", default-features = false, features = ["prettyprint"] }

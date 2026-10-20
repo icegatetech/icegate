@@ -5733,11 +5733,12 @@ dependencies = [
 [[package]]
 name = "jobmanager"
 version = "0.1.0"
-source = "git+https://github.com/icegatetech/jobmanager?rev=a88e4a0123ada360f8f9b2a22dfd72d83db315db#a88e4a0123ada360f8f9b2a22dfd72d83db315db"
+source = "git+https://github.com/icegatetech/jobmanager?rev=c7c7b24af50c5d462a0eb6a89f51074ca1079ce9#c7c7b24af50c5d462a0eb6a89f51074ca1079ce9"
 dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "aws-types",
  "chrono",
  "ciborium",
  "dashmap",
