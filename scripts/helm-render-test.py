@@ -317,6 +317,26 @@ JOB_STORAGE_BLOCKS = (
     ("maintain.yaml", "pricing", "maintain.pricing.jobsmanager.storage"),
 )
 
+# The ServiceAccounts a render under `RELEASE_NAME` creates: the one the Deployments run
+# as, and the hook-scoped one the migrate Job runs as. Stated rather than read from the
+# chart's helpers, so a check of the names cannot pass whatever they are changed to.
+SERVICE_ACCOUNT = "icegate"
+MIGRATE_SERVICE_ACCOUNT = "icegate-migrate"
+
+# An IRSA role, which both ServiceAccounts must carry: the migrate Job reaches the same
+# object storage as the Deployments. A JSON object, so the dots of the key stay in it.
+ROLE_ANNOTATION = {"eks.amazonaws.com/role-arn": "arn:aws:iam::123456789012:role/icegate"}
+
+# Fullnames around the length where `<fullname>-migrate` stops fitting the 63 characters a
+# Kubernetes name allows, with the name the migrate resources must then carry. 55 characters
+# leave the suffix exactly enough room, and 63 is the longest fullname the chart produces.
+LONG_FULLNAME_CASES = (  # (description, global.fullnameOverride, expected migrate name)
+    ("a 55-character fullname", "icegate-" + "x" * 47, "icegate-" + "x" * 47 + "-migrate"),
+    ("a 56-character fullname", "icegate-" + "x" * 48, "icegate-" + "x" * 47 + "-migrate"),
+    ("a 63-character fullname", "icegate-" + "x" * 55, "icegate-" + "x" * 47 + "-migrate"),
+    ("a fullname cut at a hyphen", "icegate-" + "x" * 46 + "-yyyyy", "icegate-" + "x" * 46 + "-migrate"),
+)
+
 
 def digest_for_row(position: int) -> str:
     """A well-formed digest that no other row of `IMAGE_DIGEST_KEYS` shares.
@@ -1314,6 +1334,165 @@ def check_extra_volume_name_collisions() -> None:
         ok("an extra volume named tls renders while ingest.tls is off")
 
 
+def read_service_accounts(*args: str) -> dict[str, dict]:
+    """Every ServiceAccount a render with `args` produces, by name."""
+    return {
+        document["metadata"]["name"]: document
+        for document in load_documents(render_chart(*args))
+        if document["kind"] == "ServiceAccount"
+    }
+
+
+def read_hook_annotations(document: dict) -> dict[str, str]:
+    """The `helm.sh/hook*` annotations of a rendered document, which make it a hook."""
+    annotations = document["metadata"].get("annotations") or {}
+    return {key: value for key, value in annotations.items() if key.startswith("helm.sh/hook")}
+
+
+def read_migrate_job(*args: str) -> dict:
+    """The migrate Job a render with `args` produces."""
+    return load_documents(render_chart(*args, show_only="templates/job-migrate.yaml"))[0]
+
+
+def check_service_accounts() -> None:
+    """An upgrade keeps the ServiceAccount the Deployments run as.
+
+    Helm deletes and recreates a hook resource on every upgrade, and a recreated
+    ServiceAccount has a new UID, so the tokens the running pods hold for it stop
+    validating. The migrate Job is a pre-install hook, which runs before any regular
+    resource exists, so it cannot run as that ServiceAccount either: it runs as a hook
+    one of its own, which a lower weight creates before the Job.
+    """
+    args = (
+        "--set-json",
+        f"serviceAccount.annotations={json.dumps(ROLE_ANNOTATION)}",
+        "--set-json",
+        'migrate.hookDeletePolicy="before-hook-creation,hook-succeeded"',
+    )
+    accounts = read_service_accounts(*args)
+    job = read_migrate_job(*args)
+    if sorted(accounts) != [SERVICE_ACCOUNT, MIGRATE_SERVICE_ACCOUNT]:
+        fail(f"the render must create the ServiceAccounts {SERVICE_ACCOUNT} and {MIGRATE_SERVICE_ACCOUNT}, it creates {sorted(accounts)}")
+        return
+
+    hook = read_hook_annotations(accounts[SERVICE_ACCOUNT])
+    if hook:
+        fail(f"the ServiceAccount {SERVICE_ACCOUNT} the Deployments run as must be a regular resource, it carries {hook}")
+    else:
+        ok(f"the ServiceAccount {SERVICE_ACCOUNT} the Deployments run as is a regular resource")
+
+    migrate_hook = read_hook_annotations(accounts[MIGRATE_SERVICE_ACCOUNT])
+    expected_hook = {"helm.sh/hook": "pre-install,pre-upgrade", "helm.sh/hook-delete-policy": "before-hook-creation,hook-succeeded"}
+    job_weight = int(read_hook_annotations(job)["helm.sh/hook-weight"])
+    if {key: migrate_hook.get(key) for key in expected_hook} != expected_hook:
+        fail(f"the ServiceAccount {MIGRATE_SERVICE_ACCOUNT} must be a hook of the migrate Job's phases and delete policy {expected_hook}, it carries {migrate_hook}")
+    elif not int(migrate_hook.get("helm.sh/hook-weight", job_weight)) < job_weight:
+        fail(f"the ServiceAccount {MIGRATE_SERVICE_ACCOUNT} must weigh less than the migrate Job's {job_weight}, so Helm creates it first; it carries {migrate_hook}")
+    else:
+        ok(f"the ServiceAccount {MIGRATE_SERVICE_ACCOUNT} is a hook created before the migrate Job, deleted by migrate.hookDeletePolicy")
+
+    if accounts[MIGRATE_SERVICE_ACCOUNT].get("automountServiceAccountToken") is not False:
+        fail(f"the ServiceAccount {MIGRATE_SERVICE_ACCOUNT} must not mount an API token: the migrate Job never calls the API")
+    else:
+        ok(f"the ServiceAccount {MIGRATE_SERVICE_ACCOUNT} mounts no API token")
+
+    for name, account in accounts.items():
+        annotations = account["metadata"].get("annotations") or {}
+        if {key: annotations.get(key) for key in ROLE_ANNOTATION} != ROLE_ANNOTATION:
+            fail(f"the ServiceAccount {name} must carry serviceAccount.annotations {ROLE_ANNOTATION}, it carries {annotations}")
+        else:
+            ok(f"the ServiceAccount {name} carries serviceAccount.annotations")
+
+    job_account = job["spec"]["template"]["spec"]["serviceAccountName"]
+    if job_account != MIGRATE_SERVICE_ACCOUNT:
+        fail(f"the migrate Job must run as {MIGRATE_SERVICE_ACCOUNT}, it runs as {job_account}")
+    else:
+        ok(f"the migrate Job runs as {MIGRATE_SERVICE_ACCOUNT}")
+    for component in COMPONENTS:
+        component_account = read_pod_spec(component, *args)["serviceAccountName"]
+        if component_account != SERVICE_ACCOUNT:
+            fail(f"the {component} Deployment must run as {SERVICE_ACCOUNT}, it runs as {component_account}")
+        else:
+            ok(f"the {component} Deployment runs as {SERVICE_ACCOUNT}")
+
+
+def check_service_account_named() -> None:
+    """A ServiceAccount the operator names, rather than the chart creating it, serves the migrate Job too.
+
+    It exists before the install does, so the pre-install hook can run as it, and the
+    chart then creates no ServiceAccount at all.
+    """
+    args = ("--set", "serviceAccount.create=false", "--set", "serviceAccount.name=external")
+    accounts = read_service_accounts(*args)
+    job_account = read_migrate_job(*args)["spec"]["template"]["spec"]["serviceAccountName"]
+    if accounts:
+        fail(f"with serviceAccount.create=false the chart must create no ServiceAccount, it creates {sorted(accounts)}")
+    elif job_account != "external":
+        fail(f"with serviceAccount.create=false the migrate Job must run as serviceAccount.name external, it runs as {job_account}")
+    else:
+        ok("with serviceAccount.create=false the migrate Job runs as serviceAccount.name and the chart creates none")
+
+
+def check_service_account_without_migrate() -> None:
+    """With migrate off, the chart creates only the Deployments' ServiceAccount, still no hook."""
+    accounts = read_service_accounts("--set", "migrate.enabled=false")
+    if sorted(accounts) != [SERVICE_ACCOUNT]:
+        fail(f"with migrate.enabled=false the render must create the ServiceAccount {SERVICE_ACCOUNT} alone, it creates {sorted(accounts)}")
+    elif read_hook_annotations(accounts[SERVICE_ACCOUNT]):
+        fail(f"with migrate.enabled=false the ServiceAccount {SERVICE_ACCOUNT} must be a regular resource")
+    else:
+        ok(f"with migrate.enabled=false the render creates the regular ServiceAccount {SERVICE_ACCOUNT} alone")
+
+
+def check_long_fullname_component_names() -> None:
+    """A long fullname is cut short of each component's suffix, never the suffix itself.
+
+    Cut after the two are joined, the suffix is what goes: from 62 characters every
+    component would carry the bare fullname, so the migrate ServiceAccount would take the
+    name of the one the Deployments run as and two Deployments would share one name.
+    """
+    for description, fullname, migrate_name in LONG_FULLNAME_CASES:
+        documents = load_documents(render_chart("--set", f"global.fullnameOverride={fullname}"))
+        names = [(document["kind"], document["metadata"]["name"]) for document in documents]
+        components = {
+            (document["kind"], document["metadata"]["name"]): document["metadata"]["labels"]["app.kubernetes.io/component"]
+            for document in documents
+            if "app.kubernetes.io/component" in (document["metadata"].get("labels") or {})
+        }
+        accounts = sorted(name for kind, name in names if kind == "ServiceAccount")
+        unsuffixed = sorted(f"{kind} {name}" for (kind, name), component in components.items() if not name.endswith(f"-{component}"))
+        too_long = sorted(f"{kind} {name}" for kind, name in names if len(name) > 63)
+        if len(set(names)) != len(names):
+            fail(f"{description} renders two resources of one kind under one name: {sorted(names)}")
+        elif unsuffixed:
+            fail(f"{description} cuts the component suffix off {unsuffixed}")
+        elif too_long:
+            fail(f"{description} renders names longer than 63 characters: {too_long}")
+        elif accounts != sorted([fullname, migrate_name]):
+            fail(f"{description} must create the ServiceAccounts {fullname} and {migrate_name}, it creates {accounts}")
+        else:
+            ok(f"{description} keeps every component suffix, and the migrate ServiceAccount is {migrate_name}")
+
+
+def check_migrate_service_account_name_refused() -> None:
+    """serviceAccount.name may not take the name of the migrate Job's hook ServiceAccount.
+
+    The Deployments would then run as a hook resource, recreated on every upgrade.
+    """
+    check_render_refuses(
+        f"serviceAccount.name {MIGRATE_SERVICE_ACCOUNT}",
+        f"the ServiceAccount the Deployments run as and the one the migrate Job runs as are both named {MIGRATE_SERVICE_ACCOUNT}",
+        "--set",
+        f"serviceAccount.name={MIGRATE_SERVICE_ACCOUNT}",
+    )
+    # The name is reserved only while the chart renders that hook: with migrate off, it is free.
+    error = capture_render_error("--set", f"serviceAccount.name={MIGRATE_SERVICE_ACCOUNT}", "--set", "migrate.enabled=false")
+    if error is not None:
+        fail(f"serviceAccount.name {MIGRATE_SERVICE_ACCOUNT} must render while migrate is off:\n{error}")
+    else:
+        ok(f"serviceAccount.name {MIGRATE_SERVICE_ACCOUNT} renders while migrate is off")
+
+
 for component_name in COMPONENTS:
     check_tenant_policy(component_name)
     check_probe_target(component_name)
@@ -1342,6 +1521,11 @@ check_tls_probe_passthrough()
 check_tls_render_refusals()
 check_pod_security_unknown_key_refused()
 check_extra_volume_name_collisions()
+check_service_accounts()
+check_service_account_named()
+check_service_account_without_migrate()
+check_long_fullname_component_names()
+check_migrate_service_account_name_refused()
 # The Secret volume is a new volume type in every pod that serves TLS; the level allows
 # `secret`, and this proves the pods rendered with it on still meet the level.
 check_restricted_profile(*(flag for component in TLS_COMPONENTS for flag in tls_args(component)))
