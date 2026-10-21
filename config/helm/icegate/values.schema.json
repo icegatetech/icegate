@@ -26,10 +26,10 @@
     "serviceAccount": {
       "type": ["object", "null"],
       "additionalProperties": true,
-      "description": "ServiceAccount used by every component.",
+      "description": "ServiceAccount the Deployments run as. While the chart creates it, the migrate Job runs as a hook ServiceAccount of its own.",
       "properties": {
-        "create": { "type": ["boolean", "null"], "description": "Create the ServiceAccount." },
-        "annotations": { "type": ["object", "null"], "description": "Annotations for the ServiceAccount, for example an AWS IRSA role ARN." },
+        "create": { "type": ["boolean", "null"], "description": "Create the ServiceAccount, and the migrate Job's own." },
+        "annotations": { "type": ["object", "null"], "description": "Annotations for both ServiceAccounts, for example an AWS IRSA role ARN." },
         "name": { "type": ["string", "null"], "description": "Name of an existing ServiceAccount to use instead of creating one." }
       }
     },

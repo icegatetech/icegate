@@ -9,10 +9,15 @@ global:
   fullnameOverride: ""
   imagePullSecrets: []
 
-## ServiceAccount
+## ServiceAccount the Deployments run as. While the chart creates it, the migrate Job
+## runs as one of its own, named like the Job (<fullname>-migrate) and given the same
+## annotations, because the Job is a hook that runs before any regular resource exists.
+## Workload identity has to cover both: an EKS Pod Identity association for each, or an
+## IRSA role whose trust policy names both. With create: false, `name` must exist before
+## the install, and the migrate Job runs as it too.
 serviceAccount:
   create: true
-  ## Annotations for the ServiceAccount (e.g. for AWS IRSA)
+  ## Annotations for both ServiceAccounts (e.g. for AWS IRSA)
   ## eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/icegate
   annotations: {}
   name: ""

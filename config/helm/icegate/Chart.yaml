@@ -92,6 +92,8 @@ annotations:
       description: ingest.extraContainers and ingest.extraVolumes, for sidecars the chart does not ship
     - kind: added
       description: ingest.metrics.host, the bind address of the operational listener
+    - kind: fixed
+      description: The ServiceAccount the Deployments run as is no longer a hook, so an upgrade keeps it and the pods' tokens; the migrate Job runs as a hook ServiceAccount of its own, and the first upgrade from an earlier chart needs --take-ownership
   # Rewritten by .github/workflows/release.yml from the tag: a tag containing a hyphen
   # is a prerelease. Editing it here changes nothing at release time.
   artifacthub.io/prerelease: "false"

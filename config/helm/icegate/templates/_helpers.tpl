@@ -87,6 +87,26 @@ ServiceAccount name.
 {{- end }}
 
 {{/*
+Name of the ServiceAccount the migrate Job runs as.
+
+The Job is a pre-install hook, and Helm runs those before it creates any regular
+resource, so on install the ServiceAccount the Deployments run as does not exist yet.
+That one cannot be a hook instead: Helm deletes and recreates a hook on every upgrade,
+and the recreated ServiceAccount has a new UID, so the tokens the running pods hold
+for it, workload identity's included, stop validating. While the chart creates the
+ServiceAccounts, the Job therefore runs as a hook one of its own
+(`serviceaccount-migrate.yaml`); one the operator names exists before the install and
+serves the Job as well.
+*/}}
+{{- define "icegate.migrateServiceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- include "icegate.componentName" (dict "context" . "component" "migrate") }}
+{{- else }}
+{{- include "icegate.serviceAccountName" . }}
+{{- end }}
+{{- end }}
+
+{{/*
 Image reference for a component or an init container.
 
 `image` is a map of `repository`, `tag` and `digest`. An empty `tag` falls back to

@@ -28,6 +28,18 @@ To pin a version:
 helm install icegate oci://ghcr.io/icegatetech/charts/icegate --version {{ .Version }}
 ```
 
+## Upgrading
+
+Chart versions up to the `0.2.0` release candidates created the ServiceAccount as a Helm
+hook whenever `migrate.enabled` was on, and the release does not record a hook, so an
+upgrade from such a release stops before changing anything: the ServiceAccount `cannot
+be imported into the current release`. Run that first upgrade with `--take-ownership`,
+which adopts the ServiceAccount as it stands, so the running pods keep their tokens:
+
+```bash
+helm upgrade icegate oci://ghcr.io/icegatetech/charts/icegate --version {{ .Version }} --take-ownership
+```
+
 ## What this chart deploys
 
 Four components, each independently enabled and scaled:
@@ -47,7 +59,9 @@ A `migrate` Job runs as a Helm hook to create or update the Iceberg tables.
 - S3 or an S3-compatible object store, reachable from every enabled component.
 - Credentials supplied through `aws.existingSecret`. Without it the chart renders
   no keys and the services use the AWS default credential chain (Pod Identity,
-  IRSA through `serviceAccount.annotations`, environment).
+  IRSA through `serviceAccount.annotations`, environment). The migrate Job runs as a
+  ServiceAccount of its own, which that identity has to cover too; see `serviceAccount`
+  in `values.yaml`.
 
 ## Running against S3-compatible storage
 
