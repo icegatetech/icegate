@@ -178,6 +178,25 @@ jobs:
             *.cache-from=type=gha,scope=release
             *.cache-to=type=gha,mode=max,scope=release
 
+      # The bake metadata carries each image's full provenance and outgrows the limit
+      # Linux puts on a single environment string (MAX_ARG_STRLEN), so a step handed it
+      # whole fails to start its shell, as the v0.2.0-rc11 run did. The runner evaluates
+      # these expressions itself, and only the digests reach a process. A target missing
+      # from the metadata yields an empty string, which the signing step refuses.
+      - name: Pick out image digests
+        id: digests
+        env:
+          QUERY: ${{ fromJSON(steps.bake.outputs.metadata).query['containerimage.digest'] }}
+          INGEST: ${{ fromJSON(steps.bake.outputs.metadata).ingest['containerimage.digest'] }}
+          MAINTAIN: ${{ fromJSON(steps.bake.outputs.metadata).maintain['containerimage.digest'] }}
+          CATALOG: ${{ fromJSON(steps.bake.outputs.metadata).catalog['containerimage.digest'] }}
+        run: |
+          set -euo pipefail
+          digests=$(jq -n -c --arg query "${QUERY}" --arg ingest "${INGEST}" \
+            --arg maintain "${MAINTAIN}" --arg catalog "${CATALOG}" \
+            '{$query, $ingest, $maintain, $catalog}')
+          echo "digests=${digests}" >> "$GITHUB_OUTPUT"
+
       # Both pins repeat what the v0.2.0-rc10 run resolved for `@v3`: that run logged
       # `cosign-release: v2.5.2` and its signatures verified. A moving tag in a step
       # that signs releases would change the signer without a diff to review.
@@ -192,11 +211,11 @@ jobs:
       - name: Sign images
         env:
           COSIGN_YES: "true"
-          BAKE_METADATA: ${{ steps.bake.outputs.metadata }}
+          IMAGE_DIGESTS: ${{ steps.digests.outputs.digests }}
         run: |
           set -euo pipefail
           for target in query ingest maintain catalog; do
-            digest=$(jq -r --arg t "$target" '.[$t]["containerimage.digest"]' <<<"${BAKE_METADATA}")
+            digest=$(jq -r --arg t "$target" '.[$t]' <<<"${IMAGE_DIGESTS}")
             if [[ -z "${digest}" || "${digest}" == "null" ]]; then
               echo "::error::bake metadata has no image digest for target '${target}'; nothing to sign"
               exit 1
@@ -209,12 +228,12 @@ jobs:
       # a gap in `--recursive` fails the release instead of reaching a user.
       - name: Verify image signatures
         env:
-          BAKE_METADATA: ${{ steps.bake.outputs.metadata }}
+          IMAGE_DIGESTS: ${{ steps.digests.outputs.digests }}
         run: |
           set -euo pipefail
           for target in query ingest maintain catalog; do
             image="${IMAGE_PREFIX}-${target}"
-            digest=$(jq -r --arg t "$target" '.[$t]["containerimage.digest"]' <<<"${BAKE_METADATA}")
+            digest=$(jq -r --arg t "$target" '.[$t]' <<<"${IMAGE_DIGESTS}")
             platform_digests=$(docker buildx imagetools inspect --raw "${image}@${digest}" | jq -r '.manifests[].digest')
             if [[ -z "${platform_digests}" ]]; then
               echo "::error::${image}@${digest} lists no per-platform manifests; refusing to verify only the index"
