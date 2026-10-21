@@ -88,6 +88,9 @@ pub mod config;
 pub mod error;
 /// Shared Iceberg Parquet write pipeline (Arrow batches → data files).
 pub mod iceberg_write;
+/// Server-side listener plumbing: the listener every server binds, plaintext or TLS with a
+/// reloadable certificate.
+pub mod listener;
 /// Snapshot data-file enumeration with decoded sort-key bounds (compaction).
 pub mod manifest_scan;
 /// Container memory-pressure request-shedding guard.
@@ -129,6 +132,10 @@ pub use attribute_key::{matches_wire_name, normalize_attribute_key};
 pub use catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle};
 pub use config::{ServerConfig, check_port_conflicts, load_config_file};
 pub use error::{CommonError as Error, Result};
+pub use listener::{
+    ApplicationProtocol, CertificateReload, Connection, DEFAULT_TLS_RELOAD_INTERVAL_SECS, ListenerRuntime,
+    MAX_TLS_RELOAD_INTERVAL_SECS, ServerCertificate, ServerListener, TlsConfig, start_listener_runtime,
+};
 pub use manifest_scan::{DataFileStats, list_data_files_with_stats};
 #[cfg(feature = "grpc")]
 pub use memory::MemoryShedInterceptor;

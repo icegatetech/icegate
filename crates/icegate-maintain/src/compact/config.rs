@@ -284,13 +284,12 @@ mod tests {
     }
 
     /// Defaults plus a populated job-state storage. The default `JobsStorageConfig`
-    /// has empty endpoint/bucket (a real deployment must set them), so a bare
+    /// has an empty bucket (a real deployment must set it), so a bare
     /// default does not validate; tests of the numeric tunables start from here.
     fn valid_config() -> CompactionConfig {
         CompactionConfig {
             jobsmanager: JobsManagerConfig {
                 storage: JobsStorageConfig {
-                    endpoint: "http://localhost:9000".to_string(),
                     bucket: "jobs".to_string(),
                     ..JobsStorageConfig::default()
                 },
@@ -434,7 +433,7 @@ mod tests {
 
     #[test]
     fn invalid_jobs_storage_is_rejected() {
-        // The bare default has empty storage endpoint/bucket, which must fail
+        // The bare default has an empty storage bucket, which must fail
         // through the delegated JobsStorageConfig::validate().
         assert!(matches!(
             CompactionConfig::default().validate(),

@@ -45,8 +45,9 @@ A `migrate` Job runs as a Helm hook to create or update the Iceberg tables.
 
 - Kubernetes with a working `StorageClass` if you run object storage in-cluster.
 - S3 or an S3-compatible object store, reachable from every enabled component.
-- Credentials supplied through `aws.existingSecret`, or an IRSA role on the
-  ServiceAccount via `serviceAccount.annotations`.
+- Credentials supplied through `aws.existingSecret`. Without it the chart renders
+  no keys and the services use the AWS default credential chain (Pod Identity,
+  IRSA through `serviceAccount.annotations`, environment).
 
 ## Running against S3-compatible storage
 
@@ -69,16 +70,30 @@ so existing clients for those protocols can read IceGate directly. Arrow Flight 
 available for SQL access. Each listener is enabled and given a port independently under
 `query`; the values table below lists the keys.
 
-## Verifying the chart signature
+## Verifying signatures
 
-Chart releases are signed with cosign using the release workflow's identity, so there
-is no public key to distribute:
+The chart and every image are signed with cosign using the identity of the release
+workflow run that published them, so there is no public key to distribute. That
+identity is the release workflow at the release tag.
+
+The chart:
 
 ```bash
 cosign verify ghcr.io/icegatetech/charts/icegate:{{ .Version }} \
-  --certificate-identity-regexp 'https://github.com/icegatetech/icegate/.*' \
+  --certificate-identity https://github.com/icegatetech/icegate/.github/workflows/release.yml@refs/tags/v{{ .Version }} \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+An image:
+
+```bash
+cosign verify ghcr.io/icegatetech/icegate-ingest:{{ .AppVersion }} \
+  --certificate-identity https://github.com/icegatetech/icegate/.github/workflows/release.yml@refs/tags/v{{ .Version }} \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The same command verifies `icegate-query`, `icegate-maintain` and `icegate-catalog`, and
+an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 
 {{ template "chart.valuesSection" . }}
 

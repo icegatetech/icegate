@@ -9,3 +9,4 @@ mod projection;
 mod read_only;
 mod smoke;
 mod tenant;
+mod tls;

@@ -3,7 +3,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use icegate_common::{CatalogBuilder, IoHandle, MemoryPressure, MetricsRuntime, run_operational_server};
+use icegate_common::{
+    CatalogBuilder, IoHandle, ListenerRuntime, MemoryPressure, MetricsRuntime, run_operational_server,
+    start_listener_runtime,
+};
 use icegate_queue::ParquetQueueReader;
 use tokio_util::sync::CancellationToken;
 
@@ -67,6 +70,12 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     // so the S3 catalog's CAS/transient retry loops abort promptly on SIGINT/
     // SIGTERM instead of running to their retry budget during shutdown.
     let cancel_token = CancellationToken::new();
+
+    // Loaded before anything else starts, so a pair that is missing or does not match stops
+    // the process here rather than once the catalog and the query engine are already
+    // running. One runtime for every listener: they present the one certificate, and its
+    // files are watched by one task.
+    let listener_runtime = start_listener_runtime(config.tls.as_ref(), &cancel_token)?;
 
     // Process-wide memory-pressure guard shared by every server task. Inert
     // (never sheds) when no finite cgroup limit exists (dev/CI/bare-metal).
@@ -139,7 +148,7 @@ pub async fn execute(config_path: PathBuf) -> Result<(), QueryError> {
     };
 
     // Spawn one task per enabled server (metrics + each query API).
-    let handles = spawn_servers(&config, &runtime, metrics_runtime.as_ref(), &cancel_token);
+    let handles = spawn_servers(&config, &runtime, metrics_runtime.as_ref(), &listener_runtime);
 
     tracing::info!("All enabled query servers started");
     tracing::info!("Press Ctrl+C or send SIGTERM to shutdown");
@@ -177,11 +186,14 @@ type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error
 /// vector: the operational listener is spawned whatever the configuration says,
 /// and [`QueryConfig::validate`] has already refused a document enabling no
 /// query protocol.
+///
+/// Every server binds with a clone of `listener_runtime`, so they stop on its
+/// token and, when it carries a certificate, all present that one.
 fn spawn_servers(
     config: &QueryConfig,
     runtime: &QueryRuntime,
     metrics_runtime: Option<&Arc<MetricsRuntime>>,
-    cancel_token: &CancellationToken,
+    listener_runtime: &ListenerRuntime,
 ) -> Vec<ServerHandle> {
     let mut handles = Vec::new();
 
@@ -190,10 +202,10 @@ fn spawn_servers(
     // scrapes no metrics.
     {
         let metrics_config = config.metrics.clone();
-        let token = cancel_token.clone();
+        let listener_runtime = listener_runtime.clone();
         let registry = metrics_runtime.map(|runtime| runtime.registry());
         handles.push(tokio::spawn(async move {
-            run_operational_server(metrics_config, registry, token)
+            run_operational_server(metrics_config, registry, listener_runtime)
                 .await
                 .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
         }));
@@ -204,36 +216,36 @@ fn spawn_servers(
     if config.loki.enabled {
         let runtime = runtime.clone();
         let loki_config = config.loki.clone();
-        let token = cancel_token.clone();
+        let listener_runtime = listener_runtime.clone();
         handles.push(tokio::spawn(async move {
-            crate::loki::run(runtime, loki_config, token).await
+            crate::loki::run(runtime, loki_config, listener_runtime).await
         }));
     }
 
     if config.prometheus.enabled {
         let runtime = runtime.clone();
         let prom_config = config.prometheus.clone();
-        let token = cancel_token.clone();
+        let listener_runtime = listener_runtime.clone();
         handles.push(tokio::spawn(async move {
-            crate::prometheus::run(runtime, prom_config, token).await
+            crate::prometheus::run(runtime, prom_config, listener_runtime).await
         }));
     }
 
     if config.tempo.enabled {
         let runtime = runtime.clone();
         let tempo_config = config.tempo.clone();
-        let token = cancel_token.clone();
+        let listener_runtime = listener_runtime.clone();
         handles.push(tokio::spawn(async move {
-            crate::tempo::run(runtime, tempo_config, token).await
+            crate::tempo::run(runtime, tempo_config, listener_runtime).await
         }));
     }
 
     if config.flight_sql.enabled {
         let runtime = runtime.clone();
         let flight_sql_config = config.flight_sql.clone();
-        let token = cancel_token.clone();
+        let listener_runtime = listener_runtime.clone();
         handles.push(tokio::spawn(async move {
-            crate::flight_sql::run(runtime, flight_sql_config, token).await
+            crate::flight_sql::run(runtime, flight_sql_config, listener_runtime).await
         }));
     }
 
@@ -294,4 +306,189 @@ async fn await_shutdown(handles: Vec<ServerHandle>, cancel_token: &CancellationT
     }
 
     failure
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        net::{Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
+
+    use icegate_common::{
+        DEFAULT_TLS_RELOAD_INTERVAL_SECS, HEALTH_PATH, OperationalConfig, ServerCertificate, TenantResolver, TlsConfig,
+    };
+    use rcgen::{CertificateParams, KeyPair};
+    use reqwest::{Client, StatusCode, Version};
+    use tempfile::TempDir;
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+
+    use super::*;
+    use crate::{
+        flight_sql::FlightSqlConfig, loki::LokiConfig, prometheus::PrometheusConfig, tempo::TempoConfig,
+        test_support::build_stalling_engine,
+    };
+
+    /// The upper bound of every wait, so a hang fails the test instead of the run.
+    const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// The name the test certificate is issued for, which the clients verify the server against.
+    const CERTIFICATE_HOST: &str = "localhost";
+
+    /// Ports nothing is listening on, all held at once so none of them is handed out twice.
+    /// Another process may take one before the server binds, which the readiness wait reports
+    /// as a server that never answered.
+    fn reserve_ports<const COUNT: usize>() -> [u16; COUNT] {
+        let reservations: Vec<_> = (0..COUNT)
+            .map(|_| std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a free port"))
+            .collect();
+        let mut ports = [0; COUNT];
+        for (port, reservation) in ports.iter_mut().zip(&reservations) {
+            *port = reservation.local_addr().expect("local address").port();
+        }
+        ports
+    }
+
+    /// Request `path` over `https` from the listener on `port` until it answers, with a client
+    /// that trusts only `certificate_pem`, and return the answer's status and HTTP version.
+    async fn get_over_tls(certificate_pem: &str, port: u16, path: &str) -> Result<(StatusCode, Version), String> {
+        let root = reqwest::Certificate::from_pem(certificate_pem.as_bytes()).expect("parse the test certificate");
+        let client = Client::builder()
+            .tls_certs_only([root])
+            .resolve(CERTIFICATE_HOST, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .build()
+            .expect("build the TLS client");
+        let url = format!("https://{CERTIFICATE_HOST}:{port}{path}");
+        let mut last_error = String::new();
+        // The servers bind on their own tasks, so the first attempts may find the port closed.
+        let attempts = async {
+            loop {
+                match client.get(&url).send().await {
+                    Ok(response) => return (response.status(), response.version()),
+                    Err(error) => last_error = error.to_string(),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let answer = tokio::time::timeout(STEP_TIMEOUT, attempts).await;
+        answer.map_err(|_elapsed| format!("{url} never answered over TLS; last error: {last_error}"))
+    }
+
+    /// Every listener the binary spawns presents the one certificate it was handed, and speaks the
+    /// protocol its clients do: `http/1.1` on the four HTTP listeners (the client offers `h2` as
+    /// well), `h2` on Flight SQL (a gRPC channel opens only once it is negotiated). A listener
+    /// left on plaintext would not complete the handshake, so each answer below proves its own
+    /// listener.
+    #[tokio::test]
+    async fn every_spawned_listener_serves_tls_with_the_one_certificate() {
+        let key_pair = KeyPair::generate().expect("generate key pair");
+        let certificate = CertificateParams::new(vec![CERTIFICATE_HOST.to_string()])
+            .expect("certificate params")
+            .self_signed(&key_pair)
+            .expect("self-sign certificate");
+        let directory = TempDir::new().expect("temp directory");
+        let certificate_path = directory.path().join("tls.crt");
+        let private_key_path = directory.path().join("tls.key");
+        fs::write(&certificate_path, certificate.pem()).expect("write certificate");
+        fs::write(&private_key_path, key_pair.serialize_pem()).expect("write private key");
+        let server_certificate = ServerCertificate::load(&TlsConfig {
+            certificate_path,
+            private_key_path,
+            reload_interval_secs: DEFAULT_TLS_RELOAD_INTERVAL_SECS,
+        })
+        .expect("load the generated pair");
+
+        let [
+            loki_port,
+            prometheus_port,
+            tempo_port,
+            flight_sql_port,
+            operational_port,
+        ] = reserve_ports();
+        let host = Ipv4Addr::LOCALHOST.to_string();
+        let config = QueryConfig {
+            loki: LokiConfig {
+                enabled: true,
+                host: host.clone(),
+                port: loki_port,
+            },
+            prometheus: PrometheusConfig {
+                enabled: true,
+                host: host.clone(),
+                port: prometheus_port,
+            },
+            tempo: TempoConfig {
+                enabled: true,
+                host: host.clone(),
+                port: tempo_port,
+            },
+            flight_sql: FlightSqlConfig {
+                enabled: true,
+                host: host.clone(),
+                port: flight_sql_port,
+                ..FlightSqlConfig::default()
+            },
+            metrics: OperationalConfig {
+                host,
+                port: operational_port,
+                ..OperationalConfig::default()
+            },
+            ..QueryConfig::default()
+        };
+        let runtime = QueryRuntime {
+            engine: build_stalling_engine(1),
+            metrics: Arc::new(QueryMetrics::new_disabled()),
+            pressure: MemoryPressure::inert(),
+            tenant_resolver: TenantResolver::Multi,
+        };
+        let cancel_token = CancellationToken::new();
+        let listener_runtime = ListenerRuntime::new(cancel_token.clone(), Some(Arc::new(server_certificate)));
+
+        let handles = spawn_servers(&config, &runtime, None, &listener_runtime);
+
+        // Four query servers and the operational one: the fixture reaches every listener.
+        assert_eq!(handles.len(), 5);
+        let pem = certificate.pem();
+        let mut answers = Vec::new();
+        for (name, port, path) in [
+            ("Loki", loki_port, "/ready"),
+            ("Prometheus", prometheus_port, "/-/ready"),
+            ("Tempo", tempo_port, "/ready"),
+            ("operational", operational_port, HEALTH_PATH),
+        ] {
+            answers.push((name, get_over_tls(&pem, port, path).await));
+        }
+        let tls_config = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&pem))
+            .domain_name(CERTIFICATE_HOST);
+        // Dropped on the spot: an open channel would keep its connection open through the drain.
+        let flight_sql_connected = tokio::time::timeout(
+            STEP_TIMEOUT,
+            Endpoint::from_shared(format!("https://{}:{flight_sql_port}", Ipv4Addr::LOCALHOST))
+                .expect("endpoint")
+                .tls_config(tls_config)
+                .expect("client TLS config")
+                .connect(),
+        )
+        .await
+        .map(|connected| connected.map(drop));
+
+        cancel_token.cancel();
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            outcomes.push(tokio::time::timeout(STEP_TIMEOUT, handle).await);
+        }
+
+        for (name, answer) in answers {
+            assert_eq!(answer, Ok((StatusCode::OK, Version::HTTP_11)), "{name}");
+        }
+        assert!(
+            matches!(flight_sql_connected, Ok(Ok(()))),
+            "got {flight_sql_connected:?}"
+        );
+        for outcome in outcomes {
+            assert!(matches!(outcome, Ok(Ok(Ok(())))), "got {outcome:?}");
+        }
+    }
 }

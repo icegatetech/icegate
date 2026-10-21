@@ -19,10 +19,11 @@ testing = ["test-harness", "testcontainers", "aws-config", "aws-sdk-s3"]
 # Harness helpers for draining a spawned server task. tokio-only, so a test or
 # benchmark that needs them does not also build the testcontainers/S3 stack.
 test-harness = []
-# The tonic adapters of this crate: the memory-pressure shedding interceptor and
-# the tenant policy interceptor. Only `icegate-query`/`icegate-ingest` (which
-# already depend on tonic) opt in; keeps `icegate-maintain`/jobmanager off tonic.
-grpc = ["dep:tonic"]
+# The tonic adapters of this crate: the memory-pressure shedding interceptor, the
+# tenant policy interceptor, and the listener's incoming-connection stream. Only
+# `icegate-query`/`icegate-ingest` (which already depend on tonic) opt in; keeps
+# `icegate-maintain`/jobmanager off tonic.
+grpc = ["dep:tonic", "dep:tokio-stream"]
 
 [dependencies]
 # Iceberg
@@ -74,6 +75,16 @@ opentelemetry-prometheus = { workspace = true }
 prometheus = { workspace = true }
 # gRPC adapters only (feature `grpc`); workspace pins 0.14.
 tonic = { workspace = true, optional = true }
+# The stream of incoming connections handed to tonic (feature `grpc`); `net` for the
+# stream over a plaintext socket.
+tokio-stream = { workspace = true, optional = true, features = ["net"] }
+
+# TLS
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+arc-swap = { workspace = true }
+x509-parser = { workspace = true }
 
 # OpenTelemetry tracing
 tracing-opentelemetry = { workspace = true }
@@ -98,3 +109,11 @@ tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 # Collects an axum response body in the operational-router tests.
 http-body-util = "0.1"
+# Server-certificate tests: generate self-signed pairs, and read the reload
+# metrics back from an in-memory exporter.
+rcgen = { workspace = true }
+time = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# `test-util` pauses the clock, so the listener test reaches a handshake deadline
+# without waiting for it in real time.
+tokio = { workspace = true, features = ["test-util"] }

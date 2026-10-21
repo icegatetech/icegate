@@ -61,6 +61,17 @@ metrics:
   port: 9091
   path: /metrics
 
+# Server-side TLS for every listener of this service, `/metrics` and `/health`
+# included. Off while this block is absent: the stand serves plaintext. To turn
+# it on, mount a directory holding both PEM files into the container, uncomment
+# the block, and move this service's Compose healthcheck and Prometheus scrape
+# (prometheus/prometheus.yml) to https.
+# `reload_interval_secs` is optional; keys and defaults: `icegate_common::listener::TlsConfig`.
+# tls:
+#   certificate_path: /etc/icegate-tls/tls.crt
+#   private_key_path: /etc/icegate-tls/tls.key
+#   reload_interval_secs: 60
+
 tracing:
   enabled: true
   service_name: icegate-ingest

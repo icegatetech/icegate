@@ -111,7 +111,7 @@ impl WalCleanupConfig {
     /// here. This method runs on every config load, including the one-shot
     /// `migrate` commands, which share `MaintainConfig` and carry no
     /// `wal_cleanup` block at all — the default job-state storage has an empty
-    /// endpoint and bucket, so validating it here would fail those commands on a
+    /// bucket, so validating it here would fail those commands on a
     /// service they never start. `WalCleanupRunner::new` validates it instead,
     /// at the one point where the pool is actually built.
     ///
@@ -247,7 +247,8 @@ mod tests {
     #[test]
     fn validate_leaves_the_job_state_storage_to_the_runner() {
         let config = WalCleanupConfig::default();
-        assert!(config.jobsmanager.storage.endpoint.is_empty());
+        assert!(config.jobsmanager.storage.endpoint.is_none());
+        assert!(config.jobsmanager.storage.bucket.is_empty());
 
         config.validate().expect("an unset job-state storage must still load");
         assert!(

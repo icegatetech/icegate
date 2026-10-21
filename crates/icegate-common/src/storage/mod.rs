@@ -2,6 +2,8 @@
 //!
 //! Provides:
 //! - [`StorageConfig`] / [`StorageBackend`] / [`S3Config`] — YAML/TOML config types
+//! - [`StaticCredentials`] — the one rule for a static S3 key pair, shared by
+//!   every config that accepts one
 //! - [`OperatorRegistry`] — the object stores and `OpenDAL` operators of one
 //!   component, each built once
 //! - [`IceGateStorage`] / [`IceGateStorageFactory`] — Iceberg `Storage` impl
@@ -18,6 +20,7 @@ mod base_path;
 mod builder;
 pub mod cache;
 mod config;
+mod credentials;
 mod icegate_s3;
 pub mod icegate_storage;
 mod layers;
@@ -29,6 +32,7 @@ pub use base_path::is_persistent_base_path;
 pub use builder::ObjectStoreWithPath;
 pub use cache::{StorageCache, build_storage_cache, register_foyer_metrics};
 pub use config::{S3Config, StorageBackend, StorageConfig};
+pub use credentials::{REDACTED, StaticCredentials, StaticCredentialsError};
 pub use icegate_storage::{IceGateStorage, IceGateStorageFactory};
 pub use layers::StorageLayersConfig;
 pub use prefetch::PrefetchConfig;

@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, run_operational_server};
+use icegate_common::{CatalogBuilder, IoHandle, MetricsRuntime, run_operational_server, start_listener_runtime};
 use icegate_queue::QueueCleaner;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -107,18 +107,21 @@ async fn abort_startup(
 /// Execute the run command.
 ///
 /// Loads the maintain configuration, initialises tracing, starts the operational
-/// server (`/health`, plus `/metrics` when `metrics.enabled`), builds the Iceberg
-/// catalog, starts the compaction service and (when enabled) the orphan-file GC
-/// service, WAL cleanup, and the LLM pricing crawler, then blocks until a
-/// shutdown signal arrives. On shutdown all worker pools are drained and the
-/// operational server is stopped before returning.
+/// server (`/health`, plus `/metrics` when `metrics.enabled`; over TLS when the
+/// config has a `tls` block), builds the Iceberg catalog, starts the compaction
+/// service and (when enabled) the orphan-file GC service, WAL cleanup, and the
+/// LLM pricing crawler, then blocks until a shutdown signal arrives. On shutdown
+/// all worker pools are drained and the operational server is stopped before
+/// returning.
 ///
 /// # Errors
 ///
 /// Returns [`MaintainError`] if the configuration cannot be loaded, the tracing
 /// block is invalid or its subscriber cannot be initialised, the metrics runtime
-/// cannot be built, the catalog cannot be built, any of the four services cannot
-/// start, or any worker pool stops with an error during shutdown.
+/// cannot be built, the `tls` certificate and key cannot be loaded as a matching
+/// pair (reported as [`MaintainError::Config`], before any service starts), the
+/// catalog cannot be built, any of the four services cannot start, or any worker
+/// pool stops with an error during shutdown.
 pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     let config = MaintainConfig::from_file(&config_path).map_err(|e| MaintainError::Config(e.to_string()))?;
 
@@ -144,12 +147,18 @@ pub async fn execute(config_path: PathBuf) -> Result<(), MaintainError> {
     // Serve `/health` — and `/metrics` when a runtime exists — for the lifetime
     // of the service; the token stops it on shutdown. Spawned unconditionally:
     // the probe endpoint does not depend on whether metrics are scraped.
+    //
+    // The certificate is loaded before the server or any worker starts, so a pair
+    // that cannot be loaded stops the process here instead of leaving it serving
+    // plaintext, or running workers behind a listener that never came up. The
+    // certificate watcher is bound to the same token as the listener, so it lives
+    // exactly as long as the listener does — through the worker drain.
     let metrics_cancel = CancellationToken::new();
+    let listener_runtime = start_listener_runtime(config.tls.as_ref(), &metrics_cancel)?;
     let operational_server = {
         let registry = metrics_runtime.as_ref().map(MetricsRuntime::registry);
         let metrics_config = config.metrics.clone();
-        let token = metrics_cancel.clone();
-        tokio::spawn(async move { run_operational_server(metrics_config, registry, token).await })
+        tokio::spawn(async move { run_operational_server(metrics_config, registry, listener_runtime).await })
     };
 
     // Cancellation token for coordinated shutdown, created before the catalog so

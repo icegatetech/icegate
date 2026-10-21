@@ -55,6 +55,14 @@ pub enum CommonError {
     #[error("wal offset resolution error: {0}")]
     WalOffset(String),
 
+    /// Server-side TLS error: a certificate or private key file that cannot be read or
+    /// parsed, a certificate and key that are not a pair, a TLS setup the crypto
+    /// provider cannot build, or a certificate reload task that cannot be started because
+    /// no Tokio runtime is running. The message names the offending file where there is
+    /// one.
+    #[error("TLS error: {0}")]
+    Tls(String),
+
     /// I/O error (file reading).
     #[error("io error: {0}")]
     Io(#[from] io::Error),

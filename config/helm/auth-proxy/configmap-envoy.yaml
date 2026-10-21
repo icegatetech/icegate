@@ -1,6 +1,6 @@
 # Envoy in front of the icegate ingest receivers: terminates TLS on the published
-# OTLP ports, verifies the ingest token, and writes x-scope-orgid from its
-# tenant_id claim.
+# OTLP ports, verifies the ingest token, writes x-scope-orgid from its tenant_id
+# claim, and reaches icegate on the pod loopback over TLS.
 #
 # Four values below name something outside this repository and MUST be replaced
 # before this is applied. Applied unchanged, the proxy refuses every request:
@@ -11,6 +11,12 @@
 #
 # A JWKS uri on `http://` takes one more change: the `transport_socket` of that
 # same cluster is deleted whole. The comment beside the block states why.
+#
+# The name the two icegate clusters verify icegate's certificate by is the ingest
+# Service's DNS name for release `icegate` in namespace `default`, the install
+# README.md shows. Another release or namespace changes it, once, at the anchor
+# `ingest_service_name`, together with the SAN of the certificate in the Secret
+# ingest.tls.secretName names.
 #
 # The upstream ports (14317/14318) must equal ingest.otlpHttp.port and
 # ingest.otlpGrpc.port of values-authproxy.yaml — icegate binds those, this file
@@ -31,6 +37,11 @@ metadata:
     app.kubernetes.io/component: ingest
 data:
   envoy.yaml: |
+    # Asked for by the SDS below although no management server is involved:
+    # `make envoy-config-test` refuses this document without both fields.
+    node:
+      id: ingest-authproxy
+      cluster: ingest-authproxy
     static_resources:
       listeners:
         # OTLP/HTTP. Terminates TLS, checks the ingest token, and rewrites
@@ -45,9 +56,16 @@ data:
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
                   common_tls_context:
-                    tls_certificates:
-                      - certificate_chain: { filename: /etc/icegate/tls/tls.crt }
-                        private_key: { filename: /etc/icegate/tls/tls.key }
+                    # icegate's certificate, through the SDS file beside this
+                    # one in the ConfigMap rather than by filename, so that a
+                    # renewal is served without restarting the proxy: the case
+                    # `certificate rotation` of scripts/authproxy-test.sh fails
+                    # if new connections keep the old certificate.
+                    tls_certificate_sds_secret_configs: &ingest_server_certificate
+                      - name: ingest_server_certificate
+                        sds_config:
+                          path_config_source:
+                            path: /etc/envoy/sds-server-certificate.yaml
               filters:
                 - name: envoy.filters.network.http_connection_manager
                   typed_config:
@@ -194,9 +212,7 @@ data:
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
                   common_tls_context:
-                    tls_certificates:
-                      - certificate_chain: { filename: /etc/icegate/tls/tls.crt }
-                        private_key: { filename: /etc/icegate/tls/tls.key }
+                    tls_certificate_sds_secret_configs: *ingest_server_certificate
                     alpn_protocols: ["h2"]
               filters:
                 - name: envoy.filters.network.http_connection_manager
@@ -227,6 +243,31 @@ data:
                         socket_address:
                           address: 127.0.0.1
                           port_value: 14318
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              # Verified by the name icegate's certificate is issued for, not by
+              # the loopback address dialled above. It must match the ingest
+              # Service name and the certificate's SAN; the header of this file
+              # says which release and namespace it assumes. The case `wrong
+              # upstream name` of scripts/authproxy-test.sh fails if a
+              # certificate for another name is forwarded to.
+              sni: &ingest_service_name icegate-ingest.default.svc
+              common_tls_context:
+                # The protocol icegate's listener on that port offers:
+                # ApplicationProtocol in
+                # crates/icegate-common/src/listener/server_listener.rs.
+                alpn_protocols: ["http/1.1"]
+                validation_context: &ingest_certificate_validation
+                  # The CA ConfigMap tls.caConfigMapName names, mounted by the
+                  # authproxy-ca volume of values-authproxy.yaml.
+                  trusted_ca:
+                    filename: /etc/icegate/ca/ca.crt
+                  match_typed_subject_alt_names:
+                    - san_type: DNS
+                      matcher:
+                        exact: *ingest_service_name
         - name: icegate_otlp_grpc
           connect_timeout: 1s
           type: STATIC
@@ -244,6 +285,14 @@ data:
                         socket_address:
                           address: 127.0.0.1
                           port_value: 14317
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              sni: *ingest_service_name
+              common_tls_context:
+                alpn_protocols: ["h2"]
+                validation_context: *ingest_certificate_validation
         # The JWKS endpoint the jwt_authn filter fetches signing keys from.
         - name: token_issuer_jwks
           connect_timeout: 2s
@@ -278,3 +327,17 @@ data:
                     - san_type: DNS
                       matcher:
                         exact: issuer.example
+
+  # The certificate both listeners serve, read by envoy.yaml from the directory
+  # this ConfigMap is mounted at. Its files are the two keys of the Secret
+  # ingest.tls.secretName names, mounted by the authproxy-tls volume of
+  # values-authproxy.yaml.
+  sds-server-certificate.yaml: |
+    resources:
+      - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
+        name: ingest_server_certificate
+        tls_certificate:
+          certificate_chain: { filename: /etc/icegate/tls/tls.crt }
+          private_key: { filename: /etc/icegate/tls/tls.key }
+          # The Secret's mount, the directory a renewed certificate appears in.
+          watched_directory: { path: /etc/icegate/tls }

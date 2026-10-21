@@ -14,18 +14,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use icegate_common::{TENANT_ID_HEADER, TenantPolicy, load_config_file};
+use icegate_common::{DEFAULT_TLS_RELOAD_INTERVAL_SECS, TENANT_ID_HEADER, TenantPolicy, TlsConfig, load_config_file};
 use icegate_ingest::IngestConfig;
 use serde::Deserialize;
 use tempfile::NamedTempFile;
 
-/// A complete ingest document with the `tenant` section left to the caller.
+/// A complete ingest document short of its leading top-level sections, which the caller
+/// writes in front of it.
 ///
 /// Every other block is here because `IngestConfig::validate` refuses the
 /// document without it, not because the case needs it; `tracing` is off so no
 /// endpoint is required.
 const DOCUMENT_TEMPLATE: &str = r"
-{tenant}
 catalog:
   backend: !s3
     warehouse: catalog
@@ -66,13 +66,14 @@ tracing:
   enabled: false
 ";
 
-/// Load a document whose `tenant` section is `tenant_section` (empty for none).
+/// Load a document that opens with `sections`, whole top-level YAML sections such as `tenant`
+/// or `tls` (empty for none).
 ///
 /// The file is owned by a `NamedTempFile`, so it is removed on success, failure,
 /// and panic alike.
-fn load_document(tenant_section: &str) -> IngestConfig {
+fn load_document(sections: &str) -> IngestConfig {
     let mut file = NamedTempFile::with_suffix(".yaml").expect("temp config file");
-    file.write_all(DOCUMENT_TEMPLATE.replace("{tenant}", tenant_section).as_bytes())
+    file.write_all(format!("{sections}{DOCUMENT_TEMPLATE}").as_bytes())
         .expect("write config document");
     file.flush().expect("flush config document");
     IngestConfig::from_file(file.path()).expect("the document must load and validate")
@@ -99,6 +100,25 @@ fn a_document_without_a_tenant_section_keeps_the_default_tenant() {
             id: "default".to_string()
         }
     );
+}
+
+#[test]
+fn a_document_with_a_tls_block_loads_its_paths_and_the_default_reload_interval() {
+    let config = load_document("tls:\n  certificate_path: /tls/tls.crt\n  private_key_path: /tls/tls.key");
+
+    assert_eq!(
+        config.tls,
+        Some(TlsConfig {
+            certificate_path: PathBuf::from("/tls/tls.crt"),
+            private_key_path: PathBuf::from("/tls/tls.key"),
+            reload_interval_secs: DEFAULT_TLS_RELOAD_INTERVAL_SECS,
+        })
+    );
+}
+
+#[test]
+fn a_document_without_a_tls_block_serves_plaintext() {
+    assert_eq!(load_document("").tls, None);
 }
 
 /// The stand configuration is a second copy of the shape a deployment behind an

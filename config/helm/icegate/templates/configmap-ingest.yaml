@@ -10,6 +10,7 @@ data:
   ingest.yaml: |
     {{- include "icegate.validateOperationalHost" . }}
     {{- include "icegate.validateOtlpHosts" . }}
+    {{- include "icegate.validateTls" (dict "context" . "component" "ingest") }}
     {{- include "icegate.tenantYaml" (dict "context" . "component" "ingest") | nindent 4 }}
     catalog:
       {{- include "icegate.catalogYaml" . | nindent 6 }}
@@ -73,7 +74,9 @@ data:
         poll_interval_ms: {{ .Values.ingest.shift.jobsmanager.pollIntervalMs }}
         iteration_interval_millisecs: {{ .Values.ingest.shift.jobsmanager.iterationIntervalMillisecs }}
         storage:
-          endpoint: {{ .Values.ingest.shift.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          {{- with include "icegate.jobsStorageEndpointYaml" (dict "context" . "storage" .Values.ingest.shift.jobsmanager.storage) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           bucket: {{ .Values.ingest.shift.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.ingest.shift.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.ingest.shift.jobsmanager.storage.region | default .Values.aws.region | quote }}
@@ -93,6 +96,9 @@ data:
       host: {{ .Values.ingest.metrics.host | quote }}
       port: {{ .Values.ingest.metrics.port }}
       path: {{ .Values.ingest.metrics.path | quote }}
+    {{- with include "icegate.tlsYaml" (dict "context" . "component" "ingest") }}
+    {{- . | nindent 4 }}
+    {{- end }}
     tracing:
       enabled: {{ .Values.ingest.tracing.enabled }}
       {{- if .Values.ingest.tracing.otlpEndpoint }}

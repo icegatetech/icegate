@@ -6,5 +6,8 @@
 //! - `labels`: Label metadata endpoint tests (labels, label values, series)
 //! - `tenant`: Tenant isolation tests
 //! - `trace`: Trace ID and span ID query tests
+//! - `tls`: The listener served over TLS
 
 mod loki;
+#[path = "support/tls_certificate.rs"]
+mod tls_certificate;

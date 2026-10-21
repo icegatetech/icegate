@@ -36,8 +36,8 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, METRICS_TABLE, PRICES_TABLE,
-    SPANS_TABLE, TENANT_ID_HEADER, TenantResolver, catalog::CatalogBuilder, schema,
+    CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, ListenerRuntime,
+    METRICS_TABLE, PRICES_TABLE, SPANS_TABLE, TENANT_ID_HEADER, TenantResolver, catalog::CatalogBuilder, schema,
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
@@ -46,7 +46,9 @@ use icegate_query::{
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+
+use crate::tls_certificate::{CERTIFICATE_HOST, TestCertificate};
 
 /// Severity values cycled across written log rows.
 const SEVERITIES: [&str; 3] = ["INFO", "WARN", "ERROR"];
@@ -74,7 +76,17 @@ impl TestServer {
     /// Runs the server under `multi`, which is what a deployment behind the
     /// auth proxy carries: every client of this suite names its tenant.
     pub async fn start() -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
-        Self::start_with(QueryEngineConfig::default(), TenantResolver::Multi).await
+        Self::start_with(QueryEngineConfig::default(), TenantResolver::Multi, None).await
+    }
+
+    /// Variant of [`Self::start`] serving TLS with `certificate` when one is given.
+    ///
+    /// `channel` then trusts exactly that certificate and connects over `https`, so tests
+    /// build clients from it as they do against the plaintext server.
+    pub async fn start_with_certificate(
+        certificate: Option<&TestCertificate>,
+    ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
+        Self::start_with(QueryEngineConfig::default(), TenantResolver::Multi, certificate).await
     }
 
     /// Variant of [`Self::start`] running the server on a specific engine
@@ -83,7 +95,7 @@ impl TestServer {
     pub async fn start_with_engine_config(
         engine_config: QueryEngineConfig,
     ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
-        Self::start_with(engine_config, TenantResolver::Multi).await
+        Self::start_with(engine_config, TenantResolver::Multi, None).await
     }
 
     /// Variant of [`Self::start`] running the server under a tenant policy of
@@ -92,12 +104,13 @@ impl TestServer {
     pub async fn start_with_tenant_policy(
         tenant_resolver: TenantResolver,
     ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
-        Self::start_with(QueryEngineConfig::default(), tenant_resolver).await
+        Self::start_with(QueryEngineConfig::default(), tenant_resolver, None).await
     }
 
     async fn start_with(
         engine_config: QueryEngineConfig,
         tenant_resolver: TenantResolver,
+        certificate: Option<&TestCertificate>,
     ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
         let warehouse_path = tempfile::tempdir()?;
         let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
@@ -128,7 +141,10 @@ impl TestServer {
         };
 
         let cancel_token = CancellationToken::new();
-        let cancel_token_clone = cancel_token.clone();
+        let listener_runtime = ListenerRuntime::new(
+            cancel_token.clone(),
+            certificate.map(TestCertificate::server_certificate),
+        );
         let runtime = QueryRuntime {
             engine: Arc::clone(&query_engine),
             metrics: Arc::new(QueryMetrics::new_disabled()),
@@ -138,7 +154,7 @@ impl TestServer {
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let mut server_handle = tokio::spawn(async move {
-            icegate_query::flight_sql::run_with_port_tx(runtime, flight_sql_config, cancel_token_clone, Some(port_tx))
+            icegate_query::flight_sql::run_with_port_tx(runtime, flight_sql_config, listener_runtime, Some(port_tx))
                 .await
                 .unwrap();
         });
@@ -161,8 +177,24 @@ impl TestServer {
             }
         };
 
-        let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{actual_port}"))?;
-        let channel = endpoint.connect().await?;
+        let channel = match certificate {
+            None => {
+                Endpoint::from_shared(format!("http://127.0.0.1:{actual_port}"))?
+                    .connect()
+                    .await?
+            }
+            // The address is the loopback one, so the name the certificate is issued for is
+            // given explicitly: it is what the handshake verifies the server against.
+            Some(certificate) => {
+                let tls_config = ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(certificate.pem()))
+                    .domain_name(CERTIFICATE_HOST);
+                Endpoint::from_shared(format!("https://127.0.0.1:{actual_port}"))?
+                    .tls_config(tls_config)?
+                    .connect()
+                    .await?
+            }
+        };
 
         Ok((
             Self {

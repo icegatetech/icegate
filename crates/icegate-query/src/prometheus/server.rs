@@ -1,8 +1,8 @@
 //! Prometheus HTTP server implementation
 
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
+use icegate_common::{ApplicationProtocol, ListenerRuntime, ServerListener};
 
 use super::PrometheusConfig;
 use crate::{engine::QueryEngine, infra::runtime::QueryRuntime};
@@ -17,16 +17,18 @@ pub struct PrometheusState {
 
 /// Run the Prometheus HTTP server
 ///
+/// Binds `config.host:config.port` and serves over TLS, offering ALPN `http/1.1`, when
+/// `listener_runtime` carries a certificate, and plaintext otherwise. Returns once the
+/// runtime's token is cancelled and the server has drained.
+///
 /// # Errors
 ///
 /// Returns an error if the server cannot be started or encounters a fatal error
 pub async fn run(
     runtime: QueryRuntime,
     config: PrometheusConfig,
-    cancel_token: CancellationToken,
+    listener_runtime: ListenerRuntime,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-
     let state = PrometheusState {
         engine: Arc::clone(&runtime.engine),
     };
@@ -36,10 +38,11 @@ pub async fn run(
     // until then a layer here would refuse requests the surface never serves.
     let app = super::routes::routes(state, runtime.pressure.clone());
 
-    tracing::info!("Prometheus API server listening on {}", addr);
+    let listener =
+        ServerListener::bind(&config.host, config.port, ApplicationProtocol::Http1, &listener_runtime).await?;
+    tracing::info!("Prometheus API server listening on {}", listener.local_addr());
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
+    let cancel_token = listener_runtime.cancel_token().clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             cancel_token.cancelled().await;

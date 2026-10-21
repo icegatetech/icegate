@@ -3,6 +3,7 @@
      from, and it is rendered here — so the check runs even when neither query
      nor migrate is enabled. */}}
 {{- include "icegate.validateRetentionWindow" . }}
+{{- include "icegate.validateTls" (dict "context" . "component" "maintain") }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -41,7 +42,9 @@ data:
         worker_count: {{ .Values.maintain.compaction.jobsmanager.workerCount }}
         poll_interval_ms: {{ .Values.maintain.compaction.jobsmanager.pollIntervalMs }}
         storage:
-          endpoint: {{ .Values.maintain.compaction.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          {{- with include "icegate.jobsStorageEndpointYaml" (dict "context" . "storage" .Values.maintain.compaction.jobsmanager.storage) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           bucket: {{ .Values.maintain.compaction.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.maintain.compaction.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.maintain.compaction.jobsmanager.storage.region | default .Values.aws.region | quote }}
@@ -66,7 +69,9 @@ data:
         worker_count: {{ .Values.maintain.gc.jobsmanager.workerCount }}
         poll_interval_ms: {{ .Values.maintain.gc.jobsmanager.pollIntervalMs }}
         storage:
-          endpoint: {{ .Values.maintain.gc.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          {{- with include "icegate.jobsStorageEndpointYaml" (dict "context" . "storage" .Values.maintain.gc.jobsmanager.storage) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           bucket: {{ .Values.maintain.gc.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.maintain.gc.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.maintain.gc.jobsmanager.storage.region | default .Values.aws.region | quote }}
@@ -93,7 +98,9 @@ data:
         worker_count: {{ .Values.maintain.walCleanup.jobsmanager.workerCount }}
         poll_interval_ms: {{ .Values.maintain.walCleanup.jobsmanager.pollIntervalMs }}
         storage:
-          endpoint: {{ .Values.maintain.walCleanup.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          {{- with include "icegate.jobsStorageEndpointYaml" (dict "context" . "storage" .Values.maintain.walCleanup.jobsmanager.storage) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           bucket: {{ .Values.maintain.walCleanup.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.maintain.walCleanup.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.maintain.walCleanup.jobsmanager.storage.region | default .Values.aws.region | quote }}
@@ -116,7 +123,9 @@ data:
         worker_count: {{ .Values.maintain.pricing.jobsmanager.workerCount }}
         poll_interval_ms: {{ .Values.maintain.pricing.jobsmanager.pollIntervalMs }}
         storage:
-          endpoint: {{ .Values.maintain.pricing.jobsmanager.storage.endpoint | default .Values.storage.s3.endpoint | quote }}
+          {{- with include "icegate.jobsStorageEndpointYaml" (dict "context" . "storage" .Values.maintain.pricing.jobsmanager.storage) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           bucket: {{ .Values.maintain.pricing.jobsmanager.storage.bucket | quote }}
           prefix: {{ .Values.maintain.pricing.jobsmanager.storage.prefix | quote }}
           region: {{ .Values.maintain.pricing.jobsmanager.storage.region | default .Values.aws.region | quote }}
@@ -127,6 +136,9 @@ data:
       host: "0.0.0.0"
       port: {{ .Values.maintain.metrics.port }}
       path: {{ .Values.maintain.metrics.path | quote }}
+    {{- with include "icegate.tlsYaml" (dict "context" . "component" "maintain") }}
+    {{- . | nindent 4 }}
+    {{- end }}
     tracing:
       enabled: {{ .Values.maintain.tracing.enabled }}
       {{- if .Values.maintain.tracing.enabled }}

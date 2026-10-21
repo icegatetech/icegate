@@ -7,7 +7,10 @@
     clippy::cast_possible_truncation
 )]
 
-use std::sync::Arc;
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use datafusion::{
     arrow::{
@@ -36,8 +39,8 @@ use iceberg::{
 };
 use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, TenantResolver, catalog::CatalogBuilder,
-    schema,
+    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, ListenerRuntime, TenantResolver,
+    catalog::CatalogBuilder, schema,
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
@@ -47,6 +50,8 @@ use icegate_query::{
 use reqwest::Client;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+
+use crate::tls_certificate::{CERTIFICATE_HOST, TestCertificate};
 
 // ============================================================================
 // Attribute map fixture builders
@@ -126,6 +131,17 @@ impl TestServer {
     /// Uses port 0 to let the OS assign an available port, avoiding port conflicts
     /// when running tests in parallel.
     pub async fn start() -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
+        Self::start_with_certificate(None).await
+    }
+
+    /// Variant of [`Self::start`] serving TLS with `certificate` when one is given.
+    ///
+    /// `client` then trusts exactly that certificate and `base_url` is an `https` URL
+    /// naming the host the certificate is issued for, so tests send requests as they do
+    /// against the plaintext server.
+    pub async fn start_with_certificate(
+        certificate: Option<&TestCertificate>,
+    ) -> Result<(Self, Arc<dyn Catalog>), Box<dyn std::error::Error>> {
         let warehouse_path = tempfile::tempdir()?;
         let warehouse_str = warehouse_path.path().to_str().unwrap().to_string();
 
@@ -176,7 +192,10 @@ impl TestServer {
             wal_reader,
         ));
         let cancel_token = CancellationToken::new();
-        let cancel_token_clone = cancel_token.clone();
+        let listener_runtime = ListenerRuntime::new(
+            cancel_token.clone(),
+            certificate.map(TestCertificate::server_certificate),
+        );
         // `multi`: every case of this suite names its tenant, which is what a
         // deployment behind the auth proxy carries.
         let runtime = QueryRuntime {
@@ -190,7 +209,7 @@ impl TestServer {
         let (port_tx, port_rx) = oneshot::channel::<u16>();
 
         let mut server_handle = tokio::spawn(async move {
-            icegate_query::loki::run_with_port_tx(runtime, loki_config, cancel_token_clone, Some(port_tx))
+            icegate_query::loki::run_with_port_tx(runtime, loki_config, listener_runtime, Some(port_tx))
                 .await
                 .unwrap();
         });
@@ -212,10 +231,20 @@ impl TestServer {
             }
         };
 
+        let (client, base_url) = certificate.map_or_else(
+            || (Client::new(), format!("http://127.0.0.1:{actual_port}")),
+            |certificate| {
+                (
+                    build_tls_client(certificate, actual_port),
+                    format!("https://{CERTIFICATE_HOST}:{actual_port}"),
+                )
+            },
+        );
+
         Ok((
             Self {
-                client: Client::new(),
-                base_url: format!("http://127.0.0.1:{actual_port}"),
+                client,
+                base_url,
                 cancel_token,
                 server_handle,
                 temp_dir: warehouse_path,
@@ -236,6 +265,20 @@ impl TestServer {
             DrainOutcome::Aborted => panic!("Loki server did not shut down within {}s", SHUTDOWN_TIMEOUT.as_secs()),
         }
     }
+}
+
+/// A client that trusts only `certificate` and reaches [`CERTIFICATE_HOST`] at the loopback
+/// address of the server bound on `port`.
+///
+/// The name is pinned to the address rather than left to the system resolver, so the
+/// connection never depends on how `localhost` resolves on the host running the test.
+fn build_tls_client(certificate: &TestCertificate, port: u16) -> Client {
+    let root = reqwest::Certificate::from_pem(certificate.pem().as_bytes()).expect("parse the test certificate");
+    Client::builder()
+        .tls_certs_only([root])
+        .resolve(CERTIFICATE_HOST, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        .build()
+        .expect("build the TLS client")
 }
 
 /// Write test log data to an Iceberg table for a specific tenant

@@ -141,19 +141,29 @@ def read_configmap_file(path: Path, key: str) -> dict:
     return yaml.load(read_configmap_text(path, key) or "{}", Loader=_TolerantLoader) or {}
 
 
+def iter_service_ports(manifests: str) -> Iterator[dict]:
+    """Every `ports[]` entry of every Service of a render, in order."""
+    for document in load_documents(manifests):
+        if document.get("kind") == "Service":
+            yield from document.get("spec", {}).get("ports", [])
+
+
+def read_service_port_entry(manifests: str, port_name: str) -> dict | None:
+    """The whole entry a rendered Service publishes under `port_name`, or `None`.
+
+    The entry rather than its number, for a check of a field other than `port`, such
+    as `appProtocol`.
+    """
+    return next((port for port in iter_service_ports(manifests) if port.get("name") == port_name), None)
+
+
 def read_service_port(manifests: str, port_name: str) -> int | None:
     """The port a rendered Service publishes under `port_name`.
 
     Read out of the render rather than stated here, so a check comparing it with
     something else does not become a second copy of the ports `values.yaml` ships.
     """
-    for document in load_documents(manifests):
-        if document.get("kind") != "Service":
-            continue
-        for port in document.get("spec", {}).get("ports", []):
-            if port.get("name") == port_name:
-                return port.get("port")
-    return None
+    return (read_service_port_entry(manifests, port_name) or {}).get("port")
 
 
 def iter_container_ports(manifests: str) -> Iterator[dict]:
@@ -185,6 +195,113 @@ def read_container_port(manifests: str, port_name: str) -> int | None:
         (port.get("containerPort") for port in iter_container_ports(manifests) if port.get("name") == port_name),
         None,
     )
+
+
+# The rules `restricted_violations` enforces. They are this check's own list, stated once
+# here: `icegate.validateRestrictedExtensions` in the chart applies the same rules to the
+# entries an operator adds, and `helm-render-test.py` shows each of them firing.
+RESTRICTED_HOST_NAMESPACES = ("hostNetwork", "hostPID", "hostIPC")
+RESTRICTED_SECCOMP_TYPES = ("RuntimeDefault", "Localhost")
+RESTRICTED_ADDABLE_CAPABILITIES = frozenset({"NET_BIND_SERVICE"})
+RESTRICTED_VOLUME_TYPES = frozenset(
+    {"configMap", "csi", "downwardAPI", "emptyDir", "ephemeral", "persistentVolumeClaim", "projected", "secret"}
+)
+
+
+def read_inherited_setting(container_context: dict, pod_context: dict, setting: str) -> object:
+    """The value of `setting` a container runs with: its own when it states one, else the pod's.
+
+    Only `None` counts as not stated, so a container's explicit `false` or `0` overrides the
+    pod's rather than falling through to it.
+    """
+    own = container_context.get(setting)
+    return pod_context.get(setting) if own is None else own
+
+
+def collect_identity_violations(
+    label: str, run_as_non_root: object, run_as_user: object, seccomp: object, *, is_unset_allowed: bool
+) -> list[str]:
+    """The runAsNonRoot, runAsUser and seccomp rules, applied to the values `label` runs with.
+
+    A container is judged by the values it runs with, so an unset one breaks its rule
+    (`is_unset_allowed` false). The pod is judged by what it states, so an unset one is left
+    to the containers that inherit it (`is_unset_allowed` true).
+    """
+    violations = []
+    is_non_root_judged = run_as_non_root is not None or not is_unset_allowed
+    if is_non_root_judged and run_as_non_root is not True:
+        violations.append(f"{label}: runAsNonRoot is not true")
+    if run_as_user == 0:
+        violations.append(f"{label}: runAsUser is 0")
+    is_seccomp_judged = seccomp is not None or not is_unset_allowed
+    if is_seccomp_judged and (seccomp or {}).get("type") not in RESTRICTED_SECCOMP_TYPES:
+        violations.append(f"{label}: seccompProfile.type is not one of {', '.join(RESTRICTED_SECCOMP_TYPES)}")
+    return violations
+
+
+def collect_container_violations(label: str, container: dict, pod_context: dict) -> list[str]:
+    """The restricted-level rules one container breaks, each as a message led by `label`."""
+    context = container.get("securityContext") or {}
+    capabilities = context.get("capabilities") or {}
+    violations = []
+
+    if context.get("allowPrivilegeEscalation") is not False:
+        violations.append(f"{label}: allowPrivilegeEscalation is not false")
+    if "ALL" not in (capabilities.get("drop") or []):
+        violations.append(f"{label}: capabilities.drop does not contain ALL")
+    added = sorted(set(capabilities.get("add") or []) - RESTRICTED_ADDABLE_CAPABILITIES)
+    if added:
+        violations.append(f"{label}: capabilities.add holds {added}, only NET_BIND_SERVICE may be added")
+    if context.get("privileged"):
+        violations.append(f"{label}: privileged is true")
+    violations += collect_identity_violations(
+        label,
+        read_inherited_setting(context, pod_context, "runAsNonRoot"),
+        read_inherited_setting(context, pod_context, "runAsUser"),
+        read_inherited_setting(context, pod_context, "seccompProfile"),
+        is_unset_allowed=False,
+    )
+    violations.extend(
+        f"{label}: hostPort {port['hostPort']} is published"
+        for port in container.get("ports") or []
+        if port.get("hostPort")
+    )
+    return violations
+
+
+def restricted_violations(pod_spec: dict) -> list[str]:
+    """The rules of the restricted Pod Security level that `pod_spec` breaks, one message each.
+
+    `pod_spec` is the `spec` of a pod, or the `spec.template.spec` of a workload. An empty
+    list means it meets every rule this check enforces: no host namespace, only the volume
+    types of `RESTRICTED_VOLUME_TYPES`, and per container and init container no privilege
+    escalation, every capability dropped, `runAsNonRoot` true under a non-zero user, a seccomp
+    profile of `RESTRICTED_SECCOMP_TYPES` and no host port. `runAsNonRoot`, `runAsUser` and
+    the seccomp profile are the pod's for every container that does not state its own, so a
+    pod-level value that breaks a rule is reported twice: once as `pod:` and once for each
+    container that inherits it. A pod-level value that is set is judged on its own as well,
+    because a container stating a compliant value of its own does not make the pod's one
+    compliant; one that is unset is judged only through the containers that inherit it.
+    """
+    pod_context = pod_spec.get("securityContext") or {}
+    violations = [f"pod: {field} is true" for field in RESTRICTED_HOST_NAMESPACES if pod_spec.get(field)]
+    violations += collect_identity_violations(
+        "pod",
+        pod_context.get("runAsNonRoot"),
+        pod_context.get("runAsUser"),
+        pod_context.get("seccompProfile"),
+        is_unset_allowed=True,
+    )
+    for volume in pod_spec.get("volumes") or []:
+        violations.extend(
+            f"volume {volume.get('name')}: type {volume_type} is not allowed"
+            for volume_type in volume
+            if volume_type != "name" and volume_type not in RESTRICTED_VOLUME_TYPES
+        )
+    for kind, key in (("init container", "initContainers"), ("container", "containers")):
+        for container in pod_spec.get(key) or []:
+            violations += collect_container_violations(f"{kind} {container.get('name')}", container, pod_context)
+    return violations
 
 
 def read_component_config(manifests: str, key: str) -> dict:

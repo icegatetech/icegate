@@ -57,6 +57,7 @@ impl From<icegate_common::error::CommonError> for MaintainError {
             CommonError::Iceberg(e) => Self::Iceberg(e),
             CommonError::Io(e) => Self::Storage(e.to_string()),
             CommonError::ObjectStore(e) => Self::Storage(format!("object store error: {e}")),
+            CommonError::Tls(msg) => Self::Config(format!("TLS error: {msg}")),
             CommonError::Write(msg) => Self::Storage(format!("write error: {msg}")),
             CommonError::CompactRead(msg) => Self::Storage(format!("compaction read error: {msg}")),
             CommonError::WalOffset(msg) => Self::Storage(format!("wal offset error: {msg}")),

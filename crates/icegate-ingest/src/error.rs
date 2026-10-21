@@ -93,6 +93,7 @@ impl From<icegate_common::error::CommonError> for IngestError {
             CommonError::Iceberg(e) => Self::Iceberg(e),
             CommonError::Io(e) => Self::Io(e),
             CommonError::ObjectStore(e) => Self::Config(format!("object store error: {e}")),
+            CommonError::Tls(msg) => Self::Config(format!("TLS error: {msg}")),
             // Write-pipeline messages (cancellation, overflow, partition split)
             // originated as `IngestError::Shift` before the pipeline moved to
             // `icegate_common`; preserve that mapping on the way back.

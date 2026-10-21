@@ -91,3 +91,10 @@ http-body-util = "0.1"
 # `test-util` enables the paused-clock (`start_paused`) test runtime used to
 # exercise the WAL ack-timeout backpressure path without real-time waits.
 tokio = { workspace = true, features = ["test-util"] }
+# The TLS listener tests (`tests/tls_listeners.rs`): rcgen mints the certificate the listeners
+# present; tokio-rustls is the client of the HTTP listener, which has no client of its own here.
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+# The gRPC client of the same tests. The workspace builds rustls on aws-lc-rs only, so the
+# client uses that backend too rather than adding `ring`.
+tonic = { workspace = true, features = ["tls-aws-lc"] }

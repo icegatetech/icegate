@@ -19,7 +19,7 @@ use icegate_common::{
         LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, METRICS_BLOOM_COLUMNS, METRICS_COLUMN_ENCODINGS,
         OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS, SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
     },
-    run_operational_server,
+    run_operational_server, start_listener_runtime,
     tenant::TenantResolver,
 };
 use icegate_queue::{
@@ -435,7 +435,9 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 
     // Run the fallible startup/run path, then always close the IO cache.
     // Foyer's background flusher tasks need a clean close to avoid channel errors.
-    let result = run_services(
+    // Boxed: the future holds every startup step and is past `clippy::large_futures`, so it lives
+    // on the heap rather than in this function's frame.
+    let result = Box::pin(run_services(
         &config,
         &io_cache,
         metrics_runtime.as_ref(),
@@ -443,7 +445,7 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
         write_tx,
         write_rx,
         tenant_resolver,
-    )
+    ))
     .await;
 
     // Gracefully close the IO cache to drain foyer's background flusher tasks.
@@ -519,6 +521,10 @@ async fn run_services(
     // so the S3 catalog's CAS/transient retry loops abort promptly on SIGINT/
     // SIGTERM instead of running to their retry budget during shutdown.
     let cancel_token = CancellationToken::new();
+
+    // Loaded before anything else starts, so a pair that is missing or does not match stops
+    // the process here rather than once the WAL writer and the shifter are already running.
+    let listener_runtime = start_listener_runtime(config.tls.as_ref(), &cancel_token)?;
 
     // Process-wide memory-pressure guard shared by every OTLP surface. Inert (never
     // sheds, no sampler) when no finite cgroup memory limit is detected (dev/CI/
@@ -645,10 +651,10 @@ async fn run_services(
     // the kubelet probes it even on a deployment that scrapes no metrics.
     {
         let metrics_config = config.metrics.clone();
-        let token = cancel_token.clone();
+        let listener_runtime = listener_runtime.clone();
         let registry = metrics_runtime.as_ref().map(|runtime| runtime.registry());
         let handle = tokio::spawn(async move {
-            run_operational_server(metrics_config, registry, token)
+            run_operational_server(metrics_config, registry, listener_runtime)
                 .await
                 .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
         });
@@ -664,11 +670,13 @@ async fn run_services(
             metrics: otlp_metrics.clone(),
         };
         let http_config = config.otlp_http.clone();
-        let token = cancel_token.clone();
+        let listener_runtime = listener_runtime.clone();
         let guard = memory_pressure.clone();
         let resolver = tenant_resolver.clone();
         let handle =
-            tokio::spawn(async move { crate::otlp_http::run(state, http_config, token, guard, resolver).await });
+            tokio::spawn(
+                async move { crate::otlp_http::run(state, http_config, listener_runtime, guard, resolver).await },
+            );
         handles.push(handle);
     }
 
@@ -681,11 +689,12 @@ async fn run_services(
             otlp_metrics.clone(),
         );
         let grpc_config = config.otlp_grpc.clone();
-        let token = cancel_token.clone();
+        let listener_runtime = listener_runtime.clone();
         let guard = memory_pressure.clone();
         let resolver = tenant_resolver.clone();
-        let handle =
-            tokio::spawn(async move { crate::otlp_grpc::run(service, grpc_config, token, guard, resolver).await });
+        let handle = tokio::spawn(async move {
+            crate::otlp_grpc::run(service, grpc_config, listener_runtime, guard, resolver).await
+        });
         handles.push(handle);
     }
 
@@ -720,11 +729,14 @@ mod tests {
     use iceberg::table::Table;
     use iceberg::transaction::ApplyTransactionAction;
     use iceberg::{Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation, TableIdent};
-    use icegate_common::{LOGS_TABLE, LOGS_TOPIC, parquet_encoding::LOGS_BLOOM_COLUMNS};
+    use icegate_common::{
+        DEFAULT_TLS_RELOAD_INTERVAL_SECS, LOGS_TABLE, LOGS_TOPIC, TlsConfig, parquet_encoding::LOGS_BLOOM_COLUMNS,
+    };
+    use tempfile::TempDir;
 
     use super::{
-        COMMITTED_OFFSET_TIMEOUT, IngestError, LOGS_COLUMN_ENCODINGS, ShiftJobSpec, SortColumnsDescriptor,
-        resolve_shift_startup_failure, resolve_wal_committed_offsets,
+        COMMITTED_OFFSET_TIMEOUT, CancellationToken, IngestError, LOGS_COLUMN_ENCODINGS, ShiftJobSpec,
+        SortColumnsDescriptor, resolve_shift_startup_failure, resolve_wal_committed_offsets, start_listener_runtime,
     };
 
     #[test]
@@ -749,6 +761,23 @@ mod tests {
         let error = resolve_shift_startup_failure(Err(panic_payload), None);
         assert!(matches!(error, IngestError::Shift(_)));
         assert!(error.to_string().contains("panic at startup"));
+    }
+
+    /// Startup must stop on a pair that cannot be loaded, here a Secret that is not mounted,
+    /// instead of falling back to the plaintext listeners the missing `tls` block would mean.
+    /// The conversion is the one `run_services` applies through `?`.
+    #[test]
+    fn a_tls_block_naming_missing_files_stops_startup_with_a_config_error() {
+        let directory = TempDir::new().expect("temp directory");
+        let tls = TlsConfig {
+            certificate_path: directory.path().join("missing.crt"),
+            private_key_path: directory.path().join("missing.key"),
+            reload_interval_secs: DEFAULT_TLS_RELOAD_INTERVAL_SECS,
+        };
+
+        let result = start_listener_runtime(Some(&tls), &CancellationToken::new()).map_err(IngestError::from);
+
+        assert!(matches!(result, Err(IngestError::Config(_))), "got {result:?}");
     }
 
     /// One shift job over the `logs` table, enough to drive

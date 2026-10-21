@@ -18,4 +18,7 @@ spec:
       path: {{ .Values.maintain.metrics.path }}
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      {{- if ($.Values.maintain.tls).enabled }}
+      {{- include "icegate.serviceMonitorTls" (dict "context" . "component" "maintain") | nindent 6 }}
+      {{- end }}
 {{- end }}

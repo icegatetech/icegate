@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use icegate_common::{
-    CatalogConfig, MemoryPressureConfig, OperationalConfig, StorageConfig, TenantPolicy, TracingConfig,
+    CatalogConfig, MemoryPressureConfig, OperationalConfig, StorageConfig, TenantPolicy, TlsConfig, TracingConfig,
     check_port_conflicts, load_config_file,
 };
 use icegate_queue::QueueConfig;
@@ -46,6 +46,10 @@ pub struct QueryConfig {
     /// tenants sets `tenant: !multi`.
     #[serde(default)]
     pub tenant: TenantPolicy,
+    /// Server-side TLS for every listener of this process: Loki, Prometheus, Tempo, Flight SQL
+    /// and the operational one. Absent means all of them serve plaintext.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     /// Loki API server
     pub loki: LokiConfig,
     /// Prometheus API server
@@ -106,6 +110,9 @@ impl QueryConfig {
             .validate()
             .map_err(|e| crate::error::QueryError::Config(e.to_string()))?;
         self.tenant.validate()?;
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
+        }
         self.loki.validate()?;
         self.prometheus.validate()?;
         self.tempo.validate()?;
@@ -142,6 +149,10 @@ impl QueryConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use icegate_common::DEFAULT_TLS_RELOAD_INTERVAL_SECS;
+
     use super::*;
     use crate::error::QueryError;
 
@@ -161,6 +172,25 @@ mod tests {
         config.validate().expect("baseline config should validate");
         // 0 < low < high <= 1 is violated: high > 1.0.
         config.memory_pressure.high_watermark = 1.5;
+        assert!(matches!(config.validate(), Err(QueryError::Config(_))));
+    }
+
+    /// A `tls` validation failure must propagate out of `QueryConfig::validate`, proving the
+    /// block is wired into the aggregate validator rather than merely deserialized: without it
+    /// the failure would surface only when the certificate is loaded at startup.
+    #[test]
+    fn validate_rejects_a_tls_block_with_an_empty_certificate_path() {
+        let mut config = QueryConfig::default();
+        config.queue.common.base_path = "s3://warehouse/queue".to_string();
+        config.tracing.enabled = false;
+        config.validate().expect("baseline config should validate");
+
+        config.tls = Some(TlsConfig {
+            certificate_path: PathBuf::new(),
+            private_key_path: PathBuf::from("/tls/tls.key"),
+            reload_interval_secs: DEFAULT_TLS_RELOAD_INTERVAL_SECS,
+        });
+
         assert!(matches!(config.validate(), Err(QueryError::Config(_))));
     }
 

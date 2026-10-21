@@ -29,4 +29,21 @@ ignore = [
     # connector, so the default HTTPS client stays on hyper 1.x + h2 0.4.
     # Remove once the AWS SDK drops the hyper-0.14 connector.
     "RUSTSEC-2026-0258",
+    # rustls client advisories patched only in >=0.23.46. The 0.23.x copy (ours and
+    # the AWS SDK's default HTTPS client) is at that floor — the workspace pins
+    # `rustls = "0.23.46"`. The remaining hit is rustls 0.21.12, which has no patched
+    # release: aws-smithy-http-client pulls it for the same legacy hyper-0.14
+    # connector as RUSTSEC-2026-0258 above, which nothing configures. 0346 needs a
+    # custom `ClientSessionStore` that formats session values with `Debug`; nothing
+    # implements one. 0349 downgrades post-quantum hybrid key exchange, which
+    # rustls 0.21 does not offer.
+    # Remove together with RUSTSEC-2026-0258.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
+    # rustls-webpki accepting distrusted intermediates, patched only in >=0.103.16.
+    # The 0.103.x copy is updated; the remaining hit is rustls-webpki 0.101.7, which
+    # rustls 0.21.12 pins and which has no patched release — the same legacy
+    # hyper-0.14 connector as RUSTSEC-2026-0258, which nothing configures. Remove
+    # together with RUSTSEC-2026-0258.
+    "RUSTSEC-2026-0382",
 ]

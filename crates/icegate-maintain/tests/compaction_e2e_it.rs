@@ -284,7 +284,7 @@ async fn data_file_count(table: &Table, descriptor: &SortColumnsDescriptor) -> u
 /// a single rewrite group, and points its job-state storage at the object store.
 fn compaction_config(conn: &StorageConn) -> CompactionConfig {
     let jobs_storage = JobsStorageConfig {
-        endpoint: conn.endpoint.clone(),
+        endpoint: Some(conn.endpoint.clone()),
         bucket: BUCKET_NAME.to_string(),
         prefix: "compactor".to_string(),
         region: "us-east-1".to_string(),

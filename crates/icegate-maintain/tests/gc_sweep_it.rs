@@ -524,7 +524,7 @@ async fn gc_runner_reclaims_in_the_background() {
             poll_interval_ms: 100,
             scan_interval_secs: 1,
             storage: JobsStorageConfig {
-                endpoint: conn.endpoint.clone(),
+                endpoint: Some(conn.endpoint.clone()),
                 bucket: BUCKET_NAME.to_string(),
                 prefix: "gc".to_string(),
                 region: "us-east-1".to_string(),

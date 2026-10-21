@@ -24,17 +24,26 @@ spec:
       port: {{ include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpGrpc") }}
       targetPort: otlp-grpc
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.ingest.service "port" "otlpGrpc") }}
+      {{ . }}
+      {{- end }}
     {{- end }}
     {{- if .Values.ingest.otlpHttp.enabled }}
     - name: otlp-http
       port: {{ include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpHttp") }}
       targetPort: otlp-http
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.ingest.service "port" "otlpHttp") }}
+      {{ . }}
+      {{- end }}
     {{- end }}
     {{- if .Values.ingest.metrics.enabled }}
     - name: metrics
       port: {{ .Values.ingest.metrics.port }}
       targetPort: metrics
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.ingest.service "port" "metrics") }}
+      {{ . }}
+      {{- end }}
     {{- end }}
 {{- end }}

@@ -45,8 +45,9 @@ A `migrate` Job runs as a Helm hook to create or update the Iceberg tables.
 
 - Kubernetes with a working `StorageClass` if you run object storage in-cluster.
 - S3 or an S3-compatible object store, reachable from every enabled component.
-- Credentials supplied through `aws.existingSecret`, or an IRSA role on the
-  ServiceAccount via `serviceAccount.annotations`.
+- Credentials supplied through `aws.existingSecret`. Without it the chart renders
+  no keys and the services use the AWS default credential chain (Pod Identity,
+  IRSA through `serviceAccount.annotations`, environment).
 
 ## Running against S3-compatible storage
 
@@ -69,16 +70,30 @@ so existing clients for those protocols can read IceGate directly. Arrow Flight 
 available for SQL access. Each listener is enabled and given a port independently under
 `query`; the values table below lists the keys.
 
-## Verifying the chart signature
+## Verifying signatures
 
-Chart releases are signed with cosign using the release workflow's identity, so there
-is no public key to distribute:
+The chart and every image are signed with cosign using the identity of the release
+workflow run that published them, so there is no public key to distribute. That
+identity is the release workflow at the release tag.
+
+The chart:
 
 ```bash
 cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
-  --certificate-identity-regexp 'https://github.com/icegatetech/icegate/.*' \
+  --certificate-identity https://github.com/icegatetech/icegate/.github/workflows/release.yml@refs/tags/v0.2.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+An image:
+
+```bash
+cosign verify ghcr.io/icegatetech/icegate-ingest:0.2.0 \
+  --certificate-identity https://github.com/icegatetech/icegate/.github/workflows/release.yml@refs/tags/v0.2.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The same command verifies `icegate-query`, `icegate-maintain` and `icegate-catalog`, and
+an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 
 ## Values
 
@@ -99,6 +114,7 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | catalogServer.extraEnv | list | `[]` |  |
 | catalogServer.http.port | int | `8181` |  |
 | catalogServer.http.prefix | string | `""` |  |
+| catalogServer.image.digest | string | `""` |  |
 | catalogServer.image.pullPolicy | string | `"IfNotPresent"` |  |
 | catalogServer.image.repository | string | `"ghcr.io/icegatetech/icegate-catalog"` |  |
 | catalogServer.image.tag | string | `""` |  |
@@ -112,6 +128,7 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | catalogServer.resources.requests.memory | string | `"256Mi"` |  |
 | catalogServer.rustLog | string | `"info"` |  |
 | catalogServer.service.annotations | object | `{}` |  |
+| catalogServer.service.appProtocol.http | string | `""` |  |
 | catalogServer.service.type | string | `"ClusterIP"` |  |
 | catalogServer.tolerations | list | `[]` |  |
 | global.fullnameOverride | string | `""` |  |
@@ -130,6 +147,7 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | ingest.extraContainers | list | `[]` |  |
 | ingest.extraEnv | list | `[]` |  |
 | ingest.extraVolumes | list | `[]` |  |
+| ingest.image.digest | string | `""` |  |
 | ingest.image.pullPolicy | string | `"IfNotPresent"` |  |
 | ingest.image.repository | string | `"ghcr.io/icegatetech/icegate-ingest"` |  |
 | ingest.image.tag | string | `""` |  |
@@ -171,6 +189,9 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | ingest.resources.requests.memory | string | `"1Gi"` |  |
 | ingest.rustLog | string | `"info"` |  |
 | ingest.service.annotations | object | `{}` |  |
+| ingest.service.appProtocol.metrics | string | `""` |  |
+| ingest.service.appProtocol.otlpGrpc | string | `""` |  |
+| ingest.service.appProtocol.otlpHttp | string | `""` |  |
 | ingest.service.otlpGrpcPort | string | `nil` |  |
 | ingest.service.otlpHttpPort | string | `nil` |  |
 | ingest.service.type | string | `"ClusterIP"` |  |
@@ -199,16 +220,22 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | ingest.shift.write.tableCacheTtlSecs | int | `60` |  |
 | ingest.tenant.id | string | `"default"` |  |
 | ingest.tenant.mode | string | `"single"` |  |
+| ingest.tls.enabled | bool | `false` |  |
+| ingest.tls.secretName | string | `""` |  |
 | ingest.tolerations | list | `[]` |  |
 | ingest.topologySpreadConstraints | list | `[]` |  |
 | ingest.tracing.enabled | bool | `true` |  |
 | ingest.tracing.otlpEndpoint | string | `""` |  |
 | ingest.tracing.sampleRatio | float | `1` |  |
-| ingest.waitForDependencies.awsCliImage | string | `"amazon/aws-cli:2.36.34"` |  |
+| ingest.waitForDependencies.awsCliImage.digest | string | `""` |  |
+| ingest.waitForDependencies.awsCliImage.repository | string | `"amazon/aws-cli"` |  |
+| ingest.waitForDependencies.awsCliImage.tag | string | `"2.36.34"` |  |
 | ingest.waitForDependencies.buckets | list | `[]` |  |
 | ingest.waitForDependencies.enabled | bool | `false` |  |
 | ingest.waitForDependencies.endpoints | list | `[]` |  |
-| ingest.waitForDependencies.image | string | `"busybox:1.38.0"` |  |
+| ingest.waitForDependencies.image.digest | string | `""` |  |
+| ingest.waitForDependencies.image.repository | string | `"busybox"` |  |
+| ingest.waitForDependencies.image.tag | string | `"1.38.0"` |  |
 | maintain.affinity | object | `{}` |  |
 | maintain.compaction.data.dataPageSizeLimitBytes | int | `2097152` |  |
 | maintain.compaction.data.maxGroupInputBytes | int | `268435456` |  |
@@ -259,6 +286,7 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | maintain.gc.tables.metrics | bool | `true` |  |
 | maintain.gc.tables.operations | bool | `true` |  |
 | maintain.gc.tables.spans | bool | `true` |  |
+| maintain.image.digest | string | `""` |  |
 | maintain.image.pullPolicy | string | `"IfNotPresent"` |  |
 | maintain.image.repository | string | `"ghcr.io/icegatetech/icegate-maintain"` |  |
 | maintain.image.tag | string | `""` |  |
@@ -295,16 +323,23 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | maintain.resources.requests.memory | string | `"1Gi"` |  |
 | maintain.rustLog | string | `"info"` |  |
 | maintain.service.annotations | object | `{}` |  |
+| maintain.service.appProtocol.metrics | string | `""` |  |
 | maintain.service.type | string | `"ClusterIP"` |  |
+| maintain.tls.enabled | bool | `false` |  |
+| maintain.tls.secretName | string | `""` |  |
 | maintain.tolerations | list | `[]` |  |
 | maintain.tracing.enabled | bool | `true` |  |
 | maintain.tracing.otlpEndpoint | string | `""` |  |
 | maintain.tracing.sampleRatio | float | `1` |  |
-| maintain.waitForDependencies.awsCliImage | string | `"amazon/aws-cli:2.36.34"` |  |
+| maintain.waitForDependencies.awsCliImage.digest | string | `""` |  |
+| maintain.waitForDependencies.awsCliImage.repository | string | `"amazon/aws-cli"` |  |
+| maintain.waitForDependencies.awsCliImage.tag | string | `"2.36.34"` |  |
 | maintain.waitForDependencies.buckets | list | `[]` |  |
 | maintain.waitForDependencies.enabled | bool | `false` |  |
 | maintain.waitForDependencies.endpoints | list | `[]` |  |
-| maintain.waitForDependencies.image | string | `"busybox:1.38.0"` |  |
+| maintain.waitForDependencies.image.digest | string | `""` |  |
+| maintain.waitForDependencies.image.repository | string | `"busybox"` |  |
+| maintain.waitForDependencies.image.tag | string | `"1.38.0"` |  |
 | maintain.walCleanup.cleanupTimeoutSecs | int | `600` |  |
 | maintain.walCleanup.deleteConcurrency | int | `16` |  |
 | maintain.walCleanup.dryRun | bool | `false` |  |
@@ -328,6 +363,7 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | migrate.backoffLimit | int | `3` |  |
 | migrate.enabled | bool | `true` |  |
 | migrate.hookDeletePolicy | string | `"before-hook-creation"` |  |
+| migrate.image.digest | string | `""` |  |
 | migrate.image.pullPolicy | string | `"IfNotPresent"` |  |
 | migrate.image.repository | string | `"ghcr.io/icegatetech/icegate-maintain"` |  |
 | migrate.image.tag | string | `""` |  |
@@ -339,12 +375,17 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | migrate.snapshotExpiration.maxSnapshotAgeMs | int | `1800000` |  |
 | migrate.snapshotExpiration.metadataPreviousVersionsMax | int | `200` |  |
 | migrate.snapshotExpiration.minSnapshotsToKeep | int | `100` |  |
-| migrate.waitForDependencies.awsCliImage | string | `"amazon/aws-cli:2.36.34"` |  |
+| migrate.waitForDependencies.awsCliImage.digest | string | `""` |  |
+| migrate.waitForDependencies.awsCliImage.repository | string | `"amazon/aws-cli"` |  |
+| migrate.waitForDependencies.awsCliImage.tag | string | `"2.36.34"` |  |
 | migrate.waitForDependencies.buckets | list | `[]` |  |
 | migrate.waitForDependencies.enabled | bool | `true` |  |
 | migrate.waitForDependencies.endpoints | list | `[]` |  |
-| migrate.waitForDependencies.image | string | `"busybox:1.38.0"` |  |
+| migrate.waitForDependencies.image.digest | string | `""` |  |
+| migrate.waitForDependencies.image.repository | string | `"busybox"` |  |
+| migrate.waitForDependencies.image.tag | string | `"1.38.0"` |  |
 | namespace.create | bool | `false` |  |
+| podSecurity.checkRestricted | bool | `false` |  |
 | query.affinity | object | `{}` |  |
 | query.cache.diskDir | string | `"/tmp/icegate/cache"` |  |
 | query.cache.diskSizeMb | int | `4096` |  |
@@ -366,6 +407,7 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | query.flightSql.enabled | bool | `true` |  |
 | query.flightSql.maxMessageSize | int | `16777216` |  |
 | query.flightSql.port | int | `8815` |  |
+| query.image.digest | string | `""` |  |
 | query.image.pullPolicy | string | `"IfNotPresent"` |  |
 | query.image.repository | string | `"ghcr.io/icegatetech/icegate-query"` |  |
 | query.image.tag | string | `""` |  |
@@ -403,21 +445,32 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | query.resources.requests.memory | string | `"2Gi"` |  |
 | query.rustLog | string | `"info"` |  |
 | query.service.annotations | object | `{}` |  |
+| query.service.appProtocol.flightSql | string | `""` |  |
+| query.service.appProtocol.loki | string | `""` |  |
+| query.service.appProtocol.metrics | string | `""` |  |
+| query.service.appProtocol.prometheus | string | `""` |  |
+| query.service.appProtocol.tempo | string | `""` |  |
 | query.service.type | string | `"ClusterIP"` |  |
 | query.tempo.enabled | bool | `true` |  |
 | query.tempo.port | int | `3200` |  |
 | query.tenant.id | string | `"default"` |  |
 | query.tenant.mode | string | `"single"` |  |
+| query.tls.enabled | bool | `false` |  |
+| query.tls.secretName | string | `""` |  |
 | query.tolerations | list | `[]` |  |
 | query.topologySpreadConstraints | list | `[]` |  |
 | query.tracing.enabled | bool | `true` |  |
 | query.tracing.otlpEndpoint | string | `""` |  |
 | query.tracing.sampleRatio | float | `1` |  |
-| query.waitForDependencies.awsCliImage | string | `"amazon/aws-cli:2.36.34"` |  |
+| query.waitForDependencies.awsCliImage.digest | string | `""` |  |
+| query.waitForDependencies.awsCliImage.repository | string | `"amazon/aws-cli"` |  |
+| query.waitForDependencies.awsCliImage.tag | string | `"2.36.34"` |  |
 | query.waitForDependencies.buckets | list | `[]` |  |
 | query.waitForDependencies.enabled | bool | `false` |  |
 | query.waitForDependencies.endpoints | list | `[]` |  |
-| query.waitForDependencies.image | string | `"busybox:1.38.0"` |  |
+| query.waitForDependencies.image.digest | string | `""` |  |
+| query.waitForDependencies.image.repository | string | `"busybox"` |  |
+| query.waitForDependencies.image.tag | string | `"1.38.0"` |  |
 | queue.common.basePath | string | `"s3://queue/"` |  |
 | queue.common.channelCapacity | int | `64` |  |
 | queue.common.maxRowGroupSize | int | `16384` |  |
@@ -437,6 +490,7 @@ cosign verify ghcr.io/icegatetech/charts/icegate:0.2.0 \
 | storage.s3.bucket | string | `"warehouse"` |  |
 | storage.s3.endpoint | string | `""` |  |
 | storage.s3.region | string | `"us-east-1"` |  |
+| tls.caConfigMapName | string | `""` |  |
 
 ## Links
 

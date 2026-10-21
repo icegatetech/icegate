@@ -68,7 +68,7 @@ fn cleanup_config(conn: &StorageConn) -> WalCleanupConfig {
             poll_interval_ms: 100,
             scan_interval_secs: 1,
             storage: JobsStorageConfig {
-                endpoint: conn.endpoint.clone(),
+                endpoint: Some(conn.endpoint.clone()),
                 bucket: BUCKET_NAME.to_string(),
                 prefix: JOB_STATE_PREFIX.to_string(),
                 region: "us-east-1".to_string(),
@@ -189,9 +189,8 @@ async fn the_runner_rejects_a_config_without_a_single_enabled_topic() {
         operations_enabled: false,
         jobsmanager: JobsManagerConfig {
             // A usable job-state storage, so the topic check is what the runner
-            // reaches: an unset endpoint is rejected before it.
+            // reaches: an unset bucket is rejected before it.
             storage: JobsStorageConfig {
-                endpoint: "http://127.0.0.1:9000".to_string(),
                 bucket: BUCKET_NAME.to_string(),
                 prefix: JOB_STATE_PREFIX.to_string(),
                 region: "us-east-1".to_string(),
@@ -215,7 +214,7 @@ async fn the_runner_rejects_a_config_without_a_single_enabled_topic() {
 }
 
 /// The job-state storage is validated where the pool is built, not at config
-/// load: a `migrate` config carries no `wal_cleanup` block at all, so an empty endpoint
+/// load: a `migrate` config carries no `wal_cleanup` block at all, so an empty bucket
 /// has to reach the loader intact and be rejected here instead.
 #[tokio::test]
 async fn the_runner_rejects_an_unset_job_state_storage() {
@@ -229,7 +228,7 @@ async fn the_runner_rejects_an_unset_job_state_storage() {
     };
 
     assert!(
-        error.to_string().contains("wal_cleanup.jobsmanager.storage.endpoint"),
+        error.to_string().contains("wal_cleanup.jobsmanager.storage.bucket"),
         "the failure must name the block to fix, got: {error}"
     );
 }

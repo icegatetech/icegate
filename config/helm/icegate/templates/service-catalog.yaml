@@ -19,4 +19,7 @@ spec:
       port: {{ .Values.catalogServer.http.port }}
       targetPort: http
       protocol: TCP
+      {{- with include "icegate.appProtocol" (dict "service" .Values.catalogServer.service "port" "http") }}
+      {{ . }}
+      {{- end }}
 {{- end }}

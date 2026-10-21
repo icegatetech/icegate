@@ -38,18 +38,27 @@
 #     token the type marker refuses;
 #   - the OTLP/HTTP listener routes by prefix rather than by a list of paths, so
 #     the token is what admits a request and the route table is not a second,
-#     silent allow-list of the paths icegate happens to serve today.
+#     silent allow-list of the paths icegate happens to serve today;
+#   - for the example, a certificate renewed under the directory its listeners
+#     read it from is served to new connections without restarting the proxy
+#     (`certificate rotation`);
+#   - for the example, an upstream presenting a certificate its CA signed for
+#     another name than the one the configuration verifies is not forwarded to:
+#     503 over HTTP, UNAVAILABLE over gRPC (`wrong upstream name`).
 #
 # Both copies of the filter chain are checked: the one the deployment example
 # ships (config/helm/auth-proxy) and the one the Compose stand ships. They are
-# meant to agree, and nothing else fails when they stop agreeing. The example's
-# listeners terminate TLS, so its cases run over https and the stand's over http.
+# meant to agree, and nothing else fails when they stop agreeing. The example
+# carries TLS on both hops — its listeners, and the stubs standing in for icegate
+# behind it — so its cases run over https; the stand carries none, and its cases
+# run over http.
 #
-# The issuer here is a throwaway RSA key generated per run; no token issuer of
-# any deployment is contacted, and the keys never leave the temporary directory.
+# The issuer here is a throwaway RSA key generated per run, and so is the CA that
+# signs the certificates; no token issuer of any deployment is contacted, and the
+# keys never leave the temporary directory.
 #
-# Requires: docker (OrbStack), openssl, curl. Not part of `make ci` — see the
-# `authproxy-test` target in the Makefile.
+# Requires: docker (OrbStack), openssl, curl, python3. Not part of `make ci` — see
+# the `authproxy-test` target in the Makefile.
 set -euo pipefail
 
 # The issuer the stand's copy carries, read out of it rather than pinned here: a
@@ -98,6 +107,22 @@ readonly UNKNOWN_PATH="/v1/unknown"
 readonly GRPC_EXPORT_PATH="/opentelemetry.proto.collector.logs.v1.LogsService/Export"
 readonly GRPC_SLOW_EXPORT_PATH="/opentelemetry.proto.collector.logs.v1.LogsService/ExportSlow"
 readonly PYTHON_IMAGE="python:3.13-alpine"
+# A name no configuration verifies, under the TLD RFC 2606 reserves for
+# documentation like the issuer placeholders: the certificate of the
+# `wrong upstream name` case is issued for it.
+readonly WRONG_UPSTREAM_NAME="wrong.example"
+# What the reason the proxy gives for refusing such a certificate carries. The
+# wording is the one the pinned image reports, so it changes only with a
+# deliberate bump of the tag, as the audience refusal's does.
+readonly UPSTREAM_VERIFY_FAILURE="CERTIFICATE_VERIFY_FAILED"
+# Where the upstream stubs find the certificate they serve. Theirs alone, so the
+# `wrong upstream name` case can hand them another one without touching the
+# directory the proxy reads.
+readonly UPSTREAM_TLS_DIR="/upstream-tls"
+# How long a renewed certificate may take to reach new connections.
+readonly ROTATION_TIMEOUT_SECONDS=10
+# How long a replaced upstream stub may take to listen.
+readonly UPSTREAM_START_TIMEOUT_SECONDS=30
 
 # Read out of the example's values rather than pinned here: the version that
 # example deploys is the version the checks have to run against. The ports each
@@ -115,7 +140,18 @@ FOREIGN_TOKEN_TYPE=""
 HEADER_TYPE=""
 FOREIGN_HEADER_TYPE=""
 ROUTE_TIMEOUT_SECONDS=""
+# https for the example, which carries TLS on both hops, http for the stand, which
+# carries none: the client requests and the upstream stubs both follow it.
 SCHEME=""
+# The example's TLS wiring, read out of its configuration in read_example_config
+# for the reason the ports are: the stand mounts each file where Envoy reads it,
+# and `make envoy-config-test` holds those paths to the mounts of the example's
+# values. UPSTREAM_SERVICE_NAME is the name its upstream clusters verify, which
+# the stubs standing in for icegate are issued certificates for.
+EXAMPLE_SDS_PATH=""
+EXAMPLE_SECRET_DIR=""
+EXAMPLE_CA_DIR=""
+UPSTREAM_SERVICE_NAME=""
 # How long ago the two expiry cases expired. Fixed here rather than derived from
 # the configuration's clock_skew_seconds: a case that computes its own input from
 # the value under test passes for every value, including zero. What the
@@ -153,9 +189,7 @@ UNPUBLISHED_KEY=""
 FAILURES=0
 
 cleanup() {
-    docker rm -f "$PROXY_CONTAINER" "$GRPC_UPSTREAM_CONTAINER" "$UPSTREAM_CONTAINER" \
-        "$JWKS_CONTAINER" >/dev/null 2>&1 || true
-    docker network rm "$NETWORK" >/dev/null 2>&1 || true
+    stop_stand
     [ -n "$WORKDIR" ] && rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -200,11 +234,45 @@ write_issuer_keys() {
 EOF
 }
 
-# Self-signed certificate for the example's listeners, which terminate TLS.
-write_server_cert() {
-    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
-        -keyout "$WORKDIR/tls.key" -out "$WORKDIR/tls.crt" 2>/dev/null
-    chmod 644 "$WORKDIR/tls.key"
+# A server certificate the run's CA signs for the DNS names $2..., written into
+# directory $1 under the two keys of a kubernetes.io/tls Secret. Readable by all,
+# for the account the Envoy image runs as (the docstring of
+# scripts/envoy-config-test.py says which). `x509 -req` rather than
+# `req -x509 -CA`, which OpenSSL added in 3.0, so that the LibreSSL a macOS
+# checkout finds first on its PATH signs it as well.
+issue_server_cert() {
+    local dir="$1"
+    shift
+    local names
+    names=$(printf 'DNS:%s,' "$@")
+    mkdir -p "$dir"
+    printf 'subjectAltName=%s\n' "${names%,}" >"$WORKDIR/server.ext"
+    openssl req -new -newkey rsa:2048 -nodes -subj "/CN=$1" \
+        -keyout "$dir/tls.key" -out "$WORKDIR/server.csr" 2>/dev/null
+    openssl x509 -req -days 1 -in "$WORKDIR/server.csr" \
+        -CA "$WORKDIR/ca/ca.crt" -CAkey "$WORKDIR/ca.key" -CAserial "$WORKDIR/ca.srl" -CAcreateserial \
+        -extfile "$WORKDIR/server.ext" -out "$dir/tls.crt" 2>/dev/null
+    chmod 755 "$dir"
+    chmod 644 "$dir/tls.crt" "$dir/tls.key"
+}
+
+# The CA, and the certificate icegate and the example's proxy both serve, laid out
+# as the example mounts them: ca/ holds the CA ConfigMap's ca.crt, and tls/ the
+# Secret. In tls/, tls.crt and tls.key are symlinks through ..data, which names
+# the directory of the current version, so that check_certificate_rotation renews
+# both files at once by replacing ..data alone. The certificate carries the name
+# the upstream clusters verify, and localhost, the name the checks ask the
+# listeners for.
+write_certificates() {
+    mkdir -p "$WORKDIR/ca" "$WORKDIR/tls"
+    chmod 755 "$WORKDIR/ca" "$WORKDIR/tls"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=authproxy-test-ca" \
+        -keyout "$WORKDIR/ca.key" -out "$WORKDIR/ca/ca.crt" 2>/dev/null
+    chmod 644 "$WORKDIR/ca/ca.crt"
+    issue_server_cert "$WORKDIR/tls/..v1" "$UPSTREAM_SERVICE_NAME" localhost
+    ln -s ..v1 "$WORKDIR/tls/..data"
+    ln -s ..data/tls.crt "$WORKDIR/tls/tls.crt"
+    ln -s ..data/tls.key "$WORKDIR/tls/tls.key"
 }
 
 # Mint an RS256 token. $1 is the payload `typ`, $2 the audience, $3 the lifetime
@@ -240,6 +308,7 @@ mint_token() {
 write_upstream() {
     cat >"$WORKDIR/upstream.py" <<'EOF'
 """Echo the x-scope-orgid the proxy forwarded, so the check can assert on it."""
+import ssl
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -271,7 +340,18 @@ class Handler(BaseHTTPRequestHandler):
 # Threading, because of the /slow path above: a single-threaded server keeps the
 # sleeping handler on the accept path, and the case that follows the slow one
 # waits behind it and hits the proxy's timeout it is supposed to stay inside.
-ThreadingHTTPServer(("0.0.0.0", int(sys.argv[1])), Handler).serve_forever()
+server = ThreadingHTTPServer(("0.0.0.0", int(sys.argv[1])), Handler)
+# A second argument names the directory of tls.crt and tls.key and turns TLS on:
+# icegate serves its receivers over TLS behind the example, in plain behind the
+# stand.
+if len(sys.argv) > 2:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(f"{sys.argv[2]}/tls.crt", f"{sys.argv[2]}/tls.key")
+    # The protocol icegate's OTLP/HTTP receiver offers: ApplicationProtocol in
+    # crates/icegate-common/src/listener/server_listener.rs.
+    context.set_alpn_protocols(["http/1.1"])
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
 EOF
 }
 
@@ -284,8 +364,25 @@ EOF
 # timeout under test, which is what a WAL write the proxy gives up on looks like
 # from the listener an OTLP exporter speaks to. The delay is stated per route, so
 # every other method is answered at once and only the case that wants it pays it.
+#
+# Behind the example it serves TLS from $UPSTREAM_TLS_DIR, as icegate's receiver
+# does once the example turns TLS on, offering the protocol that receiver offers
+# (ApplicationProtocol in crates/icegate-common/src/listener/server_listener.rs).
 write_grpc_upstream() {
     local delay_seconds=$((ROUTE_TIMEOUT_SECONDS + 2))
+    local transport_socket=""
+    if [ "$SCHEME" = "https" ]; then
+        transport_socket="
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              \"@type\": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: $UPSTREAM_TLS_DIR/tls.crt }
+                    private_key: { filename: $UPSTREAM_TLS_DIR/tls.key }
+                alpn_protocols: [\"h2\"]"
+    fi
     cat >"$WORKDIR/grpc-upstream.yaml" <<EOF
 admin:
   address:
@@ -334,28 +431,83 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
                   - name: envoy.filters.http.router
                     typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router$transport_socket
 EOF
+}
+
+# The file the example's ConfigMap carries under key $1, written to $2.
+read_configmap_key() {
+    local key="$1" dst="$2"
+    awk -v header="  $key: |" '
+        $0 == header { collecting = 1; next }
+        collecting && /^    / { sub(/^    /, ""); print; next }
+        collecting && NF { exit }
+    ' "$EXAMPLE_CONFIGMAP" >"$dst"
+    [ -s "$dst" ] || {
+        echo "$EXAMPLE_CONFIGMAP carried no $key" >&2
+        exit 1
+    }
 }
 
 # The example's committed configuration, lifted out of its ConfigMap. The chart
 # renders no proxy, so this file and the stand's are the only two copies — both
-# are rewritten by prepare_config below before anything loads them.
+# are rewritten by prepare_config below before anything loads them. The SDS file
+# its listeners read comes out of the same ConfigMap, and is loaded as committed.
 read_example_config() {
-    awk '
-        /^  envoy\.yaml: \|/ { collecting = 1; next }
-        collecting && /^    / { sub(/^    /, ""); print; next }
-        collecting && NF { exit }
-    ' "$EXAMPLE_CONFIGMAP" >"$WORKDIR/example-committed.yaml"
-    [ -s "$WORKDIR/example-committed.yaml" ] || {
-        echo "$EXAMPLE_CONFIGMAP carried no envoy.yaml" >&2
-        exit 1
-    }
+    local committed="$WORKDIR/example-committed.yaml"
+    read_configmap_key envoy.yaml "$committed"
     ENVOY_IMAGE=$(awk '/image: envoyproxy\/envoy/ { print $2; exit }' "$EXAMPLE_VALUES")
     [ -n "$ENVOY_IMAGE" ] || {
         echo "$EXAMPLE_VALUES names no proxy image" >&2
         exit 1
     }
+
+    # The gRPC listener and cluster refer to what the HTTP ones write by alias,
+    # so each value is read where it is written.
+    EXAMPLE_SDS_PATH=$(read_entry_block "$committed" otlp_http | read_scalar path)
+    [ -n "$EXAMPLE_SDS_PATH" ] || {
+        echo "the otlp_http listener of $EXAMPLE_CONFIGMAP names no SDS path" >&2
+        exit 1
+    }
+    read_configmap_key "${EXAMPLE_SDS_PATH##*/}" "$WORKDIR/example-sds.yaml"
+    EXAMPLE_SECRET_DIR=$(read_scalar path <"$WORKDIR/example-sds.yaml")
+    EXAMPLE_CA_DIR=$(read_entry_block "$committed" icegate_otlp_http | read_scalar filename)
+    EXAMPLE_CA_DIR="${EXAMPLE_CA_DIR%/*}"
+    UPSTREAM_SERVICE_NAME=$(read_entry_block "$committed" icegate_otlp_http | read_scalar sni)
+    case "$UPSTREAM_SERVICE_NAME" in
+    "" | "*"*)
+        echo "the icegate_otlp_http cluster of $EXAMPLE_CONFIGMAP writes no name as its sni" >&2
+        exit 1
+        ;;
+    esac
+    [ -n "$EXAMPLE_SECRET_DIR" ] && [ -n "$EXAMPLE_CA_DIR" ] || {
+        echo "$EXAMPLE_CONFIGMAP names no watched_directory or no CA of icegate_otlp_http" >&2
+        exit 1
+    }
+}
+
+# The listener or cluster named $2 of document $1: from its own `- name:` line to
+# the next entry at that indent, or to the end of the document for the last one.
+read_entry_block() {
+    awk -v entry="    - name: $2" '
+        $0 == entry { collecting = 1; print; next }
+        collecting && /^    - name: / { exit }
+        collecting { print }
+    ' "$1"
+}
+
+# The value of the first `$1:` key of the document on stdin, as written: a flow
+# mapping's brace is not part of it, and neither is an anchor the value carries —
+# the example writes its upstream name once, as `sni: &<anchor> <name>`.
+read_scalar() {
+    awk -v key="$1" '
+        match($0, key ": *(&[^ ]+ +)?[^ ,}]+") {
+            value = substr($0, RSTART, RLENGTH)
+            sub(key ": *(&[^ ]+ +)?", "", value)
+            print value
+            exit
+        }
+    '
 }
 
 # First port_value under the named listener or cluster of $2. Both are list
@@ -509,7 +661,8 @@ prepare_config() {
 
 # A copy whose JWKS address or route timeout is written in another form passes
 # through the rewrite untouched and fails sixty seconds later as a proxy that
-# never became ready. Named here instead, against the document about to be loaded.
+# never became ready. Named here instead, against the document about to be loaded
+# ($2), which is compared with the committed one it was rewritten from ($1).
 #
 # Stated as three places the rewrite must have reached, not as the absence of
 # $ISSUER_HOST from the document: the `issuer` of the jwt_authn provider names
@@ -517,7 +670,7 @@ prepare_config() {
 # and the filter compares the claim against that string, so a rewrite there
 # answers every case 401.
 assert_config_rewritten() {
-    local config="$1" cluster seconds
+    local committed="$1" config="$2" cluster cluster_name seconds
 
     grep -q "uri: \"http://$JWKS_CONTAINER:$JWKS_PORT/jwks.json\"" "$config" || {
         echo "$config does not fetch the JWKS from the throwaway server:" >&2
@@ -525,13 +678,7 @@ assert_config_rewritten() {
         exit 1
     }
 
-    # The token_issuer_jwks cluster alone: from its own `- name:` to the next one
-    # at that indent, or to the end of the document when it is the last cluster.
-    cluster=$(awk '
-        /^    - name: token_issuer_jwks$/ { collecting = 1; print; next }
-        collecting && /^    - name: / { exit }
-        collecting { print }
-    ' "$config")
+    cluster=$(read_entry_block "$config" token_issuer_jwks)
     [ -n "$cluster" ] || {
         echo "$config carries no token_issuer_jwks cluster" >&2
         exit 1
@@ -552,6 +699,22 @@ assert_config_rewritten() {
         ;;
     esac
 
+    # The transport_socket the rewrite drops is the JWKS cluster's alone. The two
+    # icegate clusters precede it, and the example's carry their own, which has to
+    # survive: without it the proxy would speak plain text to stubs serving TLS
+    # and every case would fail on a 503 that names nothing of the cause. Compared
+    # whole with the committed copy, which states that for both copies alike.
+    for cluster_name in icegate_otlp_http icegate_otlp_grpc; do
+        if [ "$(read_entry_block "$committed" "$cluster_name")" != \
+            "$(read_entry_block "$config" "$cluster_name")" ]; then
+            echo "the rewrite of $config changed its $cluster_name cluster, not only the" \
+                "token_issuer_jwks one:" >&2
+            diff <(read_entry_block "$committed" "$cluster_name") \
+                <(read_entry_block "$config" "$cluster_name") >&2 || true
+            exit 1
+        fi
+    done
+
     seconds=$(read_route_timeout_seconds "$config" icegate_otlp_http)
     [ "$seconds" = "$ROUTE_TIMEOUT_UNDER_TEST_SECONDS" ] || {
         echo "$config times the OTLP/HTTP route out after ${seconds}s, not the" \
@@ -569,33 +732,79 @@ start_stand() {
     docker run -d --name "$JWKS_CONTAINER" --network "$NETWORK" \
         -v "$WORKDIR:/w:ro" -w /w "$PYTHON_IMAGE" \
         python3 -m http.server "$JWKS_PORT" >/dev/null
-    # This container owns the network namespace the proxy and the gRPC upstream
-    # join, so both published ports are declared on it.
-    docker run -d --name "$UPSTREAM_CONTAINER" --network "$NETWORK" \
+    # The example's proxy reads the SDS file, icegate's certificate and the CA
+    # where its configuration names them. The certificate is a directory mount,
+    # as the Secret volume is, so a renewal inside it reaches the proxy.
+    local proxy_mounts=(-v "$config:/etc/envoy/envoy.yaml:ro")
+    if [ "$SCHEME" = "https" ]; then
+        proxy_mounts+=(
+            -v "$WORKDIR/example-sds.yaml:$EXAMPLE_SDS_PATH:ro"
+            -v "$WORKDIR/tls:$EXAMPLE_SECRET_DIR:ro"
+            -v "$WORKDIR/ca:$EXAMPLE_CA_DIR:ro"
+        )
+    fi
+    # The proxy owns the network namespace the upstream stubs join, so both
+    # published ports are declared on it, and the stubs can be replaced under a
+    # proxy that keeps running — which check_upstream_name_mismatch does.
+    docker run -d --name "$PROXY_CONTAINER" --network "$NETWORK" \
         -p "$PUBLISHED_HTTP_PORT:$LISTENER_HTTP_PORT" \
         -p "$PUBLISHED_GRPC_PORT:$LISTENER_GRPC_PORT" \
-        -v "$WORKDIR:/w:ro" "$PYTHON_IMAGE" \
-        python3 /w/upstream.py "$UPSTREAM_HTTP_PORT" >/dev/null
+        "${proxy_mounts[@]}" \
+        "$ENVOY_IMAGE" /usr/local/bin/envoy --config-path /etc/envoy/envoy.yaml >/dev/null
+    start_upstreams "$WORKDIR/tls"
+    wait_for_stand
+}
+
+# The two stubs standing in for icegate, in the proxy's network namespace, where
+# they bind the loopback ports its upstream clusters dial. Behind the example both
+# serve TLS from the certificate in directory $1; behind the stand neither does.
+# A proxy that refused its configuration has exited by now and has no namespace
+# to join, so a stub that cannot start reports the proxy's log rather than
+# Docker's complaint.
+start_upstreams() {
+    local cert_dir="$1"
+    local http_mounts=(-v "$WORKDIR:/w:ro")
+    local http_command=(python3 /w/upstream.py "$UPSTREAM_HTTP_PORT")
+    local grpc_mounts=(-v "$WORKDIR/grpc-upstream.yaml:/etc/envoy/envoy.yaml:ro")
+    if [ "$SCHEME" = "https" ]; then
+        http_mounts+=(-v "$cert_dir:$UPSTREAM_TLS_DIR:ro")
+        http_command+=("$UPSTREAM_TLS_DIR")
+        grpc_mounts+=(-v "$cert_dir:$UPSTREAM_TLS_DIR:ro")
+    fi
+    docker run -d --name "$UPSTREAM_CONTAINER" --network "container:$PROXY_CONTAINER" \
+        "${http_mounts[@]}" "$PYTHON_IMAGE" "${http_command[@]}" >/dev/null ||
+        exit_with_proxy_log "the upstream stub could not join the proxy"
     # --base-id moves this Envoy's hot-restart domain socket off the default: the
     # socket lives in the network namespace, which this container shares with the
     # proxy, and the second Envoy to start would otherwise fail to bind it. The
     # proxy keeps the default, so it runs exactly as the example deploys it.
-    docker run -d --name "$GRPC_UPSTREAM_CONTAINER" --network "container:$UPSTREAM_CONTAINER" \
-        -v "$WORKDIR/grpc-upstream.yaml:/etc/envoy/envoy.yaml:ro" \
-        "$ENVOY_IMAGE" /usr/local/bin/envoy --base-id 1 --config-path /etc/envoy/envoy.yaml >/dev/null
-    docker run -d --name "$PROXY_CONTAINER" --network "container:$UPSTREAM_CONTAINER" \
-        -v "$config:/etc/envoy/envoy.yaml:ro" \
-        -v "$WORKDIR/tls.crt:/etc/icegate/tls/tls.crt:ro" \
-        -v "$WORKDIR/tls.key:/etc/icegate/tls/tls.key:ro" \
-        "$ENVOY_IMAGE" /usr/local/bin/envoy --config-path /etc/envoy/envoy.yaml >/dev/null
+    docker run -d --name "$GRPC_UPSTREAM_CONTAINER" --network "container:$PROXY_CONTAINER" \
+        "${grpc_mounts[@]}" \
+        "$ENVOY_IMAGE" /usr/local/bin/envoy --base-id 1 --config-path /etc/envoy/envoy.yaml >/dev/null ||
+        exit_with_proxy_log "the gRPC upstream stub could not join the proxy"
+}
 
-    # The proxy answers only once it has fetched the JWKS, so readiness is polled
-    # rather than slept for; a token is what proves the fetch completed. The gRPC
-    # listener is polled on the tenant its upstream reports rather than on the
-    # HTTP status: Envoy answers a gRPC request 200 whatever the outcome, so that
-    # status is already 200 while the JWKS is still missing and while the gRPC
-    # upstream stub is still starting. The x-seen-orgid header appears only once
-    # the proxy has admitted the request and the stub has answered it.
+exit_with_proxy_log() {
+    echo "$1; envoy log follows" >&2
+    docker logs "$PROXY_CONTAINER" >&2 || true
+    exit 1
+}
+
+# The stubs again, now serving the certificate in directory $1, under the proxy
+# that keeps running.
+replace_upstreams() {
+    docker rm -f "$GRPC_UPSTREAM_CONTAINER" "$UPSTREAM_CONTAINER" >/dev/null
+    start_upstreams "$1"
+}
+
+# The proxy answers only once it has fetched the JWKS, so readiness is polled
+# rather than slept for; a token is what proves the fetch completed. The gRPC
+# listener is polled on the tenant its upstream reports rather than on the HTTP
+# status: Envoy answers a gRPC request 200 whatever the outcome, so that status is
+# already 200 while the JWKS is still missing and while the gRPC upstream stub is
+# still starting. The x-seen-orgid header appears only once the proxy has admitted
+# the request and the stub has answered it.
+wait_for_stand() {
     local token
     token=$(mint_token "$TOKEN_TYPE" "$AUDIENCE" 600)
     for _ in $(seq 1 60); do
@@ -607,13 +816,12 @@ start_stand() {
         fi
         sleep 1
     done
-    echo "the proxy did not become ready; envoy log follows" >&2
-    docker logs "$PROXY_CONTAINER" >&2 || true
-    exit 1
+    exit_with_proxy_log "the proxy did not become ready"
 }
 
+# The stubs go before the proxy whose network namespace they joined.
 stop_stand() {
-    docker rm -f "$PROXY_CONTAINER" "$GRPC_UPSTREAM_CONTAINER" "$UPSTREAM_CONTAINER" \
+    docker rm -f "$GRPC_UPSTREAM_CONTAINER" "$UPSTREAM_CONTAINER" "$PROXY_CONTAINER" \
         "$JWKS_CONTAINER" >/dev/null 2>&1 || true
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
 }
@@ -894,31 +1102,127 @@ run_grpc_cases() {
     fi
 }
 
+# SHA-256 fingerprint of the certificate the OTLP/HTTP listener serves a new
+# connection, or the empty string when it serves none.
+read_served_fingerprint() {
+    openssl s_client -connect "127.0.0.1:$PUBLISHED_HTTP_PORT" -servername localhost </dev/null 2>/dev/null |
+        openssl x509 -noout -fingerprint -sha256 2>/dev/null || true
+}
+
+# A certificate renewed under the directory the listeners read it from reaches new
+# connections while the proxy keeps running. The renewal is a second certificate of
+# the same CA in a version directory of its own, swapped in by replacing ..data
+# with one rename (see write_certificates). A Docker host whose bind mounts deliver
+# no file events fails this case on the timeout rather than passing it, and the
+# failure then says nothing about the proxy: the environment cannot run the case.
+check_certificate_rotation() {
+    local label="$1" renewed served deadline status
+    issue_server_cert "$WORKDIR/tls/..v2" "$UPSTREAM_SERVICE_NAME" localhost
+    renewed=$(openssl x509 -in "$WORKDIR/tls/..v2/tls.crt" -noout -fingerprint -sha256)
+    served=$(read_served_fingerprint)
+    if [ -z "$served" ] || [ "$served" = "$renewed" ]; then
+        fail "$label: certificate rotation: the listener serves '$served' before the renewal"
+        return
+    fi
+    ln -s ..v2 "$WORKDIR/tls/..data_tmp"
+    # os.replace is rename(2), which replaces the old link in one step; BSD mv
+    # has no -T, and without it would move the new link into the directory the
+    # old one names.
+    python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' \
+        "$WORKDIR/tls/..data_tmp" "$WORKDIR/tls/..data"
+
+    deadline=$(($(date +%s) + ROTATION_TIMEOUT_SECONDS))
+    while served=$(read_served_fingerprint) && [ "$served" != "$renewed" ]; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            fail "$label: certificate rotation: new connections are still served '$served'" \
+                "${ROTATION_TIMEOUT_SECONDS}s after the renewal to '$renewed'"
+            return
+        fi
+        sleep 0.5
+    done
+    pass "$label: certificate rotation: new connections are served the renewed certificate"
+
+    status=$(request "$(mint_token "$TOKEN_TYPE" "$AUDIENCE" 600)" "")
+    expect_status "$label: valid ingest token after the certificate rotation" 200 "$status"
+}
+
+# An upstream presenting a certificate the trusted CA signed for another name is
+# not forwarded to: the stubs are replaced, under the running proxy, by ones
+# serving such a certificate. The proxy answers 503 over HTTP and UNAVAILABLE over
+# gRPC — 14, which an exporter retries — and on both the reason names the failed
+# verification, which is what tells this refusal apart from a stub that is still
+# starting. The stubs then get a certificate of the same CA for the right name
+# back, and the stand has to become ready on it before this returns: that is what
+# makes the name, and not the CA, the cause of the refusal.
+check_upstream_name_mismatch() {
+    local label="$1" token status seen
+    issue_server_cert "$WORKDIR/wrong-name" "$WRONG_UPSTREAM_NAME"
+    replace_upstreams "$WORKDIR/wrong-name"
+    token=$(mint_token "$TOKEN_TYPE" "$AUDIENCE" 600)
+
+    for _ in $(seq 1 "$UPSTREAM_START_TIMEOUT_SECONDS"); do
+        status=$(request "$token" "")
+        if [ "$status" = "503" ] && grep -q "$UPSTREAM_VERIFY_FAILURE" "$WORKDIR/body"; then
+            break
+        fi
+        sleep 1
+    done
+    expect_status "$label: wrong upstream name" 503 "$status"
+    if grep -q "$UPSTREAM_VERIFY_FAILURE" "$WORKDIR/body"; then
+        pass "$label: wrong upstream name is refused on the certificate verification"
+    else
+        fail "$label: wrong upstream name: expected a reason naming $UPSTREAM_VERIFY_FAILURE," \
+            "got '$(cat "$WORKDIR/body")'"
+    fi
+
+    for _ in $(seq 1 "$UPSTREAM_START_TIMEOUT_SECONDS"); do
+        status=$(request_grpc "$token" "")
+        seen=$(read_response_header grpc-status)
+        if [ "$seen" = "14" ] && read_response_header grpc-message | grep -q "$UPSTREAM_VERIFY_FAILURE"; then
+            break
+        fi
+        sleep 1
+    done
+    expect_status "$label: gRPC wrong upstream name" 200 "$status"
+    if [ "$seen" = "14" ] && read_response_header grpc-message | grep -q "$UPSTREAM_VERIFY_FAILURE"; then
+        pass "$label: gRPC wrong upstream name -> grpc-status 14 on the certificate verification"
+    else
+        fail "$label: gRPC wrong upstream name: expected grpc-status 14 naming $UPSTREAM_VERIFY_FAILURE," \
+            "got '$seen' ($(read_response_header grpc-message))"
+    fi
+
+    replace_upstreams "$WORKDIR/tls"
+    wait_for_stand
+}
+
 main() {
     require docker
     require openssl
     require curl
+    require python3
 
     WORKDIR=$(mktemp -d)
     UNPUBLISHED_KEY="$WORKDIR/unpublished.pem"
     chmod 755 "$WORKDIR"
     write_issuer_keys
-    write_server_cert
     write_upstream
     # An empty gRPC message: the five-byte length prefix and nothing after it.
     printf '\0\0\0\0\0' >"$WORKDIR/grpc-empty"
     read_example_config
+    write_certificates
     prepare_config "$WORKDIR/example-committed.yaml" "$WORKDIR/example-envoy.yaml"
-    assert_config_rewritten "$WORKDIR/example-envoy.yaml"
+    assert_config_rewritten "$WORKDIR/example-committed.yaml" "$WORKDIR/example-envoy.yaml"
     prepare_config "$STAND_CONFIG" "$WORKDIR/stand-envoy.yaml"
-    assert_config_rewritten "$WORKDIR/stand-envoy.yaml"
+    assert_config_rewritten "$STAND_CONFIG" "$WORKDIR/stand-envoy.yaml"
 
     SCHEME=https
     start_stand "$WORKDIR/example-envoy.yaml"
     run_cases "example"
+    check_certificate_rotation "example"
+    check_upstream_name_mismatch "example"
     stop_stand
 
-    # The stand's listeners do not terminate TLS; everything else is the same.
+    # The stand carries no TLS on either hop; everything else is the same.
     SCHEME=http
     start_stand "$WORKDIR/stand-envoy.yaml"
     run_cases "stand"

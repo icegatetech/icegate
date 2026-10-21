@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use icegate_common::{CatalogConfig, OperationalConfig, StorageConfig, TracingConfig};
+use icegate_common::{CatalogConfig, OperationalConfig, StorageConfig, TlsConfig, TracingConfig};
 use icegate_queue::QueueConfig;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +67,11 @@ pub struct MaintainConfig {
     /// compactor's `CompactMetrics` record) and serves `/metrics`.
     #[serde(default)]
     pub metrics: OperationalConfig,
+    /// Server-side TLS for the operational listener (`/health`, `/metrics`) of the
+    /// long-running `run` service. Absent means it serves plaintext; ignored by the
+    /// one-shot `migrate` commands, which bind no listener.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     /// `OpenTelemetry` tracing for the long-running `run` service, which
     /// initialises the subscriber from this block once the config is loaded. The
     /// one-shot `migrate` commands never reach it: they install a plain JSON
@@ -88,17 +93,17 @@ impl MaintainConfig {
     }
 
     /// Validate everything that can be judged from the config file alone:
-    /// catalog, storage, the (optional) metrics endpoint, snapshot expiration,
-    /// the orphan grace period, and the WAL-cleanup tunables together with the
-    /// queue location they address.
+    /// catalog, storage, the (optional) metrics endpoint, the (optional) TLS
+    /// block, snapshot expiration, the orphan grace period, and the WAL-cleanup
+    /// tunables together with the queue location they address.
     ///
     /// What is NOT validated here is a service's job-state storage — the
     /// `jobsmanager` block of `compaction`, `gc`, `pricing` and `wal_cleanup`
     /// alike.
     /// The one-shot `migrate` commands share this `MaintainConfig` and carry
-    /// none of those blocks, so their defaults hold an empty endpoint and
-    /// bucket; checking them here would fail a command that never starts the
-    /// service they configure. (Validating `gc` here once did exactly that to
+    /// none of those blocks, so their defaults hold an empty bucket; checking
+    /// them here would fail a command that never starts the service they
+    /// configure. (Validating `gc` here once did exactly that to
     /// `migrate create`.) Each runner validates its own block instead, at the
     /// point it builds the pool: `Compactor::new`, `GcRunner::new`,
     /// `PricingRunner::new`, `WalCleanupRunner::new`. `tracing` is left out for
@@ -116,7 +121,7 @@ impl MaintainConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if the catalog, storage, metrics, snapshot-expiration or
+    /// Returns an error if the catalog, storage, metrics, TLS, snapshot-expiration or
     /// WAL-cleanup configuration is invalid, if the orphan sweep would run with
     /// no grace period (see [`Self::validate_orphan_grace_period`]), or if
     /// cleanup is enabled against a queue location it cannot address (see
@@ -125,6 +130,9 @@ impl MaintainConfig {
         self.catalog.validate()?;
         self.storage.validate()?;
         self.metrics.validate()?;
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
+        }
         self.snapshot_expiration.validate()?;
         self.validate_orphan_grace_period()?;
         self.wal_cleanup.validate()?;
@@ -215,6 +223,10 @@ impl MaintainConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use icegate_common::TlsConfig;
+
     use super::MaintainConfig;
 
     /// A `migrate`-style config — catalog + storage only, with NO `gc` or
@@ -390,6 +402,43 @@ snapshot_expiration:
         let config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse config with a zero window");
 
         assert!(config.validate().is_err());
+    }
+
+    /// A `tls` validation failure must propagate out of `MaintainConfig::validate`, proving
+    /// the block is wired into the aggregate validator rather than merely deserialized:
+    /// without it the failure would surface only when the certificate is loaded at startup,
+    /// after the process has begun serving.
+    #[test]
+    fn validate_rejects_a_tls_block_with_a_zero_reload_interval() {
+        let yaml = r"
+catalog:
+  backend: !rest
+    uri: http://catalog.example:19120/iceberg
+  warehouse: s3://warehouse/
+storage:
+  backend: !s3
+    bucket: warehouse
+    region: us-east-1
+    endpoint: http://localhost:9000
+";
+        let mut config: MaintainConfig = serde_yaml::from_str(yaml).expect("parse a config without a tls block");
+        assert_eq!(config.tls, None, "an absent tls block means plaintext");
+        config.validate().expect("the baseline maintain config is valid");
+
+        config.tls = Some(TlsConfig {
+            certificate_path: PathBuf::from("/tls/tls.crt"),
+            private_key_path: PathBuf::from("/tls/tls.key"),
+            reload_interval_secs: 0,
+        });
+
+        let error = config.validate().expect_err("a zero reload interval must be rejected");
+        assert!(
+            matches!(
+                error.downcast_ref::<icegate_common::Error>(),
+                Some(icegate_common::Error::Config(_))
+            ),
+            "got {error:?}"
+        );
     }
 
     /// A config whose sweep runs with no grace period. `enabled` is spelled out

@@ -222,7 +222,7 @@ fn shift_config(storage: &ObjectStorage, jobs_prefix: &str) -> ShiftConfig {
     config.jobsmanager.worker_count = 4;
     config.jobsmanager.poll_interval_ms = 50;
     config.jobsmanager.storage = JobsStorageConfig {
-        endpoint: storage.endpoint.clone(),
+        endpoint: Some(storage.endpoint.clone()),
         bucket: BUCKET_NAME.to_string(),
         prefix: jobs_prefix.to_string(),
         access_key_id: Some(storage.access_key.clone()),

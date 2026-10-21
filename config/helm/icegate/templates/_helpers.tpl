@@ -87,11 +87,33 @@ ServiceAccount name.
 {{- end }}
 
 {{/*
-Image reference for a component.
-Usage: include "icegate.image" (dict "image" .Values.query.image "tag" .Chart.AppVersion)
+Image reference for a component or an init container.
+
+`image` is a map of `repository`, `tag` and `digest`. An empty `tag` falls back to
+the `tag` argument, which the helper images leave unset because they have no
+chart-wide tag to follow. A set `digest` is appended, giving `repository:tag@digest`;
+the tag stays in the reference so the rendered manifest still says which release it is.
+`key` is the values path of `image`, used only to name it in a failure.
+
+Usage: include "icegate.image" (dict "image" .Values.query.image "tag" .Chart.AppVersion "key" "query.image")
 */}}
 {{- define "icegate.image" -}}
-{{- printf "%s:%s" .image.repository (.image.tag | default .tag) }}
+{{- if kindIs "string" .image }}
+{{- fail (printf "%s must be a map with repository, tag and digest" .key) }}
+{{- end }}
+{{- $tag := .image.tag | default .tag }}
+{{- if not $tag }}
+{{- fail (printf "%s.tag must be set" .key) }}
+{{- end }}
+{{- $reference := printf "%s:%s" .image.repository $tag }}
+{{- with .image.digest }}
+{{- $digest := toString . }}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) }}
+{{- fail (printf "%s.digest (%s) must be sha256: followed by 64 lowercase hex characters" $.key $digest) }}
+{{- end }}
+{{- $reference = printf "%s@%s" $reference $digest }}
+{{- end }}
+{{- $reference }}
 {{- end }}
 
 {{/*
@@ -175,6 +197,24 @@ backend: !s3
 {{- end }}
 
 {{/*
+Render the `endpoint` line of a job-storage block (zero-indented), or nothing.
+
+The block's own `endpoint` wins over `storage.s3.endpoint`. When both are empty the key
+is left out rather than rendered as `endpoint: ""`: an absent endpoint is how the
+services are told to use the regional AWS endpoint.
+
+Call it as `with include ...` and print `.` under it, so that the empty result adds no
+line.
+
+Usage: include "icegate.jobsStorageEndpointYaml" (dict "context" . "storage" .Values.ingest.shift.jobsmanager.storage)
+*/}}
+{{- define "icegate.jobsStorageEndpointYaml" -}}
+{{- with .storage.endpoint | default .context.Values.storage.s3.endpoint -}}
+endpoint: {{ . | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
 Render a component's tenant policy (zero-indented).
 Produces the YAML tagged union: `!single { id }` or `!multi`.
 Callers must use `nindent N` to place at the correct indentation level.
@@ -205,10 +245,9 @@ Returns a non-empty string for a loopback address and the empty string otherwise
 which is how Helm spells a boolean a caller can test with `if`.
 
 The whole 127.0.0.0/8 range counts, not just the address `values.yaml` ships, and
-the IPv6 loopback counts in both spellings: `run_operational_server` joins host
-and port as `{host}:{port}`, so the bracketed `[::1]` is the form that parses as a
-socket address there, while the bare `::1` reaches the same bind through the
-resolver.
+the IPv6 loopback counts in both spellings: `run_operational_server` accepts an
+IPv6 host bare (`::1`) or in brackets (`[::1]`) and binds the same address for
+either.
 
 Usage: include "icegate.isLoopbackHost" .Values.ingest.otlpHttp.host
 */}}
@@ -276,6 +315,31 @@ Usage: include "icegate.ingestPublishedPort" (dict "context" . "signal" "otlpHtt
 {{- end }}
 
 {{/*
+The `appProtocol` line of one Service port, or nothing.
+
+`service` is the component's `service` map and `port` a key of its `appProtocol`
+map. A key left unset or empty renders nothing: the value names the protocol the
+port speaks, the chart picks none, and a render that sets no key is the render
+from before the keys existed.
+
+The map is read through `default (dict)` and the parenthesised path, for the
+reason `icegate.validateOperationalHost` reads its host that way: Helm reads a
+`null` in an overlay as the removal of the key, and `index` refuses the nil that
+leaves behind. The value is quoted so that one YAML would read as another type,
+`true` or `5`, still reaches the manifest as the string the field is.
+
+Call it as `with include ...` and print `.` under it, so that the empty result
+adds no line; `nindent` would add a blank one to every render that sets nothing.
+
+Usage: include "icegate.appProtocol" (dict "service" .Values.query.service "port" "loki")
+*/}}
+{{- define "icegate.appProtocol" -}}
+{{- with index (default (dict) (.service).appProtocol) .port -}}
+appProtocol: {{ . | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
 Fail the render when an enabled OTLP receiver carries no bind address.
 
 Both reasons `icegate.validateOperationalHost` states for reading its host
@@ -283,8 +347,9 @@ through `required` and the parenthesised path hold here unchanged: Helm reads a
 `null` in an overlay as the removal of the key, so the value reaches
 `icegate.isLoopbackHost` in `deployment-ingest.yaml` as nil and aborts the render
 on a line of this file, naming none of the operator's own values; and the empty
-string renders a listener config the ingest pod refuses on load, because
-`{host}:{port}` is what it parses as a socket address.
+string renders a listener config the ingest pod refuses on load, because the
+receiver binds its host as an IP address or a hostname (an IPv6 address bare or
+in brackets) together with its port, and an empty host is neither.
 
 Which address it is decides a second thing. The operational listener has to stay
 on the Pod IP; these two are the ones an operator deliberately moves to the
@@ -325,6 +390,118 @@ Usage: include "icegate.validateOtlpHosts" .
 {{- fail (printf "ingest.%s.host (%s) is a loopback address, so this container declares no %s port, and the Service addresses that name as its targetPort: no container of ingest.extraContainers declares it either, so the pod publishes nothing and a sender is refused the connection. Add the container that listens on %s with a port named %s, or bind 0.0.0.0" $signal $host $portName $portName $portName) }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Fail the render when an entry added to the ingest pod breaks the restricted Pod
+Security level, while `podSecurity.checkRestricted` asks for it.
+
+The containers and volumes this chart declares meet the level, which
+`scripts/helm-render-test.py` proves for every pod it renders. `ingest.extraContainers`
+and `ingest.extraVolumes` are passed through as written, so nothing else holds them to
+it. The check is off unless asked for, because it would refuse a sidecar an operator
+runs where the level is not enforced.
+
+The rules are those of `restricted_violations` in `scripts/chartlib.py`. A container
+needs `allowPrivilegeEscalation` false, `capabilities.drop` holding ALL,
+`capabilities.add` empty or NET_BIND_SERVICE alone, `privileged` not true, no
+`hostPort`, `runAsNonRoot` true, a `runAsUser` other than 0 and a `seccompProfile.type`
+of RuntimeDefault or Localhost. The last three are read as the container states them,
+and as `icegate.podSecurityContext` states them for the pod when it states none, so a
+sidecar that leaves them out is judged by the pod's: the auth proxy example relies on
+that. A volume needs one of the types listed below.
+
+Every violation of every entry is named in one failure, so that an operator fixes the
+entry once rather than once per rule. `kindIs "invalid"` and `toString` read a setting
+because `default` and plain truthiness treat an explicit `false` or `0` as unset, which
+is the value a violation consists of.
+
+Usage: include "icegate.validateRestrictedExtensions" .
+*/}}
+{{- define "icegate.validateRestrictedExtensions" -}}
+{{- if (.Values.podSecurity).checkRestricted }}
+{{- $podContext := include "icegate.podSecurityContext" . | fromYaml }}
+{{- $volumeTypes := list "configMap" "csi" "downwardAPI" "emptyDir" "ephemeral" "persistentVolumeClaim" "projected" "secret" }}
+{{- $violations := list }}
+{{- range $container := default (list) .Values.ingest.extraContainers }}
+{{- $entry := printf "ingest.extraContainers[%s]" $container.name }}
+{{- $context := default (dict) $container.securityContext }}
+{{- $capabilities := default (dict) $context.capabilities }}
+{{- if ne (toString $context.allowPrivilegeEscalation) "false" }}
+{{- $violations = append $violations (printf "%s: allowPrivilegeEscalation (%s) breaks the restricted Pod Security level; set securityContext.allowPrivilegeEscalation to false" $entry (ternary "unset" (toString $context.allowPrivilegeEscalation) (kindIs "invalid" $context.allowPrivilegeEscalation))) }}
+{{- end }}
+{{- if not (has "ALL" (default (list) $capabilities.drop)) }}
+{{- $violations = append $violations (printf "%s: capabilities.drop without ALL breaks the restricted Pod Security level; set securityContext.capabilities.drop to [ALL]" $entry) }}
+{{- end }}
+{{- range $capability := default (list) $capabilities.add }}
+{{- if ne (toString $capability) "NET_BIND_SERVICE" }}
+{{- $violations = append $violations (printf "%s: capabilities.add of %s breaks the restricted Pod Security level; remove it, only NET_BIND_SERVICE may be added" $entry $capability) }}
+{{- end }}
+{{- end }}
+{{- if eq (toString $context.privileged) "true" }}
+{{- $violations = append $violations (printf "%s: privileged true breaks the restricted Pod Security level; remove securityContext.privileged" $entry) }}
+{{- end }}
+{{- range $port := default (list) $container.ports }}
+{{- if $port.hostPort }}
+{{- $violations = append $violations (printf "%s: hostPort %v breaks the restricted Pod Security level; remove hostPort from the port and publish it through the Service" $entry $port.hostPort) }}
+{{- end }}
+{{- end }}
+{{- $runAsNonRoot := $podContext.runAsNonRoot }}
+{{- if not (kindIs "invalid" $context.runAsNonRoot) }}
+{{- $runAsNonRoot = $context.runAsNonRoot }}
+{{- end }}
+{{- if ne (toString $runAsNonRoot) "true" }}
+{{- $violations = append $violations (printf "%s: runAsNonRoot %s breaks the restricted Pod Security level; set securityContext.runAsNonRoot to true or remove it to follow the pod" $entry (toString $runAsNonRoot)) }}
+{{- end }}
+{{- $runAsUser := $podContext.runAsUser }}
+{{- if not (kindIs "invalid" $context.runAsUser) }}
+{{- $runAsUser = $context.runAsUser }}
+{{- end }}
+{{- if eq (toString $runAsUser) "0" }}
+{{- $violations = append $violations (printf "%s: runAsUser 0 breaks the restricted Pod Security level; set securityContext.runAsUser to a non-zero id or remove it to follow the pod" $entry) }}
+{{- end }}
+{{- $seccompProfile := default $podContext.seccompProfile $context.seccompProfile }}
+{{- if not (has (toString $seccompProfile.type) (list "RuntimeDefault" "Localhost")) }}
+{{- $violations = append $violations (printf "%s: seccompProfile.type %s breaks the restricted Pod Security level; set securityContext.seccompProfile.type to RuntimeDefault or Localhost, or remove it to follow the pod" $entry (toString $seccompProfile.type)) }}
+{{- end }}
+{{- end }}
+{{- range $volume := default (list) .Values.ingest.extraVolumes }}
+{{- range $volumeType, $_ := omit $volume "name" }}
+{{- if not (has $volumeType $volumeTypes) }}
+{{- $violations = append $violations (printf "%s: volume type %s breaks the restricted Pod Security level; use one of %s" (printf "ingest.extraVolumes[%s]" $volume.name) $volumeType (join ", " $volumeTypes)) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $violations }}
+{{- fail (join "\n" $violations) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Fail the render when an `ingest.extraVolumes` entry takes the name of a volume the chart
+itself renders in `deployment-ingest.yaml`. Pod volume names must be unique, so the
+collision would otherwise surface only when the API server refuses the Deployment.
+
+Only the names the chart renders for these values count: `cache` and the TLS volume
+are reserved only while `ingest.cache.enabled` / `ingest.tls.enabled` add them. The
+`config` and `tmp` names here must match the ones `deployment-ingest.yaml` declares.
+
+Usage: include "icegate.validateExtraVolumeNames" .
+*/}}
+{{- define "icegate.validateExtraVolumeNames" -}}
+{{- $chartVolumeNames := list "config" "tmp" }}
+{{- if (.Values.ingest.cache).enabled }}
+{{- $chartVolumeNames = append $chartVolumeNames "cache" }}
+{{- end }}
+{{- if (.Values.ingest.tls).enabled }}
+{{- $chartVolumeNames = append $chartVolumeNames (include "icegate.tlsVolumeName" .) }}
+{{- end }}
+{{- range $volume := default (list) .Values.ingest.extraVolumes }}
+{{- if has (toString $volume.name) $chartVolumeNames }}
+{{- fail (printf "ingest.extraVolumes[%s]: the chart already renders a pod volume named %s; give this volume another name" $volume.name $volume.name) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -458,7 +635,10 @@ Init containers that block startup until dependencies are ready.
   are created out-of-band by the `rustfs-init` Job, which finishes after RustFS
   reports healthy.
 
-Usage: include "icegate.waitForDeps" (dict "context" . "config" .Values.ingest.waitForDependencies)
+Both init-container images go through `icegate.image`, so `component` (the values
+section the config comes from, e.g. "ingest") names them in a failure.
+
+Usage: include "icegate.waitForDeps" (dict "context" . "config" .Values.ingest.waitForDependencies "component" "ingest")
 */}}
 {{- define "icegate.waitForDeps" -}}
 {{- if .config.enabled }}
@@ -466,7 +646,7 @@ Usage: include "icegate.waitForDeps" (dict "context" . "config" .Values.ingest.w
 initContainers:
   {{- if .config.endpoints }}
   - name: wait-for-deps
-    image: {{ .config.image }}
+    image: {{ include "icegate.image" (dict "image" .config.image "key" (printf "%s.waitForDependencies.image" .component)) }}
     securityContext:
       {{- include "icegate.containerSecurityContext" .context | nindent 6 }}
     command:
@@ -483,7 +663,7 @@ initContainers:
   {{- end }}
   {{- if .config.buckets }}
   - name: wait-for-buckets
-    image: {{ .config.awsCliImage | default "amazon/aws-cli:2.36.34" }}
+    image: {{ include "icegate.image" (dict "image" .config.awsCliImage "key" (printf "%s.waitForDependencies.awsCliImage" .component)) }}
     securityContext:
       # readOnlyRootFilesystem is relaxed (unlike the strict container context)
       # so the AWS CLI can use its writable scratch space; still non-root, no
@@ -534,4 +714,153 @@ readOnlyRootFilesystem: true
 capabilities:
   drop:
     - ALL
+{{- end }}
+
+{{/*
+The directory a component's TLS Secret is mounted at, and so the directory its
+rendered config names the certificate and the key under.
+
+Stated once because the config (`icegate.tlsYaml`) and the container mount
+(`icegate.tlsVolumeMount`) must agree on it: a mount somewhere else leaves the
+component naming files that are not there, and it refuses to start.
+
+Usage: include "icegate.tlsMountPath" .
+*/}}
+{{- define "icegate.tlsMountPath" -}}
+/etc/icegate-tls
+{{- end }}
+
+{{/*
+Fail the render when a component serves TLS without what the render needs to wire it.
+
+`secretName` is the Secret the pod mounts: without it the volume would name no Secret.
+The CA ConfigMap is asked for where a
+ServiceMonitor is rendered for the component (`<component>.metrics.enabled` with
+`serviceMonitor.enabled`, the condition of `servicemonitor-*.yaml`), because that is
+where it is used: the scrape names it as its CA. A component with its metrics endpoint
+off renders no scrape, so it needs none.
+
+Both values are read through the parenthesised path, for the reason
+`icegate.validateOperationalHost` reads its host that way: Helm reads a `null` in an
+overlay as the removal of the key, so a plain path would abort the render on a line of
+this file instead of reaching the messages below.
+
+Invoked from the ConfigMap of each component, which renders whenever the component does.
+
+Usage: include "icegate.validateTls" (dict "context" . "component" "ingest")
+*/}}
+{{- define "icegate.validateTls" -}}
+{{- $component := index .context.Values .component }}
+{{- if ($component.tls).enabled }}
+{{- if not $component.tls.secretName }}
+{{- fail (printf "%s.tls.secretName is required when %s.tls.enabled is true: name a Secret holding tls.crt and tls.key, or turn %s.tls.enabled off" .component .component .component) }}
+{{- end }}
+{{- if and ($component.metrics).enabled (.context.Values.serviceMonitor).enabled (not (.context.Values.tls).caConfigMapName) }}
+{{- fail (printf "tls.caConfigMapName is required when %s.tls.enabled and serviceMonitor.enabled are true: the ServiceMonitor names ca.crt of that ConfigMap as the CA of the scrape. Create a ConfigMap holding the CA certificate under ca.crt and set tls.caConfigMapName to its name, or turn serviceMonitor.enabled off" .component) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+A component's `tls` config section (zero-indented), or nothing while TLS is off.
+
+The section names the certificate and the key under `icegate.tlsMountPath`, the two
+files of the Secret. `reload_interval_secs` is rendered only when the operator sets
+`<component>.tls.reloadIntervalSecs`: its default is the component's own, in code, and
+a copy here would be a second one. The component's upper bound is in code as well, so a
+value above it is rendered and refused when the pod loads its config, rather than judged
+here by a second copy of the limit. The number goes through `int64` because a values file
+hands it over as a float, which prints in exponent form from seven digits up.
+
+Call it as `with include ...` and print `.` under it, so that the empty result adds no
+line.
+
+Usage: include "icegate.tlsYaml" (dict "context" . "component" "ingest")
+*/}}
+{{- define "icegate.tlsYaml" -}}
+{{- $tls := default (dict) (index .context.Values .component).tls }}
+{{- if $tls.enabled -}}
+tls:
+  certificate_path: {{ include "icegate.tlsMountPath" .context }}/tls.crt
+  private_key_path: {{ include "icegate.tlsMountPath" .context }}/tls.key
+  {{- if not (kindIs "invalid" $tls.reloadIntervalSecs) }}
+  reload_interval_secs: {{ $tls.reloadIntervalSecs | int64 }}
+  {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+The name of the pod volume carrying a component's TLS Secret, shared by the volume,
+its mount and `icegate.validateExtraVolumeNames`.
+*/}}
+{{- define "icegate.tlsVolumeName" -}}
+tls
+{{- end }}
+
+{{/*
+The pod volume carrying a component's TLS Secret, mounted by `icegate.tlsVolumeMount`.
+
+Usage: include "icegate.tlsVolume" (dict "context" . "component" "ingest")
+*/}}
+{{- define "icegate.tlsVolume" -}}
+- name: {{ include "icegate.tlsVolumeName" . }}
+  secret:
+    secretName: {{ (index .context.Values .component).tls.secretName | quote }}
+{{- end }}
+
+{{/*
+The container mount of the volume `icegate.tlsVolume` declares.
+
+A directory mount, never a `subPath`: the component re-reads both files in place to pick
+up a renewal, so the whole Secret volume is mounted rather than single files from it.
+
+Usage: include "icegate.tlsVolumeMount" .
+*/}}
+{{- define "icegate.tlsVolumeMount" -}}
+- name: {{ include "icegate.tlsVolumeName" . }}
+  mountPath: {{ include "icegate.tlsMountPath" . }}
+  readOnly: true
+{{- end }}
+
+{{/*
+The `endpoints` fields of a ServiceMonitor that scrape a component over TLS.
+
+`serverName` is the Service's DNS name, the name the serving certificate is expected to
+carry. The CA ConfigMap name is read after `icegate.validateTls`, called here as well as
+from the ConfigMap: Helm renders templates in an order a template cannot rely on, and the
+refusal has to come from the guard, not from a nil read of an unset name.
+
+Usage: include "icegate.serviceMonitorTls" (dict "context" . "component" "ingest")
+*/}}
+{{- define "icegate.serviceMonitorTls" -}}
+{{- include "icegate.validateTls" . -}}
+scheme: https
+tlsConfig:
+  ca:
+    configMap:
+      name: {{ .context.Values.tls.caConfigMapName | quote }}
+      key: ca.crt
+  serverName: {{ include "icegate.componentName" (dict "context" .context "component" .component) }}.{{ .context.Release.Namespace }}.svc
+{{- end }}
+
+{{/*
+A probe as the Deployment renders it: the probe as written, plus `scheme: HTTPS` on its
+`httpGet` while the component serves TLS.
+
+The probes address the operational listener, which serves TLS together with the rest of
+the component, so an `httpGet` that states no scheme gets the HTTPS one. A scheme the
+operator states is kept, whichever it is, and a probe that is not an `httpGet` has no
+scheme to set, so both render unchanged. The probe is copied before it
+is touched: `.Values` is shared with every other template.
+
+Call it under `with` on the probe, so that an empty probe adds no field.
+
+Usage: include "icegate.probe" (dict "probe" .Values.ingest.livenessProbe "isTlsEnabled" (.Values.ingest.tls).enabled)
+*/}}
+{{- define "icegate.probe" -}}
+{{- $probe := deepCopy .probe }}
+{{- if and .isTlsEnabled (kindIs "map" $probe.httpGet) (not (hasKey $probe.httpGet "scheme")) }}
+{{- $_ := set $probe.httpGet "scheme" "HTTPS" }}
+{{- end }}
+{{- toYaml $probe }}
 {{- end }}
