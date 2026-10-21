@@ -34,7 +34,8 @@ Chart versions up to the `0.2.0` release candidates created the ServiceAccount a
 hook whenever `migrate.enabled` was on, and the release does not record a hook, so an
 upgrade from such a release stops before changing anything: the ServiceAccount `cannot
 be imported into the current release`. Run that first upgrade with `--take-ownership`,
-which adopts the ServiceAccount as it stands, so the running pods keep their tokens:
+which adopts the ServiceAccount as it stands, so the running pods keep their tokens. The
+flag needs Helm 3.17 or later:
 
 ```bash
 helm upgrade icegate oci://ghcr.io/icegatetech/charts/icegate --version {{ .Version }} --take-ownership

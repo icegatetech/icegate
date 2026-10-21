@@ -38,11 +38,15 @@ Create chart name and version as used by the chart label.
 {{- end }}
 
 {{/*
-Component name: {{ fullname }}-{{ component }}
+Component name: {{ fullname }}-{{ component }}, within the 63 characters a Kubernetes
+name allows. The fullname is cut, not the joined name: cutting that takes the suffix,
+and from a 62-character fullname on every component would carry the bare fullname, so
+the migrate ServiceAccount would take the Deployments' name and two Deployments one name.
 Usage: include "icegate.componentName" (dict "context" . "component" "query")
 */}}
 {{- define "icegate.componentName" -}}
-{{- printf "%s-%s" (include "icegate.fullname" .context) .component | trunc 63 | trimSuffix "-" }}
+{{- $fullname := include "icegate.fullname" .context | trunc (int (sub 62 (len .component))) | trimSuffix "-" }}
+{{- printf "%s-%s" $fullname .component }}
 {{- end }}
 
 {{/*

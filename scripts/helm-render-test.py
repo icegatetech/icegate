@@ -327,6 +327,16 @@ MIGRATE_SERVICE_ACCOUNT = "icegate-migrate"
 # object storage as the Deployments. A JSON object, so the dots of the key stay in it.
 ROLE_ANNOTATION = {"eks.amazonaws.com/role-arn": "arn:aws:iam::123456789012:role/icegate"}
 
+# Fullnames around the length where `<fullname>-migrate` stops fitting the 63 characters a
+# Kubernetes name allows, with the name the migrate resources must then carry. 55 characters
+# leave the suffix exactly enough room, and 63 is the longest fullname the chart produces.
+LONG_FULLNAME_CASES = (  # (description, global.fullnameOverride, expected migrate name)
+    ("a 55-character fullname", "icegate-" + "x" * 47, "icegate-" + "x" * 47 + "-migrate"),
+    ("a 56-character fullname", "icegate-" + "x" * 48, "icegate-" + "x" * 47 + "-migrate"),
+    ("a 63-character fullname", "icegate-" + "x" * 55, "icegate-" + "x" * 47 + "-migrate"),
+    ("a fullname cut at a hyphen", "icegate-" + "x" * 46 + "-yyyyy", "icegate-" + "x" * 46 + "-migrate"),
+)
+
 
 def digest_for_row(position: int) -> str:
     """A well-formed digest that no other row of `IMAGE_DIGEST_KEYS` shares.
@@ -1434,6 +1444,36 @@ def check_service_account_without_migrate() -> None:
         ok(f"with migrate.enabled=false the render creates the regular ServiceAccount {SERVICE_ACCOUNT} alone")
 
 
+def check_long_fullname_component_names() -> None:
+    """A long fullname is cut short of each component's suffix, never the suffix itself.
+
+    Cut after the two are joined, the suffix is what goes: from 62 characters every
+    component would carry the bare fullname, so the migrate ServiceAccount would take the
+    name of the one the Deployments run as and two Deployments would share one name.
+    """
+    for description, fullname, migrate_name in LONG_FULLNAME_CASES:
+        documents = load_documents(render_chart("--set", f"global.fullnameOverride={fullname}"))
+        names = [(document["kind"], document["metadata"]["name"]) for document in documents]
+        components = {
+            (document["kind"], document["metadata"]["name"]): document["metadata"]["labels"]["app.kubernetes.io/component"]
+            for document in documents
+            if "app.kubernetes.io/component" in (document["metadata"].get("labels") or {})
+        }
+        accounts = sorted(name for kind, name in names if kind == "ServiceAccount")
+        unsuffixed = sorted(f"{kind} {name}" for (kind, name), component in components.items() if not name.endswith(f"-{component}"))
+        too_long = sorted(f"{kind} {name}" for kind, name in names if len(name) > 63)
+        if len(set(names)) != len(names):
+            fail(f"{description} renders two resources of one kind under one name: {sorted(names)}")
+        elif unsuffixed:
+            fail(f"{description} cuts the component suffix off {unsuffixed}")
+        elif too_long:
+            fail(f"{description} renders names longer than 63 characters: {too_long}")
+        elif accounts != sorted([fullname, migrate_name]):
+            fail(f"{description} must create the ServiceAccounts {fullname} and {migrate_name}, it creates {accounts}")
+        else:
+            ok(f"{description} keeps every component suffix, and the migrate ServiceAccount is {migrate_name}")
+
+
 def check_migrate_service_account_name_refused() -> None:
     """serviceAccount.name may not take the name of the migrate Job's hook ServiceAccount.
 
@@ -1441,7 +1481,7 @@ def check_migrate_service_account_name_refused() -> None:
     """
     check_render_refuses(
         f"serviceAccount.name {MIGRATE_SERVICE_ACCOUNT}",
-        f"serviceAccount.name {MIGRATE_SERVICE_ACCOUNT} is also the name of the ServiceAccount the migrate Job runs as",
+        f"the ServiceAccount the Deployments run as and the one the migrate Job runs as are both named {MIGRATE_SERVICE_ACCOUNT}",
         "--set",
         f"serviceAccount.name={MIGRATE_SERVICE_ACCOUNT}",
     )
@@ -1484,6 +1524,7 @@ check_extra_volume_name_collisions()
 check_service_accounts()
 check_service_account_named()
 check_service_account_without_migrate()
+check_long_fullname_component_names()
 check_migrate_service_account_name_refused()
 # The Secret volume is a new volume type in every pod that serves TLS; the level allows
 # `secret`, and this proves the pods rendered with it on still meet the level.
