@@ -205,16 +205,21 @@ pub async fn create_tables(
         let exists = catalog_ref.table_exists(&table_ident).await?;
 
         if exists {
-            if def.adds_columns_in_place {
-                let table = catalog_ref.load_table(&table_ident).await?;
-                if add_missing_columns(catalog_ref, &def, &table, dry_run).await? {
-                    operations.push(MigrationOperation::Upgrade {
-                        table_name: def.name.to_string(),
-                    });
-                    continue;
-                }
+            if !def.adds_columns_in_place {
+                tracing::info!("Table {} already exists, skipping", def.name);
+                continue;
             }
-            tracing::info!("Table {} already exists, skipping", def.name);
+            let table = catalog_ref.load_table(&table_ident).await?;
+            if add_missing_columns(catalog_ref, &def, &table, dry_run).await? {
+                operations.push(MigrationOperation::Upgrade {
+                    table_name: def.name.to_string(),
+                });
+            } else {
+                tracing::info!(
+                    "Table {} already exists with no optional columns to append, leaving it unchanged",
+                    def.name
+                );
+            }
             continue;
         }
 
