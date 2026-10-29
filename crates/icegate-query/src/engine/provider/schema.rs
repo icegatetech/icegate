@@ -15,7 +15,7 @@ use datafusion::prelude::SessionContext;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
-use icegate_common::schema::{COL_MIN_WEEK_MINUTE, COL_VALID_FROM, PRICES_KEY_COLUMNS};
+use icegate_common::schema::{COL_MAX_WEEK_MINUTE, COL_MIN_WEEK_MINUTE, COL_VALID_FROM, PRICES_KEY_COLUMNS};
 use icegate_queue::ParquetQueueReader;
 
 use super::WalQueryConfig;
@@ -61,23 +61,21 @@ static PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL: LazyLock<String> = LazyLock::new(|| 
     )
 });
 
-/// SQL defining [`icegate_common::PRICES_EFFECTIVE_TABLE`]: the same rows and
-/// `valid_to` as [`PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL`], less every
-/// time-scoped row.
+/// SQL defining [`icegate_common::PRICES_EFFECTIVE_TABLE`]: the rows of
+/// [`PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL`] that are not time-scoped, each with
+/// the `valid_to` it has there.
 ///
-/// The filter runs before the window, which is sound because the time-of-day
-/// start is part of the partition key: it removes whole series, so no row
-/// that remains has its `valid_to` taken from a row that was removed.
+/// The filter runs after the window, not before: a model's window starting
+/// the week shares its key with the unscoped row it replaced, and filtering
+/// first would leave that unscoped row current, still priced at a rate
+/// upstream stopped charging.
 static PRICES_EFFECTIVE_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "SELECT *, LEAD({valid_from}) OVER (\
-             PARTITION BY {key} ORDER BY {valid_from}\
-         ) AS {valid_to} FROM {prices} WHERE {min_week_minute} IS NULL",
-        valid_from = COL_VALID_FROM,
-        key = PRICES_KEY_COLUMNS.join(", "),
-        valid_to = COL_VALID_TO,
-        prices = icegate_common::PRICES_TABLE,
+        "SELECT * FROM ({by_time_of_day}) \
+         WHERE {min_week_minute} IS NULL AND {max_week_minute} IS NULL",
+        by_time_of_day = PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL.as_str(),
         min_week_minute = COL_MIN_WEEK_MINUTE,
+        max_week_minute = COL_MAX_WEEK_MINUTE,
     )
 });
 
@@ -263,12 +261,13 @@ mod tests {
     const NEWER_VALID_FROM: i64 = 2_000_000;
 
     /// Two revisions of one (`provider`, `model`, `service_tier`, `region`,
-    /// `min_input_tokens`, `min_week_minute`) key, plus two rows whose
-    /// `valid_from` falls between them: one for a different model, and one for the same
-    /// model but scoped to a time-of-day window. Those two are the point: a
-    /// `PARTITION BY` that doesn't actually partition by the full key would
-    /// let either leak in as the older revision's derived `valid_to` instead
-    /// of NULL.
+    /// `min_input_tokens`, `min_week_minute`) key — an unscoped row, then the
+    /// row that starts the week once the model gained time-of-day windows —
+    /// plus two rows whose `valid_from` falls between them: one for a
+    /// different model, and the same model's next window. Those two are the
+    /// point: a `PARTITION BY` that doesn't actually partition by the full key
+    /// would let either leak in as the older revision's derived `valid_to`
+    /// instead of the newer revision's `valid_from`.
     fn price_revisions() -> MemTable {
         // Converted from the real Iceberg schema, not hand-written, so the test
         // cannot silently drift from `prices_schema()`.
@@ -328,7 +327,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["test", "test", "test", "test"])), // source
                 Arc::new(StringArray::from(vec![None::<&str>, None, None, None])), // source_url
                 Arc::new(Int32Array::from(vec![None, None, None, Some(60)])),      // min_week_minute
-                Arc::new(Int32Array::from(vec![None, None, None, Some(240)])),     // max_week_minute
+                Arc::new(Int32Array::from(vec![None, Some(60), None, None])),      // max_week_minute
             ],
         )
         .expect("record batch matches prices schema");
@@ -406,17 +405,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prices_effective_sql_omits_time_scoped_rows_and_keeps_every_other_valid_to() {
+    async fn prices_effective_sql_omits_time_scoped_rows_but_not_their_valid_to() {
         // Readers of `prices_effective` predate the time-of-day columns and
         // join one row per key; a time-scoped row there would be one of
-        // several matches. Dropping it must not move any other row's
-        // `valid_to`, since its series is separate.
+        // several matches, so both window rows are left out. The unscoped row
+        // they replaced must still end where the windows begin: filtering
+        // before deriving `valid_to` would leave it current, priced forever at
+        // a rate upstream no longer charges.
         let valid_to_by_valid_from = valid_to_by_valid_from(PRICES_EFFECTIVE_SQL.as_str()).await;
         assert_eq!(
             valid_to_by_valid_from,
             HashMap::from([
                 (OLDER_VALID_FROM, Some(NEWER_VALID_FROM)),
-                (NEWER_VALID_FROM, None),
                 (OTHER_MODEL_VALID_FROM, None),
             ])
         );

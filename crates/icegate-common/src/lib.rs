@@ -32,8 +32,8 @@ pub const OPERATIONS_TABLE_FQN: &str = "iceberg.icegate.operations";
 pub const PRICES_TABLE: &str = "prices";
 /// Fully qualified table name for prices (`iceberg.icegate.prices`).
 pub const PRICES_TABLE_FQN: &str = "iceberg.icegate.prices";
-/// View name exposing the rows of [`PRICES_TABLE`] that are not time-scoped,
-/// with a derived `valid_to` column.
+/// View name exposing the rows of [`PRICES_TABLE`] that are not time-scoped
+/// (both week-minute columns NULL), with a derived `valid_to` column.
 ///
 /// At any instant it holds at most one row per context tier of a rate line,
 /// as it did before the time-of-day columns existed, so a reader that does not

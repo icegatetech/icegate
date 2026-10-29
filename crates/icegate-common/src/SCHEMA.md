@@ -703,7 +703,9 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 **Notable Changes in v1.8:**
 - `prices` gains `min_week_minute` and `max_week_minute` (`INTEGER`, nullable, appended
   after `source_url` at ids 23-24), and `min_week_minute` joins the rate key: a rate that
-  depends on the time of day is one row per window of the UTC week. The predicate a
+  depends on the time of day is one row per window of the UTC week. NULL in either column
+  is that end of the week; a row with both NULL is not time-scoped, and a model's window
+  starting the week keeps that key, so it revises the model's earlier unscoped row. The predicate a
   consumer applies is documented on `prices_schema`; a join on `prices` without it counts
   a time-scoped model once per window.
 - The `prices_effective` view keeps its previous shape for existing readers: it leaves

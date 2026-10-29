@@ -979,10 +979,11 @@ pub fn operations_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// # Time of day
 ///
-/// A row whose `min_week_minute` is NULL applies at every minute of the week.
-/// Otherwise it applies from `min_week_minute` (inclusive) to `max_week_minute`
-/// (exclusive; NULL is [`MINUTES_PER_WEEK`]), counted in minutes of the UTC
-/// week from Monday 00:00. The rows one crawl writes for a model partition the
+/// A row applies from `min_week_minute` (inclusive; NULL is 0) to
+/// `max_week_minute` (exclusive; NULL is [`MINUTES_PER_WEEK`]), counted in
+/// minutes of the UTC week from Monday 00:00. A row with both NULL is not
+/// time-scoped, and a model's window starting the week keeps that key, so it
+/// revises the unscoped row the model had before it gained windows. The rows one crawl writes for a model partition the
 /// week without gaps or overlaps, and a consumer selects the one for a request
 /// at week minute `m` with `coalesce(min_week_minute, 0) <= m AND m <
 /// coalesce(max_week_minute, MINUTES_PER_WEEK)`; one that omits it matches a
@@ -994,7 +995,7 @@ pub fn operations_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// Both columns are optional rather than required with a sentinel because they
 /// were added to tables that already held rows: those rows read back NULL, so
-/// NULL is the one encoding of "not time-scoped" a writer may use.
+/// NULL is the one encoding of either end of the week a writer may use.
 ///
 /// # Field IDs
 ///
@@ -1990,7 +1991,7 @@ pub const COL_SOURCE: &str = "source";
 /// Prices — provenance URL of the upstream rate card.
 pub const COL_SOURCE_URL: &str = "source_url";
 /// Prices — inclusive start of the row's time-of-day window, in minutes of the
-/// UTC week; NULL is a row that is not time-scoped. See [`prices_schema`].
+/// UTC week; NULL is the start of the week. See [`prices_schema`].
 pub const COL_MIN_WEEK_MINUTE: &str = "min_week_minute";
 /// Prices — exclusive end of the row's time-of-day window, in minutes of the
 /// UTC week; NULL is the end of the week.

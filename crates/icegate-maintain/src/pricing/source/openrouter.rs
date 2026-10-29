@@ -580,7 +580,7 @@ mod tests {
         assert_eq!(
             week_rows(&rates, "synthetic/off-peak-model"),
             vec![
-                (Some(0), Some(7_200), Some(0.3), Some(1.2), None),
+                (None, Some(7_200), Some(0.3), Some(1.2), None),
                 (Some(7_200), None, Some(0.15), Some(0.6), None),
             ]
         );
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(
             week_rows(&rates, "synthetic/windowed-model"),
             vec![
-                (Some(0), Some(60), Some(1.0), Some(4.0), Some(0.1)),
+                (None, Some(60), Some(1.0), Some(4.0), Some(0.1)),
                 (Some(60), Some(1_380), Some(2.0), Some(4.0), Some(0.2)),
                 (Some(1_380), Some(1_440), Some(1.0), Some(4.0), Some(0.1)),
                 (Some(1_440), None, Some(2.0), Some(4.0), Some(0.2)),
@@ -655,7 +655,9 @@ mod tests {
         for day in 0..7 {
             let midnight = day * 1_440;
             let next_midnight = (day < 6).then_some(midnight + 1_440);
-            expected.push((Some(midnight), Some(midnight + 60), Some(1.0), Some(4.0), Some(0.2)));
+            // Monday's row starts the week, so its start is NULL like the base tier's.
+            let start = (day > 0).then_some(midnight);
+            expected.push((start, Some(midnight + 60), Some(1.0), Some(4.0), Some(0.2)));
             expected.push((Some(midnight + 60), next_midnight, Some(2.0), Some(4.0), Some(0.2)));
         }
         assert_eq!(week_rows(&rates, "synthetic/windowed-model"), expected);
@@ -671,7 +673,7 @@ mod tests {
         assert_eq!(
             week_rows(&rates, "synthetic/windowed-model"),
             vec![
-                (Some(0), Some(9_960), Some(2.0), Some(4.0), Some(0.2)),
+                (None, Some(9_960), Some(2.0), Some(4.0), Some(0.2)),
                 (Some(9_960), None, Some(1.0), Some(4.0), Some(0.2)),
             ]
         );

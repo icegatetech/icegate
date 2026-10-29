@@ -56,8 +56,8 @@ pub struct RateKey {
     pub region: String,
     /// Context-tier lower bound, inclusive.
     pub min_input_tokens: i64,
-    /// Time-of-day window start in minutes of the UTC week; `None` is not
-    /// time-scoped.
+    /// Time-of-day window start in minutes of the UTC week; `None` is the
+    /// start of the week.
     pub min_week_minute: Option<i32>,
 }
 
@@ -79,7 +79,8 @@ pub struct RateObservation {
     /// Context-tier upper bound, exclusive; `None` is unbounded.
     pub max_input_tokens: Option<i64>,
     /// Time-of-day window start, inclusive, in minutes of the UTC week from
-    /// Monday 00:00; `None` applies at every minute of the week.
+    /// Monday 00:00; `None` is minute 0. With `max_week_minute` also `None`
+    /// the row is not time-scoped.
     pub min_week_minute: Option<i32>,
     /// Time-of-day window end, exclusive; `None` is the end of the week.
     pub max_week_minute: Option<i32>,
@@ -298,9 +299,15 @@ const fn observation_rates(rate: &RateObservation) -> TokenRates {
 /// minutes with equal rates share a row, so the rows depend on the prices and
 /// not on how upstream cuts its windows: a reshuffle that keeps every price
 /// keeps every [`RateKey`]. For the same reason a single row spanning the week
-/// is emitted unscoped, exactly as a source with no windows would emit it. The
-/// last row's `max_week_minute` is `None`, as the top context tier's
-/// `max_input_tokens` is.
+/// is emitted unscoped, exactly as a source with no windows would emit it.
+///
+/// The first row's `min_week_minute` is `None`, not `Some(0)`, and the last
+/// row's `max_week_minute` is `None`: the bounds of the week are written the
+/// way an unscoped row writes them. So when a model that was priced all week
+/// gains windows, the row starting the week revises its unscoped row under the
+/// same key instead of leaving it in effect beside the windows — as the base
+/// context tier, keyed `min_input_tokens = 0` either way, revises an untiered
+/// row.
 #[must_use]
 pub fn expand_week_windows(base: &RateObservation, windows: &[WeekWindow]) -> Vec<RateObservation> {
     // A sweep over range edges: one sort, then one ordered-set update per
@@ -364,13 +371,12 @@ pub fn expand_week_windows(base: &RateObservation, windows: &[WeekWindow]) -> Ve
         minute = edges.peek().map_or(MINUTES_PER_WEEK, |&(at, _, _)| at);
     }
 
-    let scoped = spans.len() > 1;
     spans
         .iter()
         .enumerate()
         .map(
             |(i, &(start, [input, output, cache_read, cache_write]))| RateObservation {
-                min_week_minute: scoped.then_some(start),
+                min_week_minute: (i > 0).then_some(start),
                 max_week_minute: spans.get(i + 1).map(|&(next_start, _)| next_start),
                 input_usd_per_1m: input,
                 output_usd_per_1m: output,
@@ -764,7 +770,7 @@ mod tests {
         assert_eq!(
             week_rows(&rows),
             vec![
-                (Some(0), Some(300), Some(1.0), Some(3.0)),
+                (None, Some(300), Some(1.0), Some(3.0)),
                 (Some(300), Some(600), Some(1.5), Some(3.0)),
                 (Some(600), Some(900), Some(1.5), Some(25.0)),
                 (Some(900), None, Some(5.0), Some(25.0)),
@@ -790,7 +796,7 @@ mod tests {
         assert_eq!(
             week_rows(&rows),
             vec![
-                (Some(0), Some(100), Some(5.0), Some(25.0)),
+                (None, Some(100), Some(5.0), Some(25.0)),
                 (Some(100), Some(300), Some(1.0), Some(25.0)),
                 (Some(300), Some(1000), Some(5.0), Some(25.0)),
                 (Some(1000), Some(2000), Some(2.0), Some(25.0)),
@@ -808,6 +814,22 @@ mod tests {
             let rows = super::expand_week_windows(&RateObservation::sample(), &windows);
             assert_eq!(rows, vec![RateObservation::sample()]);
         }
+    }
+
+    #[test]
+    fn expand_week_windows_first_row_shares_the_unscoped_rows_key() {
+        // A model priced all week until upstream added windows already has an
+        // unscoped row live. The window row starting the week must revise
+        // that row, not sit beside it under a new key: otherwise the old row
+        // keeps matching every minute alongside each window.
+        let unscoped = RateObservation::sample();
+        let rows = super::expand_week_windows(&unscoped, &[window(&[(60, 120)], Some(1.0), None)]);
+        let first = rows
+            .iter()
+            .find(|r| r.max_week_minute == Some(60))
+            .expect("row before the window");
+        assert_eq!(first.key(), unscoped.key());
+        assert!(first.rates_differ(&unscoped), "its bounded end is a revision");
     }
 
     #[test]
