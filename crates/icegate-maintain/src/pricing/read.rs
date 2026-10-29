@@ -7,16 +7,17 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Array, Decimal128Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use iceberg::Catalog;
 use icegate_common::schema::{
     COL_AUDIO_INPUT_USD_PER_SECOND, COL_AUDIO_OUTPUT_USD_PER_SECOND, COL_CACHE_READ_USD_PER_1M,
     COL_CACHE_WRITE_USD_PER_1M, COL_CANONICAL_ID, COL_CURRENCY, COL_IMAGE_INPUT_USD_PER_UNIT,
-    COL_IMAGE_OUTPUT_USD_PER_UNIT, COL_INPUT_USD_PER_1M, COL_MAX_INPUT_TOKENS, COL_MIN_INPUT_TOKENS, COL_MODEL,
-    COL_OUTPUT_USD_PER_1M, COL_PROVIDER, COL_REASONING_USD_PER_1M, COL_REGION, COL_REQUEST_USD, COL_SERVICE_TIER,
-    COL_SOURCE, COL_SOURCE_URL, COL_VALID_FROM, COL_VALID_FROM_SOURCE,
+    COL_IMAGE_OUTPUT_USD_PER_UNIT, COL_INPUT_USD_PER_1M, COL_MAX_INPUT_TOKENS, COL_MAX_WEEK_MINUTE,
+    COL_MIN_INPUT_TOKENS, COL_MIN_WEEK_MINUTE, COL_MODEL, COL_OUTPUT_USD_PER_1M, COL_PROVIDER,
+    COL_REASONING_USD_PER_1M, COL_REGION, COL_REQUEST_USD, COL_SERVICE_TIER, COL_SOURCE, COL_SOURCE_URL,
+    COL_VALID_FROM, COL_VALID_FROM_SOURCE,
 };
 use icegate_common::{PRICES_TABLE, icegate_table_ident};
 
@@ -68,6 +69,8 @@ struct PriceColumns<'a> {
     region: &'a StringArray,
     min_input_tokens: &'a Int64Array,
     max_input_tokens: &'a Int64Array,
+    min_week_minute: &'a Int32Array,
+    max_week_minute: &'a Int32Array,
     valid_from: &'a TimestampMicrosecondArray,
     valid_from_source: &'a StringArray,
     input_usd_per_1m: &'a Decimal128Array,
@@ -113,6 +116,8 @@ fn resolve_columns(batch: &RecordBatch) -> Result<PriceColumns<'_>> {
         region: column(batch, COL_REGION)?,
         min_input_tokens: column(batch, COL_MIN_INPUT_TOKENS)?,
         max_input_tokens: column(batch, COL_MAX_INPUT_TOKENS)?,
+        min_week_minute: column(batch, COL_MIN_WEEK_MINUTE)?,
+        max_week_minute: column(batch, COL_MAX_WEEK_MINUTE)?,
         valid_from: column(batch, COL_VALID_FROM)?,
         valid_from_source: column(batch, COL_VALID_FROM_SOURCE)?,
         input_usd_per_1m: column(batch, COL_INPUT_USD_PER_1M)?,
@@ -142,6 +147,15 @@ fn optional_str(array: &StringArray, row: usize) -> Option<String> {
 
 /// An optional `Int64` cell.
 fn optional_i64(array: &Int64Array, row: usize) -> Option<i64> {
+    if array.is_null(row) {
+        None
+    } else {
+        Some(array.value(row))
+    }
+}
+
+/// An optional `Int32` cell.
+fn optional_i32(array: &Int32Array, row: usize) -> Option<i32> {
     if array.is_null(row) {
         None
     } else {
@@ -198,6 +212,8 @@ fn decode_row(columns: &PriceColumns<'_>, row: usize) -> Result<RateObservation>
         region: columns.region.value(row).to_string(),
         min_input_tokens: columns.min_input_tokens.value(row),
         max_input_tokens: optional_i64(columns.max_input_tokens, row),
+        min_week_minute: optional_i32(columns.min_week_minute, row),
+        max_week_minute: optional_i32(columns.max_week_minute, row),
         valid_from,
         valid_from_source: decode_valid_from_source(columns.valid_from_source.value(row))?,
         input_usd_per_1m: optional_decimal(columns.input_usd_per_1m, row),
@@ -228,6 +244,7 @@ mod tests {
 
     use super::LiveRates;
     use crate::pricing::source::{RateObservation, ValidFromSource};
+    use crate::pricing::writer::build_price_batch;
 
     fn rate(valid_from_secs: i64, input: f64) -> RateObservation {
         RateObservation {
@@ -238,6 +255,8 @@ mod tests {
             region: "global".to_string(),
             min_input_tokens: 0,
             max_input_tokens: None,
+            min_week_minute: None,
+            max_week_minute: None,
             valid_from: DateTime::from_timestamp(valid_from_secs, 0).expect("valid timestamp"),
             valid_from_source: ValidFromSource::Observed,
             input_usd_per_1m: Some(input),
@@ -254,6 +273,23 @@ mod tests {
             source: "litellm".to_string(),
             source_url: None,
         }
+    }
+
+    #[test]
+    fn decodes_the_time_of_day_window_columns_by_name() {
+        // A scoped and an unscoped row: NULL must come back as `None` (a row
+        // written before the columns existed reads back NULL and must keep
+        // its key), a value as itself.
+        let unscoped = rate(1_760_000_000, 5.0);
+        let scoped = RateObservation {
+            min_week_minute: Some(60),
+            max_week_minute: Some(240),
+            ..rate(1_760_000_000, 2.5)
+        };
+        let batch = build_price_batch(&[unscoped, scoped]).expect("batch builds");
+        let decoded = super::decode_batch(&batch).expect("batch decodes");
+        let windows: Vec<_> = decoded.iter().map(|r| (r.min_week_minute, r.max_week_minute)).collect();
+        assert_eq!(windows, vec![(None, None), (Some(60), Some(240))]);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use datafusion::prelude::SessionContext;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
-use icegate_common::schema::{COL_VALID_FROM, PRICES_KEY_COLUMNS};
+use icegate_common::schema::{COL_MIN_WEEK_MINUTE, COL_VALID_FROM, PRICES_KEY_COLUMNS};
 use icegate_queue::ParquetQueueReader;
 
 use super::WalQueryConfig;
@@ -33,22 +33,23 @@ const WAL_MERGED_TABLES: &[&str] = &[
     icegate_common::OPERATIONS_TOPIC,
 ];
 
-/// SQL defining [`icegate_common::PRICES_EFFECTIVE_TABLE`] over the raw
-/// `prices` observation log.
+/// SQL defining [`icegate_common::PRICES_EFFECTIVE_BY_TIME_OF_DAY_TABLE`]
+/// over the raw `prices` observation log.
 ///
 /// `prices` stores only `valid_from`: the sole Iceberg write path in this
 /// codebase is `fast_append`, so a superseded row cannot be updated to carry an
 /// end date. `valid_to` is therefore derived — the next revision's `valid_from`
 /// for the same key, NULL for the row currently in effect.
 ///
-/// This view is a DataFusion object: Flight SQL and the query APIs see it, but
-/// **Trino reads the Iceberg catalog directly and will not**. External consumers
-/// apply this window themselves, which is why the raw table is self-sufficient.
+/// Both prices views are DataFusion objects: Flight SQL and the query APIs see
+/// them, but **Trino reads the Iceberg catalog directly and will not**.
+/// External consumers apply this window themselves, which is why the raw table
+/// is self-sufficient.
 ///
 /// Every `prices` column is named through `icegate_common::schema`, so renaming
 /// one there breaks this build rather than silently degrading into a planning
-/// error at startup — the failure [`plan_prices_effective`] swallows.
-static PRICES_EFFECTIVE_SQL: LazyLock<String> = LazyLock::new(|| {
+/// error at startup — the failure [`plan_prices_view`] swallows.
+static PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT *, LEAD({valid_from}) OVER (\
              PARTITION BY {key} ORDER BY {valid_from}\
@@ -60,14 +61,34 @@ static PRICES_EFFECTIVE_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// The column [`PRICES_EFFECTIVE_SQL`] derives, and the only one the view adds
-/// to the `prices` schema.
+/// SQL defining [`icegate_common::PRICES_EFFECTIVE_TABLE`]: the same rows and
+/// `valid_to` as [`PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL`], less every
+/// time-scoped row.
+///
+/// The filter runs before the window, which is sound because the time-of-day
+/// start is part of the partition key: it removes whole series, so no row
+/// that remains has its `valid_to` taken from a row that was removed.
+static PRICES_EFFECTIVE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT *, LEAD({valid_from}) OVER (\
+             PARTITION BY {key} ORDER BY {valid_from}\
+         ) AS {valid_to} FROM {prices} WHERE {min_week_minute} IS NULL",
+        valid_from = COL_VALID_FROM,
+        key = PRICES_KEY_COLUMNS.join(", "),
+        valid_to = COL_VALID_TO,
+        prices = icegate_common::PRICES_TABLE,
+        min_week_minute = COL_MIN_WEEK_MINUTE,
+    )
+});
+
+/// The column both prices views derive, and the only one they add to the
+/// `prices` schema.
 ///
 /// Deliberately not in `icegate_common::schema`: no Iceberg table has this
 /// column, so it is the view's contract rather than a schema-of-record entry.
 const COL_VALID_TO: &str = "valid_to";
 
-/// Plans [`PRICES_EFFECTIVE_SQL`] over `prices` as a standalone view.
+/// Plans `sql` over `prices` as a standalone view.
 ///
 /// The plan is built against a throwaway [`SessionContext`] holding only
 /// `prices`, so the resulting `ViewTable` closes over `prices` directly and
@@ -77,15 +98,15 @@ const COL_VALID_TO: &str = "valid_to";
 /// # Errors
 ///
 /// Returns a `DataFusionError` if `prices` cannot be registered into the
-/// planning context, or if [`PRICES_EFFECTIVE_SQL`] fails to plan against it
-/// (for example because the `prices` schema has drifted from the columns the
-/// SQL references). Callers treat this as non-fatal: `prices_effective` is a
-/// convenience view over `prices`, not a table other tables depend on.
-async fn plan_prices_effective(prices: Arc<dyn TableProvider>) -> DFResult<Arc<dyn TableProvider>> {
+/// planning context, or if `sql` fails to plan against it (for example because
+/// the `prices` schema has drifted from the columns the SQL references).
+/// Callers treat this as non-fatal: a prices view is a convenience over
+/// `prices`, not a table other tables depend on.
+async fn plan_prices_view(prices: Arc<dyn TableProvider>, sql: &str) -> DFResult<Arc<dyn TableProvider>> {
     let planning_ctx = SessionContext::new();
     planning_ctx.register_table(icegate_common::PRICES_TABLE, prices)?;
-    let plan = planning_ctx.sql(PRICES_EFFECTIVE_SQL.as_str()).await?.into_unoptimized_plan();
-    Ok(Arc::new(ViewTable::new(plan, Some(PRICES_EFFECTIVE_SQL.clone()))))
+    let plan = planning_ctx.sql(sql).await?.into_unoptimized_plan();
+    Ok(Arc::new(ViewTable::new(plan, Some(sql.to_string()))))
 }
 
 /// Schema provider that substitutes `IcegateTableProvider` for WAL-backed
@@ -155,21 +176,28 @@ impl IcegateSchemaProvider {
 
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = tables_loaded.into_iter().collect();
 
-        // Register the derived-`valid_to` view beside the raw table. This is a
-        // convenience view, not a table anything else depends on, so a failure
-        // here (e.g. `PRICES_EFFECTIVE_SQL` drifting from the `prices` schema)
-        // must not take down the whole namespace — `prices` itself is already
-        // in `tables` and stays queryable either way.
-        if let Some(prices) = tables.get(icegate_common::PRICES_TABLE) {
-            match plan_prices_effective(Arc::clone(prices)).await {
-                Ok(view) => {
-                    tables.insert(icegate_common::PRICES_EFFECTIVE_TABLE.to_string(), view);
-                }
-                Err(e) => tracing::error!(
-                    error = %e,
-                    "failed to register {}; the raw prices table remains queryable",
-                    icegate_common::PRICES_EFFECTIVE_TABLE
+        // Register the derived-`valid_to` views beside the raw table. These are
+        // convenience views, not tables anything else depends on, so a failure
+        // here (e.g. their SQL drifting from the `prices` schema) must not take
+        // down the whole namespace — `prices` itself is already in `tables` and
+        // stays queryable either way.
+        if let Some(prices) = tables.get(icegate_common::PRICES_TABLE).cloned() {
+            for (name, sql) in [
+                (icegate_common::PRICES_EFFECTIVE_TABLE, PRICES_EFFECTIVE_SQL.as_str()),
+                (
+                    icegate_common::PRICES_EFFECTIVE_BY_TIME_OF_DAY_TABLE,
+                    PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL.as_str(),
                 ),
+            ] {
+                match plan_prices_view(Arc::clone(&prices), sql).await {
+                    Ok(view) => {
+                        tables.insert(name.to_string(), view);
+                    }
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "failed to register {name}; the raw prices table remains queryable"
+                    ),
+                }
             }
         }
 
@@ -199,13 +227,15 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
-        Array, ArrayRef, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
 
-    use super::{COL_VALID_FROM, COL_VALID_TO, PRICES_EFFECTIVE_SQL, WAL_MERGED_TABLES};
+    use super::{
+        COL_VALID_FROM, COL_VALID_TO, PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL, PRICES_EFFECTIVE_SQL, WAL_MERGED_TABLES,
+    };
 
     /// Guard against accidental drift in the WAL-merged table allowlist.
     /// The dispatch in `IcegateSchemaProvider::try_new` keys off this slice;
@@ -225,29 +255,26 @@ mod tests {
         assert!(!WAL_MERGED_TABLES.contains(&icegate_common::PRICES_TABLE));
     }
 
-    /// The derived `valid_to` is the whole point of the view: without the LEAD
-    /// correctly partitioned and ordered, revisions of different models
-    /// interleave or `valid_to` values land on the wrong row. A substring match
-    /// on the SQL text cannot catch that (it would pass even if `region` moved
-    /// out of `PARTITION BY` or `ORDER BY valid_from` were dropped), so this
-    /// executes the SQL and checks the derived values instead.
-    #[tokio::test]
-    async fn prices_effective_sql_derives_valid_to_over_the_full_key() {
-        // Two revisions of one (provider, model, service_tier, region,
-        // min_input_tokens) key, plus one row for a different model whose
-        // valid_from falls between them. That third row is the point: a
-        // `PARTITION BY` that doesn't actually partition would let it leak in as
-        // the older revision's derived `valid_to` instead of NULL.
-        const OLDER_VALID_FROM: i64 = 1_000_000;
-        const OTHER_MODEL_VALID_FROM: i64 = 1_500_000;
-        const NEWER_VALID_FROM: i64 = 2_000_000;
+    /// `valid_from` of the older and newer revisions of one key, and of the
+    /// two rows [`price_revisions`] places between them.
+    const OLDER_VALID_FROM: i64 = 1_000_000;
+    const OTHER_MODEL_VALID_FROM: i64 = 1_500_000;
+    const TIME_SCOPED_VALID_FROM: i64 = 1_600_000;
+    const NEWER_VALID_FROM: i64 = 2_000_000;
 
+    /// Two revisions of one (`provider`, `model`, `service_tier`, `region`,
+    /// `min_input_tokens`, `min_week_minute`) key, plus two rows whose
+    /// `valid_from` falls between them: one for a different model, and one for the same
+    /// model but scoped to a time-of-day window. Those two are the point: a
+    /// `PARTITION BY` that doesn't actually partition by the full key would
+    /// let either leak in as the older revision's derived `valid_to` instead
+    /// of NULL.
+    fn price_revisions() -> MemTable {
         // Converted from the real Iceberg schema, not hand-written, so the test
         // cannot silently drift from `prices_schema()`.
         let iceberg_schema = icegate_common::schema::prices_schema().expect("prices schema builds");
         let arrow_schema =
             Arc::new(iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).expect("prices schema converts to arrow"));
-
         // Rate columns are `Decimal(38,10)`. Build them from unscaled `i128`
         // values (rate x 10^10) with the schema's precision/scale.
         let decimal = |unscaled: Vec<Option<i128>>| -> ArrayRef {
@@ -257,31 +284,38 @@ mod tests {
                     .expect("rate decimal precision/scale"),
             )
         };
-        let empty_rates = || decimal(vec![None, None, None]);
+        let empty_rates = || decimal(vec![None, None, None, None]);
 
         let batch = RecordBatch::try_new(
             Arc::clone(&arrow_schema),
             vec![
-                Arc::new(StringArray::from(vec!["anthropic", "anthropic", "openai"])),
+                Arc::new(StringArray::from(vec!["anthropic", "anthropic", "openai", "anthropic"])),
                 Arc::new(StringArray::from(vec![
                     "claude-3-5-sonnet",
                     "claude-3-5-sonnet",
                     "gpt-4o",
+                    "claude-3-5-sonnet",
                 ])),
-                Arc::new(StringArray::from(vec![None::<&str>, None, None])), // canonical_id
-                Arc::new(StringArray::from(vec!["standard", "standard", "standard"])),
-                Arc::new(StringArray::from(vec!["global", "global", "global"])),
-                Arc::new(Int64Array::from(vec![0_i64, 0, 0])), // min_input_tokens
-                Arc::new(Int64Array::from(vec![None::<i64>, None, None])), // max_input_tokens
+                Arc::new(StringArray::from(vec![None::<&str>, None, None, None])), // canonical_id
+                Arc::new(StringArray::from(vec!["standard", "standard", "standard", "standard"])),
+                Arc::new(StringArray::from(vec!["global", "global", "global", "global"])),
+                Arc::new(Int64Array::from(vec![0_i64, 0, 0, 0])), // min_input_tokens
+                Arc::new(Int64Array::from(vec![None::<i64>, None, None, None])), // max_input_tokens
                 Arc::new(TimestampMicrosecondArray::from(vec![
                     OLDER_VALID_FROM,
                     NEWER_VALID_FROM,
                     OTHER_MODEL_VALID_FROM,
+                    TIME_SCOPED_VALID_FROM,
                 ])),
-                Arc::new(StringArray::from(vec!["vendor", "vendor", "vendor"])), // valid_from_source
-                // 3.0 / 4.0 / 2.0 as unscaled Decimal(38,10) (rate x 10^10).
-                decimal(vec![Some(30_000_000_000), Some(40_000_000_000), Some(20_000_000_000)]), // input_usd_per_1m
-                empty_rates(),                                                                   // output_usd_per_1m
+                Arc::new(StringArray::from(vec!["vendor", "vendor", "vendor", "vendor"])), // valid_from_source
+                // 3.0 / 4.0 / 2.0 / 1.5 as unscaled Decimal(38,10) (rate x 10^10).
+                decimal(vec![
+                    Some(30_000_000_000),
+                    Some(40_000_000_000),
+                    Some(20_000_000_000),
+                    Some(15_000_000_000),
+                ]), // input_usd_per_1m
+                empty_rates(), // output_usd_per_1m
                 empty_rates(), // cache_read_usd_per_1m
                 empty_rates(), // cache_write_usd_per_1m
                 empty_rates(), // reasoning_usd_per_1m
@@ -290,28 +324,33 @@ mod tests {
                 empty_rates(), // image_output_usd_per_unit
                 empty_rates(), // audio_input_usd_per_second
                 empty_rates(), // audio_output_usd_per_second
-                Arc::new(StringArray::from(vec!["USD", "USD", "USD"])),
-                Arc::new(StringArray::from(vec!["test", "test", "test"])), // source
-                Arc::new(StringArray::from(vec![None::<&str>, None, None])), // source_url
+                Arc::new(StringArray::from(vec!["USD", "USD", "USD", "USD"])),
+                Arc::new(StringArray::from(vec!["test", "test", "test", "test"])), // source
+                Arc::new(StringArray::from(vec![None::<&str>, None, None, None])), // source_url
+                Arc::new(Int32Array::from(vec![None, None, None, Some(60)])),      // min_week_minute
+                Arc::new(Int32Array::from(vec![None, None, None, Some(240)])),     // max_week_minute
             ],
         )
         .expect("record batch matches prices schema");
 
-        let table = MemTable::try_new(Arc::clone(&arrow_schema), vec![vec![batch]]).expect("mem table builds");
-        let ctx = SessionContext::new();
-        ctx.register_table(icegate_common::PRICES_TABLE, Arc::new(table))
-            .expect("prices registers");
+        MemTable::try_new(Arc::clone(&arrow_schema), vec![vec![batch]]).expect("mem table builds")
+    }
 
+    /// Run `sql` over [`price_revisions`] and map each row's `valid_from` to
+    /// its derived `valid_to`, so assertions don't depend on row order across
+    /// (possibly multiple) result batches.
+    async fn valid_to_by_valid_from(sql: &str) -> HashMap<i64, Option<i64>> {
+        let ctx = SessionContext::new();
+        ctx.register_table(icegate_common::PRICES_TABLE, Arc::new(price_revisions()))
+            .expect("prices registers");
         let results = ctx
-            .sql(PRICES_EFFECTIVE_SQL.as_str())
+            .sql(sql)
             .await
-            .expect("PRICES_EFFECTIVE_SQL plans")
+            .expect("view SQL plans")
             .collect()
             .await
-            .expect("PRICES_EFFECTIVE_SQL executes");
+            .expect("view SQL executes");
 
-        // Index derived valid_to by valid_from so assertions don't depend on
-        // row order across (possibly multiple) result batches.
         let mut valid_to_by_valid_from: HashMap<i64, Option<i64>> = HashMap::new();
         for result_batch in &results {
             let valid_from_col = result_batch
@@ -331,6 +370,18 @@ mod tests {
                 valid_to_by_valid_from.insert(valid_from_col.value(row), valid_to);
             }
         }
+        valid_to_by_valid_from
+    }
+
+    /// The derived `valid_to` is the whole point of the views: without the LEAD
+    /// correctly partitioned and ordered, revisions of different models
+    /// interleave or `valid_to` values land on the wrong row. A substring match
+    /// on the SQL text cannot catch that (it would pass even if `region` moved
+    /// out of `PARTITION BY` or `ORDER BY valid_from` were dropped), so this
+    /// executes the SQL and checks the derived values instead.
+    #[tokio::test]
+    async fn prices_effective_by_time_of_day_sql_derives_valid_to_over_the_full_key() {
+        let valid_to_by_valid_from = valid_to_by_valid_from(PRICES_EFFECTIVE_BY_TIME_OF_DAY_SQL.as_str()).await;
 
         assert_eq!(
             valid_to_by_valid_from.get(&OLDER_VALID_FROM),
@@ -346,6 +397,28 @@ mod tests {
             valid_to_by_valid_from.get(&OTHER_MODEL_VALID_FROM),
             Some(&None),
             "an unrelated model's valid_to must not leak in from a different partition"
+        );
+        assert_eq!(
+            valid_to_by_valid_from.get(&TIME_SCOPED_VALID_FROM),
+            Some(&None),
+            "a time-scoped row of the same model is its own series, not a revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn prices_effective_sql_omits_time_scoped_rows_and_keeps_every_other_valid_to() {
+        // Readers of `prices_effective` predate the time-of-day columns and
+        // join one row per key; a time-scoped row there would be one of
+        // several matches. Dropping it must not move any other row's
+        // `valid_to`, since its series is separate.
+        let valid_to_by_valid_from = valid_to_by_valid_from(PRICES_EFFECTIVE_SQL.as_str()).await;
+        assert_eq!(
+            valid_to_by_valid_from,
+            HashMap::from([
+                (OLDER_VALID_FROM, Some(NEWER_VALID_FROM)),
+                (NEWER_VALID_FROM, None),
+                (OTHER_MODEL_VALID_FROM, None),
+            ])
         );
     }
 }

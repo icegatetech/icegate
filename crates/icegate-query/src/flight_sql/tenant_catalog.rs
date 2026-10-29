@@ -478,7 +478,15 @@ mod tests {
 
     #[test]
     fn prices_is_on_the_global_allowlist() {
-        assert!(GLOBAL_TABLES.contains(&PRICES_TABLE));
+        // Both views carry no `tenant_id` either: off the list, the decorator
+        // would fail them closed and cost readers would lose the rate card.
+        for global in [
+            PRICES_TABLE,
+            icegate_common::PRICES_EFFECTIVE_TABLE,
+            icegate_common::PRICES_EFFECTIVE_BY_TIME_OF_DAY_TABLE,
+        ] {
+            assert!(GLOBAL_TABLES.contains(&global), "{global} must be global");
+        }
         assert!(!GLOBAL_TABLES.contains(&LOGS_TABLE));
     }
 

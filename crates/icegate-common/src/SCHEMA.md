@@ -696,9 +696,23 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 
 ---
 
-**Version:** 1.7
-**Last Updated:** 2026-09-23
+**Version:** 1.8
+**Last Updated:** 2026-10-29
 **Schema Source:** `crates/icegate-common/src/schema.rs`
+
+**Notable Changes in v1.8:**
+- `prices` gains `min_week_minute` and `max_week_minute` (`INTEGER`, nullable, appended
+  after `source_url` at ids 23-24), and `min_week_minute` joins the rate key: a rate that
+  depends on the time of day is one row per window of the UTC week. The predicate a
+  consumer applies is documented on `prices_schema`; a join on `prices` without it counts
+  a time-scoped model once per window.
+- The `prices_effective` view keeps its previous shape for existing readers: it leaves
+  time-scoped rows out, so a model priced only by time-of-day windows is absent from it.
+  The new `prices_effective_by_time_of_day` view holds every row, for readers that apply
+  the predicate.
+- Not breaking for storage: `migrate create` (and `migrate upgrade`) append both columns
+  to an existing `prices` in place, and rows written before read them as NULL, meaning not
+  time-scoped. The other tables are untouched.
 
 **Notable Changes in v1.7:**
 - `operations` gains `evaluations` (`ARRAY(ROW(...))`, appended after the `List<String>`

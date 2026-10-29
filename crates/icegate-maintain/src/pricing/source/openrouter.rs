@@ -6,11 +6,17 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 
-use super::{PriceSource, RateObservation, TOKENS_PER_MILLION, TierBoundary, ValidFromSource, expand_tiers};
+use super::{
+    PriceSource, RateObservation, TOKENS_PER_MILLION, TierBoundary, ValidFromSource, WeekRange, WeekWindow,
+    expand_tiers, expand_week_windows,
+};
 use crate::error::{MaintainError, Result};
 
 /// Provider string `OpenRouter` rows are attributed to.
 const PROVIDER: &str = "openrouter";
+
+/// Minutes in one UTC day, the stride between weekdays in a week minute.
+const MINUTES_PER_DAY: i32 = 24 * 60;
 
 /// Providers this source owns unless config overrides it.
 ///
@@ -47,7 +53,7 @@ struct ModelEntry {
 /// `audio`, `audio_output`, `input_audio_cache`, `input_cache_write_1h`) have
 /// no corresponding `RateObservation` column. `serde` drops them silently
 /// since they are not declared below. `overrides` is mapped, expanded into
-/// per-tier rows by [`expand_tiers`].
+/// per-tier or per-window rows by [`expand_overrides`].
 #[derive(Debug, Deserialize)]
 struct Pricing {
     prompt: String,
@@ -64,21 +70,38 @@ struct Pricing {
     input_cache_write: Option<String>,
     #[serde(default)]
     internal_reasoning: Option<String>,
-    /// Context-tier pricing, ascending by `min_prompt_tokens` in practice but
-    /// not guaranteed to be sorted by upstream; see [`resolve_tier_boundaries`].
+    /// Conditional rates: context tiers keyed by `min_prompt_tokens`, or
+    /// time-of-day windows keyed by `utc_days`/`utc_start`/`utc_end`. One
+    /// model's list holds one kind only; see [`expand_overrides`].
     #[serde(default)]
     overrides: Vec<Override>,
 }
 
-/// One tier from `pricing.overrides`. Every rate field but `min_prompt_tokens`
-/// is optional: `OpenRouter` emits only the fields a tier changes, so an
-/// absent field means "same rate as the tier below", not "free" or "unpriced".
-/// `audio`, `input_audio_cache`, and `input_cache_write_1h` also appear on a
-/// few tiers but are out of scope, matching the base [`Pricing`] struct.
+/// One entry of `pricing.overrides`: a condition plus the rates that apply
+/// while it holds. Every rate field is optional because `OpenRouter` emits only
+/// the prices an entry changes; what an absent one falls back to depends on the
+/// kind of condition (see [`TierBoundary`] and [`WeekWindow`]). `audio`,
+/// `input_audio_cache`, and `input_cache_write_1h` also appear on a few entries
+/// but are out of scope, matching the base [`Pricing`] struct.
 #[derive(Debug, Deserialize)]
 struct Override {
-    /// Inclusive lower bound, in tokens (not thousands), of this tier.
-    min_prompt_tokens: i64,
+    /// Context-tier condition: the tier's lower bound, in tokens (not
+    /// thousands), stored as an inclusive bound.
+    #[serde(default)]
+    min_prompt_tokens: Option<i64>,
+    /// Time-of-day condition: the UTC weekdays the entry applies on, evaluated
+    /// at the request instant. Scopes the `utc_start`/`utc_end` window, or the
+    /// whole day without one; absent means every day.
+    #[serde(default)]
+    utc_days: Option<Vec<UtcDay>>,
+    /// Time-of-day condition: window start as an `HHMM` UTC clock, inclusive.
+    #[serde(default)]
+    utc_start: Option<u16>,
+    /// Time-of-day condition: window end as an `HHMM` UTC clock, exclusive. A
+    /// window whose end is not after its start wraps past midnight, so `0`
+    /// ends it at midnight.
+    #[serde(default)]
+    utc_end: Option<u16>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -87,6 +110,42 @@ struct Override {
     input_cache_read: Option<String>,
     #[serde(default)]
     input_cache_write: Option<String>,
+}
+
+impl Override {
+    /// Whether this entry carries any time-of-day condition.
+    const fn is_time_window(&self) -> bool {
+        self.utc_days.is_some() || self.utc_start.is_some() || self.utc_end.is_some()
+    }
+}
+
+/// A UTC weekday as `OpenRouter` spells it in `utc_days`. An unknown name is a
+/// decode error, not a day skipped.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum UtcDay {
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+impl UtcDay {
+    /// Days since Monday, matching the Monday-00:00 origin of a week minute.
+    const fn days_since_monday(self) -> i32 {
+        match self {
+            Self::Monday => 0,
+            Self::Tuesday => 1,
+            Self::Wednesday => 2,
+            Self::Thursday => 3,
+            Self::Friday => 4,
+            Self::Saturday => 5,
+            Self::Sunday => 6,
+        }
+    }
 }
 
 /// Parse a decimal-string USD-per-token rate into USD per 1M tokens.
@@ -111,14 +170,53 @@ fn parse_optional_flat(raw: Option<&String>) -> Result<Option<f64>> {
     .transpose()
 }
 
-/// Convert `pricing.overrides` into [`TierBoundary`]s, each field already in
+/// An error naming `model` and what is wrong with its overrides.
+fn override_error(model: &str, problem: &str) -> MaintainError {
+    MaintainError::Storage(format!("openrouter: model '{model}': {problem}"))
+}
+
+/// Expand `base` by the model's `pricing.overrides`.
+///
+/// A list of context tiers expands through [`expand_tiers`], a list of
+/// time-of-day windows through [`expand_week_windows`]. A list mixing the two,
+/// or an entry combining a token threshold with a window, is an error: a row
+/// carries either a token range or a week range of the base rate, never a
+/// product of both.
+///
+/// # Errors
+///
+/// Returns an error if the overrides mix condition kinds, an entry carries no
+/// condition, a window is malformed, or a rate string is not a number.
+fn expand_overrides(entry: &ModelEntry, base: &RateObservation) -> Result<Vec<RateObservation>> {
+    let overrides = &entry.pricing.overrides;
+    let time_windows = overrides.iter().filter(|o| o.is_time_window()).count();
+    if time_windows == 0 {
+        let boundaries = resolve_tier_boundaries(&entry.id, overrides)?;
+        return Ok(expand_tiers(base, &boundaries));
+    }
+    if time_windows < overrides.len() {
+        return Err(override_error(
+            &entry.id,
+            "overrides mix context tiers and time-of-day windows",
+        ));
+    }
+    let windows = overrides
+        .iter()
+        .map(|o| resolve_week_window(&entry.id, o))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(expand_week_windows(base, &windows))
+}
+
+/// Convert context-tier overrides into [`TierBoundary`]s, each field already in
 /// USD per 1M tokens. Ordering and de-duplication are [`expand_tiers`]'s job.
-fn resolve_tier_boundaries(overrides: &[Override]) -> Result<Vec<TierBoundary>> {
+fn resolve_tier_boundaries(model: &str, overrides: &[Override]) -> Result<Vec<TierBoundary>> {
     overrides
         .iter()
         .map(|o| {
             Ok(TierBoundary {
-                boundary_tokens: o.min_prompt_tokens,
+                boundary_tokens: o
+                    .min_prompt_tokens
+                    .ok_or_else(|| override_error(model, "an override carries no condition"))?,
                 input_usd_per_1m: parse_optional_per_million(o.prompt.as_ref())?,
                 output_usd_per_1m: parse_optional_per_million(o.completion.as_ref())?,
                 cache_read_usd_per_1m: parse_optional_per_million(o.input_cache_read.as_ref())?,
@@ -128,9 +226,76 @@ fn resolve_tier_boundaries(overrides: &[Override]) -> Result<Vec<TierBoundary>> 
         .collect()
 }
 
+/// Minutes since midnight of an `HHMM` clock time, or `None` if it names no
+/// minute of the day (hour above 23 or minute above 59).
+fn minute_of_day(hhmm: u16) -> Option<i32> {
+    let (hour, minute) = (hhmm / 100, hhmm % 100);
+    (hour < 24 && minute < 60).then(|| i32::from(hour) * 60 + i32::from(minute))
+}
+
+/// Convert one time-of-day override into the [`WeekWindow`] it covers.
+///
+/// Each listed day contributes its own share of the week, and a wrapping
+/// window covers both ends of that same day: the day is the request's, and so
+/// is the clock time compared against the window.
+fn resolve_week_window(model: &str, entry: &Override) -> Result<WeekWindow> {
+    if entry.min_prompt_tokens.is_some() {
+        return Err(override_error(
+            model,
+            "an override combines a token threshold with a time window",
+        ));
+    }
+    let daily = match (entry.utc_start, entry.utc_end) {
+        (None, None) => None,
+        (Some(start), Some(end)) => {
+            let start = minute_of_day(start).ok_or_else(|| override_error(model, "utc_start is not an HHMM time"))?;
+            let end = minute_of_day(end).ok_or_else(|| override_error(model, "utc_end is not an HHMM time"))?;
+            Some((start, end))
+        }
+        _ => {
+            return Err(override_error(
+                model,
+                "a time window sets only one of utc_start and utc_end",
+            ));
+        }
+    };
+
+    // One bit per weekday, Monday lowest, so a repeated name contributes its
+    // day once; every day when `utc_days` is absent.
+    let days: u8 = match &entry.utc_days {
+        None => 0b111_1111,
+        Some(listed) if listed.is_empty() => return Err(override_error(model, "utc_days is empty")),
+        Some(listed) => listed.iter().fold(0, |mask, day| mask | (1 << day.days_since_monday())),
+    };
+
+    let mut ranges = Vec::new();
+    for midnight in (0..7).filter(|&day| days & (1 << day) != 0).map(|day| day * MINUTES_PER_DAY) {
+        let spans = match daily {
+            None => [Some((0, MINUTES_PER_DAY)), None],
+            Some((start, end)) if end > start => [Some((start, end)), None],
+            Some((start, end)) => [Some((start, MINUTES_PER_DAY)), (end > 0).then_some((0, end))],
+        };
+        for (start, end) in spans.into_iter().flatten() {
+            // Unreachable for a validated clock: every span is non-empty and
+            // inside its own day.
+            ranges.push(WeekRange::new(midnight + start, midnight + end).ok_or_else(|| {
+                MaintainError::InvariantViolation(format!("openrouter: model '{model}': empty or out-of-week window"))
+            })?);
+        }
+    }
+
+    Ok(WeekWindow {
+        ranges,
+        input_usd_per_1m: parse_optional_per_million(entry.prompt.as_ref())?,
+        output_usd_per_1m: parse_optional_per_million(entry.completion.as_ref())?,
+        cache_read_usd_per_1m: parse_optional_per_million(entry.input_cache_read.as_ref())?,
+        cache_write_usd_per_1m: parse_optional_per_million(entry.input_cache_write.as_ref())?,
+    })
+}
+
 /// Build the `min_input_tokens = 0`, `max_input_tokens = None` base row for an
-/// entry. Callers that need per-tier rows pass this to [`expand_tiers`] rather
-/// than using it directly.
+/// entry. Callers pass this to [`expand_overrides`] rather than using it
+/// directly.
 fn base_observation(entry: &ModelEntry, now: DateTime<Utc>) -> Result<RateObservation> {
     Ok(RateObservation {
         provider: PROVIDER.to_string(),
@@ -140,6 +305,8 @@ fn base_observation(entry: &ModelEntry, now: DateTime<Utc>) -> Result<RateObserv
         region: super::super::config::GLOBAL_REGION.to_string(),
         min_input_tokens: 0,
         max_input_tokens: None,
+        min_week_minute: None,
+        max_week_minute: None,
         valid_from: now,
         valid_from_source: ValidFromSource::Observed,
         input_usd_per_1m: Some(parse_per_million(&entry.pricing.prompt)?),
@@ -159,12 +326,14 @@ fn base_observation(entry: &ModelEntry, now: DateTime<Utc>) -> Result<RateObserv
 }
 
 /// Decode an `OpenRouter` `/api/v1/models` body into observations, expanding
-/// any `pricing.overrides` into the tiered rows `icegate.prices` keys on.
+/// any `pricing.overrides` into the context-tier or time-of-day rows
+/// `icegate.prices` keys on.
 ///
 /// # Errors
 ///
-/// Returns an error if the body does not decode or any rate string is not a
-/// number.
+/// Returns an error if the body does not decode, any rate string is not a
+/// number, or any model's overrides take a shape [`expand_overrides`] rejects.
+/// One such model fails the whole catalogue.
 pub fn parse_openrouter(body: &str, now: DateTime<Utc>) -> Result<Vec<RateObservation>> {
     let response: ModelsResponse =
         serde_json::from_str(body).map_err(|e| MaintainError::Storage(format!("openrouter: decode failed: {e}")))?;
@@ -172,8 +341,7 @@ pub fn parse_openrouter(body: &str, now: DateTime<Utc>) -> Result<Vec<RateObserv
     let mut observations = Vec::with_capacity(response.data.len());
     for entry in &response.data {
         let base = base_observation(entry, now)?;
-        let boundaries = resolve_tier_boundaries(&entry.pricing.overrides)?;
-        observations.extend(expand_tiers(&base, &boundaries));
+        observations.extend(expand_overrides(entry, &base)?);
     }
     Ok(observations)
 }
@@ -233,7 +401,8 @@ mod tests {
     use chrono::DateTime;
 
     use super::parse_openrouter;
-    use crate::pricing::source::ValidFromSource;
+    use crate::error::MaintainError;
+    use crate::pricing::source::{RateObservation, ValidFromSource};
 
     const FIXTURE: &str = include_str!("../../../tests/fixtures/openrouter_models.json");
 
@@ -359,6 +528,192 @@ mod tests {
         assert_eq!(rows.len(), 1, "no overrides means exactly one row");
         assert_eq!(rows[0].min_input_tokens, 0);
         assert_eq!(rows[0].max_input_tokens, None);
+    }
+
+    #[test]
+    fn decodes_a_catalogue_mixing_time_of_day_and_context_tier_models() {
+        // Regression: from 2026-10-29 the live catalogue carried time-of-day
+        // overrides with no `min_prompt_tokens`, and decoding the whole body
+        // failed with "missing field `min_prompt_tokens`", so no OpenRouter
+        // rate was priced at all. The tier model must still expand as before.
+        let synthetic = r#"{"data": [
+            {
+                "id": "synthetic/context-tier-model",
+                "pricing": {
+                    "prompt": "0.000001",
+                    "completion": "0.000002",
+                    "overrides": [
+                        {"min_prompt_tokens": 128000, "prompt": "0.000002", "completion": "0.000004"}
+                    ]
+                }
+            },
+            {
+                "id": "synthetic/off-peak-model",
+                "pricing": {
+                    "prompt": "0.0000003",
+                    "completion": "0.0000012",
+                    "overrides": [
+                        {"utc_days": ["saturday", "sunday"], "prompt": "0.00000015", "completion": "0.0000006"},
+                        {"utc_days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                         "utc_start": 100, "utc_end": 400,
+                         "prompt": "0.0000003", "completion": "0.0000012"}
+                    ]
+                }
+            }
+        ]}"#;
+        let rates = parse_openrouter(synthetic, now()).expect("a time-of-day override decodes");
+
+        let mut tier_rows: Vec<_> = rates.iter().filter(|r| r.model == "synthetic/context-tier-model").collect();
+        tier_rows.sort_by_key(|r| r.min_input_tokens);
+        assert_eq!(tier_rows.len(), 2, "base + one context tier");
+        assert_eq!(tier_rows[0].max_input_tokens, Some(128_000));
+        assert_eq!(tier_rows[1].min_input_tokens, 128_000);
+        assert!(
+            tier_rows
+                .iter()
+                .all(|r| r.min_week_minute.is_none() && r.max_week_minute.is_none()),
+            "context tiers are not time-scoped"
+        );
+
+        // The weekday window restates the base rate, so the week splits only
+        // where Saturday 00:00 UTC begins (minute 5 * 1440).
+        assert_eq!(
+            week_rows(&rates, "synthetic/off-peak-model"),
+            vec![
+                (Some(0), Some(7_200), Some(0.3), Some(1.2), None),
+                (Some(7_200), None, Some(0.15), Some(0.6), None),
+            ]
+        );
+    }
+
+    /// `(min_week_minute, max_week_minute, input, output, cache_read)` of
+    /// `model`'s rows in week order, rates rounded to the storage grid so
+    /// per-token strings scaled by a million compare exactly.
+    #[allow(clippy::type_complexity)]
+    fn week_rows(
+        rates: &[RateObservation],
+        model: &str,
+    ) -> Vec<(Option<i32>, Option<i32>, Option<f64>, Option<f64>, Option<f64>)> {
+        let round = |rate: Option<f64>| rate.map(|value| (value * 1e10).round() / 1e10);
+        let mut rows: Vec<_> = rates
+            .iter()
+            .filter(|r| r.model == model)
+            .map(|r| {
+                (
+                    r.min_week_minute,
+                    r.max_week_minute,
+                    round(r.input_usd_per_1m),
+                    round(r.output_usd_per_1m),
+                    round(r.cache_read_usd_per_1m),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|row| row.0);
+        rows
+    }
+
+    /// A one-model catalogue priced at $2 in / $4 out / $0.20 cache-read per
+    /// 1M tokens, carrying `overrides` verbatim.
+    fn catalogue_with_overrides(overrides: &str) -> String {
+        format!(
+            r#"{{"data": [{{"id": "synthetic/windowed-model", "pricing": {{
+                "prompt": "0.000002", "completion": "0.000004", "input_cache_read": "0.0000002",
+                "overrides": [{overrides}]
+            }}}}]}}"#
+        )
+    }
+
+    #[test]
+    fn a_wrapping_window_covers_both_ends_of_its_own_day_not_the_next() {
+        // `utc_days` is evaluated at the request instant, so 23:00-01:00 on
+        // Monday is Monday 00:00-01:00 and 23:00-24:00 — Tuesday 00:00-01:00
+        // keeps the base rate. A price the window omits (completion) stays
+        // at the base rate inside it.
+        let body = catalogue_with_overrides(
+            r#"{"utc_days": ["monday"], "utc_start": 2300, "utc_end": 100,
+                "prompt": "0.000001", "input_cache_read": "0.0000001"}"#,
+        );
+        let rates = parse_openrouter(&body, now()).expect("catalogue parses");
+        assert_eq!(
+            week_rows(&rates, "synthetic/windowed-model"),
+            vec![
+                (Some(0), Some(60), Some(1.0), Some(4.0), Some(0.1)),
+                (Some(60), Some(1_380), Some(2.0), Some(4.0), Some(0.2)),
+                (Some(1_380), Some(1_440), Some(1.0), Some(4.0), Some(0.1)),
+                (Some(1_440), None, Some(2.0), Some(4.0), Some(0.2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_without_utc_days_applies_on_every_day() {
+        let body = catalogue_with_overrides(r#"{"utc_start": 0, "utc_end": 100, "prompt": "0.000001"}"#);
+        let rates = parse_openrouter(&body, now()).expect("catalogue parses");
+
+        // Each day: 00:00-01:00 at $1, the rest of the day at the base $2.
+        let mut expected = Vec::new();
+        for day in 0..7 {
+            let midnight = day * 1_440;
+            let next_midnight = (day < 6).then_some(midnight + 1_440);
+            expected.push((Some(midnight), Some(midnight + 60), Some(1.0), Some(4.0), Some(0.2)));
+            expected.push((Some(midnight + 60), next_midnight, Some(2.0), Some(4.0), Some(0.2)));
+        }
+        assert_eq!(week_rows(&rates, "synthetic/windowed-model"), expected);
+    }
+
+    #[test]
+    fn an_end_of_zero_runs_the_window_to_midnight() {
+        // Sunday 22:00 is minute 6 * 1440 + 22 * 60.
+        let body = catalogue_with_overrides(
+            r#"{"utc_days": ["sunday"], "utc_start": 2200, "utc_end": 0, "prompt": "0.000001"}"#,
+        );
+        let rates = parse_openrouter(&body, now()).expect("catalogue parses");
+        assert_eq!(
+            week_rows(&rates, "synthetic/windowed-model"),
+            vec![
+                (Some(0), Some(9_960), Some(2.0), Some(4.0), Some(0.2)),
+                (Some(9_960), None, Some(1.0), Some(4.0), Some(0.2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_an_override_shape_it_cannot_price() {
+        // Each of these fails the whole source rather than pricing the model
+        // at a rate its overrides do not support: a threshold combined with a
+        // window, or tiers mixed with windows, has no row shape here; a
+        // half-open window, an empty or unknown day, an impossible clock time,
+        // or an entry with no condition at all is malformed.
+        let cases = [
+            (
+                "threshold and window in one entry",
+                r#"{"min_prompt_tokens": 1000, "utc_start": 100, "utc_end": 400, "prompt": "0.000001"}"#,
+            ),
+            (
+                "tiers and windows in one list",
+                r#"{"min_prompt_tokens": 1000, "prompt": "0.000003"}, {"utc_days": ["monday"], "prompt": "0.000001"}"#,
+            ),
+            ("start without end", r#"{"utc_start": 100, "prompt": "0.000001"}"#),
+            ("end without start", r#"{"utc_end": 100, "prompt": "0.000001"}"#),
+            ("empty utc_days", r#"{"utc_days": [], "prompt": "0.000001"}"#),
+            ("unknown weekday", r#"{"utc_days": ["funday"], "prompt": "0.000001"}"#),
+            (
+                "hour 24",
+                r#"{"utc_start": 2400, "utc_end": 100, "prompt": "0.000001"}"#,
+            ),
+            (
+                "minute 60",
+                r#"{"utc_start": 160, "utc_end": 300, "prompt": "0.000001"}"#,
+            ),
+            ("no condition", r#"{"prompt": "0.000001"}"#),
+        ];
+        for (case, overrides) in cases {
+            let result = parse_openrouter(&catalogue_with_overrides(overrides), now());
+            assert!(
+                matches!(result, Err(MaintainError::Storage(_))),
+                "{case}: expected a decode error, got {result:?}"
+            );
+        }
     }
 
     #[test]

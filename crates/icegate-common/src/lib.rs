@@ -32,8 +32,18 @@ pub const OPERATIONS_TABLE_FQN: &str = "iceberg.icegate.operations";
 pub const PRICES_TABLE: &str = "prices";
 /// Fully qualified table name for prices (`iceberg.icegate.prices`).
 pub const PRICES_TABLE_FQN: &str = "iceberg.icegate.prices";
-/// View name exposing [`PRICES_TABLE`] with a derived `valid_to` column.
+/// View name exposing the rows of [`PRICES_TABLE`] that are not time-scoped,
+/// with a derived `valid_to` column.
+///
+/// At any instant it holds at most one row per context tier of a rate line,
+/// as it did before the time-of-day columns existed, so a reader that does not
+/// filter on the time of day cannot match a model several times. A model
+/// priced only by time-of-day windows is absent from it.
 pub const PRICES_EFFECTIVE_TABLE: &str = "prices_effective";
+/// View name exposing every [`PRICES_TABLE`] row with a derived `valid_to`,
+/// time-scoped rows included. A reader of it applies the time-of-day
+/// predicate documented on [`schema::prices_schema`].
+pub const PRICES_EFFECTIVE_BY_TIME_OF_DAY_TABLE: &str = "prices_effective_by_time_of_day";
 
 /// Tables in the IceGate namespace that carry no `tenant_id` and hold identical
 /// rows for every tenant.
@@ -43,7 +53,11 @@ pub const PRICES_EFFECTIVE_TABLE: &str = "prices_effective";
 /// wrapped, and a table with no `tenant_id` column fails closed at
 /// catalog-resolution time — so forgetting to add a genuinely tenant-scoped
 /// table here is an error, never a silent cross-tenant leak.
-pub const GLOBAL_TABLES: &[&str] = &[PRICES_TABLE, PRICES_EFFECTIVE_TABLE];
+pub const GLOBAL_TABLES: &[&str] = &[
+    PRICES_TABLE,
+    PRICES_EFFECTIVE_TABLE,
+    PRICES_EFFECTIVE_BY_TIME_OF_DAY_TABLE,
+];
 
 /// Build the [`iceberg::TableIdent`] for a table name inside the IceGate
 /// namespace ([`ICEGATE_NAMESPACE`]).

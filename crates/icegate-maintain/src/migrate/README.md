@@ -1,8 +1,9 @@
 # Table migration and snapshot retention
 
 `migrate create` creates the six IceGate tables from the schema module and stamps
-their properties; `migrate upgrade` reports schema drift and never rewrites a
-table in place. Both exit when done. What each command does with an existing
+their properties; `migrate upgrade` reports schema drift. Neither rewrites a table
+in place, except that both append new optional columns to `prices`. Both exit
+when done. What each command does with an existing
 table is documented on [`operations.rs`](operations.rs); what a policy field
 means, on the field in [`config.rs`](config.rs).
 

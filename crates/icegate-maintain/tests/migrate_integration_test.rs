@@ -13,14 +13,24 @@
 
 use std::collections::HashMap;
 
+use chrono::DateTime;
+use futures::StreamExt;
+use iceberg::spec::Schema;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{NamespaceIdent, TableCreation};
 use icegate_common::{
-    CancellationToken, LOGS_TABLE, PRICES_TABLE,
+    CancellationToken, ICEGATE_NAMESPACE, LOGS_TABLE, PRICES_TABLE,
     catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
+    iceberg_write::{WriteConfig, write_record_batches_to_parquet},
     icegate_table_ident,
+    schema::{COL_MAX_WEEK_MINUTE, COL_MIN_WEEK_MINUTE, prices_schema},
     testing::{S3TestContainer, create_s3_bucket},
 };
 use icegate_maintain::migrate::config::SnapshotExpirationConfig;
 use icegate_maintain::migrate::operations::{MigrationOperation, create_tables, upgrade_schemas};
+use icegate_maintain::pricing::read::read_live_rates;
+use icegate_maintain::pricing::source::{RateObservation, ValidFromSource};
+use icegate_maintain::pricing::writer::{append_prices, build_price_batch};
 
 /// Object-storage bucket used as the Iceberg warehouse root for the catalog under test.
 const BUCKET_NAME: &str = "warehouse";
@@ -331,4 +341,146 @@ async fn a_second_create_leaves_an_existing_table_on_its_original_policy() {
         properties.get("history.expire.preserve-summary-property"),
         Some(&"icegate.queue.offset".to_string())
     );
+}
+
+/// An unscoped rate row.
+fn price_row() -> RateObservation {
+    RateObservation {
+        provider: "openrouter".to_string(),
+        model: "deepseek/deepseek-v4.1-flash-1017".to_string(),
+        canonical_id: Some("deepseek/deepseek-v4.1-flash-1017".to_string()),
+        service_tier: "standard".to_string(),
+        region: "global".to_string(),
+        min_input_tokens: 0,
+        max_input_tokens: None,
+        min_week_minute: None,
+        max_week_minute: None,
+        valid_from: DateTime::from_timestamp(1_760_000_000, 0).expect("valid timestamp"),
+        valid_from_source: ValidFromSource::Observed,
+        input_usd_per_1m: Some(0.3),
+        output_usd_per_1m: Some(1.2),
+        cache_read_usd_per_1m: None,
+        cache_write_usd_per_1m: None,
+        reasoning_usd_per_1m: None,
+        request_usd: None,
+        image_input_usd_per_unit: None,
+        image_output_usd_per_unit: None,
+        audio_input_usd_per_second: None,
+        audio_output_usd_per_second: None,
+        currency: "USD".to_string(),
+        source: "openrouter".to_string(),
+        source_url: None,
+    }
+}
+
+/// A `prices` table created before the time-of-day columns existed gains them
+/// in place on the next `migrate create` — the one command every deployment's
+/// migrate hook runs — without losing a row or a key: its rows read back
+/// unscoped, a time-scoped row then appends beside them, and a second run
+/// finds nothing left to do.
+#[tokio::test]
+async fn create_adds_the_time_of_day_columns_to_an_existing_prices_table() {
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+
+    // The previous `prices` layout: today's schema without the two trailing
+    // time-of-day columns.
+    let target = prices_schema().expect("prices schema builds");
+    let previous_fields: Vec<_> = target
+        .as_struct()
+        .fields()
+        .iter()
+        .filter(|f| f.name != COL_MIN_WEEK_MINUTE && f.name != COL_MAX_WEEK_MINUTE)
+        .cloned()
+        .collect();
+    let previous_width = previous_fields.len();
+    assert_eq!(previous_width + 2, target.as_struct().fields().len());
+    let previous = Schema::builder()
+        .with_fields(previous_fields)
+        .build()
+        .expect("previous prices schema builds");
+
+    let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("namespace created");
+    let table = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder().name(PRICES_TABLE.to_string()).schema(previous).build(),
+        )
+        .await
+        .expect("previous prices table created");
+
+    // One row written in the previous layout, as the rc12 crawler wrote it.
+    let unscoped = price_row();
+    let batch = build_price_batch(std::slice::from_ref(&unscoped)).expect("batch builds");
+    let previous_batch = batch
+        .project(&(0..previous_width).collect::<Vec<_>>())
+        .expect("previous columns are a prefix");
+    let write_config = WriteConfig {
+        row_group_size: 1_000,
+        data_page_size_limit_bytes: 1024 * 1024,
+        max_file_size_bytes: 16 * 1024 * 1024,
+        bloom_filter_columns: &[],
+        column_encodings: &[],
+    };
+    let written = write_record_batches_to_parquet(
+        table.clone(),
+        write_config,
+        futures::stream::once(async { Ok(previous_batch) }).boxed(),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("previous-layout row written");
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(written.data_files)
+        .apply(tx)
+        .expect("append applies");
+    tx.commit(catalog.as_ref()).await.expect("append commits");
+
+    let ops = create_tables(&catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create evolves prices");
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, MigrationOperation::Upgrade { table_name } if table_name == PRICES_TABLE)),
+        "prices must be evolved, not skipped: {ops:?}"
+    );
+    upgrade_schemas(&catalog, false)
+        .await
+        .expect("no schema drift is left on any table");
+
+    let live = read_live_rates(&catalog).await.expect("evolved table reads");
+    let unscoped_live = live.get(&unscoped.key()).expect("the earlier row keeps its key");
+    assert_eq!(
+        (unscoped_live.min_week_minute, unscoped_live.max_week_minute),
+        (None, None)
+    );
+
+    let scoped = RateObservation {
+        min_week_minute: Some(60),
+        max_week_minute: Some(240),
+        ..price_row()
+    };
+    append_prices(&catalog, std::slice::from_ref(&scoped))
+        .await
+        .expect("the evolved table takes a time-scoped row");
+    let live = read_live_rates(&catalog).await.expect("evolved table reads");
+    let scoped_live = live.get(&scoped.key()).expect("the time-scoped row is live");
+    assert_eq!(
+        (scoped_live.min_week_minute, scoped_live.max_week_minute),
+        (Some(60), Some(240))
+    );
+    assert!(live.get(&unscoped.key()).is_some(), "the earlier row is still live");
+
+    let again = create_tables(&catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("second create runs");
+    assert!(again.is_empty(), "nothing left to create or evolve: {again:?}");
 }
