@@ -456,6 +456,23 @@ async fn create_adds_the_time_of_day_columns_to_an_existing_prices_table() {
         .await
         .expect("no schema drift is left on any table");
 
+    // A scan projects the current snapshot's schema, not the table's, so a
+    // schema change with no snapshot behind it leaves every reader on the
+    // old columns until something next appends.
+    let evolved = catalog
+        .load_table(&icegate_table_ident(PRICES_TABLE))
+        .await
+        .expect("evolved table loads");
+    let metadata = evolved.metadata();
+    assert_eq!(
+        metadata
+            .current_snapshot()
+            .expect("the earlier append is still current")
+            .schema_id(),
+        Some(metadata.current_schema_id()),
+        "the current snapshot must carry the evolved schema"
+    );
+
     let live = read_live_rates(&catalog).await.expect("evolved table reads");
     let unscoped_live = live.get(&unscoped.key()).expect("the earlier row keeps its key");
     assert_eq!(

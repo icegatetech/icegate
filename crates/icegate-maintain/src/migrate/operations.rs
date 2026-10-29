@@ -419,6 +419,12 @@ fn plan_column_additions<'a>(
     (is_prefix && added.iter().all(|field| !field.required)).then_some(added)
 }
 
+/// Snapshot summary property naming the columns a schema-only commit added.
+///
+/// The property is what lets that commit carry a snapshot at all: an append
+/// with neither data files nor properties is refused.
+const ADDED_COLUMNS_PROPERTY: &str = "icegate.added-columns";
+
 /// Append to the existing `table` the optional columns `def`'s schema adds,
 /// in one commit.
 ///
@@ -426,8 +432,12 @@ fn plan_column_additions<'a>(
 /// `false`, touching nothing, when the table is already current or its drift
 /// is anything other than appended optional columns — `migrate upgrade`
 /// reports that drift. Rows already in the table read the new columns as
-/// NULL. Only the schema changes: the table keeps the sort order it was
-/// created with, which no reader or writer of a table this applies to relies on.
+/// NULL. A table that has a snapshot also gets a new one adding no data, so
+/// the current snapshot names the evolved schema: scans project the current
+/// snapshot's schema, and without it every reader would keep the old columns
+/// until the next append. Only the schema changes otherwise: the table keeps
+/// the sort order it was created with, which no reader or writer of a table
+/// this applies to relies on.
 async fn add_missing_columns(
     catalog: &dyn Catalog,
     def: &TableDefinition,
@@ -450,7 +460,16 @@ async fn add_missing_columns(
     let action = columns.iter().fold(tx.update_schema(), |action, field| {
         action.add_column(AddColumn::optional(&field.name, field.field_type.as_ref().clone()))
     });
-    action.apply(tx)?.commit(catalog).await?;
+    let mut tx = action.apply(tx)?;
+    // Actions apply in order within one commit, so this snapshot is stamped
+    // with the schema the action above adds.
+    if table.metadata().current_snapshot().is_some() {
+        let stamp = tx
+            .fast_append()
+            .set_snapshot_properties(HashMap::from([(ADDED_COLUMNS_PROPERTY.to_string(), names.join(","))]));
+        tx = stamp.apply(tx)?;
+    }
+    tx.commit(catalog).await?;
     tracing::info!("Added columns {:?} to table {}", names, def.name);
     Ok(true)
 }
