@@ -12,12 +12,14 @@
 )]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::DateTime;
 use futures::StreamExt;
 use iceberg::spec::Schema;
+use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{NamespaceIdent, TableCreation};
+use iceberg::{Catalog, NamespaceIdent, TableCreation};
 use icegate_common::{
     CancellationToken, ICEGATE_NAMESPACE, LOGS_TABLE, PRICES_TABLE,
     catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
@@ -373,20 +375,10 @@ fn price_row() -> RateObservation {
     }
 }
 
-/// A `prices` table created before the time-of-day columns existed gains them
-/// in place on the next `migrate create` — the one command every deployment's
-/// migrate hook runs — without losing a row or a key: its rows read back
-/// unscoped, a time-scoped row then appends beside them, and a second run
-/// finds nothing left to do.
-#[tokio::test]
-async fn create_adds_the_time_of_day_columns_to_an_existing_prices_table() {
-    let (_store, config) = setup_containers().await;
-    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
-        .await
-        .expect("Failed to create catalog");
-
-    // The previous `prices` layout: today's schema without the two trailing
-    // time-of-day columns.
+/// Create `prices` in its layout before the time-of-day columns: today's
+/// schema without the two trailing week-minute columns. Returns the table and
+/// how many columns that layout has.
+async fn create_previous_prices_table(catalog: &Arc<dyn Catalog>) -> (Table, usize) {
     let target = prices_schema().expect("prices schema builds");
     let previous_fields: Vec<_> = target
         .as_struct()
@@ -414,6 +406,21 @@ async fn create_adds_the_time_of_day_columns_to_an_existing_prices_table() {
         )
         .await
         .expect("previous prices table created");
+    (table, previous_width)
+}
+
+/// A `prices` table created before the time-of-day columns existed gains them
+/// in place on the next `migrate create` — the one command every deployment's
+/// migrate hook runs — without losing a row or a key: its rows read back
+/// unscoped, a time-scoped row then appends beside them, and a second run
+/// finds nothing left to do.
+#[tokio::test]
+async fn create_adds_the_time_of_day_columns_to_an_existing_prices_table() {
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    let (table, previous_width) = create_previous_prices_table(&catalog).await;
 
     // One row written in the previous layout, as the rc12 crawler wrote it.
     let unscoped = price_row();
@@ -500,4 +507,43 @@ async fn create_adds_the_time_of_day_columns_to_an_existing_prices_table() {
         .await
         .expect("second create runs");
     assert!(again.is_empty(), "nothing left to create or evolve: {again:?}");
+}
+
+/// A `prices` table migrated before its first crawl still comes out with a
+/// snapshot carrying the evolved schema. Without one, the first append could
+/// race the migration onto the previous schema, and a later `create` would see
+/// a current schema and add nothing to correct it.
+#[tokio::test]
+async fn create_stamps_the_evolved_schema_on_a_prices_table_with_no_snapshot() {
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    let (table, _) = create_previous_prices_table(&catalog).await;
+    assert!(
+        table.metadata().current_snapshot().is_none(),
+        "the table starts with no snapshot"
+    );
+
+    create_tables(&catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create evolves prices");
+
+    let evolved = catalog
+        .load_table(&icegate_table_ident(PRICES_TABLE))
+        .await
+        .expect("evolved table loads");
+    let metadata = evolved.metadata();
+    assert_eq!(
+        metadata
+            .current_snapshot()
+            .expect("the migration commits a snapshot")
+            .schema_id(),
+        Some(metadata.current_schema_id()),
+        "the current snapshot must carry the evolved schema"
+    );
+    assert!(
+        read_live_rates(&catalog).await.expect("evolved table reads").is_empty(),
+        "the stamp adds no rows"
+    );
 }
