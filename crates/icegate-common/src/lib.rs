@@ -32,6 +32,10 @@ pub const OPERATIONS_TABLE_FQN: &str = "iceberg.icegate.operations";
 pub const PRICES_TABLE: &str = "prices";
 /// Fully qualified table name for prices (`iceberg.icegate.prices`).
 pub const PRICES_TABLE_FQN: &str = "iceberg.icegate.prices";
+// TODO: remove this view once its readers query
+// `PRICES_EFFECTIVE_BY_TIME_OF_DAY_TABLE` with the time-of-day predicate; it
+// exists only so readers written before the week-minute columns keep one row
+// per key without a change coordinated with the release that added them.
 /// View name exposing the rows of [`PRICES_TABLE`] that are not time-scoped
 /// (both week-minute columns NULL), with a derived `valid_to` column.
 ///
