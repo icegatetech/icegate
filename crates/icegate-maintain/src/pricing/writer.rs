@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use iceberg::Catalog;
@@ -75,6 +75,8 @@ pub fn build_price_batch(rates: &[RateObservation]) -> Result<RecordBatch> {
         required_text(rates, |r| &r.currency),
         required_text(rates, |r| &r.source),
         optional_text(rates, |r| r.source_url.as_deref()),
+        Arc::new(rates.iter().map(|r| r.min_week_minute).collect::<Int32Array>()),
+        Arc::new(rates.iter().map(|r| r.max_week_minute).collect::<Int32Array>()),
     ];
 
     RecordBatch::try_new(arrow_schema, columns)
@@ -184,6 +186,8 @@ mod tests {
             region: "global".to_string(),
             min_input_tokens: 0,
             max_input_tokens: None,
+            min_week_minute: None,
+            max_week_minute: None,
             valid_from: DateTime::from_timestamp(1_760_000_000, 0).expect("valid timestamp"),
             valid_from_source: ValidFromSource::Observed,
             input_usd_per_1m: Some(5.0),
@@ -215,6 +219,8 @@ mod tests {
             region: "eu-west-1".to_string(),
             min_input_tokens: 128_000,
             max_input_tokens: Some(256_000),
+            min_week_minute: Some(60),
+            max_week_minute: Some(240),
             valid_from: DateTime::from_timestamp(1_770_000_000, 0).expect("valid timestamp"),
             valid_from_source: ValidFromSource::Vendor,
             input_usd_per_1m: Some(1.5),
@@ -249,7 +255,7 @@ mod tests {
     fn batch_round_trips_a_single_row() {
         let batch = build_price_batch(&[rate()]).expect("batch builds");
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 22);
+        assert_eq!(batch.num_columns(), 24);
     }
 
     #[test]
@@ -277,7 +283,7 @@ mod tests {
         // `Iterator::map` that closes over the first element instead of `r`).
         // Two rows differing on almost every field pin that each column array
         // is built by iterating `rates`, not by repeating one row's value.
-        use arrow::array::{Array, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow::array::{Array, Decimal128Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
 
         use crate::pricing::decimal::unscaled_to_rate;
 
@@ -302,6 +308,14 @@ mod tests {
         let max_input_tokens = col("max_input_tokens").as_any().downcast_ref::<Int64Array>().expect("int64");
         assert!(max_input_tokens.is_null(0));
         assert_eq!(max_input_tokens.value(1), 256_000);
+
+        let min_week_minute = col("min_week_minute").as_any().downcast_ref::<Int32Array>().expect("int32");
+        assert!(min_week_minute.is_null(0));
+        assert_eq!(min_week_minute.value(1), 60);
+
+        let max_week_minute = col("max_week_minute").as_any().downcast_ref::<Int32Array>().expect("int32");
+        assert!(max_week_minute.is_null(0));
+        assert_eq!(max_week_minute.value(1), 240);
 
         let input_usd = col("input_usd_per_1m")
             .as_any()
@@ -341,6 +355,6 @@ mod tests {
         // botched schema.
         let batch = build_price_batch(&[]).expect("batch builds");
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.num_columns(), 22);
+        assert_eq!(batch.num_columns(), 24);
     }
 }

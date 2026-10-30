@@ -1,7 +1,10 @@
 //! The source abstraction: one implementation per upstream rate card.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use icegate_common::schema::MINUTES_PER_WEEK;
 use reqwest::Client;
 
 use crate::error::{MaintainError, Result};
@@ -53,6 +56,9 @@ pub struct RateKey {
     pub region: String,
     /// Context-tier lower bound, inclusive.
     pub min_input_tokens: i64,
+    /// Time-of-day window start in minutes of the UTC week; `None` is the
+    /// start of the week.
+    pub min_week_minute: Option<i32>,
 }
 
 /// One rate line as observed from a source, before guarding and diffing.
@@ -72,6 +78,12 @@ pub struct RateObservation {
     pub min_input_tokens: i64,
     /// Context-tier upper bound, exclusive; `None` is unbounded.
     pub max_input_tokens: Option<i64>,
+    /// Time-of-day window start, inclusive, in minutes of the UTC week from
+    /// Monday 00:00; `None` is minute 0. With `max_week_minute` also `None`
+    /// the row is not time-scoped.
+    pub min_week_minute: Option<i32>,
+    /// Time-of-day window end, exclusive; `None` is the end of the week.
+    pub max_week_minute: Option<i32>,
     /// When this rate took effect.
     pub valid_from: DateTime<Utc>,
     /// Whether `valid_from` is the vendor's date or our observation time.
@@ -114,6 +126,7 @@ impl RateObservation {
             service_tier: self.service_tier.clone(),
             region: self.region.clone(),
             min_input_tokens: self.min_input_tokens,
+            min_week_minute: self.min_week_minute,
         }
     }
 
@@ -136,6 +149,7 @@ impl RateObservation {
             || self.audio_input_usd_per_second != other.audio_input_usd_per_second
             || self.audio_output_usd_per_second != other.audio_output_usd_per_second
             || self.max_input_tokens != other.max_input_tokens
+            || self.max_week_minute != other.max_week_minute
             || self.currency != other.currency
     }
 }
@@ -211,6 +225,167 @@ pub fn expand_tiers(base: &RateObservation, boundaries: &[TierBoundary]) -> Vec<
         });
     }
     rows
+}
+
+/// A half-open `[start, end)` span of minutes of the UTC week, Monday 00:00
+/// being minute 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeekRange {
+    start: i32,
+    end: i32,
+}
+
+impl WeekRange {
+    /// A span of the week, or `None` unless `0 <= start < end <=`
+    /// [`MINUTES_PER_WEEK`]: an empty span would emit no row, and one reaching
+    /// outside the week would name minutes no request falls on.
+    #[must_use]
+    pub const fn new(start: i32, end: i32) -> Option<Self> {
+        if 0 <= start && start < end && end <= MINUTES_PER_WEEK {
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+}
+
+/// Rates that replace the base row's during `ranges`.
+///
+/// A `None` rate defers to the base row, never to another window: an upstream
+/// entry that leaves a price out means its default price, so "unchanged from
+/// the tier below" — what [`TierBoundary`] means by `None` — does not apply.
+#[derive(Debug, Clone)]
+pub struct WeekWindow {
+    /// When this window applies. Ranges may touch or overlap; the window
+    /// covers their union.
+    pub ranges: Vec<WeekRange>,
+    /// USD per 1M input tokens during the window.
+    pub input_usd_per_1m: Option<f64>,
+    /// USD per 1M output tokens during the window.
+    pub output_usd_per_1m: Option<f64>,
+    /// USD per 1M cache-read tokens during the window.
+    pub cache_read_usd_per_1m: Option<f64>,
+    /// USD per 1M cache-write tokens during the window.
+    pub cache_write_usd_per_1m: Option<f64>,
+}
+
+/// The four token rates a [`WeekWindow`] can replace, in one fixed order so
+/// windows and the base row are resolved column by column.
+type TokenRates = [Option<f64>; 4];
+
+const fn window_rates(window: &WeekWindow) -> TokenRates {
+    [
+        window.input_usd_per_1m,
+        window.output_usd_per_1m,
+        window.cache_read_usd_per_1m,
+        window.cache_write_usd_per_1m,
+    ]
+}
+
+const fn observation_rates(rate: &RateObservation) -> TokenRates {
+    [
+        rate.input_usd_per_1m,
+        rate.output_usd_per_1m,
+        rate.cache_read_usd_per_1m,
+        rate.cache_write_usd_per_1m,
+    ]
+}
+
+/// Expand `base` (a row with `min_week_minute = None`) into rows that
+/// partition the week by `windows`.
+///
+/// At every minute each rate column comes from the last window in `windows`
+/// that covers the minute and sets that column, else from `base`. Neighbouring
+/// minutes with equal rates share a row, so the rows depend on the prices and
+/// not on how upstream cuts its windows: a reshuffle that keeps every price
+/// keeps every [`RateKey`]. For the same reason a single row spanning the week
+/// is emitted unscoped, exactly as a source with no windows would emit it.
+///
+/// The first row's `min_week_minute` is `None`, not `Some(0)`, and the last
+/// row's `max_week_minute` is `None`: the bounds of the week are written the
+/// way an unscoped row writes them. So when a model that was priced all week
+/// gains windows, the row starting the week revises its unscoped row under the
+/// same key instead of leaving it in effect beside the windows — as the base
+/// context tier, keyed `min_input_tokens = 0` either way, revises an untiered
+/// row.
+#[must_use]
+pub fn expand_week_windows(base: &RateObservation, windows: &[WeekWindow]) -> Vec<RateObservation> {
+    // A sweep over range edges: one sort, then one ordered-set update per
+    // edge, instead of testing every window against every span the edges cut.
+    let mut edges: Vec<(i32, usize, bool)> = windows
+        .iter()
+        .enumerate()
+        .flat_map(|(index, window)| {
+            window
+                .ranges
+                .iter()
+                .flat_map(move |range| [(range.start, index, true), (range.end, index, false)])
+        })
+        .collect();
+    edges.sort_unstable_by_key(|&(minute, _, _)| minute);
+
+    let base_rates = observation_rates(base);
+    // How many of each window's ranges cover the current minute, so a window
+    // whose ranges touch or overlap stays active until the last one ends.
+    let mut open_ranges = vec![0_u32; windows.len()];
+    // Per rate column, the active windows that set it; the greatest index is
+    // the last such window in upstream order, which is the one that wins.
+    let mut setters: [BTreeSet<usize>; 4] = Default::default();
+    // Each span starts at its minute and runs to the next span's start.
+    let mut spans: Vec<(i32, TokenRates)> = Vec::new();
+
+    let mut edges = edges.into_iter().peekable();
+    let mut minute = 0;
+    while minute < MINUTES_PER_WEEK {
+        while let Some((_, index, opens)) = edges.next_if(|&(at, _, _)| at == minute) {
+            let was_open = open_ranges[index] > 0;
+            if opens {
+                open_ranges[index] += 1;
+            } else {
+                open_ranges[index] -= 1;
+            }
+            let is_open = open_ranges[index] > 0;
+            if was_open != is_open {
+                for (column, rate) in window_rates(&windows[index]).iter().enumerate() {
+                    if rate.is_none() {
+                        continue;
+                    }
+                    if is_open {
+                        setters[column].insert(index);
+                    } else {
+                        setters[column].remove(&index);
+                    }
+                }
+            }
+        }
+
+        let mut rates = base_rates;
+        for (column, rate) in rates.iter_mut().enumerate() {
+            if let Some(&index) = setters[column].last() {
+                *rate = window_rates(&windows[index])[column];
+            }
+        }
+        if spans.last().is_none_or(|(_, previous)| *previous != rates) {
+            spans.push((minute, rates));
+        }
+        minute = edges.peek().map_or(MINUTES_PER_WEEK, |&(at, _, _)| at);
+    }
+
+    spans
+        .iter()
+        .enumerate()
+        .map(
+            |(i, &(start, [input, output, cache_read, cache_write]))| RateObservation {
+                min_week_minute: (i > 0).then_some(start),
+                max_week_minute: spans.get(i + 1).map(|&(next_start, _)| next_start),
+                input_usd_per_1m: input,
+                output_usd_per_1m: output,
+                cache_read_usd_per_1m: cache_read,
+                cache_write_usd_per_1m: cache_write,
+                ..base.clone()
+            },
+        )
+        .collect()
 }
 
 /// One upstream rate card.
@@ -296,8 +471,9 @@ where
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
+    use icegate_common::schema::MINUTES_PER_WEEK;
 
-    use super::{RateObservation, ValidFromSource};
+    use super::{RateObservation, ValidFromSource, WeekRange, WeekWindow};
 
     impl RateObservation {
         /// A fully-populated observation for assertions to vary one field of.
@@ -310,6 +486,8 @@ mod tests {
                 region: "global".to_string(),
                 min_input_tokens: 0,
                 max_input_tokens: None,
+                min_week_minute: None,
+                max_week_minute: None,
                 valid_from: DateTime::from_timestamp(1_760_000_000, 0).expect("valid timestamp"),
                 valid_from_source: ValidFromSource::Observed,
                 input_usd_per_1m: Some(5.0),
@@ -348,15 +526,16 @@ mod tests {
 
     #[test]
     fn key_differs_when_any_identity_field_changes() {
-        // Table-driven over all 5 components of `key()`: a regression that
+        // Table-driven over all 6 components of `key()`: a regression that
         // dropped one from the derivation would silently coalesce distinct rate
         // lines (e.g. two regions) into a single series.
-        let mutators: [(&str, fn(&mut RateObservation)); 5] = [
+        let mutators: [(&str, fn(&mut RateObservation)); 6] = [
             ("provider", |o| o.provider = "openai".to_string()),
             ("model", |o| o.model = "gpt-5".to_string()),
             ("service_tier", |o| o.service_tier = "batch".to_string()),
             ("region", |o| o.region = "eu-west-1".to_string()),
             ("min_input_tokens", |o| o.min_input_tokens = 128_000),
+            ("min_week_minute", |o| o.min_week_minute = Some(60)),
         ];
 
         for (field, mutate) in mutators {
@@ -369,10 +548,10 @@ mod tests {
 
     #[test]
     fn rates_differ_detects_a_change_in_any_compared_field() {
-        // Table-driven over all 12 columns `rates_differ` compares: a regression
+        // Table-driven over all 13 columns `rates_differ` compares: a regression
         // that dropped one from the comparison would mean a real price change on
         // that column never gets recorded as a new revision.
-        let mutators: [(&str, fn(&mut RateObservation)); 12] = [
+        let mutators: [(&str, fn(&mut RateObservation)); 13] = [
             ("input_usd_per_1m", |o| o.input_usd_per_1m = Some(999.0)),
             ("output_usd_per_1m", |o| o.output_usd_per_1m = Some(999.0)),
             ("cache_read_usd_per_1m", |o| o.cache_read_usd_per_1m = Some(999.0)),
@@ -390,6 +569,7 @@ mod tests {
                 o.audio_output_usd_per_second = Some(999.0);
             }),
             ("max_input_tokens", |o| o.max_input_tokens = Some(999)),
+            ("max_week_minute", |o| o.max_week_minute = Some(999)),
             ("currency", |o| o.currency = "EUR".to_string()),
         ];
 
@@ -528,6 +708,137 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].min_input_tokens, 0);
         assert_eq!(rows[0].max_input_tokens, None);
+    }
+
+    /// A window over `ranges` (each `[start, end)` in week minutes) that sets
+    /// only the input and output rates.
+    fn window(ranges: &[(i32, i32)], input: Option<f64>, output: Option<f64>) -> WeekWindow {
+        WeekWindow {
+            ranges: ranges
+                .iter()
+                .map(|&(start, end)| WeekRange::new(start, end).expect("test range is valid"))
+                .collect(),
+            input_usd_per_1m: input,
+            output_usd_per_1m: output,
+            cache_read_usd_per_1m: None,
+            cache_write_usd_per_1m: None,
+        }
+    }
+
+    /// `(min_week_minute, max_week_minute, input, output)` of each row, in
+    /// week order.
+    fn week_rows(rows: &[RateObservation]) -> Vec<(Option<i32>, Option<i32>, Option<f64>, Option<f64>)> {
+        let mut spans: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.min_week_minute,
+                    r.max_week_minute,
+                    r.input_usd_per_1m,
+                    r.output_usd_per_1m,
+                )
+            })
+            .collect();
+        spans.sort_by_key(|span| span.0);
+        spans
+    }
+
+    #[test]
+    fn week_range_rejects_an_empty_reversed_or_out_of_week_span() {
+        for (start, end) in [(60, 60), (120, 60), (-1, 60), (0, MINUTES_PER_WEEK + 1)] {
+            assert_eq!(WeekRange::new(start, end), None, "[{start}, {end}) must be rejected");
+        }
+        assert!(
+            WeekRange::new(0, MINUTES_PER_WEEK).is_some(),
+            "the whole week is a valid span"
+        );
+    }
+
+    #[test]
+    fn expand_week_windows_takes_each_column_from_the_last_window_setting_it() {
+        // Base: input 5, output 25 (`RateObservation::sample`). The second
+        // window overlaps the first and sets only input, so on the overlap
+        // input comes from it and output from the first; past the first
+        // window, output falls back to the base rate, not to the first window.
+        let rows = super::expand_week_windows(
+            &RateObservation::sample(),
+            &[
+                window(&[(0, 600)], Some(1.0), Some(3.0)),
+                window(&[(300, 900)], Some(1.5), None),
+            ],
+        );
+        assert_eq!(
+            week_rows(&rows),
+            vec![
+                (None, Some(300), Some(1.0), Some(3.0)),
+                (Some(300), Some(600), Some(1.5), Some(3.0)),
+                (Some(600), Some(900), Some(1.5), Some(25.0)),
+                (Some(900), None, Some(5.0), Some(25.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_week_windows_merges_neighbours_with_equal_rates() {
+        // Two windows at one rate that touch, a window that restates the base
+        // rate, and one window whose ranges touch each other must not split a
+        // row: the rows follow the price, not how upstream cut its windows,
+        // so a reshuffle that keeps every price keeps every key.
+        let rows = super::expand_week_windows(
+            &RateObservation::sample(),
+            &[
+                window(&[(100, 200)], Some(1.0), None),
+                window(&[(200, 300)], Some(1.0), None),
+                window(&[(500, 600)], Some(5.0), None),
+                window(&[(1000, 1440), (1440, 2000)], Some(2.0), None),
+            ],
+        );
+        assert_eq!(
+            week_rows(&rows),
+            vec![
+                (None, Some(100), Some(5.0), Some(25.0)),
+                (Some(100), Some(300), Some(1.0), Some(25.0)),
+                (Some(300), Some(1000), Some(5.0), Some(25.0)),
+                (Some(1000), Some(2000), Some(2.0), Some(25.0)),
+                (Some(2000), None, Some(5.0), Some(25.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_week_windows_that_change_no_rate_yield_the_unscoped_base_row() {
+        // Without this, a model whose windows only restate its base price
+        // would be stored under a time-scoped key that a model publishing no
+        // windows at all does not have.
+        for windows in [vec![], vec![window(&[(60, 120)], Some(5.0), Some(25.0))]] {
+            let rows = super::expand_week_windows(&RateObservation::sample(), &windows);
+            assert_eq!(rows, vec![RateObservation::sample()]);
+        }
+    }
+
+    #[test]
+    fn expand_week_windows_first_row_shares_the_unscoped_rows_key() {
+        // A model priced all week until upstream added windows already has an
+        // unscoped row live. The window row starting the week must revise
+        // that row, not sit beside it under a new key: otherwise the old row
+        // keeps matching every minute alongside each window.
+        let unscoped = RateObservation::sample();
+        let rows = super::expand_week_windows(&unscoped, &[window(&[(60, 120)], Some(1.0), None)]);
+        let first = rows
+            .iter()
+            .find(|r| r.max_week_minute == Some(60))
+            .expect("row before the window");
+        assert_eq!(first.key(), unscoped.key());
+        assert!(first.rates_differ(&unscoped), "its bounded end is a revision");
+    }
+
+    #[test]
+    fn expand_week_windows_covering_the_whole_week_yield_one_unscoped_row_at_the_window_rate() {
+        let rows = super::expand_week_windows(
+            &RateObservation::sample(),
+            &[window(&[(0, MINUTES_PER_WEEK)], Some(1.0), None)],
+        );
+        assert_eq!(week_rows(&rows), vec![(None, None, Some(1.0), Some(25.0))]);
     }
 
     #[tokio::test]

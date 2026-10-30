@@ -128,6 +128,8 @@ mod tests {
             region: "global".to_string(),
             min_input_tokens: 0,
             max_input_tokens: None,
+            min_week_minute: None,
+            max_week_minute: None,
             valid_from: now(),
             valid_from_source: ValidFromSource::Observed,
             input_usd_per_1m: Some(1.0),

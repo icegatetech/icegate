@@ -351,6 +351,8 @@ pub fn parse_bedrock(body: &str) -> Result<Vec<RateObservation>> {
             region: region.to_string(),
             min_input_tokens: 0,
             max_input_tokens: None,
+            min_week_minute: None,
+            max_week_minute: None,
             valid_from: rates.effective_date,
             valid_from_source: ValidFromSource::Vendor,
             input_usd_per_1m: rates.input_usd_per_1m,

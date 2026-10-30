@@ -68,6 +68,8 @@ fn rate_observation(input_usd_per_1m: f64, valid_from: DateTime<Utc>) -> RateObs
         region: "global".to_string(),
         min_input_tokens: 0,
         max_input_tokens: None,
+        min_week_minute: None,
+        max_week_minute: None,
         valid_from,
         valid_from_source: ValidFromSource::Observed,
         input_usd_per_1m: Some(input_usd_per_1m),

@@ -972,13 +972,34 @@ pub fn operations_sort_order(schema: &Schema) -> Result<SortOrder> {
 ///
 /// # Key
 ///
-/// `(provider, model, service_tier, region, min_input_tokens, valid_from)`.
-/// Context tiers and service tiers live in the key rather than in extra columns
-/// so the rate columns stay flat as the card grows.
+/// `(provider, model, service_tier, region, min_input_tokens, min_week_minute,
+/// valid_from)`. Context tiers, time-of-day windows, and service tiers live in
+/// the key rather than in extra columns so the rate columns stay flat as the
+/// card grows.
+///
+/// # Time of day
+///
+/// A row applies from `min_week_minute` (inclusive; NULL is 0) to
+/// `max_week_minute` (exclusive; NULL is [`MINUTES_PER_WEEK`]), counted in
+/// minutes of the UTC week from Monday 00:00. A row with both NULL is not
+/// time-scoped, and a model's window starting the week keeps that key, so it
+/// revises the unscoped row the model had before it gained windows. The rows one crawl writes for a model partition the
+/// week without gaps or overlaps, and a consumer selects the one for a request
+/// at week minute `m` with `coalesce(min_week_minute, 0) <= m AND m <
+/// coalesce(max_week_minute, MINUTES_PER_WEEK)`; one that omits it matches a
+/// time-scoped model once per window. The `prices_effective` view therefore
+/// leaves time-scoped rows out for readers written before these columns, and
+/// `prices_effective_by_time_of_day` keeps them. Nothing retracts a
+/// key, so a window boundary that later moves upstream leaves the old row in
+/// effect beside the new ones, exactly as a moved context-tier boundary does.
+///
+/// Both columns are optional rather than required with a sentinel because they
+/// were added to tables that already held rows: those rows read back NULL, so
+/// NULL is the one encoding of either end of the week a writer may use.
 ///
 /// # Field IDs
 ///
-/// Assigned sequentially 1–22. Schema ID is 6 (1–5 are the telemetry tables).
+/// Assigned sequentially 1–24. Schema ID is 6 (1–5 are the telemetry tables).
 ///
 /// # Errors
 ///
@@ -1099,6 +1120,19 @@ pub fn prices_schema() -> Result<Schema> {
                 22,
                 COL_SOURCE_URL,
                 Type::Primitive(PrimitiveType::String),
+            )),
+            // ── key (time of day) ────────────────────────────────────────
+            // Added to tables already in service, so they trail every field
+            // above and are optional; see "Time of day" on this function.
+            Arc::new(NestedField::optional(
+                23,
+                COL_MIN_WEEK_MINUTE,
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                24,
+                COL_MAX_WEEK_MINUTE,
+                Type::Primitive(PrimitiveType::Int),
             )),
         ])
         .build()?;
@@ -1956,6 +1990,14 @@ pub const COL_CURRENCY: &str = "currency";
 pub const COL_SOURCE: &str = "source";
 /// Prices — provenance URL of the upstream rate card.
 pub const COL_SOURCE_URL: &str = "source_url";
+/// Prices — inclusive start of the row's time-of-day window, in minutes of the
+/// UTC week; NULL is the start of the week. See [`prices_schema`].
+pub const COL_MIN_WEEK_MINUTE: &str = "min_week_minute";
+/// Prices — exclusive end of the row's time-of-day window, in minutes of the
+/// UTC week; NULL is the end of the week.
+pub const COL_MAX_WEEK_MINUTE: &str = "max_week_minute";
+/// Minutes in one week: the implicit end of a NULL [`COL_MAX_WEEK_MINUTE`].
+pub const MINUTES_PER_WEEK: i32 = 7 * 24 * 60;
 
 /// The `prices` key columns that identify one rate line across revisions.
 ///
@@ -1969,6 +2011,7 @@ pub const PRICES_KEY_COLUMNS: &[&str] = &[
     COL_SERVICE_TIER,
     COL_REGION,
     COL_MIN_INPUT_TOKENS,
+    COL_MIN_WEEK_MINUTE,
 ];
 
 /// Indexed attribute columns for log label extraction.
@@ -2635,6 +2678,27 @@ mod tests {
     }
 
     #[test]
+    fn prices_week_minute_columns_are_optional_ints_trailing_the_schema() {
+        // Both columns are added to an already-populated `prices` in place, so
+        // they must be optional (old rows have no value), and they must trail
+        // every pre-existing field: writers build Arrow batches positionally
+        // from this schema while the Parquet writer binds them to the table's
+        // evolved schema, where added columns land last.
+        let schema = prices_schema().expect("prices schema builds");
+        let names: Vec<&str> = schema.as_struct().fields().iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names[names.len() - 3..],
+            ["source_url", "min_week_minute", "max_week_minute"]
+        );
+        for name in ["min_week_minute", "max_week_minute"] {
+            let field = schema.field_by_name(name).unwrap_or_else(|| panic!("field '{name}' missing"));
+            assert!(!field.required, "field '{name}' must be optional");
+            assert_eq!(*field.field_type, Type::Primitive(PrimitiveType::Int), "{name} type");
+        }
+        assert_eq!(MINUTES_PER_WEEK, 10_080, "minutes in a 7-day week");
+    }
+
+    #[test]
     fn prices_rate_columns_are_fixed_point_decimal_not_double() {
         // Money must be exact. A regression back to `Double` would silently
         // reintroduce float rounding into stored rates and cost sums.
@@ -2689,6 +2753,7 @@ mod tests {
             "service_tier",
             "region",
             "min_input_tokens",
+            "min_week_minute",
             "valid_from",
         ]
         .iter()

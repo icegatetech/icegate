@@ -30,6 +30,20 @@ async fn prices_effective_view_is_selectable() -> Result<(), Box<dyn std::error:
 }
 
 #[tokio::test]
+async fn prices_effective_by_time_of_day_view_is_selectable() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, _catalog) = TestServer::start().await?;
+    let mut client = server.client(Some("tenant-alpha"));
+    let batches = execute_sql(
+        &mut client,
+        "SELECT count(*) FROM iceberg.icegate.prices_effective_by_time_of_day",
+    )
+    .await?;
+    assert_eq!(count_from_batches(&batches), 0);
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn prices_joins_tenant_scoped_tables_in_one_plan() -> Result<(), Box<dyn std::error::Error>> {
     let (server, catalog) = TestServer::start().await?;
 
