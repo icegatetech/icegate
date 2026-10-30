@@ -46,4 +46,18 @@ ignore = [
     # hyper-0.14 connector as RUSTSEC-2026-0258, which nothing configures. Remove
     # together with RUSTSEC-2026-0258.
     "RUSTSEC-2026-0382",
+    # zstd 0.13 / zstd-safe 7.x advisories, patched only in zstd >=0.14.3 and
+    # zstd-safe >=8.2.0. The 0.14 / 8.x copy (async-compression, which decodes
+    # OTLP HTTP request bodies) is updated. The remaining copy is zstd 0.13.3,
+    # which has no patched release; arrow-ipc, parquet, datafusion, iceberg,
+    # foyer-storage and apache-avro pull it, and even the latest apache-avro
+    # still requires zstd ^0.13. None of them reaches an affected function:
+    # 0391 needs `stream::raw::{Encoder,Decoder}::with_context`, but they all
+    # build streams with `new`, which owns a fresh context. 0403 needs
+    # `stream::write::Decoder`; they decode through `stream::read::Decoder`,
+    # `decode_all` or `bulk::Decompressor`. 0398 needs the `seekable` feature,
+    # which nothing enables. Remove once zstd 0.13 leaves the dependency tree.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
 ]

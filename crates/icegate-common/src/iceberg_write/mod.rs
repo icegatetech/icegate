@@ -682,6 +682,9 @@ mod tests {
     /// - `trace_id` / `span_id` use `DELTA_BYTE_ARRAY`
     /// - `timestamp` uses `DELTA_BINARY_PACKED`
     /// - bloom filters present on `trace_id` / `span_id`
+    /// - bloom filters lie after the data of every row group: the writer
+    ///   behind [`write_record_batches_to_parquet`] keeps
+    ///   `BloomFilterPosition::End` from `build_writer_properties`
     /// - column compression is ZSTD
     #[tokio::test]
     async fn spans_write_pins_encoding_bloom_and_compression() {
@@ -729,8 +732,9 @@ mod tests {
         let batch = spans_batch(table.metadata().current_schema(), 64);
         let stream = futures::stream::once(async { Ok(batch) }).boxed();
         let cancel = super::CancellationToken::new();
+        // The bloom filter layout check needs more than one row group.
         let cfg = WriteConfig {
-            row_group_size: 1024,
+            row_group_size: 16,
             data_page_size_limit_bytes: 2 * 1024 * 1024,
             max_file_size_bytes: writer_max_parquet_bytes(64 * 1024 * 1024),
             bloom_filter_columns: SPANS_BLOOM_COLUMNS,
@@ -744,6 +748,8 @@ mod tests {
         assert_eq!(written.data_files.len(), 1, "single partition ⇒ single file");
 
         let footer = read_parquet_footer(&file_io, &written.data_files[0]).await;
+        assert_eq!(footer.num_row_groups(), 4, "64 rows in row groups of 16");
+        crate::parquet_writer::test_support::assert_bloom_filters_after_column_data(&footer);
         let row_group = footer.row_group(0);
 
         let column = |name: &str| -> &ColumnChunkMetaData {
