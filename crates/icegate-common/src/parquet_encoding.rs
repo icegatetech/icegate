@@ -66,7 +66,7 @@ use parquet::basic::Encoding;
 
 use crate::parquet_writer::ColumnEncoding;
 use crate::schema::{
-    COL_COUNT, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_INGESTED_TIMESTAMP, COL_MAX, COL_MIN,
+    COL_CONVERSATION_ID, COL_COUNT, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_INGESTED_TIMESTAMP, COL_MAX, COL_MIN,
     COL_OBSERVED_TIMESTAMP, COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_START_TIMESTAMP, COL_STATUS_MESSAGE, COL_SUM,
     COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE, COL_VALUE_DOUBLE, COL_ZERO_COUNT, COL_ZERO_THRESHOLD,
 };
@@ -98,9 +98,14 @@ pub const METRICS_BLOOM_COLUMNS: &[&str] = &[];
 /// Bloom-filter columns for the `operations` table.
 ///
 /// Operations is a 1:1 projection of LLM/GenAI spans; equality-predicate
-/// lookups (trace-by-id, `{trace_id="..."}`) skip whole row groups via these
-/// high-cardinality columns.
-pub const OPERATIONS_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID];
+/// lookups (trace-by-id, `{trace_id="..."}`) skip whole row groups via the
+/// high-cardinality `trace_id` and `span_id`.
+///
+/// `conversation_id` is neither a partition nor a sort column, so a row
+/// group's min/max range spans many conversations and only its bloom filter
+/// lets a conversation lookup skip it. The filter is stored inside the data
+/// file, so it does not spare opening a file the scan has already selected.
+pub const OPERATIONS_BLOOM_COLUMNS: &[&str] = &[COL_TRACE_ID, COL_SPAN_ID, COL_CONVERSATION_ID];
 
 /// Encoding overrides for the `logs` table.
 ///
@@ -228,8 +233,8 @@ mod operations_encoding_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        COL_SPAN_ID, COL_TRACE_ID, EVENTS_BLOOM_COLUMNS, LOGS_BLOOM_COLUMNS, METRICS_BLOOM_COLUMNS,
-        OPERATIONS_BLOOM_COLUMNS, SPANS_BLOOM_COLUMNS,
+        COL_CONVERSATION_ID, COL_SPAN_ID, COL_TRACE_ID, EVENTS_BLOOM_COLUMNS, LOGS_BLOOM_COLUMNS,
+        METRICS_BLOOM_COLUMNS, OPERATIONS_BLOOM_COLUMNS, SPANS_BLOOM_COLUMNS,
     };
 
     #[test]
@@ -237,7 +242,10 @@ mod tests {
         assert_eq!(LOGS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
         assert_eq!(SPANS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
         assert_eq!(EVENTS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
-        assert_eq!(OPERATIONS_BLOOM_COLUMNS, &[COL_TRACE_ID, COL_SPAN_ID]);
+        assert_eq!(
+            OPERATIONS_BLOOM_COLUMNS,
+            &[COL_TRACE_ID, COL_SPAN_ID, COL_CONVERSATION_ID]
+        );
         assert!(METRICS_BLOOM_COLUMNS.is_empty());
     }
 }

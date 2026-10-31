@@ -496,7 +496,7 @@ pub fn operations_schema() -> Result<Schema> {
             // `gen_ai.conversation.id` / session id; NULL when absent.
             Arc::new(NestedField::optional(
                 2,
-                "conversation_id",
+                COL_CONVERSATION_ID,
                 Type::Primitive(PrimitiveType::String),
             )),
             // ── identity ─────────────────────────────────────────────────
@@ -1909,6 +1909,9 @@ pub const LEVEL_ALIAS: &str = "level";
 
 // ── Operations table column name constants ───────────────────────────
 
+/// Operations — conversation the operation belongs to (`STRING`); NULL when
+/// the span carries none.
+pub const COL_CONVERSATION_ID: &str = "conversation_id";
 /// Operations — evaluation results (`List<Struct>`), one element per complete
 /// result found on the span; NULL when it carries none. The element's `name`
 /// field reuses [`COL_NAME`].

@@ -1,7 +1,7 @@
 //! Shared bootstrap for Flight SQL integration tests.
 //!
-//! Spins up an in-memory Iceberg catalog with all four observability
-//! tables (`logs`, `spans`, `events`, `metrics`), starts the Flight SQL
+//! Spins up an in-memory Iceberg catalog with every table the tests query
+//! (see `create_namespace_and_tables`), starts the Flight SQL
 //! gRPC server on an OS-assigned port, and exposes a connected
 //! [`FlightSqlServiceClient`] for tests to drive.
 #![allow(
@@ -37,7 +37,8 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
     CatalogBackend, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, ListenerRuntime,
-    METRICS_TABLE, PRICES_TABLE, SPANS_TABLE, TENANT_ID_HEADER, TenantResolver, catalog::CatalogBuilder, schema,
+    METRICS_TABLE, OPERATIONS_TABLE, PRICES_TABLE, SPANS_TABLE, TENANT_ID_HEADER, TenantResolver,
+    catalog::CatalogBuilder, schema,
 };
 use icegate_query::{
     engine::{QueryEngine, QueryEngineConfig},
@@ -251,6 +252,7 @@ async fn create_namespace_and_tables(catalog: &Arc<dyn Catalog>) -> Result<(), B
         (SPANS_TABLE, schema::spans_schema()?),
         (EVENTS_TABLE, schema::events_schema()?),
         (METRICS_TABLE, schema::metrics_schema()?),
+        (OPERATIONS_TABLE, schema::operations_schema()?),
         (PRICES_TABLE, schema::prices_schema()?),
     ] {
         let creation = iceberg::TableCreation::builder().name(name.to_string()).schema(schema).build();
