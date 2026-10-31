@@ -1,18 +1,40 @@
 //! Bloom filter row group pruning of the Iceberg scan.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use datafusion::arrow::array::{Array, FixedSizeBinaryArray, RecordBatch, StringArray};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use datafusion::arrow::array::{
+    Array, ArrayRef, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    new_null_array,
+};
 use datafusion::parquet::file::properties::DEFAULT_PAGE_SIZE;
-use icegate_common::parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS};
+use iceberg::table::Table;
+use icegate_common::parquet_encoding::{
+    LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS,
+};
 use icegate_common::parquet_writer::build_writer_properties;
-use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
+use icegate_common::schema::{
+    COL_CONVERSATION_ID, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_INGESTED_TIMESTAMP, COL_SPAN_ID, COL_TENANT_ID,
+    COL_TIMESTAMP, COL_TRACE_ID,
+};
+use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, OPERATIONS_TABLE};
+use tonic::transport::Channel;
 
 use super::harness::{LogRow, TestServer, build_logs_batch, commit_data_file, execute_sql};
 
 const TENANT: &str = "tenant-bloom";
 
-/// Rows per row group: the six fixture rows land in three row groups.
+/// Rows per `logs` row group: the six fixture rows land in three row groups.
 const ROWS_PER_ROW_GROUP: usize = 2;
+
+/// Rows per `operations` row group: two operations of different conversations
+/// and one operation outside any conversation.
+const OPERATIONS_PER_ROW_GROUP: usize = 3;
+
+/// Start, end, and ingestion time of every fixture operation.
+const FIXTURE_TIMESTAMP_MICROS: i64 = 1_700_000_000_000_000;
 
 /// Trace id `Tk`: 16 bytes `[k, 0, …]`.
 const fn build_trace_id(k: u8) -> [u8; 16] {
@@ -96,6 +118,41 @@ struct BloomFilterCase {
     row_groups_pruned_bloom_filter: &'static str,
 }
 
+/// Runs every case as `SELECT span_id FROM iceberg.icegate.<table> WHERE <predicate>`
+/// and checks both the rows it returns and how its bloom filter phase pruned.
+async fn assert_bloom_filter_cases(
+    client: &mut FlightSqlServiceClient<Channel>,
+    table: &str,
+    cases: Vec<BloomFilterCase>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for case in cases {
+        let query = format!("SELECT span_id FROM iceberg.icegate.{table} WHERE {}", case.predicate);
+
+        let batches = execute_sql(client, &query).await?;
+        assert_eq!(
+            collect_sorted_span_ids(&batches),
+            case.span_ids,
+            "rows of `{}`",
+            case.predicate
+        );
+
+        let explained = execute_sql(client, &format!("EXPLAIN ANALYZE {query}")).await?;
+        assert_eq!(
+            extract_iceberg_scan_metric(&explained, "row_groups_pruned_bloom_filter"),
+            case.row_groups_pruned_bloom_filter,
+            "bloom filter pruning of `{}`",
+            case.predicate
+        );
+        assert_eq!(
+            extract_iceberg_scan_metric(&explained, "bloom_filter_read_errors"),
+            "0",
+            "bloom filter read errors of `{}`",
+            case.predicate
+        );
+    }
+    Ok(())
+}
+
 /// Row groups whose bloom filters prove the predicate value absent are
 /// skipped, and the rows returned are exactly the matching ones.
 ///
@@ -127,7 +184,7 @@ async fn bloom_filter_prunes_row_groups_without_the_value() -> Result<(), Box<dy
     );
     commit_data_file(&table, &catalog, batch, "bloom-filter", writer_properties).await?;
 
-    let cases = [
+    let cases = vec![
         BloomFilterCase {
             predicate: format!("trace_id = {}", format_trace_id_literal(7)),
             span_ids: vec![build_span_id(7).to_vec()],
@@ -161,31 +218,159 @@ async fn bloom_filter_prunes_row_groups_without_the_value() -> Result<(), Box<dy
     ];
 
     let mut client = server.client(Some(TENANT));
-    for case in cases {
-        let query = format!("SELECT span_id FROM iceberg.icegate.logs WHERE {}", case.predicate);
+    assert_bloom_filter_cases(&mut client, LOGS_TABLE, cases).await?;
 
-        let batches = execute_sql(&mut client, &query).await?;
-        assert_eq!(
-            collect_sorted_span_ids(&batches),
-            case.span_ids,
-            "rows of `{}`",
-            case.predicate
-        );
+    server.shutdown().await;
+    Ok(())
+}
 
-        let explained = execute_sql(&mut client, &format!("EXPLAIN ANALYZE {query}")).await?;
-        assert_eq!(
-            extract_iceberg_scan_metric(&explained, "row_groups_pruned_bloom_filter"),
-            case.row_groups_pruned_bloom_filter,
-            "bloom filter pruning of `{}`",
-            case.predicate
-        );
-        assert_eq!(
-            extract_iceberg_scan_metric(&explained, "bloom_filter_read_errors"),
-            "0",
-            "bloom filter read errors of `{}`",
-            case.predicate
-        );
-    }
+/// One fixture `operations` row.
+struct OperationRow {
+    /// The `k` of the row's `Tk` trace id and `Sk` span id.
+    id: u8,
+    /// `None` for an operation outside any conversation.
+    conversation_id: Option<&'static str>,
+}
+
+/// Build one `operations` batch with a row per entry of `rows`, in order.
+///
+/// Only the required columns and `conversation_id` carry values; every other
+/// column is NULL. A required column the fixture does not fill fails the build,
+/// so the fixture breaks loudly when the schema gains one.
+fn build_operations_batch(table: &Table, rows: &[OperationRow]) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let row_count = rows.len();
+    let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
+        table.metadata().current_schema(),
+    )?);
+    let timestamps = || TimestampMicrosecondArray::from(vec![FIXTURE_TIMESTAMP_MICROS; row_count]);
+
+    let mut by_name: HashMap<&str, ArrayRef> = HashMap::new();
+    by_name.insert(COL_TENANT_ID, Arc::new(StringArray::from(vec![TENANT; row_count])));
+    by_name.insert(
+        COL_CONVERSATION_ID,
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.conversation_id).collect::<Vec<_>>(),
+        )),
+    );
+    by_name.insert(
+        COL_TRACE_ID,
+        Arc::new(FixedSizeBinaryArray::try_from_iter(
+            rows.iter().map(|row| build_trace_id(row.id)),
+        )?),
+    );
+    by_name.insert(
+        COL_SPAN_ID,
+        Arc::new(FixedSizeBinaryArray::try_from_iter(
+            rows.iter().map(|row| build_span_id(row.id)),
+        )?),
+    );
+    by_name.insert(COL_TIMESTAMP, Arc::new(timestamps()));
+    by_name.insert(COL_END_TIMESTAMP, Arc::new(timestamps()));
+    by_name.insert(COL_INGESTED_TIMESTAMP, Arc::new(timestamps()));
+    by_name.insert(COL_DURATION_MICROS, Arc::new(Int64Array::from(vec![0_i64; row_count])));
+    // `icegate_common::schema` exports no `COL_*` constant for it, so it stays
+    // a literal; a misspelling leaves it unconsumed and fails the check below.
+    by_name.insert("operation_name", Arc::new(StringArray::from(vec!["chat"; row_count])));
+
+    let columns = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| match by_name.remove(field.name().as_str()) {
+            Some(column) => Ok(column),
+            None if field.is_nullable() => Ok(new_null_array(field.data_type(), row_count)),
+            None => Err(format!(
+                "operations fixture must fill required column `{}`",
+                field.name()
+            )),
+        })
+        .collect::<Result<Vec<ArrayRef>, String>>()?;
+    assert!(
+        by_name.is_empty(),
+        "operations fixture builds columns the schema does not have: {:?}",
+        by_name.keys()
+    );
+
+    Ok(RecordBatch::try_new(arrow_schema, columns)?)
+}
+
+/// A conversation lookup on `operations` skips the row groups whose
+/// `conversation_id` bloom filter proves the conversation absent, and keeps
+/// every row of the operations outside any conversation.
+///
+/// `conversation_id` is neither a partition nor a sort column, so a row group
+/// holds several conversations and its min/max range spans them: every range
+/// of the first three row groups contains `conv-5` and `conv-7`, and only the
+/// bloom filter phase can drop one of them. Each of the three also holds an
+/// operation outside any conversation, so its filter is built over a column
+/// with NULLs; the fourth row group holds only such operations.
+///
+/// The queries project `span_id` and filter on `conversation_id`: the
+/// predicate column is not read back, which is the shape of a conversation's
+/// trace lookup.
+#[tokio::test]
+async fn conversation_id_bloom_filter_prunes_operations_row_groups_without_the_conversation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (server, catalog) = TestServer::start().await?;
+    let table_ident = iceberg::TableIdent::from_strs([ICEGATE_NAMESPACE, OPERATIONS_TABLE])?;
+    let table = catalog.load_table(&table_ident).await?;
+
+    // Row groups in write order:
+    // (S1 conv-1, S9 conv-9, S11) | (S2 conv-2, S8 conv-8, S12) | (S3 conv-3, S7 conv-7, S13) | (S14, S15, S16).
+    let rows = [
+        (1, Some("conv-1")),
+        (9, Some("conv-9")),
+        (11, None),
+        (2, Some("conv-2")),
+        (8, Some("conv-8")),
+        (12, None),
+        (3, Some("conv-3")),
+        (7, Some("conv-7")),
+        (13, None),
+        (14, None),
+        (15, None),
+        (16, None),
+    ]
+    .map(|(id, conversation_id)| OperationRow { id, conversation_id });
+    let unstamped_span_ids: Vec<Vec<u8>> = [11u8, 12, 13, 14, 15, 16].map(|k| build_span_id(k).to_vec()).to_vec();
+    let batch = build_operations_batch(&table, &rows)?;
+    let writer_properties = build_writer_properties(
+        OPERATIONS_PER_ROW_GROUP,
+        DEFAULT_PAGE_SIZE,
+        OPERATIONS_BLOOM_COLUMNS,
+        OPERATIONS_COLUMN_ENCODINGS,
+    );
+    commit_data_file(&table, &catalog, batch, "bloom-filter-operations", writer_properties).await?;
+
+    // The all-NULL fourth row group never reaches the bloom filter phase of an
+    // equality lookup: its statistics already prove that no row can match, so
+    // these metrics count three row groups.
+    let cases = vec![
+        BloomFilterCase {
+            predicate: "conversation_id = 'conv-7'".to_owned(),
+            span_ids: vec![build_span_id(7).to_vec()],
+            row_groups_pruned_bloom_filter: "3 total → 1 matched",
+        },
+        BloomFilterCase {
+            predicate: "conversation_id = 'conv-5'".to_owned(),
+            span_ids: vec![],
+            row_groups_pruned_bloom_filter: "3 total → 0 matched",
+        },
+        BloomFilterCase {
+            predicate: "conversation_id IN ('conv-2', 'conv-7')".to_owned(),
+            span_ids: vec![build_span_id(2).to_vec(), build_span_id(7).to_vec()],
+            row_groups_pruned_bloom_filter: "3 total → 2 matched",
+        },
+        // A bloom filter holds no NULLs, so it must not prune a NULL lookup:
+        // every row group reaches the phase and every one is kept.
+        BloomFilterCase {
+            predicate: "conversation_id IS NULL".to_owned(),
+            span_ids: unstamped_span_ids,
+            row_groups_pruned_bloom_filter: "4 total → 4 matched",
+        },
+    ];
+
+    let mut client = server.client(Some(TENANT));
+    assert_bloom_filter_cases(&mut client, OPERATIONS_TABLE, cases).await?;
 
     server.shutdown().await;
     Ok(())
